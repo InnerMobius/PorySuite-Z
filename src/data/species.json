@@ -1,0 +1,42 @@
+{
+    "SPECIES_A": {
+        "species_info": {
+            "baseHP": 10,
+            "speciesName": "A",
+            "types": [
+                "TYPE_NORMAL",
+                "TYPE_NONE"
+            ],
+            "abilities": [
+                "ABILITY_NONE",
+                "ABILITY_NONE",
+                "ABILITY_NONE"
+            ],
+            "evolutions": []
+        },
+        "forms": {},
+        "name": "A",
+        "dex_num": null,
+        "dex_constant": null
+    },
+    "SPECIES_B": {
+        "species_info": {
+            "baseHP": 20,
+            "speciesName": "B",
+            "types": [
+                "TYPE_NORMAL",
+                "TYPE_NONE"
+            ],
+            "abilities": [
+                "ABILITY_NONE",
+                "ABILITY_NONE",
+                "ABILITY_NONE"
+            ],
+            "evolutions": []
+        },
+        "forms": {},
+        "name": "B",
+        "dex_num": null,
+        "dex_constant": null
+    }
+}

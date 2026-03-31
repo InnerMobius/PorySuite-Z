@@ -1,0 +1,71 @@
+# ── Game repos (not part of the app) ──
+/pokefirered/
+
+# ── Python runtime ──
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+cleanenv/
+_venv_off/
+
+# ── IDE / editor ──
+.idea/
+.vscode/
+*.swp
+*~
+*.autosave
+Thumbs.db
+.DS_Store
+
+# ── Test / debug artefacts ──
+.pytest_cache/
+pytestresults.json
+crashlogs/
+save_debug.log
+launch.log
+*.log
+
+# ── User-specific runtime data ──
+projects.json
+data/projects.json
+data/settings.ini
+data/toolchain/
+data/git_remotes.json
+plugins/_save_debug.log
+
+# ── Temp / junk files ──
+TMP DELETE/
+temp_lines.txt
+untracked-list.txt
+Save
+
+# ── Unrelated binaries and files ──
+codex.exe
+codex.bat
+Zeldamon.xlsx
+
+# ── Dev notes (not app code) ──
+AGENTS.md
+DATAFLOW.md
+progress.md
+renameplan.md
+
+# ── One-off test scripts ──
+test_apply.py
+test_bat.bat
+
+# ── Compiled / build artefacts ──
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.dll
+*.exe
+*.res
+*.rc
+*.debug
+out/
+cmake-build-*/

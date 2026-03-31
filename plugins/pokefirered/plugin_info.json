@@ -1,0 +1,11 @@
+{
+    "name": "FireRed Plugin",
+    "description": "Uses the official pokefirered decompilation",
+    "author": "Te_On",
+    "version": "0.1.4",
+    "identifier": "com.porysuite.firered",
+    "rom_base": "firered",
+    "project_base_repo": "https://github.com/pret/pokefirered.git",
+    "project_base_branch": "master",
+    "dependencies": []
+}

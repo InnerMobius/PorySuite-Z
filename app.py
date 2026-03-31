@@ -1,0 +1,383 @@
+import os
+import sys
+import json
+import datetime
+
+
+# Initialize logging as early as possible so import-time errors are captured
+try:
+    import crashlog as _early_crashlog
+    if not _early_crashlog.session_json_path():
+        _early_crashlog.init_logging()
+        _early_crashlog.install_std_redirects()
+except Exception:
+    pass
+
+from PyQt6.QtCore import QEventLoop, Qt
+from PyQt6.QtGui import QFontDatabase, QAction
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QMessageBox,
+    QInputDialog,
+)
+
+import res.resources_rc as resources_rc
+import crashlog
+from app_info import APP_NAME, AUTHOR, get_data_dir
+from loadingproject import LoadingProject
+from mainwindow import MainWindow
+from projectselector import ProjectSelector
+from programsetup import ProgramSetup, get_setup_complete_path
+
+
+class App:
+
+    def __init__(self):
+        # Ensure logging is initialized (it may already be from module import)
+        try:
+            if not crashlog.session_json_path():
+                log_path = crashlog.init_logging()
+                crashlog.install_std_redirects()
+        except Exception:
+            log_path = None
+        self.app = QApplication(sys.argv)
+        self.app.setApplicationName("PorySuite-Z")
+        self.app.setApplicationDisplayName("PorySuite-Z")
+        # After QApplication exists, capture Qt messages too
+        try:
+            crashlog.install_qt_message_handler()
+        except Exception:
+            pass
+        self.__initialize_fonts()
+        self.__initialize_resources()
+        self.main = None
+        self.project_selector = None
+        self.loading_dialog = None
+
+    @staticmethod
+    def __initialize_fonts():
+        QFontDatabase.addApplicationFont(":/fonts/SourceCodePro-Regular.ttf")
+
+    @staticmethod
+    def __initialize_resources():
+        resources_rc.qInitResources()
+
+    def start(self):
+        """
+        Starts the application by performing the necessary setup and loading the main window.
+
+        This method performs the following:
+        1. Makes necessary directories.
+        2. Shows project selector window.
+        3. Handles project selection.
+        4. Loads project into main window.
+        """
+
+        # Set up local data directory (migrate from AppData on first run)
+        data_dir = get_data_dir()
+        os.makedirs(os.path.join(data_dir, "plugins"), exist_ok=True)
+        self._migrate_from_appdata(data_dir)
+
+        # Ensure projects.json exists with at least one project for first launch
+        projects_file = os.path.join(data_dir, "projects.json")
+        default_project = {"projects": []}
+        modified = False
+        if not os.path.exists(projects_file):
+            projects_data = default_project
+            modified = True
+        else:
+            try:
+                with open(projects_file, "r") as f:
+                    projects_data = json.load(f)
+            except Exception:
+                projects_data = default_project
+                modified = True
+        if not projects_data.get("projects"):
+            projects_data = default_project
+            modified = True
+        if modified:
+            os.makedirs(data_dir, exist_ok=True)
+            with open(projects_file, "w") as f:
+                json.dump(projects_data, f)
+
+        # Check if the required toolchain has been set up
+        setup_path = get_setup_complete_path()
+        if not os.path.exists(setup_path):
+            setup_dialog = ProgramSetup()
+            try:
+                # Make sure the setup dialog is visible and focused, even when
+                # launched from a console window via the batch script.
+                setup_dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+                setup_dialog.show()
+                setup_dialog.raise_()
+                setup_dialog.activateWindow()
+            except Exception:
+                pass
+            if setup_dialog.exec() != QDialog.DialogCode.Accepted:
+                sys.exit()
+            os.makedirs(os.path.dirname(setup_path), exist_ok=True)
+            with open(setup_path, "w") as f:
+                f.write("complete")
+
+        # Get projects from projects.json
+        projects = App.get_projects(data_dir)
+
+        # Show project selector
+        self.project_selector = ProjectSelector(projects=projects["projects"])
+        self.project_selector.show()
+        try:
+            self.project_selector.raise_()
+            self.project_selector.activateWindow()
+        except Exception:
+            pass
+
+
+
+        # Wait for project selector to close
+        loop = QEventLoop()
+        self.project_selector.close_signal.connect(loop.quit)
+        loop.exec()
+
+        # Handle project selection
+        if self.project_selector.selected_index == -1:
+            # Exit if the user presses cancel
+            sys.exit()
+        else:
+            # Reload projects to capture any modifications from the selector
+            projects = App.get_projects(data_dir)
+            if self.project_selector.selected_index == -2:
+                # Open a new project
+                self.project_selector.selected_index = 0
+
+        # Load main window and show loading dialog
+        self.main = MainWindow()
+        self.loading_dialog = LoadingProject(self.main)
+        self.loading_dialog.show()
+
+        # Update loading progress
+        self.loading_dialog.update_progress(10)
+
+        # Load project information
+        p_info = projects["projects"][self.project_selector.selected_index]
+        self.loading_dialog.update_progress(20)
+        local_info_path = os.path.join(p_info["dir"], "project.json")
+        if not os.path.exists(local_info_path):
+            local_info_path = os.path.join(p_info["dir"], "config.json")
+        if not os.path.exists(local_info_path):
+            config_mk = os.path.join(p_info["dir"], "config.mk")
+            if os.path.exists(config_mk):
+                ret = QMessageBox.question(
+                    self.main,
+                    "Create config.json",
+                    (
+                        "No project.json or config.json found. "
+                        "PorySuite requires a config.json file.\n"
+                        "Create one using default settings?"
+                    ),
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                )
+                if ret == QMessageBox.StandardButton.Yes:
+                    import pluginmanager
+
+                    plugins = pluginmanager.get_plugins_info()
+                    if not plugins:
+                        QMessageBox.critical(self.main, "Error", "No plugins available.")
+                        sys.exit(1)
+                    items = [f"{p['name']} ({p['identifier']})" for p in plugins]
+                    choice, ok = QInputDialog.getItem(
+                        self.main,
+                        "Select Plugin",
+                        "Plugin:",
+                        items,
+                        0,
+                        False,
+                    )
+                    if not ok:
+                        sys.exit(1)
+                    plugin = plugins[items.index(choice)]
+                    default_config = {
+                        "name": p_info.get("name", os.path.basename(p_info["dir"])),
+                        "project_name": p_info.get("project_name", os.path.basename(p_info["dir"])),
+                        "version": {"major": 0, "minor": 0, "patch": 0},
+                        "plugin_identifier": plugin["identifier"],
+                        "plugin_version": plugin["version"],
+                        "date_created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "date_modified": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    with open(os.path.join(p_info["dir"], "config.json"), "w") as f:
+                        json.dump(default_config, f, indent=4)
+                    local_info_path = os.path.join(p_info["dir"], "config.json")
+                else:
+                    QMessageBox.critical(self.main, "Error", "Cannot load project without config.json")
+                    sys.exit(1)
+            else:
+                QMessageBox.critical(self.main, "Error", "Project configuration file not found")
+                sys.exit(1)
+
+        with open(local_info_path, "r") as f:
+            local_p_info = json.load(f)
+        self.loading_dialog.update_progress(30)
+
+        # Update last opened timestamp
+        p_info["last_opened"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.loading_dialog.update_progress(40)
+
+        # Load data into main window
+        self.main.load_data(p_info | local_p_info)
+        self.loading_dialog.update_progress(70)
+
+        # Set window file path
+        self.main.setWindowFilePath(p_info["dir"])
+        self.loading_dialog.update_progress(80)
+
+        # Set current item in tree view; then clear the modified flag because
+        # selecting the first species fires signals that spuriously set it.
+        self.main.ui.tree_pokemon.setCurrentItem(self.main.ui.tree_pokemon.topLevelItem(0))
+        self.main.setWindowModified(False)
+        self.loading_dialog.update_progress(90)
+
+        # Update projects.json with modified project information
+        projects["projects"][self.project_selector.selected_index] = p_info
+        with open(os.path.join(data_dir, "projects.json"), "w") as file_projects:
+            json.dump(projects, file_projects)
+
+        # Update loading progress
+        self.loading_dialog.update_progress(100)
+
+        # Add recent projects to the menu
+        for i in range(1, min(len(projects["projects"]), 5)):
+            recent_project = QAction(projects["projects"][i]["name"] + " | " + projects["projects"][i]["dir"])
+            recent_project.triggered.connect(
+                lambda _, p=projects["projects"][i]: self.main.loadAndSaveProjectSignal.emit(p)
+            )
+            self.main.ui.menuRecent_Projects.addAction(recent_project)
+
+        # Handle case when there are no recent projects
+        if len(projects["projects"]) == 1:
+            no_recent_projects = QAction("No Recent Projects")
+            no_recent_projects.setEnabled(False)
+            self.main.ui.menuRecent_Projects.addAction(no_recent_projects)
+
+        # Close loading dialog and show main window
+        self.loading_dialog.close()
+        self.main.show()
+        self.main.activateWindow()
+        self.main.setFocus()
+        # Log where this session’s JSON log lives for easy discovery
+        try:
+            jpath = crashlog.session_json_path() or crashlog.latest_json_log_file()
+            if jpath:
+                print(f"Session log (JSONL): {jpath}")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _migrate_from_appdata(data_dir: str) -> None:
+        """One-time migration: copy projects.json and plugins from AppData to the
+        local data/ directory so existing users don't lose their project history."""
+        import shutil
+        try:
+            import platformdirs
+            from app_info import APP_NAME, AUTHOR
+            old_dir = platformdirs.user_data_dir(APP_NAME, AUTHOR)
+        except Exception:
+            return
+
+        if not os.path.isdir(old_dir):
+            return
+
+        # Don't migrate if the local data dir already has a projects.json
+        local_projects = os.path.join(data_dir, "projects.json")
+        if os.path.exists(local_projects):
+            return
+
+        # Copy projects.json
+        old_projects = os.path.join(old_dir, "projects.json")
+        if os.path.exists(old_projects):
+            try:
+                shutil.copy2(old_projects, local_projects)
+            except Exception:
+                pass
+
+        # Copy plugins (non-destructive: only files not already present)
+        old_plugins = os.path.join(old_dir, "plugins")
+        new_plugins = os.path.join(data_dir, "plugins")
+        if os.path.isdir(old_plugins):
+            try:
+                for item in os.listdir(old_plugins):
+                    src = os.path.join(old_plugins, item)
+                    dst = os.path.join(new_plugins, item)
+                    if not os.path.exists(dst):
+                        if os.path.isdir(src):
+                            shutil.copytree(src, dst)
+                        else:
+                            shutil.copy2(src, dst)
+            except Exception:
+                pass
+
+        # Copy toolchain flag so setup doesn't re-run for existing users
+        old_toolchain = os.path.join(old_dir, "toolchain", "setup_complete")
+        new_toolchain = os.path.join(data_dir, "toolchain", "setup_complete")
+        if os.path.exists(old_toolchain) and not os.path.exists(new_toolchain):
+            try:
+                os.makedirs(os.path.dirname(new_toolchain), exist_ok=True)
+                shutil.copy2(old_toolchain, new_toolchain)
+            except Exception:
+                pass
+
+    @staticmethod
+    def get_projects(path: str) -> dict:
+        """
+        Retrieve the projects from the projects.json file and return them as a dictionary.
+
+        Args:
+            path (str): The path to the directory containing the projects.json file.
+
+        Returns:
+            dict: A dictionary containing the projects retrieved from the projects.json file.
+        """
+        # Define the path to the projects.json file
+        projects_file = os.path.join(path, "projects.json")
+        
+        # If the projects.json file doesn't exist, create an empty projects dictionary and save it to the file
+        if not os.path.exists(projects_file):
+            projects = {"projects": []}
+            with open(projects_file, "w") as file_projects:
+                json.dump(projects, file_projects)
+        
+        # Load the projects from the projects.json file
+        with open(projects_file, "r") as file_projects:
+            projects = json.load(file_projects)
+
+        # Normalize old entries that used 'path' instead of 'dir'
+        normalized = False
+        for project in projects.get("projects", []):
+            if "dir" not in project and "path" in project:
+                project["dir"] = project.pop("path")
+                normalized = True
+
+        if normalized:
+            with open(projects_file, "w") as file_projects:
+                json.dump(projects, file_projects)
+
+        # Sort the projects by last opened timestamp in descending order
+        projects["projects"].sort(
+            key=lambda x: (
+                datetime.datetime.strptime(
+                    x.get("last_opened", ""), "%Y-%m-%d %H:%M:%S"
+                )
+                if x.get("last_opened")
+                else datetime.datetime.min
+            ),
+            reverse=True,
+        )
+        
+        return projects
+
+
+if __name__ == "__main__":
+    app = App()
+    app.start()
+    sys.exit(QApplication.exec())

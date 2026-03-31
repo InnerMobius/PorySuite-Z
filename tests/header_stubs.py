@@ -1,0 +1,203 @@
+"""Reusable FireRed header stubs for test fixtures."""
+
+from __future__ import annotations
+
+import os
+
+POKEDEX_ENTRIES = """\
+[NATIONAL_DEX_NONE] =
+{
+    .categoryName = _(\"UNKNOWN\"),
+    .height = 1,
+    .weight = 1,
+    .description = gTestPokedexText,
+    .unusedDescription = gTestPokedexTextUnused,
+    .pokemonScale = 256,
+    .pokemonOffset = 0,
+    .trainerScale = 256,
+    .trainerOffset = 0,
+},
+[NATIONAL_DEX_TEST] =
+{
+    .categoryName = _(\"TEST\"),
+    .height = 1,
+    .weight = 1,
+    .description = gTestPokedexText,
+    .unusedDescription = gTestPokedexTextUnused,
+    .pokemonScale = 256,
+    .pokemonOffset = 0,
+    .trainerScale = 256,
+    .trainerOffset = 0,
+},
+"""
+
+POKEDEX_TEXT_FR = """\
+const u8 gTestPokedexText[] = _(
+    \"Test entry.\"
+);
+const u8 gTestPokedexTextUnused[] = _(\"");
+"""
+
+LEVEL_UP_PTRS = """\
+const struct LevelUpMove *const gLevelUpLearnsets[] = {
+    [SPECIES_TEST] = sSpeciesTestLevelUpLearnset,
+};
+"""
+
+LEVEL_UP_SETS = """\
+static const struct LevelUpMove sSpeciesTestLevelUpLearnset[] = {
+    LEVEL_UP_MOVE(1, MOVE_TEST),
+    LEVEL_UP_END,
+};
+"""
+
+TMHM_LEARNSETS = """\
+const u16 gTMHMLearnsets[][2] = {
+    [SPECIES_TEST] = TMHM_LEARNSET(TMHM(TM01_FOCUS_PUNCH), 0),
+};
+"""
+
+TUTOR_LEARNSETS = """\
+const u16 gTutorLearnsets[][2] = {
+    [SPECIES_TEST] = { TUTOR(MOVE_TEST), 0 },
+};
+"""
+
+EGG_MOVES = """\
+egg_moves(TEST,
+    MOVE_TEST,
+    MOVE_NONE
+)
+"""
+
+SPECIES_INFO = """\
+[SPECIES_NONE] =
+{
+    .baseHP = 1,
+    .types = {TYPE_NORMAL, TYPE_NORMAL},
+    .abilities = {ABILITY_NONE, ABILITY_NONE, ABILITY_NONE},
+},
+[SPECIES_TEST] =
+{
+    .baseHP = 1,
+    .types = {TYPE_NORMAL, TYPE_NORMAL},
+    .abilities = {ABILITY_NONE, ABILITY_NONE, ABILITY_NONE},
+},
+[SPECIES_OTHER] =
+{
+    .baseHP = 1,
+    .types = {TYPE_NORMAL, TYPE_NORMAL},
+    .abilities = {ABILITY_NONE, ABILITY_NONE, ABILITY_NONE},
+},
+"""
+
+SPECIES_NAMES = """\
+const u8 gSpeciesNames[][POKEMON_NAME_LENGTH + 1] = {
+    [SPECIES_NONE] = _("NONE"),
+    [SPECIES_TEST] = _("TEST"),
+    [SPECIES_OTHER] = _("OTHER"),
+};
+"""
+
+SPECIES_CONSTANTS = """\
+#define SPECIES_NONE 0
+#define SPECIES_TEST 1
+#define SPECIES_OTHER 2
+#define SPECIES_EGG 3
+#define NUM_SPECIES SPECIES_EGG
+"""
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def write_pokedex_headers(project_root: str) -> None:
+    """Write minimal Pokédex headers required for tests."""
+
+    pokemon_dir = os.path.join(project_root, "src", "data", "pokemon")
+    _ensure_dir(pokemon_dir)
+    with open(os.path.join(pokemon_dir, "pokedex_entries.h"), "w", encoding="utf-8") as handle:
+        handle.write(POKEDEX_ENTRIES)
+    with open(os.path.join(pokemon_dir, "pokedex_text_fr.h"), "w", encoding="utf-8") as handle:
+        handle.write(POKEDEX_TEXT_FR)
+
+
+def write_move_headers(project_root: str) -> None:
+    """Write canonical move/learnset headers required for write-back tests."""
+
+    pokemon_dir = os.path.join(project_root, "src", "data", "pokemon")
+    _ensure_dir(pokemon_dir)
+    with open(
+        os.path.join(pokemon_dir, "level_up_learnset_pointers.h"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(LEVEL_UP_PTRS)
+    with open(
+        os.path.join(pokemon_dir, "level_up_learnsets.h"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(LEVEL_UP_SETS)
+    with open(
+        os.path.join(pokemon_dir, "tmhm_learnsets.h"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(TMHM_LEARNSETS)
+    with open(
+        os.path.join(pokemon_dir, "tutor_learnsets.h"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(TUTOR_LEARNSETS)
+    with open(
+        os.path.join(pokemon_dir, "egg_moves.h"),
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        handle.write(EGG_MOVES)
+
+
+def write_species_headers(project_root: str) -> None:
+    """Write minimal species headers/constants required for tests."""
+
+    pokemon_dir = os.path.join(project_root, "src", "data", "pokemon")
+    text_dir = os.path.join(project_root, "src", "data", "text")
+    include_constants = os.path.join(project_root, "include", "constants")
+    data_dir = os.path.join(project_root, "src", "data")
+
+    _ensure_dir(pokemon_dir)
+    _ensure_dir(text_dir)
+    _ensure_dir(include_constants)
+    _ensure_dir(data_dir)
+
+    species_info_path = os.path.join(pokemon_dir, "species_info.h")
+    if not os.path.isfile(species_info_path):
+        with open(species_info_path, "w", encoding="utf-8") as handle:
+            handle.write(SPECIES_INFO)
+    overlay_dir = os.path.join(pokemon_dir, "species_info")
+    _ensure_dir(overlay_dir)
+    overlay_path = os.path.join(overlay_dir, "pory_species.h")
+    if not os.path.isfile(overlay_path):
+        with open(overlay_path, "w", encoding="utf-8") as handle:
+            handle.write("// overlay generated by tests\n")
+    species_names_path = os.path.join(text_dir, "species_names.h")
+    if not os.path.isfile(species_names_path):
+        with open(species_names_path, "w", encoding="utf-8") as handle:
+            handle.write(SPECIES_NAMES)
+    species_constants_path = os.path.join(include_constants, "species.h")
+    if not os.path.isfile(species_constants_path):
+        with open(species_constants_path, "w", encoding="utf-8") as handle:
+            handle.write(SPECIES_CONSTANTS)
+    evolution_header_path = os.path.join(pokemon_dir, "evolution.h")
+    if not os.path.isfile(evolution_header_path):
+        with open(evolution_header_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "const struct Evolution gEvolutionTable[NUM_SPECIES][EVOS_PER_MON] = {}\n"
+            )
+    constants_path = os.path.join(data_dir, "constants.json")
+    if not os.path.isfile(constants_path):
+        with open(constants_path, "w", encoding="utf-8") as handle:
+            handle.write("{}")
