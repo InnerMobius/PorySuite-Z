@@ -6,6 +6,10 @@ All edits are written back into the project's canonical `src/` and `include/` fi
 
 ---
 
+> **WARNING: This application is developed with heavy use of AI-assisted coding. While functional, it may contain bugs that can corrupt or break your project files. ALWAYS keep backups of your decomp project (use git!) and test thoroughly after every editing session. You are responsible for verifying that your project still compiles and behaves correctly. The authors are not responsible for any lost or damaged work.**
+
+---
+
 ## Getting Started
 
 ### Requirements
