@@ -152,4 +152,4 @@ Build output streams in real time in-app.
 
 ## License
 
-Original PorySuite by jschoeny.
+Original [PorySuite](https://github.com/jschoeny/PorySuite) by jschoeny.
