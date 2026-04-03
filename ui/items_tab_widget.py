@@ -32,6 +32,9 @@ from ui.constants import (
 
 # ── icon resolution ───────────────────────────────────────────────────────────
 
+from ui.open_folder_util import open_in_folder
+
+
 def _parse_item_icon_map(project_path: str) -> dict[str, str]:
     """
     Returns {ITEM_CONSTANT: abs_png_path} by chaining two C-header lookups:
@@ -74,6 +77,90 @@ def _parse_item_icon_map(project_path: str) -> dict[str, str]:
             result[const] = abs_png
 
     return result
+
+
+def _parse_item_icon_full(project_path: str):
+    """Parse full item-icon data for the icon picker.
+
+    Returns:
+        item_syms : {ITEM_CONST: (icon_sym, palette_sym)}
+        icon_choices : [(icon_sym, abs_png_path)] sorted by display name
+        sym_to_png : {icon_sym: abs_png_path}
+        icon_to_default_pal : {icon_sym: palette_sym}  (first palette seen)
+    """
+    icon_table = os.path.join(project_path, "src", "data", "item_icon_table.h")
+    gfx_header = os.path.join(project_path, "src", "data", "graphics", "items.h")
+
+    # Step 1: per-item icon+palette symbols
+    item_syms: dict[str, tuple[str, str]] = {}
+    try:
+        text = open(icon_table, encoding="utf-8", errors="surrogateescape").read()
+        for m in re.finditer(
+            r'\[(\w+)\]\s*=\s*\{(\w+),\s*(\w+)\}', text
+        ):
+            item_syms[m.group(1)] = (m.group(2), m.group(3))
+    except OSError:
+        pass
+
+    # Step 2: symbol → relative path (icons only)
+    sym_to_rel: dict[str, str] = {}
+    try:
+        text = open(gfx_header, encoding="utf-8", errors="surrogateescape").read()
+        for m in re.finditer(
+            r'const u32 (\w+)\[\]\s*=\s*INCBIN_U32\("([^"]+)"\)', text
+        ):
+            sym_to_rel[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+
+    # Step 3: resolve icon symbols to PNGs
+    sym_to_png: dict[str, str] = {}
+    for sym, rel in sym_to_rel.items():
+        if not sym.startswith("gItemIcon_"):
+            continue
+        png_rel = re.sub(r"\.4bpp\.lz$", ".png", rel)
+        abs_png = os.path.join(project_path, png_rel)
+        if os.path.isfile(abs_png):
+            sym_to_png[sym] = abs_png
+
+    # Step 4: build default palette mapping (first palette seen for each icon)
+    icon_to_default_pal: dict[str, str] = {}
+    for _item, (icon_sym, pal_sym) in item_syms.items():
+        if icon_sym not in icon_to_default_pal:
+            icon_to_default_pal[icon_sym] = pal_sym
+
+    # Step 5: sorted list of (icon_sym, png_path) for the picker
+    icon_choices = sorted(sym_to_png.items(), key=lambda x: x[0])
+
+    return item_syms, icon_choices, sym_to_png, icon_to_default_pal
+
+
+def write_item_icon_entry(
+    project_path: str, item_const: str, icon_sym: str, palette_sym: str
+) -> bool:
+    """Update a single item's icon entry in item_icon_table.h.
+    Returns True on success."""
+    icon_table = os.path.join(project_path, "src", "data", "item_icon_table.h")
+    try:
+        text = open(icon_table, encoding="utf-8", errors="surrogateescape").read()
+    except OSError:
+        return False
+
+    # Match the line:  [ITEM_CONST] = {gItemIcon_X, gItemIconPalette_Y},
+    pattern = re.compile(
+        r'(\[\s*' + re.escape(item_const) + r'\s*\]\s*=\s*\{)\w+,\s*\w+(\})'
+    )
+    new_text, count = pattern.subn(
+        r'\g<1>' + icon_sym + ', ' + palette_sym + r'\2', text
+    )
+    if count == 0:
+        return False
+    try:
+        with open(icon_table, "w", encoding="utf-8", newline="\n") as f:
+            f.write(new_text)
+        return True
+    except OSError:
+        return False
 
 
 # ── styling ───────────────────────────────────────────────────────────────────
@@ -309,6 +396,9 @@ class ItemDetailPanel(QWidget):
         super().__init__(parent)
         self._loading = False
         self._dirty = False
+        self._sym_to_png: dict[str, str] = {}
+        self._icon_to_default_pal: dict[str, str] = {}
+        self._current_icon_path: str = ""
         self.setStyleSheet(_FIELD_SS)
         self._build()
 
@@ -358,6 +448,39 @@ class ItemDetailPanel(QWidget):
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("background-color: #2e2e2e; border: none; max-height: 1px;")
         root.addWidget(sep)
+
+        # ── Icon card (picker + open folder) ──────────────────────────────────
+        icon_card, icon_form = _card("Icon")
+
+        self.f_icon_combo = QComboBox()
+        self.f_icon_combo.setIconSize(QSize(24, 24))
+        self.f_icon_combo.setMinimumHeight(32)
+        self.f_icon_combo.setEditable(True)
+        self.f_icon_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.f_icon_combo.setToolTip("Choose which sprite icon this item displays")
+        icon_form.addRow(_lbl("Sprite"), self.f_icon_combo)
+
+        icon_btn_row = QHBoxLayout()
+        icon_btn_row.setContentsMargins(0, 0, 0, 0)
+        icon_btn_row.setSpacing(8)
+        self._open_icon_btn = QPushButton("Open Icon in Folder")
+        self._open_icon_btn.setFixedHeight(26)
+        self._open_icon_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._open_icon_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2a2a2a; color: #aaaaaa;
+                border: 1px solid #3a3a3a; border-radius: 4px;
+                padding: 0 12px; font-size: 11px;
+            }
+            QPushButton:hover  { background-color: #333333; color: #cccccc; }
+            QPushButton:pressed { background-color: #222222; }
+        """)
+        self._open_icon_btn.clicked.connect(self._on_open_icon)
+        icon_btn_row.addWidget(self._open_icon_btn)
+        icon_btn_row.addStretch(1)
+        icon_form.addRow(icon_btn_row)
+
+        root.addWidget(icon_card)
 
         # ── Identity card ─────────────────────────────────────────────────────
         id_card, id_form = _card("Identity")
@@ -497,6 +620,7 @@ class ItemDetailPanel(QWidget):
             w.currentIndexChanged.connect(self._emit)
         for w in (self.f_importance, self.f_registrability):
             w.checkStateChanged.connect(self._emit)
+        self.f_icon_combo.currentIndexChanged.connect(self._on_icon_changed)
 
     def _emit(self, *_):
         if not self._loading:
@@ -506,7 +630,51 @@ class ItemDetailPanel(QWidget):
                 self._hdr_name.setText(self.f_name.text() or "—")
             self.changed.emit()
 
+    def _on_icon_changed(self, idx):
+        """User picked a different icon from the combo."""
+        if self._loading or idx < 0:
+            return
+        sym = self.f_icon_combo.itemData(Qt.ItemDataRole.UserRole)
+        if sym is None:
+            sym = self.f_icon_combo.itemData(idx, Qt.ItemDataRole.UserRole)
+        if not sym:
+            return
+        png = self._sym_to_png.get(sym, "")
+        self.set_icon(png)
+        self._current_icon_path = png
+        self._dirty = True
+        self.changed.emit()
+
+    def _on_open_icon(self):
+        path = getattr(self, "_current_icon_path", "")
+        if path:
+            open_in_folder(path)
+
     # ── public API ────────────────────────────────────────────────────────────
+
+    def set_icon_choices(self, icon_choices: list[tuple[str, str]],
+                         sym_to_png: dict[str, str],
+                         icon_to_default_pal: dict[str, str]):
+        """Populate the icon picker combo.
+        icon_choices: [(gItemIcon_Symbol, abs_png_path)]
+        """
+        self._sym_to_png = sym_to_png
+        self._icon_to_default_pal = icon_to_default_pal
+        self.f_icon_combo.blockSignals(True)
+        self.f_icon_combo.clear()
+        for sym, png_path in icon_choices:
+            # Display name: strip "gItemIcon_" prefix
+            display = sym.replace("gItemIcon_", "")
+            icon = QIcon()
+            if png_path and os.path.isfile(png_path):
+                pm = QPixmap(png_path).scaled(
+                    24, 24,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+                icon = QIcon(pm)
+            self.f_icon_combo.addItem(icon, display, sym)
+        self.f_icon_combo.blockSignals(False)
 
     def set_icon(self, png_path: str | None):
         """Display the item icon from a PNG path, or a placeholder if None."""
@@ -526,13 +694,25 @@ class ItemDetailPanel(QWidget):
             self._icon_lbl.setStyleSheet(_PLACEHOLDER_ICON_SS)
             self._icon_lbl.setText("?")
 
-    def load_item(self, const: str, data: dict, icon_path: str | None = None):
+    def load_item(self, const: str, data: dict, icon_path: str | None = None,
+                  icon_sym: str | None = None):
         self._loading = True
         try:
             name = data.get("english") or data.get("name") or ""
             self._hdr_name.setText(name or const)
             self._hdr_const.setText(const)
             self.set_icon(icon_path)
+            self._current_icon_path = icon_path or ""
+
+            # Select icon in combo
+            if icon_sym:
+                idx = self.f_icon_combo.findData(icon_sym, Qt.ItemDataRole.UserRole)
+                if idx >= 0:
+                    self.f_icon_combo.setCurrentIndex(idx)
+                else:
+                    self.f_icon_combo.setCurrentText(
+                        icon_sym.replace("gItemIcon_", "")
+                    )
 
             self.f_name.setText(name)
 
@@ -600,6 +780,18 @@ class ItemDetailPanel(QWidget):
             self._loading = False
             self._dirty = False
 
+    def get_selected_icon_sym(self) -> str | None:
+        """Return the currently selected icon symbol, or None if unchanged."""
+        idx = self.f_icon_combo.currentIndex()
+        if idx >= 0:
+            return self.f_icon_combo.itemData(idx, Qt.ItemDataRole.UserRole)
+        return None
+
+    def get_default_palette(self, icon_sym: str) -> str:
+        """Return a suitable palette for *icon_sym*."""
+        pal_map = getattr(self, "_icon_to_default_pal", {})
+        return pal_map.get(icon_sym, "gItemIconPalette_QuestionMark")
+
     def collect(self, base: dict) -> dict:
         d = dict(base)
         d["english"] = self.f_name.text()
@@ -624,6 +816,9 @@ class ItemDetailPanel(QWidget):
             self._hdr_name.setText("—")
             self._hdr_const.setText("")
             self.set_icon(None)
+            self._current_icon_path = ""
+            if self.f_icon_combo.count():
+                self.f_icon_combo.setCurrentIndex(0)
             self.f_name.clear()
             self.f_price.setValue(0)
             self.f_pocket.setCurrentIndex(0)
@@ -669,6 +864,9 @@ class ItemsTabWidget(QWidget):
         self._icons:    dict[str, str]  = {}   # const → abs png path
         self._current:  str | None      = None
         self._icon_cache: dict[str, QIcon] = {}
+        self._item_syms:  dict[str, tuple[str, str]] = {}  # const → (icon_sym, pal_sym)
+        self._project_path: str = ""
+        self._icon_dirty: dict[str, tuple[str, str]] = {}  # const → (new_icon, new_pal)
         self._build()
         # Prevent scroll-wheel from changing combos/spins unless clicked
         try:
@@ -798,6 +996,8 @@ class ItemsTabWidget(QWidget):
         self._order.clear()
         self._current = None
         self._icon_cache.clear()
+        self._icon_dirty.clear()
+        self._project_path = project_path
 
         if isinstance(items, list):
             for entry in items:
@@ -810,8 +1010,18 @@ class ItemsTabWidget(QWidget):
                 self._items[const] = dict(entry)
                 self._order.append(const)
 
-        # Resolve icons
+        # Resolve icons (simple map for list thumbnails)
         self._icons = _parse_item_icon_map(project_path) if project_path else {}
+
+        # Full icon data for the picker
+        if project_path:
+            (self._item_syms, icon_choices,
+             sym_to_png, icon_to_default_pal) = _parse_item_icon_full(project_path)
+            self._detail.set_icon_choices(
+                icon_choices, sym_to_png, icon_to_default_pal
+            )
+        else:
+            self._item_syms = {}
 
         self._rebuild_list()
         self._detail.clear()
@@ -878,7 +1088,12 @@ class ItemsTabWidget(QWidget):
         const = current.data(Qt.ItemDataRole.UserRole)
         self._current = const
         data = self._items.get(const, {})
-        self._detail.load_item(const, data, icon_path=self._icons.get(const))
+        icon_sym = self._item_syms.get(const, (None, None))[0]
+        self._detail.load_item(
+            const, data,
+            icon_path=self._icons.get(const),
+            icon_sym=icon_sym,
+        )
         self._rename_btn.setEnabled(bool(const))
 
     def _on_changed(self):
@@ -924,3 +1139,37 @@ class ItemsTabWidget(QWidget):
             self._items[self._current] = self._detail.collect(
                 self._items[self._current]
             )
+            # Track icon changes for writing back to item_icon_table.h
+            new_sym = self._detail.get_selected_icon_sym()
+            if new_sym:
+                orig = self._item_syms.get(self._current, (None, None))
+                if new_sym != orig[0]:
+                    pal = self._detail.get_default_palette(new_sym)
+                    self._icon_dirty[self._current] = (new_sym, pal)
+                    # Update internal tracking
+                    self._item_syms[self._current] = (new_sym, pal)
+                    # Refresh the icon in the list sidebar
+                    png = getattr(self._detail, "_sym_to_png", {}).get(new_sym, "")
+                    if png:
+                        self._icons[self._current] = png
+                        self._icon_cache.pop(self._current, None)
+
+    def save_icon_changes(self) -> bool:
+        """Write any pending icon changes to item_icon_table.h.
+        Returns True if all writes succeeded."""
+        if not self._icon_dirty or not self._project_path:
+            return True
+        self._flush()
+        ok = True
+        for item_const, (icon_sym, pal_sym) in self._icon_dirty.items():
+            if not write_item_icon_entry(
+                self._project_path, item_const, icon_sym, pal_sym
+            ):
+                ok = False
+        if ok:
+            self._icon_dirty.clear()
+        return ok
+
+    def has_icon_changes(self) -> bool:
+        """Return True if there are pending icon changes."""
+        return bool(self._icon_dirty)

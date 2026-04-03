@@ -28,7 +28,7 @@ sys.modules.setdefault("PyQt6", qt_module)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
 sys.modules.setdefault("PyQt6.QtCore", qt_core)
 
-from plugin_abstract.pokemon_data import AbstractPokemonData
+from core.pokemon_data_base import AbstractPokemonData
 
 class DummyData(AbstractPokemonData):
     DATA_FILE = "dummy.json"

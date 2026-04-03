@@ -10,13 +10,16 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QFrame, QGroupBox,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFormLayout, QFrame, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
     QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
     QTabWidget, QVBoxLayout, QWidget,
 )
+
+from ui.game_text_edit import GameTextEdit, inc_to_display, display_to_inc
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +32,28 @@ from ui.constants import (
     STRUCT_FOR_PARTY_TYPE as _STRUCT_FOR_TYPE,
     PARTY_TYPE_FOR_STRUCT as _TYPE_FOR_STRUCT,
 )
+
+# ── No-scroll combo box ──────────────────────────────────────────────────────
+# Dropdown must never change value on mouse wheel unless the popup is open.
+# User scrolls via Chrome Remote Desktop — accidental hover + wheel = data loss.
+
+class _NoScrollCombo(QComboBox):
+    """QComboBox that ignores wheel events when the popup isn't showing."""
+    def wheelEvent(self, event):
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()  # pass to parent for page scrolling
+
+
+class _NoScrollSpin(QSpinBox):
+    """QSpinBox that ignores wheel events unless it has focus."""
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
 
 # ── stylesheets ───────────────────────────────────────────────────────────────
 _LIST_SS = """
@@ -207,10 +232,9 @@ def _replace_party_declaration(text: str, symbol: str, new_code: str) -> str:
     pat = re.compile(rf'static const struct TrainerMon\w+\s+{re.escape(symbol)}\[\]\s*=')
     m = pat.search(text)
     if not m:
-        # Symbol not found — don't blindly append; the file may have the
-        # correct symbol under a different casing due to a stale cache.
-        print(f"Warning: party symbol {symbol} not found in trainer_parties.h; skipping write")
-        return text
+        # Symbol not found — this is a brand new trainer.  Append the
+        # new party declaration at the end of the file.
+        return text.rstrip() + "\n\n" + new_code + "\n"
     try:
         brace_start = text.index('{', m.end())
     except ValueError:
@@ -261,6 +285,550 @@ def _trainer_const_to_party_symbol(const: str) -> str:
     """TRAINER_AQUA_LEADER → AquaLeader  (TitleCase, no TRAINER_ prefix)."""
     stem = const[len("TRAINER_"):] if const.startswith("TRAINER_") else const
     return "".join(p.capitalize() for p in stem.split("_"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rematch table parser / writer  (vs_seeker.c :: sRematches[])
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Progression gates for each position in the sRematches[] trainerIdxs array.
+# Position 0 is the original battle (always available).
+_DEFAULT_TIER_LABELS = [
+    "First Battle",
+    "Rematch 1",
+    "Rematch 2",
+    "Rematch 3",
+    "Rematch 4",
+    "Rematch 5",
+]
+
+_SKIP = "SKIP"  # 0xFFFF marker in the C source
+
+
+def _parse_max_rematch_parties(root: str) -> int:
+    """Read MAX_REMATCH_PARTIES from vs_seeker.c. Returns 6 if not found."""
+    path = os.path.join(root, "src", "vs_seeker.c")
+    if not os.path.isfile(path):
+        return 6
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r'#define\s+MAX_REMATCH_PARTIES\s+(\d+)', line.strip())
+                if m:
+                    return int(m.group(1))
+    except Exception:
+        pass
+    return 6
+
+
+def _parse_tier_gate_flags(root: str) -> list[str]:
+    """Parse the actual tier gate flags from TryGetRematchTrainerIdGivenGameState().
+
+    Returns a list of N flag names where N = MAX_REMATCH_PARTIES.
+    Index 0 is always "" (first battle, no gate).
+    """
+    max_tiers = _parse_max_rematch_parties(root)
+    path = os.path.join(root, "src", "vs_seeker.c")
+    if not os.path.isfile(path):
+        return [""] * max_tiers
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return [""] * max_tiers
+
+    # Find the function DEFINITION (not just any mention in a comment).
+    func_def = re.search(
+        r'void\s+TryGetRematchTrainerIdGivenGameState\s*\([^)]*\)\s*\{',
+        text)
+    if not func_def:
+        return [""] * max_tiers
+    brace = func_def.end() - 1
+    if brace < 0:
+        return [""] * max_tiers
+    # Find matching closing brace (depth counting)
+    depth, end = 0, brace
+    for i in range(brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    func_body = text[brace:end]
+    # Split on case boundaries to avoid cross-case matching
+    flags = [""] * max_tiers
+    cases = re.split(r'(?=\bcase\s+\d+\s*:)', func_body)
+    for block in cases:
+        case_m = re.match(r'case\s+(\d+)\s*:', block)
+        if not case_m:
+            continue
+        idx = int(case_m.group(1))
+        flag_m = re.search(r'FlagGet\((\w+)\)', block)
+        if flag_m and 0 <= idx < max_tiers:
+            flags[idx] = flag_m.group(1)
+    return flags
+
+
+def _flag_to_label(flag: str) -> str:
+    """Convert a flag constant to a readable label.
+
+    FLAG_WORLD_MAP_CELADON_CITY → Celadon City
+    FLAG_SYS_GAME_CLEAR → Game Clear
+    FLAG_GOT_VS_SEEKER → VS Seeker
+    """
+    if not flag:
+        return ""
+    label = flag
+    for prefix in ("FLAG_WORLD_MAP_", "FLAG_SYS_", "FLAG_GOT_", "FLAG_"):
+        if label.startswith(prefix):
+            label = label[len(prefix):]
+            break
+    return label.replace("_", " ").title()
+
+
+def _build_tier_labels(gate_flags: list[str]) -> list[str]:
+    """Build human-readable tier labels from parsed gate flags."""
+    labels = []
+    for i in range(len(gate_flags)):
+        if i == 0:
+            labels.append("First Battle")
+        elif i < len(gate_flags) and gate_flags[i]:
+            labels.append(f"Rematch {i} — {_flag_to_label(gate_flags[i])}")
+        else:
+            labels.append(f"Rematch {i}")
+    return labels
+
+
+def _parse_rematch_table(root: str) -> tuple[list[dict], list[str]]:
+    """Parse vs_seeker.c → list of rematch entries.
+
+    Returns
+    -------
+    entries : list[dict]
+        Each entry: {
+            "trainers": [str, ...]  — up to 6 trainer constants (or "SKIP")
+            "map": str              — e.g. "MAP_ROUTE3"
+        }
+    raw_lines : list[str]
+        The raw lines of vs_seeker.c for write-back.
+    """
+    path = os.path.join(root, "src", "vs_seeker.c")
+    if not os.path.isfile(path):
+        return [], []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            raw_lines = f.readlines()
+    except Exception as exc:
+        log.warning("_parse_rematch_table read: %s", exc)
+        return [], []
+
+    # Read MAX_REMATCH_PARTIES for correct padding
+    max_tiers = _parse_max_rematch_parties(root)
+
+    # Find the sRematches[] array
+    entries: list[dict] = []
+    in_table = False
+    buf = ""
+    for line in raw_lines:
+        stripped = line.strip()
+        if not in_table:
+            if "sRematches[]" in stripped and "=" in stripped:
+                in_table = True
+            continue
+        if stripped == "};":
+            break
+        buf += " " + stripped
+        # Each entry ends with "}," after the MAP() — detect complete entries
+        if "}," in buf and "MAP(" in buf:
+            entry = _parse_rematch_entry(buf)
+            if entry:
+                # Pad trainers list to MAX_REMATCH_PARTIES
+                while len(entry["trainers"]) < max_tiers:
+                    entry["trainers"].append("")
+                entries.append(entry)
+            buf = ""
+
+    return entries, raw_lines
+
+
+def _parse_rematch_entry(text: str) -> Optional[dict]:
+    """Parse one sRematches[] entry like:
+    { {TRAINER_X, TRAINER_X_2, SKIP, TRAINER_X_3}, MAP(MAP_ROUTE3) },
+    """
+    # Extract the inner brace content: { {trainers...}, MAP(...) }
+    m = re.search(r'\{\s*\{([^}]+)\}\s*,\s*MAP\((\w+)\)', text)
+    if not m:
+        return None
+    trainers_raw = m.group(1)
+    map_name = m.group(2)
+    trainers = [t.strip() for t in trainers_raw.split(",") if t.strip()]
+    return {"trainers": trainers, "map": map_name}
+
+
+def _build_rematch_map(entries: list[dict]) -> tuple[dict, dict, set]:
+    """Build rematch lookups from parsed sRematches[] entries.
+
+    Returns:
+        base_map:  {TRAINER_X: {"tiers": [str,...], "map": str, "entry_idx": int}}
+        any_map:   {ANY_TIER_CONST: same info dict}  (reverse lookup from any tier)
+        variants:  set of constants that are rematch variants (tiers[1:]), to hide
+                   from the trainer list since they're accessible via tier dropdown.
+    """
+    base_map: dict[str, dict] = {}
+    any_map: dict[str, dict] = {}
+    variants: set[str] = set()
+    for idx, entry in enumerate(entries):
+        base = entry["trainers"][0]
+        if not base or base == _SKIP:
+            continue
+        info = {
+            "tiers": list(entry["trainers"]),
+            "map": entry["map"],
+            "entry_idx": idx,
+        }
+        base_map[base] = info
+        # Reverse lookup: every non-empty tier constant maps to this info
+        for tier_const in entry["trainers"]:
+            if tier_const and tier_const != _SKIP:
+                any_map[tier_const] = info
+        # Variant set: tiers[1:] are rematch variants to hide from the list
+        for tier_const in entry["trainers"][1:]:
+            if tier_const and tier_const != _SKIP:
+                variants.add(tier_const)
+    return base_map, any_map, variants
+
+
+def _parse_all_flags(root: str) -> list[str]:
+    """Parse all FLAG_* constants from flags.h for the tier gate picker."""
+    path = os.path.join(root, "include", "constants", "flags.h")
+    if not os.path.isfile(path):
+        return []
+    flags: list[str] = []
+    pat = re.compile(r'#define\s+(FLAG_\w+)')
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = pat.match(line)
+                if m:
+                    flags.append(m.group(1))
+    except Exception:
+        pass
+    return flags
+
+
+def _rewrite_vs_seeker_tier_gates(raw_lines: list[str], gate_flags: list[str],
+                                   new_max: int) -> list[str]:
+    """Rewrite vs_seeker.c with updated MAX_REMATCH_PARTIES and tier gate function.
+
+    gate_flags: list of flag names, index 0 = "" (first battle, no gate).
+    new_max: the new MAX_REMATCH_PARTIES value.
+    """
+    out: list[str] = []
+    in_func = False
+    func_depth = 0
+    skipped_func = False
+
+    for line in raw_lines:
+        stripped = line.strip()
+
+        # Replace MAX_REMATCH_PARTIES define
+        if stripped.startswith("#define MAX_REMATCH_PARTIES"):
+            out.append(f"#define MAX_REMATCH_PARTIES {new_max}\n")
+            continue
+
+        # Replace TryGetRematchTrainerIdGivenGameState function body
+        if not in_func and "void TryGetRematchTrainerIdGivenGameState" in stripped and "{" not in stripped:
+            # Signature line — keep it, the { will be on the next line or same line
+            out.append(line)
+            continue
+
+        if not in_func and "void TryGetRematchTrainerIdGivenGameState" in stripped and "{" in stripped:
+            # Signature and opening brace on same line
+            in_func = True
+            func_depth = stripped.count("{") - stripped.count("}")
+            continue
+
+        if not in_func and stripped == "{" and len(out) > 0:
+            prev = out[-1].strip()
+            if "TryGetRematchTrainerIdGivenGameState" in prev:
+                in_func = True
+                func_depth = 1
+                continue
+
+        if in_func:
+            func_depth += stripped.count("{") - stripped.count("}")
+            if func_depth <= 0:
+                # Write replacement function
+                out.append("{\n")
+                out.append("    switch (*rematchIdx_p)\n")
+                out.append("    {\n")
+                for i in range(new_max):
+                    if i == 0:
+                        out.append("     case 0:\n")
+                        out.append("         break;\n")
+                    else:
+                        flag = gate_flags[i] if i < len(gate_flags) else ""
+                        if flag:
+                            out.append(f"     case {i}:\n")
+                            out.append(f"         if (!FlagGet({flag}))\n")
+                            out.append(f"             *rematchIdx_p = GetRematchTrainerIdGivenGameState(trainerIdxs, *rematchIdx_p);\n")
+                            out.append(f"         break;\n")
+                        else:
+                            out.append(f"     case {i}:\n")
+                            out.append(f"         break;\n")
+                out.append("    }\n")
+                out.append("}\n")
+                in_func = False
+                skipped_func = True
+                continue
+            # Skip original function body lines
+            continue
+
+        out.append(line)
+
+    return out
+
+
+def _pad_rematch_entries(entries: list[dict], new_max: int) -> list[dict]:
+    """Pad or trim all rematch entries to the new tier count."""
+    result = []
+    for entry in entries:
+        trainers = list(entry["trainers"])
+        # Trim
+        while len(trainers) > new_max:
+            trainers.pop()
+        # Pad with empty
+        while len(trainers) < new_max:
+            trainers.append("")
+        result.append({"trainers": trainers, "map": entry["map"]})
+    return result
+
+
+def _write_rematch_table(raw_lines: list[str], entries: list[dict]) -> list[str]:
+    """Rebuild vs_seeker.c with an updated sRematches[] table.
+
+    Replaces only the array content between the opening { and closing };
+    Preserves everything else in the file.
+    """
+    out: list[str] = []
+    in_table = False
+    wrote_replacement = False
+
+    for line in raw_lines:
+        stripped = line.strip()
+        if not in_table:
+            out.append(line)
+            if "sRematches[]" in stripped and "=" in stripped:
+                in_table = True
+            continue
+        # We're inside the table — skip all original lines until };
+        if stripped == "};":
+            if not wrote_replacement:
+                for entry in entries:
+                    trainers = entry["trainers"]
+                    # Trim trailing empty/SKIP slots
+                    last = 0
+                    for i in range(len(trainers)):
+                        if trainers[i] and trainers[i] != "":
+                            last = i
+                    trimmed = trainers[:last + 1]
+                    t_str = ", ".join(trimmed)
+                    map_name = entry["map"]
+                    out.append(f"   {{ {{{t_str}}},\n")
+                    out.append(f"      MAP({map_name}) }},\n")
+                wrote_replacement = True
+            out.append(line)  # the closing };
+            in_table = False
+            continue
+        # Skip original table content — we're replacing it
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rematch Settings dialog
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _RematchSettingsDialog(QDialog):
+    """Dialog to edit VS Seeker tier count and gate flags.
+
+    Writes changes to vs_seeker.c: MAX_REMATCH_PARTIES, the switch statement
+    in TryGetRematchTrainerIdGivenGameState, and pads/trims sRematches[].
+    """
+
+    def __init__(self, gate_flags: list[str], all_flags: list[str],
+                 rematch_entries: list[dict], raw_lines: list[str],
+                 project_root: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("VS Seeker Rematch Settings")
+        self.setMinimumWidth(600)
+        self._gate_flags = list(gate_flags)
+        self._all_flags = all_flags
+        self._rematch_entries = rematch_entries
+        self._raw_lines = raw_lines
+        self._project_root = project_root
+        self._tier_rows: list[QComboBox] = []
+        self._build()
+
+    def _build(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # Explanation
+        info = QLabel(
+            "Each rematch tier is gated by a story progression flag. "
+            "When the player uses the VS Seeker, the game checks which flags "
+            "are set and picks the highest available tier for each trainer.\n\n"
+            "Tier 0 is always the first battle (no gate). "
+            "Add more tiers for additional progression stages. "
+            "All changes write directly to vs_seeker.c."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; font-size: 11px; padding: 4px;")
+        layout.addWidget(info)
+
+        # Tier count
+        count_row = QHBoxLayout()
+        count_row.addWidget(QLabel("Number of tiers:"))
+        self._count_spin = _NoScrollSpin()
+        self._count_spin.setRange(2, 20)
+        self._count_spin.setValue(len(self._gate_flags))
+        self._count_spin.setToolTip(
+            "Total number of battle tiers including the first battle.\n"
+            "Vanilla pokefirered has 6. Increase for more progression stages."
+        )
+        self._count_spin.valueChanged.connect(self._on_count_changed)
+        count_row.addWidget(self._count_spin)
+        count_row.addStretch()
+        layout.addLayout(count_row)
+
+        # Tier gate list
+        self._tiers_container = QWidget()
+        self._tiers_layout = QVBoxLayout(self._tiers_container)
+        self._tiers_layout.setSpacing(4)
+        self._tiers_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self._tiers_container)
+        layout.addWidget(scroll, 1)
+
+        self._rebuild_tier_rows()
+
+        # Buttons
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.accepted.connect(self._on_save)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def _rebuild_tier_rows(self):
+        # Clear existing
+        while self._tiers_layout.count() > 0:
+            item = self._tiers_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._tier_rows.clear()
+
+        count = self._count_spin.value()
+        # Ensure gate_flags list matches
+        while len(self._gate_flags) < count:
+            self._gate_flags.append("")
+        while len(self._gate_flags) > count:
+            self._gate_flags.pop()
+
+        for i in range(count):
+            row = QHBoxLayout()
+            if i == 0:
+                label = QLabel(f"Tier 0  (First Battle):")
+                label.setMinimumWidth(180)
+                row.addWidget(label)
+                note = QLabel("No gate — always available")
+                note.setStyleSheet("color: #888;")
+                row.addWidget(note, 1)
+                self._tier_rows.append(None)  # No combo for tier 0
+            else:
+                label = QLabel(f"Tier {i}  gate flag:")
+                label.setMinimumWidth(180)
+                row.addWidget(label)
+                cb = _NoScrollCombo()
+                cb.addItem("(none — always available)", "")
+                for flag in self._all_flags:
+                    cb.addItem(flag, flag)
+                # Set current value
+                current = self._gate_flags[i] if i < len(self._gate_flags) else ""
+                if current:
+                    idx = cb.findData(current)
+                    if idx >= 0:
+                        cb.setCurrentIndex(idx)
+                    else:
+                        cb.setCurrentText(current)
+                row.addWidget(cb, 1)
+                self._tier_rows.append(cb)
+
+            container = QWidget()
+            container.setLayout(row)
+            self._tiers_layout.addWidget(container)
+
+        self._tiers_layout.addStretch()
+
+    def _on_count_changed(self, value: int):
+        self._rebuild_tier_rows()
+
+    def _collect_flags(self) -> list[str]:
+        """Collect the current flag settings from the UI."""
+        flags = []
+        for i, cb in enumerate(self._tier_rows):
+            if i == 0 or cb is None:
+                flags.append("")
+            else:
+                val = cb.currentData()
+                if val is None:
+                    val = cb.currentText().strip()
+                flags.append(val if val else "")
+        return flags
+
+    def _on_save(self):
+        """Write changes to vs_seeker.c."""
+        new_flags = self._collect_flags()
+        new_max = len(new_flags)
+
+        # Step 1: Rewrite the tier gate function and MAX_REMATCH_PARTIES
+        updated_lines = _rewrite_vs_seeker_tier_gates(
+            self._raw_lines, new_flags, new_max)
+
+        # Step 2: Pad/trim all sRematches[] entries to new tier count
+        padded_entries = _pad_rematch_entries(self._rematch_entries, new_max)
+
+        # Step 3: Rewrite the sRematches[] table
+        final_lines = _write_rematch_table(updated_lines, padded_entries)
+
+        # Step 4: Write to disk
+        path = os.path.join(self._project_root, "src", "vs_seeker.c")
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.writelines(final_lines)
+            log.info("Rematch settings saved: %d tiers → %s", new_max, path)
+            QMessageBox.information(
+                self, "Saved",
+                f"VS Seeker rematch settings saved to vs_seeker.c.\n\n"
+                f"Tiers: {new_max}\n"
+                f"Entries: {len(padded_entries)}\n\n"
+                f"You may need to rebuild the ROM for changes to take effect."
+            )
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Save Error",
+                f"Failed to write vs_seeker.c:\n{exc}")
+
+    def get_updated_flags(self) -> list[str]:
+        return self._collect_flags()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -361,7 +929,7 @@ class _PartySlotWidget(QWidget):
         self._sprite_lbl.setStyleSheet("background: #111; border-radius: 2px;")
         hdr.addWidget(self._sprite_lbl)
 
-        self._species_cb = QComboBox()
+        self._species_cb = _NoScrollCombo()
         self._species_cb.setEditable(True)
         self._species_cb.setMinimumWidth(140)
         self._species_cb.setMaximumWidth(220)
@@ -373,17 +941,17 @@ class _PartySlotWidget(QWidget):
 
         hdr.addSpacing(8)
         hdr.addWidget(QLabel("Lv"))
-        self._lvl_spin = QSpinBox()
+        self._lvl_spin = _NoScrollSpin()
         self._lvl_spin.setRange(1, 100)
-        self._lvl_spin.setFixedWidth(60)
+        self._lvl_spin.setMinimumWidth(75)
         self._lvl_spin.valueChanged.connect(lambda: self.changed.emit())
         hdr.addWidget(self._lvl_spin)
 
         hdr.addSpacing(8)
         hdr.addWidget(QLabel("IV"))
-        self._iv_spin = QSpinBox()
+        self._iv_spin = _NoScrollSpin()
         self._iv_spin.setRange(0, 255)
-        self._iv_spin.setFixedWidth(60)
+        self._iv_spin.setMinimumWidth(75)
         self._iv_spin.setToolTip("0 = no IVs, 255 = all IVs perfect (all stats share one value)")
         self._iv_spin.valueChanged.connect(lambda: self.changed.emit())
         hdr.addWidget(self._iv_spin)
@@ -402,7 +970,7 @@ class _PartySlotWidget(QWidget):
         item_row = QHBoxLayout()
         item_row.setSpacing(5)
         item_row.addWidget(QLabel("Held Item:"))
-        self._item_cb = QComboBox()
+        self._item_cb = _NoScrollCombo()
         self._item_cb.setEditable(True)
         self._item_cb.setMinimumWidth(180)
         self._item_cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -426,7 +994,7 @@ class _PartySlotWidget(QWidget):
             for col_i in range(2):
                 slot_num = row_i * 2 + col_i + 1
                 row_layout.addWidget(QLabel(f"Move {slot_num}:"))
-                cb = QComboBox()
+                cb = _NoScrollCombo()
                 cb.setEditable(True)
                 cb.setMinimumWidth(160)
                 cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -527,6 +1095,9 @@ class _PartySlotWidget(QWidget):
 class _TrainerDetailPanel(QWidget):
     changed          = pyqtSignal()
     rename_requested = pyqtSignal(str)   # emits current const
+    setup_battle_requested = pyqtSignal()  # emitted when "Set up battle" button clicked
+    edit_tier_gates_requested = pyqtSignal()  # open rematch settings dialog
+    _loading         = False  # True while populating fields — suppresses changed signal
 
     def __init__(
         self,
@@ -537,6 +1108,12 @@ class _TrainerDetailPanel(QWidget):
         items_list: list,
         moves_list: list,
         species_icon_fn=None,
+        project_root: str = "",
+        rematch_map: Optional[dict] = None,
+        all_trainers: Optional[dict] = None,
+        all_parties: Optional[dict] = None,
+        tier_labels: Optional[list] = None,
+        gate_flags: Optional[list] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -547,33 +1124,41 @@ class _TrainerDetailPanel(QWidget):
         self._items_list         = items_list
         self._moves_list         = moves_list
         self._species_icon_fn    = species_icon_fn   # Callable[[str], QIcon] | None
+        self._project_root       = project_root
         self._current_const: Optional[str] = None
         self._has_female_flag: bool = False
         self._party_slots: list[_PartySlotWidget] = []
+        self._dialogue_labels: dict = {}   # {map_name: {type: (label, text)}}
+        self._rematch_map_data   = rematch_map or {}
+        self._all_trainers_data  = all_trainers or {}
+        self._all_parties_data   = all_parties or {}
+        self._tier_labels        = tier_labels or _DEFAULT_TIER_LABELS
+        self._gate_flags         = gate_flags or [""] * 6
         self._build()
 
     # ── build ─────────────────────────────────────────────────────────────────
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 8, 12, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(8, 4, 8, 4)
+        root.setSpacing(4)
 
-        # Header: large sprite + const label + rename button
+        # Header: compact sprite + name + const + rename
         hdr = QHBoxLayout()
-        hdr.setSpacing(12)
+        hdr.setSpacing(8)
 
         self._sprite_lbl = QLabel()
-        self._sprite_lbl.setFixedSize(80, 100)
+        self._sprite_lbl.setFixedSize(64, 64)
         self._sprite_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._sprite_lbl.setStyleSheet(
-            "background: #111; border-radius: 6px; border: 1px solid #333;"
+            "background: #111; border-radius: 4px; border: 1px solid #333;"
         )
         hdr.addWidget(self._sprite_lbl)
 
         info_col = QVBoxLayout()
-        info_col.setSpacing(4)
+        info_col.setSpacing(2)
+        info_col.setContentsMargins(0, 0, 0, 0)
         self._display_lbl = QLabel("—")
-        self._display_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #e0e0e0;")
+        self._display_lbl.setStyleSheet("font-size: 14px; font-weight: bold; color: #e0e0e0;")
         info_col.addWidget(self._display_lbl)
         self._const_lbl = QLabel("")
         self._const_lbl.setStyleSheet(
@@ -581,12 +1166,13 @@ class _TrainerDetailPanel(QWidget):
         )
         info_col.addWidget(self._const_lbl)
         rename_btn = QPushButton("Rename Constant…")
-        rename_btn.setFixedWidth(160)
+        rename_btn.setFixedWidth(140)
+        rename_btn.setFixedHeight(22)
+        rename_btn.setStyleSheet("font-size: 10px;")
         rename_btn.clicked.connect(
             lambda: self.rename_requested.emit(self._current_const or "")
         )
         info_col.addWidget(rename_btn)
-        info_col.addStretch()
         hdr.addLayout(info_col)
         hdr.addStretch()
         root.addLayout(hdr)
@@ -600,6 +1186,7 @@ class _TrainerDetailPanel(QWidget):
         self._tabs.addTab(self._build_ai_tab(),       "AI")
         self._tabs.addTab(self._build_bag_tab(),       "Bag")
         self._tabs.addTab(self._build_party_tab(),     "Party")
+        self._tabs.addTab(self._build_dialogue_tab(),  "Dialogue")
 
     # ── Identity tab ──────────────────────────────────────────────────────────
     def _build_identity_tab(self) -> QWidget:
@@ -617,7 +1204,7 @@ class _TrainerDetailPanel(QWidget):
         self._name_edit.textChanged.connect(self._refresh_header)
         form.addRow("Name:", self._name_edit)
 
-        self._class_cb = QComboBox()
+        self._class_cb = _NoScrollCombo()
         self._class_cb.setEditable(True)
         self._class_cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._class_cb.currentIndexChanged.connect(self._refresh_header)
@@ -625,7 +1212,7 @@ class _TrainerDetailPanel(QWidget):
 
         # Trainer Pic — combo + inline thumbnail
         pic_row = QHBoxLayout()
-        self._pic_cb = QComboBox()
+        self._pic_cb = _NoScrollCombo()
         self._pic_cb.setEditable(True)
         self._pic_cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self._pic_cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -640,7 +1227,7 @@ class _TrainerDetailPanel(QWidget):
         pic_w.setLayout(pic_row)
         form.addRow("Trainer Pic:", pic_w)
 
-        self._music_cb = QComboBox()
+        self._music_cb = _NoScrollCombo()
         for const, label in _ENCOUNTER_MUSIC:
             self._music_cb.addItem(label, const)
         self._music_cb.currentIndexChanged.connect(lambda: self.changed.emit())
@@ -686,7 +1273,7 @@ class _TrainerDetailPanel(QWidget):
         for i in range(4):
             row = QHBoxLayout()
             row.addWidget(QLabel(f"Slot {i + 1}:"))
-            cb = QComboBox()
+            cb = _NoScrollCombo()
             cb.setEditable(True)
             cb.setMinimumWidth(200)
             cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -707,9 +1294,70 @@ class _TrainerDetailPanel(QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
+        # ── Rematch tier selector (hidden for non-rematchable trainers) ──
+        self._tier_frame = QFrame()
+        self._tier_frame.setStyleSheet(
+            "QFrame { background: #1a2a1a; border: 1px solid #2a3a2a; "
+            "border-radius: 4px; padding: 4px; }")
+        self._tier_frame.setToolTip(
+            "VS Seeker rematches let the player re-fight trainers with\n"
+            "progressively stronger teams. Each tier is a separate trainer\n"
+            "entry gated by a story progression flag.\n\n"
+            "Tier gates are defined in vs_seeker.c — the flag names shown\n"
+            "here are read directly from your project's source code.\n\n"
+            "SKIP means no party upgrade at that stage — the game uses\n"
+            "the previous tier's party instead.")
+        tier_layout = QVBoxLayout(self._tier_frame)
+        tier_layout.setContentsMargins(6, 4, 6, 4)
+        tier_layout.setSpacing(4)
+
+        tier_header = QHBoxLayout()
+        title_lbl = QLabel("VS Seeker Rematch Tiers")
+        title_lbl.setStyleSheet("font-weight: bold; color: #aaffaa;")
+        tier_header.addWidget(title_lbl)
+        self._tier_settings_btn = QPushButton("Edit Tier Gates…")
+        self._tier_settings_btn.setFixedHeight(20)
+        self._tier_settings_btn.setStyleSheet("font-size: 10px; padding: 2px 8px;")
+        self._tier_settings_btn.setToolTip(
+            "Edit which story flags gate each rematch tier,\n"
+            "and add or remove tiers.")
+        self._tier_settings_btn.clicked.connect(self._on_edit_tier_gates)
+        tier_header.addWidget(self._tier_settings_btn)
+        self._tier_map_lbl = QLabel("")
+        self._tier_map_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        tier_header.addStretch()
+        tier_header.addWidget(self._tier_map_lbl)
+        tier_layout.addLayout(tier_header)
+
+        tier_info = QLabel(
+            "Each tier is a separate trainer entry with its own party, "
+            "gated by story flags defined in vs_seeker.c. "
+            "Select a tier to view/edit that party. "
+            "SKIP = no upgrade, uses previous tier's party.")
+        tier_info.setStyleSheet("color: #779977; font-size: 10px;")
+        tier_info.setWordWrap(True)
+        tier_layout.addWidget(tier_info)
+
+        tier_row = QHBoxLayout()
+        tier_row.addWidget(QLabel("Battle tier:"))
+        self._tier_combo = _NoScrollCombo()
+        self._tier_combo.currentIndexChanged.connect(self._on_tier_changed)
+        tier_row.addWidget(self._tier_combo, 1)
+        tier_layout.addLayout(tier_row)
+
+        # Tier summary line — shows constant + gate flag for selected tier
+        self._tier_summary_lbl = QLabel("")
+        self._tier_summary_lbl.setStyleSheet("color: #aaa; font-size: 10px;")
+        self._tier_summary_lbl.setWordWrap(True)
+        tier_layout.addWidget(self._tier_summary_lbl)
+
+        self._tier_frame.setVisible(False)
+        layout.addWidget(self._tier_frame)
+
+        # ── Party type selector ──────────────────────────────────────────
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Party type:"))
-        self._party_type_cb = QComboBox()
+        self._party_type_cb = _NoScrollCombo()
         for const, label in _PARTY_TYPES:
             self._party_type_cb.addItem(label, const)
         self._party_type_cb.currentIndexChanged.connect(self._on_party_type_changed)
@@ -739,7 +1387,402 @@ class _TrainerDetailPanel(QWidget):
         self._party_count_lbl.setStyleSheet("color: #777; font-size: 10px;")
         layout.addWidget(self._party_count_lbl)
 
+        # Internal rematch state
+        self._rematch_info: Optional[dict] = None
+        self._rematch_tiers: list[str] = []
+        self._viewing_tier_idx: int = -1  # which tier's party is currently displayed
+
         return w
+
+    # ── Dialogue tab ────────────────────────────────────────────────────────────
+    def _build_dialogue_tab(self) -> QWidget:
+        """Battle dialogue and prize money — reads from/writes to text.inc files."""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # Info label
+        info = QLabel(
+            "Battle dialogue text for this trainer. These are stored in the\n"
+            "map's text.inc file and shown during trainer battles in-game.\n"
+            "Edit the text here — it saves back to the correct text.inc on Save."
+        )
+        info.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(info)
+
+        # Prize money
+        money_row = QHBoxLayout()
+        money_row.addWidget(QLabel("Prize money base:"))
+        self._money_spin = _NoScrollSpin()
+        self._money_spin.setRange(0, 255)
+        self._money_spin.setToolTip(
+            "Base prize money multiplier.\n"
+            "Actual payout = this value × last Pokemon's level."
+        )
+        self._money_spin.valueChanged.connect(lambda: self.changed.emit())
+        money_row.addWidget(self._money_spin)
+        money_row.addStretch()
+        layout.addLayout(money_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(sep)
+
+        # Scroll area for dialogue sections (one per map the trainer appears on)
+        self._dialogue_scroll = QScrollArea()
+        self._dialogue_scroll.setWidgetResizable(True)
+        self._dialogue_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._dialogue_container = QWidget()
+        self._dialogue_layout = QVBoxLayout(self._dialogue_container)
+        self._dialogue_layout.setSpacing(10)
+        self._dialogue_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Placeholder shown when no dialogue is found
+        self._no_dialogue_label = QLabel(
+            "No battle dialogue found for this trainer.\n\n"
+            "Dialogue is created when the trainer is wired to a battle script\n"
+            "on a map via the Event Editor. Use 'Set up battle script' below\n"
+            "to create one, or the text will appear here once the trainer\n"
+            "is placed on a map with a trainerbattle command."
+        )
+        self._no_dialogue_label.setStyleSheet("color: #666; padding: 20px;")
+        self._no_dialogue_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._dialogue_layout.addWidget(self._no_dialogue_label)
+
+        self._dialogue_layout.addStretch()
+        self._dialogue_scroll.setWidget(self._dialogue_container)
+        layout.addWidget(self._dialogue_scroll, 1)
+
+        # "Set up battle script" button
+        self._setup_battle_btn = QPushButton("Set up battle script in Event Editor")
+        self._setup_battle_btn.setToolTip(
+            "Jump to the Event Editor to wire this trainer to an NPC on a map.\n"
+            "Creates a trainerbattle_single command with this trainer's constant."
+        )
+        self._setup_battle_btn.clicked.connect(self.setup_battle_requested.emit)
+        layout.addWidget(self._setup_battle_btn)
+
+        # Dictionary to hold text edit widgets keyed by (map, type)
+        self._dialogue_edits: dict[tuple[str, str], GameTextEdit] = {}
+
+        return w
+
+    def _populate_dialogue_tab(self, trainer_const: str):
+        """Search text.inc files for this trainer's dialogue and display it."""
+        # Clear old dialogue widgets
+        self._dialogue_edits.clear()
+        while self._dialogue_layout.count() > 0:
+            item = self._dialogue_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        self._dialogue_labels = {}
+
+        if not self._project_root or not trainer_const:
+            self._no_dialogue_label = QLabel("No project loaded.")
+            self._dialogue_layout.addWidget(self._no_dialogue_label)
+            self._dialogue_layout.addStretch()
+            return
+
+        # Search maps for trainerbattle commands referencing this trainer
+        maps_dir = os.path.join(self._project_root, "data", "maps")
+        if not os.path.isdir(maps_dir):
+            self._no_dialogue_label = QLabel("Maps directory not found.")
+            self._dialogue_layout.addWidget(self._no_dialogue_label)
+            self._dialogue_layout.addStretch()
+            return
+
+        # Get clean name for label matching
+        clean_name = trainer_const.replace("TRAINER_", "")
+        parts = clean_name.split("_")
+        camel_name = "".join(p.capitalize() for p in parts)
+
+        found_any = False
+
+        for map_name in sorted(os.listdir(maps_dir)):
+            map_dir = os.path.join(maps_dir, map_name)
+            scripts_path = os.path.join(map_dir, "scripts.inc")
+            text_path = os.path.join(map_dir, "text.inc")
+
+            if not os.path.isfile(scripts_path):
+                continue
+
+            try:
+                with open(scripts_path, "r", encoding="utf-8") as f:
+                    scripts_content = f.read()
+            except Exception:
+                continue
+
+            if trainer_const not in scripts_content:
+                continue
+
+            # This map uses this trainer. Load its text.inc.
+            texts = {}
+            if os.path.isfile(text_path):
+                try:
+                    from pathlib import Path
+                    from eventide.backend.eventide_utils import parse_text_inc
+                    texts = dict(parse_text_inc(Path(text_path)))
+                except Exception:
+                    pass
+
+            # Find text labels related to this trainer
+            map_texts = {}
+            for label, content in texts.items():
+                label_lower = label.lower()
+                camel_lower = camel_name.lower()
+                if camel_lower not in label_lower:
+                    continue
+                if "intro" in label_lower:
+                    map_texts["intro"] = (label, content)
+                elif "defeat" in label_lower:
+                    map_texts["defeat"] = (label, content)
+                elif "postbattle" in label_lower or "post" in label_lower:
+                    map_texts["post"] = (label, content)
+
+            if not map_texts:
+                # Trainer referenced in scripts but no matching text labels found.
+                # Try to find text labels from the trainerbattle command arguments.
+                map_texts = self._extract_dialogue_from_script(
+                    scripts_content, trainer_const, texts)
+
+            if map_texts:
+                found_any = True
+                self._dialogue_labels[map_name] = map_texts
+                self._add_dialogue_group(map_name, map_texts, text_path)
+
+        if not found_any:
+            self._no_dialogue_label = QLabel(
+                "No battle dialogue found for this trainer.\n\n"
+                "This trainer hasn't been placed on any map yet,\n"
+                "or the text labels don't follow the standard naming pattern.\n"
+                "Dialogue will appear here once the trainer has a\n"
+                "trainerbattle command on a map."
+            )
+            self._no_dialogue_label.setStyleSheet("color: #666; padding: 20px;")
+            self._no_dialogue_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._dialogue_layout.addWidget(self._no_dialogue_label)
+
+        self._dialogue_layout.addStretch()
+
+    def _extract_dialogue_from_script(self, scripts_content: str,
+                                       trainer_const: str,
+                                       texts: dict) -> dict:
+        """Parse trainerbattle command args to find text label references."""
+        result = {}
+        for line in scripts_content.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("trainerbattle") or trainer_const not in stripped:
+                continue
+
+            # Parse: trainerbattle_single TRAINER_X, IntroLabel, DefeatLabel [, ContinueLabel]
+            # or:    trainerbattle_no_intro TRAINER_X, DefeatLabel
+            parts_after_cmd = stripped.split(None, 1)
+            if len(parts_after_cmd) < 2:
+                continue
+            cmd = parts_after_cmd[0]
+            args = [a.strip() for a in parts_after_cmd[1].split(",")]
+
+            if "no_intro" in cmd and len(args) >= 2:
+                defeat_label = args[1]
+                if defeat_label in texts:
+                    result["defeat"] = (defeat_label, texts[defeat_label])
+            elif len(args) >= 3:
+                intro_label = args[1]
+                defeat_label = args[2]
+                if intro_label in texts:
+                    result["intro"] = (intro_label, texts[intro_label])
+                if defeat_label in texts:
+                    result["defeat"] = (defeat_label, texts[defeat_label])
+            break
+
+        return result
+
+    def _add_dialogue_group(self, map_name: str, map_texts: dict, text_path: str):
+        """Add a group box for one map's dialogue to the dialogue tab."""
+        group = QGroupBox(f"Map: {map_name}")
+        group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        group_layout = QVBoxLayout(group)
+        group_layout.setSpacing(6)
+
+        # Store text_path so we can write back on save
+        group.setProperty("text_path", text_path)
+
+        type_labels = {
+            "intro": "Intro (before battle):",
+            "defeat": "Defeat (trainer loses):",
+            "post": "Post-battle (talk after winning):",
+        }
+
+        # Max lines — generous limit; GBA trainer text can be longer
+        # than expected (Sabrina has 9+ display lines with page breaks)
+        type_max_lines = {
+            "intro": 20,
+            "defeat": 20,
+            "post": 20,
+        }
+
+        for text_type in ("intro", "defeat", "post"):
+            if text_type not in map_texts:
+                continue
+
+            label_name, content = map_texts[text_type]
+
+            header = QHBoxLayout()
+            header.addWidget(QLabel(type_labels.get(text_type, text_type)))
+            label_tag = QLabel(f"[{label_name}]")
+            label_tag.setStyleSheet("color: #777; font-size: 10px;")
+            header.addWidget(label_tag)
+            header.addStretch()
+            group_layout.addLayout(header)
+
+            edit = GameTextEdit(
+                max_chars_per_line=36,
+                max_lines=type_max_lines.get(text_type, 8),
+            )
+            edit.set_inc_text(content or "")
+            edit.setMaximumHeight(100)
+            edit.setPlaceholderText(f"(empty {text_type} text)")
+            edit.connectChanged(lambda: self.changed.emit())
+            group_layout.addWidget(edit)
+
+            # Track this edit widget so we can collect the text on save
+            self._dialogue_edits[(map_name, text_type)] = edit
+
+        self._dialogue_layout.addWidget(group)
+
+    def collect_dialogue(self) -> dict:
+        """Collect edited dialogue text. Returns {(map, type): (label, new_text)}."""
+        result = {}
+        for (map_name, text_type), edit in self._dialogue_edits.items():
+            if map_name in self._dialogue_labels:
+                map_texts = self._dialogue_labels[map_name]
+                if text_type in map_texts:
+                    label_name = map_texts[text_type][0]
+                    result[(map_name, text_type)] = (label_name, edit.get_inc_text())
+        return result
+
+    # ── Rematch tier support (integrated into Party tab) ────────────────────
+
+    def _populate_party_rematch_info(self, trainer_const: str):
+        """Update the tier dropdown in the Party tab for this trainer."""
+        rematch_map = getattr(self, '_rematch_map_data', {})
+        info = rematch_map.get(trainer_const)
+        self._rematch_info = info
+
+        has_rematches = info is not None
+        self._tier_frame.setVisible(has_rematches)
+
+        if not has_rematches:
+            self._rematch_tiers = []
+            self._viewing_tier_idx = -1
+            return
+
+        tiers = info["tiers"]
+        self._rematch_tiers = tiers
+        map_name = info["map"].replace("MAP_", "").replace("_", " ").title()
+        self._tier_map_lbl.setText(f"Map: {map_name}")
+
+        # Populate tier dropdown with summaries
+        self._tier_combo.blockSignals(True)
+        self._tier_combo.clear()
+        all_trainers = getattr(self, '_all_trainers_data', {})
+        all_parties = getattr(self, '_all_parties_data', {})
+        for i, const in enumerate(tiers):
+            tier_name = self._tier_labels[i] if i < len(self._tier_labels) else f"Tier {i}"
+            if not const or const == _SKIP or const == "":
+                self._tier_combo.addItem(f"{tier_name}  —  (same as previous tier)", i)
+            else:
+                summary = self._tier_party_summary(const, all_trainers, all_parties)
+                self._tier_combo.addItem(f"{tier_name}  —  {summary}", i)
+        self._tier_combo.setCurrentIndex(0)
+        self._tier_combo.blockSignals(False)
+        self._viewing_tier_idx = 0
+        self._update_tier_summary(0)
+
+    def _tier_party_summary(self, trainer_const: str,
+                            all_trainers: dict, all_parties: dict) -> str:
+        """Build a compact party summary string like 'Raticate L48, Arbok L48'."""
+        trainer = all_trainers.get(trainer_const, {})
+        party_macro = trainer.get("party", "")
+        party_sym = _extract_party_symbol(party_macro)
+        party = all_parties.get(party_sym) if party_sym else None
+        if not party:
+            return "(no party data)"
+        members = party.get("members", [])
+        if not members:
+            return "(empty party)"
+        parts = []
+        for m in members:
+            species = m.get("species", "???").replace("SPECIES_", "")
+            species = species.replace("_", " ").title()
+            lvl = m.get("lvl", "?")
+            parts.append(f"{species} L{lvl}")
+        return ", ".join(parts)
+
+    def _update_tier_summary(self, index: int):
+        """Update the summary label below the tier dropdown."""
+        if not self._rematch_tiers or index < 0 or index >= len(self._rematch_tiers):
+            self._tier_summary_lbl.setText("")
+            return
+        const = self._rematch_tiers[index]
+        gate = self._tier_labels[index] if index < len(self._tier_labels) else "?"
+        flag = self._gate_flags[index] if index < len(self._gate_flags) else ""
+        if not const or const == _SKIP or const == "":
+            self._tier_summary_lbl.setText(
+                f"SKIP — no party upgrade at this stage. Uses the previous tier's party."
+                + (f"  (Gate: {flag})" if flag else ""))
+        else:
+            self._tier_summary_lbl.setText(
+                f"{const}  ·  Gate: {gate}"
+                + (f"  ({flag})" if flag else ""))
+
+    def _on_tier_changed(self, index: int):
+        """Switch the party display to show the selected rematch tier's party."""
+        if self._loading:
+            return
+        if not self._rematch_tiers or index < 0 or index >= len(self._rematch_tiers):
+            return
+
+        self._update_tier_summary(index)
+        const = self._rematch_tiers[index]
+
+        if not const or const == _SKIP or const == "":
+            # Empty tier — clear party display
+            self._clear_party_slots()
+            self._update_party_count()
+            self._viewing_tier_idx = index
+            return
+
+        # Load the tier trainer's party into the party slots
+        all_trainers = getattr(self, '_all_trainers_data', {})
+        all_parties = getattr(self, '_all_parties_data', {})
+        trainer = all_trainers.get(const, {})
+        party_sym = _extract_party_symbol(trainer.get("party", ""))
+        party = all_parties.get(party_sym) if party_sym else None
+
+        self._clear_party_slots()
+        ptype = "NO_ITEM_DEFAULT_MOVES"
+        for macro_key in _STRUCT_FOR_TYPE:
+            if macro_key in trainer.get("party", ""):
+                ptype = macro_key
+                break
+        idx = self._party_type_cb.findData(ptype)
+        self._party_type_cb.blockSignals(True)
+        self._party_type_cb.setCurrentIndex(idx if idx >= 0 else 0)
+        self._party_type_cb.blockSignals(False)
+
+        if party:
+            for member in party.get("members", []):
+                self._add_slot_with_data(ptype, member)
+        self._update_party_count()
+        self._viewing_tier_idx = index
+
+    def _on_edit_tier_gates(self):
+        """Open the rematch settings dialog."""
+        self.edit_tier_gates_requested.emit()
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _populate_class_combo(self):
@@ -786,11 +1829,13 @@ class _TrainerDetailPanel(QWidget):
                                    Qt.AspectRatioMode.KeepAspectRatio,
                                    Qt.TransformationMode.SmoothTransformation)
                     )
-                    self.changed.emit()
+                    if not self._loading:
+                        self.changed.emit()
                     return
         self._sprite_lbl.clear()
         self._sprite_lbl.setText("?")
-        self.changed.emit()
+        if not self._loading:
+            self.changed.emit()
 
     def _load_sprite(self, pic_const: str):
         if pic_const and pic_const in self._pic_map:
@@ -852,6 +1897,7 @@ class _TrainerDetailPanel(QWidget):
     # ── public API ────────────────────────────────────────────────────────────
     def load(self, const: str, trainer: dict, party: Optional[dict]):
         """Populate all panel fields from trainer dict + optional party dict."""
+        self._loading = True
         self._current_const = const
         self._const_lbl.setText(const)
 
@@ -944,6 +1990,24 @@ class _TrainerDetailPanel(QWidget):
                 self._add_slot_with_data(ptype, member)
         self._update_party_count()
 
+        # Dialogue tab — search text.inc files for this trainer's battle text
+        self._populate_dialogue_tab(const)
+
+        # Rematch tiers — populate tier dropdown in Party tab
+        self._populate_party_rematch_info(const)
+
+        # Prize money — stored in trainer class definitions (not per-trainer in firered)
+        # For now, just show the setting default; per-trainer money comes with Phase 3
+        try:
+            from PyQt6.QtCore import QSettings as _QS
+            from app_info import get_settings_path as _gsp
+            _s = _QS(_gsp(), _QS.Format.IniFormat)
+            self._money_spin.setValue(
+                _s.value("trainer_defaults/money_multiplier", 20, type=int))
+        except Exception:
+            self._money_spin.setValue(20)
+        self._loading = False
+
     def _add_slot_with_data(self, ptype: str, member: dict):
         slot = _PartySlotWidget(self._species_list, self._items_list, self._moves_list,
                                 icon_fn=self._species_icon_fn, parent=self)
@@ -990,6 +2054,128 @@ class _TrainerDetailPanel(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Add Trainer dialog
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _AddTrainerDialog(QDialog):
+    """Dialog for creating a new trainer — pick a class, enter a name.
+
+    The class dropdown shows all available trainer classes sorted by
+    display name.  When the user picks a class and enters a name, the
+    caller uses the class's template trainer (the blank-named entry for
+    that class) to pre-fill encounter music, trainer pic, AI flags, etc.
+    """
+
+    def __init__(
+        self,
+        class_names: dict[str, str],
+        existing_trainers: dict,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Add Trainer")
+        self.setMinimumWidth(400)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # Trainer class dropdown
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._class_cb = _NoScrollCombo()
+        self._class_cb.setEditable(False)
+        self._class_cb.setMaxVisibleItems(20)
+        # Sort by display name, show "DISPLAY NAME  (CONSTANT)"
+        sorted_classes = sorted(class_names.items(), key=lambda kv: kv[1])
+        for const, display in sorted_classes:
+            self._class_cb.addItem(f"{display}  ({const})", const)
+        form.addRow("Class:", self._class_cb)
+
+        # Trainer name field
+        self._name_edit = QLineEdit()
+        self._name_edit.setPlaceholderText("e.g. BOB, LISA, MARCOS")
+        self._name_edit.setMaxLength(10)  # GBA trainer names max ~10 chars
+        form.addRow("Name:", self._name_edit)
+
+        # Preview of the constant that will be created
+        self._preview_lbl = QLabel()
+        self._preview_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        form.addRow("Constant:", self._preview_lbl)
+
+        layout.addLayout(form)
+
+        # Info text
+        info = QLabel(
+            "The new trainer will inherit the default encounter music,\n"
+            "trainer pic, and AI flags from the class template.\n"
+            "You can change everything after creation."
+        )
+        info.setStyleSheet("color: #666; font-size: 10px;")
+        layout.addWidget(info)
+
+        # Buttons
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        self._ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self._ok_btn.setEnabled(False)
+        layout.addWidget(buttons)
+
+        # Wire up preview updates
+        self._class_cb.currentIndexChanged.connect(self._update_preview)
+        self._name_edit.textChanged.connect(self._update_preview)
+        self._existing = existing_trainers
+        self._update_preview()
+
+    def _update_preview(self):
+        cls_const = self._class_cb.currentData()
+        name = self._name_edit.text().strip().upper().replace(" ", "_")
+        if cls_const and name:
+            cls_suffix = cls_const.replace("TRAINER_CLASS_", "")
+            const = f"TRAINER_{cls_suffix}_{name}"
+            if const in self._existing:
+                self._preview_lbl.setText(
+                    f'<span style="color:#e57373">{const} (already exists!)</span>'
+                )
+                self._ok_btn.setEnabled(False)
+            else:
+                self._preview_lbl.setText(const)
+                self._ok_btn.setEnabled(True)
+        else:
+            self._preview_lbl.setText("(enter a name)")
+            self._ok_btn.setEnabled(False)
+
+    def _validate_and_accept(self):
+        name = self._name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Name Required", "Please enter a trainer name.")
+            return
+        cls_const = self._class_cb.currentData()
+        if not cls_const:
+            QMessageBox.warning(self, "Class Required", "Please select a trainer class.")
+            return
+        # Check for duplicate one more time
+        cls_suffix = cls_const.replace("TRAINER_CLASS_", "")
+        const = f"TRAINER_{cls_suffix}_{name.upper().replace(' ', '_')}"
+        if const in self._existing:
+            QMessageBox.warning(self, "Duplicate", f"{const} already exists.")
+            return
+        self.accept()
+
+    def selected_class(self) -> str:
+        """Return the selected TRAINER_CLASS_* constant."""
+        return self._class_cb.currentData() or ""
+
+    def trainer_name(self) -> str:
+        """Return the entered name (stripped)."""
+        return self._name_edit.text().strip()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main tab widget
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -998,6 +2184,8 @@ class TrainersTabWidget(QWidget):
 
     changed          = pyqtSignal()
     rename_requested = pyqtSignal(str)   # old_const → mainwindow drives RefactorService
+    # Phase 3: jump to Event Editor with this trainer pre-selected
+    setup_battle_requested = pyqtSignal(str)  # trainer constant
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1115,6 +2303,15 @@ class TrainersTabWidget(QWidget):
         self._parties     = _parse_trainer_parties(project_root)
         self._order       = self._load_trainer_order(project_root)
 
+        # Parse VS Seeker rematch table and tier gate flags
+        rematch_entries, self._rematch_raw_lines = _parse_rematch_table(project_root)
+        self._rematch_entries = rematch_entries
+        self._rematch_base_map, self._rematch_any_map, self._rematch_variants = \
+            _build_rematch_map(rematch_entries)
+        gate_flags = _parse_tier_gate_flags(project_root)
+        self._gate_flags = gate_flags
+        tier_labels = _build_tier_labels(gate_flags)
+
         # Reset current selection — the old panel is being replaced, so
         # _flush_current must not collect stale data from the new empty panel.
         self._current_const = None
@@ -1128,10 +2325,18 @@ class TrainersTabWidget(QWidget):
             self._items_list,
             self._moves_list,
             species_icon_fn=species_icon_fn,
+            project_root=project_root,
+            rematch_map=self._rematch_any_map,
+            all_trainers=self._trainers,
+            all_parties=self._parties,
+            tier_labels=tier_labels,
+            gate_flags=gate_flags,
             parent=self,
         )
         self._detail_panel.changed.connect(lambda: self.changed.emit())
         self._detail_panel.rename_requested.connect(self.rename_requested.emit)
+        self._detail_panel.setup_battle_requested.connect(self._on_setup_battle)
+        self._detail_panel.edit_tier_gates_requested.connect(self._on_edit_tier_gates)
         self._detail_scroll.setWidget(self._detail_panel)
 
         self._rebuild_list()
@@ -1149,6 +2354,48 @@ class TrainersTabWidget(QWidget):
 
     def clear_pending_party_writes(self):
         self._pending_party_writes.clear()
+
+    def save_dialogue_edits(self) -> bool:
+        """Write edited dialogue text back to the correct text.inc files.
+
+        Returns True if any files were modified.
+        """
+        if not self._detail_panel:
+            return False
+
+        dialogue_data = self._detail_panel.collect_dialogue()
+        if not dialogue_data:
+            return False
+
+        # Group edits by text.inc file path
+        from collections import defaultdict as _dd
+        edits_by_file: dict[str, dict[str, str]] = _dd(dict)
+
+        for (map_name, text_type), (label, new_text) in dialogue_data.items():
+            text_path = os.path.join(
+                self._project_root, "data", "maps", map_name, "text.inc")
+            edits_by_file[text_path][label] = new_text
+
+        modified = False
+        for text_path, label_updates in edits_by_file.items():
+            if not os.path.isfile(text_path):
+                continue
+            try:
+                from pathlib import Path
+                from eventide.backend.eventide_utils import parse_text_inc, write_text_inc
+                texts = parse_text_inc(Path(text_path))
+                changed = False
+                for label, new_text in label_updates.items():
+                    if label in texts and texts[label] != new_text:
+                        texts[label] = new_text
+                        changed = True
+                if changed:
+                    write_text_inc(texts, Path(text_path))
+                    modified = True
+            except Exception as exc:
+                log.warning("save_dialogue_edits write %s: %s", text_path, exc)
+
+        return modified
 
     def show_script_warnings(self, const: str):
         """Scan script files for references to const and display warning."""
@@ -1211,8 +2458,13 @@ class TrainersTabWidget(QWidget):
         self._list.clear()
 
         groups: dict[str, list[str]] = defaultdict(list)
+        rematch_variants = getattr(self, '_rematch_variants', set())
         for const in self._order:
             if const not in self._trainers or const == "TRAINER_NONE":
+                continue
+            # Hide rematch variant constants — they're accessible via
+            # the tier dropdown in the base trainer's Party tab
+            if const in rematch_variants:
                 continue
             display = self._display_name(const)
             if needle_lc and needle_lc not in display.lower() and needle_lc not in const.lower():
@@ -1285,32 +2537,46 @@ class TrainersTabWidget(QWidget):
                 )
 
     def _add_trainer(self):
-        const, ok = QInputDialog.getText(
-            self, "Add Trainer",
-            "Trainer constant name (TRAINER_ prefix will be added if missing):",
+        """Open the Add Trainer dialog — pick a class, enter a name, get defaults."""
+        dlg = _AddTrainerDialog(
+            self._class_names,
+            self._trainers,
+            parent=self,
         )
-        if not ok or not const.strip():
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        const = const.strip().upper()
-        if not const.startswith("TRAINER_"):
-            const = "TRAINER_" + const
+
+        cls_const = dlg.selected_class()
+        name = dlg.trainer_name()
+
+        if not cls_const or not name:
+            return
+
+        # Build the constant: TRAINER_HIKER_BOB
+        cls_suffix = cls_const.replace("TRAINER_CLASS_", "")
+        name_upper = name.strip().upper().replace(" ", "_")
+        const = f"TRAINER_{cls_suffix}_{name_upper}"
+
         if const in self._trainers:
             QMessageBox.warning(self, "Duplicate", f"{const} already exists.")
             return
 
-        next_id    = self._next_trainer_id()
-        party_sym  = f"sParty_{_trainer_const_to_party_symbol(const)}"
-        first_cls  = next(iter(self._class_names.keys()), "")
-        first_pic  = next(iter(self._pic_map.keys()), "")
+        # Find a template trainer for this class (empty-name entry with matching class)
+        template = self._find_class_template(cls_const)
+
+        next_id = self._next_trainer_id()
+        party_sym = f"sParty_{_trainer_const_to_party_symbol(const)}"
 
         self._trainers[const] = {
-            "trainerClass":          first_cls,
-            "encounterMusic_gender": "TRAINER_ENCOUNTER_MUSIC_MALE",
-            "trainerPic":            first_pic,
-            "trainerName":           '_("")',
-            "items":                 "{}",
-            "doubleBattle":          "FALSE",
-            "aiFlags":               "AI_SCRIPT_CHECK_BAD_MOVE",
+            "trainerClass":          cls_const,
+            "encounterMusic_gender": template.get("encounterMusic_gender",
+                                                   "TRAINER_ENCOUNTER_MUSIC_MALE"),
+            "trainerPic":            template.get("trainerPic",
+                                                   next(iter(self._pic_map.keys()), "")),
+            "trainerName":           f'_("{name.upper()}")',
+            "items":                 template.get("items", "{}"),
+            "doubleBattle":          template.get("doubleBattle", "FALSE"),
+            "aiFlags":               template.get("aiFlags", "AI_SCRIPT_CHECK_BAD_MOVE"),
             "party":                 f"NO_ITEM_DEFAULT_MOVES({party_sym})",
         }
         self._parties[party_sym] = {"type": "NO_ITEM_DEFAULT_MOVES", "members": []}
@@ -1326,12 +2592,82 @@ class TrainersTabWidget(QWidget):
                 self._list.setCurrentRow(i)
                 break
 
+        # Auto-add #define to opponents.h
+        define_ok = self._add_trainer_define(const, next_id)
+
         self.changed.emit()
-        self._show_warn(
-            f"✚ {const} created (ID {next_id}). "
-            f"You must manually add  #define {const}  {next_id}  to "
-            f"include/constants/opponents.h before building."
-        )
+        if define_ok:
+            self._show_warn(
+                f"✚ {const} created (ID {next_id}). "
+                f"Added #define to opponents.h automatically."
+            )
+        else:
+            self._show_warn(
+                f"✚ {const} created (ID {next_id}). "
+                f"Could not write opponents.h — you must manually add  "
+                f"#define {const}  {next_id}  to "
+                f"include/constants/opponents.h before building."
+            )
+
+    def _find_class_template(self, cls_const: str) -> dict:
+        """Find a template trainer for a class to copy defaults from.
+
+        Priority:
+        1. A blank-named entry for that class (the unused RS_ templates)
+        2. Any existing trainer of that class (they all share the same
+           encounter music, trainer pic, etc. within a class)
+        3. Empty dict — caller uses hardcoded defaults
+        """
+        first_match = None
+        for const, data in self._trainers.items():
+            if data.get("trainerClass") != cls_const:
+                continue
+            name = data.get("trainerName", "")
+            # Prefer blank-named template: _("") or _('')
+            if name in ('_("")', "_('')", ''):
+                return data
+            # Remember the first named trainer as fallback
+            if first_match is None:
+                first_match = data
+        return first_match or {}
+
+    def _add_trainer_define(self, const: str, trainer_id: int) -> bool:
+        """Append a #define for the new trainer to opponents.h.
+        Returns True on success, False if the file couldn't be written.
+        Checks for duplicates — won't write if the constant already exists."""
+        path = os.path.join(self._project_root, "include", "constants", "opponents.h")
+        if not os.path.isfile(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            # Check if this constant already exists — don't write a duplicate
+            if re.search(r'#define\s+' + re.escape(const) + r'\s', content):
+                return True  # already there, nothing to do
+            # Find the last #define TRAINER_* line and insert after it
+            lines = content.splitlines(keepends=True)
+            last_define_idx = -1
+            for i, line in enumerate(lines):
+                if line.strip().startswith("#define TRAINER_"):
+                    last_define_idx = i
+            if last_define_idx < 0:
+                return False
+            # Insert new #define right after the last one
+            new_line = f"#define {const:<40s} {trainer_id}\n"
+            lines.insert(last_define_idx + 1, new_line)
+            # Update NUM_TRAINERS to reflect the new count
+            num_pat = re.compile(r'(#define\s+NUM_TRAINERS\s+)\d+')
+            for i, line in enumerate(lines):
+                m = num_pat.match(line)
+                if m:
+                    lines[i] = f"{m.group(1)}{trainer_id + 1}\n"
+                    break
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.writelines(lines)
+            return True
+        except Exception as exc:
+            log.warning("_add_trainer_define: %s", exc)
+            return False
 
     def _next_trainer_id(self) -> int:
         path = os.path.join(self._project_root, "include", "constants", "opponents.h")
@@ -1349,6 +2685,48 @@ class TrainersTabWidget(QWidget):
             except Exception:
                 pass
         return max_id + 1
+
+    def _on_setup_battle(self):
+        """Emit signal to jump to Event Editor with this trainer pre-selected."""
+        if self._current_const:
+            self.setup_battle_requested.emit(self._current_const)
+
+    def _on_edit_tier_gates(self):
+        """Open the rematch tier settings dialog."""
+        all_flags = _parse_all_flags(self._project_root)
+        dlg = _RematchSettingsDialog(
+            gate_flags=list(getattr(self, '_gate_flags', [""] * 6)),
+            all_flags=all_flags,
+            rematch_entries=list(self._rematch_entries),
+            raw_lines=list(self._rematch_raw_lines),
+            project_root=self._project_root,
+            parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Reload everything — the file changed on disk
+            self._reload_after_rematch_edit()
+
+    def _reload_after_rematch_edit(self):
+        """Reload rematch data after the settings dialog saved changes."""
+        rematch_entries, self._rematch_raw_lines = _parse_rematch_table(self._project_root)
+        self._rematch_entries = rematch_entries
+        self._rematch_base_map, self._rematch_any_map, self._rematch_variants = \
+            _build_rematch_map(rematch_entries)
+        gate_flags = _parse_tier_gate_flags(self._project_root)
+        self._gate_flags = gate_flags
+        tier_labels = _build_tier_labels(gate_flags)
+
+        # Update the detail panel's data refs
+        if self._detail_panel:
+            self._detail_panel._rematch_map_data = self._rematch_any_map
+            self._detail_panel._tier_labels = tier_labels
+            self._detail_panel._gate_flags = gate_flags
+            # Re-populate the tier dropdown for the current trainer
+            if self._current_const:
+                self._detail_panel._populate_party_rematch_info(self._current_const)
+
+        # Rebuild the trainer list to reflect any changes in variant filtering
+        self._rebuild_list()
 
     def _show_warn(self, msg: str):
         self._warn_lbl.setText(msg)

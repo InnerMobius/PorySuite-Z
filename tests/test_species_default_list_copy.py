@@ -19,7 +19,7 @@ sys.modules.setdefault("PyQt6", qt_module)
 sys.modules.setdefault("PyQt6.QtCore", qt_core)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
 
-import plugins.pokefirered.pokemon_data_extractor as pde
+import core.pokemon_data_extractor as pde
 
 class DummyDex:
     def __init__(self, project_info, data_file):

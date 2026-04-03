@@ -1,0 +1,1608 @@
+"""
+Unified Main Window for PorySuite-Z
+
+Single window containing all PorySuite (data editing) and EVENTide (map/script
+editing) editors, accessible via an RPG Maker XP-style icon toolbar.
+
+Phase 1: shell only — existing editors are hosted as-is in a QStackedWidget.
+No shared data layer yet; each side loads independently from disk.
+"""
+
+import os
+import sys
+
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QSettings
+from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence
+from PyQt6.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QStackedWidget,
+    QToolBar,
+    QToolButton,
+    QSplitter,
+    QTextEdit,
+    QLabel,
+    QMessageBox,
+    QStatusBar,
+    QButtonGroup,
+    QSizePolicy,
+    QFrame,
+)
+
+from app_info import get_settings_path
+from suppress_dialog import maybe_exec
+from porymap_bridge.porymap_launcher import (
+    is_porymap_installed, launch_porymap, inject_bridge_script,
+)
+from porymap_bridge.bridge_watcher import BridgeWatcher
+from porymap_bridge.shared_file_watcher import SharedFileWatcher
+
+
+# ─── Icon path helper ────────────────────────────────────────────────────────
+
+def _icon(name: str) -> QIcon:
+    """Return a QIcon for a toolbar placeholder icon."""
+    path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "res", "icons", "toolbar", f"{name}.png")
+    if os.path.isfile(path):
+        return QIcon(path)
+    return QIcon()
+
+
+# ─── Toolbar separator helper ────────────────────────────────────────────────
+
+def _add_separator(toolbar: QToolBar):
+    """Add a thin vertical separator line to the toolbar."""
+    sep = QFrame()
+    sep.setFrameShape(QFrame.Shape.VLine)
+    sep.setFrameShadow(QFrame.Shadow.Sunken)
+    sep.setFixedWidth(2)
+    sep.setFixedHeight(28)
+    toolbar.addWidget(sep)
+
+
+class UnifiedMainWindow(QMainWindow):
+    """Single window containing all PorySuite + EVENTide editors."""
+
+    # Signals (kept for compatibility with App cross-launch wiring)
+    open_in_eventide_signal = pyqtSignal(dict)
+    open_in_porysuite_signal = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("PorySuite-Z[*]")
+        self.resize(1400, 900)
+        self.project_info = None
+
+        # ── Internal references to child windows ─────────────────────────────
+        self._porysuite_window = None   # The original MainWindow (used as a widget)
+        self._eventide_window = None    # The original EventideMainWindow (used as a widget)
+
+        # ── Porymap bridge ──────────────────────────────────────────────────
+        self._bridge_watcher = None     # BridgeWatcher instance (created on project load)
+        self._shared_file_watcher = None  # SharedFileWatcher (created on project load)
+
+        # ── Central layout: splitter with stacked content + log panel ────────
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        root_layout.addWidget(splitter)
+
+        # ── Stacked widget: one page per editor section ──────────────────────
+        self.stack = QStackedWidget()
+        splitter.addWidget(self.stack)
+
+        # ── Log panel ────────────────────────────────────────────────────────
+        self.log_panel = QTextEdit()
+        self.log_panel.setReadOnly(True)
+        self.log_panel.setMaximumHeight(160)
+        self.log_panel.setFont(QFont("Courier New", 9))
+        self.log_panel.setPlaceholderText("Log output will appear here...")
+        splitter.addWidget(self.log_panel)
+
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 1)
+
+        # ── Page index tracking ──────────────────────────────────────────────
+        # Maps page name -> stack index.  Filled by _setup_pages().
+        self._page_indices: dict[str, int] = {}
+        self._page_buttons: dict[str, QToolButton] = {}
+
+        # ── Build toolbar and menus ──────────────────────────────────────────
+        self._build_toolbar()
+        self._build_menus()
+
+        # ── Status bar ───────────────────────────────────────────────────────
+        self._git_bar_label = QLabel("")
+        self._git_bar_label.setObjectName("git_status_bar")
+        self._git_bar_label.setStyleSheet(
+            "#git_status_bar { color: #888; margin-right: 8px; }")
+        self._git_bar_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._git_bar_label.mousePressEvent = lambda _e: self._open_git_panel()
+        self.statusBar().addPermanentWidget(self._git_bar_label)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Toolbar
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _build_toolbar(self):
+        tb = QToolBar("Main Toolbar")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(32, 32))
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        tb.setStyleSheet("""
+            QToolBar { spacing: 4px; padding: 4px; }
+            QToolButton { padding: 4px; border-radius: 4px; }
+            QToolButton:hover { background: palette(midlight); }
+            QToolButton:checked { background: palette(highlight);
+                                  color: palette(highlighted-text); }
+        """)
+        self.addToolBar(tb)
+        self._toolbar = tb
+
+        # ── Action buttons (Save, Make, Make Modern) ─────────────────────────
+        self._save_action = QAction(_icon("save"), "Save All", self)
+        self._save_action.setShortcut("Ctrl+S")
+        self._save_action.setToolTip("Save all changes (Ctrl+S)")
+        self._save_action.triggered.connect(lambda _checked=False: self._on_save_all())
+        tb.addAction(self._save_action)
+
+        self._make_action = QAction(_icon("make"), "Make", self)
+        self._make_action.setShortcut("Ctrl+M")
+        self._make_action.setToolTip("Build ROM with 'make' (Ctrl+M)")
+        self._make_action.triggered.connect(lambda: self._on_make([]))
+        tb.addAction(self._make_action)
+
+        self._make_modern_action = QAction(_icon("make_modern"), "Make Modern", self)
+        self._make_modern_action.setShortcut("Ctrl+Shift+M")
+        self._make_modern_action.setToolTip("Build ROM with 'make modern' (Ctrl+Shift+M)")
+        self._make_modern_action.triggered.connect(lambda: self._on_make(["MODERN=1"]))
+        tb.addAction(self._make_modern_action)
+
+        _add_separator(tb)
+
+        # ── PorySuite data editor pages ──────────────────────────────────────
+        self._page_button_group = QButtonGroup(self)
+        self._page_button_group.setExclusive(True)
+
+        porysuite_pages = [
+            ("pokemon",  "Pokemon"),
+            ("pokedex",  "Pokedex"),
+            ("moves",    "Moves"),
+            ("items",    "Items"),
+            ("trainers", "Trainers"),
+            ("starters", "Starters"),
+            ("credits",  "Credits"),
+        ]
+        for icon_name, tooltip in porysuite_pages:
+            btn = self._make_page_button(icon_name, tooltip)
+            tb.addWidget(btn)
+
+        _add_separator(tb)
+
+        # ── EVENTide map/script editor pages ─────────────────────────────────
+        eventide_pages = [
+            ("events",    "Event Editor"),
+            ("maps",      "Maps"),
+            ("layouts",   "Layouts & Tilesets"),
+            ("regionmap", "Region Map"),
+            ("labels",    "Label Manager"),
+        ]
+        for icon_name, tooltip in eventide_pages:
+            btn = self._make_page_button(icon_name, tooltip)
+            tb.addWidget(btn)
+
+        _add_separator(tb)
+
+        # ── Settings pages ───────────────────────────────────────────────────
+        settings_pages = [
+            ("ui",       "UI Settings"),
+            ("config",   "Config"),
+        ]
+        for icon_name, tooltip in settings_pages:
+            btn = self._make_page_button(icon_name, tooltip)
+            tb.addWidget(btn)
+
+        _add_separator(tb)
+
+        # ── Play button (last in line) ──────────────────────────────────────
+        self._play_action = QAction(_icon("play"), "Play", self)
+        self._play_action.setShortcut("F9")
+        self._play_action.setToolTip("Launch ROM in emulator (F9)")
+        self._play_action.triggered.connect(self._on_play)
+        tb.addAction(self._play_action)
+
+    def _make_page_button(self, icon_name: str, tooltip: str) -> QToolButton:
+        """Create a checkable toolbar button that switches the stacked widget."""
+        btn = QToolButton()
+        btn.setIcon(_icon(icon_name))
+        btn.setToolTip(tooltip)
+        btn.setCheckable(True)
+        btn.setIconSize(QSize(32, 32))
+        btn.setFixedSize(40, 40)
+        self._page_button_group.addButton(btn)
+        self._page_buttons[icon_name] = btn
+        btn.clicked.connect(lambda checked, name=icon_name: self._switch_page(name))
+        return btn
+
+    def _switch_page(self, name: str):
+        """Switch the stacked widget to the page identified by name."""
+        idx = self._page_indices.get(name, -1)
+        if idx >= 0:
+            self.stack.setCurrentIndex(idx)
+            # Lazy loading is handled by _on_stack_page_changed
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Menu bar
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _build_menus(self):
+        menubar = self.menuBar()
+
+        # ── File ─────────────────────────────────────────────────────────────
+        file_menu = menubar.addMenu("&File")
+
+        open_action = QAction("&Open Project...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self._open_project_dialog)
+        file_menu.addAction(open_action)
+
+        self._recent_menu = file_menu.addMenu("Recent Projects")
+
+        file_menu.addSeparator()
+
+        save_action = QAction("Save All", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(lambda _checked=False: self._on_save_all())
+        file_menu.addAction(save_action)
+
+        file_menu.addSeparator()
+
+        refresh_action = QAction("Refresh", self)
+        refresh_action.setShortcut("F5")
+        refresh_action.setToolTip(
+            "Reload all data from disk — PorySuite data, EVENTide scripts, "
+            "sprite caches, everything. Use this after saving to verify changes persisted.")
+        refresh_action.triggered.connect(self._refresh_project)
+        file_menu.addAction(refresh_action)
+
+        file_menu.addSeparator()
+
+        open_folder_action = QAction("Open Project Folder", self)
+        open_folder_action.triggered.connect(self._open_project_folder)
+        file_menu.addAction(open_folder_action)
+
+        file_menu.addSeparator()
+
+        quit_action = QAction("Quit", self)
+        quit_action.setShortcut("Ctrl+Q")
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        # ── Edit ─────────────────────────────────────────────────────────────
+        edit_menu = menubar.addMenu("&Edit")
+
+        rename_action = QAction("Rename Entity...", self)
+        rename_action.triggered.connect(self._rename_entity)
+        edit_menu.addAction(rename_action)
+
+        # ── View ─────────────────────────────────────────────────────────────
+        view_menu = menubar.addMenu("&View")
+
+        # Data editors
+        for icon_name, label in [
+            ("pokemon", "Pokemon"), ("pokedex", "Pokedex"), ("moves", "Moves"),
+            ("items", "Items"), ("trainers", "Trainers"), ("starters", "Starters"),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
+            view_menu.addAction(act)
+
+        view_menu.addSeparator()
+
+        # Map/script editors
+        for icon_name, label in [
+            ("events", "Event Editor"), ("maps", "Maps"),
+            ("layouts", "Layouts && Tilesets"), ("regionmap", "Region Map"),
+            ("labels", "Label Manager"),
+        ]:
+            act = QAction(label, self)
+            act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
+            view_menu.addAction(act)
+
+        view_menu.addSeparator()
+
+        # Settings/config
+        for icon_name, label in [("ui", "UI Settings"), ("config", "Config")]:
+            act = QAction(label, self)
+            act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
+            view_menu.addAction(act)
+
+        view_menu.addSeparator()
+
+        self._toggle_log_action = QAction("Toggle Log Panel", self)
+        self._toggle_log_action.triggered.connect(self._toggle_log_panel)
+        view_menu.addAction(self._toggle_log_action)
+
+        # ── Tools ────────────────────────────────────────────────────────────
+        tools_menu = menubar.addMenu("&Tools")
+
+        make_action = QAction("Make", self)
+        make_action.setShortcut("Ctrl+M")
+        make_action.triggered.connect(lambda: self._on_make([]))
+        tools_menu.addAction(make_action)
+
+        make_modern_action = QAction("Make Modern", self)
+        make_modern_action.setShortcut("Ctrl+Shift+M")
+        make_modern_action.triggered.connect(lambda: self._on_make(["MODERN=1"]))
+        tools_menu.addAction(make_modern_action)
+
+        play_action = QAction("Play", self)
+        play_action.setShortcut("F9")
+        play_action.triggered.connect(self._on_play)
+        tools_menu.addAction(play_action)
+
+        tools_menu.addSeparator()
+
+        open_terminal_action = QAction("Open Terminal", self)
+        open_terminal_action.setShortcut("Ctrl+T")
+        open_terminal_action.triggered.connect(self._open_terminal)
+        tools_menu.addAction(open_terminal_action)
+
+        tools_menu.addSeparator()
+
+        settings_action = QAction("Settings...", self)
+        settings_action.triggered.connect(self._open_settings)
+        tools_menu.addAction(settings_action)
+
+        tools_menu.addSeparator()
+
+        # ── Porymap integration ──────────────────────────────────────────────
+        self._install_porymap_action = QAction("Install Porymap...", self)
+        self._install_porymap_action.triggered.connect(self._install_porymap)
+        tools_menu.addAction(self._install_porymap_action)
+
+        self._open_porymap_action = QAction("Open in Porymap", self)
+        self._open_porymap_action.setShortcut("Ctrl+F7")
+        self._open_porymap_action.triggered.connect(self._open_in_porymap)
+        self._open_porymap_action.setEnabled(is_porymap_installed())
+        if not is_porymap_installed():
+            self._open_porymap_action.setToolTip("Install Porymap first (Tools → Install Porymap)")
+        tools_menu.addAction(self._open_porymap_action)
+
+        # ── Git ──────────────────────────────────────────────────────────────
+        self._git_menu = menubar.addMenu("&Git")
+
+        self._git_panel_action = QAction("Git Panel...", self)
+        self._git_panel_action.setShortcut("Ctrl+Shift+G")
+        self._git_panel_action.setToolTip(
+            "Open the Git panel — pull, push, commit, branches, stash, history,\n"
+            "and remote configuration, all in one window with full descriptions."
+        )
+        self._git_panel_action.setEnabled(False)
+        self._git_panel_action.triggered.connect(self._open_git_panel)
+        self._git_menu.addAction(self._git_panel_action)
+
+        self._git_menu.addSeparator()
+
+        self._pull_upstream_action = QAction("Pull from Upstream", self)
+        self._pull_upstream_action.setShortcut("Ctrl+Shift+L")
+        self._pull_upstream_action.setEnabled(False)
+        self._pull_upstream_action.triggered.connect(
+            lambda: self._git_pull(use_upstream=True))
+        self._git_menu.addAction(self._pull_upstream_action)
+
+        self._pull_origin_action = QAction("Pull from origin", self)
+        self._pull_origin_action.setEnabled(False)
+        self._pull_origin_action.triggered.connect(self._git_pull)
+        self._git_menu.addAction(self._pull_origin_action)
+
+        self._push_action = QAction("Push to origin", self)
+        self._push_action.setShortcut("Ctrl+Shift+U")
+        self._push_action.setEnabled(False)
+        self._push_action.triggered.connect(self._git_push)
+        self._git_menu.addAction(self._push_action)
+
+        self._git_commit_action = QAction("Commit...", self)
+        self._git_commit_action.setShortcut("Ctrl+Shift+K")
+        self._git_commit_action.setEnabled(False)
+        self._git_commit_action.triggered.connect(self._git_commit)
+        self._git_menu.addAction(self._git_commit_action)
+
+        # Stubs for _git_set_all_enabled compatibility
+        self._git_configure_action = QAction("", self)
+        self._git_status_action = QAction("", self)
+        self._git_new_branch_action = QAction("", self)
+        self._git_stash_action = QAction("", self)
+        self._git_pop_stash_action = QAction("", self)
+        self._git_log_action = QAction("", self)
+        from PyQt6.QtWidgets import QMenu
+        self._pull_menu = QMenu("", self)
+
+        # ── Help ─────────────────────────────────────────────────────────────
+        help_menu = menubar.addMenu("&Help")
+
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Page setup — called after both child windows are created
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def setup_pages(self, porysuite_main, eventide_main):
+        """
+        Extract editor widgets from the existing PorySuite and EVENTide windows
+        and add them as pages in our stacked widget.
+
+        This is called from app.py after both windows have been created and
+        their data has been loaded.
+        """
+        self._porysuite_window = porysuite_main
+        self._eventide_window = eventide_main
+
+        # ── PorySuite pages ──────────────────────────────────────────────────
+        # The PorySuite MainWindow has a tab widget (self.ui.mainTabs) with
+        # several tabs.  We pull each tab's widget out and add it as a page.
+
+        ps_ui = porysuite_main.ui
+
+        # Map: our page name -> (tab widget reference, original tab label)
+        porysuite_tabs = [
+            ("pokemon",  ps_ui.tab_pokemon),
+            ("pokedex",  ps_ui.tab_pokedex),
+            ("items",    ps_ui.tab_items),
+            ("starters", ps_ui.tab_starters),
+            ("trainers", ps_ui.tab_trainers),
+            ("ui",       ps_ui.tab_ui),
+            ("config",   ps_ui.tab_config),
+        ]
+
+        # The Moves tab was dynamically added by MainWindow.__init__
+        if hasattr(ps_ui, 'moves_widget'):
+            porysuite_tabs.insert(2, ("moves", ps_ui.moves_widget))
+
+        for name, widget in porysuite_tabs:
+            idx = self.stack.addWidget(widget)
+            self._page_indices[name] = idx
+
+        # ── Credits editor (standalone page) ─────────────────────────────────
+        from credits_editor import CreditsEditorWidget
+        self._credits_editor = CreditsEditorWidget()
+        idx = self.stack.addWidget(self._credits_editor)
+        self._page_indices["credits"] = idx
+
+        # ── EVENTide pages ───────────────────────────────────────────────────
+        eventide_tabs = [
+            ("events",    eventide_main.event_editor_tab),
+            ("maps",      eventide_main.maps_tab),
+            ("layouts",   eventide_main.layouts_tab),
+            ("regionmap", eventide_main.region_map_tab),
+        ]
+
+        for name, widget in eventide_tabs:
+            idx = self.stack.addWidget(widget)
+            self._page_indices[name] = idx
+
+        # ── Label Manager (standalone page) ─────────────────────────────────
+        from label_manager import LabelManagerWidget
+        self._label_manager = LabelManagerWidget()
+        idx = self.stack.addWidget(self._label_manager)
+        self._page_indices["labels"] = idx
+
+        # ── Disconnect PorySuite's own tab-change handler ────────────────────
+        # Pages have been reparented out of mainTabs, so PorySuite's
+        # on_main_tab_changed would fire spuriously and set dirty flags.
+        try:
+            ps_ui.mainTabs.currentChanged.disconnect(
+                porysuite_main.on_main_tab_changed)
+        except (TypeError, RuntimeError):
+            pass  # already disconnected or never connected
+
+        # ── Wrap PorySuite's internal navigation handlers with dirty suppression.
+        # These methods populate UI fields which trigger widget signals connected
+        # to setWindowModified(True), but they aren't real user edits.
+        # Because Qt signals hold direct references to the original methods,
+        # setattr wrappers don't intercept signal-triggered calls.  Instead we
+        # install suppression directly on the signal connections.
+        porysuite_main._ps_suppress_dirty = False
+
+        # Pokemon sub-tab switches — disconnect ALL slots, reconnect wrapped.
+        # PyQt6 bound-method identity can prevent targeted disconnect, so
+        # we disconnect everything and re-wire with suppression wrappers.
+        try:
+            ps_ui.tab_pokemon_data.currentChanged.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        def _wrapped_pokemon_tab_changed(index):
+            porysuite_main._ps_suppress_dirty = True
+            try:
+                porysuite_main.on_pokemon_tab_changed(index)
+                porysuite_main.refresh_current_species(index)
+            finally:
+                porysuite_main._ps_suppress_dirty = False
+        ps_ui.tab_pokemon_data.currentChanged.connect(_wrapped_pokemon_tab_changed)
+
+        # Species tree selection changes
+        try:
+            ps_ui.tree_pokemon.itemSelectionChanged.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        def _wrapped_species_changed():
+            porysuite_main._ps_suppress_dirty = True
+            try:
+                porysuite_main.update_tree_pokemon()
+            finally:
+                porysuite_main._ps_suppress_dirty = False
+        ps_ui.tree_pokemon.itemSelectionChanged.connect(_wrapped_species_changed)
+
+        # ── Wire stacked widget page changes to PorySuite's save/load logic ──
+        self._current_page_name = "pokemon"
+        self.stack.currentChanged.connect(self._on_stack_page_changed)
+
+        # ── Default to the Pokemon page ──────────────────────────────────────
+        if "pokemon" in self._page_indices:
+            self.stack.setCurrentIndex(self._page_indices["pokemon"])
+            btn = self._page_buttons.get("pokemon")
+            if btn:
+                btn.setChecked(True)
+
+        # ── Shared data layer ────────────────────────────────────────────────
+        from shared_data import ProjectData
+        self.project_data = ProjectData(
+            porysuite_main.project_info or {}, parent=self)
+        if porysuite_main.source_data:
+            self.project_data.attach_source_data(porysuite_main.source_data)
+        try:
+            from eventide.backend.constants_manager import ConstantsManager
+            self.project_data.attach_constants_manager(ConstantsManager)
+        except Exception:
+            pass
+        self.project_data.attach_event_editor(eventide_main.event_editor_tab)
+
+        # ── Wire change signals: PorySuite → EVENTide ────────────────────────
+        # When trainers are saved in PorySuite, tell EVENTide to refresh its
+        # trainer dropdown so the new trainer shows up immediately.
+        self.project_data.trainers_changed.connect(
+            self._refresh_eventide_constants)
+        self.project_data.items_changed.connect(
+            self._refresh_eventide_constants)
+        self.project_data.species_changed.connect(
+            self._refresh_eventide_constants)
+
+        # ── Populate Event Editor display names ─────────────────────────────
+        self._update_event_editor_display_names()
+
+        # Wire label manager changes to refresh display names
+        if hasattr(self, '_label_manager'):
+            self._label_manager.labels_changed.connect(
+                self._update_event_editor_display_names)
+
+        # ── Phase 3: Cross-editor navigation ────────────────────────────────
+        # Trainer tab → Event Editor ("Set up battle script")
+        if hasattr(porysuite_main, 'trainers_editor'):
+            porysuite_main.trainers_editor.setup_battle_requested.connect(
+                self._on_jump_to_event_editor)
+        # Event Editor → Trainer tab (right-click "Edit Trainer Party")
+        eventide_main.event_editor_tab.jump_to_trainer.connect(
+            self._on_jump_to_trainer)
+        # Event Editor → Items tab (right-click "Edit Item")
+        eventide_main.event_editor_tab.jump_to_item.connect(
+            self._on_jump_to_item)
+        # Event Editor → Label Manager (right-click "Edit Label")
+        eventide_main.event_editor_tab.jump_to_label.connect(
+            self._on_jump_to_label)
+        # Maps tab → Event Editor (double-click a map to open it)
+        eventide_main.maps_tab.map_selected.connect(
+            self._on_map_selected)
+
+        # ── Connect dirty tracking from both windows ─────────────────────────
+        # _suppress_dirty blocks dirty propagation during flush/load operations
+        # that save in-memory state but aren't genuine user edits.
+        self._suppress_dirty = False
+
+        # When either child marks itself as modified, we reflect it here.
+        porysuite_main.windowModified = self._on_child_modified
+        # For EVENTide, listen to its data_changed signals
+        eventide_main.event_editor_tab.data_changed.connect(
+            lambda: self.setWindowModified(True) if not self._suppress_dirty else None)
+
+        # ── Connect PorySuite's log signal to our log panel ──────────────────
+        porysuite_main.logSignal.connect(self.log_message)
+
+        # ── Forward PorySuite dirty tracking ─────────────────────────────────
+        # Override PorySuite's setWindowModified to also update ours.
+        _original_set_modified = porysuite_main.setWindowModified
+
+        def _unified_set_modified(modified):
+            if modified and (self._suppress_dirty
+                             or getattr(porysuite_main, '_ps_suppress_dirty', False)):
+                return  # don't mark dirty during flush/load/navigation
+            _original_set_modified(modified)
+            if modified:
+                self.setWindowModified(True)
+
+        porysuite_main.setWindowModified = _unified_set_modified
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Project loading
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def load_data(self, project_info: dict):
+        """Store project info and update window title."""
+        self.project_info = project_info
+        project_name = project_info.get("name", os.path.basename(
+            project_info.get("dir", "")))
+        self.setWindowTitle(f"PorySuite-Z — {project_name}[*]")
+
+        # Enable git actions
+        self._git_set_all_enabled(True)
+
+        # Load credits editor data
+        project_dir = project_info.get("dir", "")
+        if project_dir and hasattr(self, "_credits_editor"):
+            try:
+                self._credits_editor.load_project(project_dir)
+            except Exception:
+                pass
+
+        # Load label manager data
+        if project_dir and hasattr(self, "_label_manager"):
+            try:
+                self._label_manager.load_project(project_dir)
+            except Exception:
+                pass
+
+        # Refresh Event Editor display names (species, items, trainers, etc.)
+        self._update_event_editor_display_names()
+
+        # ── Start Porymap bridge watcher ────────────────────────────────────
+        self._start_bridge_watcher(project_dir)
+
+        # ── Start shared file watcher (detects Porymap saves on disk) ──────
+        self._start_shared_file_watcher(project_dir)
+
+        # Auto-inject bridge script into project's Porymap config
+        if project_dir and is_porymap_installed():
+            try:
+                inject_bridge_script(project_dir)
+            except Exception:
+                pass
+
+        self.setWindowModified(False)
+        self._git_refresh_status_bar()
+        self.log_message(f"Loaded project: {project_name}")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Action handlers
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _on_save_all(self):
+        """Save all dirty editors and emit change signals."""
+        saved_porysuite = False
+        saved_eventide = False
+
+        # Save PorySuite data — always attempt if a project is loaded.
+        # The dirty flag can fall out of sync with suppress-dirty wrappers,
+        # so we rely on update_save()'s own internal checks instead of
+        # gating on isWindowModified().
+        if self._porysuite_window:
+            try:
+                self._porysuite_window.update_save()
+                saved_porysuite = True
+            except Exception as e:
+                self.log_message(f"Error saving PorySuite data: {e}")
+
+        # Save EVENTide data
+        if self._eventide_window and self._eventide_window.isWindowModified():
+            try:
+                self._eventide_window.event_editor_tab._on_save()
+                self._eventide_window.setWindowModified(False)
+                saved_eventide = True
+            except Exception as e:
+                self.log_message(f"Error saving EVENTide data: {e}")
+
+        # Emit change signals so the other side picks up changes
+        if saved_porysuite and hasattr(self, 'project_data'):
+            self.project_data.notify_trainers_changed()
+            self.project_data.notify_items_changed()
+            self.project_data.notify_species_changed()
+            self.project_data.notify_moves_changed()
+
+        if saved_eventide and hasattr(self, 'project_data'):
+            self.project_data.notify_texts_changed()
+            self.project_data.notify_scripts_changed()
+
+        # Save credits editor
+        saved_credits = False
+        if hasattr(self, "_credits_editor") and self._credits_editor.has_unsaved_changes():
+            try:
+                self._credits_editor._on_save()
+                saved_credits = True
+            except Exception as e:
+                self.log_message(f"Error saving credits: {e}")
+
+        # Save label manager
+        saved_labels = False
+        if hasattr(self, "_label_manager") and self._label_manager.has_unsaved_changes():
+            try:
+                self._label_manager._save_labels()
+                saved_labels = True
+            except Exception as e:
+                self.log_message(f"Error saving labels: {e}")
+
+        if saved_porysuite or saved_eventide or saved_credits or saved_labels:
+            self.setWindowModified(False)
+            self.statusBar().showMessage("All changes saved.", 4000)
+        else:
+            self.statusBar().showMessage("Nothing to save.", 2000)
+            self.log_message("[Save] Nothing to save.")
+
+    def _on_make(self, extra_args: list):
+        """Delegate make to PorySuite's existing _run_make method."""
+        if self._porysuite_window:
+            self._porysuite_window._run_make(extra_args)
+        else:
+            self.log_message("Cannot build — no project loaded.")
+
+    def _on_play(self):
+        """Launch the compiled .gba file using the configured emulator or Windows default."""
+        if not self.project_info:
+            QMessageBox.information(self, "Play", "No project is open.")
+            return
+
+        project_dir = self.project_info.get("dir", "")
+
+        # Read settings for which .gba and which emulator
+        settings = QSettings(get_settings_path(), QSettings.Format.IniFormat)
+        gba_name = settings.value("build/gba_file", "pokefirered_modern.gba", type=str)
+        emulator = settings.value("build/emulator_path", "", type=str)
+
+        gba_path = os.path.join(project_dir, gba_name)
+        if not os.path.isfile(gba_path):
+            # Try the other one as fallback
+            fallback = ("pokefirered.gba" if "modern" in gba_name
+                        else "pokefirered_modern.gba")
+            gba_path = os.path.join(project_dir, fallback)
+        if not os.path.isfile(gba_path):
+            QMessageBox.warning(
+                self, "Play",
+                "No .gba file found. Build the ROM first using Make or Make Modern.")
+            return
+
+        try:
+            if emulator and os.path.isfile(emulator):
+                import subprocess
+                subprocess.Popen([emulator, gba_path])
+            else:
+                os.startfile(gba_path)
+            self.log_message(f"Launched: {gba_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Play", f"Could not launch ROM:\n{e}")
+
+    def _switch_to_page(self, name: str):
+        """Switch to a page and update the toolbar button state."""
+        self._switch_page(name)
+        btn = self._page_buttons.get(name)
+        if btn:
+            btn.setChecked(True)
+
+    def _on_stack_page_changed(self, new_index: int):
+        """Handle page switches — flush previous PorySuite page data, lazy-load new page."""
+        # Find which page name we're going to
+        new_name = None
+        for name, idx in self._page_indices.items():
+            if idx == new_index:
+                new_name = name
+                break
+
+        # Flush data from the page we're leaving (PorySuite pages).
+        # Suppress dirty tracking — flushing preserves existing data, it's
+        # not a new edit.
+        old_name = self._current_page_name
+        self._suppress_dirty = True
+        try:
+            self._flush_porysuite_page(old_name)
+        finally:
+            self._suppress_dirty = False
+
+        self._current_page_name = new_name
+        if new_name:
+            self._suppress_dirty = True
+            try:
+                self._trigger_lazy_load(new_name)
+            finally:
+                self._suppress_dirty = False
+
+    def _flush_porysuite_page(self, page_name: str):
+        """Save in-memory data from a PorySuite page before leaving it."""
+        ps = self._porysuite_window
+        if not ps or not ps.source_data:
+            return
+        try:
+            if page_name == "pokemon":
+                # Save current species data
+                if ps.previous_selected_species is not None:
+                    learnset_index = getattr(ps, "learnset_tab_index", ps.moves_tab_index)
+                    if ps.ui.tab_pokemon_data.currentIndex() == learnset_index:
+                        ps.save_species_learnset_table()
+                    ps.save_species_data(
+                        ps.previous_selected_species,
+                        form=ps.previous_selected_form,
+                    )
+            elif page_name == "pokedex":
+                ps._flush_pokedex_panel()
+            elif page_name == "items":
+                ps.save_items_table()
+            elif page_name == "moves":
+                ps.save_moves_defs_table()
+            elif page_name == "trainers":
+                ps._save_trainers_editor()
+            elif page_name == "starters":
+                # Flush starters — same as update_main_tabs for starters
+                for i, prefix in enumerate(["starter1", "starter2", "starter3"]):
+                    species_cb = getattr(ps.ui, f"{prefix}_species", None)
+                    level_sb = getattr(ps.ui, f"{prefix}_level", None)
+                    item_cb = getattr(ps.ui, f"{prefix}_item", None)
+                    move_cb = getattr(ps.ui, f"{prefix}_move", None)
+                    if species_cb:
+                        ps.source_data.set_starter_data(i, "species", species_cb.currentData())
+                    if level_sb:
+                        ps.source_data.set_starter_data(i, "level", level_sb.value())
+                    if item_cb:
+                        ps.source_data.set_starter_data(i, "item", item_cb.currentData())
+                    if move_cb:
+                        ps.source_data.set_starter_data(i, "custom_move", move_cb.currentData())
+        except Exception as e:
+            self.log_message(f"Warning: could not flush {page_name} data: {e}")
+
+    def _trigger_lazy_load(self, page_name: str):
+        """Trigger lazy data loading that PorySuite normally does on tab change."""
+        ps = self._porysuite_window
+        if not ps or not ps.source_data:
+            return
+        if page_name == "items":
+            ps.load_items_table()
+        elif page_name == "trainers":
+            ps._load_trainers_editor()
+        elif page_name == "moves":
+            ps.load_moves_defs_table()
+
+    # ── Phase 3: Cross-editor navigation handlers ─────────────────────────
+
+    def _on_jump_to_event_editor(self, trainer_const: str):
+        """Switch to Event Editor when 'Set up battle script' is clicked."""
+        self._switch_to_page('events')
+        self.log_message(
+            f'Switched to Event Editor. Open a map and add a '
+            f'trainerbattle_single command for {trainer_const}.')
+        self.statusBar().showMessage(
+            f'Add a trainerbattle_single for {trainer_const} to an NPC.', 8000)
+
+    def _on_jump_to_trainer(self, trainer_const: str):
+        """Switch to Trainers tab and select the given trainer."""
+        self._switch_to_page('trainers')
+        ps = self._porysuite_window
+        if ps and hasattr(ps, 'trainers_editor'):
+            editor = ps.trainers_editor
+            # Find and select the trainer in the list
+            for i in range(editor._list.count()):
+                item = editor._list.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole) == trainer_const:
+                    editor._list.setCurrentRow(i)
+                    break
+        self.log_message(f'Jumped to trainer: {trainer_const}')
+
+    def _on_jump_to_item(self, item_const: str):
+        """Switch to Items tab and select the given item."""
+        self._switch_to_page('items')
+        ps = self._porysuite_window
+        if ps:
+            # Try to find and select the item in PorySuite's items table
+            try:
+                table = ps.ui.items_table
+                for row in range(table.rowCount()):
+                    cell = table.item(row, 0)
+                    if cell and cell.text() == item_const:
+                        table.selectRow(row)
+                        table.scrollTo(table.model().index(row, 0))
+                        break
+            except Exception:
+                pass
+        self.log_message(f'Jumped to item: {item_const}')
+
+    def _on_jump_to_label(self, const: str):
+        """Switch to Label Manager and select the given flag/var constant."""
+        self._switch_to_page('labels')
+        if hasattr(self, '_label_manager'):
+            self._label_manager.select_constant(const)
+        self.log_message(f'Jumped to label: {const}')
+
+    def _on_map_selected(self, map_folder: str):
+        """Double-clicking a map in Maps tab opens it in Event Editor."""
+        self._switch_to_page('events')
+        ev = self._eventide_window
+        if ev and hasattr(ev, 'event_editor_tab'):
+            ev.event_editor_tab.open_map_and_select(map_folder)
+        self.log_message(f'Opened map in Event Editor: {map_folder}')
+
+    def _toggle_log_panel(self):
+        """Show or hide the log panel."""
+        self.log_panel.setVisible(not self.log_panel.isVisible())
+
+    def _open_project_dialog(self):
+        """Placeholder — projects are opened from the launcher."""
+        QMessageBox.information(
+            self, "Open Project",
+            "Close this window and use the project selector to open a different project.")
+
+    def _refresh_project(self):
+        """Reload everything from disk — both PorySuite and EVENTide data."""
+        if not self.project_info:
+            return
+
+        # Check for unsaved changes first
+        if self._has_unsaved_changes():
+            from app_util import create_unsaved_changes_dialog
+            ret = create_unsaved_changes_dialog(
+                self,
+                "You have unsaved changes. Refreshing will discard them.\n"
+                "Would you like to save first?")
+            if ret == QMessageBox.StandardButton.Cancel:
+                return
+            if ret == QMessageBox.StandardButton.Save:
+                self._on_save_all()
+
+        # Refresh PorySuite (clears caches, re-parses headers, reloads all editors)
+        if self._porysuite_window:
+            try:
+                self._porysuite_window._refresh_project()
+            except Exception as e:
+                self.log_message(f"PorySuite refresh error: {e}")
+
+        # Refresh EVENTide (reloads all tabs from disk)
+        if self._eventide_window and self._eventide_window.project_info:
+            try:
+                self._eventide_window.load_data(self._eventide_window.project_info)
+            except Exception as e:
+                self.log_message(f"EVENTide refresh error: {e}")
+
+        # Refresh Label Manager
+        project_dir = self.project_info.get("dir", "")
+        if project_dir and hasattr(self, "_label_manager"):
+            try:
+                self._label_manager.load_project(project_dir)
+            except Exception:
+                pass
+
+        self.setWindowModified(False)
+        self.statusBar().showMessage("Everything refreshed from disk.", 4000)
+        self.log_message("Full refresh complete — all data reloaded from disk.")
+
+    def _open_project_folder(self):
+        """Open the project directory in the system file manager."""
+        if self.project_info:
+            import app_util
+            app_util.reveal_directory(self.project_info.get("dir", ""))
+
+    def _rename_entity(self):
+        """Delegate to PorySuite's rename_entity."""
+        if self._porysuite_window:
+            self._porysuite_window.rename_entity()
+
+    def _open_terminal(self):
+        """Open a terminal in the project directory."""
+        if self._porysuite_window:
+            self._porysuite_window.update_action()
+
+    def _open_settings(self):
+        """Open the settings dialog."""
+        from settingsdialog import SettingsDialog
+        dlg = SettingsDialog(self)
+        if dlg.exec():
+            # Reload all event editor settings (colors, tooltips, etc.)
+            if (self._eventide_window
+                    and hasattr(self._eventide_window, 'event_editor_tab')):
+                self._eventide_window.event_editor_tab.reload_settings()
+
+    def _show_about(self):
+        QMessageBox.about(
+            self, "About PorySuite-Z",
+            "PorySuite-Z\n\n"
+            "Unified editor for pokefirered decomp projects.\n"
+            "Combines PorySuite (data editing) and EVENTide (map/script editing)\n"
+            "into a single window.")
+
+    def _refresh_eventide_constants(self):
+        """Reload EVENTide's constants so its dropdowns pick up PorySuite changes."""
+        if not self._eventide_window or not self.project_info:
+            return
+        try:
+            from eventide.backend.constants_manager import ConstantsManager
+            ConstantsManager.load(self.project_info.get("dir", ""))
+            self.log_message("EVENTide constants refreshed (trainers/items/species updated).")
+        except Exception as e:
+            self.log_message(f"Warning: could not refresh EVENTide constants: {e}")
+        # Also refresh display names since constants may have changed
+        self._update_event_editor_display_names()
+
+    def _update_event_editor_display_names(self):
+        """Push display name data into the Event Editor's module-level resolver.
+
+        This lets _stringize() show friendly names (e.g. 'Gym Leader Brock'
+        instead of 'TRAINER_BROCK') and enables color coding by constant type.
+        """
+        try:
+            from eventide.ui.event_editor_tab import _set_display_data
+
+            # Get display name lists from shared data
+            species = []
+            items = []
+            moves = []
+            trainers = {}
+            labels = {}
+
+            if hasattr(self, 'project_data'):
+                species = self.project_data.get_species_list()
+                items = self.project_data.get_items_list()
+                moves = self.project_data.get_moves_list()
+                trainers = self.project_data.get_trainers()
+
+            # Get Label Manager labels
+            if hasattr(self, '_label_manager'):
+                labels = self._label_manager.get_labels()
+
+            _set_display_data(species, items, moves, trainers, labels)
+            self.log_message(
+                f"Display names loaded: {len(species)} species, "
+                f"{len(items)} items, {len(moves)} moves, "
+                f"{len(trainers)} trainers, {len(labels)} labels")
+
+            # Re-render the currently displayed command list so items
+            # already on screen pick up the new friendly names.
+            if (self._eventide_window
+                    and hasattr(self._eventide_window, 'event_editor_tab')):
+                self._eventide_window.event_editor_tab.refresh_display_names()
+        except Exception as e:
+            self.log_message(f"Warning: could not update display names: {e}")
+            import traceback
+            self.log_message(traceback.format_exc())
+
+    def _on_child_modified(self):
+        """Called when a child window reports modifications."""
+        self.setWindowModified(True)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Unsaved changes / close
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _has_unsaved_changes(self) -> bool:
+        """Check if any editor has unsaved changes."""
+        if self._porysuite_window and self._porysuite_window.isWindowModified():
+            return True
+        if self._eventide_window and self._eventide_window.isWindowModified():
+            return True
+        if hasattr(self, "_credits_editor") and self._credits_editor.has_unsaved_changes():
+            return True
+        if hasattr(self, "_label_manager") and self._label_manager.has_unsaved_changes():
+            return True
+        return False
+
+    def closeEvent(self, event):
+        """Prompt to save unsaved changes before closing."""
+        if not self._has_unsaved_changes():
+            event.accept()
+            return
+
+        from app_util import create_unsaved_changes_dialog
+        ret = create_unsaved_changes_dialog(
+            self,
+            "You have unsaved changes. Would you like to save before closing?")
+        if ret == QMessageBox.StandardButton.Save:
+            self._on_save_all()
+            event.accept()
+        elif ret == QMessageBox.StandardButton.Discard:
+            event.accept()
+        else:
+            event.ignore()
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Logging
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def log_message(self, msg: str):
+        """Append a message to the log panel."""
+        self.log_panel.append(msg)
+
+    # Alias so PorySuite code that calls self.log() works when delegated
+    def log(self, msg: str):
+        self.log_panel.append(msg)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Git — delegates to PorySuite or EVENTide's git methods
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _git_exe(self) -> str:
+        """Find git executable."""
+        for c in (
+            r"C:\Program Files\Git\bin\git.exe",
+            r"C:\Program Files (x86)\Git\bin\git.exe",
+        ):
+            if os.path.isfile(c):
+                return c
+        return "git"
+
+    def _git_run(self, *args, timeout: int = 120) -> tuple:
+        """Run a git command in the project directory."""
+        import subprocess
+        cwd = (self.project_info or {}).get("dir", "")
+        _no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            r = subprocess.run(
+                [self._git_exe(), "-C", cwd, *args],
+                capture_output=True, text=True, timeout=timeout,
+                creationflags=_no_win,
+            )
+            out = (r.stdout + r.stderr).strip()
+            return r.returncode == 0, out
+        except FileNotFoundError:
+            return False, "git not found — install Git for Windows."
+        except subprocess.TimeoutExpired:
+            return False, f"git timed out after {timeout}s."
+        except Exception as exc:
+            return False, str(exc)
+
+    def _open_git_panel(self):
+        """Open the Git panel dialog."""
+        from git_panel import GitPanel
+        panel = getattr(self, "_git_panel_instance", None)
+        if panel is None or not panel.isVisible():
+            panel = GitPanel(self)
+            self._git_panel_instance = panel
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
+
+    def _git_set_all_enabled(self, enabled: bool):
+        """Enable/disable all git-related actions."""
+        for name in (
+            "_git_panel_action",
+            "_git_configure_action", "_git_status_action",
+            "_pull_upstream_action", "_pull_origin_action",
+            "_push_action", "_git_commit_action", "_git_new_branch_action",
+            "_git_stash_action", "_git_pop_stash_action", "_git_log_action",
+        ):
+            act = getattr(self, name, None)
+            if act:
+                act.setEnabled(enabled)
+        pm = getattr(self, "_pull_menu", None)
+        if pm:
+            pm.setEnabled(enabled)
+
+    def _git_pull(self, use_upstream: bool = False):
+        """Delegate to the appropriate child window's git pull."""
+        # Use PorySuite's implementation if available (it has the full git UI)
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            def _after_refresh():
+                self._git_refresh_status_bar()
+                # Also refresh EVENTide if pull was done via PorySuite
+                if target is self._porysuite_window and self._eventide_window:
+                    try:
+                        ew = self._eventide_window
+                        if ew.project_info:
+                            ew.load_data(ew.project_info)
+                    except Exception:
+                        pass
+            target._git_pull(use_upstream=use_upstream,
+                             on_refresh_done=_after_refresh)
+
+    def _git_push(self):
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            target._git_push()
+
+    def _git_commit(self):
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            target._git_commit()
+
+    def _git_stash(self):
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            target._git_stash()
+
+    def _git_pop_stash(self):
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            target._git_pop_stash()
+
+    def _git_new_branch(self):
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            target._git_new_branch()
+
+    def _git_checkout_branch(self, branch: str):
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            target._git_checkout_branch(branch)
+
+    def _git_view_log(self):
+        target = self._porysuite_window or self._eventide_window
+        if target:
+            target._git_view_log()
+
+    def _git_refresh_status_bar(self):
+        """Show current branch in the status bar."""
+        if not self.project_info:
+            return
+        ok, branch = self._git_run("branch", "--show-current")
+        if ok and branch:
+            self._git_bar_label.setText(f"  {branch}  ")
+        else:
+            self._git_bar_label.setText("")
+
+    # ── Saved-remotes persistence (needed by GitPanel) ───────────────────────
+
+    def _remotes_file(self) -> str:
+        from app_info import get_data_dir
+        return os.path.join(get_data_dir(), "git_remotes.json")
+
+    def _load_saved_remotes(self) -> list:
+        import json
+        cwd = (self.project_info or {}).get("dir", "")
+        try:
+            with open(self._remotes_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get(cwd, [])
+        except Exception:
+            return []
+
+    def _save_saved_remotes(self, remotes: list) -> None:
+        import json
+        cwd = (self.project_info or {}).get("dir", "")
+        path = self._remotes_file()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data[cwd] = remotes
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def _git_upstream_url(self) -> str:
+        import json
+        cwd = (self.project_info or {}).get("dir", "")
+        try:
+            with open(self._remotes_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("__upstream__", {}).get(
+                cwd, "https://github.com/pret/pokefirered.git")
+        except Exception:
+            return "https://github.com/pret/pokefirered.git"
+
+    def _git_save_upstream_url(self, url: str) -> None:
+        import json
+        cwd = (self.project_info or {}).get("dir", "")
+        path = self._remotes_file()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        if "__upstream__" not in data:
+            data["__upstream__"] = {}
+        data["__upstream__"][cwd] = url
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Porymap integration
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _start_bridge_watcher(self, project_dir: str):
+        """Start (or restart) the Porymap bridge watcher for a project."""
+        # Stop any existing watcher
+        if self._bridge_watcher:
+            self._bridge_watcher.stop()
+            self._bridge_watcher.deleteLater()
+            self._bridge_watcher = None
+
+        if not project_dir:
+            return
+
+        self._bridge_watcher = BridgeWatcher(project_dir, parent=self)
+        self._connect_bridge_signals()
+        self._bridge_watcher.start()
+
+    def _connect_bridge_signals(self):
+        """Connect bridge watcher signals to the appropriate editors."""
+        bw = self._bridge_watcher
+        if not bw:
+            return
+
+        # Map navigation — when Porymap opens a map, switch Event Editor there
+        bw.map_opened.connect(self._on_bridge_map_opened)
+        bw.sync_requested.connect(self._on_bridge_map_opened)
+
+        # Event selection — when user clicks an event in Porymap
+        bw.event_selected.connect(self._on_bridge_event_selected)
+        bw.edit_requested.connect(self._on_bridge_edit_requested)
+
+        # Map data changes — reload when Porymap saves
+        bw.map_saved.connect(self._on_bridge_map_saved)
+
+        # Event lifecycle
+        bw.event_created.connect(self._on_bridge_event_created)
+        bw.event_deleted.connect(self._on_bridge_event_deleted)
+
+    def _on_bridge_map_opened(self, map_name: str, *_args):
+        """Porymap opened a map — navigate Event Editor there."""
+        if not map_name:
+            return
+        # Switch to Event Editor page
+        self._switch_to_page("events")
+        # Navigate the Event Editor to this map
+        ew = self._eventide_window
+        if ew and hasattr(ew, "event_editor_tab"):
+            try:
+                ew.event_editor_tab.navigate_to_map(map_name)
+            except Exception:
+                pass
+        self.log_message(f"Porymap: opened {map_name}")
+
+    def _on_bridge_event_selected(self, map_name: str, event_type: str,
+                                   event_index: int, script_label: str,
+                                   x: int, y: int):
+        """Porymap user clicked an event — select it in our Event Editor."""
+        # Make sure we're on the right map first
+        self._switch_to_page("events")
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "event_editor_tab"):
+            return
+        tab = ew.event_editor_tab
+        try:
+            # Navigate to map if needed
+            tab.navigate_to_map(map_name)
+            # Select the event by type and index
+            tab.select_event_by_bridge(event_type, event_index, script_label)
+        except Exception:
+            pass
+        self.log_message(
+            f"Porymap: selected {event_type} #{event_index} "
+            f"({script_label or 'no script'}) at ({x},{y})")
+
+    def _on_bridge_edit_requested(self, map_name: str, x: int, y: int):
+        """Porymap user pressed Ctrl+E — find event at position and select it."""
+        self._switch_to_page("events")
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "event_editor_tab"):
+            return
+        tab = ew.event_editor_tab
+        try:
+            tab.navigate_to_map(map_name)
+            tab.select_event_at_position(x, y)
+        except Exception:
+            pass
+        self.log_message(f"Porymap: edit request at {map_name} ({x},{y})")
+
+    def _on_bridge_map_saved(self, map_name: str):
+        """Porymap saved a map — reload our data for it."""
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "event_editor_tab"):
+            return
+        try:
+            tab = ew.event_editor_tab
+            # Only reload if we're looking at the same map
+            if hasattr(tab, "_current_map") and tab._current_map == map_name:
+                tab.reload_current_map()
+                self.log_message(f"Porymap saved {map_name} — reloaded")
+        except Exception:
+            pass
+
+    def _on_bridge_event_created(self, map_name: str, event_type: str,
+                                  event_index: int):
+        """Porymap created a new event — reload and select it."""
+        self._on_bridge_map_saved(map_name)
+        self.log_message(
+            f"Porymap: new {event_type} #{event_index} on {map_name}")
+
+    def _on_bridge_event_deleted(self, map_name: str, event_type: str,
+                                  event_index: int):
+        """Porymap deleted an event — reload."""
+        self._on_bridge_map_saved(map_name)
+        self.log_message(
+            f"Porymap: deleted {event_type} #{event_index} from {map_name}")
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Shared file watcher — detects external edits to project files
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _start_shared_file_watcher(self, project_dir: str):
+        """Start (or restart) the shared file watcher for a project."""
+        if self._shared_file_watcher:
+            self._shared_file_watcher.stop()
+            self._shared_file_watcher.deleteLater()
+            self._shared_file_watcher = None
+
+        if not project_dir:
+            return
+
+        self._shared_file_watcher = SharedFileWatcher(project_dir, parent=self)
+
+        # Connect signals
+        sfw = self._shared_file_watcher
+        sfw.map_json_changed.connect(self._on_shared_map_changed)
+        sfw.scripts_changed.connect(self._on_shared_scripts_changed)
+        sfw.layouts_changed.connect(self._on_shared_layouts_changed)
+        sfw.map_groups_changed.connect(self._on_shared_map_groups_changed)
+        sfw.file_changed.connect(
+            lambda rel: self.log_message(f"External change detected: {rel}"))
+
+        sfw.start()
+
+    def _on_shared_map_changed(self, map_folder: str):
+        """A map's map.json was modified externally (likely by Porymap)."""
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "event_editor_tab"):
+            return
+        tab = ew.event_editor_tab
+        # Only auto-reload if we're looking at the changed map
+        if hasattr(tab, "_current_map") and tab._current_map == map_folder:
+            try:
+                tab.reload_current_map()
+                self.log_message(
+                    f"Reloaded {map_folder} (map.json changed externally)")
+            except Exception:
+                pass
+
+    def _on_shared_scripts_changed(self, map_folder: str):
+        """A map's scripts.inc was modified externally."""
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "event_editor_tab"):
+            return
+        tab = ew.event_editor_tab
+        if hasattr(tab, "_current_map") and tab._current_map == map_folder:
+            try:
+                tab.reload_current_map()
+                self.log_message(
+                    f"Reloaded {map_folder} (scripts.inc changed externally)")
+            except Exception:
+                pass
+
+    def _on_shared_layouts_changed(self):
+        """layouts.json was modified externally — refresh the Layouts tab."""
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "layouts_tab"):
+            return
+        try:
+            if self.project_info:
+                ew.layouts_tab.load_project(self.project_info)
+                self.log_message("Reloaded layouts (layouts.json changed externally)")
+        except Exception:
+            pass
+
+    def _on_shared_map_groups_changed(self):
+        """map_groups.json was modified externally — refresh the Maps tab."""
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "maps_tab"):
+            return
+        try:
+            if self.project_info:
+                ew.maps_tab.load_project(self.project_info)
+                self.log_message(
+                    "Reloaded maps (map_groups.json changed externally)")
+        except Exception:
+            pass
+
+    def _install_porymap(self):
+        """Tools → Install Porymap. Downloads, patches, and builds Porymap."""
+        if is_porymap_installed():
+            reply = QMessageBox.question(
+                self, "Porymap Already Installed",
+                "Porymap is already installed. Re-install / update?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # Defer to installer module (will be built next)
+        try:
+            from porymap_bridge.porymap_installer import run_install
+            run_install(self)
+        except ImportError:
+            QMessageBox.information(
+                self, "Not Yet Available",
+                "The Porymap installer is being built. Check back soon!",
+            )
+            return
+
+        # Refresh menu state
+        installed = is_porymap_installed()
+        self._open_porymap_action.setEnabled(installed)
+        if installed:
+            self._open_porymap_action.setToolTip("")
+            self.log_message("Porymap installed successfully")
+
+    def _open_in_porymap(self):
+        """Tools → Open in Porymap. Launches Porymap at the current map."""
+        if not is_porymap_installed():
+            QMessageBox.information(
+                self, "Porymap Not Installed",
+                "Install Porymap first via Tools → Install Porymap.",
+            )
+            return
+
+        project_dir = (self.project_info or {}).get("dir", "")
+        if not project_dir:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+
+        # Try to get current map name — check multiple sources
+        map_name = ""
+        ew = self._eventide_window
+        if ew:
+            # 1. Event editor's currently loaded map
+            if hasattr(ew, "event_editor_tab"):
+                tab = ew.event_editor_tab
+                if hasattr(tab, "_current_map"):
+                    map_name = tab._current_map or ""
+                    self.log_message(f"[Porymap] Event editor map: '{map_name}'")
+            # 2. Maps tab's currently selected map (if event editor has nothing)
+            if not map_name and hasattr(ew, "maps_tab"):
+                try:
+                    data = ew.maps_tab._selected_item_data()
+                    self.log_message(f"[Porymap] Maps tab selection: {data}")
+                    if data and data.get("type") == "map":
+                        map_name = data.get("folder", "")
+                except Exception:
+                    pass
+        else:
+            self.log_message("[Porymap] WARNING: _eventide_window is None")
+        # 3. Fallback: read map_groups.json and pick the first real town/route
+        if not map_name:
+            map_name = self._first_map_from_project(project_dir)
+            self.log_message(f"[Porymap] Fallback map: '{map_name}'")
+
+        self.log_message(f"[Porymap] Calling launch_porymap('{project_dir}', '{map_name}')")
+        ok = launch_porymap(project_dir, map_name)
+        if ok:
+            self.log_message(
+                f"Launched Porymap"
+                + (f" at {map_name}" if map_name else ""))
+        else:
+            QMessageBox.warning(
+                self, "Launch Failed",
+                "Could not launch Porymap. Check that it's installed correctly.",
+            )
+
+    @staticmethod
+    def _first_map_from_project(project_dir: str) -> str:
+        """Read map_groups.json and return the first town/route map name."""
+        import json as _json
+        groups_path = os.path.join(project_dir, "data", "maps", "map_groups.json")
+        try:
+            with open(groups_path, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except (OSError, ValueError):
+            return ""
+        # Prefer TownsAndRoutes group for a sensible default
+        for group_name in data.get("group_order", []):
+            if "towns" in group_name.lower() or "route" in group_name.lower():
+                maps = data.get(group_name, [])
+                if maps:
+                    return maps[0]
+        # Otherwise grab the first map from the first non-empty group
+        for group_name in data.get("group_order", []):
+            maps = data.get(group_name, [])
+            if maps:
+                return maps[0]
+        return ""

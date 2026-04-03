@@ -1,1 +1,0 @@
-const struct Evolution gEvolutionTable[NUM_SPECIES][EVOS_PER_MON] = {}

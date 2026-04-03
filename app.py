@@ -3,10 +3,20 @@ import sys
 import json
 import datetime
 
+# Add subfolders to sys.path so modules can be imported by name
+# from their new locations without needing shim files in root.
+_root = os.path.dirname(os.path.abspath(__file__))
+for _subdir in ("core", "ui", os.path.join("ui", "dialogs")):
+    _p = os.path.join(_root, _subdir)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 
 # Initialize logging as early as possible so import-time errors are captured
 try:
     import crashlog as _early_crashlog
+    _keep, _cap = _early_crashlog.read_purge_settings()
+    _early_crashlog.purge_old_logs(_keep, _cap)
     if not _early_crashlog.session_json_path():
         _early_crashlog.init_logging()
         _early_crashlog.install_std_redirects()
@@ -19,7 +29,6 @@ from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
     QMessageBox,
-    QInputDialog,
 )
 
 import res.resources_rc as resources_rc
@@ -150,121 +159,60 @@ class App:
                 # Open a new project
                 self.project_selector.selected_index = 0
 
-        # Load main window and show loading dialog
-        self.main = MainWindow()
-        self.loading_dialog = LoadingProject(self.main)
-        self.loading_dialog.show()
-
-        # Update loading progress
-        self.loading_dialog.update_progress(10)
+        # Unified window is the only launch mode now
 
         # Load project information
         p_info = projects["projects"][self.project_selector.selected_index]
-        self.loading_dialog.update_progress(20)
         local_info_path = os.path.join(p_info["dir"], "project.json")
         if not os.path.exists(local_info_path):
             local_info_path = os.path.join(p_info["dir"], "config.json")
         if not os.path.exists(local_info_path):
             config_mk = os.path.join(p_info["dir"], "config.mk")
             if os.path.exists(config_mk):
+                # Create a minimal config.json for projects that don’t have one
+                default_config = {
+                    "name": p_info.get("name", os.path.basename(p_info["dir"])),
+                    "project_name": p_info.get("project_name", os.path.basename(p_info["dir"])),
+                    "version": {"major": 0, "minor": 0, "patch": 0},
+                    "date_created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "date_modified": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
                 ret = QMessageBox.question(
-                    self.main,
+                    None,
                     "Create config.json",
                     (
-                        "No project.json or config.json found. "
-                        "PorySuite requires a config.json file.\n"
+                        "No project.json or config.json found.\n"
                         "Create one using default settings?"
                     ),
                     QMessageBox.StandardButton.Yes
                     | QMessageBox.StandardButton.No,
                 )
                 if ret == QMessageBox.StandardButton.Yes:
-                    import pluginmanager
-
-                    plugins = pluginmanager.get_plugins_info()
-                    if not plugins:
-                        QMessageBox.critical(self.main, "Error", "No plugins available.")
-                        sys.exit(1)
-                    items = [f"{p['name']} ({p['identifier']})" for p in plugins]
-                    choice, ok = QInputDialog.getItem(
-                        self.main,
-                        "Select Plugin",
-                        "Plugin:",
-                        items,
-                        0,
-                        False,
-                    )
-                    if not ok:
-                        sys.exit(1)
-                    plugin = plugins[items.index(choice)]
-                    default_config = {
-                        "name": p_info.get("name", os.path.basename(p_info["dir"])),
-                        "project_name": p_info.get("project_name", os.path.basename(p_info["dir"])),
-                        "version": {"major": 0, "minor": 0, "patch": 0},
-                        "plugin_identifier": plugin["identifier"],
-                        "plugin_version": plugin["version"],
-                        "date_created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "date_modified": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
                     with open(os.path.join(p_info["dir"], "config.json"), "w") as f:
                         json.dump(default_config, f, indent=4)
                     local_info_path = os.path.join(p_info["dir"], "config.json")
                 else:
-                    QMessageBox.critical(self.main, "Error", "Cannot load project without config.json")
+                    QMessageBox.critical(None, "Error", "Cannot load project without config.json")
                     sys.exit(1)
             else:
-                QMessageBox.critical(self.main, "Error", "Project configuration file not found")
+                QMessageBox.critical(None, "Error", "Project configuration file not found")
                 sys.exit(1)
 
         with open(local_info_path, "r") as f:
             local_p_info = json.load(f)
-        self.loading_dialog.update_progress(30)
 
         # Update last opened timestamp
         p_info["last_opened"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.loading_dialog.update_progress(40)
 
-        # Load data into main window
-        self.main.load_data(p_info | local_p_info)
-        self.loading_dialog.update_progress(70)
-
-        # Set window file path
-        self.main.setWindowFilePath(p_info["dir"])
-        self.loading_dialog.update_progress(80)
-
-        # Set current item in tree view; then clear the modified flag because
-        # selecting the first species fires signals that spuriously set it.
-        self.main.ui.tree_pokemon.setCurrentItem(self.main.ui.tree_pokemon.topLevelItem(0))
-        self.main.setWindowModified(False)
-        self.loading_dialog.update_progress(90)
-
-        # Update projects.json with modified project information
+        # Update projects.json
         projects["projects"][self.project_selector.selected_index] = p_info
         with open(os.path.join(data_dir, "projects.json"), "w") as file_projects:
             json.dump(projects, file_projects)
 
-        # Update loading progress
-        self.loading_dialog.update_progress(100)
+        merged_info = p_info | local_p_info
 
-        # Add recent projects to the menu
-        for i in range(1, min(len(projects["projects"]), 5)):
-            recent_project = QAction(projects["projects"][i]["name"] + " | " + projects["projects"][i]["dir"])
-            recent_project.triggered.connect(
-                lambda _, p=projects["projects"][i]: self.main.loadAndSaveProjectSignal.emit(p)
-            )
-            self.main.ui.menuRecent_Projects.addAction(recent_project)
+        self._launch_unified(merged_info, projects, data_dir)
 
-        # Handle case when there are no recent projects
-        if len(projects["projects"]) == 1:
-            no_recent_projects = QAction("No Recent Projects")
-            no_recent_projects.setEnabled(False)
-            self.main.ui.menuRecent_Projects.addAction(no_recent_projects)
-
-        # Close loading dialog and show main window
-        self.loading_dialog.close()
-        self.main.show()
-        self.main.activateWindow()
-        self.main.setFocus()
         # Log where this session’s JSON log lives for easy discovery
         try:
             jpath = crashlog.session_json_path() or crashlog.latest_json_log_file()
@@ -272,6 +220,68 @@ class App:
                 print(f"Session log (JSONL): {jpath}")
         except Exception:
             pass
+
+    def _launch_unified(self, merged_info: dict, projects: dict, data_dir: str):
+        """Launch the unified PorySuite-Z window with all editors."""
+        from eventide.mainwindow import EventideMainWindow
+        from unified_mainwindow import UnifiedMainWindow
+
+        # Create both child windows (hidden — we only use their widgets)
+        porysuite_win = MainWindow()
+        eventide_win = EventideMainWindow()
+
+        # Show loading dialog on PorySuite (the heavier one)
+        self.loading_dialog = LoadingProject(porysuite_win)
+        self.loading_dialog.show()
+        self.loading_dialog.update_progress(10)
+
+        # Load PorySuite data
+        porysuite_win.load_data(merged_info)
+        self.loading_dialog.update_progress(40)
+
+        # Select first Pokemon so the tree is initialized
+        try:
+            porysuite_win.ui.tree_pokemon.setCurrentItem(
+                porysuite_win.ui.tree_pokemon.topLevelItem(0))
+            porysuite_win.setWindowModified(False)
+        except Exception:
+            pass
+        self.loading_dialog.update_progress(50)
+
+        # Load EVENTide data
+        eventide_win.load_data(merged_info)
+        self.loading_dialog.update_progress(70)
+
+        # Create the unified window
+        self.main = UnifiedMainWindow()
+        self.main.setup_pages(porysuite_win, eventide_win)
+        self.loading_dialog.update_progress(85)
+
+        # Load project info into unified window
+        self.main.load_data(merged_info)
+        self.main.setWindowFilePath(merged_info.get("dir", ""))
+
+        # Add recent projects to the menu
+        for i in range(1, min(len(projects["projects"]), 5)):
+            recent = projects["projects"][i]
+            action = QAction(recent["name"] + " | " + recent["dir"])
+            self.main._recent_menu.addAction(action)
+
+        if len(projects["projects"]) == 1:
+            no_recent = QAction("No Recent Projects")
+            no_recent.setEnabled(False)
+            self.main._recent_menu.addAction(no_recent)
+
+        self.loading_dialog.update_progress(100)
+        self.loading_dialog.close()
+
+        # Keep references to prevent garbage collection
+        self._porysuite_win = porysuite_win
+        self._eventide_win = eventide_win
+
+        self.main.show()
+        self.main.activateWindow()
+        self.main.setFocus()
 
     @staticmethod
     def _migrate_from_appdata(data_dir: str) -> None:

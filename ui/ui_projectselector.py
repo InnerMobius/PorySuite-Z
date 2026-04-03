@@ -44,12 +44,12 @@ class Ui_ProjectSelector(object):
         self.label_icon.setObjectName("label_icon")
         self.verticalLayout.addWidget(self.label_icon)
         self.label = QtWidgets.QLabel(parent=self.centralwidget)
-        self.label.setMaximumSize(QtCore.QSize(250, 50))
+        self.label.setMaximumSize(QtCore.QSize(250, 80))
         font = QtGui.QFont()
         font.setPointSize(26)
         font.setBold(True)
         self.label.setFont(font)
-        self.label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeading|QtCore.Qt.AlignmentFlag.AlignLeft|QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter|QtCore.Qt.AlignmentFlag.AlignVCenter)
         self.label.setObjectName("label")
         self.verticalLayout.addWidget(self.label)
         self.label_3 = QtWidgets.QLabel(parent=self.centralwidget)
@@ -121,7 +121,7 @@ class Ui_ProjectSelector(object):
 
     def retranslateUi(self, ProjectSelector):
         _translate = QtCore.QCoreApplication.translate
-        self.label.setText(_translate("ProjectSelector", "PorySuite-Z"))
+        self.label.setText(_translate("ProjectSelector", "PorySuite-Z\nEVENTide"))
         self.label_3.setText(_translate("ProjectSelector", ""))
         self.button_newproject.setText(_translate("ProjectSelector", "New Project"))
         self.button_newproject.setToolTip(_translate("ProjectSelector",

@@ -30,7 +30,7 @@ sys.modules.setdefault("PyQt6.QtCore", qt_core)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
 
 from header_stubs import write_move_headers, write_pokedex_headers, write_species_headers
-from plugin_abstract.pokemon_data import MissingSourceError
+from core.pokemon_data_base import MissingSourceError
 
 SPECIES_INFO = """\
 [SPECIES_NONE] =
