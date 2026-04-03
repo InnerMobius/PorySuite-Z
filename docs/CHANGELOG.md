@@ -1,3 +1,36 @@
+## [2026-04-03] — Phase 7: Porymap Launch & Bidirectional Sync
+
+### Type
+Bug Fix, Enhancement
+
+### Summary
+**Porymap now opens to the correct map and supports bidirectional map navigation.** Three critical bugs fixed and compile progress feedback added.
+
+- **Fixed: `openMap` patch never applied** — `patch_mainwindow_h` checked `if "openMap" in content` which always matched existing `openMapListItem`/`openMapFromHistory`, so the `Q_INVOKABLE bool openMap()` declaration was never added. Same issue with `patch_mainwindow_openmap`. Fixed both checks to match exact signatures (`"Q_INVOKABLE bool openMap"` and `"MainWindow::openMap(const QString"`).
+- **Fixed: Backslash/forward slash mismatch broke all map loading** — Windows CLI passes `C:\GBA\...` (backslashes) but Qt's `ParseUtil::pathWithRoot()` uses `startsWith(this->root)` where root is forward-slash normalized. This caused double-prepending of the project path, making all 425 map.json files unfindable. Fix: `QDir::cleanPath(args.at(1))` in main.cpp normalizes backslashes before writing to config.
+- **Fixed: Bridge script format** — Changed `1:path` to `path:1` (Porymap's `parseCustomScripts()` expects suffix format).
+- **Fixed: Duplicate Porymap windows** — Replaced `is_porymap_running()` (tasklist-based, unreliable) with `bring_porymap_to_front()` (Windows API window enumeration). If Porymap is running, sends a command file instead of launching a new instance.
+- **Bidirectional command channel** — Added `readCommandFile()` C++ method to Porymap's ScriptUtility, bridge script polls it every 500ms, PorySuite writes `porysuite_command.json` when requesting a map switch.
+- **Compile progress streaming** — Install Porymap now shows which .cpp file is being compiled and a running count instead of appearing hung during multi-minute builds.
+- **CLI argument support** — Porymap accepts `porymap.exe [project_dir] [map_name]` as arguments for direct project/map opening.
+
+### Files modified
+- `porymap_patches/apply_patches.py` — Fixed false-positive idempotency checks for `patch_mainwindow_h` and `patch_mainwindow_openmap`; added `patch_main_cpp` for CLI arg handling
+- `porymap_bridge/porymap_launcher.py` — Added `_send_command()`, `_first_map_from_project()`, `bring_porymap_to_front()`; fixed bridge script format; added CLI arg passing
+- `porymap_bridge/porymap_installer.py` — Added `_run_cmd_streaming()` for compile progress feedback
+- `porymap_bridge/porysuite_bridge.mjs` — Added command polling (`pollForCommand`, `handleCommand`)
+- `ui/unified_mainwindow.py` — Updated `_open_in_porymap` with multi-source map detection
+- `.gitignore` — Added `porymap_src/`, `porymap/`, `qt_sdk/` exclusions for GitHub
+
+### Porymap C++ source changes (via patcher)
+- `src/main.cpp` — CLI project/map arguments with `QDir::cleanPath` normalization
+- `include/mainwindow.h` — Added `Q_INVOKABLE bool openMap(const QString &mapName)`
+- `src/mainwindow.cpp` — Added `MainWindow::openMap()` implementation wrapping private `setMap()`
+- `include/scriptutility.h` — Added `Q_INVOKABLE QString readCommandFile()`
+- `src/scriptapi/apiutility.cpp` — Added `readCommandFile()` implementation
+
+---
+
 ## [2026-04-03] — Phase 7: Porymap Integration (Infrastructure)
 
 ### Type

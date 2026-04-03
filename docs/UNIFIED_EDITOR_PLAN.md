@@ -8,7 +8,7 @@ Merge PorySuite (data editor) and EVENTide (script editor) into a single window 
 
 ## Current State (2026-04-03)
 
-Phases 1 through 6 are **complete**. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. Next major phase: **Phase 7 — Porymap Integration**.
+Phases 1 through 6 are **complete**. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync all working. Polish remaining.
 
 **13 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Event Editor, Maps, Layouts & Tilesets, Region Map, UI Settings, Config.
 
@@ -342,7 +342,7 @@ PorySuite-Z fully integrates Porymap (the visual map/tile editor) as a companion
 
 **Approach:** PorySuite-Z downloads the Porymap source repo, runs a patch script that adds event-aware callbacks and a bridge API to the existing JS scripting engine, then builds the patched binary. The install script handles downloading Qt build tools and compiling — the user just clicks "Install Porymap" and waits. No fork, no manual steps.
 
-**Status (2026-04-03):** Infrastructure complete — install pipeline, bridge communication, launcher, file watchers, C++ patcher all built and verified. Remaining: build-test the patched binary, test stock Porymap fallback, wire additional callback hooks (event create/delete/move).
+**Status (2026-04-03):** Core integration working end-to-end. Install pipeline builds patched Porymap with compile progress streaming. "Open in Porymap" opens the correct map via CLI args (with QDir::cleanPath fix for Windows backslash normalization). Bidirectional sync works — if Porymap is already running, PorySuite writes a command file and the bridge script polls + calls `map.openMap()`. Duplicate window prevention via Win32 API. Remaining: auto-sync on map selection, Ctrl+E handler, additional callback hooks (event create/delete/move), stock Porymap fallback testing.
 
 ---
 

@@ -133,6 +133,8 @@ Visual region map editor with actual tileset graphics as background. Section ass
 
 | Action | Shortcut |
 |--------|----------|
+| Install Porymap | -- |
+| Open in Porymap | Ctrl+F7 |
 | Open Terminal | Ctrl+T |
 | Rename Species | -- |
 | Open Crashlogs Folder | -- |
@@ -156,6 +158,30 @@ Accessible from Tools > Settings:
 - **Build Environment** -- Open the Setup Wizard to install/verify build tools
 - **Event Colors** -- Customise colors for constant types (flags, vars, trainers, items, species, moves) and command categories (dialogue, flow, movement, sound, screen, battle, pokemon, items, system). Changes apply immediately.
 - **Event Editor Tooltips** -- Toggle descriptive hover tooltips in the Event Editor on/off (on by default, applies immediately)
+
+---
+
+## Porymap Integration
+
+PorySuite-Z integrates [Porymap](https://github.com/huderlem/porymap) as a companion visual map editor. Edit tiles and place events in Porymap, edit scripts and data in PorySuite-Z — the two apps communicate bidirectionally.
+
+### Setup
+
+1. Go to **Tools > Install Porymap**
+2. The installer clones the Porymap source, downloads the Qt SDK, applies PorySuite-Z patches, compiles, and deploys — all automatically
+3. Progress shows which file is being compiled so it doesn't appear hung
+
+### Usage
+
+- **Open in Porymap** (Ctrl+F7) — opens Porymap to whatever map you're editing in PorySuite-Z
+- If Porymap is already running, it switches to the requested map instead of opening a second window
+- Clicking an event in Porymap updates PorySuite-Z's Event Editor to show that event's script
+- Maps/Layouts tabs have right-click "Open in Porymap" context menus
+- Shared file watchers detect when Porymap saves a map and offer to reload in PorySuite-Z
+
+### What gets patched
+
+The installer adds event callbacks, a bridge API, and CLI argument handling to Porymap's scripting engine via `porymap_patches/apply_patches.py`. This is a search-and-replace patcher (not fragile git patches) that survives upstream Porymap updates. The patched binary lives in `porymap/` (not committed to git — built locally).
 
 ---
 

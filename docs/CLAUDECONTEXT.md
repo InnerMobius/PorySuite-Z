@@ -65,19 +65,25 @@ PorySuite-Z is a unified editor for pokefirered decomp ROM hacking projects. It 
 ### Other Phase 5 features
 - Trainer Class Editor, Open in Folder buttons, editable item icons (all complete)
 
-## Phase 7 — Porymap Integration (in progress)
+## Phase 7 — Porymap Integration (working, polish remaining)
 
-PorySuite-Z integrates Porymap as a companion map/tile editor. The two apps communicate via a JSON bridge file and shared file watchers, behaving like one tool.
+PorySuite-Z integrates Porymap as a companion map/tile editor. The two apps communicate via a JSON bridge file, command polling, and shared file watchers, behaving like one tool.
 
 **Architecture:**
 - `porymap_bridge/` — Python modules for bridge communication, launching, installing
-- `porymap_patches/apply_patches.py` — Python patcher adds 11 callbacks + 5 query functions to Porymap's C++ scripting engine
-- `porysuite_bridge.mjs` — JS companion script runs inside Porymap, handles all callbacks and writes bridge messages
+- `porymap_patches/apply_patches.py` — Python patcher adds 11 callbacks + 5 query functions + `openMap` + `readCommandFile` + CLI arg handling to Porymap's C++ source
+- `porysuite_bridge.mjs` — JS companion script runs inside Porymap, handles all callbacks, writes bridge messages, and polls for PorySuite commands every 500ms
 - `SharedFileWatcher` — monitors `map.json`, `scripts.inc`, `layouts.json`, `map_groups.json` for external changes
 
-**What's done:** Install pipeline, bridge watcher (18 signals), launcher with config writing, "Open in Porymap" buttons on Event Editor/Maps/Layouts tabs, C++ patcher with correct API calls, shared file watchers with auto-reload.
+**What's working:**
+- Install pipeline (Tools > Install Porymap) with compile progress streaming
+- "Open in Porymap" opens to the correct map (CLI args + QDir::cleanPath fix)
+- If Porymap is already running, PorySuite sends a command file and Porymap switches maps (bidirectional sync via readCommandFile + bridge polling)
+- Duplicate window prevention (Win32 window enumeration + bring-to-front)
+- Bridge watcher (18 signals), launcher with config writing, bridge script auto-injection
+- C++ patcher survives `git reset --hard` (Install Porymap re-applies all patches)
 
-**What's remaining:** Build-test the patched Porymap binary, test stock Porymap fallback (log-based bridge), add more callback wire-up points in Porymap source (event creation/deletion/movement).
+**What's remaining:** Auto-sync on map selection (map_selected signal → auto-send to Porymap), Ctrl+E handler cleanup, additional callback wire-up (event creation/deletion/movement), stock Porymap fallback testing.
 
 ## Standardised text editing
 - `ui/game_text_edit.py` — `GameTextEdit` widget for all game text editing

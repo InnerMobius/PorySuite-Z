@@ -452,6 +452,35 @@ FireRed's MOVE_NAME_LENGTH is 12 characters. If you enter a longer name in the
 Add Move or Duplicate Move dialog, it will be truncated to 12 characters when
 written to `move_names.h`. The dialog enforces this limit.
 
+## Porymap Integration
+
+### Install Porymap appears to hang during compile
+
+The first install (or any install after the source is reset) does a full compile of ~200 C++ files, which takes several minutes. The progress dialog now shows which file is being compiled and a running count. If it still appears stuck for more than 10 minutes, check `aqtinstall.log` in the porysuite folder for download errors, or `crashlogs/` for build failures.
+
+### Porymap opens but shows the wrong map (Battle Colosseum 2P)
+
+This was fixed. The root cause was a Windows backslash vs Qt forward-slash mismatch — CLI args use `C:\GBA\...` but Qt normalizes paths to `C:/GBA/...`, causing `ParseUtil::pathWithRoot()` to double-prepend the project path. All map.json files became unfindable, so Porymap fell back to the first alphabetical map.
+
+If this happens again after a reinstall:
+1. Go to Tools > Install Porymap to rebuild (the patch is now correct)
+2. Close and restart both PorySuite and Porymap
+3. Click "Open in Porymap" — it should open to the map you're editing
+
+### "Open in Porymap" does nothing
+
+Check that Porymap is installed (Tools > Install Porymap). The button is greyed out with a tooltip if Porymap isn't found. If the button is active but nothing happens, check the Output panel for error messages from the launcher.
+
+### Porymap opens a second window instead of switching maps
+
+The launcher detects running Porymap windows by title. If the window title doesn't contain "porymap" (case-insensitive), detection fails. This can happen if Porymap is minimized to the system tray. Bring Porymap to the foreground manually and try again, or close the extra window.
+
+### Porymap loses patches after reinstall
+
+This is expected. The Install Porymap flow runs `git reset --hard` to ensure a clean source tree, then re-applies all patches via `apply_patches.py`. If a patch fails to apply (check the Output panel for errors), the binary will be missing features like `openMap` or `readCommandFile`. Report the specific error — it usually means an upstream Porymap change moved the anchor string the patcher looks for.
+
+---
+
 ## Potential Improvements
 
 Future versions of PorySuite may offer clearer error messages and an option in the UI to reset the configuration.
