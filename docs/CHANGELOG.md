@@ -1,3 +1,1557 @@
+## [2026-04-07] — Generate GM Fix, Song Export/Replace, GM Slot Trimming
+
+### Type
+Fix / Feature
+
+### Summary
+Fixed the Generate GM button crash (broken by a renamed dict key in the coverage report). Added "Export .s File..." and "Replace with .s File..." to the song right-click context menu — users can now back up a song and replace it with music from another .s file while keeping the same constant and registration. GM voicegroup generator no longer pads to 128 slots — it stops at the last real instrument, so a voicegroup with instruments only up to slot 80 will have 81 slots instead of 128.
+
+### What Changed
+- **Voicegroups Tab** (`ui/voicegroups_tab.py`): Fixed `_on_generate_gm()` — was reading `report['total_samples']` but the key was renamed to `total_ds_samples`. Updated confirmation and success dialog text to match new behavior (filler, not square wave fallback).
+- **GM Voicegroup Generator** (`core/sound/gm_voicegroup.py`): Voicegroup size is now trimmed to only include slots up to the highest real instrument. No empty trailing slots.
+- **Sound Editor Tab** (`ui/sound_editor_tab.py`): Added "Export .s File..." (saves a copy) and "Replace with .s File..." (overwrites music data, rewrites labels to match existing constant, keeps registration) to the song context menu.
+
+### Files Changed
+- ui/voicegroups_tab.py — fixed dict key, updated dialog text
+- core/sound/gm_voicegroup.py — trimmed voicegroup to last real instrument slot
+- ui/sound_editor_tab.py — export and replace song methods
+
+---
+
+## [2026-04-07] — Save & Git Confirmation Dialogs
+
+### Type
+UX
+
+### Summary
+Added confirmation dialogs before destructive actions. File → Save / Ctrl+S now asks "Save all changes to disk?" before writing. Piano roll save button warns that it writes the .s file directly to disk (unlike most PorySuite edits which stay in memory until File → Save). Git Push and Pull confirmations are now non-suppressible (no "Don't show again" checkbox) and use explicit language about what data will be overwritten or lost.
+
+### What Changed
+- **Unified Main Window** (`ui/unified_mainwindow.py`): `_on_save_all()` shows a confirmation dialog before saving, explaining that edits will be written to C source, assembly, and JSON files.
+- **Piano Roll Window** (`ui/piano_roll_window.py`): `_on_save()` shows a confirmation dialog explaining that this writes the .s file immediately — unlike most edits which wait for File → Save.
+- **Main Window** (`ui/mainwindow.py`): Git Pull confirmation reworded — warns "Pulling will overwrite your local files" and "Any work you haven't committed will be permanently lost." Git Push confirmation reworded — warns "Pushing will overwrite the remote with your local commits" and "If you have broken or incomplete work, it will be pushed too." Both changed from suppressible `maybe_exec()` to non-suppressible `QMessageBox.question()`, default button set to Cancel.
+- **Suppress Dialog** (`core/suppress_dialog.py`): Removed `git_pull_confirm` and `git_push_confirm` from the suppressible registry (these should never be skippable).
+
+### Files Changed
+- ui/unified_mainwindow.py — pre-save confirmation dialog
+- ui/piano_roll_window.py — pre-save confirmation with direct-write warning
+- ui/mainwindow.py — git push/pull confirmations reworded, made non-suppressible
+- core/suppress_dialog.py — removed git keys from suppressible registry
+
+---
+
+## [2026-04-07] — Sound Editor: Song Rename/Delete, Piano Roll Fixes, GM VG Dedup, .s Import Polish
+
+### Type
+Fix / Feature
+
+### Summary
+Four fixes from user testing: (1) .s file import dialog now asks for a display name instead of a raw constant — auto-derives MUS_/SE_ constant with a type selector dropdown. (2) Right-click context menu on the Songs list with "Rename Song..." and "Delete Song". Rename updates all 3 config files + renames .s file + rewrites internal labels. Delete checks for cross-references in project source and warns before removing. (3) Piano roll save/reload corruption fixed — `flatten_track_commands` was called with `loop_count=1` which duplicated loop content on every save→reload cycle; changed to `loop_count=0`. Multi-select drag fixed (was only moving the grabbed note). Ctrl+A now respects track filter (selects only the current track's notes in single-track view). (4) GM voicegroup generator no longer floods with 80+ identical square wave fallbacks — empty slots get silent filler instead, and all unique non-DirectSound instruments (square waves, programmable waves, noise) from existing voicegroups are included.
+
+### What Changed
+- **Song Table Manager** (`core/sound/song_table_manager.py`): Added `rename_song()`, `delete_song()`, and `find_song_references()` functions.
+- **Sound Editor Tab** (`ui/sound_editor_tab.py`): Right-click context menu on song tree with Rename/Delete. Rename asks for display name, derives constant, validates, updates everything. Delete checks references, shows warning, re-indexes remaining songs.
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): Changed `loop_count=1` to `loop_count=0` in `load_song_data()`. Added `_drag_originals` dict for multi-select drag. Fixed `select_all()` to filter by `_track_index`.
+- **.s Import Dialog** (`ui/dialogs/s_file_import_dialog.py`): Changed from constant input to display name input with MUS_/SE_ prefix selector and auto-derived constant preview.
+- **GM Voicegroup Generator** (`core/sound/gm_voicegroup.py`): Added `_catalog_all_instruments()` to collect all unique non-filler instruments. Empty GM slots now get silent filler instead of playable square wave fallbacks. Non-DirectSound instruments (square, prog wave, noise) placed in appropriate GM slots.
+- **Voicegroups Tab** (`ui/voicegroups_tab.py`): Added "Rename" button and double-click rename for voicegroup friendly labels.
+
+### Files Changed
+- core/sound/song_table_manager.py — rename_song(), delete_song(), find_song_references()
+- core/sound/gm_voicegroup.py — _catalog_all_instruments(), deduplicated GM generator, filler for empty slots
+- ui/sound_editor_tab.py — song context menu (rename/delete)
+- ui/piano_roll_widget.py — loop_count fix, multi-select drag, track-filtered select_all
+- ui/dialogs/s_file_import_dialog.py — display name input with constant derivation
+- ui/voicegroups_tab.py — rename button + double-click rename
+
+---
+
+## [2026-04-07] — Sound Editor: Import Song .s File from Another Project
+
+### Type
+Feature
+
+### Summary
+New "Import .s..." button on the Songs tab lets users import a pre-compiled .s assembly song file from another pokefirered project. A 3-page wizard walks through file selection (with full song preview — tracks, tempo, voicegroup, loop info), voicegroup compatibility checking (warns if the source voicegroup doesn't exist and lets you pick an alternative), and automatic registration in song_table.inc, songs.h, and midi.cfg. Labels and voicegroup references are rewritten automatically to match the target project. Completes Sound Editor Phase 9.
+
+### What Changed
+- **SFileImportDialog** (`ui/dialogs/s_file_import_dialog.py`): NEW — 3-page wizard dialog. Page 0: file picker + song preview (parsed via `song_parser`) + constant name input with live validation + player type selector. Page 1: voicegroup compatibility check with green/amber status, dropdown to remap, editable reverb/volume/priority. Page 2: progress bar + result summary. Worker thread copies .s file, rewrites labels/voicegroup, calls `register_song()`.
+- **Sound Editor Tab** (`ui/sound_editor_tab.py`): Added "Import .s..." button alongside "Import MIDI...", `_open_s_import()` and `_on_s_imported()` methods.
+- **Sound Editor Roadmap** (`docs/SOUND_EDITOR_PLAN.md`): Phase 9 marked COMPLETE. Steps 9.1 (export) and 9.2 (QoL) marked NOT NEEDED.
+- **Unified Editor Plan** (`docs/UNIFIED_EDITOR_PLAN.md`): Sound Editor status updated to Phases 1-9 COMPLETE. Added Phase 9 (Pokedex Habitat/Area Display) to roadmap.
+
+### Files Changed
+- ui/dialogs/s_file_import_dialog.py — NEW: Import Song .s wizard dialog
+- ui/sound_editor_tab.py — added Import .s button + handler methods
+- docs/SOUND_EDITOR_PLAN.md — Phase 9 completion, 9.1/9.2 marked not needed
+- docs/UNIFIED_EDITOR_PLAN.md — status update + Phase 9 Pokedex habitat roadmap entry
+
+---
+
+## [2026-04-07] — Piano Roll: Song Structure Panel, Save Button, Instrument Dropdown, VG Labels
+
+### Type
+Feature
+
+### Summary
+Major piano roll usability improvements. Song Structure panel on the right side shows the song's structural commands (sections, loops, pattern calls, end markers) in plain English — users can add, remove, and edit these to control how the song plays back. Save button added to the toolbar with Ctrl+S shortcut. Instrument selector changed from a tiny number spinner to a full dropdown showing instrument names. Voicegroup selector now shows friendly labels (auto-generated from song usage or user-renamed), with a new "Auto-Label" button in the Voicegroups tab. Labels are stored in PorySuite's cache — source code is never touched.
+
+### What Changed
+- **Song Structure Panel** (`ui/piano_roll_structure.py`): NEW — Right-side panel showing structural commands with friendly names (Section = LABEL, Loop Back = GOTO, Play Pattern = PATT, End Pattern = PEND, End Song = FINE). Color-coded list (green/blue/orange/red). Click to seek, double-click to edit. Add/Remove/Edit buttons with helpful tooltips. `get_loop_region()` returns loop start/end from structure items. `structure_changed` signal syncs loop region to sequencer.
+- **Save Button** (`ui/piano_roll_window.py`): Save button on toolbar + Ctrl+S shortcut. Calls `save_to_disk()` directly — no need to go back to main window File → Save.
+- **Instrument Dropdown** (`ui/piano_roll_tracks.py`): Replaced QSpinBox (tiny up/down arrows) with QComboBox showing all 128 slots with instrument names (e.g. "0: Sc88Pro Square Wave", "38: Sc88Pro Organ2"). Repopulates when voicegroup changes.
+- **Voicegroup Friendly Labels** (`core/sound/voicegroup_labels.py`): NEW — JSON label mapping stored per-project in PorySuite's cache dir. "Auto-Label" button in Voicegroups tab generates names from song usage (e.g. "Encounter Rocket", "Cycling + 4 more"). Pencil button in piano roll for individual rename. Labels show in VG dropdowns as "Friendly Name (voicegroupNNN)". VG dropdown refreshes from live data on open (picks up newly created GM voicegroups).
+- **Voicegroups Tab** (`ui/voicegroups_tab.py`): "Auto-Label" button added to toolbar. VG tree shows friendly labels inline ("VG 013 — Encounter Rocket"). Labels loaded on `load_data()`, shared with piano roll via same dict reference.
+
+### Files Changed
+- ui/piano_roll_structure.py — NEW: Song Structure panel
+- core/sound/voicegroup_labels.py — NEW: VG label management (load/save/generate/rename)
+- ui/piano_roll_window.py — Save button, Ctrl+S, structure panel wiring, VG label passthrough
+- ui/piano_roll_tracks.py — Instrument dropdown (was spinner), VG rename button, live VG refresh
+- ui/voicegroups_tab.py — Auto-Label button, labels in VG tree
+- ui/sound_editor_tab.py — VG labels loaded on project open, passed to piano roll + voicegroups tab
+
+---
+
+## [2026-04-07] — Abilities Editor: Visual Battle & Field Effect Editor
+
+### Type
+Feature
+
+### Summary
+The Abilities Editor's read-only "Battle & Field Effects" card is now a full visual editor. Users pick an effect category from a dropdown (Status Immunity, Contact Status Infliction, Type Absorb, Weather, Stat Boost, etc.) and configure parameters (which status, which type, which stat, chance percentage, HP fraction). The editor writes real C code to the correct source files (battle_util.c, wild_encounter.c, pokemon.c, battle_script_commands.c, battle_main.c) on save. Detects existing effects automatically by parsing the C source.
+
+### What Changed
+- **Ability Effect Templates** (`core/ability_effect_templates.py`): NEW — 13 battle effect templates (status immunity, contact status, type absorb HP, type absorb power boost, weather switch-in, end-of-turn stat boost, intimidate, contact recoil, pinch type boost, type immunity, weather recovery, type trap, crit prevention) and 8 field effect templates (encounter rate halve, encounter rate double, type encounter rate boost, post-battle item pickup, guaranteed wild escape, faster egg hatching, nature sync, gender attract). Each template defines configurable parameters, C code generation, and auto-detection from existing source. Value maps for all GBA types, stats, statuses, weather conditions. Field templates that don't exist natively in pokefirered (egg hatching, nature sync, gender attract, type encounters) generate and insert the code when assigned.
+- **Abilities Tab Widget** (`ui/abilities_tab_widget.py`): Replaced read-only `QGroupBox("Battle & Field Effects (read-only)")` with two editable sections — Battle Effect and Field Effect. Each has a category `QComboBox`, dynamic parameter widgets that rebuild per-category, and a monospace code preview showing the generated C. `AbilityDetailPanel.load()` now auto-detects existing effects via `detect_all_effects()`. `save_current()` stores effect config. New `apply_effect_changes()` method writes C code on save, with old-code removal and new-code insertion.
+- **Main Window** (`ui/mainwindow.py`): `save_abilities_editor()` now calls `apply_effect_changes()` after writing ability names/descriptions, logging results.
+
+### Files Changed
+- core/ability_effect_templates.py — NEW: template registry, detection, code gen, file manipulation
+- ui/abilities_tab_widget.py — Effect editor UI, save integration
+- ui/mainwindow.py — Effect save pipeline hook
+
+---
+
+## [2026-04-07] — Abilities Editor (Phase 8A) — COMPLETE
+
+### Type
+Feature
+
+### Summary
+Full Abilities Editor added to the PorySuite toolbar. Browse, search, add, duplicate, rename, and delete abilities with live species usage cross-references. Battle and field effect code copying when creating new abilities. Rename uses the same RefactorService pattern as moves/items/trainers/species. Species names in the usage table now display real project data (no fabrication).
+
+### What Changed
+- **Abilities Tab Widget** (`ui/abilities_tab_widget.py`): Searchable ability browser (left panel) with detail editor (right panel). Identity section: display name (12-char limit with counter/color feedback), constant name (read-only, renamed via Rename button), ID (read-only). Description editor with 52-char limit and overflow highlighting. Battle & Field Info card showing parsed effect categories from C source with "Open in Editor" buttons. Species Usage table with slot info and double-click cross-navigation to the Pokemon tab. Add New Ability dialog with auto-derived constant from display name, separate Battle Effect and Field Effect dropdowns (filtered to abilities that actually have each type), preview labels showing what code will be copied. Duplicate pre-fills source ability in effect dropdowns. Delete with safety scan (blocks if species are using the ability, warns about C code references).
+- **Add Dialog — Effect Copying**: `scan_ability_battle_effects()` and `scan_ability_field_effects()` parse C source files to find which abilities have battle case blocks or field effect checks. `copy_battle_effects()` duplicates case blocks in battle_util.c. `copy_field_effects()` adds `|| ability == NEW` to existing if-chains in wild_encounter.c. `build_inline_ref_summary()` lists inline references the user needs to handle manually.
+- **Refactor Service** (`core/refactor_service.py`): Added `rename_ability()` — generates preview of ABILITY_* constant + sXxxDescription variable renames across all source files, queues pending op. `apply_pending()` handles the `rename_ability` op: search-and-replace constant + description variable, update display name in gAbilityNames, update abilities.json key.
+- **Rename Dialog** (`ui/custom_widgets/rename_dialog.py`): Added "Ability" to `_NAME_LIMITS` (12 chars).
+- **Main Window** (`ui/mainwindow.py`): `_on_ability_rename()` rewritten as a full RenameDialog handler matching the move/item rename pattern. `load_abilities_editor()` passes `project_root` to the tab widget.
+- **Species name fix**: `_get_species_usage()` no longer transforms species names — displays them exactly as stored in species.json (was fabricating title-cased names via `.replace("_", " ").title()`).
+
+### Files Changed
+- ui/abilities_tab_widget.py — Full editor with add/duplicate/rename/delete, effect copying, species usage
+- core/refactor_service.py — rename_ability() method + apply_pending handler
+- ui/custom_widgets/rename_dialog.py — Ability name limit added
+- ui/mainwindow.py — Ability rename handler, project_root passthrough
+
+---
+
+## [2026-04-07] — Piano Roll UI Overhaul: Fixed Ruler & Compact Toolbar
+
+### Type
+UI Fix
+
+### Summary
+The piano roll toolbar was so crowded that controls were getting clipped off-screen, and the timeline ruler was invisible because it scrolled away with the note grid. Fixed both: the ruler is now a separate widget pinned above the scroll area (always visible), and the toolbar is streamlined — track selector changed from tabs to a dropdown, song info moved to the status bar.
+
+### What Changed
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): NEW `RulerWidget` class — a separate fixed-height widget that draws measure numbers, beat ticks, and the red playback triangle. Lives above the scroll area so it never scrolls vertically. Syncs horizontally with the piano roll via `set_scroll_offset()`. Click-and-drag scrubbing on the ruler to set playback position. `PianoRollWidget` changed from `QScrollArea` to `QWidget` composite (ruler row + scroll area in a `QVBoxLayout`). Ruler row includes a spacer for the piano key column and a spacer for the vertical scrollbar. Canvas no longer draws the ruler or handles ruler clicks — `_RULER_HEIGHT` offset removed from canvas coordinate math. Added `set_playback_tick()` wrapper that updates both canvas and ruler.
+- **Piano Roll Window** (`ui/piano_roll_window.py`): Track selector changed from `QTabBar` (took huge horizontal space with 7+ tracks) to a compact `QComboBox` (140px). Song info label moved from toolbar to status bar. Removed `QTabBar` import. All `_track_tabs` references replaced with `_track_combo`. All `canvas.set_playback_tick()` calls changed to `_piano_roll.set_playback_tick()` so both canvas and ruler update together.
+
+### Files Changed
+- ui/piano_roll_widget.py — RulerWidget class, PianoRollWidget restructured, canvas ruler code removed
+- ui/piano_roll_window.py — Compact toolbar, track dropdown, status bar info
+
+---
+
+## [2026-04-07] — Piano Roll Round-Trip Editing (Step 8.6)
+
+### Type
+Feature
+
+### Summary
+Piano roll edits now save properly through PorySuite's standard save pipeline — edits stay in RAM, the main window's dirty flag lights up, and File → Save writes the .s file. Loop points, mid-song control changes, and structural commands are all preserved. Enhanced timeline ruler with drag-to-scrub and red triangle position handle.
+
+### What Changed
+- **Song Writer** (`core/sound/song_writer.py`): NEW — Converts SongData back to valid .s assembly. `notes_to_track_commands()` generates NOTE+WAIT pairs with loop support (LABEL+GOTO), preserves mid-song control changes (VOL/PAN/MOD/BEND/TEMPO) from original tracks at their tick positions, and keeps structural commands (PATT/PEND/GOTO/LABEL/FINE). Running-status optimization (omits unchanged pitch/velocity/duration). `write_song()` produces the full .s file. `save_song_file()` writes to disk.
+- **Piano Roll Window** (`ui/piano_roll_window.py`): Follows PorySuite save pattern — NO standalone save button. Emits `modified` signal that propagates to main window dirty flag. `save_to_disk()` called by `_on_save_all()`. `has_unsaved_changes()` for pipeline check. Close confirmation warns edits will save with File → Save. Title bar shows [modified].
+- **Sound Editor Tab** (`ui/sound_editor_tab.py`): Connects `piano_roll.modified` → `self.modified.emit()` to propagate dirty flag.
+- **Unified Main Window** (`ui/unified_mainwindow.py`): `_on_save_all()` now checks piano roll for unsaved changes and calls `save_to_disk()`.
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): Ruler expanded to 32px with gradient, beat ticks, red triangle playback handle, drag-to-scrub.
+
+### Files Changed
+- core/sound/song_writer.py — NEW: song-to-assembly writer
+- ui/piano_roll_window.py — Save pipeline integration, modified signal, dirty tracking
+- ui/sound_editor_tab.py — Piano roll modified signal connection
+- ui/unified_mainwindow.py — Piano roll added to _on_save_all
+- ui/piano_roll_widget.py — Enhanced ruler/timeline
+
+---
+
+## [2026-04-07] — Piano Roll Ruler Scrub & Position Marker
+
+### Type
+Enhancement
+
+### Summary
+Added visible playback position marker (red triangle) on the piano roll ruler and drag-to-scrub — click and drag anywhere on the ruler to move the playback position, like a standard DAW timeline. Previously the ruler only responded to single clicks, which was easy to miss.
+
+### What Changed
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): Added `RULER_SCRUB` drag mode — clicking the ruler enters scrub mode, dragging continuously updates playback position. Red downward-pointing triangle drawn on ruler at current playback tick. Releases scrub mode on mouse up.
+- **Piano Roll Window** (`ui/piano_roll_window.py`): Updated Play button tooltip to mention drag-to-scrub.
+
+### Files Changed
+- ui/piano_roll_widget.py — Ruler scrub drag mode, position triangle marker
+- ui/piano_roll_window.py — Updated tooltip
+
+---
+
+## [2026-04-07] — Piano Roll Tempo Fix & Song Structure Flattening
+
+### Type
+Bug Fix / Performance
+
+### Summary
+Fixed two major playback issues: (1) inconsistent tempo (lagging/speeding up) caused by rendering notes inside the audio callback, and (2) songs with PATT/PEND/GOTO structure (like Game Corner) not showing their full intro-then-loop sequence.
+
+### What Changed
+- **Real-Time Sequencer** (`core/sound/realtime_sequencer.py`): Note rendering moved to a background worker thread. The audio callback now ONLY does lightweight mixing of already-rendered voices. Notes are queued as `_RenderRequest` objects and rendered by `_render_worker()` on a daemon thread. This eliminates buffer underruns that caused tempo wobble.
+- **Audio Engine** (`core/sound/audio_engine.py`): Vectorized the looping sample resample in `render_directsound`. The old Python for-loop (65k iterations per note) is replaced with numpy array operations — roughly 10-50x faster.
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): `load_song_data` now calls `flatten_track_commands(loop_count=1)` before extracting notes. Songs with PATT subroutine calls and GOTO loops now show their full structure — intro sections, pattern expansions, and loop bodies are all visible.
+
+### Files Changed
+- core/sound/realtime_sequencer.py — Background render thread, render queue, callback only mixes
+- core/sound/audio_engine.py — Vectorized looping sample interpolation
+- ui/piano_roll_widget.py — Flatten PATT/PEND/GOTO in load_song_data
+
+---
+
+## [2026-04-07] — Piano Roll Playback Bug Fixes (Live Updates)
+
+### Type
+Bug Fix
+
+### Summary
+Fixed all critical playback bugs found in the piano roll audit. Swapping voicegroups or instruments during playback now works correctly — the sequencer is updated in-place instead of being destroyed and silently not recreated. Track volume and pan sliders are now connected to the sequencer. Pressing pause/resume when the sequencer hasn't been created yet starts playback instead of doing nothing. The sequencer is properly stopped before being discarded anywhere in the code.
+
+### What Changed
+- **Piano Roll Window** (`ui/piano_roll_window.py`):
+  - `_on_voicegroup_changed`: now calls `sequencer.update_voicegroup()` instead of setting sequencer to None (which broke playback)
+  - `_on_track_instrument`: now calls `sequencer.set_track_instrument()` instead of destroying sequencer
+  - NEW `_on_track_volume`: connected to sidebar's track_volume signal, calls `sequencer.set_track_volume()`
+  - NEW `_on_track_pan`: connected to sidebar's track_pan signal, calls `sequencer.set_track_pan()`
+  - `_on_pause_resume`: calls `_on_play()` instead of returning silently when sequencer is None
+  - `_reload_tracks` and `closeEvent`: now call `sequencer.stop()` before setting sequencer to None
+- **Real-Time Sequencer** (`core/sound/realtime_sequencer.py`): Already had `update_voicegroup()`, `set_track_volume()`, `set_track_pan()`, `set_track_instrument()` methods added in previous session
+
+### Files Changed
+- ui/piano_roll_window.py — Fixed 7 bugs: voicegroup swap, instrument swap, volume/pan wiring, pause/resume edge case, cleanup on destroy
+
+---
+
+## [2026-04-07] — Piano Roll Controls & Scroll Guards
+
+### Type
+Enhancement
+
+### Summary
+Fleshed out the piano roll track sidebar with proper controls: voicegroup selector, per-track instrument (VOICE) picker with live name lookup, Mute All / Unmute All / Clear Solo batch buttons. Added scroll guards to every slider and spinner in the piano roll to prevent accidental changes when scrolling the page.
+
+### What Changed
+- **Track sidebar** (`ui/piano_roll_tracks.py`): Voicegroup combo (top of sidebar), per-track instrument QSpinBox with live name label, Mute All / Unmute All / Clear Solo buttons, scroll guards on all vol/pan sliders and instrument spinners
+- **Piano roll window** (`ui/piano_roll_window.py`): Scroll guards on zoom X, zoom Y, and volume sliders. Wired up voicegroup_changed, track_instrument, and mute_solo_changed signals. Voicegroup change updates all instrument names and recreates sequencer.
+- **New helper** `get_instrument_names()` in piano_roll_tracks.py: returns 128 friendly names for any voicegroup
+
+### Files Changed
+- ui/piano_roll_tracks.py — Voicegroup combo, instrument picker, batch mute/solo, scroll guards
+- ui/piano_roll_window.py — Scroll guards on toolbar sliders, new signal handlers
+
+---
+
+## [2026-04-06] — GM Voicegroup Generator (Step 8.5)
+
+### Type
+Enhancement
+
+### Summary
+Added a GM (General MIDI) Voicegroup Generator that scans all 77 voicegroups, catalogs all 89 unique DirectSound samples, and builds a 128-slot voicegroup mapped to GM program numbers (0-127). Matched slots use real instruments from the project; unmatched slots fall back to a square wave. Accessible from both the Voicegroups tab toolbar and the MIDI Import dialog.
+
+### What Changed
+- **GM Voicegroup Generator** (`core/sound/gm_voicegroup.py`): NEW — Scans all voicegroups, catalogs 89 unique DirectSound samples, maps them to GM program numbers (0-127) by SC-88 Pro/SD-90 name matching. Creates a 128-slot voicegroup with real instruments for matched slots and square wave fallback for unmatched. Includes a coverage report function showing how many GM slots have real instruments.
+- **Voicegroups Tab** (`ui/voicegroups_tab.py`): Added "Generate GM" button to the toolbar. Creates the GM voicegroup and adds it to the project.
+- **MIDI Import Dialog** (`ui/dialogs/midi_import_dialog.py`): Added "Generate GM" button to the voicegroup selection page. MIDI import auto-detects an existing GM voicegroup and pre-selects it.
+
+### Files Changed
+- core/sound/gm_voicegroup.py — NEW: GM voicegroup generator with sample scanning, GM mapping, and coverage reporting
+- ui/voicegroups_tab.py — Added "Generate GM" toolbar button
+- ui/dialogs/midi_import_dialog.py — Added "Generate GM" button + auto-select existing GM voicegroup
+
+---
+
+## [2026-04-07] — Real-Time Sequencer for Piano Roll (Step 8.4)
+
+### Type
+Enhancement
+
+### Summary
+Piano roll now uses a real-time sequencer — notes are synthesized on-the-fly as the cursor crosses them on the timeline. No pre-rendering of the full song. Pause anywhere, edit notes, resume instantly. Click the ruler to seek. Edits take effect immediately because there's no buffer to re-render.
+
+### What Changed
+- **Real-Time Sequencer** (`core/sound/realtime_sequencer.py`): NEW — Real-time audio engine that plays piano roll notes as the cursor reaches them. Each note is rendered individually and mixed into live audio output via sounddevice. Supports play/pause/resume/seek with no latency. 32-voice polyphony limit, per-track mute/solo/volume/pan, loop region support.
+- **Piano Roll Window** (`ui/piano_roll_window.py`): Rewritten to use RealtimeSequencer instead of pre-rendering. Play starts instantly from any position. Pause/resume preserves position. Edits push updated notes to the sequencer with no re-render step. Click ruler to seek.
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): Added `ruler_clicked` signal — clicking the ruler bar seeks to that tick position.
+
+### Files Changed
+- core/sound/realtime_sequencer.py — NEW: real-time note-by-note sequencer
+- ui/piano_roll_window.py — Rewritten to use real-time sequencer
+- ui/piano_roll_widget.py — Added ruler_clicked signal for click-to-seek
+
+---
+
+## [2026-04-07] — Piano Roll Editing & Track Management (Steps 8.2 + 8.3)
+
+### Type
+Enhancement
+
+### Summary
+Added full note editing to the piano roll and a track management sidebar. Users can now place, move, resize, and delete notes visually, select groups of notes with box-select or Ctrl+click, copy/paste, and manage tracks (add, remove, duplicate, mute, solo, volume, pan).
+
+### What Changed
+- **Piano Roll Editing (Step 8.2)** (`ui/piano_roll_widget.py`): Click empty space to place a new note (snapped to grid), drag right after placing to extend duration, click-drag an existing note body to move it (time + pitch), drag the right edge of a note to resize its duration, right-click a note to delete it. Shift+drag draws a selection box selecting all notes inside, Ctrl+click toggles selection on individual notes, Delete/Backspace deletes selected notes, Ctrl+A select all, Escape deselect, Ctrl+C copy, Ctrl+V paste at playback position. Selected notes get yellow highlight outline. Velocity shown as thin bar at bottom of each note. Snap grid options: 1/4 beat, 1/8, 1/16, 1/32, Free (dropdown in toolbar). Cursor changes: crosshair on empty space, open hand on note body, resize arrow on right edge.
+- **Track Management (Step 8.3)** (`ui/piano_roll_tracks.py`): NEW — 220px track sidebar panel on the left side of the piano roll. Per-track rows showing color swatch, track name, instrument number + name from voicegroup, channel, note count. Volume slider per track (0-127, reads initial VOL command), pan slider per track (0-127, 64=center, reads initial PAN command). Mute (M) and Solo (S) toggle buttons with colored highlight when active. Click a track row to select it and switch the piano roll to that track. Add track (+) creates new empty track with default VOICE command, Remove track (-) with confirmation dialog if track has notes, Duplicate track (Dup) deep copies all commands and notes. Instrument names looked up from voicegroup data when available.
+
+### Files Changed
+- ui/piano_roll_widget.py — Added note placement, movement, resizing, deletion, selection (box/individual/all), copy/paste, velocity display, cursor changes
+- ui/piano_roll_tracks.py — NEW: Track sidebar panel with per-track controls (volume, pan, mute, solo, instrument info, add/remove/duplicate)
+
+---
+
+## [2026-04-06] — Read-Only Piano Roll View (Step 8.1)
+
+### Type
+Enhancement
+
+### Summary
+Added a read-only piano roll view that opens from the Songs tab. Users can now visualize any song as colored note bars on a DAW-style grid, with per-track tabs, zoom controls, and a playback cursor.
+
+### What Changed
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): NEW — Custom QPainter-based canvas inside a QScrollArea. Mini piano keyboard on the left sidebar (all 128 MIDI notes), measure ruler at top with measure numbers, grid lines at measure/beat/sub-beat levels (bright/medium/dim), darker rows for black keys, colored note bars per track (velocity affects opacity), loop region highlight (green tint), playback cursor (red vertical line), zoom via Ctrl+Wheel (horizontal) and Ctrl+Shift+Wheel (vertical), hover shows note name in status bar.
+- **Piano Roll Window** (`ui/piano_roll_window.py`): NEW — Standalone QMainWindow hosting the piano roll. Track tab bar ("All Tracks" plus one tab per track showing channel and instrument), horizontal and vertical zoom sliders in toolbar, grid snap selector combo box (scroll-guarded per project rules), song info label (label, BPM, notes, tracks, loop info), status bar with hovered note name, keyboard shortcuts (Ctrl+0 reset zoom, Ctrl+/- zoom in/out), Reset Zoom button.
+- **Sound Editor Tab** (`ui/sound_editor_tab.py`): Added "Piano Roll" button next to Play/Stop in transport controls. Opens PianoRollWindow for the currently selected song. Button enables/disables based on whether a parsed song is selected.
+
+### Files Changed
+- ui/piano_roll_widget.py — NEW: QPainter-based piano roll canvas with keyboard, ruler, grid, notes, loop highlight, zoom
+- ui/piano_roll_window.py — NEW: Standalone window with track tabs, zoom sliders, grid snap, song info
+- ui/sound_editor_tab.py — Added "Piano Roll" button to transport controls
+
+---
+
+## [2026-04-06] — Added mido to Setup Wizard Dependencies
+
+### Type
+Fix
+
+### Summary
+The `mido` library (used by the MIDI Import wizard) was listed in requirements.txt but missing from the setup wizard's dependency checker. Users who didn't have mido installed would see no entry for it on the setup screen and no install button.
+
+### What Changed
+- **Setup wizard** (`core/programsetup.py`): Added `mido` to the dependency list under "App / Editor" with check, description, and pip install button.
+
+### Files Changed
+- core/programsetup.py — Added mido dependency entry
+
+---
+
+## [2026-04-06] — Song Structure Page Rebuilt as Section Sequencer (Step 7.3)
+
+### Type
+Enhancement
+
+### Summary
+Rebuilt the Song Structure page (Page 3) of the MIDI Import wizard from 4 simple radio buttons into a full section sequencer. Users can now define named sections, arrange them in a custom play order, and set a loop start position.
+
+### What Changed
+- **Section Sequencer (Step 7.3 rebuild):** The Song Structure page now lets users define named sections by specifying start/end measure numbers, arrange sections in a custom play order (drag/reorder), and set which position in the play order starts the loop (everything before the loop point is the intro that plays once, everything from that point onward repeats). Quick presets (Automatic, Loop All, No Loop) cover simple cases. The post-processor translates custom structure into GOTO/PATT/PEND assembly commands in the .s file.
+- **MidiFileInfo expanded:** `core/sound/midi_importer.py` `MidiFileInfo` now includes `total_measures`, `time_sig_num`, `time_sig_den` computed from the MIDI file, so the structure page can display measure ranges accurately.
+
+### Files Changed
+- ui/dialogs/midi_import_dialog.py — Rebuilt Song Structure page (Page 3) from radio buttons to section sequencer with drag-reorder and loop point
+- core/sound/midi_importer.py — Added total_measures, time_sig_num, time_sig_den to MidiFileInfo
+
+---
+
+## [2026-04-06] — Phase 7 MIDI Import Complete (Steps 7.2 + 7.3)
+
+### Type
+Enhancement
+
+### Summary
+Completed the remaining two steps of the MIDI Import wizard: instrument mapping and song structure/loop points. The wizard is now a full 5-page flow.
+
+### What Changed
+- **Instrument Mapping page (Step 7.2):** Per-track grid showing MIDI instrument → voicegroup slot mapping. Each row has the GM instrument name, a slot spinner (0-127), and a live label showing what instrument is in that voicegroup slot (green text) or "filler / empty" (red). Auto-Match by Name button uses word overlap scoring. After mid2agb converts the file, `_postprocess_voice_remap()` rewrites VOICE commands for any remapped tracks.
+- **Song Structure page (Step 7.3):** Initial version with 4 loop mode presets (later rebuilt as full section sequencer — see entry above).
+- **Step indicator:** Top of the dialog shows the current step in the 5-page flow.
+- **Dialog now receives voicegroup data** from the Sound Editor so instrument names can be displayed in the mapping page.
+
+### Files Changed
+- ui/dialogs/midi_import_dialog.py — Rewrote as 5-page wizard (was 3 pages), added mapping grid, structure page, voice remap post-processor
+- ui/sound_editor_tab.py — Pass voicegroup_data to MidiImportDialog constructor
+
+---
+
+## [2026-04-06] — Phase 7 MIDI Import, Phase 6 Complete, Dynamic Palettes Fix
+
+### Type
+Enhancement + Fix
+
+### Summary
+Three areas of work: (1) Built the MIDI Import wizard (Phase 7, Steps 7.1 + 7.4) — users can now import .mid files as new GBA songs from within PorySuite. (2) Completed the remaining Phase 6 items — constants sync, Porymap integration (already handled by file watching), and audio output device selector in Settings. (3) Fixed a bug where replacing the pokefirered folder would leave a stale marker file, making PorySuite think dynamic palettes were still applied when they weren't — causing broken overworld palette colors.
+
+### What Changed
+- **MIDI Import Dialog** (`ui/dialogs/midi_import_dialog.py`): 3-page wizard — pick a .mid file (see tracks, tempo, duration), choose voicegroup + settings (volume, reverb, priority), then import. Runs mid2agb on a background thread and registers the new song in song_table.inc, songs.h, and midi.cfg.
+- **MIDI Importer backend** (`core/sound/midi_importer.py`): Full GM instrument name table (128 entries), MIDI parser via `mido`, mid2agb runner, song registration pipeline, constant name validation.
+- **Import MIDI button**: Added to Songs tab left panel. Opens the wizard. After import, reloads the song list and selects the new song.
+- **Constants sync**: Added "sound" to the page set that triggers ConstantsManager.refresh() when switching to EVENTide. New/removed songs now appear in EVENTide dropdowns automatically.
+- **Audio output mode selector**: New dropdown in Settings > Sound Editor — Stereo or Mono. Stereo preserves left/right panning like the GBA. Mono mixes both channels together. Both Songs tab and Instruments tab preview respect the setting.
+- **Dynamic palettes detection fix**: `is_dowp_enabled()` now checks the actual C source code for DOWP patch signatures instead of just looking for a marker file. If the source doesn't match the marker (e.g. folder was replaced), the stale marker is cleaned up and the button re-enables.
+- **Scroll guards**: Added `install_scroll_guard()` to all QComboBox widgets in the Settings dialog (6 combos — previously unprotected).
+- **New dependency**: `mido>=1.3` added to requirements.txt.
+
+### Files Changed
+- core/dynamic_ow_pal_patch.py — Rewrote `is_dowp_enabled()` to verify source code, not just marker file
+- core/sound/midi_importer.py — NEW: MIDI import pipeline
+- core/sound/audio_engine.py — Added `mono` parameter to `AudioPlayer.play()` for stereo/mono output mode
+- ui/sound_editor_tab.py — Added "Import MIDI..." button, `_open_midi_import()`, `_on_midi_imported()`
+- ui/dialogs/midi_import_dialog.py — NEW: MIDI Import wizard dialog
+- ui/dialogs/settingsdialog.py — Added audio device selector, scroll guards on all combos
+- ui/instruments_tab.py — Pass output device setting to AudioPlayer
+- ui/unified_mainwindow.py — Added "sound" to pages that trigger ConstantsManager refresh
+- requirements.txt — Added mido>=1.3
+- docs/SOUND_EDITOR_PLAN.md — Phase 6 marked COMPLETE, Phase 7 Steps 7.1+7.4 marked COMPLETE
+
+---
+
+## [2026-04-06] — EVENTide Command Widget Bug Fixes (savebgm, healplayerteam, playmoncry, shared sub-label save, local_id)
+
+### Type
+Fix
+
+### Summary
+Fixed five bugs in EVENTide's event editor command widgets and save pipeline discovered during Sound Editor integration testing. The savebgm widget was missing its required song argument (build error). The healplayerteam widget emitted a nonexistent macro instead of `special HealPlayerParty`. The playmoncry widget discarded the mode parameter. Scripts sharing sub-labels via `goto` could overwrite each other during save. Objects without a `local_id` field got an empty one injected, causing a build error.
+
+### What's Fixed
+- **savebgm missing song argument**: `_SaveBgmWidget` was `_header_only = True`, returning just `('savebgm',)`. The GBA macro requires `savebgm song:req`. Added a ConstantPicker for MUS_* constants so the widget returns `('savebgm', song_constant)`. Factory updated to pass the parsed song arg.
+- **healplayerteam not a real macro**: Widget returned `('healplayerteam',)` which doesn't exist as a GBA assembly macro. Changed to return `('special', 'HealPlayerParty')`. Factory maps `special HealPlayerParty` → `_HealPlayerTeamWidget()`.
+- **playmoncry mode discarded**: Widget always hardcoded mode to `0`, dropping the original value. Now accepts and preserves the `mode` parameter via constructor.
+- **Shared sub-label save overwrite**: When multiple events share a script sub-label via `goto` (e.g. three triggers all referencing `RivalBattle`), the save loop processed events in order, so the last event's stale copy overwrote the user's edit. Fixed by reordering the save loop so the currently-selected event is processed last (its edits win).
+- **Empty local_id build error**: `_collect_current()` wrote `obj['local_id'] = ""` to objects that originally had no `local_id` field. The build tool rejected the empty value. Now only writes `local_id` if the text is non-empty. Removed the bogus field from Oak's Lab map.json.
+
+### Files Changed
+- eventide/ui/event_editor_tab.py — Fixed _SaveBgmWidget, _HealPlayerTeamWidget, _PlayMonCryWidget, shared sub-label save ordering, local_id guard
+- pokefirered/data/maps/PalletTown/scripts.inc — Fixed `savebgm` → `savebgm MUS_PALLET`
+- pokefirered/data/maps/PalletTown_ProfessorOaksLab/map.json — Removed bogus empty `local_id` from Aide1
+
+---
+
+## [2026-04-06] — EVENTide Sound Preview: Stay-on-Page, Stop Button, Song Looping
+
+### Type
+Enhancement
+
+### Summary
+Three user-facing improvements to the Sound Editor ↔ EVENTide integration. Preview playback no longer switches tabs (stays on the Event Editor). A dedicated ■ Stop button was added to all sound command widgets. Songs now loop during preview instead of playing once and stopping.
+
+### What's New
+- **Preview stays on page**: Clicking ▶ Play on a playbgm/playse/playfanfare widget renders and plays the song in the background without switching to the Sound Editor tab. Previously it switched tabs, losing your place in the event editor.
+- **■ Stop button**: All three sound command widgets (playbgm, playse, playfanfare) now have a ■ Stop button that stops audio playback without leaving the Event Editor.
+- **Song looping**: Songs now render with configurable loop iterations (default 2) via the `sound/loop_count` setting. Previously played the intro section and stopped after one pass.
+
+### Files Changed
+- eventide/ui/event_editor_tab.py — Added ■ Stop buttons, _stop_preview_cb callback
+- ui/sound_editor_tab.py — preview_song_by_constant() renders in background without tab switch, loop_count from settings
+- ui/unified_mainwindow.py — _sound_preview_song no longer switches pages, added _sound_stop_preview
+- ui/dialogs/settingsdialog.py — Loop count setting in Sound Editor page
+
+---
+
+## [2026-04-06] — Sound Editor Phase 6: Integration with PorySuite-Z
+
+### Type
+Feature
+
+### Summary
+Wired the Sound Editor into the rest of the app. EVENTide's playbgm, playse, and playfanfare command widgets now have Preview (▶) and Open in Sound Editor (🔊) buttons. F8 keyboard shortcut jumps to the Sound Editor. Save pipeline expanded to cover song table, songs.h, and midi.cfg when modified. New "Sound Editor" page in Settings with preview volume, loop count, and sample import defaults. Also fixed the Voicegroups save dropping the `.include "sound/cry_tables.inc"` line that caused build failures.
+
+### What's New
+- **EVENTide Preview buttons**: ▶ Play and ■ Stop buttons on playbgm, playse, and playfanfare command widgets — plays/stops the selected song without leaving the Event Editor
+- **Open in Sound Editor**: 🔊 button on the same widgets — switches to the Sound Editor and selects that song
+- **F8 shortcut**: Press F8 from anywhere to jump to the Sound Editor
+- **Save pipeline**: song_table.inc, songs.h, and midi.cfg now save when modified (via `_dirty` flag on SongTableData)
+- **Sound Settings page**: New page in Settings dialog with preview volume, loop count, and auto-downsample rate
+- **Cry tables fix**: Voicegroups save now preserves `.include` lines from the original file (was dropping `cry_tables.inc` causing linker errors)
+- **Song looping**: Songs now render with 2 loop iterations by default (configurable in Settings). Previously played the intro and stopped.
+- **Public API**: `preview_song_by_constant()`, `select_song_by_constant()`, `stop_preview()`, `is_playing` on SoundEditorTab for cross-editor use
+
+### Files Changed
+- ui/sound_editor_tab.py — Added `preview_song_by_constant()`, `select_song_by_constant()`, `song_table` property
+- eventide/ui/event_editor_tab.py — Added preview/open buttons to _PlaySEWidget, _PlayFanfareWidget, _PlayBGMWidget; module-level callbacks
+- ui/unified_mainwindow.py — Wired Sound Editor ↔ EVENTide callbacks, expanded save pipeline, F8 shortcut
+- ui/dialogs/settingsdialog.py — New "Sound Editor" settings page
+- ui/voicegroups_tab.py — Fixed save_to_disk() to preserve .include lines
+- porysuite/pokefirered/sound/voice_groups.inc — Restored missing cry_tables.inc include
+
+---
+
+## [2026-04-06] — Sample Import Size Warning & Downsample Option
+
+### Type
+Enhancement
+
+### Summary
+When importing a WAV sample, the editor now shows the file's size, sample rate, and duration upfront. If the WAV's sample rate is higher than GBA-typical (13379 Hz), it offers downsample options so you don't accidentally fill the ROM with a 44 kHz recording when 13 kHz sounds identical on GBA hardware.
+
+### What's New
+- **Import size preview**: Before importing, shows estimated GBA size (e.g. "129.2 KB at 44100 Hz")
+- **Downsample menu**: For high-rate WAVs, offers choices like "Keep original (44100 Hz) — 129.2 KB", "Downsample to 22050 Hz — 64.6 KB", "Downsample to 13379 Hz — 26.1 KB"
+- **Low-rate pass-through**: WAVs already at GBA-friendly rates (≤13379 Hz) get a simple confirmation with size info
+- **`peek_wav_info()` utility**: New function in sample_loader.py reads WAV metadata without converting — returns rate, channels, duration, estimated GBA size
+- **`target_rate` parameter**: `import_wav_as_sample()` now accepts a target rate and resamples during import if specified
+
+### Files Changed
+- ui/instruments_tab.py — Rewrote `_on_import_sample()` with size/rate dialog and downsample options
+- core/sound/sample_loader.py — Added `peek_wav_info()`, added `target_rate` param to `import_wav_as_sample()`
+
+---
+
+## [2026-04-06] — Sound Editor Phase 5: Voicegroups Tab
+
+### Type
+Feature
+
+### Summary
+Built the full Voicegroups Tab — browse all 77 voicegroups, view/edit all 128 instrument slots per voicegroup, change instrument types (swap square waves for samples, etc.), assign samples/waveforms, edit all parameters (ADSR, base key, pan, duty, sweep, period), add/clone/delete voicegroups, and save to disk. Also fixed "No Map Loaded" error on save when no EVENTide map was open, and added sample rate resampling on Replace so pitch stays correct.
+
+### What's New
+- **Voicegroup Browser**: Left panel lists all voicegroups with real (non-filler) slot counts and song usage counts. Search filter. Tooltips show which songs use each voicegroup.
+- **128-Slot Grid**: All slots shown with type badge, friendly name, and detail summary. Filter dropdown: All / Non-Filler / Samples / Square / Prog. Wave / Noise / Keysplit. Filler slots greyed out.
+- **Voice Type Changer**: Dropdown to change any slot's instrument type (all 13 editable voice types). Type-specific fields show/hide automatically. Defaults assigned when switching types.
+- **Sample Picker**: Dropdown of all DirectSoundWaveData samples with info line (rate, length, loop). Appears for DirectSound slots.
+- **Wave Picker**: Dropdown of all programmable wave samples. Appears for Prog. Wave slots.
+- **Keysplit Editor**: Target voicegroup picker + keysplit table picker. Table combo hidden for keysplit_all.
+- **Full Parameter Editor**: Base key spinner, pan spinner, duty cycle dropdown, sweep spinner, period dropdown, ADSR sliders with auto-scaling (CGB vs DirectSound ranges).
+- **Voicegroup Management**: Add new (128 filler slots), Clone (deep copy all slots), Delete (blocked if songs reference it).
+- **Copy Instrument From VG**: Right-click a slot → copy that slot's instrument definition from another voicegroup.
+- **Go to Instrument**: Right-click a slot → jump to the Instruments tab with that instrument selected.
+- **Cross-Reference**: "Songs Using This Voicegroup" section shows all songs referencing the selected VG.
+- **Save to Disk**: Writes full `voice_groups.inc` with correct assembly syntax for all 15 voice types. Dirty tracking per-voicegroup.
+- **Save Pipeline**: Voicegroup changes saved via File → Save alongside all other editors.
+- **Sample Resampling on Replace**: Replace now auto-resamples WAV to match original sample rate + preserves loop flag.
+- **"No Map Loaded" fix**: Save no longer shows EVENTide error popup when no map is open.
+- **Scroll guards**: QSlider added to scroll guard types — all sliders app-wide now require click-focus before scroll wheel changes values.
+
+### Files Changed
+- ui/voicegroups_tab.py — NEW: Full Voicegroups Tab (browser, editor, management, save)
+- ui/sound_editor_tab.py — Added Voicegroups sub-tab, wired data loading and sample sharing
+- ui/unified_mainwindow.py — Voicegroup save in pipeline, EVENTide save guard
+- core/sound/sample_loader.py — Added _resample_linear(), updated replace_sample_from_wav() with resampling + loop preservation
+- ui/custom_widgets/scroll_guard.py — Added QSlider to guarded types
+- ui/instruments_tab.py — Scroll guards on ADSR sliders, updated Replace tooltip
+
+---
+
+## [2026-04-06] — Sound Editor: Piano Octave Controls & Go to Instrument
+
+### Type
+Enhancement
+
+### Summary
+Added octave shift controls to the piano keyboard (was stuck at C3-B5, now you can shift up/down freely) and a right-click "Go to Instrument" option on the Songs tab track list that jumps you directly to that instrument in the Instruments tab.
+
+### What's New
+- **Piano octave shift**: Arrow buttons (◀/▶) flanking the keyboard shift it up or down one octave at a time. Range label updates to show the current span (e.g. "C5 – B7"). Clamped to MIDI 0-127.
+- **Right-click "Go to Instrument"**: In the Songs tab, right-click any track to see a "Go to Instrument" option. Clicking it switches to the Instruments tab and highlights that instrument. Works via identity-key matching so it finds the right deduplicated entry even across shared voicegroups.
+- **`select_instrument()` public API**: New method on InstrumentsTab for programmatic instrument selection by voicegroup name + slot index.
+
+### Files Changed
+- ui/instruments_tab.py — Added `set_start_octave()`, `start_octave` property, octave buttons, range label, `_on_octave_down/up`, `_update_piano_range_label`, `select_instrument()` method
+- ui/sound_editor_tab.py — Added QMenu/QAction imports, track context menu with "Go to Instrument", stored voicegroup/slot data on track tree items
+
+---
+
+## [2026-04-06] — Sound Editor: Tooltips & Guidance Pass
+
+### Type
+Enhancement
+
+### Summary
+Added comprehensive tooltips and guidance text across the entire Instruments Tab. Every interactive control now has a tooltip explaining what it does in plain English — especially important for the Import button which explains WAV file requirements (must be mono, any bit depth, any sample rate, shorter is better for GBA).
+
+### What's New
+- **Import button tooltip**: Full requirements — mono only, supported bit depths (8/16/24/32-bit int, 32/64-bit float), typical GBA sample rates (8000–22050 Hz), note about GBA memory limits, loop point detection
+- **Export button tooltip**: Explains output format (8-bit mono WAV)
+- **Replace button tooltip**: Clarifies it keeps the label and all references
+- **Delete button tooltip**: Explains what gets removed (.bin file + .inc entry)
+- **ADSR slider tooltips**: Each slider now explains what the parameter controls and shows both scale ranges (synth 0–7 vs sample 0–255)
+- **ADSR group box tooltip**: Plain English explanation of the volume envelope concept
+- **Duty Cycle tooltip**: Describes each percentage and its sound character
+- **Sweep tooltip**: Explains the pitch slide effect (square_1 only)
+- **Period tooltip**: Describes white noise vs metallic noise
+- **Pan tooltip**: Expanded with full range description
+- **Play button tooltip**: Explains what it does and mentions the piano alternative
+- **Piano keyboard tooltip + hint label**: "Click any key to preview at that pitch (C3–B5)"
+- **Search box tooltip**: Explains it filters across all type groups
+- **Instrument Details group tooltip**: Notes that edits apply to all shared copies
+- **Used By group tooltip**: Explains cross-voicegroup sharing
+
+### Files Changed
+- ui/instruments_tab.py — Added/improved tooltips on all interactive controls, added piano hint label
+
+---
+
+## [2026-04-06] — Sound Editor Phase 4.4: Sample Management
+
+### Type
+Feature
+
+### Summary
+Added sample management features to the Instruments Tab — export samples to WAV, import new samples from WAV (using wav2agb), replace existing sample audio, and delete unused samples with reference checking. Also added a UI hint explaining that Base Key doesn't change pitch for sample-based instruments.
+
+### What's New
+- **Export to WAV**: Save any DirectSound sample as a standard .wav file (converts signed 8-bit GBA format to unsigned 8-bit WAV)
+- **Import from WAV**: Pick a .wav file, name it, and wav2agb converts it to GBA .bin format — automatically added to `direct_sound_data.inc` and the sample library
+- **Replace sample**: Swap a sample's audio with a new .wav file while keeping the same label and all voicegroup references intact (backs up the original during conversion)
+- **Delete sample**: Remove an unused sample — checks all voicegroups first and blocks deletion if any instrument still references it
+- **Reference checker**: `get_sample_references()` finds every voicegroup slot that uses a given sample
+- **Base Key hint**: When viewing a sample instrument, a note explains that pitch comes from the sample file itself, not the Base Key value
+
+### Files Changed
+- core/sound/sample_loader.py — Added: `export_sample_to_wav()`, `import_wav_as_sample()`, `replace_sample_from_wav()`, `delete_sample()`, `get_sample_references()`, `_find_wav2agb()`, `_remove_inc_entry()`
+- ui/instruments_tab.py — Added: Export WAV / Replace / Delete buttons on sample instruments, Import New Sample button always visible, Base Key hint label, QFileDialog/QMessageBox/QInputDialog imports
+
+### Notes
+- wav2agb is expected in the project at `tools/wav2agb/wav2agb.exe` (Windows) or `tools/wav2agb/wav2agb` (Linux)
+- Replace creates a `.bak` backup of the original .bin during conversion, cleaned up on success or restored on failure
+- Delete only works for unreferenced samples — the UI shows which voicegroups are blocking deletion
+- Programmable wave import (visual editor) deferred to a later phase
+
+---
+
+## [2026-04-06] — Sound Editor Phase 4: Instruments Tab
+
+### Type
+Feature
+
+### Summary
+Added the Instruments Tab to the Sound Editor — a browsable list of all 7,841 instruments across 77 voicegroups with filtering, detail view, ADSR envelope visualization, and a clickable 3-octave piano keyboard for previewing any instrument at any pitch.
+
+### What's New
+- **Sub-tab bar**: Sound Editor now has "Songs" and "Instruments" sub-tabs (was a flat Songs-only page)
+- **Instrument browser**: Scrollable list showing every instrument in every voicegroup — columns for name, type, voicegroup number, and slot index
+- **Three filters**: Filter by voicegroup, by type (Sample / Square Wave / Prog. Wave / Noise / Keysplit), or search by name
+- **Detail panel**: Shows instrument type, base key, pan, voice macro, and type-specific info (sample name + rate + loop for DirectSound; duty cycle + sweep for square waves; waveform label for prog. wave; period for noise; target voicegroup for keysplits)
+- **ADSR envelope display**: Visual curve showing the Attack / Decay / Sustain / Release shape, with numeric readouts (auto-detects CGB 0-7/0-15 vs DirectSound 0-255 scale)
+- **"Used By" cross-reference**: Shows which other voicegroups contain the same sample or synth definition
+- **Piano keyboard preview**: Click any key on a 3-octave piano (C3–B5) to hear the instrument at that pitch. Also a "Play Note" button for middle C. Renders in a background thread so the UI stays responsive.
+
+### Files Changed
+- ui/sound_editor_tab.py — Restructured: added QTabWidget with "Songs" and "Instruments" sub-tabs, passes voicegroup/sample data to instruments tab, wires modified signal
+- ui/instruments_tab.py — **New file**: InstrumentsTab widget (grouped unique-instrument browser, editable detail panel with ADSR sliders, type-specific controls, cross-voicegroup edit propagation), PianoKeyboard widget, ADSRDisplay widget
+
+### Notes
+- All 18 existing audio tests still pass
+- 144 unique instruments shown (deduplicated from 7,841 total slots, filler removed)
+- Grouped by type: Samples (89), Square Waves (32), Prog. Waves (11), Noise (2), Keysplits (10)
+- Preview playback lazy-loads sample data on first use (same pattern as Songs tab)
+- Editing an instrument updates every copy across all voicegroups that share it
+- File writing (voice_groups.inc) deferred to Phase 6 save pipeline
+
+---
+
+## [2026-04-06] — Sound Editor: XCMD Parser Fix, Fixed-Pitch Instruments, Drum Overflow
+
+### Type
+Bugfix
+
+### Summary
+Fixed three critical audio bugs: XCMD continuation lines creating phantom key-shift commands (affected ~85 songs), `_alt` voice types ignoring the fixed-pitch flag (406 percussion instruments pitch-shifted when they shouldn't be), and keysplit_all overflow making drum tracks silent when note indices exceeded voicegroup bounds.
+
+### Problems Fixed
+1. **XCMD continuation lines misparse** — Multi-line XCMD instructions (`.byte xIECL, 8` on a continuation line) fell through to the running-status handler. `xIECL` resolved to integer 9, then was emitted as the last control command (usually KEYSH), creating phantom KEYSH=9/8 that shifted all subsequent notes up 8-16 semitones. This broke mus_gym, mus_encounter_gym_leader, and ~83 other songs. Fixed by recognizing XCMD sub-command tokens before the running-status handler.
+2. **_alt voice types (TONEDATA_TYPE_FIX) investigated** — Initially assumed 406 CGB _alt instruments needed fixed pitch. Applied blanket fix that caused REGRESSION (monotone flat sounds). After tracing GBA source: TONEDATA_TYPE_FIX only means "fixed pitch" for DirectSound channels (already handled by `no_resample`). For CGB channels it only does minor frequency rounding for anti-aliasing — pitch still varies normally. Fix REVERTED. CGB _alt instruments now correctly pitch-shift.
+3. **keysplit_all overflow** — GBA stores voicegroups contiguously, so keysplit_all (which indexes by MIDI note) can overflow past the target voicegroup into the next one. voicegroup001 has 29 slots; drum note 40 should reach voicegroup002[11] (orchestra_snare) but our parser returned None (silent). Fixed by adding `get_instrument_overflow()` that chains into subsequent voicegroups.
+
+### Files Changed
+- core/sound/song_parser.py — Added XCMD sub-command token recognition (xIECV, xIECL) to skip continuation lines
+- core/sound/audio_engine.py — Added TONEDATA_TYPE_FIX check (fixed-pitch for _alt instruments); updated keysplit_all to use overflow lookup
+- core/sound/voicegroup_parser.py — Added `get_instrument_overflow()` method to VoicegroupData for GBA-style contiguous memory indexing
+
+### Notes
+- All 18 tests pass
+- mus_gym: drum track now renders (peak 0.38 vs silence), no more phantom KEYSH
+- mus_encounter_gym_leader: no more phantom KEYSH=16, notes at correct pitch
+
+---
+
+## [2026-04-06] — Sound Editor: Audio Accuracy Fixes (Volume, Pitch, Pan, Parser)
+
+### Type
+Bugfix
+
+### Summary
+Fixed multiple audio accuracy bugs in the Sound Editor's rendering engine. Songs now play with correct volume balance, proper pitch (no more wrong-key instruments), correct stereo panning matching GBA hardware, and no missing notes from unparsed running-status bytes.
+
+### Problems Fixed
+1. **Double velocity + wrong master volume** — Velocity was applied twice (once in track_renderer, again in audio_engine). The song's `mvl` constant was also multiplied in again, but it's already baked into VOL command values in the source (written as `VOL, n*mvl/mxv`). Combined effect: some instruments were at ~18% of correct volume.
+2. **Fake CGB volume reduction factors** — Square waves (×0.3), programmable waves (×0.25), and noise (×0.2) had arbitrary reduction multipliers that don't exist on GBA hardware. The GBA runs the same volume pipeline for all channel types.
+3. **Constant-power panning instead of GBA linear crossfade** — `apply_pan` used `cos/sin` but GBA uses a simple linear split: `left = (127 - pan) / 255`, `right = (pan + 128) / 255`.
+4. **Per-track panning instead of per-note** — Only the first PAN command per track was used for the entire track. Mid-song PAN changes were tracked in state but never applied. Now each note is panned at the current pan value.
+5. **BEND command not subtracting C_V** (prior session) — GBA's `ply_bend` subtracts 64 before storing. With BENDR=12 (Lavender Town), this caused +6 semitone offset on all notes.
+6. **Running status bytes dropped** (prior session) — Bare integer values on `.byte` lines (VOL running status) were stored as unused CONTINUATION commands, causing notes to play at VOL=0 (silent). Fixed by tracking `last_control_cmd`.
+
+### Files Changed
+- core/sound/audio_engine.py — Removed ×0.3/×0.25/×0.2 CGB volume factors; changed `apply_pan` from constant-power to GBA linear crossfade
+- core/sound/track_renderer.py — Removed double velocity application; removed master_volume multiplication; `render_track` now returns stereo with per-note panning; `render_song` simplified (no more per-track pan pass)
+- tests/test_track_renderer.py — Updated for stereo return from `render_track`
+
+### Notes
+- All 18 tests pass
+- Rendered test WAVs: mus_victory_trainer (30.6s), mus_vs_wild (77s), mus_vs_trainer (185s), mus_gym (68s), mus_lavender (158s)
+
+---
+
+## [2026-04-06] — Sound Editor Phase 3 (Start): Songs Tab Integrated into PorySuite-Z
+
+### Type
+Feature
+
+### Summary
+Added the Sound Editor as a new toolbar page in PorySuite-Z. Users can now browse all 347 songs, view details (voicegroup, tempo, tracks, loop points), and play songs directly in the app using the project's actual instruments.
+
+### Files Changed
+- ui/sound_editor_tab.py (new) — Full Songs browser with playback controls
+- ui/unified_mainwindow.py (modified) — Added "Sound Editor" toolbar button and page, data loading on project open
+- res/icons/toolbar/sound.png (new) — Music note toolbar icon
+
+### Notes
+- Song list supports filtering by type (BGM/SE) and text search
+- Clicking a song parses its .s file on demand and shows: voicegroup, track count, tempo, reverb, volume, loop points
+- Track list shows per-track info: MIDI channel, note count, first instrument name
+- Play button renders the song in a background thread then streams via sounddevice
+- Transport: Play/Pause/Resume/Stop with volume slider and time display
+
+---
+
+## [2026-04-06] — Sound Editor Phase 2: Audio Playback Engine
+
+### Type
+Feature
+
+### Summary
+Built the complete audio rendering pipeline for the Sound Editor. Can now render any song from the project to playable audio using the actual instruments — DirectSound samples with pitch shifting and looping, square wave synthesis, programmable wave synthesis, noise generation, ADSR envelopes, stereo panning, and reverb.
+
+### Files Changed
+- core/sound/audio_engine.py (new) — All synthesis: DirectSound PCM, square wave, prog. wave, noise, ADSR, reverb, panning, AudioPlayer
+- core/sound/track_renderer.py (new) — Track state machine, tick timing, song mixer, instrument preview
+- tests/test_audio_engine.py (new) — 14 unit + integration tests
+- tests/test_track_renderer.py (new) — 4 integration tests (full song renders)
+- tests/test_playback.py (new) — End-to-end WAV output test
+- docs/SOUND_EDITOR_PLAN.md (updated) — Phase 2 marked COMPLETE
+
+### Notes
+- mus_cycling (8 tracks, 34.6s) renders in ~1.9s, mus_pallet (6 tracks, 44s) in ~2.6s
+- New dependencies: sounddevice 0.5.5, numpy 2.4.4
+- Phase 3 (Songs Tab UI) is next
+
+---
+
+## [2026-04-06] — Sound Editor Phase 1: Core Parsing Engine
+
+### Type
+Feature
+
+### Summary
+Built the complete parsing backend for the Sound Editor — reads all music data from the pokefirered project into Python data structures. This is the foundation for the full music editor that will be integrated into PorySuite-Z.
+
+### Files Changed
+- core/sound/__init__.py (new)
+- core/sound/sound_constants.py (new) — GBA M4A bytecode constants, note names, voice types
+- core/sound/song_parser.py (new) — .s song file parser (tracks, commands, loop points)
+- core/sound/song_table_manager.py (new) — song_table.inc + songs.h + midi.cfg reader/writer
+- core/sound/voicegroup_parser.py (new) — voice_groups.inc + keysplit_tables.inc parser
+- core/sound/sample_loader.py (new) — .bin sample loader with GBA WaveData header decoding
+- docs/SOUND_EDITOR_PLAN.md (new) — full 9-phase roadmap for the Sound Editor
+
+### Notes
+- Tested against live pokefirered data: 347 songs, 77 voicegroups, 89 instrument samples, 5 keysplit tables
+- Discovered .bin sample format uses fixed-point frequency (Hz = raw >> 10) and 0x4000 status flag for looping
+- Phase 2 (audio playback engine) is next
+
+---
+
+## [2026-04-06] — Overworld Editor Overhaul: Sprite-First UI, Animation Fixes, Add New Sprites, Cross-Tab Sync
+
+### Type
+Feature / Enhancement
+
+### Summary
+Major overhaul of the Overworld Graphics editor across multiple areas:
+
+**UI restructured to sprite-first layout:**
+- Left panel now shows all sprites in a searchable, filterable thumbnail grid
+  (category dropdown + search bar) instead of grouping by palette pool.
+- Right panel split: sprite sheet + animation preview on top, palette editor
+  on bottom. Clicking any sprite in the grid loads its detail and palette.
+- Blue highlight on the selected sprite in the grid.
+
+**Animation type-aware previews (fixed):**
+- **Fishing sprites:** Now show all 4 directional rod animations (South, West,
+  North, East=West mirrored) instead of a single Cast/Hold/Reel view.
+- **Surf sprites:** Two-row display — Row 1 shows static directional poses,
+  Row 2 shows the surf run cycle (stand→step1→stand→step2 per direction).
+  Second row only appears when the sheet has 12+ frames.
+- **VS Seeker sprites:** Shows the actual raise animation sequence
+  (0→1→5→6→7→8→6→1→0) instead of incorrectly treating it as a walk cycle.
+- Animation speed matched to GBA (~150ms per frame, up from 333ms).
+
+**Add New Overworld Sprite:**
+- "+ Add New Sprite…" button in the left panel opens a dialog to create a new
+  overworld sprite from a PNG sheet.
+- Auto-detects frame size, name, and palette from the PNG.
+- Choose animation type (Walk Cycle, Static, Player-style), category
+  (People, Pokemon, Misc), and palette assignment.
+- Palette choice: "Create new from PNG" (if DOWP enabled) or pick from 4 NPC
+  palette slots (Blue/Pink/Green/White).
+- Writes all 6 C header/source files automatically: event_objects.h,
+  object_event_graphics.h, object_event_pic_tables.h,
+  object_event_graphics_info.h, object_event_graphics_info_pointers.h,
+  event_object_movement.c.
+- New `OBJ_EVENT_GFX_` constant is pushed into EVENTide's ConstantsManager
+  immediately — the Event Editor's graphic dropdown picks up new sprites
+  without needing a save or refresh.
+
+**Palette reassignment:**
+- "Assign to" dropdown + Apply button in the Palette section lets you change
+  which palette a sprite uses. Modifies the C source directly.
+
+**Dynamic Overworld Palettes (DOWP):**
+- One-way patch button to enable per-sprite palettes in the C engine.
+- Modifies 5 source files (event_object_movement.c, field_effect.c,
+  field_effect_helpers.c, event_object_movement.h, field_effect.h).
+- Status indicator shows whether DOWP is active.
+
+**Cross-tab sync (Overworld → EVENTide):**
+- New `gfx_constants_changed` signal on the overworld tab.
+- Wired through `UnifiedMainWindow` to call `_refresh_eventide_constants()`.
+- Event editor's `refresh_gfx_constants()` repopulates the graphic dropdown.
+- Same pattern as trainers/items/species cross-tab sync.
+
+**Other improvements:**
+- "Show in Folder" button opens Explorer with the sprite PNG selected
+  (`explorer /select,...`) instead of just opening the folder.
+- Overworld GFX toolbar button added to unified window.
+- App opens maximized reliably (QTimer.singleShot workaround).
+
+**Project Display Name setting:**
+- New "Project" section at the top of Settings → General page.
+- "Display Name" field controls what shows in the launcher and window title.
+- Persisted to both `projects.json` and per-project `config.json`.
+
+### Files modified
+- `ui/overworld_graphics_tab.py` — restructured to sprite-first layout,
+  animation type dispatching (surf/fish/VS Seeker/inanimate/destroy),
+  two-row surf preview, Add New Sprite dialog, palette reassignment,
+  Show in Folder, cross-tab GFX signal
+- `core/overworld_sprite_creator.py` — **new file**, backend for adding new
+  overworld sprites (all 6 C file modifications)
+- `core/dynamic_ow_pal_patch.py` — **new file**, DOWP patch engine
+- `ui/unified_mainwindow.py` — overworld tab in toolbar, GFX signal wiring,
+  project name save, maximize fix, DOWP constants refresh
+- `ui/dialogs/settingsdialog.py` — project display name field
+- `eventide/ui/event_editor_tab.py` — `_refresh_gfx_combo()` and
+  `refresh_gfx_constants()` public method for cross-tab sync
+- `eventide/ui/widgets.py` — animation speed 333ms → 150ms
+- `app.py` — maximize fix (QTimer.singleShot)
+- `res/icons/toolbar/overworld.png` — **new file**, toolbar icon
+
+
+## [2026-04-06] — Overworld Graphics Tab (Initial)
+
+### Type
+Feature
+
+### Summary
+**New top-level "Overworld GFX" tab in the main toolbar**, providing a full
+overworld sprite and palette management interface.
+
+Features:
+- **Left panel — Palette pool list:** Shows all shared overworld palettes
+  (Player Red, NPC Blue, NPC Pink, NPC Green, NPC White, Seagallop, SS Anne,
+  etc.) with a sprite count beside each pool. Selecting a pool shows its
+  editable 16-colour `PaletteSwatchRow`. "Import from PNG" extracts colours
+  from an indexed PNG and GBA-clamps to 15-bit. "Open Folder" opens the
+  palettes directory in the OS file manager.
+- **Right panel — Sprite browser:** Category filter dropdown
+  (All / Players & NPCs / Pokemon / Objects & Items) plus a search box.
+  Scrollable grid of sprite thumbnails rendered with the current palette —
+  all sprites sharing the selected palette update live when a colour is edited.
+- **Sprite detail area (bottom of right panel):** Click any sprite to see:
+  - Full sprite sheet (PNG scaled up)
+  - 4-direction walk animation (Down, Left, Up, Right) with proper frame
+    extraction: 9-frame sheets get a full walk cycle
+    (stand → step1 → stand → step2) per direction; right direction is left
+    mirrored (matching GBA engine); 3-frame sheets show directional stands;
+    single-frame sprites display as static in all directions
+  - Sprite info: name, constant, frame dimensions, palette tag
+  - "Open Sprite Folder" button
+- **Proper INCBIN chain resolution** — sprites are resolved by following the
+  full C header chain: `object_event_graphics_info_pointers.h` →
+  `object_event_graphics_info.h` → `.images = sPicTable_*` →
+  `object_event_pic_tables.h` → `gObjectEventPic_*` →
+  `object_event_graphics.h` → INCBIN path → PNG. Falls back to simple slug
+  matching if the chain doesn't resolve. This fixed 7 sprites that had
+  filename mismatches (e.g. PUSHABLE_BOULDER → strength_boulder.png,
+  METEORITE → birth_island_stone.png). Total sprites: 152 (up from 145).
+- **Accurate frame detection for walk animation** — the 4-direction walk
+  preview now uses the actual frame dimensions from ObjectEventGraphicsInfo
+  (width/height fields) instead of guessing from the sheet. This fixes
+  32×32 bike sprites (288×32 sheets) that were incorrectly detected as
+  18 frames of 16px instead of 9 frames of 32px.
+- **Debounced grid refresh** — when editing palette swatches, the sprite grid
+  no longer rebuilds on every single click. The selected sprite detail
+  updates immediately while the full grid refresh is debounced to 400ms.
+  This prevents UI stutter when rapidly editing colours in a pool with
+  50+ sprites.
+- **Data sources:** Parsed from C headers — `object_event_graphics_info.h`,
+  `object_event_graphics_info_pointers.h`, `object_event_pic_tables.h`,
+  `object_event_graphics.h`, `event_object_movement.c`, `event_objects.h`.
+  10 palette pools detected, 152 sprites mapped in testing.
+- **Save:** Palette changes saved on File → Save via `flush_to_disk()`.
+
+### Files modified
+- `ui/overworld_graphics_tab.py` — **new file**, `OverworldGraphicsTab` widget
+  with palette pool list, sprite browser, detail view, animation preview,
+  import, and save logic.
+- `ui/mainwindow.py` — imports `OverworldGraphicsTab`, creates instance as a
+  top-level tab "Overworld GFX", loads on project open, saves via
+  `_save_overworld_graphics()` in all three save paths.
+
+### Testing
+1. Open a project. You should see a new "Overworld GFX" tab in the main
+   toolbar.
+2. Click "Overworld GFX" — the left panel should list palette pools with
+   sprite counts (e.g. "Player Red (3)", "NPC Blue (28)").
+3. Click a palette pool — its 16-colour swatch row should appear below. Click
+   any swatch to open the colour picker, change a colour, and confirm — all
+   sprite thumbnails in the right panel that share that palette should update
+   immediately.
+4. Use the category dropdown to filter sprites (e.g. "Pokemon"). The grid
+   should show only matching sprites.
+5. Type in the search box — the grid should filter as you type.
+6. Click any sprite thumbnail — the bottom detail area should show the full
+   sprite sheet, 4-direction walk animation, and sprite info.
+7. Click "Import from PNG" — pick an indexed PNG — the palette swatches and
+   all linked sprite thumbnails should update.
+8. File → Save — the palette `.pal` file on disk should contain the new
+   colours.
+
+
+## [2026-04-06] — Trainer Graphics Tab
+
+### Type
+Feature
+
+### Summary
+**New "Graphics" sub-tab added to the Trainers section**, sitting alongside the
+existing "Trainers" and "Trainer Classes" tabs. This gives trainers the same
+palette-editing workflow that Pokemon already had.
+
+Features:
+- Dropdown to select any TRAINER_PIC_* constant (friendly display names shown,
+  e.g. "Lass", "Ranger"). Combo box wheel-scroll disabled per project rules.
+- 128×160 sprite preview rendered with the current palette applied via
+  `_reskin_indexed_png` — changes are visible immediately.
+- Editable 16-colour palette swatch row (reuses `PaletteSwatchRow` from the
+  Pokemon Graphics tab).
+- "Import Palette from PNG" button — extracts the colour table from an indexed
+  PNG, GBA-clamps to 15-bit, and applies it to the palette. File picker
+  defaults to the trainer's palettes folder (`graphics/trainers/palettes/`).
+- "Open Palettes Folder" button for quick OS file-manager access.
+- Palette edits refresh the sprite preview immediately.
+- Changes saved on File → Save via `flush_to_disk()` which writes JASC-PAL
+  `.pal` files.
+
+### Files modified
+- `ui/trainer_graphics_tab.py` — **new file**, `TrainerGraphicsTab` widget with
+  all sprite preview, palette swatch, import, and save logic.
+- `ui/mainwindow.py` — imports `TrainerGraphicsTab`, creates instance, connects
+  `modified` signal, adds it as the 3rd tab in the trainers tab switcher, loads
+  it with `pic_map` from the trainers editor on project load, saves via
+  `_save_trainer_graphics()` in all three save paths.
+
+### Testing
+1. Open a project and go to the Trainers toolbar page.
+2. You should see three sub-tabs at the top: "Trainers", "Trainer Classes",
+   and "Graphics".
+3. Click "Graphics".
+4. Use the dropdown to pick a trainer pic (e.g. "Lass") — a 128×160 sprite
+   preview should appear with its current palette.
+5. Click any colour swatch in the palette row — the colour picker should open.
+   Pick a new colour, close the picker — the sprite preview should update
+   immediately.
+6. Click "Import Palette from PNG", pick an indexed PNG from the palettes
+   folder — the palette swatches and sprite preview should update.
+7. Try scrolling the mouse wheel over the dropdown without clicking it open
+   first — the value must NOT change (wheel-scroll is blocked).
+8. File → Save — the `.pal` file on disk should contain the new palette.
+
+
+## [2026-04-05] — Palette Importer (Graphics Tab)
+
+### Type
+Feature
+
+### Summary
+**New "Import Palette from PNG" tool on the Graphics tab.** A new group box
+sits between the Shiny Palette swatches and the Icon Palette section in the
+right column. Two radio buttons let the user choose Normal or Shiny (Normal
+is the default). Clicking "Select Indexed PNG..." opens a file picker; the
+tool reads the PNG's color table (up to 16 colors), GBA-clamps each color
+to 15-bit, and loads them into the selected palette slot. The swatch row
+and battle scene preview refresh immediately so the change is visible right
+away. The palette is marked dirty and will be written to the `.pal` file on
+File → Save via the existing `flush_to_disk()` pipeline. If the PNG is not
+an indexed image (`Format_Indexed8`), a clear error message is shown.
+
+### Files modified
+- `ui/graphics_tab_widget.py` — added Import Palette group box with
+  Normal/Shiny radio buttons, file picker, palette extraction, GBA clamping,
+  swatch refresh, and indexed-PNG validation.
+
+### Testing
+1. Open a project and go to the Pokemon tab → Images (Graphics) sub-tab.
+2. In the right column, find the new "Import Palette from PNG" group box
+   between the Shiny swatches and the Icon Palette section.
+3. Leave "Normal" selected. Click "Select Indexed PNG..." and pick an
+   indexed-color PNG file.
+4. The Normal palette swatches and the battle preview should update
+   immediately with the new colors.
+5. Switch to "Shiny", pick a different indexed PNG — the Shiny swatches
+   and Shiny preview should update.
+6. Try picking a non-indexed PNG (e.g. a 32-bit RGBA image) — you should
+   see an error message saying the file is not indexed.
+7. File → Save — the `.pal` file on disk should now contain the imported
+   palette.
+
+
+## [2026-04-05] — Name Decapitalizer: Species Names Now Persist to Disk
+
+### Type
+Fix
+
+### Summary
+**Species names were UI-only and never hit the ROM.** The decapitalizer was
+updating `speciesName` in the in-memory JSON cache and the PorySuite tree
+widget, so the app *looked* like it had renamed every species — but the
+compiled ROM still showed ALL CAPS (BULBASAUR, CHARMANDER, etc.).
+
+Root cause: species display names live in `src/data/text/species_names.h`
+(`gSpeciesNames[]`), which is the actual text table the game reads at
+runtime. That file is NOT touched by the normal `File → Save` pipeline —
+only the individual Rename tool (`core/refactor_service.py`) ever writes
+to it. The decapitalizer was updating the `speciesName` field inside
+`species_info.h` and the JSON mirror, neither of which the game engine
+reads for the in-battle/trainer-card name.
+
+Fix: added `_write_species_names_header()` to `ui/name_decapitalizer.py`.
+On Apply, it reads `species_names.h`, patches every `[SPECIES_XXX] =
+_("OLDNAME")` line that has a change, caps at 10 chars (POKEMON_NAME_LENGTH),
+escapes quotes, and writes the file back immediately. Items already worked
+(they go through `_write_items_header()` on save). Species now work the
+same way — write direct to the header on Apply, no save needed.
+
+### Files modified
+- `ui/name_decapitalizer.py` — new `_write_species_names_header()` + hook
+  in `_on_apply` after the per-entry apply loop.
+
+### Testing
+1. Open project, `Edit → Name Decapitalizer…`, check "Species Names", Scan.
+2. Apply Checked. The species_names.h file is patched immediately.
+3. Build the ROM — in-game Pokemon names now show "Bulbasaur", "Charmander"
+   etc. instead of "BULBASAUR", "CHARMANDER".
+
+
+## [2026-04-05] — Name Decapitalizer Bug Fixes
+
+### Type
+Fix
+
+### Summary
+Five follow-up fixes after the Name Decapitalizer shipped:
+
+-1. **Items not scanned when Items tab wasn't opened.** Same bug as
+    Trainer Classes: the items editor loads its `_items` dict lazily
+    (only when the Items sub-tab is first shown). If the user ran the
+    decapitalizer without clicking Items first, `_items` was empty and
+    the scanner returned zero rows. Fixed by reading items directly
+    from `source_data.get_pokemon_items()` — which is populated on
+    project open — and mirroring edits into both the source_data dict
+    (drives the on-disk save via `_write_items_header()`) and the
+    editor's `_items` dict (drives the list widget refresh) when the
+    editor has been loaded.
+
+
+0. **Charmap control codes `{PKMN}` got lowercased, breaking the build.**
+   `trainer_class_names.h` contains `_("{PKMN} Trainer")` etc. — `{PKMN}`
+   is a charmap control code (it maps to the two-glyph "Pk/Mn" tile), not
+   display text. Decapitalizer turned it into `{pkmn}`, which the
+   compiler emitted as `unknown constant 'pkmn'` and the build died.
+   Fixed: `decapitalize()` now extracts every `{...}` token before
+   processing, decapitalizes only the plain-text segments, and stitches
+   the control codes back in verbatim. Covers `{PKMN}`, `{PLAYER}`,
+   `{STR_VAR_1}`, and every other charmap/escape-code sequence. User
+   needs to restore `trainer_class_names.h` from a clean copy (or git)
+   before re-running the tool — the lower-cased file on disk is
+   corrupted.
+
+
+1. **Pokemon tree stayed ALL-CAPS after apply.** The tree reads from a
+   separate display-cache field (`"name"`) while I was only updating the
+   source-of-truth field (`"speciesName"`). Apply now writes to both, and
+   the tree is walked + relabelled item-by-item after apply. Also
+   refreshes the detail panel's name field for the currently-selected
+   species — otherwise `save_species_data` would read the stale ALL-CAPS
+   text on File → Save and clobber our edit back.
+2. **Trainer names came out lowercase (`matt`, `bridget` instead of
+   `Matt`, `Bridget`).** Trainer names are stored as C-macro-wrapped
+   strings like `_("MATT")`. The decapitalizer was seeing the whole
+   wrapped string, capitalising the leading `_`, lower-casing the rest,
+   producing `_("matt")`. Fixed by unwrapping `_("…")` before decapitalise
+   and re-wrapping on apply. The Trainers editor's private `_trainers`
+   dict and detail panel are also updated in place so the list/header
+   refresh live after apply.
+3. **Trainer Class names weren't touched at all.** The Trainer Class
+   editor loads lazily (only when that sub-tab is clicked), so if the
+   user hadn't opened it yet, `_names` was empty and my scanner returned
+   zero entries. Fixed by force-loading the editor in the scanner when
+   `_loaded` is False.
+
+### Files touched
+- `ui/name_decapitalizer.py` — all three fixes live here.
+
+### Test plan
+1. File → Refresh (F5) to wipe any stale state from the previous run.
+2. Edit → Name Decapitalizer…, tick all categories, Scan Project.
+3. Preview table should now include Trainer Class rows
+   (`AQUA ADMIN → Aqua Admin`, `BEAUTY → Beauty`, etc.) and trainer-name
+   rows showing the unwrapped display text (`MATT` not `_("MATT")`).
+4. Apply Checked.
+5. Pokemon tab's tree list on the left should show Title-Cased species
+   names immediately (Bulbasaur, Ivysaur, …).
+6. Trainers tab: list entries show `Aqua Admin Matt`, `Beauty Bridget`,
+   etc. — class properly title-cased, trainer name properly capitalised.
+7. File → Save. Close/reopen. Names persist.
+
+
+## [2026-04-05] — Name Decapitalizer Tool (Edit menu)
+
+### Type
+Feature
+
+### Summary
+New batch-rename tool under **Edit → Name Decapitalizer…** that converts
+ALL-CAPS display names to Smart Title Case across 7 categories. Only
+touches display-name fields — dialogue and script source code are left
+alone per the user's instruction.
+
+### Categories scanned
+- Species names (`speciesName` via `set_species_info`)
+- Move names (`name` via `set_move_data`)
+- Item names (`items_editor._items[const]["english"/"name"]`)
+- Trainer names (`trainerName` via `set_trainer_data`)
+- Trainer class names (pushed into `TrainerClassEditor._dirty_names`)
+- Ability names (direct regex rewrite of `src/data/text/abilities.h`)
+- UI key strings (QLineEdit fields on the UI tab's Key Strings sub-tab —
+  multi-line dialogue boxes are deliberately skipped)
+
+### Casing rules
+- Only converts strings whose alphabetic characters are ≥70% upper-case
+  (so hand-customised mixed-case names are left alone)
+- First letter of each space-separated word capitalized, rest lower
+- Filler words (of / the / and / in / on / to / at / for / by / or / as /
+  vs / de / la / du / nor / but) stay lowercase mid-string
+- Roman numerals (II, III, IV, V, VI, VII, VIII, IX, X, XI, XII, XIII,
+  XIV, XV, XX) kept upper-case
+- User-editable **skip-list** keeps specified tokens upper-case. Seeded
+  with: HM, TM, PP, HP, EXP, PC, LV, STR, DEF, ATK, SPE, SPA, SPD, SP,
+  OK, OT, ID, VS, AI, IV, EV, KO, CPU, NPC, TV, PS
+- `TM42`/`HM03` style (skip-token + digits) keeps the letter prefix upper
+- Apostrophes/hyphens preserved: `FARFETCH'D` → `Farfetch'd`,
+  `ROCK-HARD` → `Rock-Hard`
+- Skip-list persisted per-user in `settings.ini` under
+  `[NameDecapitalizer]/skip_list`
+
+### UX flow
+1. Edit → Name Decapitalizer…
+2. Tick which categories to scan, edit the skip-list if needed
+3. Click **Scan Project** — builds a preview table of every proposed
+   change (Category + constant, Original, Proposed)
+4. Untick any rows you don't want changed (Check All / Uncheck All
+   buttons for convenience)
+5. Click **Apply Checked** — in-memory edits are committed and items-list
+   widgets + trainer-class list are refreshed live; window is marked
+   dirty. Ability-name edits are written directly to `abilities.h` on
+   apply. Everything else lands on the next File → Save.
+
+### Files touched
+- `ui/name_decapitalizer.py` — new module (core logic, scanners, dialog)
+- `ui/unified_mainwindow.py` — Edit menu entry + handler
+
+### Test plan
+1. Open a project. Edit → Name Decapitalizer… opens the dialog.
+2. Tick all 7 categories, click Scan Project. Status line reports the
+   number of names found. Preview table lists them.
+3. Spot-check a few rows: `BULBASAUR → Bulbasaur`, `MASTER BALL → Master
+   Ball`, `HYPER BEAM → Hyper Beam`, `HP` (if present) stays `HP`.
+4. Untick one row, click Apply Checked, confirm. Dialog closes with a
+   summary. Title bar shows `[*]` (dirty marker).
+5. Check the Items tab list — unchecked name is untouched, everything
+   else now shows the new capitalization.
+6. Check the Pokemon tab — pick a species, its display name field shows
+   the new value.
+7. File → Save. Restart the app, reload the project. Names persist on
+   disk. `src/data/text/abilities.h` contains the new ability names.
+8. Re-run the tool — preview table should be empty (nothing left to
+   decapitalize).
+
+
+## [2026-04-05] — Graphics Tab Polish (shadow fix, transparency, colour picker, icon preview)
+
+### Type
+Fix + UX
+
+### Summary
+Five follow-up fixes after the Graphics tab refactor:
+
+1. **Shadow positioning + visibility match the game.** Shadow is now drawn at
+   the fixed screen position `(enemy_x, enemy_y + 29)` per pokefirered's
+   `LoadAndCreateEnemyShadowSprites`, instead of floating under the sprite
+   frame's bottom. It is **only shown when `gEnemyMonElevation[species] != 0`**
+   — which matches `SetBattlerShadowSpriteCallback`. "Show Shadow" checkbox
+   remains a preview-only override.
+2. **Shiny preview transparency fixed.** The palette-reskin routine was
+   rebuilding the indexed PNG's colour table from scratch with hard-coded
+   alpha=255, which clobbered the tRNS chunk. Now it preserves each slot's
+   original alpha bits and only swaps R/G/B — so index 0 (the transparent
+   colour) stays transparent.
+3. **Animated menu icon moved into the Menu Icon Palette box.** Previously a
+   tiny static 32×32 thumb in the left column. Now a 64×64 live preview
+   sitting next to the 0/1/2 palette dropdown, palette-swapped in real time
+   using the selected shared icon palette. Edits to the swatches in that row
+   recolour the preview on the next animation tick.
+4. **Colour picker rehoused.** Swatch click now opens Qt's full visual
+   colour picker (wheel, saturation/value box, standard colours, custom
+   colours, RGB/HSV fields). The confusing `HTML:` label on the hex field
+   is auto-renamed to `Hex:` by walking the dialog's children.
+5. **Swatch styling no longer bleeds into the picker.** Swatches used to
+   paint their colour via a Qt stylesheet, which cascaded into any dialog
+   parented to the swatch — turning the whole colour picker the swatch's
+   colour. Switched swatches to `QPalette`-based painting and reparented the
+   picker to the top-level window.
+
+### Files touched
+- `ui/graphics_tab_widget.py` — all five fixes live here.
+
+### Test plan
+1. Graphics tab → pick Bulbasaur (elevation 0). No shadow should appear.
+   Pick Zubat/Gengar/Pidgeot (elevation > 0) — shadow appears on the enemy
+   platform.
+2. Bump Enemy Altitude on any species from 0 → 8. Sprite floats up and
+   shadow appears.
+3. Tick "Preview Shiny". Sprites should show transparent backgrounds over
+   the battle BG (no tan rectangles).
+4. Change Palette 0/1/2 dropdown → the 64×64 icon preview recolours
+   immediately. Edit a swatch in the matching Icon Palette N row → icon
+   preview updates on next bob.
+5. Click any swatch → Qt visual picker opens, hex field says **Hex:** not
+   HTML, the picker dialog itself uses the app theme (not the swatch
+   colour).
+
+
+## [2026-04-05] — Graphics Tab Refactor (Battle Preview + Palette Editor)
+
+### Type
+Feature
+
+### Summary
+Completely rebuilt the Pokemon Graphics sub-tab as a 3-column editor modeled on
+Gen III Hacking Suite. Live battle-scene preview (BattleBG.png + sprites +
+shadow + textbox), editable positioning spinboxes, editable Normal + Shiny
+palettes, editable shared icon palettes, and an icon-palette-slot selector.
+
+### What's new
+- **Battle Scene Preview (center column)**: `res/images/BattleBG.png` as the
+  canvas, with the current species' **front sprite** (enemy) and **back
+  sprite** (player) composited over it, shadow under the enemy, and the
+  battle textbox overlaid at the bottom. Updates live as you edit.
+- **Positioning spinboxes**: **Player Y** writes to
+  `gMonBackPicCoords[SPECIES].y_offset`, **Enemy Y** writes to
+  `gMonFrontPicCoords[SPECIES].y_offset`, **Enemy Altitude** writes to
+  `gEnemyMonElevation[SPECIES]`. Sparse entries in the elevation table are
+  handled — setting to 0 removes the species' line; nonzero inserts/updates.
+- **Show Shadow checkbox**: preview-only toggle (no data written).
+- **Normal + Shiny palette grids (right column)**: 16 clickable swatches
+  each. Click any swatch to open the color picker; chosen color is
+  automatically clamped to 15-bit GBA color (channels snap to multiples of 8).
+  Writes to `graphics/pokemon/<slug>/normal.pal` and `shiny.pal`.
+- **Menu Icon Palette selector**: dropdown 0/1/2 (writes to
+  `gMonIconPaletteIndices[SPECIES]` in `src/pokemon_icon.c`) + three editable
+  swatch rows showing all shared icon palettes
+  (`graphics/pokemon/icon_palettes/icon_palette_{0,1,2}.pal`). Editing a
+  swatch in any of those rows updates the shared palette for every species
+  using that slot.
+- **Left column**: kept the front/back/icon/footprint thumbnails + Open
+  Graphics Folder button.
+- **Save integration**: all edits live in memory and mark the window dirty.
+  `flush_to_disk()` runs at the start of the main save pipeline and writes
+  all touched `.h` tables and `.pal` files.
+
+### Files added
+- `ui/palette_utils.py` — JASC-PAL read/write, GBA 15-bit color clamping.
+- `ui/graphics_data.py` — Parsers + writers for `front_pic_coordinates.h`,
+  `back_pic_coordinates.h`, `enemy_mon_elevation.h`,
+  `gMonIconPaletteIndices[]`. `GraphicsDataCache` holds per-project state.
+- `ui/graphics_tab_widget.py` — `GraphicsTabWidget` + `BattleScenePreview` +
+  `PaletteSwatch`/`PaletteSwatchRow`.
+
+### Files modified
+- `ui/mainwindow.py` — Legacy sprite buttons reparented to a hidden sink
+  widget; new `GraphicsTabWidget` installed in `tab_pokemon_graphics_grid`;
+  `set_project_root()` wired on project load; `load_species()` called from
+  `update_data()`; `flush_to_disk()` hooked into `save_data()`.
+
+### Testing
+1. Open a project → pick any species (e.g. Bulbasaur) → switch to the Graphics
+   sub-tab.
+2. You should see the battle scene with Bulbasaur on the enemy platform,
+   textbox at the bottom, and sprite thumbnails on the left.
+3. Drag the **Enemy Y** spinbox: the sprite should move up/down in real time.
+4. Pick a flying species (e.g. Pidgeot) and look at **Enemy Altitude**: it
+   should show the float-above-platform value; changing it moves the sprite
+   and shadow together.
+5. Click any swatch in the **Normal Palette** row: color picker opens. Pick
+   a new color → the swatch updates. Title bar shows `[*]` (dirty).
+6. Change the **Icon Palette** dropdown from 0 → 2. Title bar goes dirty.
+7. File → Save All. Title bar `[*]` clears. Reopen the project and verify
+   your edits persisted in `.pal` / `.h` files.
+8. Click **Show Shadow** off — shadow disappears from preview (no file
+   change).
+
+---
+
+## [2026-04-05] — Sound Test (Pokemon Cry Preview)
+
+### Type
+Enhancement
+
+### Summary
+First pass of the Sound Test roadmap item: Pokemon cry playback. Shipping cries as
+clickable preview across the Pokemon tab, Pokedex tab, and the Event Editor's
+`playmoncry` command. SE_*/MUS_* previews are deliberately out of scope — those
+require the GBA music engine and cannot be rendered from the decomp sources on
+desktop.
+
+### What's new
+- **Shared audio player**: `ui/audio_player.py` exposes a module-level
+  `AudioPlayer` singleton built on `QMediaPlayer` + `QAudioOutput`. One call:
+  `get_audio_player().play_cry("SPECIES_BULBASAUR")`. Species constant →
+  lowercase slug → `sound/direct_sound_samples/cries/<slug>.wav` lookup.
+- **Pokemon tab (Info sub-tab)**: New "▶ Play Cry" button sits under the
+  front sprite + icon in the Info sub-tab's sprite panel. Plays the current
+  species' cry. If the file is missing, pops up a clear message with the
+  expected path.
+- **Pokedex tab**: "▶ Play Cry" button added to the top-right of the Pokédex detail panel header (next to the species name + dex number + constant label), via a new `PokedexDetailPanel.play_cry_requested` signal.
+- **Event Editor `playmoncry`**: Species picker now has a "▶ Preview" button
+  so you can hear a cry while wiring up a script.
+
+### Not yet covered (documented limitation)
+- `playse` (SE_*), `playbgm` (MUS_*), `fanfare`, `savebgm`: these route through
+  the GBA sound engine's voice-group/MIDI system and cannot be previewed
+  directly from project sources. Left in the roadmap as "future work — would
+  require a mini GBA audio backend or pre-rendered preview files."
+
+### Files modified
+- `ui/audio_player.py` — NEW. Shared QMediaPlayer wrapper + cry file lookup.
+- `ui/mainwindow.py` — Added `play_cry_button` (Pokemon tab) and
+  `play_cry_pokedex_button` (Pokedex tab); wired to
+  `_on_play_current_cry()` / `_on_play_current_pokedex_cry()`.
+- `eventide/ui/event_editor_tab.py` — `_PlayMonCryWidget` gained a
+  `▶ Preview` button that uses `ConstantsManager._root` to resolve the project
+  directory.
+
+### Testing
+1. Open PorySuite-Z → select a Pokemon (e.g. Bulbasaur) → click **▶ Play Cry**.
+   You should hear the cry sample immediately.
+2. Switch to the Pokedex tab → select an entry → click **▶ Play Cry**.
+3. Event Editor: open any script → add a **Play Pokémon Cry** command → pick a
+   species → click **▶ Preview** in the edit dialog.
+4. Try a missing species (e.g. a new custom Fakemon without a cry file):
+   Pokemon tab should show a message telling you which path it expected.
+
+---
+
+## [2026-04-05] — Phase 7 Polish + Stale-State Audit Sweep
+
+### Type
+Enhancement, Bug Fix
+
+### Summary
+Closed out the remaining Phase 7 (Porymap Integration) polish items and resolved the actionable bugs from the stale-state audit.
+
+### Phase 7 polish
+- **Ctrl+E feedback**: Pressing Ctrl+E in Porymap now brings the PorySuite-Z window to the foreground, logs which event was selected, or clearly states that no event was within 2 tiles of the cursor. Event-click callbacks also raise the window and log a "could not match" line if the event isn't found (e.g. out-of-sync data).
+- **Event lifecycle callbacks wired**: `event_moved` from Porymap is now handled. If the map is currently shown AND no unsaved edits exist, the Event Editor's X/Y spinboxes silently update (no dirty flag). If the user has unsaved work, the move is logged but not applied — preserving in-progress edits. `event_created` now also selects the new event after reload instead of just reloading.
+- **Stock Porymap fallback**: Installer drops a `.psinstalled` marker file next to `porymap.exe`. `is_porymap_patched()` checks it. When missing, the launcher strips the patched-only `map_name` CLI arg and skips `_send_command` calls so stock Porymap doesn't choke. The JS bridge detects when `readCommandFile` is missing and disables command polling instead of spamming the log every 500ms.
+
+### Stale-state audit — actionable fixes
+- **Credits editor external edit guard**: `ui/credits_editor.py` now records mtimes of `strings.c` and `credits.c` on load. At save, it checks whether either file changed on disk since load and prompts Save/Discard/Cancel before overwriting. Previously external edits were silently clobbered.
+
+### Stale-state audit — no action needed (verified clean)
+- **Region Map / Layouts cross-refresh (#4)**: `eventide/mainwindow.py` correctly connects `maps_tab.data_changed` → reload of both region_map_tab and layouts_tab.
+- **Config tab dirty-check (#7)**: `_dirty` flag persists across tab switches; `modified` signal wires to `setWindowModified(True)`.
+- **Starter species list refresh (#8)**: After `refactor_service.apply_pending()` in `_on_save`, `load_data()` runs which clears and repopulates all starter species combos. No stale state.
+- **Item icon picker (#2)**: Low severity (requires external rename of icon symbols while PorySuite is open). Deferred — re-parses on project reload.
+
+### Files modified
+- `ui/unified_mainwindow.py` — Added `_bring_to_front()`, `_on_bridge_event_moved()`; event selection callbacks now return success bools and log outcomes; `_on_bridge_event_created` selects the new event after reload; imports `is_porymap_patched`; gates `_send_command` behind patched-marker check.
+- `eventide/ui/event_editor_tab.py` — `select_event_by_bridge()` and `select_event_at_position()` now return bool.
+- `porymap_bridge/porymap_launcher.py` — Added `is_porymap_patched()`; launcher strips map_name CLI arg and skips `_send_command` when binary isn't patched.
+- `porymap_bridge/porymap_installer.py` — Drops `.psinstalled` marker file after successful copy.
+- `porymap_bridge/porysuite_bridge.mjs` — Command-polling loop checks for `utility.readCommandFile` before calling; backs off after repeated errors.
+- `ui/credits_editor.py` — Added `_loaded_mtimes` snapshot in `load_project()`; `_on_save()` checks for external edits and prompts before overwriting.
+
+### Testing
+1. **Ctrl+E**: With PorySuite-Z behind Porymap, press Ctrl+E in Porymap. The PorySuite window should pop to the front. If the hover is over an event, it gets selected; if not, the log says "no event within 2 tiles".
+2. **Event move**: In Porymap, drag an event to a new tile. The Event Editor's X/Y spinboxes should update to match without marking the window dirty.
+3. **Stock Porymap**: If you manually replace `porysuite/porymap/porymap.exe` with an unpatched build (or delete the `.psinstalled` file), "Open in Porymap" should still launch without passing the map arg. No log spam every 500ms.
+4. **Credits external edit**: Open Credits editor. Externally edit `src/credits.c` (add a comment line, save). Click Save in PorySuite — you should get a Save/Discard/Cancel dialog.
+
+---
+
+## [2026-04-05] — Live Push: Trainer Class Renames Into Trainers List
+
+### Type
+Bug Fix
+
+### Summary
+Class name edits in the Trainer Classes sub-tab are now immediately visible in the sibling Trainers sub-tab (list grouping labels, trainer display names, class combo dropdown) without requiring a save. Previously the Trainers editor read class names from disk once at load time and never re-checked, so pending renames were invisible until Save-All.
+
+### Files modified
+- `ui/trainer_class_editor.py` — Added `class_name_edited = pyqtSignal(str, str)` emitted on every keystroke in the Name field, carrying `(const, effective_name)`.
+- `ui/trainers_tab_widget.py` — Added `TrainersTabWidget.apply_class_name(const, new_name)` method. Updates `self._class_names`, pushes into the detail panel's mirror, refreshes the class combo dropdown and header, and rebuilds the list so grouping labels update.
+- `ui/mainwindow.py` — Connected `trainer_class_editor.class_name_edited` → `trainers_editor.apply_class_name` so edits flow live across sibling sub-tabs.
+
+### Testing
+1. Open Trainers → Trainer Classes. Rename a class (e.g. "HIKER" → "Climber").
+2. Without saving, switch to the Trainers sub-tab. Confirm trainers of that class now display under the new name in the list, and the class dropdown in the detail panel shows the new name.
+
+---
+
+## [2026-04-05] — Stale-State Audit Fixes (#1 Trainer Class Clobber, #5 Watcher Clobber, #3 ConstantsManager Staleness)
+
+### Type
+Bug Fix
+
+### Summary
+Three stale-state bugs identified during the post-bridge audit are fixed.
+
+1. **Trainer Class Editor silently discarded edits on Trainers tab re-entry.** Every time the user switched to the Trainers tab, `_load_trainers_editor` unconditionally re-ran `trainer_class_editor.load()`, which called `._dirty_names.clear()` / `._dirty_money.clear()` / `._dirty_pics.clear()`. Any pending name/money/sprite edits vanished without warning. Now the reload is skipped if the class editor already has unsaved edits.
+2. **External file watcher clobbered unsaved Event Editor edits.** When Porymap saved a map, or any watched file (`map.json`, `scripts.inc`) changed on disk, the bridge called `reload_current_map()` which re-loaded from disk with zero protection — the user's in-progress edits were gone. Now `reload_current_map()` checks `isWindowModified()` and prompts the user (Save / Discard / Cancel) before clobbering.
+3. **ConstantsManager stayed stale after PorySuite edits.** Item, flag, var, trainer, and move renames made in PorySuite weren't visible in EVENTide dropdowns until a full project reload. Added `ConstantsManager.refresh()` and hooked it into the unified tab switch so entering an EVENTide page from a PorySuite page re-reads the headers.
+
+### Files modified
+- `ui/mainwindow.py` — `_load_trainers_editor` now guards `self.trainer_class_editor.load(root, trainers)` behind a `not has_edits()` check. The class editor is only reloaded from disk if there are no pending dirty edits to preserve.
+- `eventide/ui/event_editor_tab.py` — `reload_current_map()` gained a `force: bool = False` parameter. When `force` is False (the default, used by all watcher-driven call sites) and `_mw.isWindowModified()` is True, it shows a Save / Discard / Cancel dialog instead of blindly reloading.
+- `eventide/backend/constants_manager.py` — Added `ConstantsManager.refresh()` classmethod. No-op if `load()` was never called; otherwise re-reads every header file from the cached `_root`.
+- `ui/unified_mainwindow.py` — `_on_stack_page_changed` calls `ConstantsManager.refresh()` when entering an EVENTide page (`events`/`maps`/`layouts`/`regionmap`) from a PorySuite page. Cheap: a handful of header reads.
+
+### Testing
+1. **Trainer Class Editor guard**: Go to Trainers → Trainer Classes sub-tab, change a class name or money value. Switch to another tab (e.g. Items), then back to Trainers. Confirm your edit is still there.
+2. **Watcher guard**: Open a map in Event Editor. Make an edit (drag a command). Without saving, externally modify that map's `map.json` or `scripts.inc` (or trigger a Porymap save). Confirm a dialog appears asking to Save / Discard / Cancel — NOT a silent reload.
+3. **Constants refresh**: In PorySuite, rename an item. Save. Switch to Event Editor. Open a giveitem command — confirm the new name appears in the dropdown.
+
+---
+
+## [2026-04-05] — Trainer Editor: Cross-Editor Live Dialogue Bridge + Command Palette Refactor
+
+### Type
+Enhancement, Bug Fix
+
+### Summary
+**The Trainers → Dialogue tab now sees live, unsaved edits from the Event Editor.** Previously it only read from disk `.inc` files, so a user placing a new trainer on a map and customizing their battle dialogue in the Event Editor's Trainer Battle dialog saw nothing in the Trainers tab until they saved the project. Now both editors share in-RAM state — dialogue edits flow cross-tab instantly.
+
+Also fixed: new trainer names were being force-uppercased ("Fat Man" → "FAT MAN"), new trainers didn't appear in the Event Editor's trainer dropdown until save, the trainer dropdown list was in source-file order instead of alphabetical, and new trainers showed "No battle dialogue found" on their Dialogue tab even after default text was seeded in RAM (timing bug).
+
+Also refactored the Event Editor's 3-page command palette to put the most common commands (lock, face player, apply movement, trainer battle, text dialogue, give item, set flag, wild battle) on page 1 where they belong. Added 19 previously-missing commands including `trainerbattle_rematch`, `healplayerteam`, `getplayerxy`, `random`, `setobjectxyperm`, `savebgm`, `fadedefaultbgm`, `buffernumberstring`, `bufferstring`, and all 6 comparison operators for `call_if_*` variants.
+
+### What changed in plain English
+- **Cross-editor bridge**: The Event Editor now continuously syncs its in-memory command list into a shared table. Any mutation — adding a command, editing text in a trainer battle dialog, moving commands up/down — gets committed so other tabs see the current state without requiring a save.
+- **Trainer Dialogue tab**: Reads from both disk `.inc` files AND the Event Editor's live state. When displaying a trainer's dialogue, entries from the current live map are tagged `(live — unsaved edits)` so you can tell disk state from RAM state at a glance.
+- **Pending dialogue**: Newly-created trainers get Settings-driven default Intro/Defeat/Post-battle text seeded into RAM immediately, shown in a `(Pending — not yet placed on a map)` group box. Once the trainer is placed on a real map, the Pending entry is replaced by the live map entry automatically.
+- **Alphabetical trainer dropdown**: `ConstantPicker` sorts items alphabetically by pretty name, with "None" pinned at top.
+- **Name casing preserved**: Trainer display names preserve user casing — only the generated constant (e.g. `TRAINER_HIKER_FAT_MAN`) stays uppercase.
+- **Live trainer registration**: Adding a trainer immediately appends its constant to `ConstantsManager.TRAINERS` so the Event Editor's Trainer Battle dialog finds it without requiring a project reload.
+
+### Files modified
+- `eventide/ui/event_editor_tab.py` — Added `_sync_live_script_state()` helper, called from `_mark_dirty()` to commit `_cmd_tuples` → active page dict AND mirror every page of the current event into `_all_scripts[label]`. Changed `_ALL_SCRIPTS['__texts__']` to share the texts dict by reference (was a copy, which silently dropped trainer battle dialog edits at save time). Added `_ALL_SCRIPTS['__texts_map__']` key exposing the currently-open map name. Refactored 3-page command palette (lines ~4935-5082) with everyday-use-first layout. Added 19 new command widgets, tooltips, friendly names, and color-coding entries. Extended `_CallIfCompareWidget` to all 6 comparison operators. Extended `_TrainerBattleWidget` with rematch variants. Added `_SetObjectXYWidget` support for `setobjectxyperm`.
+- `ui/trainers_tab_widget.py` — Added `_pending_dialogue` in-RAM store on `_TrainerDetailPanel`, with `set_pending_dialogue()`, `clear_pending_dialogue()`, `_harvest_pending_dialogue()` methods. Added `_get_live_event_editor_state()` that synthesizes scripts.inc content from the Event Editor's live `_ALL_SCRIPTS` dict. Extended `_populate_dialogue_tab` to merge live state alongside disk state, tag live entries visually, and auto-clear pending when a trainer gets placed. Extended `_add_dialogue_group` with optional `display_name` parameter. Moved `set_pending_dialogue()` call in `_add_trainer` to run BEFORE list rebuild (fixes timing bug where Dialogue tab rendered before the pending entry was set). Added live `ConstantsManager.TRAINERS` append. Fixed `.upper()` bug on trainer display names (line 2581 area).
+- `eventide/ui/widgets.py` — `ConstantPicker` sorts items alphabetically with "None" pinned at top.
+
+### Testing
+1. Add a new trainer via Trainers → Add Trainer. Confirm name casing preserved and `(Pending)` dialogue group box shows immediately.
+2. Switch to Event Editor, place trainer on a map, add trainerbattle command with custom intro/defeat text.
+3. Switch back to Trainers tab without saving. Confirm dialogue group box shows `(live — unsaved edits)` with your custom text.
+4. Save project. Confirm edits land in `data/maps/<MapName>/text.inc`.
+
+---
+
+## [2026-04-05] — Event Editor: Go To Button in Command Dialogs + Display Name Polish
+
+### Type
+Enhancement
+
+### Summary
+**Command edit dialogs now have a "Go To →" button** for any command that references a script label. Double-click a `call`, `goto`, `call_if_eq`, `goto_if_set`, or any other label-referencing command — the popup now shows a Go To button alongside OK/Cancel. Clicking it saves your edits and immediately navigates to the target script, even across maps.
+
+Also completed display name improvements from the previous session:
+- `setworldmapflag` resolves FLAG_ args to plain English (e.g. "World Map: Pallet Town")
+- `.byte 0` shows as "End of Script Table" instead of raw `.byte`
+- Map script types show friendly names (e.g. "On Transition" instead of `MAP_SCRIPT_ON_TRANSITION`)
+- `fadescreen`, `setweather`, `playse`, `playfanfare`, `playbgm` all resolve constants to readable names
+- `turnobject` resolves DIR_ prefixes, `showobjectat`/`hideobjectat` resolve OBJ_EVENT_GFX_ and MAP_
+- Generic fallback resolves any args with known prefixes (FLAG_, VAR_, TRAINER_, ITEM_, SPECIES_, MOVE_, SE_, MUS_, WEATHER_, OBJ_EVENT_GFX_)
+
+Auto-sync fixes from previous session:
+- Removed tasklist subprocess that caused 4-second lag on every map switch
+- Fixed ping-pong echo loop between PorySuite and Porymap with dual dedup (flag + last-map tracking)
+
+### Files modified
+- `eventide/ui/event_editor_tab.py` — Added Go To button to `_CommandEditDialog`, added `_on_goto()` handler, updated `_on_edit_command()` to handle GoToResult code and navigate. Added `_MAP_SCRIPT_TYPES`, `_FADESCREEN_NAMES`, `_WEATHER_NAMES` dicts. Added stringizer handlers for 10+ command types. Improved generic fallback resolver.
+- `ui/unified_mainwindow.py` — Added auto-sync via `map_loaded` signal, anti-echo dedup with `_porymap_initiated_load` flag + `_last_porymap_sync_map`
+
+---
+
 ## [2026-04-03] — Phase 7: Porymap Launch & Bidirectional Sync
 
 ### Type

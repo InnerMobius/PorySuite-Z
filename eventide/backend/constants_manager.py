@@ -155,6 +155,20 @@ class ConstantsManager:
         return cls._loaded
 
     @classmethod
+    def refresh(cls) -> bool:
+        """Re-read every constants file from disk using the cached root.
+
+        Call this after another editor writes headers (item/flag/var renames,
+        new trainers, etc.) so EVENTide dropdowns pick up the changes without
+        requiring a project reload. No-op if ``load()`` has never been called.
+        Returns True if the reload ran, False if there was no cached root.
+        """
+        if not cls._loaded or cls._root is None:
+            return False
+        cls.load(str(cls._root))
+        return True
+
+    @classmethod
     def root(cls) -> Path | None:
         return cls._root
 

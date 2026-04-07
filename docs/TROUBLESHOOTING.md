@@ -7,8 +7,38 @@ This guide covers common setup issues and how to reset the application if someth
 ### The toolbar icons are colored squares
 That's expected — they're placeholders. Replace them with your own 32x32 PNG files in `res/icons/toolbar/`. The filenames are: save.png, make.png, make_modern.png, pokemon.png, pokedex.png, moves.png, items.png, trainers.png, starters.png, events.png, maps.png, layouts.png, regionmap.png, ui.png, config.png, play.png.
 
+### Dynamic Palettes says "Active" but sprites have broken colors
+This happens when you replaced the pokefirered folder (e.g. with a fresh copy) after the Dynamic OW Palettes patch was applied. The old marker file (`.porysuite_dowp_enabled`) stayed behind from the previous folder, so PorySuite thought the patch was still applied. **Fixed in 2026-04-06**: PorySuite now checks the actual C source code for DOWP signatures instead of relying on the marker file. If the source is unpatched, the stale marker is automatically removed and the "Enable Dynamic Palettes" button re-enables. Just restart PorySuite after replacing the folder and the button will be available again.
+
 ### The trainer Dialogue tab says "No battle dialogue found"
-This happens when the trainer hasn't been placed on any map yet, or the text labels in text.inc don't follow the standard naming pattern (e.g. `MapName_Text_TrainerNameIntro`). The tab searches scripts.inc files for `trainerbattle` commands that reference the trainer constant, then looks in the same map's text.inc for matching labels.
+This happens when a trainer has no dialogue in disk `.inc` files, no pending in-RAM dialogue, and no live edits from the Event Editor. Normally you won't see this:
+- **New trainers** automatically get default Intro/Defeat/Post-battle text seeded into RAM as a `(Pending — not yet placed on a map)` entry the moment you add them. Default text comes from Settings → Trainer Defaults.
+- **Trainers placed on a map via the Event Editor** show up as `(live — unsaved edits)` here as soon as you add the trainerbattle command — no save needed.
+- **Trainers placed on a map and saved** read from the map's `text.inc` using labels that contain the trainer's camel-case name (e.g. `PalletTown_Text_HikerFatManIntro`) or match the labels listed on the `trainerbattle` command in scripts.inc.
+
+If you still see "No battle dialogue found," check that the trainer's constant is actually referenced somewhere — use the search (Ctrl+Shift+F) from the Event Editor tab to find `trainerbattle TRAINER_YOUR_CONSTANT`.
+
+### My trainer class name/money/sprite edit disappeared
+Fixed (2026-04-05). Previously, switching to another tab and back to the Trainers tab silently re-loaded trainer class data from disk and discarded any pending edits. Now the class editor preserves its dirty state across tab switches. If you still see this happen, save first before switching away, or report it.
+
+### Name Decapitalizer changed species names in the UI but the ROM still showed ALL CAPS
+
+Fixed (2026-04-05). The decapitalizer was updating the in-memory `speciesName` field and the PorySuite tree widget, so the app looked correct — but the compiled ROM still showed ALL CAPS names (BULBASAUR, CHARMANDER, etc.). The root cause was that the game reads species display names from `src/data/text/species_names.h` (`gSpeciesNames[]`), and that file was never written by the decapitalizer. Only the individual Rename tool (`core/refactor_service.py`) ever touched it. Fix: added `_write_species_names_header()` to `ui/name_decapitalizer.py` — on Apply, it patches `species_names.h` directly. Species names now persist to the ROM without needing a separate save step.
+
+### External changes from Porymap wiped my unsaved work
+Fixed (2026-04-05). Previously, if Porymap saved a map (or any external tool modified `map.json`/`scripts.inc`) while you had unsaved Event Editor edits, the file watcher silently reloaded from disk and your edits were gone. Now you get a Save / Discard / Cancel dialog when an external change is detected during unsaved edits.
+
+### My external edits to src/credits.c got wiped by PorySuite
+Fixed (2026-04-05). The Credits editor now takes a snapshot of `src/credits.c` and `src/strings.c` modification times when you load the tab. If either file is edited outside PorySuite-Z before you hit Save, you get a Save / Discard / Cancel dialog instead of a silent overwrite.
+
+### Ctrl+E in Porymap doesn't bring PorySuite to the foreground
+Fixed (2026-04-05). Pressing Ctrl+E (or clicking an event in Porymap) now raises the PorySuite-Z window and logs which event was picked (or "no event within 2 tiles" if the cursor wasn't on an event).
+
+### PorySuite-Z complains about Porymap command files or log errors every half-second
+This means the Porymap install is missing the patches PorySuite-Z expects. The installer normally drops a `.psinstalled` marker file next to `porymap.exe`. If that marker is missing, PorySuite-Z treats Porymap as "stock" and avoids commands it can't handle. To fix, re-run Tools → Install Porymap to rebuild with patches.
+
+### An item (or flag/var/trainer) I renamed in PorySuite doesn't show up in the Event Editor dropdowns
+Switch to an EVENTide page (Event Editor / Maps / Layouts / Region Map) from any PorySuite page — the constants cache refreshes on that switch. If the rename hasn't been saved to the header files yet, you still need to Save-All first. In-memory-only renames that haven't touched disk require a dedicated bridge that isn't implemented yet.
 
 ### Dialogue text shows {PLAY_BGM} and other commands in blue
 That's intentional — those are text commands that are part of the game's text system, not script leakage. `{PLAY_BGM}{MUS_ENCOUNTER_GYM_LEADER}` sets the battle music. `{PLAYER}` inserts the player's name. They're highlighted blue to distinguish them from regular text. Right-click in a text box to insert commands from a menu.
@@ -21,6 +51,9 @@ You need to build the ROM first. Click Make or Make Modern, or press Ctrl+M / Ct
 
 ### Changes in PorySuite don't show in EVENTide dropdowns
 Save first (Ctrl+S). The shared data layer sends a signal to refresh EVENTide's constants after saving. If it still doesn't show, use File > Refresh (F5) to reload everything from disk.
+
+### New overworld sprite doesn't appear in the Event Editor's graphic dropdown
+New sprites added via the Overworld Graphics tab push their `OBJ_EVENT_GFX_*` constant directly into the Event Editor's dropdown through cross-tab sync — no save or refresh needed. If the sprite still doesn't appear, switch to any EVENTide page and back to trigger a constants refresh, or use File > Refresh (F5).
 
 ### Settings dialog looks different
 The settings dialog was rebuilt with a sidebar. All your old settings (diagnostics, autosave, notification preferences) are still there under the same INI keys. Nothing was lost.
@@ -475,9 +508,52 @@ Check that Porymap is installed (Tools > Install Porymap). The button is greyed 
 
 The launcher detects running Porymap windows by title. If the window title doesn't contain "porymap" (case-insensitive), detection fails. This can happen if Porymap is minimized to the system tray. Bring Porymap to the foreground manually and try again, or close the extra window.
 
+### Map switching feels slow or bounces back to a previous map
+
+This was caused by two issues (both fixed):
+1. **Lag**: The auto-sync feature was checking if Porymap was running by spawning a `tasklist.exe` subprocess on every map switch, which blocked the UI for ~4 seconds. Now it just writes a small command file (near-instant).
+2. **Echo loop**: PorySuite sends "switch to map X" → Porymap switches → Porymap tells PorySuite "I'm now on map X" → PorySuite sends "switch to map X" again. Fixed with a dual dedup system (flag + last-map tracking) that breaks the loop.
+
+If you still see bouncing, check that you're running the latest code — older versions don't have the anti-echo logic.
+
 ### Porymap loses patches after reinstall
 
 This is expected. The Install Porymap flow runs `git reset --hard` to ensure a clean source tree, then re-applies all patches via `apply_patches.py`. If a patch fails to apply (check the Output panel for errors), the binary will be missing features like `openMap` or `readCommandFile`. Report the specific error — it usually means an upstream Porymap change moved the anchor string the patcher looks for.
+
+### EVENTide: Script changes not saving (shared sub-label overwrite)
+Fixed (2026-04-06). When multiple events share a script sub-label via `goto` (for example, three trigger events that all jump to the same `RivalBattle` label), editing one event's copy of that shared label and saving could lose the edit. The save loop processed events in order, and the last event's stale copy of the shared label overwrote the user's edit. Fixed: the currently-selected event is now processed last during save, so its edits always win.
+
+### EVENTide: "Value for 'local_id' cannot be empty" build error
+Fixed (2026-04-06). Switching between events in the editor could inject an empty `"local_id": ""` field into objects that originally had no `local_id` (like the three unnamed lab assistants in Oak's Lab). The build tool rejects empty values for this field. Fixed: the editor only writes `local_id` when the field has actual text. If your map.json already has bogus empty `local_id` fields, remove them manually or re-save the map in PorySuite-Z.
+
+### EVENTide: "Missing value for required parameter 'song' of macro 'savebgm'" build error
+Fixed (2026-04-06). The `savebgm` command widget was outputting just `savebgm` with no song argument. The GBA macro requires `savebgm MUS_SOMETHING`. Fixed: the widget now has a song picker dropdown and includes the selected constant in its output.
+
+### EVENTide: "healplayerteam" assembler error
+Fixed (2026-04-06). The Heal Player Team command widget was emitting `healplayerteam` which isn't a real GBA assembly macro. The correct output is `special HealPlayerParty`. Fixed in the widget's output.
+
+### Voice groups save causes "undefined reference to gCryTable" linker error
+Fixed (2026-04-06). The Voicegroups Tab's `save_to_disk()` was writing the full `voice_groups.inc` file from scratch, dropping any `.include` lines that existed between voicegroup blocks (like `.include "sound/cry_tables.inc"`). Without that include, the linker couldn't find the cry table symbols. Fixed: the save function now reads the existing file first, records which `.include` lines appear after which voicegroup, and re-inserts them at the correct positions when writing.
+
+---
+
+## Sound Editor
+
+### Songs sound wrong — wrong pitch, missing notes, volume too loud/quiet
+Multiple audio accuracy bugs were fixed on 2026-04-06. If you're hearing:
+- **Wrong key / pitches off**: The BEND command and MidiKeyToFreq pitch calculation are now GBA-accurate. If a specific song still sounds off, report which song and which instrument sounds wrong.
+- **Missing notes or silent sections**: Running status bytes (bare integers that repeat the last control command like VOL) are now parsed correctly. Previously they were silently dropped, causing volume to stay at 0.
+- **Some instruments way too loud or quiet compared to in-game**: The volume pipeline was fixed — velocity is now applied once (not twice), the song's master volume constant is no longer double-applied (it's already baked into VOL command values), and CGB instruments (square waves, programmable waves, noise) no longer have arbitrary volume reduction factors.
+- **Sounds disappear in mono playback**: Per-note stereo panning now uses GBA's linear crossfade instead of constant-power. No phase cancellation occurs when channels are summed.
+
+### Song playback has a piercing high-pitched sound
+Some songs (e.g., mus_victory_trainer) have square wave notes at very high MIDI pitches (96-98). These are present in the original GBA data but may sound harsher in our renderer than on actual hardware due to differences in the output filtering. This is a known limitation.
+
+### Songs sound shifted up by several semitones / shrill high pitch
+Fixed (2026-04-06). XCMD instructions in GBA assembly span multiple `.byte` lines. The parser only handled the first line — the continuation line (e.g., `.byte xIECL, 8`) was misinterpreted as a running-status command, creating phantom KEYSH commands that shifted all subsequent notes up by 8-16 semitones. This affected roughly 85 songs. Fixed by recognizing XCMD sub-command tokens (xIECV, xIECL) and skipping them.
+
+### Drum tracks are silent
+Fixed (2026-04-06). The GBA stores voicegroups back-to-back in memory. Drum kits using `keysplit_all` index directly by MIDI note number, which can overflow past the target voicegroup's bounds into the next one (e.g., note 40 in a 29-instrument voicegroup reads slot 11 of the next voicegroup). The parser was returning "not found" for overflow indices. Fixed by chaining into subsequent voicegroups.
 
 ---
 

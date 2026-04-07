@@ -20,7 +20,9 @@ The centrepiece. A visual script editor modeled after RPG Maker XP's event edito
 - **RMXP-style command list**: `@>Text: Hello world` format. Double-click to edit. `@>` insertion line at bottom.
 - **Numbered page tabs**: 1, 2, 3 (matching RMXP) for condition-based script branching
 - **Editable conditions box**: Flag/var conditions above Event Properties with searchable pickers
-- **84+ command widgets**: Searchable constant pickers, context-aware dropdowns, scroll-wheel guarded
+- **▶ Preview (Play Pokémon Cry)**: The `playmoncry` command widget has a Preview button that plays the selected species' cry from `sound/direct_sound_samples/cries/*.wav`.
+- **▶ Preview / ■ Stop / 🔊 Open (Sound commands)**: The `playbgm`, `playse`, and `playfanfare` command widgets have three integration buttons. ▶ renders and plays the selected song in the background without leaving the Event Editor. ■ stops playback. 🔊 switches to the Sound Editor tab and selects the song.
+- **100+ command widgets**: Searchable constant pickers, context-aware dropdowns, scroll-wheel guarded. The 3-page command palette is laid out everyday-use-first — page 1 has lock/faceplayer/applymovement/trainerbattle/message/giveitem/setflag/wildbattle at the top.
 - **Display overhaul**: Human-readable names for trainers, items, species, moves, flags, vars
 - **Full save**: Writes scripts.inc + text.inc + map.json
 
@@ -41,7 +43,7 @@ Only specific categories get colored — plain text/choices/structure stays defa
 - **Cross-references**: Clickable notes when other scripts modify an NPC's position, with actual coordinates shown inline.
 
 ### Navigation
-- **Go To →**: Follows goto/call/trainer battle targets across pages and events
+- **Go To →**: Follows goto/call/trainer battle targets across pages and events. Also available as a button directly inside command edit dialogs — any popup for call/goto/call_if_*/goto_if_* commands shows Go To alongside OK/Cancel.
 - **Set Flag → Page linking**: `setflag`/`setvar` commands show "→ activates Page N", Go To jumps there
 - **Script Lookup** (Ctrl+Shift+F): Project-wide search across 5,300+ labels. Navigates to map/event/page.
 - **Find in commands** (Ctrl+F): Inline search with highlight, Next/Prev, wrap-around
@@ -71,7 +73,7 @@ Only specific categories get colored — plain text/choices/structure stays defa
 - **`ui/script_search_dialog.py`** — Project-wide script label search dialog (Ctrl+Shift+F).
 - **`backend/script_index.py`** — Label index. Scans all scripts.inc + data/scripts/ on project load (~5,300 labels, <1 second).
 - **`backend/eventide_utils.py`** — Script parser, text parser, save writers.
-- **`backend/constants_manager.py`** — Loads all project constants from C header files.
+- **`backend/constants_manager.py`** — Loads all project constants from C header files. Supports live push of new `OBJ_EVENT_GFX_*` constants from the Overworld Graphics tab via cross-tab sync.
 - **`backend/map_renamer.py`** — Map rename, group/section management, orphan cleanup.
 - **`backend/layout_renamer.py`** — Layout rename/delete, orphan cleanup, tileset assignment.
 - **`backend/tileset_renamer.py`** — Secondary tileset renaming with repo-wide reference updates.
@@ -82,7 +84,7 @@ Only specific categories get colored — plain text/choices/structure stays defa
 
 ## Save model
 
-All saves are manual — only the Save button (or Ctrl+S) writes to disk. `_collect_current()` syncs UI fields to memory when switching between objects/pages but never writes to disk. Save/Discard/Cancel dialog on close, map switch, or refresh.
+All saves are manual — only the Save button (or Ctrl+S) writes to disk. `_collect_current()` syncs UI fields to memory when switching between objects/pages but never writes to disk. Save/Discard/Cancel dialog on close, map switch, or refresh. External file watchers (Porymap saves, other tools modifying `map.json`/`scripts.inc`) also trigger a Save/Discard/Cancel prompt before clobbering unsaved edits — see `reload_current_map(force=False)`.
 
 ## Docs
 - `CLAUDECONTEXT.md` — Context for new Claude threads (EVENTide-specific)

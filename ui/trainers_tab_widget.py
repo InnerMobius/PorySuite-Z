@@ -1129,6 +1129,10 @@ class _TrainerDetailPanel(QWidget):
         self._has_female_flag: bool = False
         self._party_slots: list[_PartySlotWidget] = []
         self._dialogue_labels: dict = {}   # {map_name: {type: (label, text)}}
+        # Pending dialogue for newly-added trainers that aren't on a map yet.
+        # {trainer_const: {type: (label, text)}} — held in RAM until the
+        # trainer gets placed on a map via Event Editor.
+        self._pending_dialogue: dict = {}
         self._rematch_map_data   = rematch_map or {}
         self._all_trainers_data  = all_trainers or {}
         self._all_parties_data   = all_parties or {}
@@ -1471,6 +1475,9 @@ class _TrainerDetailPanel(QWidget):
 
     def _populate_dialogue_tab(self, trainer_const: str):
         """Search text.inc files for this trainer's dialogue and display it."""
+        # Harvest any edited pending dialogue for the previously-shown trainer
+        # so the user's edits aren't lost when switching trainers.
+        self._harvest_pending_dialogue()
         # Clear old dialogue widgets
         self._dialogue_edits.clear()
         while self._dialogue_layout.count() > 0:
@@ -1501,6 +1508,14 @@ class _TrainerDetailPanel(QWidget):
 
         found_any = False
 
+        # Grab Event Editor's live in-RAM state (if any map is open there).
+        # The user may have placed this trainer on a map and/or edited its
+        # dialogue in the Event Editor's Trainer Battle dialog without
+        # saving yet — we need to show those live edits here so the two
+        # editors stay in sync.
+        live_map, live_scripts_src, live_texts = \
+            self._get_live_event_editor_state()
+
         for map_name in sorted(os.listdir(maps_dir)):
             map_dir = os.path.join(maps_dir, map_name)
             scripts_path = os.path.join(map_dir, "scripts.inc")
@@ -1509,24 +1524,33 @@ class _TrainerDetailPanel(QWidget):
             if not os.path.isfile(scripts_path):
                 continue
 
-            try:
-                with open(scripts_path, "r", encoding="utf-8") as f:
-                    scripts_content = f.read()
-            except Exception:
-                continue
+            # Prefer live Event Editor state when it's the same map — user
+            # may have added the trainer here without saving yet.
+            is_live = (map_name == live_map)
+            if is_live:
+                scripts_content = live_scripts_src
+                texts = dict(live_texts)
+            else:
+                try:
+                    with open(scripts_path, "r", encoding="utf-8") as f:
+                        scripts_content = f.read()
+                except Exception:
+                    continue
 
             if trainer_const not in scripts_content:
                 continue
 
-            # This map uses this trainer. Load its text.inc.
-            texts = {}
-            if os.path.isfile(text_path):
-                try:
-                    from pathlib import Path
-                    from eventide.backend.eventide_utils import parse_text_inc
-                    texts = dict(parse_text_inc(Path(text_path)))
-                except Exception:
-                    pass
+            # This map uses this trainer. Load its text.inc if we didn't
+            # already pull texts from the live event editor state.
+            if not is_live:
+                texts = {}
+                if os.path.isfile(text_path):
+                    try:
+                        from pathlib import Path
+                        from eventide.backend.eventide_utils import parse_text_inc
+                        texts = dict(parse_text_inc(Path(text_path)))
+                    except Exception:
+                        pass
 
             # Find text labels related to this trainer
             map_texts = {}
@@ -1551,7 +1575,24 @@ class _TrainerDetailPanel(QWidget):
             if map_texts:
                 found_any = True
                 self._dialogue_labels[map_name] = map_texts
-                self._add_dialogue_group(map_name, map_texts, text_path)
+                display_name = (f"{map_name}  (live — unsaved edits)"
+                                if is_live else None)
+                self._add_dialogue_group(
+                    map_name, map_texts, text_path, display_name)
+
+        # Also show pending dialogue for trainers not yet placed on a map.
+        # Stored in RAM only — will migrate to text.inc when the trainer is
+        # wired to a trainerbattle command on a map.
+        # Once the trainer has been placed (disk or live), drop the pending
+        # entry so the user doesn't see two editors for the same dialogue.
+        if found_any and trainer_const in self._pending_dialogue:
+            self._pending_dialogue.pop(trainer_const, None)
+        pending = self._pending_dialogue.get(trainer_const)
+        if pending:
+            found_any = True
+            self._dialogue_labels['__pending__'] = pending
+            self._add_dialogue_group(
+                '(Pending — not yet placed on a map)', pending, '')
 
         if not found_any:
             self._no_dialogue_label = QLabel(
@@ -1566,6 +1607,48 @@ class _TrainerDetailPanel(QWidget):
             self._dialogue_layout.addWidget(self._no_dialogue_label)
 
         self._dialogue_layout.addStretch()
+
+    def _get_live_event_editor_state(self) -> tuple[str, str, dict]:
+        """Peek at the Event Editor's in-RAM scripts and texts for the
+        currently-open map.
+
+        Returns ``(map_name, synthetic_scripts_content, texts_dict)``.
+        ``map_name`` matches a folder name under ``data/maps``. If the user
+        has placed a trainer on that map via the Event Editor (without
+        saving yet), the synthetic scripts content will contain the
+        trainerbattle command so this tab can discover it just like it
+        would from disk. Returns ``('', '', {})`` if no map is loaded.
+        """
+        try:
+            from eventide.ui.event_editor_tab import _ALL_SCRIPTS
+        except Exception:
+            return ('', '', {})
+
+        live_map = _ALL_SCRIPTS.get('__texts_map__') or ''
+        live_texts = _ALL_SCRIPTS.get('__texts__') or {}
+        if not live_map:
+            return ('', '', {})
+
+        # Flatten live scripts dict into a pseudo scripts.inc format.
+        # We only need the trainerbattle lines + their args to be
+        # recognizable to _extract_dialogue_from_script and the
+        # "trainer_const in scripts_content" substring check.
+        lines = []
+        for label, cmds in _ALL_SCRIPTS.items():
+            if label.startswith('__') or not isinstance(cmds, list):
+                continue
+            lines.append(f'{label}:')
+            for cmd in cmds:
+                if not cmd or not isinstance(cmd, tuple):
+                    continue
+                name = cmd[0]
+                rest = cmd[1:]
+                if rest:
+                    args = ', '.join(str(a) for a in rest)
+                    lines.append(f'\t{name} {args}')
+                else:
+                    lines.append(f'\t{name}')
+        return (live_map, '\n'.join(lines), dict(live_texts))
 
     def _extract_dialogue_from_script(self, scripts_content: str,
                                        trainer_const: str,
@@ -1600,9 +1683,17 @@ class _TrainerDetailPanel(QWidget):
 
         return result
 
-    def _add_dialogue_group(self, map_name: str, map_texts: dict, text_path: str):
-        """Add a group box for one map's dialogue to the dialogue tab."""
-        group = QGroupBox(f"Map: {map_name}")
+    def _add_dialogue_group(self, map_name: str, map_texts: dict, text_path: str,
+                            display_name: str | None = None):
+        """Add a group box for one map's dialogue to the dialogue tab.
+
+        ``map_name`` is the canonical key used for _dialogue_edits lookups
+        (must match what's in _dialogue_labels so save can find it).
+        ``display_name`` is the human-friendly title shown in the group
+        header — defaults to ``map_name`` when not given.
+        """
+        shown = display_name if display_name is not None else map_name
+        group = QGroupBox(f"Map: {shown}")
         group.setStyleSheet("QGroupBox { font-weight: bold; }")
         group_layout = QVBoxLayout(group)
         group_layout.setSpacing(6)
@@ -1653,8 +1744,48 @@ class _TrainerDetailPanel(QWidget):
 
         self._dialogue_layout.addWidget(group)
 
+    def _harvest_pending_dialogue(self) -> None:
+        """Read edited text from the pending dialogue widgets and store it
+        back into self._pending_dialogue so edits survive trainer switches."""
+        if not self._current_const:
+            return
+        pending = self._pending_dialogue.get(self._current_const)
+        if not pending:
+            return
+        pending_map_key = '(Pending — not yet placed on a map)'
+        for (map_name, text_type), edit in list(self._dialogue_edits.items()):
+            if map_name != pending_map_key:
+                continue
+            if text_type in pending:
+                label = pending[text_type][0]
+                pending[text_type] = (label, edit.get_inc_text())
+
+    def set_pending_dialogue(self, trainer_const: str,
+                             intro_text: str, defeat_text: str,
+                             post_text: str) -> None:
+        """Create an in-RAM pending dialogue entry for a newly-added trainer.
+
+        The labels follow the standard map_text naming pattern and will be
+        picked up automatically when the trainer gets placed on a map.
+        """
+        clean = trainer_const.replace('TRAINER_', '')
+        parts = clean.split('_')
+        camel = ''.join(p.capitalize() for p in parts)
+        self._pending_dialogue[trainer_const] = {
+            'intro':  (f'Text_{camel}_Intro', intro_text),
+            'defeat': (f'Text_{camel}_Defeat', defeat_text),
+            'post':   (f'Text_{camel}_PostBattle', post_text),
+        }
+
+    def clear_pending_dialogue(self, trainer_const: str) -> None:
+        """Drop the pending entry once the trainer is placed on a real map."""
+        self._pending_dialogue.pop(trainer_const, None)
+
     def collect_dialogue(self) -> dict:
         """Collect edited dialogue text. Returns {(map, type): (label, new_text)}."""
+        # Keep pending dialogue in RAM in sync with the editor widgets so
+        # edits don't get lost at save-time or when switching trainers.
+        self._harvest_pending_dialogue()
         result = {}
         for (map_name, text_type), edit in self._dialogue_edits.items():
             if map_name in self._dialogue_labels:
@@ -2407,6 +2538,35 @@ class TrainersTabWidget(QWidget):
                 + ("\n  …and more." if len(refs) > 25 else "")
             )
 
+    def apply_class_name(self, const: str, new_name: str) -> None:
+        """Live-apply a trainer-class display name rename from the sibling
+        Trainer Class editor. Updates in-memory mapping and refreshes
+        visible widgets — no disk write, no save required."""
+        if not const:
+            return
+        self._class_names[const] = new_name
+        # Push into the detail panel too (it holds its own reference — the
+        # initial load passed the dict in by reference, but defensively
+        # update in place to ensure both match).
+        panel = getattr(self, "_detail_panel", None)
+        if panel is not None and hasattr(panel, "_class_names"):
+            panel._class_names[const] = new_name
+            # Refresh the class combobox so the new name shows in the dropdown
+            try:
+                panel._populate_class_combo()
+            except Exception:
+                pass
+            # Refresh the header label if this class is currently displayed
+            try:
+                panel._refresh_header()
+            except Exception:
+                pass
+        # Rebuild the list so class-grouping labels and display names update
+        try:
+            self._rebuild_list()
+        except Exception:
+            pass
+
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _load_trainer_order(self, root: str) -> list[str]:
@@ -2573,7 +2733,7 @@ class TrainersTabWidget(QWidget):
                                                    "TRAINER_ENCOUNTER_MUSIC_MALE"),
             "trainerPic":            template.get("trainerPic",
                                                    next(iter(self._pic_map.keys()), "")),
-            "trainerName":           f'_("{name.upper()}")',
+            "trainerName":           f'_("{name}")',
             "items":                 template.get("items", "{}"),
             "doubleBattle":          template.get("doubleBattle", "FALSE"),
             "aiFlags":               template.get("aiFlags", "AI_SCRIPT_CHECK_BAD_MOVE"),
@@ -2584,6 +2744,39 @@ class TrainersTabWidget(QWidget):
         self._pending_party_writes[party_sym] = _generate_party_c(
             party_sym, "NO_ITEM_DEFAULT_MOVES", []
         )
+
+        # Live-refresh: make the new trainer immediately available to any
+        # ConstantPicker (e.g. Event Editor's Trainer Battle dialog) without
+        # requiring a full Save + project reload.
+        try:
+            from eventide.backend.constants_manager import ConstantsManager
+            if const not in ConstantsManager.TRAINERS:
+                ConstantsManager.TRAINERS.append(const)
+        except Exception:
+            pass  # ConstantsManager not available — ignore silently
+
+        # Seed default battle dialogue in RAM using the Settings templates.
+        # Must happen BEFORE _rebuild_list() — otherwise setCurrentRow fires
+        # _populate_dialogue_tab before the pending entry exists, leaving
+        # the Dialogue tab showing "No battle dialogue found" until the user
+        # switches trainers and comes back.
+        try:
+            from PyQt6.QtCore import QSettings as _QS
+            from app_info import get_settings_path as _gsp
+            _s = _QS(_gsp(), _QS.Format.IniFormat)
+            intro_text = _s.value(
+                'trainer_defaults/intro_text', "Let's battle!$", type=str)
+            defeat_text = _s.value(
+                'trainer_defaults/defeat_text', "I lost...$", type=str)
+            post_text = _s.value(
+                'trainer_defaults/post_battle_text', "Good fight.$", type=str)
+        except Exception:
+            intro_text = "Let's battle!$"
+            defeat_text = "I lost...$"
+            post_text = "Good fight.$"
+        if self._detail_panel:
+            self._detail_panel.set_pending_dialogue(
+                const, intro_text, defeat_text, post_text)
 
         self._rebuild_list()
         for i in range(self._list.count()):

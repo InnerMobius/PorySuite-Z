@@ -391,6 +391,16 @@ class InstallWorker(QThread):
         # Copy exe
         shutil.copy2(built_exe, os.path.join(runtime, "porymap.exe"))
 
+        # Drop a marker file so the launcher can tell this binary was built
+        # with our patches (CLI map arg, bridge file writer, command reader).
+        # Missing marker ⇒ treat as stock Porymap and degrade gracefully.
+        try:
+            with open(os.path.join(runtime, ".psinstalled"),
+                      "w", encoding="utf-8") as mf:
+                mf.write("PORYSUITE-Z PATCHED PORYMAP\n")
+        except OSError:
+            pass
+
         # Copy MinGW runtime DLLs that the exe needs
         mingw_bin = getattr(self, '_mingw_bin', '')
         if mingw_bin:

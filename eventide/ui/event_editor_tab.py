@@ -43,6 +43,13 @@ from eventide.backend.constants_manager import ConstantsManager
 from eventide.ui.widgets import ConstantPicker, MapPicker, SpritePreview
 from ui.custom_widgets.scroll_guard import install_scroll_guard_recursive
 
+# ── Sound Editor integration callbacks (set by unified_mainwindow) ──────────
+# These let the playbgm/playse/playfanfare widgets talk to the Sound Editor
+# without threading parent refs through dozens of constructors.
+_preview_song_cb = None      # Callable[[str], bool] — constant -> play it
+_open_in_sound_editor_cb = None  # Callable[[str], None] — constant -> switch page
+_stop_preview_cb = None      # Callable[[], None] — stop any playing preview
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Base command widget
@@ -324,7 +331,8 @@ def _primary_const_in_cmd(cmd_tuple: tuple) -> str:
         return str(arg1)
     # Trainer battles — trainer const is first part of comma-separated args
     if cmd in ('trainerbattle', 'trainerbattle_single', 'trainerbattle_no_intro',
-               'trainerbattle_earlyrival', 'trainerbattle_double'):
+               'trainerbattle_earlyrival', 'trainerbattle_double',
+               'trainerbattle_rematch', 'trainerbattle_rematch_double'):
         parts = [p.strip() for p in str(arg1).split(',')]
         return parts[0] if parts else ''
     # Wild battle — species
@@ -421,6 +429,7 @@ def _apply_cmd_color(item: QListWidgetItem, cmd_tuple: tuple):
     # Battles — trainer and wild
     if cmd in ('trainerbattle', 'trainerbattle_single', 'trainerbattle_no_intro',
                'trainerbattle_earlyrival', 'trainerbattle_double',
+               'trainerbattle_rematch', 'trainerbattle_rematch_double',
                'wildbattle', 'setwildbattle', 'dowildbattle',
                'dotrainerbattle'):
         item.setForeground(QColor(_CATEGORY_COLORS.get('battle', '#e74c3c')))
@@ -483,6 +492,7 @@ def _category_for_cmd(cmd: str) -> str:
         return 'screen'
     if cmd in ('trainerbattle', 'trainerbattle_single', 'trainerbattle_no_intro',
                'trainerbattle_earlyrival', 'trainerbattle_double',
+               'trainerbattle_rematch', 'trainerbattle_rematch_double',
                'wildbattle', 'setwildbattle', 'dowildbattle',
                'dotrainerbattle'):
         return 'battle'
@@ -547,6 +557,13 @@ _FRIENDLY_NAMES: dict[str, str] = {
     'trainerbattle_no_intro': 'Trainer Battle (No Intro)',
     'trainerbattle_earlyrival': 'Trainer Battle (Early Rival)',
     'trainerbattle_double': 'Trainer Battle (Double)',
+    'trainerbattle_rematch': 'Trainer Battle (Rematch)',
+    'trainerbattle_rematch_double': 'Trainer Battle (Rematch Double)',
+    'healplayerteam': 'Heal Player Team',
+    'getplayerxy': 'Get Player Position', 'random': 'Random Number',
+    'setobjectxyperm': 'Set NPC Position (Permanent)',
+    'savebgm': 'Save Current Music', 'fadedefaultbgm': 'Restore Saved Music',
+    'buffernumberstring': 'Buffer Number', 'bufferstring': 'Buffer String',
     'wildbattle': 'Wild Battle',
     'givemon': 'Give Pokémon', 'giveegg': 'Give Egg',
     'finditem': 'Find Item',
@@ -562,7 +579,10 @@ _FRIENDLY_NAMES: dict[str, str] = {
     'setmonmove': 'Set Mon Move', 'showmonpic': 'Show Mon Pic',
     'hidemonpic': 'Hide Mon Pic', 'pokemart': 'PokéMart',
     'setmetatile': 'Set Metatile', 'textcolor': 'Text Color',
-    'setworldmapflag': 'Set World Map Flag', 'famechecker': 'Fame Checker',
+    'setworldmapflag': 'Set World Map Flag',
+    'famechecker': 'Fame Checker',
+    'map_script': 'Map Script', 'map_script_2': 'Map Script (Conditional)',
+    '.byte': 'End Script Table', '.2byte': 'Data',
     'signmsg': 'Sign Message Mode', 'normalmsg': 'Normal Message Mode',
     'goto_if_questlog': 'If Quest Log → Goto',
     'switch': 'Switch', 'case': 'Case',
@@ -575,7 +595,42 @@ _OP_DISPLAY = {
     'goto_if_eq': '==', 'goto_if_ne': '!=', 'goto_if_lt': '<',
     'goto_if_ge': '>=', 'goto_if_le': '<=', 'goto_if_gt': '>',
     'call_if_eq': '==', 'call_if_ne': '!=', 'call_if_lt': '<',
-    'call_if_ge': '>=',
+    'call_if_ge': '>=', 'call_if_le': '<=', 'call_if_gt': '>',
+}
+
+# Map script type constants → friendly names
+_MAP_SCRIPT_TYPES = {
+    'MAP_SCRIPT_ON_LOAD': 'On Load',
+    'MAP_SCRIPT_ON_TRANSITION': 'On Transition',
+    'MAP_SCRIPT_ON_FRAME_TABLE': 'On Frame',
+    'MAP_SCRIPT_ON_WARP_INTO_MAP_TABLE': 'On Warp In',
+    'MAP_SCRIPT_ON_RESUME': 'On Resume',
+    'MAP_SCRIPT_ON_RETURN_TO_FIELD': 'On Return to Field',
+    'MAP_SCRIPT_ON_DIVE_WARP': 'On Dive Warp',
+}
+
+# Fadescreen constants → friendly names
+_FADESCREEN_NAMES = {
+    'FADE_TO_BLACK': 'Fade to Black',
+    'FADE_FROM_BLACK': 'Fade from Black',
+    'FADE_TO_WHITE': 'Fade to White',
+    'FADE_FROM_WHITE': 'Fade from White',
+    '0': 'Fade to Black', '1': 'Fade from Black',
+    '2': 'Fade to White', '3': 'Fade from White',
+}
+
+# Weather constants → friendly names
+_WEATHER_NAMES = {
+    'WEATHER_NONE': 'None', 'WEATHER_CLOUDS': 'Clouds',
+    'WEATHER_SUNNY': 'Sunny', 'WEATHER_RAIN': 'Rain',
+    'WEATHER_SNOW': 'Snow', 'WEATHER_RAIN_THUNDERSTORM': 'Thunderstorm',
+    'WEATHER_FOG_HORIZONTAL': 'Fog (Horizontal)',
+    'WEATHER_FOG_DIAGONAL': 'Fog (Diagonal)',
+    'WEATHER_VOLCANIC_ASH': 'Volcanic Ash',
+    'WEATHER_SANDSTORM': 'Sandstorm',
+    'WEATHER_SHADE': 'Shade', 'WEATHER_DROUGHT': 'Drought',
+    'WEATHER_DOWNPOUR': 'Downpour',
+    'WEATHER_UNDERWATER': 'Underwater',
 }
 
 
@@ -776,26 +831,19 @@ def _stringize(cmd_tuple: tuple) -> str:
         return f'@>{friendly}: {obj_id}'
     if cmd in ('showobjectat', 'hideobjectat'):
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
-        return f'@>{friendly}: {args}'
+        parts = [p.strip() for p in str(args).split(',')]
+        resolved = [_resolve_name(p) if p.startswith(('OBJ_EVENT_GFX_', 'MAP_')) else p for p in parts]
+        return f'@>{friendly}: {", ".join(resolved)}'
     if cmd == 'turnobject':
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        parts = [p.strip() for p in str(args).split(',')]
+        if len(parts) >= 2:
+            direction = parts[1].replace('DIR_', '').replace('_', ' ').title() if parts[1].startswith('DIR_') else parts[1]
+            return f'@>Turn Object: {parts[0]}, {direction}'
         return f'@>Turn Object: {args}'
     if cmd == 'setobjectxy':
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         return f'@>Move Object: {args}'
-
-    # ── Sound ───────────────────────────────────────────────────────────
-    if cmd in ('playse', 'playfanfare', 'playbgm'):
-        name = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
-        return f'@>{friendly}: {name}'
-    if cmd in ('fadeoutbgm', 'fadeinbgm'):
-        dur = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
-        return f'@>{friendly}: {dur}'
-
-    # ── Weather ─────────────────────────────────────────────────────────
-    if cmd == 'setweather':
-        weather = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
-        return f'@>Set Weather: {weather}'
 
     # ── Delay ───────────────────────────────────────────────────────────
     if cmd == 'delay':
@@ -809,7 +857,8 @@ def _stringize(cmd_tuple: tuple) -> str:
 
     # ── Trainer / Wild Battle ───────────────────────────────────────────
     if cmd in ('trainerbattle', 'trainerbattle_single', 'trainerbattle_earlyrival',
-                'trainerbattle_no_intro', 'trainerbattle_double'):
+                'trainerbattle_no_intro', 'trainerbattle_double',
+                'trainerbattle_rematch', 'trainerbattle_rematch_double'):
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         parts = [p.strip() for p in str(args).split(',')]
         # Args layout: TRAINER is always parts[0] (type is in the command name)
@@ -932,14 +981,80 @@ def _stringize(cmd_tuple: tuple) -> str:
         return f'@>{friendly}: {_resolve_name(args)}'
 
     # ── Screen effects ──────────────────────────────────────────────────
-    if cmd in ('fadescreen', 'fadescreenspeed', 'setflashlevel'):
+    if cmd in ('fadescreen', 'fadescreenspeed'):
+        args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        return f'@>{friendly}: {_FADESCREEN_NAMES.get(str(args).strip(), args)}'
+    if cmd == 'setflashlevel':
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         return f'@>{friendly}: {args}'
 
-    # ── Fallback: show command name and raw args ────────────────────────
+    # ── Weather ────────────────────────────────────────────────────────
+    if cmd in ('setweather', 'doweather', 'resetweather'):
+        args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        if args:
+            return f'@>{friendly}: {_WEATHER_NAMES.get(str(args).strip(), _resolve_name(str(args).strip()))}'
+        return f'@>{friendly}'
+
+    # ── World map flags ────────────────────────────────────────────────
+    if cmd == 'setworldmapflag':
+        flag = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        name = _resolve_name(flag.strip()) if flag else ''
+        return f'@>{friendly}: {name}'
+
+    # ── Map script table entries ───────────────────────────────────────
+    if cmd == 'map_script':
+        args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        parts = [p.strip() for p in str(args).split(',')]
+        if len(parts) >= 2:
+            script_type = _MAP_SCRIPT_TYPES.get(parts[0], parts[0])
+            return f'@>{friendly} ({script_type}): {parts[1]}'
+        return f'@>{friendly}: {args}'
+    if cmd == 'map_script_2':
+        args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        parts = [p.strip() for p in str(args).split(',')]
+        if len(parts) >= 3:
+            var_name = _resolve_name(parts[0])
+            return f'@>{friendly}: If [{var_name}] == {parts[1]} → {parts[2]}'
+        return f'@>{friendly}: {args}'
+
+    # ── Script table terminator ────────────────────────────────────────
+    if cmd == '.byte' and str(cmd_tuple[1]).strip() == '0':
+        return '@>End of Script Table'
+    if cmd in ('.byte', '.2byte'):
+        args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        return f'@>{friendly}: {args}'
+
+    # ── Object control — resolve constant names ────────────────────────
+    if cmd in ('setobjectmovementtype',):
+        args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        parts = [p.strip() for p in str(args).split(',')]
+        if len(parts) >= 2:
+            return f'@>Set Movement Type: {parts[0]}, {_resolve_name(parts[1])}'
+        return f'@>{friendly}: {args}'
+
+    # ── Sound — resolve constant names ─────────────────────────────────
+    if cmd in ('playse', 'playfanfare'):
+        name = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        return f'@>{friendly}: {_resolve_name(str(name).strip())}'
+    if cmd == 'playbgm':
+        args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
+        parts = [p.strip() for p in str(args).split(',')]
+        return f'@>{friendly}: {_resolve_name(parts[0])}'
+
+    # ── Fallback: resolve any recognizable constants in args ───────────
     args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
     if args:
-        return f'@>{friendly}: {args}'
+        # Try to resolve each comma-separated argument
+        parts = [p.strip() for p in str(args).split(',')]
+        resolved = []
+        for p in parts:
+            if p and any(p.startswith(pfx) for pfx in
+                         ('FLAG_', 'VAR_', 'TRAINER_', 'ITEM_', 'SPECIES_',
+                          'MOVE_', 'SE_', 'MUS_', 'WEATHER_', 'OBJ_EVENT_GFX_')):
+                resolved.append(_resolve_name(p))
+            else:
+                resolved.append(p)
+        return f'@>{friendly}: {", ".join(resolved)}'
     return f'@>{friendly}'
 
 
@@ -953,7 +1068,13 @@ class _CommandEditDialog(QDialog):
     Wraps the appropriate _CommandWidget (the same widget classes used before)
     inside a dialog with OK / Cancel buttons.  Returns the edited tuple on
     accept, or None on cancel.
+
+    If the command references a script label (call, goto, call_if_*, goto_if_*,
+    etc.) a "Go To" button appears that saves and navigates to the target.
     """
+
+    # Custom result code for Go To action
+    GoToResult = 2
 
     def __init__(self, cmd_tuple: tuple, parent=None):
         super().__init__(parent)
@@ -961,6 +1082,7 @@ class _CommandEditDialog(QDialog):
         friendly = _FRIENDLY_NAMES.get(cmd, cmd)
         self.setWindowTitle(f'Edit: {friendly}')
         self.setMinimumWidth(480)
+        self._goto_label: str = ''
 
         layout = QVBoxLayout(self)
 
@@ -975,12 +1097,35 @@ class _CommandEditDialog(QDialog):
             install_scroll_guard_recursive(self._widget)
             layout.addWidget(self._widget)
 
+        # Button row
+        btn_layout = QHBoxLayout()
+
+        # Add "Go To →" button if the widget has a navigable label field
+        self._goto_btn = None
+        if hasattr(self._widget, 'label_combo'):
+            self._goto_btn = QPushButton('Go To \u2192')
+            self._goto_btn.setToolTip(
+                'Save changes and navigate to the target script')
+            self._goto_btn.clicked.connect(self._on_goto)
+            btn_layout.addWidget(self._goto_btn)
+
+        btn_layout.addStretch()
+
         # OK / Cancel buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        btn_layout.addWidget(buttons)
+
+        layout.addLayout(btn_layout)
+
+    def _on_goto(self):
+        """Handle Go To button — save the target label and close."""
+        if hasattr(self._widget, 'label_combo'):
+            self._goto_label = self._widget.label_combo.currentText().strip()
+        if self._goto_label:
+            self.done(self.GoToResult)
 
     def result_tuple(self) -> tuple:
         """Return the edited command tuple."""
@@ -1479,6 +1624,8 @@ class _CallIfCompareWidget(_CommandWidget):
         ('call_if_eq', '=='),
         ('call_if_ne', '!='),
         ('call_if_lt', '<'),
+        ('call_if_gt', '>'),
+        ('call_if_le', '<='),
         ('call_if_ge', '>='),
     ]
 
@@ -2921,8 +3068,9 @@ class _TurnObjectWidget(_CommandWidget):
 
 class _SetObjectXYWidget(_CommandWidget):
     """Move NPC to coordinates — object dropdown + x/y spinners."""
-    def __init__(self, obj_id='', x=0, y=0, parent=None):
+    def __init__(self, obj_id='', x=0, y=0, cmd='setobjectxy', parent=None):
         super().__init__(parent)
+        self._cmd = cmd
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Object:'))
@@ -2937,10 +3085,10 @@ class _SetObjectXYWidget(_CommandWidget):
         layout.addStretch()
 
     def to_tuple(self):
-        return ('setobjectxy', f'{self.id_combo.currentText()}, {self.x_spin.value()}, {self.y_spin.value()}')
+        return (self._cmd, f'{self.id_combo.currentText()}, {self.x_spin.value()}, {self.y_spin.value()}')
 
     def friendly_name(self):
-        return 'Move NPC'
+        return 'Set NPC Position (Permanent)' if self._cmd == 'setobjectxyperm' else 'Move NPC'
 
 
 class _LockWidget(_CommandWidget):
@@ -3044,6 +3192,24 @@ class _PlaySEWidget(_CommandWidget):
             self.picker.set_constant(sfx)
         layout.addWidget(self.picker, 1)
 
+        btn_preview = QPushButton("▶")
+        btn_preview.setFixedSize(28, 24)
+        btn_preview.setToolTip("Preview this sound effect")
+        btn_preview.clicked.connect(lambda: _preview_song_cb and _preview_song_cb(self.picker.selected_constant()))
+        layout.addWidget(btn_preview)
+
+        btn_stop = QPushButton("■")
+        btn_stop.setFixedSize(28, 24)
+        btn_stop.setToolTip("Stop preview")
+        btn_stop.clicked.connect(lambda: _stop_preview_cb and _stop_preview_cb())
+        layout.addWidget(btn_stop)
+
+        btn_open = QPushButton("🔊")
+        btn_open.setFixedSize(28, 24)
+        btn_open.setToolTip("Open in Sound Editor")
+        btn_open.clicked.connect(lambda: _open_in_sound_editor_cb and _open_in_sound_editor_cb(self.picker.selected_constant()))
+        layout.addWidget(btn_open)
+
     def to_tuple(self):
         return ('playse', self.picker.selected_constant())
 
@@ -3080,6 +3246,24 @@ class _PlayFanfareWidget(_CommandWidget):
         if fanfare:
             self.picker.set_constant(fanfare)
         layout.addWidget(self.picker, 1)
+
+        btn_preview = QPushButton("▶")
+        btn_preview.setFixedSize(28, 24)
+        btn_preview.setToolTip("Preview this fanfare")
+        btn_preview.clicked.connect(lambda: _preview_song_cb and _preview_song_cb(self.picker.selected_constant()))
+        layout.addWidget(btn_preview)
+
+        btn_stop = QPushButton("■")
+        btn_stop.setFixedSize(28, 24)
+        btn_stop.setToolTip("Stop preview")
+        btn_stop.clicked.connect(lambda: _stop_preview_cb and _stop_preview_cb())
+        layout.addWidget(btn_stop)
+
+        btn_open = QPushButton("🔊")
+        btn_open.setFixedSize(28, 24)
+        btn_open.setToolTip("Open in Sound Editor")
+        btn_open.clicked.connect(lambda: _open_in_sound_editor_cb and _open_in_sound_editor_cb(self.picker.selected_constant()))
+        layout.addWidget(btn_open)
 
     def to_tuple(self):
         return ('playfanfare', self.picker.selected_constant())
@@ -3120,6 +3304,24 @@ class _PlayBGMWidget(_CommandWidget):
         self.loop_check = QCheckBox('Loop')
         self.loop_check.setChecked(loop)
         layout.addWidget(self.loop_check)
+
+        btn_preview = QPushButton("▶")
+        btn_preview.setFixedSize(28, 24)
+        btn_preview.setToolTip("Preview this song")
+        btn_preview.clicked.connect(lambda: _preview_song_cb and _preview_song_cb(self.picker.selected_constant()))
+        layout.addWidget(btn_preview)
+
+        btn_stop = QPushButton("■")
+        btn_stop.setFixedSize(28, 24)
+        btn_stop.setToolTip("Stop preview")
+        btn_stop.clicked.connect(lambda: _stop_preview_cb and _stop_preview_cb())
+        layout.addWidget(btn_stop)
+
+        btn_open = QPushButton("🔊")
+        btn_open.setFixedSize(28, 24)
+        btn_open.setToolTip("Open in Sound Editor")
+        btn_open.clicked.connect(lambda: _open_in_sound_editor_cb and _open_in_sound_editor_cb(self.picker.selected_constant()))
+        layout.addWidget(btn_open)
 
     def to_tuple(self):
         loop_val = 1 if self.loop_check.isChecked() else 0
@@ -3274,9 +3476,10 @@ class _SetFlashLevelWidget(_CommandWidget):
 
 
 class _PlayMonCryWidget(_CommandWidget):
-    """Play Pokemon Cry — species picker."""
-    def __init__(self, species='', parent=None):
+    """Play Pokemon Cry — species picker + mode."""
+    def __init__(self, species='', mode='0', parent=None):
         super().__init__(parent)
+        self._mode = str(mode).strip() if mode else '0'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Species:'))
@@ -3285,9 +3488,28 @@ class _PlayMonCryWidget(_CommandWidget):
         if species:
             self.picker.set_constant(species)
         layout.addWidget(self.picker, 1)
+        self.preview_btn = QPushButton('\u25B6 Preview')
+        self.preview_btn.setToolTip(_tt('Play this cry from the project .wav sample'))
+        self.preview_btn.setMaximumWidth(90)
+        self.preview_btn.clicked.connect(self._on_preview)
+        layout.addWidget(self.preview_btn)
+
+    def _on_preview(self):
+        try:
+            from ui.audio_player import get_audio_player
+            player = get_audio_player()
+            root = ConstantsManager._root
+            if root is not None:
+                player.set_project_root(str(root))
+            species = self.picker.selected_constant() or ''
+            if not species:
+                return
+            player.play_cry(species)
+        except Exception:
+            pass
 
     def to_tuple(self):
-        return ('playmoncry', f'{self.picker.selected_constant()}, 0')
+        return ('playmoncry', f'{self.picker.selected_constant()}, {self._mode}')
 
     def friendly_name(self):
         return 'Play Pokémon Cry'
@@ -3371,6 +3593,8 @@ class _TrainerBattleWidget(_CommandWidget):
         'trainerbattle_double': 'Double',
         'trainerbattle_no_intro': 'No Intro',
         'trainerbattle_earlyrival': 'Early Rival',
+        'trainerbattle_rematch': 'Rematch',
+        'trainerbattle_rematch_double': 'Rematch Double',
         'trainerbattle': 'Generic',
     }
 
@@ -3446,7 +3670,7 @@ class _TrainerBattleWidget(_CommandWidget):
                 combo_d, self._texts, 'Defeat:')
             layout.addWidget(grp_d)
 
-            if variant == 'trainerbattle_double':
+            if variant in ('trainerbattle_double', 'trainerbattle_rematch_double'):
                 # Not enough pokemon text
                 combo_ne = _make_label_combo(extra1)
                 combo_ne.setPlaceholderText('not enough pokemon text')
@@ -3477,7 +3701,7 @@ class _TrainerBattleWidget(_CommandWidget):
             victory = self.extra2_combo.currentText().strip()
             return (self._variant, f'{trainer}, {flags}, {defeat}, {victory}')
 
-        elif self._variant == 'trainerbattle_double':
+        elif self._variant in ('trainerbattle_double', 'trainerbattle_rematch_double'):
             intro = self.intro_combo.currentText().strip()
             defeat = self.defeat_combo.currentText().strip()
             not_enough = self.extra1_combo.currentText().strip()
@@ -3487,7 +3711,7 @@ class _TrainerBattleWidget(_CommandWidget):
                 parts.append(cont)
             return (self._variant, ', '.join(parts))
 
-        else:  # trainerbattle_single or generic
+        else:  # trainerbattle_single, trainerbattle_rematch, or generic
             intro = self.intro_combo.currentText().strip()
             defeat = self.defeat_combo.currentText().strip()
             parts = [trainer, intro, defeat]
@@ -4351,6 +4575,160 @@ class _WaitstateWidget(_CommandWidget):
         return 'Wait State'
 
 
+class _GetPlayerXYWidget(_CommandWidget):
+    """Get Player Position — store X and Y into two variables."""
+    def __init__(self, var_x='VAR_0x8004', var_y='VAR_0x8005', parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Store X in:'))
+        self.var_x_edit = QLineEdit(var_x)
+        self.var_x_edit.setPlaceholderText('variable for X')
+        self.var_x_edit.setToolTip(_tt('Variable to store the player\'s X (horizontal) position'))
+        layout.addWidget(self.var_x_edit, 1)
+        layout.addWidget(QLabel('Store Y in:'))
+        self.var_y_edit = QLineEdit(var_y)
+        self.var_y_edit.setPlaceholderText('variable for Y')
+        self.var_y_edit.setToolTip(_tt('Variable to store the player\'s Y (vertical) position'))
+        layout.addWidget(self.var_y_edit, 1)
+
+    def to_tuple(self):
+        return ('getplayerxy', f'{self.var_x_edit.text().strip()}, {self.var_y_edit.text().strip()}')
+
+    def friendly_name(self):
+        return 'Get Player Position'
+
+
+class _RandomWidget(_CommandWidget):
+    """Random Number — generate a random value from 0 to max-1."""
+    def __init__(self, limit=10, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Random 0 to:'))
+        self.limit_spin = QSpinBox()
+        self.limit_spin.setRange(1, 65535)
+        self.limit_spin.setValue(int(limit) if str(limit).isdigit() else 10)
+        self.limit_spin.setToolTip(_tt('Upper bound (exclusive) — result is 0 to this-minus-1\nStored in VAR_RESULT'))
+        layout.addWidget(self.limit_spin)
+        layout.addWidget(QLabel('(result in VAR_RESULT)'))
+        layout.addStretch()
+
+    def to_tuple(self):
+        return ('random', str(self.limit_spin.value()))
+
+    def friendly_name(self):
+        return 'Random Number'
+
+
+class _HealPlayerTeamWidget(_CommandWidget):
+    """Heal Player Team — emits 'special HealPlayerParty'."""
+    _header_only = True
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Heal Player Team (full HP/PP/status restore)'))
+        layout.addStretch()
+
+    def to_tuple(self):
+        return ('special', 'HealPlayerParty')
+
+    def friendly_name(self):
+        return 'Heal Player Team'
+
+
+class _SaveBgmWidget(_CommandWidget):
+    """Save BGM — requires a song parameter."""
+    def __init__(self, song='', parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Save Music:'))
+        self.picker = ConstantPicker(ConstantsManager.MUSIC, prefix='MUS_')
+        self.picker.setToolTip(_tt(
+            'Song to save — restores later with fadedefaultbgm.\n'
+            'The macro requires a song parameter.'))
+        if song:
+            self.picker.set_constant(song)
+        layout.addWidget(self.picker, 1)
+
+    def to_tuple(self):
+        return ('savebgm', self.picker.selected_constant())
+
+    def friendly_name(self):
+        return 'Save Current Music'
+
+
+class _FadeDefaultBgmWidget(_CommandWidget):
+    """Restore saved BGM — no parameters."""
+    _header_only = True
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Restore Saved Music (fade back to BGM saved by savebgm)'))
+        layout.addStretch()
+
+    def to_tuple(self):
+        return ('fadedefaultbgm',)
+
+    def friendly_name(self):
+        return 'Restore Saved Music'
+
+
+class _BufferNumberWidget(_CommandWidget):
+    """Buffer Number — buffer slot (0-2) + number value."""
+    def __init__(self, slot='0', value='0', parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Buffer:'))
+        self.slot_spin = QSpinBox()
+        self.slot_spin.setRange(0, 2)
+        self.slot_spin.setValue(int(slot) if str(slot).isdigit() else 0)
+        self.slot_spin.setMaximumWidth(50)
+        self.slot_spin.setToolTip(_tt('Buffer slot (0–2) — use {STR_VAR_1/2/3} in text to display it'))
+        layout.addWidget(self.slot_spin)
+        layout.addWidget(QLabel('Number:'))
+        self.value_edit = QLineEdit(str(value))
+        self.value_edit.setPlaceholderText('number or variable')
+        self.value_edit.setToolTip(_tt('Number to convert to text in the buffer'))
+        layout.addWidget(self.value_edit, 1)
+
+    def to_tuple(self):
+        return ('buffernumberstring', f'{self.slot_spin.value()}, {self.value_edit.text().strip()}')
+
+    def friendly_name(self):
+        return 'Buffer Number'
+
+
+class _BufferStringWidget(_CommandWidget):
+    """Buffer String — buffer slot (0-2) + text label."""
+    def __init__(self, slot='0', label='', parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Buffer:'))
+        self.slot_spin = QSpinBox()
+        self.slot_spin.setRange(0, 2)
+        self.slot_spin.setValue(int(slot) if str(slot).isdigit() else 0)
+        self.slot_spin.setMaximumWidth(50)
+        self.slot_spin.setToolTip(_tt('Buffer slot (0–2) — use {STR_VAR_1/2/3} in text to display it'))
+        layout.addWidget(self.slot_spin)
+        layout.addWidget(QLabel('Text label:'))
+        self.label_edit = QLineEdit(str(label))
+        self.label_edit.setPlaceholderText('text label from strings')
+        self.label_edit.setToolTip(_tt('Script label pointing to the text to store'))
+        layout.addWidget(self.label_edit, 1)
+
+    def to_tuple(self):
+        return ('bufferstring', f'{self.slot_spin.value()}, {self.label_edit.text().strip()}')
+
+    def friendly_name(self):
+        return 'Buffer String'
+
+
 class _SetMetatileWidget(_CommandWidget):
     """Set Metatile — x, y, metatile_id, impassable."""
     def __init__(self, x=0, y=0, tile_id='', impassable=False, parent=None):
@@ -4508,7 +4886,8 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         return _GotoIfFlagWidget(cmd, flag, lbl)
 
     # ── Conditional calls (compare) ──────────────────────────────────
-    if cmd in ('call_if_eq', 'call_if_ne', 'call_if_lt', 'call_if_ge'):
+    if cmd in ('call_if_eq', 'call_if_ne', 'call_if_lt', 'call_if_gt',
+                'call_if_le', 'call_if_ge'):
         var = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         val = cmd_tuple[2] if len(cmd_tuple) > 2 else ''
         lbl = cmd_tuple[3] if len(cmd_tuple) > 3 else ''
@@ -4529,6 +4908,9 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
     if cmd == 'return':
         return _ReturnWidget()
     if cmd == 'special':
+        # Friendly widget for known specials
+        if str(args).strip() == 'HealPlayerParty':
+            return _HealPlayerTeamWidget()
         return _SpecialWidget(str(args))
     if cmd == 'specialvar':
         parts = _split_args(str(args))
@@ -4570,10 +4952,11 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
     if cmd == 'turnobject':
         parts = _split_args(args)
         return _TurnObjectWidget(parts[0], parts[1] if len(parts) > 1 else 'DIR_DOWN')
-    if cmd == 'setobjectxy':
+    if cmd in ('setobjectxy', 'setobjectxyperm'):
         parts = _split_args(args)
         return _SetObjectXYWidget(parts[0], _safe_int(parts[1]) if len(parts) > 1 else 0,
-                                  _safe_int(parts[2]) if len(parts) > 2 else 0)
+                                  _safe_int(parts[2]) if len(parts) > 2 else 0,
+                                  cmd=cmd)
     if cmd == 'setobjectmovementtype':
         parts = _split_args(args)
         return _SetObjectMovementTypeWidget(
@@ -4632,11 +5015,14 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         return _SetFlashLevelWidget(_safe_int(args, 0))
     if cmd == 'playmoncry':
         parts = _split_args(args)
-        return _PlayMonCryWidget(parts[0] if parts else '')
+        return _PlayMonCryWidget(
+            parts[0] if parts else '',
+            parts[1] if len(parts) > 1 else '0')
 
     # ── Battles, Items & System (Page 3) ─────────────────────────────────
     if cmd in ('trainerbattle', 'trainerbattle_single', 'trainerbattle_no_intro',
-                'trainerbattle_earlyrival', 'trainerbattle_double'):
+                'trainerbattle_earlyrival', 'trainerbattle_double',
+                'trainerbattle_rematch', 'trainerbattle_rematch_double'):
         parts = _split_args(args)
         # Args layout depends on variant (type is in the command name, NOT in args):
         #   _single:     TRAINER, INTRO, DEFEAT [, CONTINUE]
@@ -4652,7 +5038,11 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
                                         parts[1] if len(parts) > 1 else '',  # flags
                                         parts[2] if len(parts) > 2 else '',  # defeat
                                         parts[3] if len(parts) > 3 else '')  # victory
-        elif cmd == 'trainerbattle_double':
+        elif cmd == 'trainerbattle_rematch':
+            return _TrainerBattleWidget(cmd, trainer,
+                                        parts[1] if len(parts) > 1 else '',  # intro
+                                        parts[2] if len(parts) > 2 else '')  # defeat
+        elif cmd in ('trainerbattle_double', 'trainerbattle_rematch_double'):
             return _TrainerBattleWidget(cmd, trainer,
                                         parts[1] if len(parts) > 1 else '',  # intro
                                         parts[2] if len(parts) > 2 else '',  # defeat
@@ -4796,6 +5186,28 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
             parts[2] if len(parts) > 2 else '',
             parts[3] == '1' if len(parts) > 3 else False)
 
+    # ── New commands ───────────────────────────────────────────────────────
+    if cmd == 'getplayerxy':
+        parts = _split_args(args)
+        return _GetPlayerXYWidget(parts[0] if parts else 'VAR_0x8004',
+                                   parts[1] if len(parts) > 1 else 'VAR_0x8005')
+    if cmd == 'random':
+        return _RandomWidget(_safe_int(args, 10))
+    if cmd == 'healplayerteam':
+        return _HealPlayerTeamWidget()
+    if cmd == 'savebgm':
+        return _SaveBgmWidget(str(args) if args else '')
+    if cmd == 'fadedefaultbgm':
+        return _FadeDefaultBgmWidget()
+    if cmd == 'buffernumberstring':
+        parts = _split_args(args)
+        return _BufferNumberWidget(parts[0] if parts else '0',
+                                    parts[1] if len(parts) > 1 else '0')
+    if cmd == 'bufferstring':
+        parts = _split_args(args)
+        return _BufferStringWidget(parts[0] if parts else '0',
+                                    parts[1] if len(parts) > 1 else '')
+
     # ── Fallback ─────────────────────────────────────────────────────────
     return _GenericWidget(cmd, str(args))
 
@@ -4805,7 +5217,18 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Each page is a list of (section_name, [(friendly_label, raw_command), ...])
+# ── Page 1: Everyday Scripting ──────────────────────────────────────────────
+# The commands you reach for most when writing NPC scripts, cutscenes,
+# trainer encounters, and item hand-outs.  "Open palette → click" with
+# zero page-switching for the 80% case.
 _PAGE_1_COMMANDS = [
+    ('NPC Basics', [
+        ('Lock Player', 'lock'),
+        ('Lock All', 'lockall'),
+        ('Face Player', 'faceplayer'),
+        ('Release Player', 'release'),
+        ('Release All', 'releaseall'),
+    ]),
     ('Dialogue', [
         ('Show Message', 'message'),
         ('Yes/No Choice', 'yesnobox'),
@@ -4813,57 +5236,67 @@ _PAGE_1_COMMANDS = [
         ('Wait for Message', 'waitmessage'),
         ('Close Message', 'closemessage'),
     ]),
+    ('Movement', [
+        ('Set Move Route', 'applymovement'),
+        ('Wait for Movement', 'waitmovement'),
+        ('Turn NPC', 'turnobject'),
+    ]),
+    ('Battles', [
+        ('Trainer Battle (Single)', 'trainerbattle_single'),
+        ('Trainer Battle (Double)', 'trainerbattle_double'),
+        ('Trainer Battle (No Intro)', 'trainerbattle_no_intro'),
+        ('Trainer Battle (Rematch)', 'trainerbattle_rematch'),
+        ('Wild Battle', 'wildbattle'),
+    ]),
+    ('Items & Rewards', [
+        ('Give Item', 'additem'),
+        ('Find Item (Item Ball)', 'finditem'),
+        ('Check for Item', 'checkitem'),
+        ('Check Item Space', 'checkitemspace'),
+        ('Remove Item', 'removeitem'),
+        ('PokéMart', 'pokemart'),
+    ]),
     ('Flags & Variables', [
         ('Set Flag', 'setflag'),
         ('Clear Flag', 'clearflag'),
-        ('Check Flag', 'checkflag'),
         ('Set Variable', 'setvar'),
         ('Add to Variable', 'addvar'),
         ('Subtract from Variable', 'subvar'),
-        ('Copy Variable', 'copyvar'),
-        ('Compare Variable to Value', 'compare_var_to_value'),
-        ('Compare Variable to Variable', 'compare_var_to_var'),
     ]),
     ('Flow Control', [
-        ('If Variable → Goto', 'goto_if_eq'),
         ('If Flag → Goto', 'goto_if_set'),
+        ('If Flag (Off) → Goto', 'goto_if_unset'),
+        ('If Variable → Goto', 'goto_if_eq'),
         ('If Variable → Call', 'call_if_eq'),
         ('If Flag → Call', 'call_if_set'),
+        ('If Flag (Off) → Call', 'call_if_unset'),
         ('Call Script', 'call'),
         ('Goto', 'goto'),
-        ('Call Standard', 'callstd'),
-        ('Goto Standard', 'gotostd'),
         ('End Script', 'end'),
         ('Return', 'return'),
-        ('Special Function', 'special'),
-        ('Special Var', 'specialvar'),
-        ('Wait for Button Press', 'waitbuttonpress'),
     ]),
 ]
 
+# ── Page 2: World, Characters & Effects ─────────────────────────────────────
+# NPC manipulation, warps, camera, sound, screen effects, timing —
+# everything about the world and presentation.
 _PAGE_2_COMMANDS = [
+    ('NPC & Object Control', [
+        ('Remove NPC/Object', 'removeobject'),
+        ('Add NPC/Object', 'addobject'),
+        ('Show NPC/Object', 'showobjectat'),
+        ('Hide NPC/Object', 'hideobjectat'),
+        ('Set NPC Position', 'setobjectxy'),
+        ('Set NPC Position (Permanent)', 'setobjectxyperm'),
+        ('Set NPC Movement Type', 'setobjectmovementtype'),
+        ('Get Player Position', 'getplayerxy'),
+    ]),
     ('Warps & Teleportation', [
         ('Warp Player', 'warp'),
         ('Warp (Silent)', 'warpsilent'),
         ('Warp Through Door', 'warpdoor'),
         ('Fall Through Hole', 'warphole'),
         ('Teleport Player', 'warpteleport'),
-    ]),
-    ('NPC & Object Control', [
-        ('Set Move Route', 'applymovement'),
-        ('Wait for Movement', 'waitmovement'),
-        ('Remove NPC/Object', 'removeobject'),
-        ('Add NPC/Object', 'addobject'),
-        ('Show NPC/Object', 'showobjectat'),
-        ('Hide NPC/Object', 'hideobjectat'),
-        ('Face Player', 'faceplayer'),
-        ('Turn NPC', 'turnobject'),
-    ]),
-    ('Movement Locking', [
-        ('Lock Player', 'lock'),
-        ('Lock All', 'lockall'),
-        ('Release Player', 'release'),
-        ('Release All', 'releaseall'),
     ]),
     ('Camera', [
         ('Move Camera (Cutscene)', 'movecamera'),
@@ -4886,6 +5319,8 @@ _PAGE_2_COMMANDS = [
         ('Play Music', 'playbgm'),
         ('Fade Out Music', 'fadeoutbgm'),
         ('Fade In Music', 'fadeinbgm'),
+        ('Save Current Music', 'savebgm'),
+        ('Restore Saved Music', 'fadedefaultbgm'),
     ]),
     ('Weather', [
         ('Set Weather', 'setweather'),
@@ -4895,6 +5330,7 @@ _PAGE_2_COMMANDS = [
     ('Timing', [
         ('Delay (Frames)', 'delay'),
         ('Wait State', 'waitstate'),
+        ('Wait for Button Press', 'waitbuttonpress'),
     ]),
     ('Map', [
         ('Set Metatile', 'setmetatile'),
@@ -4907,16 +5343,14 @@ _PAGE_2_COMMANDS = [
     ]),
 ]
 
+# ── Page 3: Data, System & Advanced ─────────────────────────────────────────
+# Pokémon party manipulation, money, buffers, advanced flow control,
+# specials, and everything else.
 _PAGE_3_COMMANDS = [
-    ('Battles', [
-        ('Trainer Battle (Single)', 'trainerbattle_single'),
-        ('Trainer Battle (Double)', 'trainerbattle_double'),
-        ('Trainer Battle (No Intro)', 'trainerbattle_no_intro'),
-        ('Wild Battle', 'wildbattle'),
-    ]),
     ('Pokémon', [
         ('Give Pokémon', 'givemon'),
         ('Give Egg', 'giveegg'),
+        ('Heal Player Team', 'healplayerteam'),
         ('Set Pokémon Move', 'setmonmove'),
         ('Check Party for Move', 'checkpartymove'),
         ('Get Party Size', 'getpartysize'),
@@ -4924,14 +5358,6 @@ _PAGE_3_COMMANDS = [
         ('Show Pokémon Picture', 'showmonpic'),
         ('Hide Pokémon Picture', 'hidemonpic'),
         ('Play Pokémon Cry', 'playmoncry'),
-    ]),
-    ('Items', [
-        ('Find Item (Item Ball)', 'finditem'),
-        ('Give Item', 'additem'),
-        ('Remove Item', 'removeitem'),
-        ('Check for Item', 'checkitem'),
-        ('Check Item Space', 'checkitemspace'),
-        ('PokéMart', 'pokemart'),
     ]),
     ('Money & Coins', [
         ('Give Money', 'addmoney'),
@@ -4944,13 +5370,40 @@ _PAGE_3_COMMANDS = [
         ('Buffer Species Name', 'bufferspeciesname'),
         ('Buffer Item Name', 'bufferitemname'),
         ('Buffer Move Name', 'buffermovename'),
+        ('Buffer Number', 'buffernumberstring'),
+        ('Buffer String', 'bufferstring'),
+    ]),
+    ('Advanced Flow Control', [
+        ('If Var ≠ → Goto', 'goto_if_ne'),
+        ('If Var < → Goto', 'goto_if_lt'),
+        ('If Var > → Goto', 'goto_if_gt'),
+        ('If Var ≤ → Goto', 'goto_if_le'),
+        ('If Var ≥ → Goto', 'goto_if_ge'),
+        ('If Var ≠ → Call', 'call_if_ne'),
+        ('If Var < → Call', 'call_if_lt'),
+        ('If Var > → Call', 'call_if_gt'),
+        ('If Var ≤ → Call', 'call_if_le'),
+        ('If Var ≥ → Call', 'call_if_ge'),
+        ('Check Flag', 'checkflag'),
+        ('Compare Variable to Value', 'compare_var_to_value'),
+        ('Compare Variable to Variable', 'compare_var_to_var'),
+        ('Copy Variable', 'copyvar'),
+        ('Random Number', 'random'),
+    ]),
+    ('Specials & System', [
+        ('Call Standard', 'callstd'),
+        ('Goto Standard', 'gotostd'),
+        ('Special Function', 'special'),
+        ('Special Var', 'specialvar'),
+        ('Set Respawn Point', 'setrespawn'),
+    ]),
+    ('Trainer Battle Variants', [
+        ('Trainer Battle (Early Rival)', 'trainerbattle_earlyrival'),
+        ('Trainer Battle (Rematch Double)', 'trainerbattle_rematch_double'),
     ]),
     ('Decorations', [
         ('Add Decoration', 'adddecoration'),
         ('Remove Decoration', 'removedecoration'),
-    ]),
-    ('System', [
-        ('Set Respawn Point', 'setrespawn'),
     ]),
 ]
 
@@ -5116,6 +5569,33 @@ _CMD_TOOLTIPS: dict[str, str] = {
 
     # ── Page 3: System ───────────────────────────────────────────────
     'setrespawn': 'Set where the player respawns after whiting out\nUsually the nearest healing location',
+
+    # ── New commands ─────────────────────────────────────────────────
+    'goto_if_unset': 'If a flag is OFF, jump to a label\nExecution does NOT return to this point',
+    'call_if_unset': 'If a flag is OFF, call a sub-script\nExecution returns here when the called script ends',
+    'goto_if_ne': 'If a variable does NOT equal a value, jump to a label',
+    'goto_if_lt': 'If a variable is LESS than a value, jump to a label',
+    'goto_if_gt': 'If a variable is GREATER than a value, jump to a label',
+    'goto_if_le': 'If a variable is ≤ a value, jump to a label',
+    'goto_if_ge': 'If a variable is ≥ a value, jump to a label',
+    'call_if_ne': 'If a variable does NOT equal a value, call a sub-script',
+    'call_if_lt': 'If a variable is LESS than a value, call a sub-script',
+    'call_if_gt': 'If a variable is GREATER than a value, call a sub-script',
+    'call_if_le': 'If a variable is ≤ a value, call a sub-script',
+    'call_if_ge': 'If a variable is ≥ a value, call a sub-script',
+    'trainerbattle_rematch': 'Start a rematch trainer battle\nUsed with the VS Seeker system',
+    'trainerbattle_earlyrival': 'Start an early rival battle\nSpecial variant with unique intro handling',
+    'trainerbattle_rematch_double': 'Start a rematch double battle\nVS Seeker system with two-on-two format',
+    'setobjectxy': 'Move an NPC to a new position instantly\nOnly lasts until the map reloads',
+    'setobjectxyperm': 'Move an NPC to a new position permanently\nPersists across map reloads until flag/var resets it',
+    'setobjectmovementtype': 'Change an NPC\'s movement behavior\n(e.g. from standing still to walking a route)',
+    'getplayerxy': 'Store the player\'s X and Y position into two variables',
+    'random': 'Generate a random number from 0 to (max-1)\nResult stored in VAR_RESULT',
+    'savebgm': 'Save the currently playing music so it can be restored later',
+    'fadedefaultbgm': 'Fade back to the previously saved background music',
+    'healplayerteam': 'Fully heal the player\'s entire party\n(HP, PP, status — like visiting a healing center)',
+    'buffernumberstring': 'Store a number as text in a buffer\nUse {STR_VAR_1}, {STR_VAR_2}, or {STR_VAR_3} in messages',
+    'bufferstring': 'Store a raw text string in a buffer\nUse {STR_VAR_1}, {STR_VAR_2}, or {STR_VAR_3} in messages',
 }
 
 
@@ -5420,6 +5900,8 @@ class EventEditorTab(QWidget):
     jump_to_item = pyqtSignal(str)      # item constant e.g. "ITEM_POTION"
     # Emitted when user wants to edit a flag/var label → jump to Label Manager
     jump_to_label = pyqtSignal(str)     # flag/var constant e.g. "FLAG_GOT_STARTER"
+    # Phase 7: Porymap sync — emitted when a map is loaded so Porymap can follow
+    map_loaded = pyqtSignal(str)         # map folder name e.g. "PalletTown"
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
@@ -5446,7 +5928,46 @@ class EventEditorTab(QWidget):
     def _mark_dirty(self):
         """Mark the project as having unsaved changes."""
         if not self._loading:
+            # Commit the active page's live command edits back into both
+            # the per-event page dict AND _all_scripts[label] so other
+            # tabs (e.g. Trainers → Dialogue) can see in-RAM script edits
+            # without needing the user to save first.
+            self._sync_live_script_state()
             self.data_changed.emit()
+
+    def _sync_live_script_state(self) -> None:
+        """Push live script edits into _all_scripts so cross-tab readers
+        can see them without a save first.
+
+        Two steps:
+          1. Commit the active page's _cmd_tuples back into its page
+             dict (canonical per-event store).
+          2. Mirror EVERY page of the current event into
+             _all_scripts[page_label]. This covers the active page AND
+             any non-active pages that were edited directly (e.g.
+             _on_rename_page rewrites commands across sibling pages).
+
+        _ALL_SCRIPTS is the same dict object as self._all_scripts (set
+        at map-load time), so updating self._all_scripts implicitly
+        updates the module-level mirror that other tabs consume.
+        Idempotent — safe to call after every _mark_dirty().
+        """
+        if self._current_obj_idx < 0 or self._current_obj_idx >= len(self._objects):
+            return
+        obj = self._objects[self._current_obj_idx]
+        pages = obj.get('_pages', [])
+        # (1) Flush _cmd_tuples into the active page dict.
+        if 0 <= self._current_page_idx < len(pages):
+            pages[self._current_page_idx]['commands'] = list(self._cmd_tuples)
+        # (2) Mirror every page's commands into _all_scripts[label].
+        default_label = obj.get('script', '')
+        for page in pages:
+            label = page.get('_label') or default_label
+            if not label or label == '0x0':
+                continue
+            cmds = page.get('commands', [])
+            if isinstance(cmds, list):
+                self._all_scripts[label] = list(cmds)
 
     def has_unsaved_changes(self) -> bool:
         """Return True if the window has been marked as modified."""
@@ -5881,9 +6402,7 @@ class EventEditorTab(QWidget):
             pass
 
         # GFX combo
-        self.gfx_combo.clear()
-        for gfx_const in sorted(ConstantsManager.OBJECT_GFX):
-            self.gfx_combo.addItem(gfx_const)
+        self._refresh_gfx_combo()
 
         self.btn_open.setEnabled(True)
         self.map_label.setText('No map loaded — click Open Map')
@@ -5900,6 +6419,30 @@ class EventEditorTab(QWidget):
                   f'{len(ConstantsManager.TRAINERS)} trainers, '
                   f'{n_labels} script labels')
         self._mw.log_message(f'Event Editor: ready ({counts})')
+
+    def _refresh_gfx_combo(self) -> None:
+        """Repopulate the graphics dropdown from ConstantsManager.
+
+        Called during load_project and whenever new OW sprites are added
+        so the event editor immediately sees new OBJ_EVENT_GFX_ constants.
+        """
+        prev = self.gfx_combo.currentText()
+        self.gfx_combo.clear()
+        for gfx_const in sorted(ConstantsManager.OBJECT_GFX):
+            self.gfx_combo.addItem(gfx_const)
+        # Restore previous selection if it still exists
+        if prev:
+            idx = self.gfx_combo.findText(prev)
+            if idx >= 0:
+                self.gfx_combo.setCurrentIndex(idx)
+
+    def refresh_gfx_constants(self) -> None:
+        """Public method for cross-tab refresh of GFX constants.
+
+        Called by the unified main window when the Overworld editor adds
+        new sprites. Re-reads ConstantsManager and repopulates the combo.
+        """
+        self._refresh_gfx_combo()
 
     # ─────────────────────────────────────────────────────────────────────
     # Map loading
@@ -6161,9 +6704,18 @@ class EventEditorTab(QWidget):
 
         # Make available to stringizer for movement step lookups
         # Also stash texts under a special key so trainer battle stringizer
-        # can look up intro/defeat dialogue
+        # can look up intro/defeat dialogue.
+        #
+        # IMPORTANT: share texts by REFERENCE, not copy. The trainer battle
+        # widget captures this dict and writes user edits back into it; if
+        # we copy here, those edits never flow back to self._texts and get
+        # silently dropped at save time. Sharing the reference also lets
+        # the Trainers tab Dialogue view peek at live in-RAM edits before
+        # the user saves the project.
         _ALL_SCRIPTS = self._all_scripts
-        _ALL_SCRIPTS['__texts__'] = dict(self._texts)
+        _ALL_SCRIPTS['__texts__'] = self._texts
+        _ALL_SCRIPTS['__texts_map__'] = (
+            self._map_dir.name if self._map_dir else None)
 
         # Build position override lookup from OnTransition scripts
         self._build_position_overrides()
@@ -6256,6 +6808,16 @@ class EventEditorTab(QWidget):
         map_scripts_label = f'{name}_MapScripts'
         map_script_cmds = self._all_scripts.get(map_scripts_label, [])
         if map_script_cmds:
+            # Build a summary of script types for the main label
+            script_types = []
+            for ct in map_script_cmds:
+                if ct and ct[0] == 'map_script' and len(ct) > 1:
+                    type_arg = str(ct[1]).split(',')[0].strip()
+                    script_types.append(_MAP_SCRIPT_TYPES.get(type_arg, type_arg))
+                elif ct and ct[0] == 'map_script_2':
+                    script_types.append('Conditional')
+            type_summary = ', '.join(script_types) if script_types else 'Scripts'
+
             # The MapScripts label itself is a pseudo-event
             ms_entry = {
                 'script': map_scripts_label,
@@ -6264,7 +6826,7 @@ class EventEditorTab(QWidget):
                     map_scripts_label, self._all_scripts),
             }
             self._objects.append(ms_entry)
-            self.obj_combo.addItem('[MapScript] On Load')
+            self.obj_combo.addItem(f'[MapScript] Script Table ({type_summary})')
 
             # Also add each individual map_script target as its own entry
             for cmd_tuple in map_script_cmds:
@@ -6275,6 +6837,10 @@ class EventEditorTab(QWidget):
                     args = str(cmd_tuple[1]).split(',')
                     # map_script: TYPE, LABEL
                     # map_script_2: VAR, VALUE, LABEL
+                    if cmd == 'map_script' and len(args) >= 2:
+                        script_type = _MAP_SCRIPT_TYPES.get(args[0].strip(), args[0].strip())
+                    else:
+                        script_type = 'Conditional'
                     target_label = args[-1].strip() if args else ''
                     if target_label and target_label in self._all_scripts:
                         ms_sub = {
@@ -6287,7 +6853,7 @@ class EventEditorTab(QWidget):
                         short = target_label
                         if '_' in short:
                             short = target_label.split(f'{name}_', 1)[-1]
-                        self.obj_combo.addItem(f'[MapScript] {short}')
+                        self.obj_combo.addItem(f'[MapScript] {script_type}: {short}')
 
         self.obj_combo.blockSignals(False)
 
@@ -6307,6 +6873,9 @@ class EventEditorTab(QWidget):
         if self._objects:
             self.obj_combo.setCurrentIndex(0)
             self._on_object_changed(0)
+
+        # Phase 7: notify listeners (e.g. Porymap sync) that a map was loaded
+        self.map_loaded.emit(name)
 
     # ─────────────────────────────────────────────────────────────────────
     # Self-verification — log warnings when data looks wrong
@@ -7358,7 +7927,12 @@ class EventEditorTab(QWidget):
         etype = obj.get('_event_type', 'object')
         # Only write back editable properties for NPC object events
         if etype == 'object':
-            obj['local_id'] = self.obj_id_edit.text()
+            # Only write local_id if non-empty.  An empty string causes
+            # the build to fail with "local_id cannot be empty".  Objects
+            # that never had a local_id should not get one added.
+            lid = self.obj_id_edit.text().strip()
+            if lid:
+                obj['local_id'] = lid
 
             # If current page has a position override from a script,
             # save edited X/Y back to the setobjectxyperm command in
@@ -7541,7 +8115,9 @@ class EventEditorTab(QWidget):
         # For applymovement, use the full edit dialog which includes
         # the Edit Steps button for the Move Route editor
         dlg = _CommandEditDialog(cmd_tuple, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        result_code = dlg.exec()
+        if result_code in (QDialog.DialogCode.Accepted,
+                           _CommandEditDialog.GoToResult):
             result = dlg.result_tuple()
             self._cmd_tuples[idx] = result
             # Check if movement steps were modified
@@ -7557,6 +8133,15 @@ class EventEditorTab(QWidget):
                         self._modified_movements[label] = new_steps
             self._refresh_item(idx)
             self._mark_dirty()
+
+            # Go To: navigate to the target label after saving
+            if result_code == _CommandEditDialog.GoToResult:
+                target = dlg._goto_label
+                if target:
+                    current_map = (self._map_dir.name
+                                   if self._map_dir else None)
+                    self._navigate_to_script_label(
+                        target, current_map)
 
     def _on_add_command(self):
         cmd = _CommandSelectorDialog.get_command(self)
@@ -7766,7 +8351,8 @@ class EventEditorTab(QWidget):
         # trainerbattle TYPE, TRAINER, INTRO_TEXT, DEFEAT_TEXT[, CONTINUE_SCRIPT]
         # trainerbattle_single has continue_script as 4th comma-separated arg
         if cmd in ('trainerbattle', 'trainerbattle_single',
-                   'trainerbattle_earlyrival', 'trainerbattle_no_intro'):
+                   'trainerbattle_earlyrival', 'trainerbattle_no_intro',
+                   'trainerbattle_rematch', 'trainerbattle_rematch_double'):
             args = str(cmd_tuple[1]) if len(cmd_tuple) > 1 else ''
             parts = [p.strip() for p in args.split(',')]
             # For trainerbattle_single: parts[4] is the continue script
@@ -9033,8 +9619,19 @@ class EventEditorTab(QWidget):
         # Condition pages need their conditional gotos re-inserted into the
         # entry label (they were extracted for display).
         # Skip external scripts — those live in their own files.
+        #
+        # IMPORTANT: Process the currently-selected event LAST.
+        # Multiple events can share sub-labels via goto (e.g. three triggers
+        # all goto the same battle script).  Each event has its own merged
+        # copy of the sub-label.  The user can only edit one at a time, so
+        # the currently-selected event's copy has the latest edits — it must
+        # be saved last so it overwrites stale copies from other events.
         save_pages = OrderedDict()
-        for obj in self._objects:
+        ordered_objects = list(self._objects)
+        if 0 <= self._current_obj_idx < len(ordered_objects):
+            current_obj = ordered_objects.pop(self._current_obj_idx)
+            ordered_objects.append(current_obj)
+        for obj in ordered_objects:
             script = obj.get('script', '')
             if not script or script == '0x0':
                 continue
@@ -9291,23 +9888,23 @@ class EventEditorTab(QWidget):
             self._load_map(map_dir)
 
     def select_event_by_bridge(self, event_type: str, event_index: int,
-                                script_label: str = ''):
+                                script_label: str = '') -> bool:
         """Select an event by Porymap's type/index. Maps Porymap event types
-        to our obj_combo indices."""
+        to our obj_combo indices. Returns True if an event was selected."""
         if not self._objects:
-            return
+            return False
 
         # Try matching by script label first (most reliable)
         if script_label:
             for i, obj in enumerate(self._objects):
                 if obj.get('script', '') == script_label:
                     self.obj_combo.setCurrentIndex(i)
-                    return
+                    return True
                 # Check page labels too
                 for page in obj.get('_pages', []):
                     if page.get('label', '') == script_label:
                         self.obj_combo.setCurrentIndex(i)
-                        return
+                        return True
 
         # Fall back to type + index matching
         # Porymap types: "Object", "Warp", "Trigger", "Sign", "HiddenItem"
@@ -9323,7 +9920,7 @@ class EventEditorTab(QWidget):
         }
         target_group = type_map.get(event_type, '')
         if not target_group:
-            return
+            return False
 
         # Count through objects to find the matching one
         group_count = 0
@@ -9331,13 +9928,15 @@ class EventEditorTab(QWidget):
             if obj.get('_event_group', '') == target_group:
                 if group_count == event_index:
                     self.obj_combo.setCurrentIndex(i)
-                    return
+                    return True
                 group_count += 1
+        return False
 
-    def select_event_at_position(self, x: int, y: int):
-        """Select the event closest to (x, y) on the current map."""
+    def select_event_at_position(self, x: int, y: int) -> bool:
+        """Select the event closest to (x, y) on the current map.
+        Returns True if an event within 2 tiles was found and selected."""
         if not self._objects:
-            return
+            return False
         best_idx = -1
         best_dist = float('inf')
         for i, obj in enumerate(self._objects):
@@ -9349,11 +9948,37 @@ class EventEditorTab(QWidget):
                 best_idx = i
         if best_idx >= 0 and best_dist <= 2:
             self.obj_combo.setCurrentIndex(best_idx)
+            return True
+        return False
 
-    def reload_current_map(self):
-        """Reload the currently loaded map from disk (e.g. after Porymap saves)."""
-        if self._map_dir and (self._map_dir / 'map.json').is_file():
-            self._load_map(self._map_dir)
+    def reload_current_map(self, force: bool = False):
+        """Reload the currently loaded map from disk (e.g. after Porymap saves).
+
+        If the Event Editor has unsaved edits and *force* is False, prompts
+        the user before clobbering their work. The watcher-driven call paths
+        (Porymap bridge, SharedFileWatcher) always use the guarded default.
+        """
+        if not (self._map_dir and (self._map_dir / 'map.json').is_file()):
+            return
+        if not force and self._mw.isWindowModified():
+            from PyQt6.QtWidgets import QMessageBox
+            ret = QMessageBox.question(
+                self, 'External Changes Detected',
+                'The current map was modified outside the Event Editor '
+                '(likely by Porymap), but you have unsaved changes here.\n\n'
+                'Save your edits first, discard them and reload from disk, '
+                'or keep working and ignore the external change?',
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if ret == QMessageBox.StandardButton.Save:
+                self._on_save()
+                return
+            if ret != QMessageBox.StandardButton.Discard:
+                return  # Cancel / closed dialog — keep user's work intact
+        self._load_map(self._map_dir)
 
     def _on_open_in_porymap(self):
         """Open in Porymap button clicked — delegate to unified window."""

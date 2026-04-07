@@ -18,17 +18,21 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QSettings, QSize
 from PyQt6.QtGui import QFont
 
+from ui.custom_widgets.scroll_guard import install_scroll_guard
+
 from app_info import get_settings_path
 from suppress_dialog import SUPPRESSIBLE, suppress, is_suppressed, clear_all
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, project_info: dict = None):
         super().__init__(parent)
         self.setWindowTitle("Settings — PorySuite-Z")
         self.setModal(True)
         self.resize(720, 560)
         self.setMinimumSize(640, 480)
+
+        self._project_info = project_info or {}
 
         os.makedirs(os.path.dirname(get_settings_path()), exist_ok=True)
         self.settings = QSettings(get_settings_path(), QSettings.Format.IniFormat)
@@ -76,6 +80,7 @@ class SettingsDialog(QDialog):
         self._build_editor_page()
         self._build_event_colors_page()
         self._build_notifications_page()
+        self._build_sound_page()
 
         # Select first page
         self._sidebar.setCurrentRow(0)
@@ -127,6 +132,23 @@ class SettingsDialog(QDialog):
     def _build_general_page(self):
         scroll, layout = self._make_page_scroll()
 
+        # ── Project Display Name ────────────────────────────────────────────
+        proj_box = QGroupBox("Project")
+        proj_lay = QFormLayout(proj_box)
+        proj_lay.addRow(QLabel(
+            "The display name shown in the launcher and window title.\n"
+            "This does not rename any files — it only changes what you see."
+        ))
+        self._project_name_edit = QLineEdit()
+        current_name = self._project_info.get("name", "")
+        self._project_name_edit.setText(current_name)
+        self._project_name_edit.setPlaceholderText("e.g. My Hack, Zeldamon, etc.")
+        proj_lay.addRow("Display Name:", self._project_name_edit)
+        if not self._project_info:
+            self._project_name_edit.setEnabled(False)
+            self._project_name_edit.setPlaceholderText("(open a project first)")
+        layout.addWidget(proj_box)
+
         # ── Diagnostics ─────────────────────────────────────────────────────
         diag_box = QGroupBox("Advanced Diagnostics")
         diag_lay = QVBoxLayout(diag_box)
@@ -151,6 +173,7 @@ class SettingsDialog(QDialog):
         ))
 
         self.crashlog_days_combo = QComboBox()
+        install_scroll_guard(self.crashlog_days_combo)
         self._crashlog_day_values = [1, 3, 7, 14, 30]
         for d in self._crashlog_day_values:
             self.crashlog_days_combo.addItem(f"{d} day{'s' if d != 1 else ''}")
@@ -160,6 +183,7 @@ class SettingsDialog(QDialog):
         log_lay.addRow("Keep logs for:", self.crashlog_days_combo)
 
         self.crashlog_size_combo = QComboBox()
+        install_scroll_guard(self.crashlog_size_combo)
         self._crashlog_size_values = [50, 100, 250, 500, 0]
         self._crashlog_size_labels = ["50 MB", "100 MB", "250 MB", "500 MB", "Unlimited"]
         self.crashlog_size_combo.addItems(self._crashlog_size_labels)
@@ -227,6 +251,7 @@ class SettingsDialog(QDialog):
         ))
 
         self.gba_combo = QComboBox()
+        install_scroll_guard(self.gba_combo)
         self.gba_combo.addItems([
             "pokefirered_modern.gba (Make Modern output)",
             "pokefirered.gba (Make output)",
@@ -338,6 +363,7 @@ class SettingsDialog(QDialog):
         startup_lay = QFormLayout(startup_box)
 
         self.startup_page_combo = QComboBox()
+        install_scroll_guard(self.startup_page_combo)
         pages = [
             "Pokemon", "Pokedex", "Moves", "Items", "Trainers", "Starters",
             "Event Editor", "Maps", "Layouts & Tilesets", "Region Map",
@@ -602,7 +628,102 @@ class SettingsDialog(QDialog):
     # Save
     # ═════════════════════════════════════════════════════════════════════════
 
+    @property
+    def project_name_changed(self) -> bool:
+        """True if the user changed the project display name."""
+        if not self._project_info:
+            return False
+        new_name = self._project_name_edit.text().strip()
+        return bool(new_name and new_name != self._project_info.get("name", ""))
+
+    @property
+    def new_project_name(self) -> str:
+        return self._project_name_edit.text().strip()
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # Page: Sound Editor
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _build_sound_page(self):
+        scroll, layout = self._make_page_scroll()
+
+        layout.addWidget(QLabel(
+            "Settings for the built-in Sound Editor (song preview,\n"
+            "instrument browser, voicegroup editor)."
+        ))
+
+        # ── Preview volume ──────────────────────────────────────────────────
+        vol_box = QGroupBox("Preview")
+        vol_lay = QFormLayout(vol_box)
+
+        self._sound_vol_spin = QSpinBox()
+        self._sound_vol_spin.setRange(0, 100)
+        self._sound_vol_spin.setSuffix("%")
+        self._sound_vol_spin.setValue(
+            int(self.settings.value("sound/preview_volume", 80)))
+        vol_lay.addRow("Default volume:", self._sound_vol_spin)
+
+        self._sound_loop_spin = QSpinBox()
+        self._sound_loop_spin.setRange(1, 10)
+        self._sound_loop_spin.setSuffix(" times")
+        self._sound_loop_spin.setValue(
+            int(self.settings.value("sound/loop_count", 2)))
+        self._sound_loop_spin.setToolTip(
+            "How many times a song's loop section repeats\n"
+            "before the preview stops automatically.")
+        vol_lay.addRow("Loop count:", self._sound_loop_spin)
+
+        layout.addWidget(vol_box)
+
+        # ── Import defaults ─────────────────────────────────────────────────
+        import_box = QGroupBox("Sample Import")
+        import_lay = QFormLayout(import_box)
+
+        self._sound_max_rate_combo = QComboBox()
+        install_scroll_guard(self._sound_max_rate_combo)
+        self._sound_max_rate_combo.addItems([
+            "No limit",
+            "44100 Hz",
+            "22050 Hz",
+            "13379 Hz (GBA default)",
+        ])
+        saved_max = self.settings.value("sound/max_import_rate", "No limit")
+        idx = self._sound_max_rate_combo.findText(str(saved_max))
+        if idx >= 0:
+            self._sound_max_rate_combo.setCurrentIndex(idx)
+        self._sound_max_rate_combo.setToolTip(
+            "When importing a WAV, auto-downsample to this rate.\n"
+            "'No limit' keeps the original rate and asks each time.")
+        import_lay.addRow("Auto-downsample to:", self._sound_max_rate_combo)
+
+        layout.addWidget(import_box)
+
+        # ── Audio output mode ───────────────────────────────────────────────
+        output_box = QGroupBox("Audio Output")
+        output_lay = QFormLayout(output_box)
+
+        self._sound_output_mode_combo = QComboBox()
+        install_scroll_guard(self._sound_output_mode_combo)
+        self._sound_output_mode_combo.addItems(["Stereo", "Mono"])
+        saved_mode = self.settings.value("sound/output_mode", "Stereo")
+        idx = self._sound_output_mode_combo.findText(str(saved_mode))
+        if idx >= 0:
+            self._sound_output_mode_combo.setCurrentIndex(idx)
+        self._sound_output_mode_combo.setToolTip(
+            "Stereo uses left/right panning like the GBA.\n"
+            "Mono mixes both channels together into one.")
+        output_lay.addRow("Output mode:", self._sound_output_mode_combo)
+
+        layout.addWidget(output_box)
+
+        layout.addStretch(1)
+        self._add_page("Sound Editor", scroll)
+
     def accept(self) -> None:
+        # Project name — update in-memory project_info (caller persists)
+        if self._project_info and self.project_name_changed:
+            self._project_info["name"] = self.new_project_name
+
         # General
         self.settings.setValue("advanced_diagnostics", bool(self.adv_checkbox.isChecked()))
         self.settings.setValue("autosave_enabled", bool(self.auto_checkbox.isChecked()))
@@ -639,6 +760,14 @@ class SettingsDialog(QDialog):
                                self.porymap_edit.text().strip())
         self.settings.setValue("editor/event_tooltips",
                                bool(self.event_tooltips_checkbox.isChecked()))
+
+        # Sound Editor
+        self.settings.setValue("sound/preview_volume", self._sound_vol_spin.value())
+        self.settings.setValue("sound/loop_count", self._sound_loop_spin.value())
+        self.settings.setValue("sound/max_import_rate",
+                               self._sound_max_rate_combo.currentText())
+        self.settings.setValue("sound/output_mode",
+                               self._sound_output_mode_combo.currentText())
 
         # Event Colors
         for key, btn in self._color_buttons.items():

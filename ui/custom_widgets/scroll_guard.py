@@ -18,9 +18,9 @@ Usage
 from __future__ import annotations
 
 from PyQt6.QtCore import QEvent, QObject, Qt
-from PyQt6.QtWidgets import QComboBox, QSpinBox, QDoubleSpinBox, QWidget
+from PyQt6.QtWidgets import QComboBox, QSpinBox, QDoubleSpinBox, QSlider, QWidget
 
-_GUARDED_TYPES = (QComboBox, QSpinBox, QDoubleSpinBox)
+_GUARDED_TYPES = (QComboBox, QSpinBox, QDoubleSpinBox, QSlider)
 
 
 class _WheelGuard(QObject):

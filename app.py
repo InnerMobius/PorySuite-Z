@@ -279,9 +279,19 @@ class App:
         self._porysuite_win = porysuite_win
         self._eventide_win = eventide_win
 
-        self.main.show()
+        self.main.showMaximized()
         self.main.activateWindow()
         self.main.setFocus()
+        # Defer a second maximize after the event loop has started — on some
+        # Windows / remote-desktop setups, showMaximized() alone is ignored
+        # when called before the event loop is running.
+        from PyQt6.QtCore import QTimer
+        def _force_maximize():
+            from PyQt6.QtCore import Qt as _Qt
+            self.main.setWindowState(
+                self.main.windowState() | _Qt.WindowState.WindowMaximized
+            )
+        QTimer.singleShot(0, _force_maximize)
 
     @staticmethod
     def _migrate_from_appdata(data_dir: str) -> None:

@@ -48,7 +48,7 @@ All warnings appear in the log panel.
 - `eventide/mainwindow.py` — Tab setup. Event Editor is the leftmost/default tab.
 
 ## Navigation
-- **Go To → button**: Follows goto/call/conditional/trainerbattle targets to their destination script. Works across page tabs and across events.
+- **Go To → button**: Follows goto/call/conditional/trainerbattle targets to their destination script. Works across page tabs and across events. Also available directly in command edit dialogs — any popup for a label-referencing command (call, goto, call_if_*, goto_if_*) has a Go To button that saves edits and navigates.
 - `_extract_goto_target()` pulls the target label from any navigable command type.
 - **Find in commands** (Ctrl+F): Inline search bar with highlight, Next/Prev, match count, wrap-around.
 
@@ -59,9 +59,18 @@ All warnings appear in the log panel.
 - If a target exists in `_all_scripts` but wasn't loaded as a page tab, it gets dynamically added.
 
 ## Trainer Battles
-- The parser preserves variant names: `trainerbattle_single`, `trainerbattle_no_intro`, `trainerbattle_earlyrival`, `trainerbattle_double`.
+- The parser preserves variant names: `trainerbattle_single`, `trainerbattle_no_intro`, `trainerbattle_earlyrival`, `trainerbattle_double`, plus `trainerbattle_rematch` and `trainerbattle_rematch_double` for VS Seeker rematches.
 - The stringizer shows intro/defeat text labels and continue script on separate lines.
 - The `__texts__` key in `_ALL_SCRIPTS` gives the stringizer access to text content for inline preview.
+
+## Cross-Editor Live Bridge (2026-04-05)
+The Event Editor exposes its in-memory state so other tabs (Trainers → Dialogue, etc.) can see unsaved edits without requiring a save.
+
+- **`_sync_live_script_state()`** — called from `_mark_dirty()` on every script mutation. Commits `_cmd_tuples` → active page dict, then mirrors every page of the current event into `self._all_scripts[label]`. Idempotent.
+- **`_ALL_SCRIPTS` (module-level)** — same dict object as `self._all_scripts` (aliased at map-load time on line ~6556). Other tabs import this and read from it.
+- **`_ALL_SCRIPTS['__texts__']`** — same dict reference as `self._texts` (NOT a copy). Trainer battle widget text edits write into this dict directly, and they flow back to `self._texts` → `write_text_inc()` on save.
+- **`_ALL_SCRIPTS['__texts_map__']`** — map folder name the texts belong to. Consumers use this to disambiguate "which map's texts are these?"
+- **Universal mutation hook**: all 37 `_mark_dirty()` call sites trigger sync automatically — add/delete/edit/move/duplicate/paste/cut/drag-drop/template-install/camera-sequence all covered.
 
 ## Inline Text Editing
 - `_make_text_field(label_combo, texts, label_text)` pairs a label dropdown with a QPlainTextEdit
@@ -167,6 +176,19 @@ All warnings appear in the log panel.
 - **Save/Discard/Cancel dialog**: Shown on close, map switch, and refresh. Uses `app_util.create_unsaved_changes_dialog()` — same as PorySuite.
 - `_loading` flag suppresses dirty marking during field population (so switching objects doesn't falsely mark dirty).
 - `_current_obj_idx = -1` is set at the start of `_load_map` to prevent `_collect_current` from corrupting new map data with stale UI values.
+- **Watcher-safe reload**: `reload_current_map(force=False)` is the reload entry point used by the Porymap bridge and SharedFileWatcher. If `isWindowModified()` is True and `force` is False, it shows a Save/Discard/Cancel dialog instead of silently clobbering unsaved edits. Pass `force=True` only for intentional reloads where the caller already handled dirty-state.
+- **ConstantsManager.refresh()**: Added so switching back to EVENTide from a PorySuite page re-reads header files. Items/flags/vars/trainers renamed and saved on the PorySuite side appear in dropdowns without a project reload.
+- **Cross-tab GFX sync**: When a new overworld sprite is added in the Overworld Graphics tab, `OverworldGraphicsTab.gfx_constants_changed` signal fires → `UnifiedMainWindow._refresh_eventide_constants()` → `ConstantsManager.load()` + `EventEditorTab.refresh_gfx_constants()`. The new `OBJ_EVENT_GFX_*` constant is also pushed directly into `ConstantsManager.OBJECT_GFX` and `OBJECT_GFX_PATHS` in-memory, so the Event Editor's graphic dropdown updates immediately without a project reload or save.
+
+## Sound Editor Integration (2026-04-06)
+- **▶ Preview / ■ Stop / 🔊 Open buttons**: `_PlayBGMWidget`, `_PlaySEWidget`, and `_PlayFanfareWidget` all have three integration buttons. Preview renders and plays the selected song in the background WITHOUT switching tabs. Stop halts playback. Open switches to the Sound Editor and selects the song.
+- **Module-level callbacks**: `_preview_song_cb`, `_open_in_sound_editor_cb`, `_stop_preview_cb` are set by `unified_mainwindow.py` during `setup_pages()`. This avoids threading parent references through widget constructors.
+- **Constants sync**: Switching from the Sound Editor page to any EVENTide page triggers `ConstantsManager.refresh()`, so new/removed songs appear in song dropdowns automatically (no restart needed).
+- **Fixed savebgm widget**: Was `_header_only = True` returning `('savebgm',)`. Now has a ConstantPicker for MUS_* constants and returns `('savebgm', song_constant)`.
+- **Fixed healplayerteam widget**: Was returning `('healplayerteam',)` (nonexistent macro). Now returns `('special', 'HealPlayerParty')`.
+- **Fixed playmoncry mode**: Widget now preserves the `mode` parameter instead of hardcoding `0`.
+- **Shared sub-label save fix**: When multiple events share a script sub-label via `goto`, the save loop reorders `self._objects` so the currently-selected event is processed LAST (its sub-labels win over stale copies from other events).
+- **Empty local_id guard**: `_collect_current()` only writes `local_id` to the object dict if the text field is non-empty. Prevents injecting `"local_id": ""` into objects that never had one.
 
 ## Known Patterns / Gotchas
 - `_ALL_SCRIPTS` is a module-level dict so the stringizer can look up movement steps without dependency injection.

@@ -959,6 +959,28 @@ class PokemonDataManager(ABC):
             if abilities[ability]["id"] == ability_id:
                 return abilities[ability].get(key)
 
+    def set_ability_data(self, ability: str, key: str, value) -> None:
+        """Set a field on an ability entry (display_name, description, etc.)."""
+        abilities = self.get_pokemon_abilities()
+        if ability in abilities:
+            abilities[ability][key] = value
+
+    def add_ability(self, const: str, ability_id: int, display_name: str,
+                    description: str) -> None:
+        """Add a brand-new ability to the in-memory data."""
+        abilities = self.get_pokemon_abilities()
+        abilities[const] = {
+            "name": const[len("ABILITY_"):] if const.startswith("ABILITY_") else const,
+            "id": ability_id,
+            "display_name": display_name,
+            "description": description,
+        }
+
+    def remove_ability(self, const: str) -> None:
+        """Remove an ability from in-memory data."""
+        abilities = self.get_pokemon_abilities()
+        abilities.pop(const, None)
+
     def get_pokemon_items(self) -> dict:
         pi = self.data.get("pokemon_items")
         if pi and pi.data:

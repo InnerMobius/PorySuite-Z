@@ -793,6 +793,34 @@ DEPS = [
         "install_label": "pip install",
         "install_fn": lambda: _pip_install("typing_extensions~=4.9.0"),
     },
+    # ── category: Sound Editor ────────────────────────────
+    {
+        "category": "App / Editor",
+        "name": "numpy",
+        "description": "Numerical computing library — used by the Sound Editor for audio synthesis and mixing.",
+        "platform": None,
+        "check": lambda: _pkg_installed("numpy"),
+        "install_label": "pip install",
+        "install_fn": lambda: _pip_install("numpy>=2.0"),
+    },
+    {
+        "category": "App / Editor",
+        "name": "sounddevice",
+        "description": "Audio output library — used by the Sound Editor to play song previews through your speakers.",
+        "platform": None,
+        "check": lambda: _pkg_installed("sounddevice"),
+        "install_label": "pip install",
+        "install_fn": lambda: _pip_install("sounddevice>=0.5"),
+    },
+    {
+        "category": "App / Editor",
+        "name": "mido",
+        "description": "MIDI file reader — used by the MIDI Import wizard to read track info, instruments, and measure counts.",
+        "platform": None,
+        "check": lambda: _pkg_installed("mido"),
+        "install_label": "pip install",
+        "install_fn": lambda: _pip_install("mido>=1.3"),
+    },
     # ── category: Git ──────────────────────────────────────
     {
         "category": "Git",

@@ -218,7 +218,16 @@ function startCommandPoll() {
     pollForCommand();
 }
 
+let pollErrorCount = 0;
 function pollForCommand() {
+    // If readCommandFile isn't patched into this Porymap build, bail
+    // out after 3 consecutive errors so we don't log-spam forever.
+    if (typeof utility.readCommandFile !== "function") {
+        utility.log("[PorySuite-Z Bridge] readCommandFile not available — "
+                    + "this Porymap is unpatched. Command poll disabled.");
+        commandPollActive = false;
+        return;
+    }
     try {
         // Read command file (written by PorySuite-Z launcher, deleted after reading)
         let raw = utility.readCommandFile();
@@ -227,8 +236,18 @@ function pollForCommand() {
             let cmd = JSON.parse(raw);
             handleCommand(cmd);
         }
+        pollErrorCount = 0;
     } catch(e) {
-        utility.log("[PorySuite-Z Bridge] Poll error: " + e);
+        pollErrorCount += 1;
+        if (pollErrorCount <= 3) {
+            utility.log("[PorySuite-Z Bridge] Poll error: " + e);
+        }
+        if (pollErrorCount >= 10) {
+            utility.log("[PorySuite-Z Bridge] Too many poll errors — "
+                        + "disabling command poll.");
+            commandPollActive = false;
+            return;
+        }
     }
     // Poll every 500ms
     utility.setTimeout(pollForCommand, 500);

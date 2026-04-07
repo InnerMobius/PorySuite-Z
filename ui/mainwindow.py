@@ -246,9 +246,12 @@ from ui.trainer_class_editor import (
     TrainerClassEditor, write_trainer_class_names, write_money_table,
     write_facility_pic_mapping,
 )
+from ui.trainer_graphics_tab import TrainerGraphicsTab
+from ui.overworld_graphics_tab import OverworldGraphicsTab
 from ui.pokedex_detail_panel import PokedexDetailPanel
 from ui.dex_description_edit import attach_dex_limit_ui
 from ui.moves_tab_widget import MovesTabWidget
+from ui.abilities_tab_widget import AbilitiesTabWidget
 from ui.config_tab_widget import ConfigTabWidget
 from ui.ui_tab_widget import UITabWidget
 
@@ -332,8 +335,17 @@ class MainWindow(QMainWindow):
 
         self.trainer_class_editor = TrainerClassEditor()
         self.trainer_class_editor.changed.connect(lambda: self.setWindowModified(True))
+        # Live-push pending class-name renames into the sibling Trainers
+        # editor so the trainer list and detail panel reflect them without
+        # requiring save.
+        self.trainer_class_editor.class_name_edited.connect(
+            self.trainers_editor.apply_class_name
+        )
 
-        # Tab switcher: Trainers / Trainer Classes (same pattern as Pokedex)
+        self.trainer_graphics_tab = TrainerGraphicsTab()
+        self.trainer_graphics_tab.modified.connect(lambda: self.setWindowModified(True))
+
+        # Tab switcher: Trainers / Trainer Classes / Graphics
         _TRAINER_TAB_SS = """
 QTabWidget::pane {
     border: 1px solid #2e2e2e;
@@ -364,6 +376,7 @@ QTabBar::tab:hover:!selected {
         self._trainers_tab_switcher.setDocumentMode(True)
         self._trainers_tab_switcher.addTab(self.trainers_editor, "Trainers")
         self._trainers_tab_switcher.addTab(self.trainer_class_editor, "Trainer Classes")
+        self._trainers_tab_switcher.addTab(self.trainer_graphics_tab, "Graphics")
         self.ui.tab_trainers_grid.addWidget(self._trainers_tab_switcher, 0, 0, 1, 1)
 
         # Initialize instance variables
@@ -405,6 +418,30 @@ QTabBar::tab:hover:!selected {
         except Exception:
             self.moves_main_tab_index = -1
 
+        # Add a global Abilities editor tab
+        try:
+            self.abilities_tab = AbilitiesTabWidget()
+            self.abilities_tab.data_changed.connect(lambda: self.setWindowModified(True))
+            self.abilities_tab.data_changed.connect(self._refresh_ability_combos)
+            self.abilities_tab.rename_requested.connect(self._on_ability_rename)
+            self.abilities_tab.species_jump_requested.connect(self._jump_to_species)
+        except Exception as e:
+            self.abilities_tab = None
+            print(f"[AbilitiesEditor] Failed to create: {e}")
+
+        # ── Overworld Graphics tab (top-level) ──────────────────────────────
+        try:
+            self.overworld_graphics_tab = OverworldGraphicsTab()
+            self.overworld_graphics_tab.modified.connect(
+                lambda: self.setWindowModified(True)
+            )
+            self.ui.mainTabs.addTab(self.overworld_graphics_tab, "Overworld GFX")
+            self.overworld_gfx_tab_index = self.ui.mainTabs.indexOf(
+                self.overworld_graphics_tab
+            )
+        except Exception:
+            self.overworld_gfx_tab_index = -1
+
         # ── Config tab ───────────────────────────────────────────────────────
         self.config_tab = ConfigTabWidget(self.ui.tab_config)
         self.ui.tab_config_grid.addWidget(self.config_tab, 0, 0, 1, 1)
@@ -431,19 +468,45 @@ QTabBar::tab:hover:!selected {
         # ── Pokédex tab: add detail panel ─────────────────────────────────────
         self._setup_pokedex_tab()
 
-        # ── Graphics tab: Open Folder button ──────────────────────────────────
+        # ── Graphics tab: REPLACED by GraphicsTabWidget ───────────────────────
         self._current_species_gfx_folder: str = ""
         try:
-            from PyQt6.QtWidgets import QPushButton as _QPB
-            self._gfx_open_btn = _QPB("Open Graphics Folder")
-            self._gfx_open_btn.setStyleSheet(
-                "background: #2a2a3a; color: #aac; border: 1px solid #3a3a4a; "
-                "padding: 4px 12px; border-radius: 3px; font-size: 10px;"
+            from ui.graphics_tab_widget import GraphicsTabWidget
+            # Hide the legacy sprite buttons (keep alive — other code
+            # still writes stylesheets to them harmlessly).
+            _sink = QWidget(self.ui.tab_pokemon_graphics)
+            _sink.hide()
+            for _name in ("frontPic_0", "frontPic_1", "backPic", "iconPic",
+                          "footprintPic", "label_33", "label_34", "label_51",
+                          "label_52"):
+                _w = getattr(self.ui, _name, None)
+                if _w is not None:
+                    _w.setParent(_sink)
+            # Also stash the animated icon label if _setup_species_info
+            # replaced iconPic earlier with it.
+            _anim = getattr(self, "_icon_anim_lbl", None)
+            if _anim is not None:
+                _anim.setParent(_sink)
+            # Remove the old formLayout_2 from the grid so it doesn't overlap
+            try:
+                self.ui.tab_pokemon_graphics_grid.removeItem(self.ui.formLayout_2)
+            except Exception:
+                pass
+            # Build the new Graphics widget (its own res folder)
+            _res_dir = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "res", "images",
             )
-            self._gfx_open_btn.clicked.connect(self._open_species_gfx_folder)
-            self.ui.formLayout_2.addRow("", self._gfx_open_btn)
-        except Exception:
-            pass
+            self.graphics_tab_widget = GraphicsTabWidget(_res_dir)
+            self.graphics_tab_widget.modified.connect(
+                lambda: self.setWindowModified(True)
+            )
+            self.ui.tab_pokemon_graphics_grid.addWidget(
+                self.graphics_tab_widget, 0, 0, 1, 1
+            )
+        except Exception as _e:
+            logging.exception("Failed to build GraphicsTabWidget: %s", _e)
+            self.graphics_tab_widget = None
 
         # Monitor tab changes
         self.ui.mainTabs.currentChanged.connect(self.on_main_tab_changed)
@@ -709,6 +772,12 @@ QTabBar::tab:hover:!selected {
                 self._pokedex_panel.set_project_root(self.project_info["dir"])
         except Exception:
             pass
+        try:
+            if (getattr(self, "graphics_tab_widget", None) is not None
+                    and self.project_info.get("dir")):
+                self.graphics_tab_widget.set_project_root(self.project_info["dir"])
+        except Exception:
+            pass
 
     def _open_crashlogs_folder(self):
         """Open the project's crashlogs folder in the host OS file browser.
@@ -844,6 +913,10 @@ QTabBar::tab:hover:!selected {
             pass
         try:
             self.load_moves_defs_table()
+        except Exception:
+            pass
+        try:
+            self.load_abilities_editor()
         except Exception:
             pass
 
@@ -1365,29 +1438,26 @@ QTabBar::tab:hover:!selected {
                 )
 
         confirm_text = (
-            f"This will run:\n\n"
-            f"  {fetch_label}\n"
-            f"  {reset_label}\n"
-            + ("  git clean -fd\n" if is_upstream_pull else "") +
-            f"\n  Remote: {remote_label}\n"
+            f"⚠ WARNING: Pulling will overwrite your local files.\n\n"
+            f"Your local copy will be replaced with whatever is on the "
+            f"remote. Any work you haven't committed will be permanently lost.\n\n"
+            f"  Remote: {remote_label}\n"
             + (f"  Branch: {branch_label}\n" if branch_label else "") +
-            f"\nThis will discard:\n"
-            f"  - All uncommitted changes to tracked files\n"
-            f"  - All unsaved edits open in the editor\n"
-            f"  - All queued rename operations not yet written to disk\n"
-            + ("  - ALL untracked files (custom graphics, scripts, etc.)\n" if is_upstream_pull else "") +
+            f"\nWhat will be wiped:\n"
+            f"  • All uncommitted changes to tracked files\n"
+            f"  • All unsaved edits open in the editor\n"
+            f"  • All queued rename operations not yet written to disk\n"
+            + ("  • ALL untracked files (custom graphics, scripts, etc.)\n" if is_upstream_pull else "") +
             clean_preview +
-            f"\nContinue?"
+            f"\nAre you sure you want to continue?"
         )
 
-        ans = maybe_exec(
-            key="git_pull_confirm",
-            parent=self,
-            title="Pull from Remote",
-            text=confirm_text,
-            icon=QMessageBox.Icon.Question,
-            buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            default_button=QMessageBox.StandardButton.Yes,
+        ans = QMessageBox.question(
+            self,
+            "Pull from Remote",
+            confirm_text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
@@ -1948,14 +2018,18 @@ QTabBar::tab:hover:!selected {
         )
         ahead_label = f"\n\nCommits to push:\n{ahead_log}" if ahead_log else "\n\n(No commits ahead of origin — push anyway?)"
 
-        ans = maybe_exec(
-            key="git_push_confirm",
-            parent=self,
-            title="Push to Remote",
-            text=f"Push branch  {branch}  →  {remote_url}?{ahead_label}",
-            icon=QMessageBox.Icon.Question,
-            buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            default_button=QMessageBox.StandardButton.Yes,
+        ans = QMessageBox.question(
+            self,
+            "Push to Remote",
+            f"⚠ WARNING: Pushing will overwrite the remote with your local commits.\n\n"
+            f"Anyone else pulling from this remote will get your changes. "
+            f"If you have broken or incomplete work, it will be pushed too.\n\n"
+            f"  Branch: {branch}\n"
+            f"  Remote: {remote_url}"
+            f"{ahead_label}\n\n"
+            f"Are you sure you want to push?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
@@ -2164,6 +2238,19 @@ QTabBar::tab:hover:!selected {
         Returns:
         - None
         """
+        # Flush Graphics tab edits (pic coords, elevation, icon palette index,
+        # .pal files) before the main save pipeline runs.
+        try:
+            if getattr(self, "graphics_tab_widget", None) is not None:
+                ok, errs = self.graphics_tab_widget.flush_to_disk()
+                if ok or errs:
+                    logging.info(
+                        "Graphics tab: wrote %d file(s); errors: %s",
+                        ok, errs or "none",
+                    )
+        except Exception:
+            logging.exception("graphics_tab_widget.flush_to_disk failed")
+
         # Save the source data
         self.source_data.save()
         # Persist any generated C code (headers) back to the project's source files
@@ -2407,15 +2494,29 @@ QTabBar::tab:hover:!selected {
         self.ui.ability1.clear()
         self.ui.ability2.clear()
         abilities = self.source_data.get_pokemon_abilities()
+
+        # Enrich with display names + descriptions from the C text file.
+        # The JSON cache only stores {name, id}; the real display names
+        # live in src/data/text/abilities.h.
+        try:
+            root = self.source_data.docker_util.repo_root()
+            self._enrich_abilities_from_text(root, abilities)
+        except Exception:
+            pass
+
         for ability in sorted(
             abilities.keys(), key=lambda x: self.source_data.get_ability_data(x, "id")
         ):
-            self.ui.ability1.addItem(
-                self.source_data.get_ability_data(ability, "name"), ability
-            )
-            self.ui.ability2.addItem(
-                self.source_data.get_ability_data(ability, "name"), ability
-            )
+            display = (self.source_data.get_ability_data(ability, "display_name")
+                        or self.source_data.get_ability_data(ability, "name"))
+            self.ui.ability1.addItem(display, ability)
+            self.ui.ability2.addItem(display, ability)
+
+        # Load abilities editor
+        try:
+            self.load_abilities_editor()
+        except Exception:
+            pass
 
         # Add items to item combo boxes (fallback to constants when cache is empty)
         self._populate_item_comboboxes([
@@ -2639,6 +2740,11 @@ QTabBar::tab:hover:!selected {
                 pass
             try:
                 self.ui_tab.load(_project_dir)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "overworld_graphics_tab"):
+                    self.overworld_graphics_tab.load(_project_dir)
             except Exception:
                 pass
 
@@ -3313,6 +3419,19 @@ QTabBar::tab:hover:!selected {
 
         # Update Info-tab sprite thumbnails, constant label, and animated icon
         self._update_species_info_sprites(front_pic, icon_pic, species=species)
+
+        # Update Graphics tab widget with sprites + per-species data
+        try:
+            if getattr(self, "graphics_tab_widget", None) is not None:
+                self.graphics_tab_widget.load_species(
+                    species,
+                    front_path=front_pic or "",
+                    back_path=back_pic or "",
+                    icon_path=icon_pic or "",
+                    footprint_path=footprint_pic or "",
+                )
+        except Exception:
+            logging.exception("graphics_tab_widget.load_species failed")
         if hasattr(self, "_icon_timer"):
             self._set_icon_animation(icon_pic)
 
@@ -4663,6 +4782,7 @@ QTabBar::tab:hover:!selected {
             elif self.previous_main_tab == 4:  # Trainers
                 self._save_trainers_editor()
                 self._save_trainer_classes()
+                self._save_trainer_graphics()
             elif self.previous_main_tab == 5:  # UI
                 pass
             elif self.previous_main_tab == 6:  # Config
@@ -4802,6 +4922,18 @@ QTabBar::tab:hover:!selected {
             )
             sp_vbox.addWidget(
                 self._info_icon_lbl, 0, Qt.AlignmentFlag.AlignHCenter
+            )
+
+            # Play Cry button — sits directly under the sprites on the Info tab
+            self.play_cry_button = QPushButton("\u25B6 Play Cry")
+            self.play_cry_button.setToolTip(
+                "Play this species' cry sample\n"
+                "(sound/direct_sound_samples/cries/*.wav)"
+            )
+            self.play_cry_button.setFixedWidth(80)
+            self.play_cry_button.clicked.connect(self._on_play_current_cry)
+            sp_vbox.addWidget(
+                self.play_cry_button, 0, Qt.AlignmentFlag.AlignHCenter
             )
             sp_vbox.addStretch(1)
 
@@ -5045,6 +5177,9 @@ QTabBar::tab:hover:!selected {
             )
             self._pokedex_panel.changed.connect(
                 lambda: self.setWindowModified(True)
+            )
+            self._pokedex_panel.play_cry_requested.connect(
+                self._on_play_current_pokedex_cry
             )
             dex_scroll.setWidget(self._pokedex_panel)
 
@@ -5292,6 +5427,372 @@ QTabBar::tab:hover:!selected {
                     pm.data.setdefault("move_descriptions", {}).update(descriptions)
             except Exception:
                 pass
+
+    # ── Abilities editor load / save ────────────────────────────────────────
+
+    def load_abilities_editor(self):
+        """Populate the abilities editor with ability data + species cross-refs."""
+        if not self.source_data or not hasattr(self, "abilities_tab") or not self.abilities_tab:
+            return
+        abilities = self.source_data.get_pokemon_abilities() or {}
+
+        # The JSON cache only has {name, id} — read display names and
+        # descriptions directly from src/data/text/abilities.h (the same
+        # file the name decapitalizer reads/writes).
+        root = ""
+        try:
+            root = self.source_data.docker_util.repo_root()
+        except Exception:
+            pass
+        if root:
+            self._enrich_abilities_from_text(root, abilities)
+
+        # Build species data dict for cross-reference.
+        # get_species_ability() resolves numeric IDs to ABILITY_* constants.
+        species_data = {}
+        pokemon = self.source_data.get_pokemon_data() or {}
+        for sp_const in pokemon:
+            resolved = []
+            for i in range(2):
+                try:
+                    ab = self.source_data.get_species_ability(sp_const, i)
+                except Exception:
+                    ab = "ABILITY_NONE"
+                resolved.append(ab or "ABILITY_NONE")
+            sp_name = self.source_data.get_species_data(sp_const, "name") or sp_const
+            species_data[sp_const] = {
+                "abilities": resolved,
+                "name": sp_name,
+            }
+
+        self.abilities_tab.load_abilities(abilities, species_data, project_root=root)
+
+    @staticmethod
+    def _enrich_abilities_from_text(root: str, abilities: dict):
+        """Read display names + descriptions from src/data/text/abilities.h."""
+        import re as _re
+        text_path = os.path.join(root, "src", "data", "text", "abilities.h")
+        if not os.path.isfile(text_path):
+            return
+        try:
+            with open(text_path, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return
+
+        # Display names from gAbilityNames:  [ABILITY_XXX] = _("Display Name"),
+        name_rx = _re.compile(
+            r'\[(ABILITY_[A-Z0-9_]+)\]\s*=\s*_\("([^"]*)"\)'
+        )
+        # Description strings:  static const u8 sXxxDescription[] = _("...");
+        desc_var_rx = _re.compile(
+            r'static\s+const\s+u8\s+(s\w+Description)\[\]\s*=\s*_\("([^"]*)"\)\s*;'
+        )
+        # Pointer table:  [ABILITY_XXX] = sXxxDescription,
+        desc_ptr_rx = _re.compile(
+            r'\[(ABILITY_[A-Z0-9_]+)\]\s*=\s*(s\w+Description)\s*,'
+        )
+
+        # Variable → text mapping
+        desc_vars: dict[str, str] = {}
+        for m in desc_var_rx.finditer(content):
+            desc_vars[m.group(1)] = m.group(2)
+
+        # Constant → description via pointer table
+        for m in desc_ptr_rx.finditer(content):
+            const, var = m.group(1), m.group(2)
+            if var in desc_vars and const in abilities:
+                abilities[const]["description"] = desc_vars[var]
+
+        # Display names — only from the gAbilityNames array
+        names_start = content.find("gAbilityNames")
+        for m in name_rx.finditer(content, names_start if names_start >= 0 else 0):
+            const, display_name = m.group(1), m.group(2)
+            if const in abilities:
+                abilities[const]["display_name"] = display_name
+
+    def save_abilities_editor(self):
+        """Flush abilities editor edits back to source data and write files."""
+        if not self.source_data or not hasattr(self, "abilities_tab") or not self.abilities_tab:
+            return
+        self.abilities_tab.save_current()
+        abilities = self.abilities_tab.get_abilities_data()
+        if not abilities:
+            return
+
+        # Update in-memory data layer
+        for const, data in abilities.items():
+            self.source_data.set_ability_data(const, "display_name",
+                                              data.get("display_name", ""))
+            self.source_data.set_ability_data(const, "description",
+                                              data.get("description", ""))
+
+        # Write to disk: abilities.h (constants) + src/data/text/abilities.h (names + descriptions)
+        root = self.source_data.data.get("repo_root") or ""
+        if not root:
+            try:
+                root = self.source_data.docker_util.repo_root()
+            except Exception:
+                pass
+        if not root:
+            return
+        self._write_abilities_constants(root, abilities)
+        self._write_abilities_text(root, abilities)
+
+        # Write battle/field effect code changes to C source files
+        try:
+            effect_msgs = self.abilities_tab.apply_effect_changes()
+            if effect_msgs:
+                self.log(f"Abilities: wrote effect code — "
+                         + "; ".join(effect_msgs))
+        except Exception as e:
+            self.log(f"Abilities: error writing effect code — {e}")
+
+    def _write_abilities_constants(self, root: str, abilities: dict):
+        """Write include/constants/abilities.h."""
+        path = os.path.join(root, "include", "constants", "abilities.h")
+        if not os.path.isfile(path):
+            return
+        sorted_abs = sorted(abilities.items(), key=lambda kv: kv[1].get("id", 0))
+        max_id = max((d.get("id", 0) for d in abilities.values()), default=0)
+
+        lines = [
+            "#ifndef GUARD_CONSTANTS_ABILITIES_H\n",
+            "#define GUARD_CONSTANTS_ABILITIES_H\n",
+            "\n",
+        ]
+        for const, data in sorted_abs:
+            lines.append(f"#define {const} {data.get('id', 0)}\n")
+        lines.append(f"\n#define ABILITIES_COUNT {max_id + 1}\n")
+        lines.append("\n#endif  // GUARD_CONSTANTS_ABILITIES_H\n")
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except OSError as e:
+            print(f"[Abilities] Failed to write {path}: {e}")
+
+    def _write_abilities_text(self, root: str, abilities: dict):
+        """Write src/data/text/abilities.h (names + descriptions)."""
+        path = os.path.join(root, "src", "data", "text", "abilities.h")
+        if not os.path.isfile(path):
+            return
+        sorted_abs = sorted(abilities.items(), key=lambda kv: kv[1].get("id", 0))
+
+        lines = []
+
+        # Description strings
+        for const, data in sorted_abs:
+            # Generate a variable name from the constant: ABILITY_SPEED_BOOST → sSpeedBoostDescription
+            suffix = const.replace("ABILITY_", "")
+            parts = suffix.split("_")
+            var_name = "s" + "".join(p.capitalize() for p in parts) + "Description"
+            desc = data.get("description", "No description.")
+            lines.append(f'static const u8 {var_name}[] = _("{desc}");\n')
+
+        lines.append("\n")
+
+        # Description pointer table
+        lines.append("const u8 *const gAbilityDescriptionPointers[ABILITIES_COUNT] =\n")
+        lines.append("{\n")
+        for const, data in sorted_abs:
+            suffix = const.replace("ABILITY_", "")
+            parts = suffix.split("_")
+            var_name = "s" + "".join(p.capitalize() for p in parts) + "Description"
+            lines.append(f"    [{const}] = {var_name},\n")
+        lines.append("};\n")
+
+        lines.append("\n")
+
+        # Name table
+        lines.append("const u8 gAbilityNames[ABILITIES_COUNT][ABILITY_NAME_LENGTH + 1] =\n")
+        lines.append("{\n")
+        for const, data in sorted_abs:
+            display = data.get("display_name", data.get("name", "-------"))
+            lines.append(f'    [{const}] = _("{display}"),\n')
+        lines.append("};\n")
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        except OSError as e:
+            print(f"[Abilities] Failed to write {path}: {e}")
+
+    def _refresh_ability_combos(self):
+        """Repopulate ability dropdowns on the Pokemon tab after abilities change."""
+        if not self.source_data:
+            return
+        # Preserve current selections
+        cur1 = self.ui.ability1.currentData()
+        cur2 = self.ui.ability2.currentData()
+
+        self.ui.ability1.blockSignals(True)
+        self.ui.ability2.blockSignals(True)
+        self.ui.ability1.clear()
+        self.ui.ability2.clear()
+
+        abilities = self.source_data.get_pokemon_abilities()
+        # Abilities data is already enriched with display_name at this point
+        for ability in sorted(
+            abilities.keys(),
+            key=lambda x: self.source_data.get_ability_data(x, "id"),
+        ):
+            display = (abilities.get(ability, {}).get("display_name")
+                        or abilities.get(ability, {}).get("name", ability))
+            self.ui.ability1.addItem(display, ability)
+            self.ui.ability2.addItem(display, ability)
+
+        # Restore selections
+        if cur1:
+            idx = self.ui.ability1.findData(cur1)
+            if idx >= 0:
+                self.ui.ability1.setCurrentIndex(idx)
+        if cur2:
+            idx = self.ui.ability2.findData(cur2)
+            if idx >= 0:
+                self.ui.ability2.setCurrentIndex(idx)
+
+        self.ui.ability1.blockSignals(False)
+        self.ui.ability2.blockSignals(False)
+
+    def _on_ability_rename(self, old_const: str):
+        """Rename an ability constant across the whole project."""
+        if not self.source_data or not old_const:
+            return
+        try:
+            from ui.custom_widgets.rename_dialog import RenameDialog
+            dlg = RenameDialog(self, prefix="ABILITY_", entity_type="Ability", show_display=True)
+            dlg.set_old_constant(old_const)
+            # Pre-populate with the actual display name
+            ab_name = ""
+            try:
+                abilities = self.source_data.get_pokemon_abilities() or {}
+                ab_info = abilities.get(old_const, {})
+                ab_name = (ab_info.get("display_name") or ab_info.get("name") or "").strip()
+            except Exception:
+                pass
+            if not ab_name:
+                base = old_const[len("ABILITY_"):] if old_const.startswith("ABILITY_") else old_const
+                ab_name = base.replace("_", " ")
+            dlg.set_display_name(ab_name)
+            # Live preview
+            def _preview():
+                _, new_const, display_name = dlg.get_values()
+                if new_const and new_const != old_const:
+                    try:
+                        svc = getattr(getattr(self, "source_data", None), "refactor_service", None)
+                        if svc:
+                            previews = svc.rename_ability(old_const, new_const, display_name=display_name or "", preview=True)
+                            dlg.set_preview(previews or [])
+                    except Exception:
+                        pass
+            dlg.suffix_edit.textChanged.connect(_preview)
+            try:
+                dlg.display_edit.textChanged.connect(_preview)
+            except Exception:
+                pass
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            _, new_const, display_name = dlg.get_values()
+            if not new_const:
+                return
+
+            const_changed = new_const != old_const
+            old_display = ""
+            try:
+                abilities = self.source_data.get_pokemon_abilities() or {}
+                old_display = (abilities.get(old_const, {}).get("display_name") or "").strip()
+            except Exception:
+                pass
+            display_changed = display_name != old_display
+
+            if not const_changed and not display_changed:
+                return
+
+            previews = []
+            if const_changed:
+                svc = getattr(getattr(self, "source_data", None), "refactor_service", None)
+                if svc is None:
+                    QMessageBox.warning(self, "Rename", "Refactor service unavailable.")
+                    return
+                previews = svc.rename_ability(old_const, new_const, display_name=display_name or "")
+
+            # Update widget in-memory data
+            if hasattr(self, "abilities_tab") and self.abilities_tab:
+                self.abilities_tab.save_current()
+                if const_changed:
+                    self.abilities_tab.rename_ability_key(old_const, new_const)
+                # Update display name
+                target = new_const if const_changed else old_const
+                ab_data = self.abilities_tab._abilities_data
+                if target in ab_data:
+                    ab_data[target]["display_name"] = display_name
+
+            # Update source_data in-memory dict
+            try:
+                abilities = self.source_data.get_pokemon_abilities() or {}
+                if const_changed and old_const in abilities:
+                    abilities[new_const] = abilities.pop(old_const)
+                target = new_const if const_changed else old_const
+                if target in abilities:
+                    abilities[target]["display_name"] = display_name
+            except Exception:
+                pass
+
+            # If only display name changed, refresh the list
+            if not const_changed and display_changed:
+                if hasattr(self, "abilities_tab") and self.abilities_tab:
+                    self.abilities_tab._rebuild_list()
+                    for i in range(self.abilities_tab._list.count()):
+                        item = self.abilities_tab._list.item(i)
+                        if item and item.data(Qt.ItemDataRole.UserRole) == old_const:
+                            self.abilities_tab._list.setCurrentRow(i)
+                            break
+
+            self.setWindowModified(True)
+            self._refresh_ability_combos()
+
+            if const_changed:
+                n = len(previews)
+                maybe_exec(
+                    key="rename_queued_ability",
+                    parent=self,
+                    title="Rename Queued",
+                    text=(
+                        f"Ability rename  {old_const}  \u2192  {new_const}  staged.\n"
+                        f"{n} reference(s) found in source files.\n\n"
+                        "Changes will be written to disk on File \u2192 Save."
+                    ),
+                )
+            else:
+                maybe_exec(
+                    key="rename_queued_ability",
+                    parent=self,
+                    title="Name Updated",
+                    text=f"Display name changed to \"{display_name}\".",
+                )
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _jump_to_species(self, species_const: str):
+        """Jump to a species in the Pokemon tab."""
+        try:
+            # Find the species in the species list and select it
+            for i in range(self.ui.speciesList.count()):
+                item = self.ui.speciesList.item(i)
+                if item and item.data(Qt.ItemDataRole.UserRole) == species_const:
+                    self.ui.speciesList.setCurrentItem(item)
+                    # Switch to Pokemon page in unified window
+                    parent = self.parent()
+                    while parent:
+                        if hasattr(parent, '_switch_page'):
+                            parent._switch_page("pokemon")
+                            break
+                        parent = parent.parent()
+                    return
+        except Exception as e:
+            print(f"[Abilities] Jump to species failed: {e}")
 
     def on_pokemon_tab_changed(self, index: int):
         """Handle switching between Pokémon sub-tabs, saving edits first."""
@@ -6182,6 +6683,31 @@ QTabBar::tab:hover:!selected {
             except Exception:
                 pass
 
+    def _on_play_current_cry(self) -> None:
+        """Play the cry for the species currently shown in the Pokemon tab."""
+        species = getattr(self, "previous_selected_species", None)
+        if not species:
+            return
+        try:
+            from ui.audio_player import get_audio_player
+            player = get_audio_player()
+            root = (self.project_info or {}).get("dir")
+            if root:
+                player.set_project_root(root)
+            if not player.play_cry(species):
+                QMessageBox.information(
+                    self, "Play Cry",
+                    f"No cry sample found for {species}.\n"
+                    f"Expected: sound/direct_sound_samples/cries/"
+                    f"{species[len('SPECIES_'):].lower()}.wav",
+                )
+        except Exception as e:
+            QMessageBox.warning(self, "Play Cry", f"Could not play cry: {e}")
+
+    def _on_play_current_pokedex_cry(self) -> None:
+        """Play the cry for the species currently shown in the Pokedex tab."""
+        self._on_play_current_cry()
+
     def reset_current_species_view(self) -> None:
         """Discard unsaved edits for the currently selected species."""
 
@@ -6412,9 +6938,20 @@ QTabBar::tab:hover:!selected {
                 species_icon_fn=self._species_list_icon,
             )
 
-            # Also load the trainer class editor
+            # Load the trainer graphics tab with the same pic map
             try:
-                self.trainer_class_editor.load(root, trainers)
+                pic_map = getattr(self.trainers_editor, "_pic_map", {})
+                self.trainer_graphics_tab.load(root, pic_map)
+            except Exception:
+                pass
+
+            # Also load the trainer class editor, but ONLY if it has no
+            # unsaved edits — otherwise re-running load() would silently
+            # discard the user's dirty name/money/pic changes.
+            try:
+                tce = self.trainer_class_editor
+                if not (getattr(tce, "_loaded", False) and tce.has_edits()):
+                    tce.load(root, trainers)
             except Exception as exc2:
                 logging.getLogger(__name__).warning(
                     "_load_trainers_editor class editor: %s", exc2
@@ -6488,6 +7025,38 @@ QTabBar::tab:hover:!selected {
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("_save_trainers_editor: %s", exc)
+
+    def _save_trainer_graphics(self):
+        """Flush TrainerGraphicsTab palette edits to .pal files on disk."""
+        if not self.trainer_graphics_tab.has_unsaved_changes():
+            return
+        try:
+            ok, errs = self.trainer_graphics_tab.flush_to_disk()
+            if errs:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "_save_trainer_graphics errors: %s", errs
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("_save_trainer_graphics: %s", exc)
+
+    def _save_overworld_graphics(self):
+        """Flush OverworldGraphicsTab palette edits to .pal files on disk."""
+        if not hasattr(self, "overworld_graphics_tab"):
+            return
+        if not self.overworld_graphics_tab.has_unsaved_changes():
+            return
+        try:
+            ok, errs = self.overworld_graphics_tab.flush_to_disk()
+            if errs:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "_save_overworld_graphics errors: %s", errs
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("_save_overworld_graphics: %s", exc)
 
     def _on_trainer_rename_from_panel(self, old_const: str):
         """Handle rename_requested from TrainersTabWidget."""
@@ -7149,6 +7718,18 @@ QTabBar::tab:hover:!selected {
                 self._save_trainer_classes()
             except Exception:
                 pass
+            try:
+                self._save_trainer_graphics()
+            except Exception:
+                pass
+            try:
+                self._save_overworld_graphics()
+            except Exception:
+                pass
+            try:
+                self.save_abilities_editor()
+            except Exception:
+                pass
             # Learnset table (only if on that sub-tab)
             try:
                 learnset_index = getattr(self, "learnset_tab_index", self.moves_tab_index)
@@ -7236,6 +7817,21 @@ QTabBar::tab:hover:!selected {
                     pass
                 try:
                     self._save_trainer_classes()
+                except Exception:
+                    pass
+                try:
+                    self._save_trainer_graphics()
+                except Exception:
+                    pass
+                try:
+                    self._save_overworld_graphics()
+                except Exception:
+                    pass
+
+                # Flush abilities editor and write abilities.h files
+                dlg.step("Writing abilities")
+                try:
+                    self.save_abilities_editor()
                 except Exception:
                     pass
 

@@ -69,6 +69,20 @@ def is_porymap_installed() -> bool:
     return os.path.isfile(porymap_exe_path())
 
 
+def is_porymap_patched() -> bool:
+    """Return True if the installed porymap.exe was built from our patched
+    source. The installer drops a ``.psinstalled`` marker file next to the
+    exe on success. If missing, the launcher treats the binary as stock
+    Porymap and avoids passing patched-only CLI args or sending commands
+    that the JS bridge can't handle.
+    """
+    exe = porymap_exe_path()
+    if not os.path.isfile(exe):
+        return False
+    marker = os.path.join(os.path.dirname(exe), ".psinstalled")
+    return os.path.isfile(marker)
+
+
 # ─── Config writing ──────────────────────────────────────────────────────────
 
 def _read_cfg(path: str) -> dict:
@@ -253,10 +267,16 @@ def launch_porymap(project_dir: str, map_name: str = "") -> bool:
         log.warning("Porymap not installed")
         return False
 
+    patched = is_porymap_patched()
+    if not patched:
+        log.warning(
+            "Porymap binary has no .psinstalled marker — treating as stock "
+            "Porymap. Map-arg CLI and command-file navigation disabled.")
+
     # If already running, send a command to navigate to the right map
     if bring_porymap_to_front():
         log.info(f"Porymap already running, sending command: map={map_name!r}")
-        if map_name and project_dir:
+        if map_name and project_dir and patched:
             _send_command(project_dir, {"action": "openMap", "map": map_name})
         return True
 
@@ -286,9 +306,11 @@ def launch_porymap(project_dir: str, map_name: str = "") -> bool:
                                  ["mingw", "msys"])]
         # Ensure the exe's own directory is first so its DLLs are found
         env["PATH"] = os.pathsep.join([exe_dir] + clean_dirs)
-        # Pass project dir + map name as CLI args (our patch to main.cpp handles this)
+        # Pass project dir + map name as CLI args (our patch to main.cpp
+        # handles the second arg). Stock Porymap only understands the
+        # project dir arg, so strip map_name when the marker is missing.
         cmd = [exe, project_dir]
-        if map_name:
+        if map_name and patched:
             cmd.append(map_name)
         log.info(f"Launching: {cmd}")
         subprocess.Popen(

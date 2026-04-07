@@ -50,6 +50,16 @@ class ConstantPicker(QComboBox):
             self._display_to_raw[display] = c
             display_items.append(display)
 
+        # Sort alphabetically by the pretty name portion (case-insensitive)
+        # so dropdowns are easy to scan — "None (TRAINER_NONE)" first when
+        # present, then all names A→Z.
+        def _sort_key(d: str) -> tuple:
+            key = d.split('  (')[0].lower()
+            # Keep "none"/"__none__" at top by flagging it first
+            is_none = ('_none' in d.lower()) or key in ('none', '')
+            return (0 if is_none else 1, key)
+        display_items.sort(key=_sort_key)
+
         self.addItems(display_items)
 
         # Enable type-ahead filtering
@@ -168,7 +178,7 @@ class SpritePreview(QLabel):
     """
 
     _SCALE = 3        # 3× nearest-neighbor zoom
-    _FRAME_MS = 333   # ~3 FPS walk cycle
+    _FRAME_MS = 150   # ~GBA speed (8 ticks @ 60fps ≈ 133ms)
 
     def __init__(self, parent=None):
         super().__init__(parent)

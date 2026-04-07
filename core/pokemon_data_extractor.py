@@ -944,6 +944,8 @@ class AbilitiesDataExtractor(PokemonDataExtractor):
         source_headers = [header] if header else []
         data = _load_json(json_path, source_headers=source_headers)
         if data is not None:
+            # Enrich with display names + descriptions from text file
+            self._enrich_abilities(data)
             print(f"Loaded {len(data)} abilities [OK]")
             return data
         if not header:
@@ -960,12 +962,65 @@ class AbilitiesDataExtractor(PokemonDataExtractor):
                 const, ident = m.groups()
                 abilities[const] = {"name": const[len("ABILITY_"):], "id": int(ident)}
 
+        # Enrich with display names + descriptions from text file
+        self._enrich_abilities(abilities)
+
         if not _write_json(json_path, abilities, 1):
             print("Aborting abilities load.")
             return abilities
 
         print(f"Loaded {len(abilities)} abilities [OK]")
         return abilities
+
+    def _enrich_abilities(self, abilities: dict) -> None:
+        """Parse display names and descriptions from src/data/text/abilities.h."""
+        root = self.docker_util.repo_root()
+        text_path = os.path.join(root, "src", "data", "text", "abilities.h")
+        if not os.path.isfile(text_path):
+            return
+        try:
+            with open(text_path, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return
+
+        # Parse display names:  [ABILITY_XXX] = _("Display Name"),
+        name_rx = re.compile(
+            r'\[(ABILITY_[A-Z0-9_]+)\]\s*=\s*_\("([^"]*)"\)',
+        )
+        # Parse descriptions:  static const u8 sXxxDescription[] = _("...");
+        desc_var_rx = re.compile(
+            r'static\s+const\s+u8\s+(s\w+Description)\[\]\s*=\s*_\("([^"]*)"\)\s*;'
+        )
+        # Parse pointer table:  [ABILITY_XXX] = sXxxDescription,
+        desc_ptr_rx = re.compile(
+            r'\[(ABILITY_[A-Z0-9_]+)\]\s*=\s*(s\w+Description)\s*,'
+        )
+
+        # Build variable→text mapping from description strings
+        desc_vars: dict[str, str] = {}
+        for m in desc_var_rx.finditer(content):
+            desc_vars[m.group(1)] = m.group(2)
+
+        # Map ABILITY_* constant → description via pointer table
+        desc_map: dict[str, str] = {}
+        for m in desc_ptr_rx.finditer(content):
+            const, var = m.group(1), m.group(2)
+            if var in desc_vars:
+                desc_map[const] = desc_vars[var]
+
+        # Find where the gAbilityNames array starts so we only match
+        # names inside it (not descriptions above)
+        names_start = content.find("gAbilityNames")
+
+        for m in name_rx.finditer(content, names_start if names_start >= 0 else 0):
+            const, display_name = m.group(1), m.group(2)
+            if const in abilities:
+                abilities[const]["display_name"] = display_name
+
+        for const, desc in desc_map.items():
+            if const in abilities:
+                abilities[const]["description"] = desc
 
 
 class ItemsDataExtractor(PokemonDataExtractor):

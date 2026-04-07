@@ -47,9 +47,6 @@ SUPPRESSIBLE: dict[str, tuple[str, str]] = {
     "rename_complete":          ("Species rename queued notification",           "Rename"),
     # Save flow
     "save_header_confirm":      ("C header write-back confirmation on Save",     "Save"),
-    # Git flow
-    "git_pull_confirm":         ("Pull from Remote confirmation",                "Git"),
-    "git_push_confirm":         ("Push to Remote confirmation",                  "Git"),
 }
 
 

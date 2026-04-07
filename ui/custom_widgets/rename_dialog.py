@@ -124,7 +124,7 @@ class RenameDialog(QDialog):
         # ── Row 2: display name — PRIMARY input ──────────────────────────────
         if show_display:
             # Character limits per entity type
-            _NAME_LIMITS = {"Species": 10, "Move": 12, "Item": 20}
+            _NAME_LIMITS = {"Species": 10, "Move": 12, "Item": 20, "Ability": 12}
             _DISP_MAX = _NAME_LIMITS.get(entity_type, 10)
             self.display_edit = QLineEdit()
             self.display_edit.setMaxLength(_DISP_MAX)

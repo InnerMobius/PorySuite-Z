@@ -12,7 +12,7 @@ import os
 import sys
 
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QSettings
-from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence
+from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -35,6 +35,8 @@ from app_info import get_settings_path
 from suppress_dialog import maybe_exec
 from porymap_bridge.porymap_launcher import (
     is_porymap_installed, launch_porymap, inject_bridge_script,
+    _send_command,
+    is_porymap_patched,
 )
 from porymap_bridge.bridge_watcher import BridgeWatcher
 from porymap_bridge.shared_file_watcher import SharedFileWatcher
@@ -72,7 +74,7 @@ class UnifiedMainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PorySuite-Z[*]")
-        self.resize(1400, 900)
+        self.setMinimumSize(1024, 768)
         self.project_info = None
 
         # ── Internal references to child windows ─────────────────────────────
@@ -82,6 +84,8 @@ class UnifiedMainWindow(QMainWindow):
         # ── Porymap bridge ──────────────────────────────────────────────────
         self._bridge_watcher = None     # BridgeWatcher instance (created on project load)
         self._shared_file_watcher = None  # SharedFileWatcher (created on project load)
+        self._porymap_initiated_load = False  # Suppress sync-back when Porymap triggered the load
+        self._last_porymap_sync_map = ''      # Last map we sent to Porymap — skip echo
 
         # ── Central layout: splitter with stacked content + log panel ────────
         central = QWidget()
@@ -171,13 +175,16 @@ class UnifiedMainWindow(QMainWindow):
         self._page_button_group.setExclusive(True)
 
         porysuite_pages = [
-            ("pokemon",  "Pokemon"),
-            ("pokedex",  "Pokedex"),
-            ("moves",    "Moves"),
-            ("items",    "Items"),
-            ("trainers", "Trainers"),
-            ("starters", "Starters"),
-            ("credits",  "Credits"),
+            ("pokemon",    "Pokemon"),
+            ("pokedex",    "Pokedex"),
+            ("moves",      "Moves"),
+            ("items",      "Items"),
+            ("abilities",  "Abilities"),
+            ("trainers",   "Trainers"),
+            ("starters",   "Starters"),
+            ("overworld",  "Overworld Graphics"),
+            ("credits",    "Credits"),
+            ("sound",      "Sound Editor"),
         ]
         for icon_name, tooltip in porysuite_pages:
             btn = self._make_page_button(icon_name, tooltip)
@@ -216,6 +223,13 @@ class UnifiedMainWindow(QMainWindow):
         self._play_action.setToolTip("Launch ROM in emulator (F9)")
         self._play_action.triggered.connect(self._on_play)
         tb.addAction(self._play_action)
+
+        # ── Keyboard shortcut to jump to Sound Editor ──────────────────────
+        _sound_shortcut = QShortcut(QKeySequence("F8"), self)
+        _sound_shortcut.activated.connect(lambda: self._switch_page("sound"))
+        # Update the tooltip so the user knows about the shortcut
+        if "sound" in self._page_buttons:
+            self._page_buttons["sound"].setToolTip("Sound Editor (F8)")
 
     def _make_page_button(self, icon_name: str, tooltip: str) -> QToolButton:
         """Create a checkable toolbar button that switches the stacked widget."""
@@ -291,6 +305,16 @@ class UnifiedMainWindow(QMainWindow):
         rename_action.triggered.connect(self._rename_entity)
         edit_menu.addAction(rename_action)
 
+        edit_menu.addSeparator()
+
+        decapitalize_action = QAction("Name Decapitalizer...", self)
+        decapitalize_action.setToolTip(
+            "Batch-convert ALL-CAPS display names (species, moves, items, "
+            "trainers, trainer classes, abilities, UI labels) to Smart "
+            "Title Case. Preview every change before applying.")
+        decapitalize_action.triggered.connect(self._open_name_decapitalizer)
+        edit_menu.addAction(decapitalize_action)
+
         # ── View ─────────────────────────────────────────────────────────────
         view_menu = menubar.addMenu("&View")
 
@@ -298,6 +322,7 @@ class UnifiedMainWindow(QMainWindow):
         for icon_name, label in [
             ("pokemon", "Pokemon"), ("pokedex", "Pokedex"), ("moves", "Moves"),
             ("items", "Items"), ("trainers", "Trainers"), ("starters", "Starters"),
+            ("overworld", "Overworld Graphics"),
         ]:
             act = QAction(label, self)
             act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
@@ -346,6 +371,16 @@ class UnifiedMainWindow(QMainWindow):
         play_action.setShortcut("F9")
         play_action.triggered.connect(self._on_play)
         tools_menu.addAction(play_action)
+
+        tools_menu.addSeparator()
+
+        expand_rom_action = QAction("Expand ROM to 32 MB...", self)
+        expand_rom_action.setToolTip(
+            "Patch the Makefile to allow the ROM to grow up to 32 MB.\n"
+            "Needed when adding new voicegroups, samples, or other data\n"
+            "that pushes the ROM past the default 16 MB limit.")
+        expand_rom_action.triggered.connect(self._on_expand_rom)
+        tools_menu.addAction(expand_rom_action)
 
         tools_menu.addSeparator()
 
@@ -471,11 +506,33 @@ class UnifiedMainWindow(QMainWindow):
             idx = self.stack.addWidget(widget)
             self._page_indices[name] = idx
 
+        # ── Abilities editor (standalone page) ──────────────────────────────
+        if hasattr(porysuite_main, "abilities_tab"):
+            idx = self.stack.addWidget(porysuite_main.abilities_tab)
+            self._page_indices["abilities"] = idx
+
+        # ── Overworld Graphics (standalone page pulled from MainWindow) ──────
+        if hasattr(porysuite_main, "overworld_graphics_tab"):
+            ow_widget = porysuite_main.overworld_graphics_tab
+            idx = self.stack.addWidget(ow_widget)
+            self._page_indices["overworld"] = idx
+
         # ── Credits editor (standalone page) ─────────────────────────────────
         from credits_editor import CreditsEditorWidget
         self._credits_editor = CreditsEditorWidget()
         idx = self.stack.addWidget(self._credits_editor)
         self._page_indices["credits"] = idx
+
+        # ── Sound Editor (standalone page) ───────────────────────────────────
+        try:
+            from ui.sound_editor_tab import SoundEditorTab
+            self._sound_editor = SoundEditorTab()
+            idx = self.stack.addWidget(self._sound_editor)
+            self._page_indices["sound"] = idx
+        except Exception as e:
+            print(f"[SoundEditor] Failed to load: {e}")
+            import traceback
+            traceback.print_exc()
 
         # ── EVENTide pages ───────────────────────────────────────────────────
         eventide_tabs = [
@@ -574,6 +631,13 @@ class UnifiedMainWindow(QMainWindow):
             self._refresh_eventide_constants)
         self.project_data.species_changed.connect(
             self._refresh_eventide_constants)
+        self.project_data.constants_changed.connect(
+            self._refresh_eventide_constants)
+
+        # ── Overworld → EVENTide GFX constant sync ────────────────────────
+        if hasattr(porysuite_main, "overworld_graphics_tab"):
+            porysuite_main.overworld_graphics_tab.gfx_constants_changed.connect(
+                self._refresh_eventide_constants)
 
         # ── Populate Event Editor display names ─────────────────────────────
         self._update_event_editor_display_names()
@@ -600,6 +664,21 @@ class UnifiedMainWindow(QMainWindow):
         # Maps tab → Event Editor (double-click a map to open it)
         eventide_main.maps_tab.map_selected.connect(
             self._on_map_selected)
+        # Event Editor map loaded → auto-sync to Porymap if running
+        eventide_main.event_editor_tab.map_loaded.connect(
+            self._on_map_loaded_sync_porymap)
+
+        # ── Sound Editor ↔ EVENTide integration ─────────────────────────────
+        # Wire preview / open-in-editor callbacks so playbgm/playse/playfanfare
+        # command widgets can talk to the Sound Editor.
+        try:
+            import eventide.ui.event_editor_tab as _eet_mod
+            if hasattr(self, '_sound_editor'):
+                _eet_mod._preview_song_cb = self._sound_preview_song
+                _eet_mod._open_in_sound_editor_cb = self._sound_open_song
+                _eet_mod._stop_preview_cb = self._sound_stop_preview
+        except Exception:
+            pass
 
         # ── Connect dirty tracking from both windows ─────────────────────────
         # _suppress_dirty blocks dirty propagation during flush/load operations
@@ -658,6 +737,13 @@ class UnifiedMainWindow(QMainWindow):
             except Exception:
                 pass
 
+        # Load Sound Editor data
+        if project_dir and hasattr(self, "_sound_editor"):
+            try:
+                self._sound_editor.load_project(project_dir)
+            except Exception:
+                pass
+
         # Refresh Event Editor display names (species, items, trainers, etc.)
         self._update_event_editor_display_names()
 
@@ -684,6 +770,17 @@ class UnifiedMainWindow(QMainWindow):
 
     def _on_save_all(self):
         """Save all dirty editors and emit change signals."""
+        ans = QMessageBox.question(
+            self, "Save All",
+            "Save all changes to disk?\n\n"
+            "This will write your edits to the project's C source files, "
+            "assembly files, JSON data, and any other modified files.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
         saved_porysuite = False
         saved_eventide = False
 
@@ -698,14 +795,16 @@ class UnifiedMainWindow(QMainWindow):
             except Exception as e:
                 self.log_message(f"Error saving PorySuite data: {e}")
 
-        # Save EVENTide data
+        # Save EVENTide data (skip if no map is loaded — nothing to save)
         if self._eventide_window and self._eventide_window.isWindowModified():
-            try:
-                self._eventide_window.event_editor_tab._on_save()
-                self._eventide_window.setWindowModified(False)
-                saved_eventide = True
-            except Exception as e:
-                self.log_message(f"Error saving EVENTide data: {e}")
+            eet = self._eventide_window.event_editor_tab
+            if getattr(eet, '_map_dir', None) and getattr(eet, '_map_data', None):
+                try:
+                    eet._on_save()
+                    self._eventide_window.setWindowModified(False)
+                    saved_eventide = True
+                except Exception as e:
+                    self.log_message(f"Error saving EVENTide data: {e}")
 
         # Emit change signals so the other side picks up changes
         if saved_porysuite and hasattr(self, 'project_data'):
@@ -736,12 +835,49 @@ class UnifiedMainWindow(QMainWindow):
             except Exception as e:
                 self.log_message(f"Error saving labels: {e}")
 
-        if saved_porysuite or saved_eventide or saved_credits or saved_labels:
+        # Save Sound Editor data (voicegroups + song table when modified)
+        saved_sound = False
+        if hasattr(self, '_sound_editor'):
+            se = self._sound_editor
+            # Voicegroups
+            vg_tab = getattr(se, '_voicegroups_tab', None)
+            if vg_tab and vg_tab.has_unsaved_changes():
+                try:
+                    vg_tab.save_to_disk()
+                    saved_sound = True
+                except Exception as e:
+                    self.log_message(f"Error saving voicegroups: {e}")
+            # Piano roll edits (song .s files)
+            pr = getattr(se, '_piano_roll_window', None)
+            if pr and getattr(pr, 'has_unsaved_changes', lambda: False)():
+                try:
+                    path = pr.save_to_disk()
+                    saved_sound = True
+                    self.log_message(f"Saved piano roll edits to {path}")
+                except Exception as e:
+                    self.log_message(f"Error saving piano roll: {e}")
+
+            # Song table (song_table.inc, songs.h, midi.cfg) — when modified
+            st = getattr(se, '_song_table', None)
+            if st and getattr(st, '_dirty', False):
+                try:
+                    from core.sound.song_table_manager import (
+                        write_song_table, write_songs_h, write_midi_cfg)
+                    write_song_table(se._project_root, st)
+                    write_songs_h(se._project_root, st)
+                    write_midi_cfg(se._project_root, st)
+                    st._dirty = False
+                    saved_sound = True
+                    self.log_message("Saved song table, songs.h, and midi.cfg")
+                except Exception as e:
+                    self.log_message(f"Error saving song table: {e}")
+
+        if (saved_porysuite or saved_eventide or saved_credits
+                or saved_labels or saved_sound):
             self.setWindowModified(False)
             self.statusBar().showMessage("All changes saved.", 4000)
         else:
             self.statusBar().showMessage("Nothing to save.", 2000)
-            self.log_message("[Save] Nothing to save.")
 
     def _on_make(self, extra_args: list):
         """Delegate make to PorySuite's existing _run_make method."""
@@ -749,6 +885,67 @@ class UnifiedMainWindow(QMainWindow):
             self._porysuite_window._run_make(extra_args)
         else:
             self.log_message("Cannot build — no project loaded.")
+
+    def _on_expand_rom(self):
+        """Patch the project's Makefile to allow 32 MB ROMs."""
+        if not self.project_info:
+            QMessageBox.information(self, 'Expand ROM', 'No project is open.')
+            return
+
+        project_dir = self.project_info.get('dir', '')
+        makefile_path = os.path.join(project_dir, 'Makefile')
+        if not os.path.isfile(makefile_path):
+            QMessageBox.warning(
+                self, 'Expand ROM',
+                f'Makefile not found at:\n{makefile_path}')
+            return
+
+        # Read the Makefile
+        with open(makefile_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Check current state
+        PAD_16MB = '--pad-to 0x9000000'
+        PAD_32MB = '--pad-to 0xA000000'
+
+        if PAD_32MB in content:
+            QMessageBox.information(
+                self, 'Expand ROM',
+                'This project is already set to 32 MB.\n\n'
+                'The Makefile already uses --pad-to 0xA000000.')
+            return
+
+        if PAD_16MB not in content:
+            QMessageBox.warning(
+                self, 'Expand ROM',
+                'Could not find the expected --pad-to line in the Makefile.\n\n'
+                f'Expected: {PAD_16MB}\n\n'
+                'The Makefile may have been modified manually.')
+            return
+
+        reply = QMessageBox.question(
+            self, 'Expand ROM to 32 MB?',
+            'This will change the Makefile so the compiled ROM is padded\n'
+            'to 32 MB instead of 16 MB.\n\n'
+            'This is needed when adding new voicegroups, samples, or\n'
+            'other data that pushes the ROM past 16 MB.\n\n'
+            'The change is a single line in the Makefile:\n'
+            f'  {PAD_16MB}  →  {PAD_32MB}\n\n'
+            'Continue?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Apply the patch
+        new_content = content.replace(PAD_16MB, PAD_32MB, 1)
+        with open(makefile_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(new_content)
+
+        self.log_message("[ROM] Makefile patched: ROM padded to 32 MB")
+        QMessageBox.information(
+            self, 'ROM Expanded',
+            'Done! The Makefile now pads the ROM to 32 MB.\n\n'
+            'Rebuild with Make Modern to create the larger ROM.')
 
     def _on_play(self):
         """Launch the compiled .gba file using the configured emulator or Windows default."""
@@ -812,6 +1009,21 @@ class UnifiedMainWindow(QMainWindow):
             self._suppress_dirty = False
 
         self._current_page_name = new_name
+
+        # When entering an EVENTide page from a PorySuite page, refresh the
+        # ConstantsManager cache so item/flag/var/trainer rename edits that
+        # hit disk are reflected in EVENTide dropdowns. Cheap: re-reads a
+        # handful of header files. No-op if already current.
+        _PS_PAGES = {"pokemon", "pokedex", "moves", "items", "starters",
+                     "trainers", "ui", "config", "credits", "sound"}
+        _EV_PAGES = {"events", "maps", "layouts", "regionmap"}
+        if new_name in _EV_PAGES and old_name in _PS_PAGES:
+            try:
+                from eventide.backend.constants_manager import ConstantsManager
+                ConstantsManager.refresh()
+            except Exception:
+                pass
+
         if new_name:
             self._suppress_dirty = True
             try:
@@ -931,6 +1143,34 @@ class UnifiedMainWindow(QMainWindow):
             ev.event_editor_tab.open_map_and_select(map_folder)
         self.log_message(f'Opened map in Event Editor: {map_folder}')
 
+    # ── Sound Editor integration handlers ──────────────────────────────────
+
+    def _sound_preview_song(self, constant: str) -> bool:
+        """Called from EVENTide playbgm/playse/playfanfare ▶ button.
+
+        Plays the song in the background — does NOT switch tabs.
+        The user stays on whatever page they were on.
+        """
+        if not constant or not hasattr(self, '_sound_editor'):
+            return False
+        return self._sound_editor.preview_song_by_constant(constant)
+
+    def _sound_open_song(self, constant: str):
+        """Called from EVENTide 'Open in Sound Editor' button.
+
+        Switches to the Sound Editor page and selects (but doesn't play)
+        the song.
+        """
+        if not constant or not hasattr(self, '_sound_editor'):
+            return
+        self._switch_page("sound")
+        self._sound_editor.select_song_by_constant(constant)
+
+    def _sound_stop_preview(self):
+        """Called from EVENTide Stop button — stops audio without switching pages."""
+        if hasattr(self, '_sound_editor'):
+            self._sound_editor.stop_preview()
+
     def _toggle_log_panel(self):
         """Show or hide the log panel."""
         self.log_panel.setVisible(not self.log_panel.isVisible())
@@ -995,6 +1235,11 @@ class UnifiedMainWindow(QMainWindow):
         if self._porysuite_window:
             self._porysuite_window.rename_entity()
 
+    def _open_name_decapitalizer(self):
+        """Open the bulk Name Decapitalizer dialog (Edit menu)."""
+        from ui.name_decapitalizer import open_decapitalizer
+        open_decapitalizer(self, self._porysuite_window)
+
     def _open_terminal(self):
         """Open a terminal in the project directory."""
         if self._porysuite_window:
@@ -1003,12 +1248,53 @@ class UnifiedMainWindow(QMainWindow):
     def _open_settings(self):
         """Open the settings dialog."""
         from settingsdialog import SettingsDialog
-        dlg = SettingsDialog(self)
+        dlg = SettingsDialog(self, project_info=self.project_info)
         if dlg.exec():
+            # If project name changed, update window title + projects.json
+            if dlg.project_name_changed and self.project_info:
+                new_name = dlg.new_project_name
+                self.project_info["name"] = new_name
+                self.setWindowTitle(f"PorySuite-Z — {new_name}[*]")
+                self._save_project_name(new_name)
+
             # Reload all event editor settings (colors, tooltips, etc.)
             if (self._eventide_window
                     and hasattr(self._eventide_window, 'event_editor_tab')):
                 self._eventide_window.event_editor_tab.reload_settings()
+
+    def _save_project_name(self, new_name: str):
+        """Persist project display name to projects.json and config.json."""
+        import json
+        from app_info import get_data_dir
+
+        # Update projects.json
+        data_dir = get_data_dir()
+        pj_path = os.path.join(data_dir, "projects.json")
+        try:
+            with open(pj_path, encoding="utf-8") as f:
+                pj = json.load(f)
+            proj_dir = self.project_info.get("dir", "")
+            for entry in pj.get("projects", []):
+                if entry.get("dir", "") == proj_dir:
+                    entry["name"] = new_name
+                    break
+            with open(pj_path, "w", encoding="utf-8") as f:
+                json.dump(pj, f, indent=2)
+        except Exception:
+            pass
+
+        # Update project config.json
+        proj_dir = self.project_info.get("dir", "")
+        cfg_path = os.path.join(proj_dir, "config.json")
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                cfg["name"] = new_name
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=4)
+            except Exception:
+                pass
 
     def _show_about(self):
         QMessageBox.about(
@@ -1025,9 +1311,16 @@ class UnifiedMainWindow(QMainWindow):
         try:
             from eventide.backend.constants_manager import ConstantsManager
             ConstantsManager.load(self.project_info.get("dir", ""))
-            self.log_message("EVENTide constants refreshed (trainers/items/species updated).")
+            self.log_message("EVENTide constants refreshed.")
         except Exception as e:
             self.log_message(f"Warning: could not refresh EVENTide constants: {e}")
+        # Refresh the event editor's GFX dropdown
+        try:
+            eet = self._eventide_window.event_editor_tab
+            if hasattr(eet, 'refresh_gfx_constants'):
+                eet.refresh_gfx_constants()
+        except Exception:
+            pass
         # Also refresh display names since constants may have changed
         self._update_event_editor_display_names()
 
@@ -1343,6 +1636,7 @@ class UnifiedMainWindow(QMainWindow):
         # Event lifecycle
         bw.event_created.connect(self._on_bridge_event_created)
         bw.event_deleted.connect(self._on_bridge_event_deleted)
+        bw.event_moved.connect(self._on_bridge_event_moved)
 
     def _on_bridge_map_opened(self, map_name: str, *_args):
         """Porymap opened a map — navigate Event Editor there."""
@@ -1350,13 +1644,17 @@ class UnifiedMainWindow(QMainWindow):
             return
         # Switch to Event Editor page
         self._switch_to_page("events")
-        # Navigate the Event Editor to this map
+        # Navigate the Event Editor to this map (suppress sync-back to Porymap)
         ew = self._eventide_window
         if ew and hasattr(ew, "event_editor_tab"):
             try:
+                self._porymap_initiated_load = True
+                self._last_porymap_sync_map = map_name
                 ew.event_editor_tab.navigate_to_map(map_name)
             except Exception:
                 pass
+            finally:
+                self._porymap_initiated_load = False
         self.log_message(f"Porymap: opened {map_name}")
 
     def _on_bridge_event_selected(self, map_name: str, event_type: str,
@@ -1365,34 +1663,76 @@ class UnifiedMainWindow(QMainWindow):
         """Porymap user clicked an event — select it in our Event Editor."""
         # Make sure we're on the right map first
         self._switch_to_page("events")
+        self._bring_to_front()
         ew = self._eventide_window
         if not ew or not hasattr(ew, "event_editor_tab"):
             return
         tab = ew.event_editor_tab
+        found = False
         try:
+            self._porymap_initiated_load = True
             # Navigate to map if needed
             tab.navigate_to_map(map_name)
             # Select the event by type and index
-            tab.select_event_by_bridge(event_type, event_index, script_label)
+            found = bool(tab.select_event_by_bridge(
+                event_type, event_index, script_label))
         except Exception:
             pass
-        self.log_message(
-            f"Porymap: selected {event_type} #{event_index} "
-            f"({script_label or 'no script'}) at ({x},{y})")
+        finally:
+            self._porymap_initiated_load = False
+        if found:
+            self.log_message(
+                f"Porymap: selected {event_type} #{event_index} "
+                f"({script_label or 'no script'}) at ({x},{y})")
+        else:
+            self.log_message(
+                f"Porymap: could not match {event_type} #{event_index} "
+                f"on {map_name} — data may be out of sync")
 
     def _on_bridge_edit_requested(self, map_name: str, x: int, y: int):
-        """Porymap user pressed Ctrl+E — find event at position and select it."""
+        """Porymap user pressed Ctrl+E — find event at position and select it.
+
+        Brings the unified window forward so the user can see the result, and
+        emits clear feedback: which event was picked, or that no event was
+        near the hovered tile.
+        """
         self._switch_to_page("events")
+        self._bring_to_front()
         ew = self._eventide_window
         if not ew or not hasattr(ew, "event_editor_tab"):
             return
         tab = ew.event_editor_tab
+        found = False
         try:
+            self._porymap_initiated_load = True
             tab.navigate_to_map(map_name)
-            tab.select_event_at_position(x, y)
+            found = bool(tab.select_event_at_position(x, y))
         except Exception:
             pass
-        self.log_message(f"Porymap: edit request at {map_name} ({x},{y})")
+        finally:
+            self._porymap_initiated_load = False
+        if found:
+            self.log_message(
+                f"Porymap Ctrl+E: selected event near {map_name} ({x},{y})")
+        else:
+            self.log_message(
+                f"Porymap Ctrl+E: no event within 2 tiles of "
+                f"{map_name} ({x},{y})")
+
+    def _bring_to_front(self) -> None:
+        """Raise the unified window above other apps (used by bridge callbacks).
+        Cheap and safe to call repeatedly — no-op if already focused.
+        """
+        try:
+            # Restore if minimized, raise, and activate
+            from PyQt6.QtCore import Qt
+            st = self.windowState()
+            if st & Qt.WindowState.WindowMinimized:
+                self.setWindowState(st & ~Qt.WindowState.WindowMinimized)
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
 
     def _on_bridge_map_saved(self, map_name: str):
         """Porymap saved a map — reload our data for it."""
@@ -1400,6 +1740,7 @@ class UnifiedMainWindow(QMainWindow):
         if not ew or not hasattr(ew, "event_editor_tab"):
             return
         try:
+            self._porymap_initiated_load = True
             tab = ew.event_editor_tab
             # Only reload if we're looking at the same map
             if hasattr(tab, "_current_map") and tab._current_map == map_name:
@@ -1407,11 +1748,26 @@ class UnifiedMainWindow(QMainWindow):
                 self.log_message(f"Porymap saved {map_name} — reloaded")
         except Exception:
             pass
+        finally:
+            self._porymap_initiated_load = False
 
     def _on_bridge_event_created(self, map_name: str, event_type: str,
                                   event_index: int):
         """Porymap created a new event — reload and select it."""
         self._on_bridge_map_saved(map_name)
+        # Attempt to select the newly created event after reload
+        ew = self._eventide_window
+        if ew and hasattr(ew, "event_editor_tab"):
+            tab = ew.event_editor_tab
+            if (hasattr(tab, "_current_map")
+                    and tab._current_map == map_name):
+                try:
+                    self._porymap_initiated_load = True
+                    tab.select_event_by_bridge(event_type, event_index, '')
+                except Exception:
+                    pass
+                finally:
+                    self._porymap_initiated_load = False
         self.log_message(
             f"Porymap: new {event_type} #{event_index} on {map_name}")
 
@@ -1421,6 +1777,51 @@ class UnifiedMainWindow(QMainWindow):
         self._on_bridge_map_saved(map_name)
         self.log_message(
             f"Porymap: deleted {event_type} #{event_index} from {map_name}")
+
+    def _on_bridge_event_moved(self, map_name: str, event_type: str,
+                                event_index: int,
+                                old_x: int, old_y: int,
+                                new_x: int, new_y: int):
+        """Porymap moved an event — reflect the new position in the Event
+        Editor's X/Y spinboxes without marking dirty. If the user has other
+        unsaved edits, we skip the reflect and just log — the user's work is
+        preserved and the next Porymap save will trigger the normal watcher
+        prompt."""
+        ew = self._eventide_window
+        if not ew or not hasattr(ew, "event_editor_tab"):
+            return
+        tab = ew.event_editor_tab
+        # Only react if we're looking at the same map
+        if not (hasattr(tab, "_current_map")
+                and tab._current_map == map_name):
+            return
+        # If user has unsaved edits, don't touch the spinboxes — the move
+        # will surface via the next watcher event anyway.
+        if self.isWindowModified():
+            self.log_message(
+                f"Porymap: moved {event_type} #{event_index} on {map_name} "
+                f"({old_x},{old_y}) → ({new_x},{new_y}) "
+                f"— skipped (unsaved edits present)")
+            return
+        try:
+            self._porymap_initiated_load = True
+            if tab.select_event_by_bridge(event_type, event_index, ''):
+                if hasattr(tab, "x_spin") and hasattr(tab, "y_spin"):
+                    # Suppress dirty marking while reflecting the move.
+                    prev = getattr(tab, "_loading", False)
+                    tab._loading = True
+                    try:
+                        tab.x_spin.setValue(new_x)
+                        tab.y_spin.setValue(new_y)
+                    finally:
+                        tab._loading = prev
+        except Exception:
+            pass
+        finally:
+            self._porymap_initiated_load = False
+        self.log_message(
+            f"Porymap: moved {event_type} #{event_index} on {map_name} "
+            f"({old_x},{old_y}) → ({new_x},{new_y})")
 
     # ═════════════════════════════════════════════════════════════════════════
     # Shared file watcher — detects external edits to project files
@@ -1458,11 +1859,14 @@ class UnifiedMainWindow(QMainWindow):
         # Only auto-reload if we're looking at the changed map
         if hasattr(tab, "_current_map") and tab._current_map == map_folder:
             try:
+                self._porymap_initiated_load = True
                 tab.reload_current_map()
                 self.log_message(
                     f"Reloaded {map_folder} (map.json changed externally)")
             except Exception:
                 pass
+            finally:
+                self._porymap_initiated_load = False
 
     def _on_shared_scripts_changed(self, map_folder: str):
         """A map's scripts.inc was modified externally."""
@@ -1472,11 +1876,14 @@ class UnifiedMainWindow(QMainWindow):
         tab = ew.event_editor_tab
         if hasattr(tab, "_current_map") and tab._current_map == map_folder:
             try:
+                self._porymap_initiated_load = True
                 tab.reload_current_map()
                 self.log_message(
                     f"Reloaded {map_folder} (scripts.inc changed externally)")
             except Exception:
                 pass
+            finally:
+                self._porymap_initiated_load = False
 
     def _on_shared_layouts_changed(self):
         """layouts.json was modified externally — refresh the Layouts tab."""
@@ -1555,24 +1962,18 @@ class UnifiedMainWindow(QMainWindow):
                 tab = ew.event_editor_tab
                 if hasattr(tab, "_current_map"):
                     map_name = tab._current_map or ""
-                    self.log_message(f"[Porymap] Event editor map: '{map_name}'")
             # 2. Maps tab's currently selected map (if event editor has nothing)
             if not map_name and hasattr(ew, "maps_tab"):
                 try:
                     data = ew.maps_tab._selected_item_data()
-                    self.log_message(f"[Porymap] Maps tab selection: {data}")
                     if data and data.get("type") == "map":
                         map_name = data.get("folder", "")
                 except Exception:
                     pass
-        else:
-            self.log_message("[Porymap] WARNING: _eventide_window is None")
         # 3. Fallback: read map_groups.json and pick the first real town/route
         if not map_name:
             map_name = self._first_map_from_project(project_dir)
-            self.log_message(f"[Porymap] Fallback map: '{map_name}'")
 
-        self.log_message(f"[Porymap] Calling launch_porymap('{project_dir}', '{map_name}')")
         ok = launch_porymap(project_dir, map_name)
         if ok:
             self.log_message(
@@ -1606,3 +2007,27 @@ class UnifiedMainWindow(QMainWindow):
             if maps:
                 return maps[0]
         return ""
+
+    def _on_map_loaded_sync_porymap(self, map_name: str):
+        """Auto-sync: when Event Editor loads a map, tell Porymap to follow.
+
+        Suppressed when:
+        - The load was triggered BY Porymap (flag set by bridge handlers)
+        - The map is the same one we last sent (prevents echo loops)
+        """
+        if self._porymap_initiated_load:
+            return
+        if not map_name or not is_porymap_installed():
+            return
+        # Command-file sync only works against our patched Porymap.
+        if not is_porymap_patched():
+            return
+        # Don't re-send if Porymap already has this map (prevents echo loop
+        # from bridge response arriving after the flag was cleared)
+        if map_name == self._last_porymap_sync_map:
+            return
+        project_dir = (self.project_info or {}).get("dir", "")
+        if not project_dir:
+            return
+        self._last_porymap_sync_map = map_name
+        _send_command(project_dir, {"action": "openMap", "map": map_name})

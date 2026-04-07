@@ -620,6 +620,37 @@ class RefactorService:
         base = trainer_const[len("TRAINER_"):] if trainer_const.startswith("TRAINER_") else trainer_const
         return "sParty_" + self._camel(base)
 
+    def rename_ability(self, old_const: str, new_const: str, display_name: str, preview: bool = False) -> List[PreviewEntry]:
+        """Rename an ability constant across the whole repo.
+
+        Updates:
+        - The ABILITY_* constant in abilities.h, battle_util.c, species_info.h, etc.
+        - The display name in src/data/text/abilities.h (gAbilityNames entry)
+        - The description variable name (sXxxDescription → sNewDescription)
+        - The src/data/abilities.json key
+        """
+        old_base = old_const[len("ABILITY_"):] if old_const.startswith("ABILITY_") else old_const
+        new_base = new_const[len("ABILITY_"):] if new_const.startswith("ABILITY_") else new_const
+        old_desc_var = "s" + self._camel(old_base) + "Description"
+        new_desc_var = "s" + self._camel(new_base) + "Description"
+
+        previews: List[PreviewEntry] = []
+        previews.extend(self._search_and_replace(old_const, new_const, preview_only=True))
+        if old_desc_var != new_desc_var:
+            previews.extend(self._search_and_replace(old_desc_var, new_desc_var, preview_only=True))
+
+        if not preview:
+            self.pending.append({
+                "op": "rename_ability",
+                "old": old_const,
+                "new": new_const,
+                "display": display_name,
+                "old_desc_var": old_desc_var,
+                "new_desc_var": new_desc_var,
+            })
+
+        return previews
+
     def rename_trainer(self, old_const: str, new_const: str, preview: bool = False) -> List[PreviewEntry]:
         """Rename a trainer constant across the whole repo.
 
@@ -926,6 +957,40 @@ class RefactorService:
                 if self._logger:
                     self._logger("Updated src/data/moves.json")
                 self._record("moves", old, new)
+            elif kind == "rename_ability":
+                # Replace the ABILITY_* constant everywhere
+                self._search_and_replace(old, new, preview_only=False)
+                # Replace the description variable name
+                old_dv = op.get("old_desc_var", "")
+                new_dv = op.get("new_desc_var", "")
+                if old_dv and new_dv and old_dv != new_dv:
+                    self._search_and_replace(old_dv, new_dv, preview_only=False)
+                # Update display name in gAbilityNames in src/data/text/abilities.h
+                ab_display = op.get("display")
+                if ab_display:
+                    text_h = os.path.join(root, "src", "data", "text", "abilities.h")
+                    if os.path.isfile(text_h):
+                        try:
+                            with open(text_h, "r", encoding="utf-8") as fh:
+                                text = fh.read()
+                            text = re.sub(
+                                r'(\[' + re.escape(new) + r'\]\s*=\s*_\(")[^"]*(")',
+                                lambda m: m.group(1) + ab_display + m.group(2),
+                                text,
+                            )
+                            with open(text_h, "w", encoding="utf-8", newline="\n") as fh:
+                                fh.write(text)
+                            if self._logger:
+                                self._logger(f"Updated ability name in abilities.h: {ab_display}")
+                        except Exception:
+                            logging.exception("Failed updating abilities.h display name")
+                # Update abilities.json key
+                ab_json = os.path.join(root, "src", "data", "abilities.json")
+                self._rename_in_json(ab_json, old, new, ab_display)
+                if self._logger:
+                    self._logger(f"Renamed ability {old} -> {new}")
+                self._record("abilities", old, new)
+                applied.append(op)
             elif kind == "rename_trainer":
                 old_party = op.get("old_party") or self._trainer_to_party_symbol(old)
                 new_party = op.get("new_party") or self._trainer_to_party_symbol(new)

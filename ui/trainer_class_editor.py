@@ -485,6 +485,10 @@ class TrainerClassEditor(QWidget):
     battle music, terrain, facility classes, and sprite preview."""
 
     changed = pyqtSignal()
+    # Emitted on every keystroke in the name field: (const, new_display_name).
+    # Used to push pending name renames to the sibling Trainers editor live,
+    # so the trainer list/detail reflect pending class name edits without save.
+    class_name_edited = pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1037,6 +1041,11 @@ class TrainerClassEditor(QWidget):
             if item.data(Qt.ItemDataRole.UserRole) == self._current_class:
                 item.setText(text or self._current_class)
                 break
+
+        # Push to sibling Trainers editor live — pending rename is visible
+        # without save.
+        effective = text or self._names.get(self._current_class, "")
+        self.class_name_edited.emit(self._current_class, effective)
 
         self.changed.emit()
 

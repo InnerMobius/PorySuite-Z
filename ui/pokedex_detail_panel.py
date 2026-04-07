@@ -12,7 +12,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit,
+    QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -231,6 +231,7 @@ class PokedexDetailPanel(QWidget):
     """
 
     changed = pyqtSignal()
+    play_cry_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -281,6 +282,16 @@ class PokedexDetailPanel(QWidget):
 
         hdr.addLayout(name_block)
         hdr.addStretch(1)
+
+        self._play_cry_btn = QPushButton("\u25B6 Play Cry")
+        self._play_cry_btn.setToolTip(
+            "Play this species' cry sample\n"
+            "(sound/direct_sound_samples/cries/*.wav)"
+        )
+        self._play_cry_btn.setFixedWidth(90)
+        self._play_cry_btn.clicked.connect(self.play_cry_requested.emit)
+        hdr.addWidget(self._play_cry_btn, 0, Qt.AlignmentFlag.AlignTop)
+
         root.addLayout(hdr)
 
         sep = QFrame()

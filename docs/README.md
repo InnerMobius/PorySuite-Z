@@ -95,6 +95,8 @@ RMXP-style visual script editor. See `eventide/docs/README.md` for full details.
 - Position overrides from OnTransition scripts, cross-reference links
 - Script Lookup (Ctrl+Shift+F) — project-wide search across 5,300+ labels
 - 84+ command widgets, drag-to-reorder, right-click context menu, Go To navigation
+- Go To button in command edit dialogs — double-click a call/goto/conditional and navigate directly to the target script
+- Plain English display names for all constants (flags, vars, weather, sounds, fade types)
 - Move Camera cutscene tool — pan, fade, shake, weather, sound, timing in one dialog
 
 ### Maps

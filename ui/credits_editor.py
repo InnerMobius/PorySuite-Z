@@ -110,6 +110,9 @@ class CreditsEditorWidget(QWidget):
         self._entries: list[CreditsEntry] = []   # parsed text pairs
         self._script: list[ScriptCommand] = []   # parsed script sequence
         self._dirty = False
+        # mtime snapshot taken on load; checked at save to detect external
+        # edits (external-tool modifications to strings.c / credits.c).
+        self._loaded_mtimes: dict[str, float] = {}
         self._build_ui()
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -304,6 +307,15 @@ class CreditsEditorWidget(QWidget):
         if not os.path.isfile(credits_path):
             self._status_label.setText("credits.c not found")
             return
+
+        # Record the mtimes we loaded so save-time can detect external edits
+        try:
+            self._loaded_mtimes = {
+                strings_path: os.path.getmtime(strings_path),
+                credits_path: os.path.getmtime(credits_path),
+            }
+        except OSError:
+            self._loaded_mtimes = {}
 
         # ── Parse strings.c for gCreditsString_* definitions ─────────────────
         with open(strings_path, "r", encoding="utf-8") as f:
@@ -626,6 +638,39 @@ class CreditsEditorWidget(QWidget):
     def _on_save(self):
         if not self._project_dir:
             return
+        # Guard: has strings.c or credits.c been modified externally since
+        # we loaded it? Warn before overwriting — an external editor's
+        # changes would be silently clobbered otherwise.
+        stale = []
+        for path, prev_mtime in self._loaded_mtimes.items():
+            try:
+                now_mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if now_mtime - prev_mtime > 1.0:  # 1s tolerance for FS clock drift
+                stale.append(os.path.basename(path))
+        if stale:
+            ret = QMessageBox.question(
+                self, "External Changes Detected",
+                f"The following file(s) were modified outside PorySuite-Z "
+                f"since you loaded them:\n\n  " + "\n  ".join(stale) +
+                "\n\nSaving will overwrite those external edits. "
+                "Continue anyway, or reload from disk first?",
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if ret == QMessageBox.StandardButton.Discard:
+                # Reload from disk, throwing away unsaved UI edits.
+                self.load_project(self._project_dir)
+                self._dirty = False
+                self._save_btn.setEnabled(False)
+                self._status_label.setText("Reloaded from disk")
+                self._status_label.setStyleSheet("color: #d3a73a; font-size: 11px;")
+                return
+            if ret != QMessageBox.StandardButton.Save:
+                return  # Cancel
         try:
             self._write_strings()
             self._write_credits_c()
@@ -633,6 +678,12 @@ class CreditsEditorWidget(QWidget):
             self._save_btn.setEnabled(False)
             self._status_label.setText("Saved successfully")
             self._status_label.setStyleSheet("color: #7cbb5e; font-size: 11px;")
+            # Refresh mtime snapshot after successful save
+            for path in list(self._loaded_mtimes.keys()):
+                try:
+                    self._loaded_mtimes[path] = os.path.getmtime(path)
+                except OSError:
+                    pass
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save credits:\n{e}")
 

@@ -6,11 +6,11 @@ Merge PorySuite (data editor) and EVENTide (script editor) into a single window 
 
 ---
 
-## Current State (2026-04-03)
+## Current State (2026-04-07)
 
-Phases 1 through 6 are **complete**. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync all working. Polish remaining.
+Phases 1 through 6 are **complete**. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE**. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding.
 
-**13 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Event Editor, Maps, Layouts & Tilesets, Region Map, UI Settings, Config.
+**15 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Event Editor, Maps, Layouts & Tilesets, Region Map, UI Settings, Config.
 
 ---
 
@@ -51,6 +51,9 @@ All planned cross-editor bridges are working.
 - Double-click map in Maps tab → opens in Event Editor
 - Unified save/dirty tracking with title bar indicator
 - Ctrl+S saves both editors, close prompt catches both sides
+- **Live cross-editor state bridge (2026-04-05)**: Event Editor continuously syncs its in-memory script state (`_cmd_tuples` → active page dict → `_all_scripts[label]`) on every `_mark_dirty()` call. The Trainers → Dialogue tab reads the Event Editor's live state alongside disk `.inc` files, tags live entries `(live — unsaved edits)`, and shows Settings-driven default dialogue for newly-added trainers in a self-clearing `(Pending)` group box. Trainer battle dialog text edits flow through a shared `_ALL_SCRIPTS['__texts__']` reference (previously a copy that silently dropped edits at save time).
+- **Trainer class name live push (2026-04-05)**: `TrainerClassEditor.class_name_edited(const, name)` signal pushes pending class-name renames into the sibling Trainers editor on every keystroke. `TrainersTabWidget.apply_class_name()` updates the in-memory class-names dict and refreshes the list, class dropdown, and detail header.
+- **Stale-state guards (2026-04-05)**: (1) `_load_trainers_editor` skips `trainer_class_editor.load()` when it has pending dirty edits, preserving user work across tab switches. (2) `EventEditorTab.reload_current_map(force=False)` prompts Save/Discard/Cancel before clobbering unsaved edits on watcher-driven reloads. (3) `ConstantsManager.refresh()` re-reads all header files when switching from a PorySuite page into an EVENTide page, so item/flag/var/trainer renames reach EVENTide dropdowns without a project reload.
 
 ### Phase 3.5: VS Seeker Rematch System — COMPLETE
 
@@ -336,13 +339,13 @@ When an OnTransition script sets different X/Y positions for an NPC based on fla
 - Editing X/Y on an overridden page saves back to the `setobjectxyperm` command in the script, not to map.json
 - Works globally for any map — scans all loaded scripts, not just specific patterns
 
-### Phase 7: Porymap Integration — IN PROGRESS
+### Phase 7: Porymap Integration — COMPLETE
 
 PorySuite-Z fully integrates Porymap (the visual map/tile editor) as a companion tool. Users get one seamless workflow: paint tiles and place events in Porymap, edit scripts and data in PorySuite-Z. Map sync and event selection bridge the two apps so they behave like one tool.
 
 **Approach:** PorySuite-Z downloads the Porymap source repo, runs a patch script that adds event-aware callbacks and a bridge API to the existing JS scripting engine, then builds the patched binary. The install script handles downloading Qt build tools and compiling — the user just clicks "Install Porymap" and waits. No fork, no manual steps.
 
-**Status (2026-04-03):** Core integration working end-to-end. Install pipeline builds patched Porymap with compile progress streaming. "Open in Porymap" opens the correct map via CLI args (with QDir::cleanPath fix for Windows backslash normalization). Bidirectional sync works — if Porymap is already running, PorySuite writes a command file and the bridge script polls + calls `map.openMap()`. Duplicate window prevention via Win32 API. Remaining: auto-sync on map selection, Ctrl+E handler, additional callback hooks (event create/delete/move), stock Porymap fallback testing.
+**Status (2026-04-05):** All integration complete. Install pipeline builds patched Porymap with compile progress streaming. Install drops a `.psinstalled` marker so the launcher can degrade gracefully for stock Porymap. "Open in Porymap" opens the correct map via CLI args. Bidirectional map sync, event click→select, Ctrl+E edit-at-cursor with window raise + feedback logging, event create/delete/move lifecycle callbacks, Go To button in command edit dialogs all working. Anti-echo dedup, duplicate-window prevention, JS bridge command-polling backoff all in place.
 
 ---
 
@@ -895,19 +898,187 @@ All of these:
 
 Development can be staged: test 7A/7C/7D with stock Porymap first (existing callbacks like `onMapOpened` and `onMainTabChanged` work without patches). Then apply patches for the event/map callbacks that don't exist yet.
 
-### Backlog (do when ready)
+### Phase 8A: Abilities Editor — COMPLETE
 
-**Abilities Editor (LOWEST priority):**
-- New toolbar page (icon already exists)
-- Edit ability data table: name, description, slot assignment
-- Rename abilities with the same refactor system used for species/trainers
-- For new abilities: editor makes it clear the user must write the C behavior code manually, shows where the code lives (`src/battle_util.c`, ability handlers), or have an AI agent generate it
-- Does NOT attempt to visually edit C battle logic
+Full editor for ability data — names, descriptions, constants, species cross-references, with visual battle and field effect editing. Built and completed 2026-04-07. Significantly exceeds original plan: the "read-only" battle/field info section was replaced with a full visual editor backed by 13 battle effect templates and 8 field effect templates (`core/ability_effect_templates.py`). Users pick an effect category from a dropdown and configure parameters (type, status, stat, weather, chance, HP fraction); the editor detects existing effects by parsing C source, shows live code preview, and writes correct C code to the right files on save. Field templates include features not natively in pokefirered (egg hatching speed, nature sync, gender attract, type encounter boost) — the editor generates and inserts the necessary C code when assigned. Also includes: battle/field effect copying in the Add dialog, auto-derived constant names, full RefactorService rename, DexDescriptionEdit on all text fields. Species usage table shows real project data (no name fabrication). Everything lives in PorySuite's own codebase — no changes are made to the loaded project until the user saves.
+
+**Source files touched by abilities in pokefirered:**
+
+| File | What It Stores |
+|------|---------------|
+| `include/constants/abilities.h` | `#define ABILITY_*` constants (78 abilities, IDs 0–77), `ABILITIES_COUNT` |
+| `src/data/text/abilities.h` | `gAbilityNames[78][13]` (display names, 12-char max) + `gAbilityDescriptionPointers[78]` (description strings, ~50 chars practical max — 52-byte buffer on GBA summary screen) |
+| `src/data/pokemon/species_info.h` | `.abilities = {ABILITY_X, ABILITY_Y}` per species (2 slots, no hidden ability in Gen 3 struct) |
+| `src/battle_util.c` | `AbilityBattleEffects()` — switch/case battle behavior (editor writes/replaces case blocks) |
+| `src/wild_encounter.c` | Field effects — encounter rate, type encounter, nature sync, gender attract (editor inserts code) |
+| `src/battle_script_commands.c` | Pickup item table, type immunity checks, status prevention (editor writes inline code) |
+| `src/pokemon.c` | `CalculateBaseDamage()` — pinch type boosts (editor inserts if-statements) |
+| `src/battle_main.c` | Flee prevention (traps), guaranteed escape, speed modifiers (editor inserts code) |
+| `src/daycare.c` | Egg hatch speed (editor inserts ability check if assigned) |
+| `src/battle_ai_switch_items.c` | AI checks for absorbing/blocking abilities (not edited by templates) |
+| `src/pokemon_summary_screen.c` | Displays ability name (12 chars) + description (52-byte buffer, 29-tile-wide window) |
+| `include/battle_main.h` | `ABILITY_NAME_LENGTH = 12` |
+
+**UI Layout:**
+
+Left panel — Ability browser:
+- Searchable list of all abilities sorted by ID
+- Each row: ID number + display name
+- Filter bar at top
+- "+ Add New Ability" button at bottom
+
+Right panel — Detail view (4 sections):
+
+1. **Identity** (top)
+   - Constant name (read-only — renamed via Rename button which triggers RefactorService across all files)
+   - Display name (editable, 12-char limit with counter + color feedback per project rules)
+   - ID number (read-only)
+
+2. **Description** (middle)
+   - Text edit with character limit feedback (52 chars max, counter label, overflow highlighting per project rules)
+   - This is what shows on the in-game Pokemon Summary screen
+
+3. **Battle Effect Editor**
+   - Category dropdown with 13 templates: Status Immunity, Contact Status Infliction, Type Absorb (HP), Type Absorb (Power Boost), Weather on Switch-In, End-of-Turn Stat Boost, Intimidate, Contact Recoil, Low-HP Type Power Boost, Type Immunity, Weather HP Recovery, Type Trap, Critical Hit Prevention
+   - Dynamic parameter widgets per category (which status/type/stat/weather, chance %, HP fraction)
+   - Live C code preview showing what will be written to source files
+   - Auto-detects existing effect by parsing C source when loading an ability
+
+4. **Field Effect Editor**
+   - Category dropdown with 8 templates: Reduce Encounter Rate, Increase Encounter Rate, Type Encounter Rate Boost (pick type), Post-Battle Item Pickup (pick chance), Guaranteed Wild Escape, Faster Egg Hatching, Nature Sync, Gender Attract
+   - Dynamic parameter widgets where applicable
+   - Templates for features not natively in pokefirered (egg hatch, nature sync, gender attract, type encounters) generate and insert the C code when assigned
+
+5. **Species Usage** (bottom)
+
+   - Table: Species Name | Slot (Primary / Secondary)
+   - Double-click → jumps to that species in the Pokemon tab (cross-editor link)
+   - Count header: "Used by X species (Y as primary, Z as secondary)"
+   - Yellow warning if ability is assigned to zero species
+
+**Add New Ability:**
+- Dialog: constant name (auto-prefixed `ABILITY_`), display name (12-char limit), description (52-char limit)
+- Writes: new `#define` in `abilities.h`, new name + description entries in `data/text/abilities.h`, bumps `ABILITIES_COUNT`
+- Shows reminder: "New ability has no battle effect. Add behavior in `src/battle_util.c` → `AbilityBattleEffects()`"
+
+**Delete Ability:**
+- Safety scan before deletion:
+  - Check `species_info.h` for any species using it → block + show which species
+  - Grep battle code for hardcoded `ABILITY_*` references → warn that C code references exist
+- If safe: remove constant, name, description entries; update `ABILITIES_COUNT`
+
+**Rename Constant:**
+- Uses existing RefactorService pattern (same as species/trainers)
+- Generates search/replace tokens for `ABILITY_OLD` → `ABILITY_NEW`
+- Applies across all files that reference the constant
+
+**Cross-Editor Sync:**
+- When ability is renamed/added/deleted, Pokemon tab's ability dropdowns refresh immediately
+- Same signal pattern as trainer class name push (`ability_names_changed` signal)
+- Name Decapitalizer's existing `_flush_abilities()` path migrates into the Abilities Editor save pipeline (single owner of `abilities.h` writes)
+
+**Save Pipeline (follows Moves editor pattern):**
+1. `AbilitiesTabWidget.save_current()` — flush detail panel to internal dict
+2. `get_abilities_data()` / `get_descriptions()` — return modified dicts
+3. `mainwindow.save_abilities_table()` — write names to `gAbilityNames`, descriptions to description strings + pointer array in `data/text/abilities.h`
+4. New constants write to `include/constants/abilities.h`
+5. Refactor renames go through `RefactorService`
+
+**What this editor does NOT do:**
+- Does not add a third ability slot (Gen 3 struct has `abilities[2]` only — expanding requires struct + save format changes, out of scope)
+- Some niche effects (Trace, Forecast, Wonder Guard, Synchronize status-pass) don't have configurable templates yet — the editor shows "(none)" for these and they must be edited in C manually
+- Complex multi-file effects (e.g. Hustle modifies both attack and accuracy in different files) are handled for the primary file but may need manual review for secondary locations
+
+**Files created/modified:**
+
+| File | Action |
+|------|--------|
+| `ui/abilities_tab_widget.py` | **Created** — main editor widget (browser, detail panel, effect editors, add/delete/rename) |
+| `core/ability_effect_templates.py` | **Created** — 13 battle + 8 field effect templates, detection, code generation, file manipulation |
+| `core/refactor_service.py` | **Modified** — added `rename_ability()` + apply_pending handler |
+| `ui/custom_widgets/rename_dialog.py` | **Modified** — added Ability to name limits |
+| `ui/mainwindow.py` | **Modified** — ability rename handler, save pipeline with effect code writing |
+| `ui/unified_mainwindow.py` | **Modified** — added Abilities page to toolbar + stacked widget |
+| `core/pokemon_data_base.py` | **Modified** — added setters for ability name/description |
+| `core/pokemon_data_extractor.py` | **Modified** — extract descriptions |
 
 **Sound Test / Cry Preview:**
-- Pokemon and Pokedex tabs: button to preview the cry audio
-- Event Editor: preview any SFX when setting up event nodes
-- Uses Qt's QMediaPlayer for playback
+- **Pokemon tab + Pokedex tab — COMPLETE (2026-04-05)**: "▶ Play Cry" button added to both tabs. Plays `sound/direct_sound_samples/cries/<slug>.wav` for the currently selected species via the shared `ui/audio_player.py` `AudioPlayer` (QMediaPlayer + QAudioOutput). Shows a clear "no cry sample found, expected path: …" warning for custom Fakemon without a cry file.
+- **Event Editor `playmoncry` — COMPLETE (2026-04-05)**: species picker in the Play Pokémon Cry command widget now has a "▶ Preview" button right next to it.
+- **Sound Editor (2026-04-07) — Phases 1-9 COMPLETE (all steps)**: Full GBA M4A audio engine built in Python. Parses song .s files, voicegroups, samples, and renders all 347 songs using the project's actual instruments. Songs Tab with browse/filter/play. Instruments Tab with 144 unique instruments, editable detail panel, piano keyboard with octave shift, sample management (export/import/replace with auto-resampling/delete). Phase 5: Voicegroups Tab — browse all 77 voicegroups, full 128-slot editor, add/clone/delete with reference checking, saves to `voice_groups.inc`. Phase 6 COMPLETE: EVENTide integration (▶ Preview, ■ Stop, 🔊 Open in Sound Editor), F8 shortcut, save pipeline, Sound Settings (volume, loop count, auto-downsample, stereo/mono output mode), constants sync (Sound Editor → EVENTide refresh), Porymap reads songs.h directly. Phase 7 COMPLETE: MIDI Import wizard — 5-page flow: file picker with track preview, voicegroup + settings, per-track instrument mapping (GM → VG slot with auto-match), song structure (full section sequencer — define named sections by measure range, drag/reorder play order, set loop start position; quick presets for simple cases; post-processor generates GOTO/PATT/PEND assembly), mid2agb conversion + registration. `MidiFileInfo` includes `total_measures`, `time_sig_num`, `time_sig_den`. **Phase 8 Steps 8.1-8.5 COMPLETE**: Step 8.1 — Read-only piano roll view with playback. Step 8.2 — Full note editing (place, move, resize, delete, selection, copy/paste, snap grid, cursors). Step 8.3 — Track management sidebar with per-track volume/pan/mute/solo, add/remove/duplicate. Step 8.4 — Real-time sequencer: notes synthesized on-the-fly as cursor crosses them (no pre-rendering), play/pause/resume/seek, ruler drag-to-scrub with red triangle position marker, 32-voice polyphony, per-track mute/solo/volume/pan. Background render thread (note rendering off audio callback for stable tempo), vectorized looping sample resample, PATT/PEND/GOTO flattening for full song structure. All playback bugs fixed (2026-04-07): voicegroup and instrument swaps update live sequencer in-place, track volume/pan sliders wired, pause/resume edge cases handled. Step 8.5 — GM Voicegroup Generator: scans all voicegroups, maps 89 samples to GM program numbers by SC-88 Pro/SD-90 name matching, builds 128-slot GM voicegroup, "Generate GM" button in Voicegroups tab and MIDI Import dialog, auto-detect existing GM voicegroup. Step 8.6 COMPLETE — Round-trip editing: `core/sound/song_writer.py` converts piano roll notes back to .s assembly, follows PorySuite save pipeline (modified signal → File → Save), preserves PATT/GOTO structure. UI overhaul: ruler extracted to fixed `RulerWidget` above scroll area (always visible, drag-to-scrub), toolbar compacted (track tabs → combo box, song info → status bar). See `docs/SOUND_EDITOR_PLAN.md` for full roadmap.
+
+**Palette Importer (Graphics tab) — COMPLETE (2026-04-05):**
+- **Location**: "Import Palette from PNG" group box in the right column of the Graphics tab, between the Shiny Palette swatches and the Icon Palette section.
+- **UI**: Normal/Shiny radio buttons (Normal default) + "Select Indexed PNG..." button.
+- **Flow**: User picks an indexed PNG → tool extracts color table (up to 16 colors) → GBA-clamps each to 15-bit → loads into selected palette slot (Normal or Shiny). Swatches and battle preview refresh immediately.
+- **Validation**: Checks `Format_Indexed8`; shows clear error if the PNG is not indexed.
+- **Save**: Palette marked dirty → written to `.pal` file on File → Save via existing `flush_to_disk()` pipeline.
+- **File**: `ui/graphics_tab_widget.py`.
+
+**Name Decapitalizer (Edit menu) — COMPLETE (2026-04-05):**
+- **Menu item**: **Edit → Name Decapitalizer…**
+- **Categories (all 7 delivered)**: species names, move names, item names, trainer names, trainer class names, ability names, UI key strings. Dialogue scripts deliberately not touched (user manages those by hand).
+- **Safety guard**: only strings whose alphabetic characters are ≥70% uppercase are offered for conversion, so mixed-case custom names are left alone automatically.
+- **Smart Title Case**: first letter of each word cap'd, rest lower; filler words (of/the/and/in/on/to/at/for/by/or/as/vs/de/la/du/nor/but) lowercased mid-string; roman numerals II–XV and XX kept upper; skip-list tokens kept upper; `TM42`/`HM03` style keeps the letter prefix upper. Apostrophes and hyphens preserved (`FARFETCH'D → Farfetch'd`, `ROCK-HARD → Rock-Hard`).
+- **Skip-list**: user-editable text box in the dialog, persisted in `settings.ini` under `[NameDecapitalizer]/skip_list`. Seeded with HM, TM, PP, HP, EXP, PC, LV, STR, DEF, ATK, SPE, SPA, SPD, SP, OK, OT, ID, VS, AI, IV, EV, KO, CPU, NPC, TV, PS.
+- **UX**: category checkboxes + skip-list editor → Scan Project → preview table (every row shows Category/constant, Original, Proposed with a checkbox) → untick rows you want to keep → Apply Checked.
+- **Writes**: species/moves/items/trainers/trainer-classes/UI-strings go through the existing in-memory setters and are committed on File → Save. Ability names are written directly to `src/data/text/abilities.h` at apply time (PorySuite doesn't own abilities.h through its save pipeline). Species names are written directly to `src/data/text/species_names.h` at apply time via `_write_species_names_header()` (final bug fix — previously only the Rename tool wrote this file, so decapitalized species names never persisted to the ROM). Items list + trainer-class list refresh live after apply.
+- **Module**: `ui/name_decapitalizer.py`; Edit-menu entry in `ui/unified_mainwindow.py`.
+
+**Trainer Graphics Tab — COMPLETE (2026-04-06):**
+- **Location**: New "Graphics" sub-tab alongside "Trainers" and "Trainer Classes" in the trainers section (3rd tab in `_trainers_tab_switcher`).
+- **Sprite preview**: Dropdown to select any TRAINER_PIC_* constant (friendly display names like "Lass"). 128×160 sprite preview rendered with the current palette applied via `_reskin_indexed_png`. Combo box wheel-scroll disabled per project rules.
+- **Palette editing**: Editable 16-colour palette swatch row (reuses `PaletteSwatchRow` from the Pokemon Graphics tab). Colour changes refresh the sprite preview immediately.
+- **Import Palette from PNG**: Extracts colour table from an indexed PNG, GBA-clamps each colour to 15-bit, applies to the palette. File picker defaults to `graphics/trainers/palettes/`.
+- **Open Palettes Folder**: Button opens the trainer palettes directory in the OS file manager.
+- **Save**: Palette changes saved on File → Save via `flush_to_disk()` which writes JASC-PAL `.pal` files.
+- **New file**: `ui/trainer_graphics_tab.py` (`TrainerGraphicsTab` widget).
+- **Main window wiring**: `ui/mainwindow.py` — imports `TrainerGraphicsTab`, creates instance, connects `modified` signal, adds as 3rd tab, loads with `pic_map` from trainers editor on project load, saves via `_save_trainer_graphics()` in all three save paths.
+
+**Overworld Graphics Editor — COMPLETE (2026-04-06):**
+- **Location**: Top-level "Overworld GFX" tab in the main toolbar with dedicated toolbar icon.
+- **Left panel — Sprite browser**: Category filter dropdown + search bar, scrollable thumbnail grid of all 152 sprites, "+ Add New Sprite…" button, Dynamic OW Palettes status/enable button.
+- **Right panel — Detail + palette**: Sprite sheet view with animation-type-aware preview, palette editor with "Assign to" reassignment dropdown, Import from PNG, "Show in Folder".
+- **Animation types** (parsed from `.anims` field in GraphicsInfo):
+  - Walk/Bike/Nurse/HoOh: standard 4-direction walk cycle (stand→step1→stand→step2)
+  - Surf: two-row display — Row 1: static directional poses, Row 2: surf run cycle (frames 3-11)
+  - Fishing: 4-directional rod animation (South/West/North/East)
+  - VS Seeker: single raise animation sequence (0→1→5→6→7→8→6→1→0)
+  - Inanimate: single static frame
+  - Destroy (CutTree/RockSmash): sequential frame playback
+  - Field Move: walk cycle (player holding arm out)
+- **Add New Sprite**: Dialog with PNG file chooser, auto-detect frame size/name/palette, animation type picker, category picker, palette choice (DOWP: create new from PNG; non-DOWP: pick from 4 NPC slots). Writes all 6 C headers automatically. New constant pushed to EVENTide's ConstantsManager immediately via `gfx_constants_changed` signal — no save/refresh needed.
+- **Dynamic OW Palettes (DOWP)**: One-way patch button modifies 5 C source files to enable per-sprite palettes. Status indicator shows active/inactive.
+- **Palette reassignment**: "Assign to" dropdown + Apply button changes a sprite's palette tag in the C source directly.
+- **Cross-tab sync**: `gfx_constants_changed` → `UnifiedMainWindow._refresh_eventide_constants()` → `EventEditorTab.refresh_gfx_constants()` repopulates the graphic dropdown. Same pattern as trainers/items/species.
+- **Files**: `ui/overworld_graphics_tab.py`, `core/overworld_sprite_creator.py` (new), `core/dynamic_ow_pal_patch.py` (new).
+
+**Project Display Name — COMPLETE (2026-04-06):**
+- New "Project" section at top of Settings → General page.
+- "Display Name" field controls what shows in the launcher and window title bar.
+- Persisted to both `projects.json` (launcher) and per-project `config.json`.
+- Does not rename files — cosmetic only.
+
+---
+
+### Phase 9: Pokedex Habitat / Area Display
+
+Add a "Habitat" or "Area" section to the Pokedex tab that shows where each species can be found in the wild. Cross-references `wild_encounters.json` to build a per-species location list.
+
+**What it shows:**
+- Read-only location list on the Pokedex detail panel (e.g. "Route 1 — Grass (Lv 2-5), Route 2 — Grass (Lv 3-6)")
+- Encounter method (grass, water, fishing, rock smash) and level range per location
+- Optionally highlight locations as dots on the region map image (like the in-game Pokedex "Area" screen)
+- "Not found in wild" message for species that only come from gifts, trades, or evolutions
+
+**How it works:**
+- On project load, parse `src/data/wild_encounters.json` and build a reverse lookup: species → list of (map, method, level range, encounter rate)
+- Display as a collapsible section on the Pokedex tab detail panel
+- Re-reads encounter data when Porymap signals `wild_encounters_saved` via the bridge
+
+**What it does NOT do:**
+- Does not edit encounter tables — that stays in Porymap's Wild Encounters tab
+- Does not duplicate Porymap's per-map encounter editor
 
 ---
 
@@ -937,6 +1108,7 @@ View
   Trainers
   Starters
   Credits
+  Overworld GFX
   ----------
   Event Editor
   Maps
@@ -973,7 +1145,7 @@ Help
 ### Icon Toolbar Layout
 
 ```
-[Save] [Make] [Make Modern] | [Pokemon] [Pokedex] [Moves] [Items] [Trainers] [Starters] [Credits] | [Events] [Maps] [Layouts] [Region Map] [Labels] | [UI] [Config] [Settings] | [Play]
+[Save] [Make] [Make Modern] | [Pokemon] [Pokedex] [Moves] [Items] [Trainers] [Starters] [Credits] [Overworld GFX] | [Events] [Maps] [Layouts] [Region Map] [Labels] | [UI] [Config] [Settings] | [Play]
 ```
 
 ### Unified Window
