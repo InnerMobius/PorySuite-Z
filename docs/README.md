@@ -268,3 +268,5 @@ Build output streams in real time in-app.
 ## License
 
 Original [PorySuite](https://github.com/jschoeny/PorySuite) by jschoeny.
+
+[Porymap](https://github.com/huderlem/porymap) by huderlem is a separate project and is **not included** in this repository. PorySuite-Z's optional installer clones and builds Porymap from its own GitHub repo on your machine. We do not distribute Porymap or any of its code.
