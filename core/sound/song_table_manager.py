@@ -237,6 +237,10 @@ def write_song_table(project_root: str, data: SongTableData):
     lines = ['gSongTable::\n']
     for entry in data.entries:
         lines.append(f'\tsong {entry.label}, {entry.music_player}, {entry.unknown}\n')
+    # Footer: dummy_song_header is required by the engine
+    lines.append('\n')
+    lines.append('dummy_song_header:\n')
+    lines.append('\t.byte 0, 0, 0, 0\n')
     with open(table_path, 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
@@ -397,11 +401,20 @@ def delete_song(
     write_midi_cfg(project_root, data)
     data.rebuild_indices()
 
-    # Delete the .s file
+    # Delete the .s file and .mid file
     midi_dir = os.path.join(project_root, 'sound', 'songs', 'midi')
-    s_file = os.path.join(midi_dir, f'{label}.s')
-    if os.path.isfile(s_file):
-        os.remove(s_file)
+    for ext in ('.s', '.mid'):
+        path = os.path.join(midi_dir, f'{label}{ext}')
+        if os.path.isfile(path):
+            os.remove(path)
+
+    # Clean up build artifacts (.o files) if they exist
+    for build_dir_name in ('build/firered_modern', 'build/firered'):
+        obj_path = os.path.join(
+            project_root, build_dir_name, 'sound', 'songs', 'midi',
+            f'{label}.o')
+        if os.path.isfile(obj_path):
+            os.remove(obj_path)
 
 
 def find_song_references(project_root: str, constant: str) -> list[str]:
@@ -409,6 +422,10 @@ def find_song_references(project_root: str, constant: str) -> list[str]:
 
     Returns a list of file paths that reference the constant.
     Helps the user understand what will break if they delete a song.
+
+    Skips auto-generated .inc files (they contain a "DO NOT MODIFY" header
+    and are rebuilt from .json source files during make).  Searches .json
+    files so that Porymap-style map headers are checked too.
     """
     refs = []
     search_dirs = ['src', 'data', 'include']
@@ -419,7 +436,7 @@ def find_song_references(project_root: str, constant: str) -> list[str]:
             continue
         for root, dirs, files in os.walk(dir_path):
             for fn in files:
-                if not fn.endswith(('.c', '.h', '.inc', '.s')):
+                if not fn.endswith(('.c', '.h', '.inc', '.s', '.json')):
                     continue
                 fpath = os.path.join(root, fn)
                 # Skip songs.h itself
@@ -427,10 +444,14 @@ def find_song_references(project_root: str, constant: str) -> list[str]:
                     continue
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
-                        if constant in f.read():
-                            # Make path relative for readability
-                            rel = os.path.relpath(fpath, project_root)
-                            refs.append(rel)
+                        content = f.read()
+                    # Skip auto-generated .inc files — the real source of
+                    # truth is the .json file they're generated from.
+                    if fn.endswith('.inc') and 'DO NOT MODIFY' in content[:200]:
+                        continue
+                    if constant in content:
+                        rel = os.path.relpath(fpath, project_root)
+                        refs.append(rel)
                 except OSError:
                     pass
 

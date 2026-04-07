@@ -764,8 +764,17 @@ class GitPanel(QDialog):
     # Section 8 — Remotes
     # ══════════════════════════════════════════════════════════════════════════
 
+    def switch_to_page(self, page: str):
+        """Scroll to a named section (e.g. 'remotes')."""
+        widget = {"remotes": getattr(self, "_remotes_box", None)}.get(page)
+        if widget:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(50, lambda: self.findChild(
+                QScrollArea).ensureWidgetVisible(widget, 0, 50))
+
     def _build_remotes_section(self):
         box = QGroupBox("⚙  Remotes")
+        self._remotes_box = box
         box.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; }")
         lay = QVBoxLayout(box)
         lay.setSpacing(10)

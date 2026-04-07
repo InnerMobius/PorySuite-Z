@@ -71,7 +71,7 @@ class TrackRow(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setContentsMargins(6, 4, 4, 4)
         layout.setSpacing(2)
 
         # ── Row 1: color swatch + track name + mute/solo ──
@@ -266,7 +266,7 @@ class TrackSidebar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(220)
+        self.setFixedWidth(240)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)

@@ -72,6 +72,15 @@ class _SImportWorker(QThread):
             # Copy the .s file
             shutil.copy2(self._source_s_path, dest_path)
 
+            # Create a placeholder .mid so the Makefile's wildcard picks up
+            # this song.  pokefirered derives MID_OBJS from *.mid — without a
+            # .mid the .s never gets assembled into a .o and the link fails.
+            self._create_placeholder_mid(dest_dir)
+
+            # Touch the .s so its mtime is newer than the .mid — make will
+            # skip the mid2agb step and just assemble the existing .s.
+            os.utime(dest_path)
+
             # Rewrite label references if the source label differs from our target label
             self._rewrite_labels(dest_path)
 
@@ -161,6 +170,30 @@ class _SImportWorker(QThread):
         if changed:
             with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
                 f.writelines(lines)
+
+    @staticmethod
+    def _make_placeholder_mid() -> bytes:
+        """Return a minimal valid MIDI file (format 0, 0 tracks worth of data).
+
+        This is just enough for the Makefile wildcard to find a .mid and
+        create a build target.  The .s file is always newer, so mid2agb
+        is never actually invoked on this placeholder.
+        """
+        import struct
+        # MThd chunk: format 0, 1 track, 48 ticks/quarter
+        header = b'MThd' + struct.pack('>I', 6) + struct.pack('>HHH', 0, 1, 48)
+        # MTrk chunk: just an end-of-track meta event (00 FF 2F 00)
+        track_data = b'\x00\xff\x2f\x00'
+        track = b'MTrk' + struct.pack('>I', len(track_data)) + track_data
+        return header + track
+
+    def _create_placeholder_mid(self, midi_dir: str):
+        """Write a tiny .mid file next to the .s so the Makefile picks it up."""
+        mid_path = os.path.join(midi_dir, self._label + ".mid")
+        if not os.path.isfile(mid_path):
+            with open(mid_path, "wb") as f:
+                f.write(self._make_placeholder_mid())
+            _log.info("Created placeholder .mid: %s", mid_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

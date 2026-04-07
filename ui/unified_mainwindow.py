@@ -206,10 +206,11 @@ class UnifiedMainWindow(QMainWindow):
 
         _add_separator(tb)
 
-        # ── Settings pages ───────────────────────────────────────────────────
+        # ── Settings / Info pages ────────────────────────────────────────────
         settings_pages = [
-            ("ui",       "UI Settings"),
-            ("config",   "Config"),
+            ("diagnostics", "ROM Diagnostics"),
+            ("ui",          "UI Settings"),
+            ("config",      "Config"),
         ]
         for icon_name, tooltip in settings_pages:
             btn = self._make_page_button(icon_name, tooltip)
@@ -449,6 +450,16 @@ class UnifiedMainWindow(QMainWindow):
         self._git_commit_action.triggered.connect(self._git_commit)
         self._git_menu.addAction(self._git_commit_action)
 
+        self._git_menu.addSeparator()
+
+        self._git_configure_remotes_action = QAction("Configure Remotes…", self)
+        self._git_configure_remotes_action.setToolTip(
+            "Set origin and upstream URLs, manage saved remotes.")
+        self._git_configure_remotes_action.setEnabled(False)
+        self._git_configure_remotes_action.triggered.connect(
+            lambda: self._open_git_panel(page="remotes"))
+        self._git_menu.addAction(self._git_configure_remotes_action)
+
         # Stubs for _git_set_all_enabled compatibility
         self._git_configure_action = QAction("", self)
         self._git_status_action = QAction("", self)
@@ -551,6 +562,12 @@ class UnifiedMainWindow(QMainWindow):
         self._label_manager = LabelManagerWidget()
         idx = self.stack.addWidget(self._label_manager)
         self._page_indices["labels"] = idx
+
+        # ── ROM Diagnostics ─────────────────────────────────────────────────
+        from ui.diagnostics_tab import DiagnosticsTab
+        self._diagnostics_tab = DiagnosticsTab()
+        idx = self.stack.addWidget(self._diagnostics_tab)
+        self._page_indices["diagnostics"] = idx
 
         # ── Disconnect PorySuite's own tab-change handler ────────────────────
         # Pages have been reparented out of mainTabs, so PorySuite's
@@ -1084,6 +1101,10 @@ class UnifiedMainWindow(QMainWindow):
             ps._load_trainers_editor()
         elif page_name == "moves":
             ps.load_moves_defs_table()
+        elif page_name == "diagnostics":
+            project_dir = (self.project_info or {}).get("dir", "")
+            if project_dir and hasattr(self, '_diagnostics_tab'):
+                self._diagnostics_tab.set_project(project_dir)
 
     # ── Phase 3: Cross-editor navigation handlers ─────────────────────────
 
@@ -1450,7 +1471,7 @@ class UnifiedMainWindow(QMainWindow):
         except Exception as exc:
             return False, str(exc)
 
-    def _open_git_panel(self):
+    def _open_git_panel(self, page: str = ""):
         """Open the Git panel dialog."""
         from git_panel import GitPanel
         panel = getattr(self, "_git_panel_instance", None)
@@ -1460,11 +1481,13 @@ class UnifiedMainWindow(QMainWindow):
         panel.show()
         panel.raise_()
         panel.activateWindow()
+        if page and hasattr(panel, 'switch_to_page'):
+            panel.switch_to_page(page)
 
     def _git_set_all_enabled(self, enabled: bool):
         """Enable/disable all git-related actions."""
         for name in (
-            "_git_panel_action",
+            "_git_panel_action", "_git_configure_remotes_action",
             "_git_configure_action", "_git_status_action",
             "_pull_upstream_action", "_pull_origin_action",
             "_push_action", "_git_commit_action", "_git_new_branch_action",

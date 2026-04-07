@@ -136,9 +136,16 @@ def _write_track_raw(track: Track, song: SongData) -> list[str]:
         # Generate the command from parsed data
         if cmd.cmd == 'NOTE':
             lines.extend(_format_note(cmd, last_note_dur, last_pitch, last_velocity))
-            last_note_dur = cmd.duration
+            last_note_dur = min(cmd.duration or 24, 96)
             last_pitch = cmd.pitch
             last_velocity = cmd.velocity
+        elif cmd.cmd == 'TIE':
+            lines.extend(_format_tie(cmd, last_pitch, last_velocity))
+            last_pitch = cmd.pitch
+            if cmd.velocity is not None:
+                last_velocity = cmd.velocity
+        elif cmd.cmd == 'EOT':
+            lines.extend(_format_eot(cmd))
         elif cmd.cmd == 'WAIT':
             lines.extend(_emit_waits(cmd.duration))
         elif cmd.cmd == 'LABEL':
@@ -194,6 +201,9 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
     last_pitch = None
     last_velocity = None
 
+    # Track last emitted control values to filter redundant commands
+    _last_control: dict[str, int] = {}
+
     # Separate setup commands from note/wait commands
     setup_cmds = []
     note_cmds = []
@@ -207,7 +217,7 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
                 setup_cmds.append(cmd)
             else:
                 note_cmds.append(cmd)
-        elif cmd.cmd in ('NOTE', 'WAIT'):
+        elif cmd.cmd in ('NOTE', 'WAIT', 'TIE', 'EOT'):
             note_cmds.append(cmd)
         elif cmd.cmd == 'LABEL':
             if cmd.target_label:
@@ -250,6 +260,9 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
         elif cmd.cmd == 'TUNE':
             tune_offset = (cmd.value or 64) - C_V
             lines.append(f'\t.byte\tTUNE  , c_v{tune_offset:+d}')
+        # Track initial control values for redundancy filtering
+        if cmd.value is not None:
+            _last_control[cmd.cmd] = cmd.value
 
     # Write note/wait sequence
     for cmd in note_cmds:
@@ -266,9 +279,16 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
         elif cmd.cmd == 'NOTE':
             note_lines = _format_note(cmd, last_note_dur, last_pitch, last_velocity)
             lines.extend(note_lines)
-            last_note_dur = cmd.duration
+            last_note_dur = min(cmd.duration or 24, 96)
             last_pitch = cmd.pitch
             last_velocity = cmd.velocity
+        elif cmd.cmd == 'TIE':
+            lines.extend(_format_tie(cmd, last_pitch, last_velocity))
+            last_pitch = cmd.pitch
+            if cmd.velocity is not None:
+                last_velocity = cmd.velocity
+        elif cmd.cmd == 'EOT':
+            lines.extend(_format_eot(cmd))
         elif cmd.cmd == 'WAIT':
             lines.extend(_emit_waits(cmd.duration))
             current_tick += cmd.duration
@@ -284,11 +304,15 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
             lines.append('\t.byte\tFINE')
         elif cmd.cmd in ('VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR',
                           'LFOS', 'MODT', 'TUNE'):
-            # Inline control commands
+            # Skip redundant control commands (same value as last emitted)
+            if cmd.value is not None and _last_control.get(cmd.cmd) == cmd.value:
+                continue
             if cmd.raw_line:
                 lines.append(cmd.raw_line.rstrip())
             else:
                 lines.extend(_format_control(cmd, song))
+            if cmd.value is not None:
+                _last_control[cmd.cmd] = cmd.value
 
     # Add FINE if not already there
     if not note_cmds or note_cmds[-1].cmd != 'FINE':
@@ -304,17 +328,24 @@ def _format_note(
     last_pitch: Optional[int],
     last_vel: Optional[int],
 ) -> list[str]:
-    """Format a NOTE command with running-status optimization."""
+    """Format a NOTE command with running-status optimization.
+
+    Notes with duration > 96 ticks are handled separately via TIE/EOT
+    in notes_to_track_commands — this function only handles Nxx notes.
+    """
     parts = []
 
+    # Clamp duration to 96 max (caller should use TIE for longer notes)
+    duration = min(cmd.duration or 24, 96)
+
     # Duration (Nxx) — only emit if changed
-    dur_name = _best_note_name(cmd.duration or 24)
-    if cmd.duration != last_dur:
+    dur_name = _best_note_name(duration)
+    if duration != last_dur:
         parts.append(dur_name)
 
     # Pitch — only emit if changed
     pitch_str = _pitch_name(cmd.pitch if cmd.pitch is not None else 60)
-    if cmd.pitch != last_pitch or cmd.duration != last_dur:
+    if cmd.pitch != last_pitch or duration != last_dur:
         parts.append(pitch_str)
 
     # Velocity — only emit if changed
@@ -332,6 +363,34 @@ def _format_note(
     # Format: .byte  N12 , Cn3 , v127
     formatted = ' , '.join(parts)
     return [f'\t.byte\t{formatted}']
+
+
+def _format_tie(
+    cmd: TrackCommand,
+    last_pitch: Optional[int],
+    last_vel: Optional[int],
+) -> list[str]:
+    """Format a TIE command (sustain note indefinitely until EOT)."""
+    parts = ['TIE']
+
+    # TIE always includes pitch (need to know what to sustain)
+    pitch_str = _pitch_name(cmd.pitch if cmd.pitch is not None else 60)
+    parts.append(pitch_str)
+
+    # Velocity — only include if provided and different
+    if cmd.velocity is not None and cmd.velocity != last_vel:
+        parts.append(f'v{cmd.velocity:03d}')
+
+    formatted = ' , '.join(parts)
+    return [f'\t.byte\t{formatted}']
+
+
+def _format_eot(cmd: TrackCommand) -> list[str]:
+    """Format an EOT (End of Tie) command."""
+    if cmd.pitch is not None:
+        pitch_str = _pitch_name(cmd.pitch)
+        return [f'\t.byte\tEOT   , {pitch_str}']
+    return ['\t.byte\tEOT']
 
 
 def _format_control(cmd: TrackCommand, song: SongData) -> list[str]:
@@ -414,8 +473,15 @@ def notes_to_track_commands(
     control_events: list[TrackCommand] = []
     structure_events: list[TrackCommand] = []
     if original_commands:
+        # Filter out redundant consecutive control commands (same cmd + value)
+        _seen_control: dict[str, int] = {}
         for cmd in original_commands:
             if cmd.cmd in _CONTROL_CMDS:
+                # Only keep if value actually changed from last time
+                if cmd.value is not None and _seen_control.get(cmd.cmd) == cmd.value:
+                    continue  # redundant — skip
+                if cmd.value is not None:
+                    _seen_control[cmd.cmd] = cmd.value
                 control_events.append(cmd)
             elif cmd.cmd in _STRUCTURE_CMDS:
                 structure_events.append(cmd)
@@ -517,11 +583,22 @@ def notes_to_track_commands(
             current_tick += gap
 
         if cmd.cmd == 'NOTE':
-            commands.append(cmd)
-            # WAIT for note duration (notes don't advance the clock)
-            commands.append(TrackCommand(
-                cmd='WAIT', tick=current_tick, duration=cmd.duration))
-            current_tick += cmd.duration
+            duration = cmd.duration or 24
+            if duration > 96:
+                # Note exceeds max N96 — use TIE + waits + EOT
+                commands.append(TrackCommand(
+                    cmd='TIE', tick=current_tick,
+                    pitch=cmd.pitch, velocity=cmd.velocity))
+                commands.append(TrackCommand(
+                    cmd='WAIT', tick=current_tick, duration=duration))
+                current_tick += duration
+                commands.append(TrackCommand(
+                    cmd='EOT', tick=current_tick, pitch=cmd.pitch))
+            else:
+                commands.append(cmd)
+                commands.append(TrackCommand(
+                    cmd='WAIT', tick=current_tick, duration=duration))
+                current_tick += duration
         elif cmd.cmd in ('GOTO', 'PATT', 'PEND', 'FINE'):
             commands.append(cmd)
             if cmd.cmd == 'GOTO':

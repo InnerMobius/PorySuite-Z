@@ -45,6 +45,9 @@ class _InAppBuildDialog(QDialog):
     def __init__(self, title: str, program: str, args: list[str],
                  env_extra: dict | None = None, parent=None):
         super().__init__(parent)
+        # Window flag gives this dialog its own taskbar entry so the user
+        # can switch to it without alt-tabbing.
+        self.setWindowFlag(Qt.WindowType.Window)
         self.setWindowTitle(title)
         self.setMinimumSize(700, 420)
         self.setSizeGripEnabled(True)

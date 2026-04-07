@@ -1,3 +1,28 @@
+## [2026-04-07] — Song Writer Optimizations, Song Deletion Fix, Piano Roll UX
+
+### Type
+Fix / Optimization / UX
+
+### Summary
+Three song writer optimizations reduce .s file output size and fix a silent note truncation bug. Song deletion now properly cleans up all related files. Piano roll track sidebar widened so Mute/Solo buttons aren't hidden behind scrollbar. BPM spinbox widened for readability. Song Structure panel defaults to cursor position for all add operations.
+
+### What Changed
+- **Song Writer** (`core/sound/song_writer.py`): Notes longer than 96 ticks now correctly generate TIE + EOT commands instead of being silently truncated to N96 (was a bug — long notes got cut short). Redundant control commands (VOL/PAN/MOD/BEND/etc. set to the same value twice) are now filtered out in both `notes_to_track_commands()` and `_write_track_linear()`. New `_format_tie()` and `_format_eot()` helpers. Both `_write_track_raw` and `_write_track_linear` handle TIE/EOT command types. Assembly output verified with arm-none-eabi-as on 4 test songs.
+- **Song Deletion** (`core/sound/song_table_manager.py`): `delete_song()` now deletes `.mid` files alongside `.s` files (previously left orphan .mid that caused build failures). Also cleans up `.o` build artifacts in both `build/firered_modern` and `build/firered` directories. `write_song_table()` now includes the required `dummy_song_header` footer block (was missing — could corrupt song_table.inc on any write).
+- **Piano Roll Tracks** (`ui/piano_roll_tracks.py`): Sidebar widened from 220px to 240px so Mute (M) and Solo (S) buttons aren't clipped behind the vertical scrollbar. Track row right margin tightened (6→4px).
+- **Piano Roll Window** (`ui/piano_roll_window.py`): BPM spinbox widened from 65px to 85px for readability. Cursor tick position now forwarded to Song Structure panel via `set_cursor_tick()` on ruler click and during playback.
+- **Song Structure Panel** (`ui/piano_roll_structure.py`): All four "Add" dialogs (Section, Loop Back, Pattern Call, End Song) now default to the current cursor position instead of start/end of song.
+- **Build fix**: Cleaned up stale `mus_graveyard` entries from song_table.inc and midi.cfg in test project (orphan from incomplete song deletion).
+
+### Files Changed
+- core/sound/song_writer.py — TIE/EOT generation, redundant control filtering, long note fix
+- core/sound/song_table_manager.py — delete .mid + .o files, write dummy_song_header footer
+- ui/piano_roll_tracks.py — sidebar width 220→240, right margin 6→4
+- ui/piano_roll_window.py — BPM spinbox width 65→85, cursor tick forwarding to structure panel
+- ui/piano_roll_structure.py — all add dialogs default to cursor position
+
+---
+
 ## [2026-04-07] — Generate GM Fix, Song Export/Replace, GM Slot Trimming
 
 ### Type

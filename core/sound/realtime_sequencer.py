@@ -168,6 +168,15 @@ class RealtimeSequencer:
         with self._lock:
             self._visible_tracks = visible
 
+    def set_bpm(self, bpm: int):
+        """Update the tempo. Recalculates timing so playback speed changes
+        immediately without restarting."""
+        with self._lock:
+            self._bpm = bpm
+            ticks_per_frame = bpm * self._tbs / 150.0
+            ticks_per_second = ticks_per_frame * 59.7275
+            self._samples_per_tick = OUTPUT_SAMPLE_RATE / ticks_per_second
+
     def set_loop(self, start: Optional[int], end: Optional[int]):
         """Set loop region. None = no loop."""
         with self._lock:

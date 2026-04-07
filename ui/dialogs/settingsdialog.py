@@ -196,20 +196,6 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(log_box)
 
-        # ── Autosave ────────────────────────────────────────────────────────
-        auto_box = QGroupBox("Autosave (Experimental)")
-        auto_lay = QVBoxLayout(auto_box)
-        auto_lay.addWidget(QLabel(
-            "Automatically save project changes.\n"
-            "THIS IS EXPERIMENTAL — keep backups before enabling."
-        ))
-        self.auto_checkbox = QCheckBox("Enable Autosave (experimental)")
-        self.auto_checkbox.setChecked(
-            bool(self.settings.value("autosave_enabled", False, type=bool))
-        )
-        auto_lay.addWidget(self.auto_checkbox)
-        layout.addWidget(auto_box)
-
         layout.addStretch(1)
         self._add_page("General", scroll)
 
@@ -286,7 +272,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(setup_box)
 
         layout.addStretch(1)
-        self._add_page("Build && Play", scroll)
+        self._add_page("Build & Play", scroll)
 
     # ═════════════════════════════════════════════════════════════════════════
     # Page: Trainer Defaults
@@ -405,22 +391,6 @@ class SettingsDialog(QDialog):
         tooltip_lay.addWidget(self.event_tooltips_checkbox)
 
         layout.addWidget(tooltip_box)
-
-        # ── Paths ───────────────────────────────────────────────────────────
-        paths_box = QGroupBox("External Tools")
-        paths_lay = QFormLayout(paths_box)
-
-        porymap_row = QHBoxLayout()
-        self.porymap_edit = QLineEdit(
-            self.settings.value("editor/porymap_path", "", type=str))
-        self.porymap_edit.setPlaceholderText("(not set — needed for Phase 4 integration)")
-        porymap_row.addWidget(self.porymap_edit)
-        porymap_browse = QPushButton("Browse...")
-        porymap_browse.clicked.connect(self._browse_porymap)
-        porymap_row.addWidget(porymap_browse)
-        paths_lay.addRow("Porymap path:", porymap_row)
-
-        layout.addWidget(paths_box)
 
         layout.addStretch(1)
         self._add_page("Editor", scroll)
@@ -612,13 +582,6 @@ class SettingsDialog(QDialog):
         if path:
             self.emulator_edit.setText(path)
 
-    def _browse_porymap(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Porymap", "",
-            "Executables (*.exe);;All Files (*)")
-        if path:
-            self.porymap_edit.setText(path)
-
     def _reset_all_notifications(self):
         clear_all()
         for cb in self._notif_checks.values():
@@ -726,7 +689,6 @@ class SettingsDialog(QDialog):
 
         # General
         self.settings.setValue("advanced_diagnostics", bool(self.adv_checkbox.isChecked()))
-        self.settings.setValue("autosave_enabled", bool(self.auto_checkbox.isChecked()))
         self.settings.setValue("crashlog/keep_days",
                                self._crashlog_day_values[self.crashlog_days_combo.currentIndex()])
         self.settings.setValue("crashlog/max_size_mb",
@@ -756,8 +718,6 @@ class SettingsDialog(QDialog):
                                self.startup_page_combo.currentText())
         self.settings.setValue("editor/log_visible",
                                bool(self.log_visible_checkbox.isChecked()))
-        self.settings.setValue("editor/porymap_path",
-                               self.porymap_edit.text().strip())
         self.settings.setValue("editor/event_tooltips",
                                bool(self.event_tooltips_checkbox.isChecked()))
 

@@ -598,6 +598,16 @@ QTabBar::tab:hover:!selected {
         self._git_commit_action.triggered.connect(self._git_commit)
         self._git_menu.addAction(self._git_commit_action)
 
+        self._git_menu.addSeparator()
+
+        self._git_configure_remotes_action = _QAction("Configure Remotes…", self)
+        self._git_configure_remotes_action.setToolTip(
+            "Set origin and upstream URLs, manage saved remotes.")
+        self._git_configure_remotes_action.setEnabled(False)
+        self._git_configure_remotes_action.triggered.connect(
+            lambda: self._open_git_panel(page="remotes"))
+        self._git_menu.addAction(self._git_configure_remotes_action)
+
         # Keep these stubs so _git_set_all_enabled doesn't break
         self._git_configure_action  = _QAction("", self)
         self._git_status_action     = _QAction("", self)
@@ -1015,8 +1025,11 @@ QTabBar::tab:hover:!selected {
         except Exception as exc:
             return False, str(exc)
 
-    def _open_git_panel(self) -> None:
-        """Open (or bring to front) the Git Panel window."""
+    def _open_git_panel(self, page: str = "") -> None:
+        """Open (or bring to front) the Git Panel window.
+
+        page: optional section name to scroll/switch to (e.g. "remotes").
+        """
         from git_panel import GitPanel
         panel = getattr(self, "_git_panel_instance", None)
         if panel is None or not panel.isVisible():
@@ -1025,11 +1038,13 @@ QTabBar::tab:hover:!selected {
         panel.show()
         panel.raise_()
         panel.activateWindow()
+        if page and hasattr(panel, 'switch_to_page'):
+            panel.switch_to_page(page)
 
     def _git_set_all_enabled(self, enabled: bool) -> None:
         """Enable or disable all git menu actions at once."""
         for name in (
-            "_git_panel_action",
+            "_git_panel_action", "_git_configure_remotes_action",
             "_git_configure_action", "_git_status_action",
             "_pull_upstream_action", "_pull_origin_action",
             "_push_action", "_git_commit_action", "_git_new_branch_action",

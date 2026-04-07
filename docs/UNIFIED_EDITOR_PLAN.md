@@ -8,9 +8,9 @@ Merge PorySuite (data editor) and EVENTide (script editor) into a single window 
 
 ## Current State (2026-04-07)
 
-Phases 1 through 6 are **complete**. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE**. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding.
+Phases 1 through 6 are **complete**. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE**. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding. **Song Writer Optimizations — COMPLETE**: TIE/EOT for long notes, redundant control filtering, proper song deletion cleanup. **ROM Diagnostics Tab — COMPLETE**: ROM size, EWRAM/IWRAM usage, section breakdown, build info.
 
-**15 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Event Editor, Maps, Layouts & Tilesets, Region Map, UI Settings, Config.
+**17 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Diagnostics, Event Editor, Maps, Layouts & Tilesets, Region Map, UI (Text Content), Config.
 
 ---
 
@@ -132,10 +132,10 @@ All existing editors are finished.
 **Settings System (5 tabs):**
 - `settings.ini` persistence with full config sections
 - Settings dialog at `ui/dialogs/settingsdialog.py`
-- **General tab:** diagnostics, crashlog retention (keep_days + max_size_mb dropdowns), autosave toggle
+- **General tab:** diagnostics, crashlog retention (keep_days + max_size_mb dropdowns)
 - **Build & Play tab:** make command, make modern command, .gba path, emulator path, build environment
 - **Trainer Defaults tab:** default intro/defeat/post-battle text templates, prize money multiplier
-- **Editor tab:** startup page, log panel visibility, Porymap path
+- **Editor tab:** startup page, log panel visibility
 - **Notifications tab:** re-enable suppressed dialogs
 - Missing/corrupted INI = sensible defaults, never crash
 

@@ -55,8 +55,17 @@ Save first (Ctrl+S). The shared data layer sends a signal to refresh EVENTide's 
 ### New overworld sprite doesn't appear in the Event Editor's graphic dropdown
 New sprites added via the Overworld Graphics tab push their `OBJ_EVENT_GFX_*` constant directly into the Event Editor's dropdown through cross-tab sync — no save or refresh needed. If the sprite still doesn't appear, switch to any EVENTide page and back to trigger a constants refresh, or use File > Refresh (F5).
 
+### Deleting a song still causes build failures
+Fixed (2026-04-07). Previously, deleting a song from PorySuite only removed the `.s` file but left the `.mid` placeholder behind. The Makefile's wildcard found the orphan `.mid`, tried to build from it, and failed. Now `delete_song()` also removes the `.mid` file and any `.o` build artifacts. Additionally, `write_song_table()` was missing the required `dummy_song_header` footer — this could corrupt `song_table.inc` on any write operation. Fixed.
+
+### Piano roll notes longer than 4 beats get cut short
+Fixed (2026-04-07). Notes longer than 96 ticks (4 beats at 24 ticks/beat) were silently truncated to N96 — the maximum single-note duration in GBA M4A. Now the song writer generates TIE + EOT commands for long notes, which is exactly what mid2agb does. Notes sustain for their full drawn duration.
+
+### Piano roll Mute/Solo buttons hidden behind scrollbar
+Fixed (2026-04-07). The track sidebar was 220px wide, and when the vertical scrollbar appeared (6+ tracks), it covered the M and S buttons on each track row. Sidebar widened to 240px.
+
 ### Settings dialog looks different
-The settings dialog was rebuilt with a sidebar. All your old settings (diagnostics, autosave, notification preferences) are still there under the same INI keys. Nothing was lost.
+The settings dialog was rebuilt with a sidebar. All your old settings (diagnostics, notification preferences) are still there under the same INI keys. Autosave and Porymap path settings were removed (they were dead code that never did anything).
 
 ---
 

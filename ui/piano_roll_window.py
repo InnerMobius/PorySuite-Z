@@ -14,7 +14,7 @@ from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QToolBar, QSlider, QStatusBar,
-    QComboBox, QSizePolicy, QMessageBox,
+    QComboBox, QSpinBox, QSizePolicy, QMessageBox,
 )
 
 from ui.piano_roll_widget import PianoRollWidget, SNAP_VALUES
@@ -52,6 +52,15 @@ class PianoRollWindow(QMainWindow):
         self._total_ticks = 0
         self._bpm = 120
         self._is_dirty = False
+        self._structure_dirty = False  # True if user edited Song Structure
+
+        # Snapshot original track commands before any editing so save can
+        # reference the original control/structure commands
+        import copy
+        self._original_track_commands = {
+            i: copy.deepcopy(track.commands)
+            for i, track in enumerate(song_data.tracks)
+        }
 
         self.setWindowTitle(f"Piano Roll  --  {song_data.label}")
         self.setMinimumSize(900, 500)
@@ -92,7 +101,7 @@ class PianoRollWindow(QMainWindow):
         self._btn_stop = QPushButton("Stop")
         self._btn_stop.setFixedWidth(60)
         self._btn_stop.setToolTip("Stop and reset to start.")
-        self._btn_stop.clicked.connect(self._on_stop)
+        self._btn_stop.clicked.connect(lambda: self._on_stop())
         self._btn_stop.setEnabled(False)
         toolbar.addWidget(self._btn_stop)
 
@@ -116,6 +125,18 @@ class PianoRollWindow(QMainWindow):
         self._snap_combo.setFixedWidth(90)
         self._snap_combo.currentTextChanged.connect(self._on_snap_changed)
         toolbar.addWidget(self._snap_combo)
+
+        toolbar.addSeparator()
+
+        toolbar.addWidget(QLabel(" BPM:"))
+        self._bpm_spin = QSpinBox()
+        install_scroll_guard(self._bpm_spin)
+        self._bpm_spin.setRange(20, 510)
+        self._bpm_spin.setValue(self._bpm)
+        self._bpm_spin.setFixedWidth(85)
+        self._bpm_spin.setToolTip("Song tempo in beats per minute.")
+        self._bpm_spin.valueChanged.connect(self._on_bpm_changed)
+        toolbar.addWidget(self._bpm_spin)
 
         toolbar.addSeparator()
 
@@ -214,6 +235,9 @@ class PianoRollWindow(QMainWindow):
         from core.sound.song_parser import get_song_tempo
 
         self._bpm = get_song_tempo(song)
+        self._bpm_spin.blockSignals(True)
+        self._bpm_spin.setValue(self._bpm)
+        self._bpm_spin.blockSignals(False)
 
         self._track_combo.blockSignals(True)
         self._track_combo.clear()
@@ -380,12 +404,13 @@ class PianoRollWindow(QMainWindow):
             self._btn_play.setText("Pause")
             self._playback_timer.start()
 
-    def _on_stop(self):
+    def _on_stop(self, reset_cursor: bool = True):
         self._playback_timer.stop()
         if self._sequencer:
             self._sequencer.stop()
-        self._cursor_tick = 0
-        self._piano_roll.set_playback_tick(0)
+        if reset_cursor:
+            self._cursor_tick = 0
+            self._piano_roll.set_playback_tick(0)
         self._btn_play.setText("Play")
         self._btn_stop.setEnabled(False)
         self._time_label.setText("")
@@ -410,6 +435,7 @@ class PianoRollWindow(QMainWindow):
         """User clicked or dragged the ruler — jump to that position."""
         self._cursor_tick = tick
         self._piano_roll.set_playback_tick(tick)
+        self._structure_panel.set_cursor_tick(tick)
 
         if self._sequencer is not None:
             self._sequencer.seek(tick)
@@ -427,13 +453,20 @@ class PianoRollWindow(QMainWindow):
         if self._sequencer is None:
             return
 
+        # Song finished (past end, no loop) — stop playback but keep
+        # the cursor where it ended so the user can click the ruler to
+        # reposition before playing again.
+        if not self._sequencer.is_playing:
+            self._on_stop(reset_cursor=False)
+            return
+
         tick = self._sequencer.current_tick
         self._cursor_tick = tick
+        self._structure_panel.set_cursor_tick(tick)
         self._piano_roll.set_playback_tick(tick)
         self._piano_roll.scroll_to_tick(tick)
 
         # Time display
-        from core.sound.audio_engine import OUTPUT_SAMPLE_RATE
         tbs = self._song.tempo_base if self._song.tempo_base else 1
         tpf = self._bpm * tbs / 150.0
         tps = tpf * 59.7275
@@ -445,10 +478,6 @@ class PianoRollWindow(QMainWindow):
             self._time_label.setText(
                 f"{pos_min}:{pos_s:02d} / {tot_min}:{tot_s:02d}  "
                 f"(tick {tick})")
-
-        # Check if stopped (cursor past end and no loop)
-        if not self._sequencer.is_playing:
-            self._on_stop()
 
     # ═══════════════════════════════════════════════════════════════════
     # Toolbar slots
@@ -477,6 +506,24 @@ class PianoRollWindow(QMainWindow):
 
     def _on_snap_changed(self, text: str):
         self._piano_roll.canvas.set_snap(text)
+
+    def _on_bpm_changed(self, value: int):
+        """Update the song's tempo when the user changes the BPM spinbox."""
+        self._bpm = value
+
+        # Update the TEMPO command in track 1 (where tempo lives)
+        if self._song and self._song.tracks:
+            tbs = self._song.tempo_base if self._song.tempo_base else 1
+            for cmd in self._song.tracks[0].commands:
+                if cmd.cmd == 'TEMPO':
+                    cmd.value = value
+                    break
+
+        # Update sequencer playback speed if playing
+        if self._sequencer:
+            self._sequencer.set_bpm(value)
+
+        self._mark_dirty()
 
     def _on_volume(self, value: int):
         if self._sequencer:
@@ -511,6 +558,7 @@ class PianoRollWindow(QMainWindow):
     def _on_structure_changed(self):
         """User edited song structure (sections, loops, etc.)."""
         self._mark_dirty()
+        self._structure_dirty = True
         # Update loop region from the structure panel
         loop_s, loop_e = self._structure_panel.get_loop_region()
         self._piano_roll.canvas._loop_start = loop_s
@@ -748,11 +796,12 @@ class PianoRollWindow(QMainWindow):
 
         Preserves:
         - Mid-song control changes (VOL, PAN, MOD, BEND, TEMPO, etc.)
-        - Loop structure (GOTO/LABEL) — uses the piano roll's loop region
-        - Structural commands (PATT/PEND) from the original song
+        - If the user didn't touch Song Structure: the original file's
+          structure (PATT, GOTO, LABEL, PEND, FINE) is kept intact
+        - If the user DID edit Song Structure: structure is rebuilt from
+          the piano roll's loop region only
         """
         from core.sound.song_writer import notes_to_track_commands
-        from core.sound.song_parser import get_loop_info
         from core.sound.realtime_sequencer import extract_track_play_states
 
         notes = self._piano_roll.canvas.get_notes()
@@ -768,6 +817,20 @@ class PianoRollWindow(QMainWindow):
             volume = ts.volume if ts else 100
             pan = ts.pan if ts else 64
 
+            # Use the ORIGINAL commands from when the song was loaded,
+            # not the current (potentially already-synced) commands.
+            orig_cmds = self._original_track_commands.get(i, [])
+
+            # If the user edited Song Structure, strip structural commands
+            # so only controls remain — loop comes from the piano roll.
+            if self._structure_dirty:
+                _CONTROL_ONLY = {
+                    'VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR',
+                    'LFOS', 'LFODL', 'MODT', 'TUNE', 'TEMPO', 'KEYSH',
+                    'XCMD', 'PRIO',
+                }
+                orig_cmds = [c for c in orig_cmds if c.cmd in _CONTROL_ONLY]
+
             # Determine loop label for this track
             track_loop_label = track.loop_label
             if not track_loop_label and loop_start is not None:
@@ -778,22 +841,36 @@ class PianoRollWindow(QMainWindow):
                 loop_start_tick=loop_start,
                 loop_end_tick=loop_end,
                 loop_label=track_loop_label,
-                original_commands=track.commands,
+                original_commands=orig_cmds,
             )
+
+    def has_unsaved_changes(self) -> bool:
+        return self._is_dirty
 
     def closeEvent(self, event):
         if self._is_dirty:
-            reply = QMessageBox.question(
-                self, "Unsaved Changes",
-                f"'{self._song.label}' has unsaved note edits.\n\n"
-                "These will be saved when you use File → Save.\n"
-                "Close the piano roll anyway?",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+            box = QMessageBox(self)
+            box.setWindowTitle("Unsaved Changes")
+            box.setText(
+                f"'{self._song.label}' has unsaved note edits.")
+            box.setInformativeText(
+                "Do you want to keep your changes for File > Save, "
+                "or discard them?")
+            btn_keep = box.addButton(
+                "Keep && Close", QMessageBox.ButtonRole.AcceptRole)
+            btn_discard = box.addButton(
+                "Discard && Close", QMessageBox.ButtonRole.DestructiveRole)
+            btn_cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(btn_cancel)
+            box.exec()
+
+            clicked = box.clickedButton()
+            if clicked == btn_cancel:
                 event.ignore()
                 return
+            elif clicked == btn_discard:
+                # Reload the song from disk so in-memory edits are thrown away
+                self._discard_changes()
 
         self._on_stop()
         if self._sequencer is not None:
@@ -801,3 +878,22 @@ class PianoRollWindow(QMainWindow):
             self._sequencer = None
         self.closed.emit()
         super().closeEvent(event)
+
+    def _discard_changes(self):
+        """Reload the song's .s file from disk, throwing away all edits."""
+        if not self._song.file_path:
+            return
+        try:
+            from core.sound.song_parser import parse_song_file
+            fresh = parse_song_file(self._song.file_path)
+            # Overwrite the in-memory song object's tracks so the main
+            # window's reference sees the original data, not our edits.
+            self._song.tracks = fresh.tracks
+            self._song.num_tracks = fresh.num_tracks
+            self._song.reverb = fresh.reverb
+            self._song.master_volume = fresh.master_volume
+            self._song.priority = fresh.priority
+            self._song.tempo_base = fresh.tempo_base
+            self._is_dirty = False
+        except Exception:
+            pass  # worst case, edits persist — user can still not save

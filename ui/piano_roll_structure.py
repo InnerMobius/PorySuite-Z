@@ -75,7 +75,12 @@ class SongStructurePanel(QWidget):
         self._items: list[StructureItem] = []
         self._labels: list[str] = []   # available section names
         self._total_ticks: int = 0
+        self._cursor_tick: int = 0     # current playback/ruler position
         self._build_ui()
+
+    def set_cursor_tick(self, tick: int):
+        """Update the cursor position so Add dialogs default to it."""
+        self._cursor_tick = tick
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -155,6 +160,11 @@ class SongStructurePanel(QWidget):
             "Edit the selected item (change target, tick, name).")
         self._btn_edit.clicked.connect(self._on_item_double_clicked)
         btn_row.addWidget(self._btn_edit)
+
+        self._btn_clear = QPushButton("Clear All")
+        self._btn_clear.setToolTip("Remove all structure items at once.")
+        self._btn_clear.clicked.connect(self._clear_all)
+        btn_row.addWidget(self._btn_clear)
         layout.addLayout(btn_row)
 
     # ── Public API ──
@@ -314,7 +324,7 @@ class SongStructurePanel(QWidget):
 
         tick, ok = QInputDialog.getInt(
             self, "Section Position",
-            "Place at tick:", 0, 0, max(1, self._total_ticks))
+            "Place at tick:", self._cursor_tick, 0, max(1, self._total_ticks))
         if not ok:
             return
 
@@ -345,7 +355,7 @@ class SongStructurePanel(QWidget):
 
         tick, ok = QInputDialog.getInt(
             self, "Loop Back Position",
-            "Place Loop Back at tick:", self._total_ticks,
+            "Place Loop Back at tick:", self._cursor_tick,
             0, max(1, self._total_ticks))
         if not ok:
             return
@@ -373,7 +383,7 @@ class SongStructurePanel(QWidget):
 
         tick, ok = QInputDialog.getInt(
             self, "Pattern Call Position",
-            "Insert Pattern Call at tick:", 0,
+            "Insert Pattern Call at tick:", self._cursor_tick,
             0, max(1, self._total_ticks))
         if not ok:
             return
@@ -386,7 +396,7 @@ class SongStructurePanel(QWidget):
     def _add_end_song(self):
         tick, ok = QInputDialog.getInt(
             self, "End Song Position",
-            "End the song at tick:", self._total_ticks,
+            "End the song at tick:", self._cursor_tick,
             0, max(1, self._total_ticks))
         if not ok:
             return
@@ -414,5 +424,19 @@ class SongStructurePanel(QWidget):
             self._labels.remove(item.label)
 
         self._items.remove(item)
+        self._refresh_list()
+        self.structure_changed.emit()
+
+    def _clear_all(self):
+        if not self._items:
+            return
+        reply = QMessageBox.question(
+            self, "Clear All",
+            f"Remove all {len(self._items)} structure items?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._items.clear()
+        self._labels.clear()
         self._refresh_list()
         self.structure_changed.emit()

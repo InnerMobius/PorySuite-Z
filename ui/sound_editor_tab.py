@@ -800,6 +800,18 @@ class SoundEditorTab(QWidget):
             with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
 
+            # Ensure a .mid placeholder exists so the Makefile picks up
+            # this song (MID_OBJS is derived from *.mid wildcard).
+            mid_path = os.path.join(midi_dir, f"{entry.label}.mid")
+            if not os.path.isfile(mid_path):
+                from ui.dialogs.s_file_import_dialog import _SImportWorker
+                with open(mid_path, "wb") as mf:
+                    mf.write(_SImportWorker._make_placeholder_mid())
+                _log.info("Created placeholder .mid for %s", entry.label)
+
+            # Touch the .s so it's newer than the .mid — prevents mid2agb
+            os.utime(dest_path)
+
             # Clear cached parse so it re-reads from disk
             self._all_songs.pop(entry.label, None)
 
@@ -1296,7 +1308,13 @@ class SoundEditorTab(QWidget):
                     1 for inst in vg.instruments
                     if inst.voice_type not in (0x00,) or inst.sample_label
                 )
-                vg_names.append(f"voicegroup{vg.number:03d} ({non_filler} instruments)")
+                label = self._vg_labels.get(name, '')
+                if label:
+                    vg_names.append(
+                        f"voicegroup{vg.number:03d} ({non_filler} instruments) — {label}")
+                else:
+                    vg_names.append(
+                        f"voicegroup{vg.number:03d} ({non_filler} instruments)")
 
         from ui.dialogs.midi_import_dialog import MidiImportDialog
         dlg = MidiImportDialog(self._project_root, vg_names,
@@ -1335,7 +1353,13 @@ class SoundEditorTab(QWidget):
                     1 for inst in vg.instruments
                     if inst.voice_type not in (0x00,) or inst.sample_label
                 )
-                vg_names.append(f"voicegroup{vg.number:03d} ({non_filler} instruments)")
+                label = self._vg_labels.get(name, '')
+                if label:
+                    vg_names.append(
+                        f"voicegroup{vg.number:03d} ({non_filler} instruments) — {label}")
+                else:
+                    vg_names.append(
+                        f"voicegroup{vg.number:03d} ({non_filler} instruments)")
 
         from ui.dialogs.s_file_import_dialog import SFileImportDialog
         dlg = SFileImportDialog(self._project_root, vg_names,

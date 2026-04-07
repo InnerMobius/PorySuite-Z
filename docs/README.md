@@ -41,7 +41,7 @@ On first run, the **Project Selector** window appears. Use **Open Existing Proje
 
 ## Editor Pages
 
-PorySuite-Z has 16 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
+PorySuite-Z has 17 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
 
 ### Pokemon
 
@@ -145,6 +145,10 @@ Three sub-tabs for editing in-game text:
 - **Location Names** -- Region map section names
 - **Key Strings** -- Miscellaneous game strings from `src/strings.c`
 
+### Diagnostics
+
+ROM build diagnostics dashboard. Shows EWRAM/IWRAM/ROM usage bars, section-by-section memory breakdown, build warnings/errors summary, and quick links to problem files. Helps catch memory overflows before they become runtime crashes.
+
 ### Config
 
 Edit build configuration (`config.mk`) and game defines (`include/config.h`). Makefile variables and C preprocessor `#define` values are organized into collapsible section cards with toggle support.
@@ -196,6 +200,7 @@ Edit build configuration (`config.mk`) and game defines (`include/config.h`). Ma
 | Pull from Upstream | Ctrl+Shift+L |
 | Push to Origin | Ctrl+Shift+U |
 | Commit | Ctrl+Shift+K |
+| Configure Remotes... | -- |
 
 All git push and pull operations show a confirmation dialog warning about data that will be overwritten. These cannot be suppressed.
 
