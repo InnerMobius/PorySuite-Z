@@ -74,6 +74,8 @@ class TrackPlayState:
     pan: int = 64         # 0=left, 64=center, 127=right
     key_shift: int = 0
     muted: bool = False
+    bend: float = 0.0     # pitch bend in semitones (from BEND command)
+    bend_range: int = 2   # BENDR: max semitones (default 2)
 
 
 # ---------------------------------------------------------------------------
@@ -154,9 +156,16 @@ class RealtimeSequencer:
         notes the cursor hasn't reached yet.
 
         notes: list of dicts with keys: tick, pitch, duration, velocity, track
+               Control events have an extra 'type' key ('BEND', 'BENDR', 'VOL',
+               'PAN') and are processed to update per-track playback state
+               before notes at the same tick.
         track_states: dict of track_index -> TrackPlayState
         """
-        sorted_notes = sorted(notes, key=lambda n: n['tick'])
+        # Sort by tick, then priority (control events=0 before notes=1)
+        sorted_notes = sorted(
+            notes,
+            key=lambda n: (n['tick'], 0 if 'type' in n else 1),
+        )
         with self._lock:
             self._notes = sorted_notes
             self._track_states = dict(track_states)
@@ -451,6 +460,9 @@ class RealtimeSequencer:
                     self._tick_accumulator = float(self._loop_start)
                     self._note_index = self._find_note_index(self._loop_start)
                     self._active_voices.clear()
+                    # NOTE: Do NOT reset BEND state on loop wrap.
+                    # The real GBA M4A engine carries BEND state through
+                    # loops (GOTO), and the Songs tab renderer does too.
                     continue
 
                 # Queue notes at the current tick for background rendering
@@ -461,9 +473,32 @@ class RealtimeSequencer:
                     self._note_index += 1
 
                     trk = note.get('track', 0)
+                    ts = track_states.get(trk)
+
+                    # Control events: update track state and skip rendering
+                    evt_type = note.get('type')
+                    if evt_type == 'BEND':
+                        if ts:
+                            raw = note.get('value', 64)
+                            ts.bend = (raw - 64) / 64.0 * ts.bend_range
+                        continue
+                    if evt_type == 'BENDR':
+                        if ts:
+                            ts.bend_range = note.get('value', 2)
+                        continue
+                    if evt_type == 'VOL':
+                        if ts:
+                            ts.volume = max(0, min(127, note.get('value', 100)))
+                        continue
+                    if evt_type == 'PAN':
+                        if ts:
+                            ts.pan = max(0, min(127, note.get('value', 64)))
+                        continue
+                    if evt_type:
+                        continue  # unknown control event
+
                     if visible is not None and trk not in visible:
                         continue
-                    ts = track_states.get(trk)
                     if ts and ts.muted:
                         continue
                     self._queue_note(note, ts)
@@ -482,12 +517,15 @@ class RealtimeSequencer:
 
         if ts:
             pitch += ts.key_shift
+            # Apply current pitch bend (BEND command offset in semitones)
+            pitch += round(ts.bend)
         pitch = max(0, min(127, pitch))
 
         # Convert duration ticks to samples.
-        # Cap at ~4 seconds to avoid long renders.
+        # Cap at 60 seconds — TIE notes in slow songs can sustain for
+        # very long periods (e.g. a sustained bass at 50 BPM).
         duration_samples = max(1, int(duration_ticks * self._samples_per_tick))
-        duration_samples = min(duration_samples, OUTPUT_SAMPLE_RATE * 4)
+        duration_samples = min(duration_samples, OUTPUT_SAMPLE_RATE * 60)
         release_samples = min(2048, duration_samples)
 
         track_vol = (ts.volume / 127.0) if ts else 1.0

@@ -69,6 +69,27 @@ def _pitch_name(midi_note: int) -> str:
     return MIDI_TO_NAME.get(midi_note, f'Cn3')
 
 
+def _raw_vol(value: int, master_volume: int) -> int:
+    """Reverse the VOL evaluation: value was parsed as raw*mvl/mxv.
+
+    The parser evaluates 127*mvl/mxv → ~90. If we write 90*mvl/mxv,
+    the assembler would get ~63 — wrong. We need to recover the original
+    raw value (127) so the round-trip is lossless.
+    """
+    mvl = max(1, master_volume)
+    return min(127, round(value * MXV / mvl))
+
+
+def _raw_tempo(value: int, tempo_base: int) -> int:
+    """Reverse the TEMPO evaluation: value was parsed as raw*tbs/2.
+
+    The parser evaluates 50*1/2 → 25. If we write 25*tbs/2 the assembler
+    gets 12. We recover the original raw value (50).
+    """
+    tbs = max(1, tempo_base or 1)
+    return round(value * 2 / tbs)
+
+
 # ---------------------------------------------------------------------------
 # Track writer
 # ---------------------------------------------------------------------------
@@ -154,13 +175,14 @@ def _write_track_raw(track: Track, song: SongData) -> list[str]:
         elif cmd.cmd == 'VOICE':
             lines.append(f'\t.byte\tVOICE , {cmd.value}')
         elif cmd.cmd == 'VOL':
-            lines.append(f'\t.byte\tVOL   , {cmd.value}*{song.label}_mvl/mxv')
+            raw_v = _raw_vol(cmd.value or 100, song.master_volume)
+            lines.append(f'\t.byte\tVOL   , {raw_v}*{song.label}_mvl/mxv')
         elif cmd.cmd == 'PAN':
             pan_offset = (cmd.value or 64) - C_V
             lines.append(f'\t.byte\tPAN   , c_v{pan_offset:+d}')
         elif cmd.cmd == 'TEMPO':
-            tempo_val = (cmd.value or 120) * (song.tempo_base or 1) // 2
-            lines.append(f'\t.byte\tTEMPO , {tempo_val}*{song.label}_tbs/2')
+            raw_t = _raw_tempo(cmd.value or 120, song.tempo_base)
+            lines.append(f'\t.byte\tTEMPO , {raw_t}*{song.label}_tbs/2')
         elif cmd.cmd == 'MOD':
             lines.append(f'\t.byte\tMOD   , {cmd.value or 0}')
         elif cmd.cmd == 'BEND':
@@ -237,12 +259,13 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
         if cmd.raw_line:
             lines.append(cmd.raw_line.rstrip())
         elif cmd.cmd == 'TEMPO':
-            tempo_val = (cmd.value or 120) * (song.tempo_base or 1) // 2
-            lines.append(f'\t.byte\tTEMPO , {tempo_val}*{prefix}_tbs/2')
+            raw_t = _raw_tempo(cmd.value or 120, song.tempo_base)
+            lines.append(f'\t.byte\tTEMPO , {raw_t}*{prefix}_tbs/2')
         elif cmd.cmd == 'VOICE':
             lines.append(f'\t.byte\tVOICE , {cmd.value}')
         elif cmd.cmd == 'VOL':
-            lines.append(f'\t.byte\tVOL   , {cmd.value}*{prefix}_mvl/mxv')
+            raw_v = _raw_vol(cmd.value or 100, song.master_volume)
+            lines.append(f'\t.byte\tVOL   , {raw_v}*{prefix}_mvl/mxv')
         elif cmd.cmd == 'PAN':
             pan_offset = (cmd.value or 64) - C_V
             lines.append(f'\t.byte\tPAN   , c_v{pan_offset:+d}')
@@ -398,7 +421,8 @@ def _format_control(cmd: TrackCommand, song: SongData) -> list[str]:
     if cmd.cmd == 'VOICE':
         return [f'\t.byte\tVOICE , {cmd.value}']
     elif cmd.cmd == 'VOL':
-        return [f'\t.byte\tVOL   , {cmd.value}*{song.label}_mvl/mxv']
+        raw_v = _raw_vol(cmd.value or 100, song.master_volume)
+        return [f'\t.byte\tVOL   , {raw_v}*{song.label}_mvl/mxv']
     elif cmd.cmd == 'PAN':
         pan_offset = (cmd.value or 64) - C_V
         return [f'\t.byte\tPAN   , c_v{pan_offset:+d}']
@@ -472,6 +496,7 @@ def notes_to_track_commands(
     # VOL/PAN/MOD/BEND/TEMPO changes that the piano roll doesn't edit)
     control_events: list[TrackCommand] = []
     structure_events: list[TrackCommand] = []
+    has_patt_structure = False  # True if original uses PATT/PEND subroutines
     if original_commands:
         # Filter out redundant consecutive control commands (same cmd + value)
         _seen_control: dict[str, int] = {}
@@ -485,26 +510,45 @@ def notes_to_track_commands(
                 control_events.append(cmd)
             elif cmd.cmd in _STRUCTURE_CMDS:
                 structure_events.append(cmd)
+                if cmd.cmd in ('PATT', 'PEND'):
+                    has_patt_structure = True
 
-    # If original had structural commands (PATT/GOTO), keep them
-    has_orig_structure = bool(structure_events)
+    # PATT/PEND subroutines CANNOT survive the flatten→edit→save round-trip.
+    # The piano roll flattens all PATT calls into expanded linear notes.
+    # Trying to mix those flattened notes back into the PATT structure
+    # produces garbage (notes after FINE, broken subroutine boundaries).
+    # When PATT/PEND exist, we MUST strip them and write a fully linear track.
+    # Simple GOTO loops (no subroutines) are safe to preserve.
+    if has_patt_structure:
+        # Strip ALL structure — will be written as linear with FINE at end
+        structure_events = [
+            c for c in structure_events
+            if c.cmd == 'GOTO'  # keep GOTO if present (rare with PATT)
+        ]
+
+    has_orig_structure = bool(structure_events) and not has_patt_structure
 
     commands: list[TrackCommand] = []
     current_tick = 0
 
-    # Setup commands — use original control commands at tick 0 if available
+    # Setup commands — VOICE, VOL, PAN always come from the caller's
+    # parameters (which reflect the user's sidebar edits), NOT from the
+    # original file's tick-0 commands. Other tick-0 controls (KEYSH,
+    # TEMPO, MOD, etc.) are preserved from the original.
     tick0_controls = {c.cmd: c for c in control_events if c.tick == 0}
     commands.append(tick0_controls.pop('KEYSH', TrackCommand(
         cmd='KEYSH', tick=0, value=0)))
     if 'TEMPO' in tick0_controls:
         commands.append(tick0_controls.pop('TEMPO'))
-    commands.append(tick0_controls.pop('VOICE', TrackCommand(
-        cmd='VOICE', tick=0, value=voice)))
-    commands.append(tick0_controls.pop('VOL', TrackCommand(
-        cmd='VOL', tick=0, value=volume)))
-    if pan != 64 or 'PAN' in tick0_controls:
-        commands.append(tick0_controls.pop('PAN', TrackCommand(
-            cmd='PAN', tick=0, value=pan)))
+    # Discard any original VOICE/VOL/PAN at tick 0 — use the caller's
+    # values instead (these reflect the user's current sidebar settings)
+    tick0_controls.pop('VOICE', None)
+    tick0_controls.pop('VOL', None)
+    tick0_controls.pop('PAN', None)
+    commands.append(TrackCommand(cmd='VOICE', tick=0, value=voice))
+    commands.append(TrackCommand(cmd='VOL', tick=0, value=volume))
+    if pan != 64:
+        commands.append(TrackCommand(cmd='PAN', tick=0, value=pan))
     if 'MOD' in tick0_controls:
         commands.append(tick0_controls.pop('MOD'))
 
@@ -535,8 +579,11 @@ def notes_to_track_commands(
     # Priority: 0=label, 1=control, 2=note, 3=structure(goto/fine)
     timeline = []
 
-    # Add loop start label
-    if loop_start_tick is not None and loop_label:
+    # Add loop start label — but only if the original didn't already have
+    # structural commands (PATT/GOTO/LABEL).  When the original structure
+    # is preserved, its labels are already in all_structure and adding a
+    # new one would create a duplicate label that breaks assembly.
+    if loop_start_tick is not None and loop_label and not has_orig_structure:
         timeline.append((loop_start_tick, 0, TrackCommand(
             cmd='LABEL', tick=loop_start_tick,
             target_label=loop_label)))
@@ -545,15 +592,27 @@ def notes_to_track_commands(
     for cmd in mid_controls:
         timeline.append((cmd.tick, 1, cmd))
 
-    # Add notes
+    # Add notes — long notes (>96 ticks) are split into TIE + EOT so that
+    # control events (PAN sweeps, BEND, etc.) interleave naturally between
+    # them via the gap-based WAIT generation below.
     for note in track_notes:
         tick = note['tick']
         pitch = note.get('pitch', 60)
         duration = note.get('duration', 24)
         velocity = note.get('velocity', 100)
-        timeline.append((tick, 2, TrackCommand(
-            cmd='NOTE', tick=tick,
-            duration=duration, pitch=pitch, velocity=velocity)))
+
+        if duration > 96:
+            # Split into separate TIE and EOT timeline entries.
+            # Control events between these ticks will be interleaved
+            # with proper WAIT timing by the gap-based emit loop.
+            timeline.append((tick, 2, TrackCommand(
+                cmd='TIE', tick=tick, pitch=pitch, velocity=velocity)))
+            timeline.append((tick + duration, 2, TrackCommand(
+                cmd='EOT', tick=tick + duration, pitch=pitch)))
+        else:
+            timeline.append((tick, 2, TrackCommand(
+                cmd='NOTE', tick=tick,
+                duration=duration, pitch=pitch, velocity=velocity)))
 
     # Add structural commands from original
     for cmd in all_structure:
@@ -567,7 +626,18 @@ def notes_to_track_commands(
     # Sort by tick, then priority
     timeline.sort(key=lambda x: (x[0], x[1]))
 
-    # Emit the timeline
+    # Emit the timeline.
+    #
+    # Key design: WAITs are generated ONLY from tick gaps between timeline
+    # events — notes do NOT auto-emit a WAIT for their duration. This lets
+    # control events (PAN, BEND, etc.) that fall mid-note be placed at
+    # their correct tick positions with proper WAITs around them.
+    #
+    # For a note at tick 0 (dur=48) followed by a note at tick 48:
+    #   gap=48 → WAIT(48) before the second note.  Same result as before.
+    #
+    # For TIE at tick 0 with PAN@2, PAN@4, ..., EOT@100:
+    #   TIE, W02, PAN, W02, PAN, ..., W02, EOT.  Properly interleaved.
     has_goto = False
     has_fine = False
     for tick, priority, cmd in timeline:
@@ -583,22 +653,13 @@ def notes_to_track_commands(
             current_tick += gap
 
         if cmd.cmd == 'NOTE':
-            duration = cmd.duration or 24
-            if duration > 96:
-                # Note exceeds max N96 — use TIE + waits + EOT
-                commands.append(TrackCommand(
-                    cmd='TIE', tick=current_tick,
-                    pitch=cmd.pitch, velocity=cmd.velocity))
-                commands.append(TrackCommand(
-                    cmd='WAIT', tick=current_tick, duration=duration))
-                current_tick += duration
-                commands.append(TrackCommand(
-                    cmd='EOT', tick=current_tick, pitch=cmd.pitch))
-            else:
-                commands.append(cmd)
-                commands.append(TrackCommand(
-                    cmd='WAIT', tick=current_tick, duration=duration))
-                current_tick += duration
+            commands.append(cmd)
+            # Don't auto-emit WAIT — the gap to the next event handles it
+        elif cmd.cmd == 'TIE':
+            commands.append(cmd)
+            # Gaps to interleaved control events generate the WAITs
+        elif cmd.cmd == 'EOT':
+            commands.append(cmd)
         elif cmd.cmd in ('GOTO', 'PATT', 'PEND', 'FINE'):
             commands.append(cmd)
             if cmd.cmd == 'GOTO':

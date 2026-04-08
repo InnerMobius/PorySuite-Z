@@ -46,8 +46,11 @@ class _InAppBuildDialog(QDialog):
                  env_extra: dict | None = None, parent=None):
         super().__init__(parent)
         # Window flag gives this dialog its own taskbar entry so the user
-        # can switch to it without alt-tabbing.
-        self.setWindowFlag(Qt.WindowType.Window)
+        # can switch to it without alt-tabbing.  WindowStaysOnTopHint keeps
+        # it visible even when the user clicks the main window behind it.
+        self.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint
+        )
         self.setWindowTitle(title)
         self.setMinimumSize(700, 420)
         self.setSizeGripEnabled(True)

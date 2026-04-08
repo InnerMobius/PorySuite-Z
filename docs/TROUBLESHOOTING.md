@@ -64,6 +64,15 @@ Fixed (2026-04-07). Notes longer than 96 ticks (4 beats at 24 ticks/beat) were s
 ### Piano roll Mute/Solo buttons hidden behind scrollbar
 Fixed (2026-04-07). The track sidebar was 220px wide, and when the vertical scrollbar appeared (6+ tracks), it covered the M and S buttons on each track row. Sidebar widened to 240px.
 
+### Piano roll save corrupts songs with PATT subroutines (broken structure, missing notes, wrong instruments)
+Fixed (2026-04-08). Songs using PATT/PEND subroutine calls (mid2agb's way of compressing repeated sections) were destroyed by the piano roll save — notes went missing, instruments changed, dead code appeared after FINE. Root cause: the save tried to insert flattened notes back into the PATT structure, which is impossible. Fix: PATT/PEND are stripped on save and the track is written as a clean linear sequence. The music content is identical, just represented differently (explicit repetitions instead of subroutine calls).
+
+### Piano roll save halves volume every time you save
+Fixed (2026-04-08). Volume dropped from 90 to 63 to 44 on successive saves. The parser evaluated `127*mvl/mxv` to get the byte value (89), but the writer wrote `89*mvl/mxv` — applying the multiplier again. Same issue with TEMPO. Fix: reverse-evaluation helpers recover the original raw value before writing.
+
+### Piano roll BEND effects stop working after the song loops
+Fixed (2026-04-08). The piano roll sequencer was resetting pitch bend state to zero every time the playback looped. The real GBA engine doesn't do this — BEND state carries through GOTO loops. Now the piano roll matches the GBA behavior.
+
 ### Settings dialog looks different
 The settings dialog was rebuilt with a sidebar. All your old settings (diagnostics, notification preferences) are still there under the same INI keys. Autosave and Porymap path settings were removed (they were dead code that never did anything).
 

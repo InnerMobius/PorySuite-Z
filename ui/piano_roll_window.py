@@ -344,7 +344,7 @@ class PianoRollWindow(QMainWindow):
         if self._sequencer is None:
             return
         from core.sound.realtime_sequencer import extract_track_play_states
-        notes = self._piano_roll.canvas.get_notes()
+        notes = self._piano_roll.canvas.get_sequencer_events()
         track_states = extract_track_play_states(self._song)
 
         # Apply mute/solo
@@ -604,12 +604,20 @@ class PianoRollWindow(QMainWindow):
 
     def _on_track_instrument(self, track_index: int, voice_slot: int):
         """User changed the instrument for a track via the sidebar spinner."""
+        import traceback, os, time
+        log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'voice_debug.log')
+        with open(log_path, 'a', encoding='utf-8') as _f:
+            _f.write(f"[{time.strftime('%H:%M:%S')}] _on_track_instrument: track={track_index} voice={voice_slot}\n")
+            traceback.print_stack(limit=8, file=_f)
+            _f.write('\n')
         if 0 <= track_index < len(self._song.tracks):
             track = self._song.tracks[track_index]
             # Update the VOICE command in the track
             found = False
             for cmd in track.commands:
                 if cmd.cmd == 'VOICE':
+                    with open(log_path, 'a', encoding='utf-8') as _f:
+                        _f.write(f"  overwriting VOICE {cmd.value} -> {voice_slot}\n")
                     cmd.value = voice_slot
                     found = True
                     break
@@ -626,11 +634,33 @@ class PianoRollWindow(QMainWindow):
         """User changed a track's volume slider."""
         if self._sequencer is not None:
             self._sequencer.set_track_volume(track_index, volume)
+        # Also persist in song data so save captures it
+        if 0 <= track_index < len(self._song.tracks):
+            track = self._song.tracks[track_index]
+            for cmd in track.commands:
+                if cmd.cmd == 'VOL':
+                    cmd.value = volume
+                    break
+            self._mark_dirty()
 
     def _on_track_pan(self, track_index: int, pan: int):
         """User changed a track's pan slider."""
         if self._sequencer is not None:
             self._sequencer.set_track_pan(track_index, pan)
+        # Also persist in song data so save captures it
+        if 0 <= track_index < len(self._song.tracks):
+            track = self._song.tracks[track_index]
+            found = False
+            for cmd in track.commands:
+                if cmd.cmd == 'PAN':
+                    cmd.value = pan
+                    found = True
+                    break
+            if not found:
+                from core.sound.song_parser import TrackCommand
+                track.commands.insert(0, TrackCommand(
+                    cmd='PAN', tick=0, value=pan, raw_line=''))
+            self._mark_dirty()
 
     def _on_voicegroup_changed(self, vg_display: str):
         """User picked a different voicegroup from the sidebar combo."""
@@ -802,6 +832,7 @@ class PianoRollWindow(QMainWindow):
           the piano roll's loop region only
         """
         from core.sound.song_writer import notes_to_track_commands
+        from core.sound.song_parser import TrackCommand
         from core.sound.realtime_sequencer import extract_track_play_states
 
         notes = self._piano_roll.canvas.get_notes()
@@ -811,15 +842,33 @@ class PianoRollWindow(QMainWindow):
         loop_start = self._piano_roll.canvas._loop_start
         loop_end = self._piano_roll.canvas._loop_end
 
+        # Get user-edited control events from the canvas (BEND/BENDR/VOL/PAN)
+        canvas_controls = self._piano_roll.canvas._control_events
+
+        # Group canvas control events by track
+        _canvas_by_track: dict[int, list[dict]] = {}
+        for evt in canvas_controls:
+            trk = evt.get('track', 0)
+            _canvas_by_track.setdefault(trk, []).append(evt)
+
+        _EDITABLE_CTRL = {'BEND', 'BENDR', 'VOL', 'PAN'}
+
+        import os, time as _time
+        _log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'voice_debug.log')
+        with open(_log_path, 'a', encoding='utf-8') as _f:
+            _f.write(f"\n[{_time.strftime('%H:%M:%S')}] === SAVE START ===\n")
+
         for i, track in enumerate(self._song.tracks):
             ts = track_states.get(i)
             voice = ts.voice if ts else 0
             volume = ts.volume if ts else 100
             pan = ts.pan if ts else 64
+            with open(_log_path, 'a', encoding='utf-8') as _f:
+                _f.write(f"  Track {i}: voice={voice} vol={volume} pan={pan}\n")
 
             # Use the ORIGINAL commands from when the song was loaded,
             # not the current (potentially already-synced) commands.
-            orig_cmds = self._original_track_commands.get(i, [])
+            orig_cmds = list(self._original_track_commands.get(i, []))
 
             # If the user edited Song Structure, strip structural commands
             # so only controls remain — loop comes from the piano roll.
@@ -830,6 +879,24 @@ class PianoRollWindow(QMainWindow):
                     'XCMD', 'PRIO',
                 }
                 orig_cmds = [c for c in orig_cmds if c.cmd in _CONTROL_ONLY]
+
+            # Replace editable control events (BEND/BENDR/VOL/PAN) with
+            # the canvas's version — this includes user edits from the
+            # Note Properties dialog.
+            if i in _canvas_by_track:
+                # Strip original BEND/BENDR mid-song events (tick > 0)
+                # Keep tick-0 setup and non-editable controls intact
+                orig_cmds = [
+                    c for c in orig_cmds
+                    if not (c.cmd in _EDITABLE_CTRL and c.tick > 0)
+                ]
+                # Add canvas control events as TrackCommands
+                for evt in _canvas_by_track[i]:
+                    orig_cmds.append(TrackCommand(
+                        cmd=evt['type'],
+                        tick=evt['tick'],
+                        value=evt.get('value', 64),
+                    ))
 
             # Determine loop label for this track
             track_loop_label = track.loop_label

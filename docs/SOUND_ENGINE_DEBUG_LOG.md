@@ -90,6 +90,26 @@ Purpose: prevent re-investigating solved problems and avoid regressions from bad
 
 ---
 
+### 13. Piano roll BEND state reset on loop (2026-04-08)
+- **Problem**: Pitch bend effects stopped working after the piano roll looped
+- **Root cause**: `realtime_sequencer.py` explicitly reset `ts.bend = 0.0` for all tracks on every loop wrap
+- **Fix**: Removed the reset. The real GBA M4A engine carries BEND state through GOTO loops (the Songs tab track_renderer.py already did this correctly with its single persistent TrackState object)
+- **Verified**: BEND effects persist through loop boundaries, matching GBA behavior
+
+### 14. Piano roll save PATT corruption (2026-04-08)
+- **Problem**: Songs with PATT/PEND subroutines were destroyed on save — notes missing, wrong instruments, dead code after FINE
+- **Root cause**: Save tried to mix flattened notes (expanded from PATT calls) back into original PATT/PEND structure. Impossible — produced broken subroutine boundaries.
+- **Fix**: `notes_to_track_commands` in song_writer.py now strips PATT/PEND entirely and writes fully linear tracks. PATT cannot survive the flatten→edit→save round-trip.
+- **Verified**: MUS_EVIL round-trips correctly — 205 notes, correct instruments, correct volumes
+
+### 15. VOL/TEMPO double-evaluation on save (2026-04-08)
+- **Problem**: Volume halved every save cycle (127→89→63→44...). TEMPO similarly degraded.
+- **Root cause**: Parser evaluates `127*mvl/mxv` → 89 (byte value). Writer wrote `89*mvl/mxv` — applying the multiplier again.
+- **Fix**: Added `_raw_vol()` and `_raw_tempo()` in song_writer.py that reverse the evaluation. All 5 VOL and 2 TEMPO write sites use them.
+- **Verified**: `127*mvl/mxv` round-trips perfectly. Minor ±1 rounding on non-127 values due to integer truncation.
+
+---
+
 ## Answered Questions
 
 - **What does TONEDATA_TYPE_FIX do for CGB vs DirectSound?** — DirectSound: fixed mixer step (0x800000), plays at native rate. CGB: minor frequency rounding in CgbSound() for anti-aliasing only. Noise (_alt): zero effect (CgbSound checks `ch < 4`). See item 13 above.

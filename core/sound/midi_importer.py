@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
@@ -184,9 +185,14 @@ class Mid2AgbSettings:
 
 def _find_mid2agb(project_root: str) -> Optional[str]:
     """Locate the mid2agb executable in the project."""
+    if sys.platform == "win32":
+        # Windows: only consider .exe — the extensionless file is a Linux ELF
+        p = os.path.join(project_root, "tools", "mid2agb", "mid2agb.exe")
+        return p if os.path.isfile(p) else None
+    # Linux / macOS
     candidates = [
-        os.path.join(project_root, "tools", "mid2agb", "mid2agb.exe"),
         os.path.join(project_root, "tools", "mid2agb", "mid2agb"),
+        os.path.join(project_root, "tools", "mid2agb", "mid2agb.exe"),
     ]
     for c in candidates:
         if os.path.isfile(c):
@@ -271,16 +277,22 @@ def run_mid2agb(
 
 # ── Song registration ──────────────────────────────────────────────────────
 
-def _next_constant_index(songs_h_path: str) -> int:
-    """Find the next available index for a new song constant in songs.h."""
-    max_idx = -1
-    if os.path.isfile(songs_h_path):
-        with open(songs_h_path, encoding="utf-8") as f:
+def _next_constant_index(project_root: str) -> int:
+    """Find the next available index by counting entries in song_table.inc.
+
+    This is authoritative — song_table.inc defines the actual order, and
+    the index in songs.h must match the position in the table.  Scanning
+    songs.h for the max #define is unreliable because stale constants
+    from deleted songs can inflate the number.
+    """
+    table_path = os.path.join(project_root, "sound", "song_table.inc")
+    count = 0
+    if os.path.isfile(table_path):
+        with open(table_path, encoding="utf-8") as f:
             for line in f:
-                m = re.match(r'#define\s+(?:MUS|SE)_\w+\s+(\d+)', line)
-                if m:
-                    max_idx = max(max_idx, int(m.group(1)))
-    return max_idx + 1
+                if line.strip().startswith("song "):
+                    count += 1
+    return count
 
 
 def register_song(
@@ -310,7 +322,7 @@ def register_song(
     if not os.path.isfile(songs_h):
         return False, "include/constants/songs.h not found"
 
-    next_idx = _next_constant_index(songs_h)
+    next_idx = _next_constant_index(project_root)
 
     with open(songs_h, encoding="utf-8") as f:
         content = f.read()
@@ -427,6 +439,15 @@ def import_midi(
     # Step 1: Run mid2agb
     ok, s_path, err = run_mid2agb(project_root, midi_path, label, settings)
     if not ok:
+        # Clean up the .mid copy so a failed import doesn't leave orphan files
+        # that break the build system
+        midi_dir = os.path.join(project_root, "sound", "songs", "midi")
+        midi_copy = os.path.join(midi_dir, os.path.basename(midi_path))
+        if os.path.isfile(midi_copy):
+            try:
+                os.remove(midi_copy)
+            except OSError:
+                pass
         result.error = err
         return result
 

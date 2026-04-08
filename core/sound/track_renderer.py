@@ -343,9 +343,29 @@ def render_track(
             current_tempo = (cmd.value * 2) // max(tbs, 1)
             state.tempo = current_tempo
 
-        elif cmd.cmd == 'NOTE':
+        elif cmd.cmd in ('NOTE', 'TIE'):
             if cmd.pitch is None:
                 continue
+
+            # For TIE commands, compute duration by finding the matching EOT
+            if cmd.cmd == 'TIE':
+                tie_duration = 0
+                cmd_idx = flat_cmds.index(cmd)
+                for fc in flat_cmds[cmd_idx + 1:]:
+                    if fc.cmd == 'EOT' and (fc.pitch is None or fc.pitch == cmd.pitch):
+                        tie_duration = fc.tick - cmd.tick
+                        break
+                    if fc.cmd == 'TIE' and fc.pitch == cmd.pitch:
+                        tie_duration = fc.tick - cmd.tick
+                        break
+                    if fc.cmd in ('FINE', 'GOTO'):
+                        tie_duration = fc.tick - cmd.tick
+                        break
+                if tie_duration <= 0:
+                    tie_duration = 96
+                note_duration = tie_duration
+            else:
+                note_duration = cmd.duration
 
             midi_note = cmd.pitch + state.key_shift
 
@@ -368,7 +388,7 @@ def render_track(
             # then scale the rendered output by track volume.
             track_vol_scale = state.volume / 127.0
 
-            note_samples = ticks_to_samples(cmd.duration, current_tempo, tbs)
+            note_samples = ticks_to_samples(note_duration, current_tempo, tbs)
             if note_samples <= 0:
                 continue
 

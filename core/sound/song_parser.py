@@ -119,6 +119,62 @@ _RE_GLOBAL = re.compile(r'\.global\s+(\w+)')
 _RE_FOOTER_BYTE = re.compile(r'\.byte\s+(\d+)\s+@\s*NumTrks')
 
 
+def extract_tie_notes(track) -> list[dict]:
+    """Extract note dicts from TIE/EOT pairs WITHOUT modifying the track.
+
+    mid2agb uses TIE to start a sustained note and EOT to end it.  This
+    function reads TIE/EOT pairs and returns them as note dicts compatible
+    with the piano roll's note format, leaving track.commands untouched
+    so the song writer can round-trip the original assembly faithfully.
+
+    Returns list of dicts with keys: tick, pitch, duration, velocity.
+    (Caller must add the 'track' key.)
+    """
+    cmds = track.commands
+    notes = []
+    used_eots: set[int] = set()
+
+    for i, cmd in enumerate(cmds):
+        if cmd.cmd != 'TIE' or cmd.pitch is None:
+            continue
+
+        tie_tick = cmd.tick
+        tie_pitch = cmd.pitch
+        tie_velocity = cmd.velocity
+
+        # Search forward for the matching EOT
+        eot_tick = None
+        for j in range(i + 1, len(cmds)):
+            if j in used_eots:
+                continue
+            other = cmds[j]
+            if other.cmd == 'EOT':
+                if other.pitch is None or other.pitch == tie_pitch:
+                    eot_tick = other.tick
+                    used_eots.add(j)
+                    break
+            if other.cmd == 'TIE' and other.pitch == tie_pitch:
+                eot_tick = other.tick
+                break
+            if other.cmd in ('FINE', 'GOTO'):
+                eot_tick = other.tick
+                break
+
+        if eot_tick is not None and eot_tick > tie_tick:
+            duration = eot_tick - tie_tick
+        else:
+            duration = 96
+
+        notes.append({
+            'tick': tie_tick,
+            'pitch': tie_pitch,
+            'duration': duration,
+            'velocity': tie_velocity if tie_velocity else 100,
+        })
+
+    return notes
+
+
 def parse_song_file(filepath: str) -> SongData:
     """Parse a single .s song file into a SongData structure."""
     with open(filepath, 'r', encoding='utf-8') as f:
@@ -503,6 +559,7 @@ def parse_song_file(filepath: str) -> SongData:
     if current_track is not None and not in_footer:
         tracks.append(current_track)
 
+    # --- Post-process: convert TIE/EOT pairs into NOTE commands ---
     song.tracks = tracks
     if not song.num_tracks:
         song.num_tracks = len(tracks)

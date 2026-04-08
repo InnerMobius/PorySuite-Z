@@ -535,9 +535,9 @@ class MidiImportDialog(QDialog):
         layout = QVBoxLayout(page)
 
         layout.addWidget(QLabel(
-            "Each MIDI track uses a General MIDI instrument number.\n"
-            "mid2agb will use that same number as the voicegroup slot.\n"
-            "You can remap any track to a different slot if needed."
+            "Each MIDI track uses a General MIDI instrument.\n"
+            "Pick which voicegroup instrument each track should use.\n"
+            "The Auto-Match button tries to find the best match by name."
         ))
 
         self._mapping_info = QLabel("")
@@ -552,12 +552,11 @@ class MidiImportDialog(QDialog):
         self._mapping_layout.setColumnStretch(0, 0)   # Channel
         self._mapping_layout.setColumnStretch(1, 2)   # MIDI says
         self._mapping_layout.setColumnStretch(2, 0)   # Arrow
-        self._mapping_layout.setColumnStretch(3, 2)   # VG slot picker
-        self._mapping_layout.setColumnStretch(4, 2)   # VG instrument name
+        self._mapping_layout.setColumnStretch(3, 3)   # VG Instrument picker
 
         # Headers
         for col, text in enumerate(["Ch", "MIDI Instrument", "",
-                                     "VG Slot", "VG Instrument"]):
+                                     "VG Instrument"]):
             lbl = QLabel(f"<b>{text}</b>")
             self._mapping_layout.addWidget(lbl, 0, col)
 
@@ -624,43 +623,47 @@ class MidiImportDialog(QDialog):
             arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._mapping_layout.addWidget(arrow, row, 2)
 
-            # VG slot spinner
-            slot_spin = QSpinBox()
-            slot_spin.setRange(0, 127)
+            # VG slot dropdown — shows instrument names instead of raw numbers
+            slot_combo = QComboBox()
+            slot_combo.setMaxVisibleItems(20)
+            slot_combo.setMinimumWidth(250)
+            install_scroll_guard(slot_combo)
+
+            # Populate with instrument names from the voicegroup
+            for idx in range(128):
+                if vg_instruments and idx < len(vg_instruments):
+                    inst = vg_instruments[idx]
+                    if _is_filler(inst):
+                        label = f"{idx}: (empty)"
+                    else:
+                        label = f"{idx}: {inst.friendly_name}"
+                else:
+                    label = f"{idx}: (unknown)"
+                slot_combo.addItem(label, idx)
+
+            # Color-code the items: red for filler, green for real instruments
+            for idx in range(slot_combo.count()):
+                if vg_instruments and idx < len(vg_instruments):
+                    inst = vg_instruments[idx]
+                    if _is_filler(inst):
+                        slot_combo.setItemData(
+                            idx, QColor("#c44"), Qt.ItemDataRole.ForegroundRole)
+                    else:
+                        slot_combo.setItemData(
+                            idx, QColor("#6a6"), Qt.ItemDataRole.ForegroundRole)
+
             if t.is_drums:
-                slot_spin.setValue(0)
-                slot_spin.setToolTip("Drums — mid2agb maps drum hits by note number")
+                slot_combo.setCurrentIndex(0)
+                slot_combo.setToolTip("Drums — mid2agb maps drum hits by note number")
             else:
-                slot_spin.setValue(max(0, min(127, t.instrument_num)))
-                slot_spin.setToolTip(
+                slot_combo.setCurrentIndex(max(0, min(127, t.instrument_num)))
+                slot_combo.setToolTip(
                     f"Which slot in the voicegroup to use for this track.\n"
                     f"Default: {t.instrument_num} (same as the MIDI program number).")
 
-            # VG instrument name label (updates when spinner changes)
-            vg_name_label = QLabel("")
-            vg_name_label.setStyleSheet("color: #888;")
+            self._mapping_layout.addWidget(slot_combo, row, 3)
 
-            def _on_slot_changed(val, lbl=vg_name_label):
-                insts = self._get_selected_vg_instruments()
-                if insts and 0 <= val < len(insts):
-                    inst = insts[val]
-                    if _is_filler(inst):
-                        lbl.setText("(filler / empty)")
-                        lbl.setStyleSheet("color: #c44;")
-                    else:
-                        lbl.setText(inst.friendly_name)
-                        lbl.setStyleSheet("color: #6a6;")
-                else:
-                    lbl.setText("(unknown)")
-                    lbl.setStyleSheet("color: #888;")
-
-            slot_spin.valueChanged.connect(_on_slot_changed)
-            _on_slot_changed(slot_spin.value())  # initial
-
-            self._mapping_layout.addWidget(slot_spin, row, 3)
-            self._mapping_layout.addWidget(vg_name_label, row, 4)
-
-            self._mapping_combos.append((t.instrument_num, slot_spin))
+            self._mapping_combos.append((t.instrument_num, slot_combo))
             row += 1
 
         if self._midi_info.tracks:
@@ -787,7 +790,7 @@ class MidiImportDialog(QDialog):
                         best_score = overlap + 2
                         best_slot = slot_idx
 
-            spin.setValue(best_slot)
+            spin.setCurrentIndex(best_slot)
 
     # ── Page 3: Song Structure & Loop Points ───────────────────────────
 
@@ -1340,9 +1343,9 @@ class MidiImportDialog(QDialog):
 
         # Build voice remap from the mapping page
         voice_remap = {}
-        for gm_num, spin in self._mapping_combos:
-            if gm_num >= 0 and spin.value() != gm_num:
-                voice_remap[gm_num] = spin.value()
+        for gm_num, combo in self._mapping_combos:
+            if gm_num >= 0 and combo.currentIndex() != gm_num:
+                voice_remap[gm_num] = combo.currentIndex()
 
         # Loop / structure config
         loop_config = {
@@ -1384,8 +1387,8 @@ class MidiImportDialog(QDialog):
             constant = self._name_edit.text().strip()
 
             # Count remapped instruments
-            remap_count = sum(1 for gm, spin in self._mapping_combos
-                              if gm >= 0 and spin.value() != gm)
+            remap_count = sum(1 for gm, combo in self._mapping_combos
+                              if gm >= 0 and combo.currentIndex() != gm)
 
             self._progress_label.setText("Import successful!")
             self._progress_label.setStyleSheet("color: #6a6; font-size: 12px;")

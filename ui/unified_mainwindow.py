@@ -262,15 +262,6 @@ class UnifiedMainWindow(QMainWindow):
         # ── File ─────────────────────────────────────────────────────────────
         file_menu = menubar.addMenu("&File")
 
-        open_action = QAction("&Open Project...", self)
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self._open_project_dialog)
-        file_menu.addAction(open_action)
-
-        self._recent_menu = file_menu.addMenu("Recent Projects")
-
-        file_menu.addSeparator()
-
         save_action = QAction("Save All", self)
         save_action.setShortcut("Ctrl+S")
         save_action.triggered.connect(lambda _checked=False: self._on_save_all())
@@ -1195,12 +1186,6 @@ class UnifiedMainWindow(QMainWindow):
     def _toggle_log_panel(self):
         """Show or hide the log panel."""
         self.log_panel.setVisible(not self.log_panel.isVisible())
-
-    def _open_project_dialog(self):
-        """Placeholder — projects are opened from the launcher."""
-        QMessageBox.information(
-            self, "Open Project",
-            "Close this window and use the project selector to open a different project.")
 
     def _refresh_project(self):
         """Reload everything from disk — both PorySuite and EVENTide data."""

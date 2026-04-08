@@ -1,3 +1,28 @@
+## [2026-04-08] — Piano Roll Save Pipeline Fixes, BEND Editing, MIDI Import Dropdowns
+
+### Type
+Fix / Feature
+
+### Summary
+Three critical piano roll save bugs fixed: PATT subroutine corruption (songs with pattern calls were destroyed on save), VOL/TEMPO double-evaluation (volume halved every save cycle), and BEND state incorrectly reset on loop wrap. New Note Properties dialog for editing pitch bend and control events per-note. MIDI import instrument mapping page upgraded from number spinners to named dropdowns.
+
+### What Changed
+- **Song Writer** (`core/sound/song_writer.py`): PATT/PEND subroutines are now stripped on save and written as fully linear tracks — you can't unflatten edited notes back into subroutines, so the save no longer tries to. Added `_raw_vol()` and `_raw_tempo()` reverse-evaluation helpers so VOL and TEMPO values round-trip correctly (parser evaluates `127*mvl/mxv` to 89, writer now recovers 127 instead of writing `89*mvl/mxv`). All five VOL write sites and two TEMPO write sites fixed.
+- **Realtime Sequencer** (`core/sound/realtime_sequencer.py`): Removed incorrect BEND reset to 0.0 on loop wrap. The real GBA M4A engine carries BEND state through GOTO loops — the Songs tab renderer already did this correctly.
+- **Piano Roll Widget** (`ui/piano_roll_widget.py`): Right-click on a note now shows a context menu (Edit Note Properties / Delete) instead of instant-deleting. New `NotePropertiesDialog` class: shows note info summary, editable table of control events (BEND, BENDR, VOL, PAN) at that note's position with Add/Delete buttons. Edits update the canvas's control events, push to sequencer for immediate playback, and are included in the save pipeline.
+- **Piano Roll Window** (`ui/piano_roll_window.py`): Save pipeline now uses canvas-edited control events (from Note Properties dialog) instead of only the original file's events. BEND/BENDR/VOL/PAN events from the canvas replace the originals for each track. Debug logging added to `voice_debug.log` for instrument/volume/pan values during save.
+- **MIDI Import Dialog** (`ui/dialogs/midi_import_dialog.py`): Instrument mapping page replaced QSpinBox with QComboBox showing "0: Acoustic Grand Piano" style labels, color-coded (red for empty/filler, green for real instruments). Auto-match and voice remap collection updated.
+
+### Files Changed
+- core/sound/song_writer.py — PATT stripping, VOL/TEMPO reverse evaluation
+- core/sound/realtime_sequencer.py — removed BEND reset on loop wrap
+- ui/piano_roll_widget.py — right-click context menu, NotePropertiesDialog
+- ui/piano_roll_window.py — canvas control events in save, debug logging
+- ui/dialogs/midi_import_dialog.py — instrument mapping dropdowns
+- docs/BUGS.md — created, tracks all known bugs with status
+
+---
+
 ## [2026-04-07] — Song Writer Optimizations, Song Deletion Fix, Piano Roll UX
 
 ### Type

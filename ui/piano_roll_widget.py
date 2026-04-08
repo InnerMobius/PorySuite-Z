@@ -15,7 +15,13 @@ from PyQt6.QtGui import (
     QPainter, QColor, QFont, QPen, QWheelEvent,
     QMouseEvent, QPaintEvent, QLinearGradient, QPolygonF,
 )
-from PyQt6.QtWidgets import QWidget, QScrollArea, QVBoxLayout, QHBoxLayout
+from PyQt6.QtWidgets import (
+    QWidget, QScrollArea, QVBoxLayout, QHBoxLayout, QMenu,
+    QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QLabel,
+    QComboBox, QGroupBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QPushButton, QHBoxLayout as _HBox,
+)
+from ui.custom_widgets.scroll_guard import install_scroll_guard
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -81,6 +87,164 @@ def _is_black_key(midi: int) -> bool:
     return (midi % 12) in _BLACK_KEYS
 
 
+# ── Note Properties Dialog ────────────────────────────────────────────────
+
+class NotePropertiesDialog(QDialog):
+    """Popup for editing a note's properties and its nearby control events.
+
+    Shows the note's pitch/tick/duration/velocity (read-only summary at top),
+    then a table of control events (BEND, BENDR, VOL, PAN) that sit between
+    this note's tick and the next note on the same track.  The user can edit
+    values, add new control events, or delete existing ones.
+    """
+
+    def __init__(
+        self,
+        note: dict,
+        control_events: list[dict],
+        next_note_tick: int | None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Note Properties")
+        self.setMinimumWidth(420)
+
+        self._note = note
+        self._result_events: list[dict] = []
+        tick = note['tick']
+        end_tick = tick + note.get('duration', 24)
+        # Control events in this note's range (tick to next note or end of note)
+        boundary = next_note_tick if next_note_tick is not None else end_tick
+        self._range_start = tick
+        self._range_end = boundary
+
+        layout = QVBoxLayout(self)
+
+        # ── Note summary (read-only) ──
+        pitch_name = _note_name(note.get('pitch', 60))
+        info = QLabel(
+            f"<b>{pitch_name}</b> &nbsp; "
+            f"Tick {tick} &nbsp; Duration {note.get('duration', 24)} &nbsp; "
+            f"Velocity {note.get('velocity', 100)} &nbsp; "
+            f"Track {note.get('track', 0) + 1}"
+        )
+        layout.addWidget(info)
+
+        # ── Control events table ──
+        group = QGroupBox(f"Control Events (tick {tick} – {boundary})")
+        glayout = QVBoxLayout(group)
+
+        self._table = QTableWidget()
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels(["Tick", "Type", "Value"])
+        self._table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch)
+        self._table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows)
+
+        # Filter control events to this note's range
+        relevant = [
+            e for e in control_events
+            if e.get('track') == note.get('track', 0)
+            and tick <= e['tick'] < boundary
+        ]
+        relevant.sort(key=lambda e: e['tick'])
+        self._populate_table(relevant)
+
+        glayout.addWidget(self._table)
+
+        # Add / Delete buttons
+        btn_row = QHBoxLayout()
+        self._add_btn = QPushButton("Add Event")
+        self._del_btn = QPushButton("Delete Selected")
+        btn_row.addWidget(self._add_btn)
+        btn_row.addWidget(self._del_btn)
+        btn_row.addStretch()
+        glayout.addLayout(btn_row)
+
+        self._add_btn.clicked.connect(self._on_add)
+        self._del_btn.clicked.connect(self._on_delete)
+
+        layout.addWidget(group)
+
+        # ── OK / Cancel ──
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _populate_table(self, events: list[dict]):
+        self._table.setRowCount(len(events))
+        for row, evt in enumerate(events):
+            tick_item = QTableWidgetItem(str(evt['tick']))
+            self._table.setItem(row, 0, tick_item)
+
+            type_combo = QComboBox()
+            install_scroll_guard(type_combo)
+            for t in ('BEND', 'BENDR', 'VOL', 'PAN'):
+                type_combo.addItem(t)
+            idx = type_combo.findText(evt.get('type', 'BEND'))
+            if idx >= 0:
+                type_combo.setCurrentIndex(idx)
+            self._table.setCellWidget(row, 1, type_combo)
+
+            val_item = QTableWidgetItem(str(evt.get('value', 64)))
+            self._table.setItem(row, 2, val_item)
+
+    def _on_add(self):
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+        tick_item = QTableWidgetItem(str(self._range_start))
+        self._table.setItem(row, 0, tick_item)
+
+        type_combo = QComboBox()
+        install_scroll_guard(type_combo)
+        for t in ('BEND', 'BENDR', 'VOL', 'PAN'):
+            type_combo.addItem(t)
+        self._table.setCellWidget(row, 1, type_combo)
+
+        val_item = QTableWidgetItem("64")
+        self._table.setItem(row, 2, val_item)
+
+    def _on_delete(self):
+        rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()),
+                       reverse=True)
+        for r in rows:
+            self._table.removeRow(r)
+
+    def get_events(self) -> list[dict]:
+        """Return the edited list of control events from the table."""
+        events = []
+        track = self._note.get('track', 0)
+        for row in range(self._table.rowCount()):
+            tick_item = self._table.item(row, 0)
+            type_combo = self._table.cellWidget(row, 1)
+            val_item = self._table.item(row, 2)
+            if tick_item is None or val_item is None:
+                continue
+            try:
+                tick = int(tick_item.text())
+            except ValueError:
+                tick = self._range_start
+            evt_type = type_combo.currentText() if type_combo else 'BEND'
+            try:
+                value = int(val_item.text())
+            except ValueError:
+                value = 64
+            # Clamp value to valid range
+            value = max(0, min(127, value))
+            events.append({
+                'tick': tick,
+                'type': evt_type,
+                'value': value,
+                'track': track,
+            })
+        return events
+
+
 # ── Interaction modes ──────────────────────────────────────────────────────
 
 class _Mode:
@@ -111,6 +275,7 @@ class PianoRollCanvas(QWidget):
 
         # Data
         self._notes: list[dict] = []
+        self._control_events: list[dict] = []  # BEND/BENDR/VOL/PAN for sequencer
         self._total_ticks: int = 960
         self._beats_per_measure: int = 4
         self._ticks_per_beat: int = _TICKS_PER_BEAT
@@ -165,6 +330,10 @@ class PianoRollCanvas(QWidget):
 
     def get_notes(self) -> list[dict]:
         return list(self._notes)
+
+    def get_sequencer_events(self) -> list[dict]:
+        """Get notes + control events merged for the sequencer."""
+        return list(self._notes) + list(self._control_events)
 
     def set_loop_region(self, start: Optional[int], end: Optional[int]):
         self._loop_start = start
@@ -536,16 +705,11 @@ class PianoRollCanvas(QWidget):
             if idx >= 0:
                 n = self._notes[idx]
                 self._debug(
-                    f"  -> RIGHT-CLICK DELETE note #{idx}: {_note_name(n['pitch'])} "
+                    f"  -> RIGHT-CLICK note #{idx}: {_note_name(n['pitch'])} "
                     f"tick={n['tick']} track={n.get('track',0)}")
-                self._selected.discard(idx)
-                self._notes.pop(idx)
-                self._selected = {i if i < idx else i - 1
-                                  for i in self._selected if i != idx}
-                self.notes_changed.emit()
-                self.update()
+                self._show_note_context_menu(idx, event.globalPosition().toPoint())
             else:
-                self._debug("  -> RIGHT-CLICK on empty space, no note to delete")
+                self._debug("  -> RIGHT-CLICK on empty space")
             return
 
         if event.button() != Qt.MouseButton.LeftButton:
@@ -740,6 +904,64 @@ class PianoRollCanvas(QWidget):
                 self._selected.add(i)
 
     # ── Keyboard shortcuts (handled by the canvas directly) ────────────
+
+    # ── Right-click context menu & note properties ──────────────────────
+
+    def _show_note_context_menu(self, idx: int, global_pos):
+        """Show a context menu for a note: Edit Properties / Delete."""
+        menu = QMenu(self)
+        act_props = menu.addAction("Edit Note Properties...")
+        menu.addSeparator()
+        act_delete = menu.addAction("Delete Note")
+
+        chosen = menu.exec(global_pos)
+        if chosen == act_props:
+            self._open_note_properties(idx)
+        elif chosen == act_delete:
+            n = self._notes[idx]
+            self._debug(
+                f"  -> CONTEXT DELETE note #{idx}: {_note_name(n['pitch'])} "
+                f"tick={n['tick']} track={n.get('track', 0)}")
+            self._selected.discard(idx)
+            self._notes.pop(idx)
+            self._selected = {i if i < idx else i - 1
+                              for i in self._selected if i != idx}
+            self.notes_changed.emit()
+            self.update()
+
+    def _open_note_properties(self, idx: int):
+        """Open the Note Properties dialog for the given note index."""
+        note = self._notes[idx]
+        track = note.get('track', 0)
+        tick = note['tick']
+
+        # Find the next note on the same track (to bound the control event range)
+        same_track = sorted(
+            [n for n in self._notes if n.get('track', 0) == track and n['tick'] > tick],
+            key=lambda n: n['tick'],
+        )
+        next_tick = same_track[0]['tick'] if same_track else tick + note.get('duration', 24)
+
+        dlg = NotePropertiesDialog(
+            note, self._control_events, next_tick, parent=self)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_events = dlg.get_events()
+
+            # Remove old control events in this note's range on this track
+            self._control_events = [
+                e for e in self._control_events
+                if not (e.get('track') == track
+                        and tick <= e['tick'] < next_tick)
+            ]
+            # Add the new/edited events
+            self._control_events.extend(new_events)
+
+            self._debug(
+                f"  -> Note properties saved: {len(new_events)} control events "
+                f"for track {track} tick {tick}-{next_tick}")
+            self.notes_changed.emit()
+            self.update()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
@@ -956,8 +1178,10 @@ class PianoRollWidget(QWidget):
         from core.sound.track_renderer import (
             flatten_track_commands, get_flattened_loop_info,
         )
+        from core.sound.song_parser import extract_tie_notes
 
         notes = []
+        control_events = []   # BEND, BENDR, VOL, PAN — separate from visual notes
         total_ticks = 0
         loop_start = None
         loop_end = None
@@ -974,14 +1198,46 @@ class PianoRollWidget(QWidget):
                         'track': ti,
                     })
 
-            # Use first track to get loop info and duration
-            if ti == 0:
-                ls, le, dur = get_flattened_loop_info(track.commands)
-                loop_start = ls
-                loop_end = le
+            # Extract TIE/EOT notes from the FLATTENED commands so ticks
+            # are correct for PATT-structured songs.  We create a temporary
+            # Track wrapper so extract_tie_notes can read .commands.
+            from core.sound.song_parser import Track as _Track
+            _flat_track = _Track(index=ti, label=track.label)
+            _flat_track.commands = flat_cmds
+            for note_dict in extract_tie_notes(_flat_track):
+                note_dict['track'] = ti
+                notes.append(note_dict)
+
+            # Extract control events (BEND, BENDR, VOL, PAN) from flattened
+            # commands so the sequencer can process mid-song changes like
+            # pitch bending and volume/pan automation during playback.
+            # These are stored SEPARATELY from visual notes — they're not
+            # drawn on the canvas but are merged when pushing to the sequencer.
+            _CONTROL_EVENT_CMDS = {'BEND', 'BENDR', 'VOL', 'PAN'}
+            for cmd in flat_cmds:
+                if cmd.cmd in _CONTROL_EVENT_CMDS and cmd.value is not None:
+                    control_events.append({
+                        'tick': cmd.tick,
+                        'type': cmd.cmd,
+                        'value': cmd.value,
+                        'track': ti,
+                    })
+
+            # Collect loop info from ALL tracks — use the latest loop_end
+            # and earliest loop_start across all tracks.  The GBA M4A engine
+            # loops each track independently, but the piano roll has one
+            # global loop region, so we use the outermost boundaries.
+            ls, le, dur = get_flattened_loop_info(track.commands)
+            if le is not None:
+                if loop_end is None or le > loop_end:
+                    loop_end = le
+            if ls is not None:
+                if loop_start is None or ls < loop_start:
+                    loop_start = ls
+            if dur > total_ticks:
                 total_ticks = dur
 
-            # Also check other tracks for longer duration
+            # Also check flattened commands for longer duration
             for cmd in flat_cmds:
                 end = cmd.tick + (cmd.duration or 0)
                 if end > total_ticks:
@@ -991,6 +1247,7 @@ class PianoRollWidget(QWidget):
             total_ticks = 960
 
         self._canvas.set_notes(notes, total_ticks)
+        self._canvas._control_events = control_events  # for sequencer playback
         self._canvas.set_track_filter(track_index)
         self._canvas.set_loop_region(loop_start, loop_end)
 

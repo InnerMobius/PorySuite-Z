@@ -574,20 +574,28 @@ def extract_track_infos(song_data, vg_data=None) -> list[dict]:
         if track.midi_channel is not None:
             info['name'] = f"Track {i + 1} (Ch{track.midi_channel})"
 
+        got_voice = False
+        got_vol = False
+        got_pan = False
         for cmd in track.commands:
-            if cmd.cmd == 'VOICE' and cmd.value is not None and info['instrument'] < 0:
+            if cmd.cmd == 'VOICE' and cmd.value is not None and not got_voice:
                 info['instrument'] = cmd.value
-            elif cmd.cmd == 'VOL' and cmd.value is not None:
+                got_voice = True
+            elif cmd.cmd == 'VOL' and cmd.value is not None and not got_vol:
                 info['volume'] = cmd.value
-                break  # Only read the first volume
-            elif cmd.cmd == 'PAN' and cmd.value is not None:
+                got_vol = True
+            elif cmd.cmd == 'PAN' and cmd.value is not None and not got_pan:
                 info['pan'] = cmd.value
-            elif cmd.cmd == 'NOTE':
-                info['note_count'] += 1
+                got_pan = True
+            # Stop scanning once we have all setup values
+            if got_voice and got_vol and got_pan:
+                break
 
-        # Count all notes
-        info['note_count'] = sum(
-            1 for c in track.commands if c.cmd == 'NOTE')
+        # Count all notes (including TIE-based sustained notes)
+        from core.sound.song_parser import extract_tie_notes
+        regular_notes = sum(1 for c in track.commands if c.cmd == 'NOTE')
+        tie_notes = len(extract_tie_notes(track))
+        info['note_count'] = regular_notes + tie_notes
 
         # Look up instrument name from voicegroup
         if vg_data and info['instrument'] >= 0:

@@ -26,12 +26,9 @@ _ROM_16MB = 16 * 1024 * 1024   # 16,777,216 bytes
 _ROM_32MB = 32 * 1024 * 1024   # 33,554,432 bytes
 _GBA_EWRAM = 256 * 1024        # 256 KB
 
-# pokefirered map file patterns
-_SYM_EWRAM_START = '__ewram_start'
-_SYM_EWRAM_END   = '__ewram_end'
-_SYM_IWRAM_START = '__iwram_start'
-_SYM_IWRAM_END   = '__iwram_end'
-_SYM_ROM_START   = '__rom_start'  # typically 0x08000000
+# GBA ROM address range
+_ROM_ADDR_START = 0x08000000
+_ROM_ADDR_END   = 0x0A000000
 
 
 def _sizeof_fmt(num: int) -> str:
@@ -186,6 +183,10 @@ class DiagnosticsTab(QWidget):
 
         root = self._project_root
 
+        # Parse the .map file for memory section info (needed for ROM content size)
+        map_data = self._parse_map_file(root)
+        elf_data = self._parse_elf_sections(root)
+
         # Find the ROM file
         rom_size = 0
         rom_path = ""
@@ -197,21 +198,26 @@ class DiagnosticsTab(QWidget):
                 break
 
         if rom_size:
+            # The .gba is typically padded to a power-of-2 (often 32 MB).
+            # Use the actual ROM content size from the .map file when available.
+            content_size = map_data.get('rom_content_size', 0) if map_data else 0
+            display_size = content_size if content_size > 0 else rom_size
+            padded_note = ""
+            if content_size > 0 and rom_size > content_size:
+                padded_note = (f"  (file is {_sizeof_fmt(rom_size)} "
+                               f"— padded by build system)")
             self._rom_file_label.setText(
-                f"{os.path.basename(rom_path)}: {_sizeof_fmt(rom_size)}")
+                f"{os.path.basename(rom_path)}: "
+                f"{_sizeof_fmt(display_size)}{padded_note}")
             self._rom_bar_16 = self._update_bar(
-                self._rom_bar_16, rom_size, _ROM_16MB,
+                self._rom_bar_16, display_size, _ROM_16MB,
                 self.layout().itemAt(2).widget().layout(), 2)
             self._rom_bar_32 = self._update_bar(
-                self._rom_bar_32, rom_size, _ROM_32MB,
+                self._rom_bar_32, display_size, _ROM_32MB,
                 self.layout().itemAt(2).widget().layout(), 4)
         else:
             self._rom_file_label.setText(
                 "No .gba file found — build the project first.")
-
-        # Parse the .map file for memory section info
-        map_data = self._parse_map_file(root)
-        elf_data = self._parse_elf_sections(root)
 
         if map_data:
             ewram_used = map_data.get('ewram_used', 0)
@@ -231,11 +237,13 @@ class DiagnosticsTab(QWidget):
                 f"{_sizeof_fmt(iwram_used)} used, "
                 f"{_sizeof_fmt(32 * 1024 - iwram_used)} free")
 
-        if elf_data:
-            self._text_label.setText(_sizeof_fmt(elf_data.get('text', 0)))
-            self._rodata_label.setText(_sizeof_fmt(elf_data.get('rodata', 0)))
-            self._data_label.setText(_sizeof_fmt(elf_data.get('data', 0)))
-            self._bss_label.setText(_sizeof_fmt(elf_data.get('bss', 0)))
+        # Section breakdown — prefer ELF data, fall back to .map file
+        sec_src = elf_data if elf_data else (map_data if map_data else {})
+        if sec_src:
+            self._text_label.setText(_sizeof_fmt(sec_src.get('text', 0)))
+            self._rodata_label.setText(_sizeof_fmt(sec_src.get('rodata', 0)))
+            self._data_label.setText(_sizeof_fmt(sec_src.get('data', 0)))
+            self._bss_label.setText(_sizeof_fmt(sec_src.get('bss', 0)))
 
         # Build type
         if os.path.isfile(os.path.join(root, "pokefirered_modern.gba")):
@@ -261,51 +269,62 @@ class DiagnosticsTab(QWidget):
         return new_bar
 
     def _parse_map_file(self, root: str) -> dict:
-        """Parse the linker .map file for EWRAM/IWRAM usage."""
+        """Parse the linker .map file for EWRAM/IWRAM usage and ROM content size.
+
+        pokefirered's .map has section header lines like:
+            ewram           0x02000000    0x3f46e
+            iwram           0x03000000     0x7398
+            .text           0x08000000   0x170f10
+            .rodata         0x081ed948   0x6faedc
+        The third column is the section size.
+        """
         result = {}
         for name in ("pokefirered_modern.map", "pokefirered.map"):
             map_path = os.path.join(root, name)
-            if os.path.isfile(map_path):
-                try:
-                    with open(map_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
+            if not os.path.isfile(map_path):
+                continue
+            try:
+                with open(map_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
 
-                    # Look for EWRAM section boundaries
-                    ewram_start = self._find_symbol(content, '__ewram_start')
-                    ewram_end = self._find_symbol(content, '__ewram_end')
-                    if ewram_start and ewram_end:
-                        result['ewram_used'] = ewram_end - ewram_start
+                # Parse section headers: name  address  size
+                # Lowercase lines (ewram, .text, .rodata) are actual content.
+                # UPPERCASE lines (ROM, EWRAM, IWRAM) are memory region
+                # definitions (capacity, not usage) — skip them.
+                section_re = re.compile(
+                    r'^([a-z.]\S*)\s+(0x[0-9a-fA-F]+)\s+(0x[0-9a-fA-F]+)',
+                    re.MULTILINE)
+                rom_end = 0
+                for m in section_re.finditer(content):
+                    sec_name = m.group(1)
+                    sec_addr = int(m.group(2), 16)
+                    sec_size = int(m.group(3), 16)
 
-                    iwram_start = self._find_symbol(content, '__iwram_start')
-                    iwram_end = self._find_symbol(content, '__iwram_end')
-                    if iwram_start and iwram_end:
-                        result['iwram_used'] = iwram_end - iwram_start
+                    if sec_name == 'ewram':
+                        result['ewram_used'] = sec_size
+                    elif sec_name == 'iwram':
+                        result['iwram_used'] = sec_size
+                    elif sec_name == '.text':
+                        result['text'] = sec_size
+                    elif sec_name == '.rodata':
+                        result['rodata'] = sec_size
+                    elif sec_name == '.data':
+                        result['data'] = sec_size
+                    elif sec_name == '.bss':
+                        result['bss'] = sec_size
+                    if _ROM_ADDR_START <= sec_addr < _ROM_ADDR_END and sec_size > 0:
+                        # ROM content section — track the highest end address
+                        end = sec_addr + sec_size
+                        if end > rom_end:
+                            rom_end = end
 
-                    # Try alternate patterns for bss-based EWRAM
-                    if 'ewram_used' not in result:
-                        ewram_start = self._find_symbol(content, '__ewram_bss_start')
-                        ewram_end = self._find_symbol(content, '__ewram_bss_end')
-                        if ewram_start is None:
-                            ewram_start = self._find_symbol(content, '__edata')
-                        if ewram_end is None:
-                            ewram_end = self._find_symbol(content, '__end__')
-                        if ewram_start and ewram_end:
-                            result['ewram_used'] = ewram_end - ewram_start
+                if rom_end > _ROM_ADDR_START:
+                    result['rom_content_size'] = rom_end - _ROM_ADDR_START
 
-                except Exception:
-                    pass
-                break
+            except Exception:
+                pass
+            break
         return result
-
-    def _find_symbol(self, map_content: str, symbol: str) -> Optional[int]:
-        """Find a symbol's address in a linker .map file."""
-        # Pattern: 0x0800abcd  symbol_name
-        m = re.search(
-            rf'^\s*(0x[0-9a-fA-F]+)\s+{re.escape(symbol)}\s*$',
-            map_content, re.MULTILINE)
-        if m:
-            return int(m.group(1), 16)
-        return None
 
     def _parse_elf_sections(self, root: str) -> dict:
         """Try to get section sizes from the ELF file using objdump or size."""
@@ -315,8 +334,20 @@ class DiagnosticsTab(QWidget):
             if not os.path.isfile(elf_path):
                 continue
 
-            # Try arm-none-eabi-size first
-            for size_cmd in ("arm-none-eabi-size", "size"):
+            # Try arm-none-eabi-size — check devkitARM path too
+            size_cmds = ["arm-none-eabi-size", "size"]
+            devkit = os.environ.get("DEVKITARM", "")
+            if not devkit:
+                # Common default install location on Windows
+                for dkp in (r"C:\devkitpro\devkitARM",
+                            r"C:\devkitPro\devkitARM"):
+                    if os.path.isdir(dkp):
+                        devkit = dkp
+                        break
+            if devkit:
+                size_cmds.insert(0, os.path.join(devkit, "bin",
+                                                 "arm-none-eabi-size"))
+            for size_cmd in size_cmds:
                 try:
                     r = subprocess.run(
                         [size_cmd, "-A", elf_path],

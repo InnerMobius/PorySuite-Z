@@ -261,17 +261,6 @@ class App:
         self.main.load_data(merged_info)
         self.main.setWindowFilePath(merged_info.get("dir", ""))
 
-        # Add recent projects to the menu
-        for i in range(1, min(len(projects["projects"]), 5)):
-            recent = projects["projects"][i]
-            action = QAction(recent["name"] + " | " + recent["dir"])
-            self.main._recent_menu.addAction(action)
-
-        if len(projects["projects"]) == 1:
-            no_recent = QAction("No Recent Projects")
-            no_recent.setEnabled(False)
-            self.main._recent_menu.addAction(no_recent)
-
         self.loading_dialog.update_progress(100)
         self.loading_dialog.close()
 
