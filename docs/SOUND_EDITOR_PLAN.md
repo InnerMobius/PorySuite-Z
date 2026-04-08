@@ -1,7 +1,7 @@
 # PorySuite-Z Sound Editor — Master Roadmap
 
 **Created:** 2026-04-06
-**Status:** All phases COMPLETE (1-9). Phase 8: piano roll with full editing, real-time sequencer, GM voicegroup generator, round-trip save, song structure panel. Phase 9: Import song .s file from another project (9.1 export and 9.2 QoL marked NOT NEEDED).
+**Status:** Phases 1-9 COMPLETE. Phase 10 (Per-Note Automation Editor) IN PROGRESS — Step 10.1 done (table dialog), Steps 10.2-10.6 pending (visual automation lanes, expanded dialog, save pipeline for all control types, sequencer playback, MIDI import verification).
 **Goal:** A full-featured music and sound editing suite built into PorySuite-Z, allowing users to browse, preview, edit, and create songs, instruments, and voicegroups using the actual project data — no external tools needed.
 
 ---
@@ -570,6 +570,101 @@ Implemented 2026-04-07. New file: `ui/dialogs/s_file_import_dialog.py`.
 - Additional files changed: `core/sound/song_table_manager.py` (rename_song, delete_song, find_song_references), `core/sound/gm_voicegroup.py` (_catalog_all_instruments, filler for empty slots, trimmed VG size), `ui/piano_roll_widget.py` (loop_count fix, multi-drag, track select_all), `ui/voicegroups_tab.py` (rename button, Generate GM dict key fix).
 - Song context menu expanded: "Export .s File..." (save a copy) and "Replace with .s File..." (overwrite music data, rewrite labels, keep registration) added alongside Rename and Delete.
 - GM voicegroup no longer pads to 128 slots — stops at the highest real instrument index.
+
+---
+
+## Phase 10 — Per-Note Automation Editor
+
+**Status:** IN PROGRESS (Step 10.1 basic dialog done, rest pending)
+
+**Goal:** Full per-note control event editing in the piano roll. When a MIDI has pitch bends, volume swells, pan sweeps, vibrato, or any other mid-note control changes, the user needs to see them, edit them, and add new ones. Currently the piano roll shows notes as bars but control events are invisible — you can only edit them through the Note Properties table dialog (added in Step 10.1). This phase adds visual automation lanes and a complete editing workflow.
+
+### What the GBA M4A engine supports per-note
+
+These are all the control commands that can appear between notes (mid-song, not just at track setup). Each one can change at any tick, as often as every tick if needed:
+
+| Command | Range | What it does | MIDI equivalent |
+|---------|-------|-------------|-----------------|
+| **BEND** | 0-127 (64 = center) | Pitch bend — shifts the playing note's pitch up or down. Offset from center (64) scaled by BENDR range. | Pitch Wheel |
+| **BENDR** | 0-24 (default 2) | Bend range — how many semitones a full BEND covers. Set once, rarely changes mid-song. | RPN 0x0000 |
+| **VOL** | 0-127 | Track volume. Fades, swells, crescendo/decrescendo. | CC7 (Volume) |
+| **PAN** | 0-127 (64 = center) | Stereo position. Sweeps left/right, autopan effects. | CC10 (Pan) |
+| **MOD** | 0-127 | Modulation depth — controls how intense the LFO effect is. | CC1 (Mod Wheel) |
+| **MODT** | 0=vibrato, 1=tremolo, 2=autopan | Modulation type — what the LFO affects (pitch wobble, volume wobble, or pan wobble). | — |
+| **LFOS** | 0-127 | LFO speed — how fast the modulation oscillates. | — |
+| **LFODL** | 0-127 | LFO delay — ticks before modulation kicks in (common for delayed vibrato). | — |
+| **TUNE** | 0-127 (64 = center) | Fine tuning — micro-pitch adjustment, like BEND but permanent until changed. | CC94 (Celeste) |
+| **KEYSH** | -128 to 127 | Key shift — transpose all notes on this track by N semitones. Usually set once. | — |
+| **TEMPO** | BPM value | Changes the song speed mid-playback. Affects all tracks. | Tempo meta-event |
+
+mid2agb converts MIDI control changes into these commands. A MIDI with pitch wheel automation generates dense BEND commands (often every tick). A MIDI with volume automation generates VOL commands. Pan automation generates PAN commands. Vibrato (CC1) generates MOD + LFOS + LFODL.
+
+### Step 10.1 — Note Properties Dialog (Table Editor) — COMPLETE
+
+Added 2026-04-08. Right-click a note → "Edit Note Properties..." opens a dialog with:
+- Note summary (pitch, tick, duration, velocity, track)
+- Editable table of control events (BEND, BENDR, VOL, PAN) in that note's tick range
+- Add Event / Delete Selected buttons
+- Tick, Type (dropdown), and Value columns
+- Edits push to sequencer immediately and save to .s file
+
+This is the basic "get it done" editor. Works but not visual — you're editing numbers in a table.
+
+**Files:** `ui/piano_roll_widget.py` (NotePropertiesDialog class, right-click context menu)
+
+### Step 10.2 — Automation Lanes (Visual Curves)
+
+Collapsible automation lanes below the note canvas for each control type. Each lane shows the control's value over time as a connected line/curve that the user can see at a glance.
+
+**What to build:**
+- One lane per control type per track (BEND, VOL, PAN, MOD at minimum)
+- Lane height: ~40px, collapsible to a header bar
+- X axis = ticks (same as piano roll), Y axis = control value (0-127)
+- Existing control events shown as dots/handles on the curve
+- Click to add a new point, drag to move, right-click to delete
+- Line interpolation between points (step or linear — GBA uses step, but linear preview helps visualize intent)
+- Lane headers show the control type name and current track
+- Lanes scroll horizontally in sync with the piano roll canvas
+- Zoom matches the piano roll
+
+**Not needed yet:** Bezier curves, automation recording, copy/paste automation between tracks.
+
+### Step 10.3 — Expanded Note Properties Dialog
+
+Upgrade the Note Properties dialog from Step 10.1:
+- Add all GBA control types to the Type dropdown (MOD, MODT, LFOS, LFODL, TUNE, KEYSH, TEMPO — not just BEND/BENDR/VOL/PAN)
+- Show a mini visualization of the control curve around this note's tick range
+- "Copy automation from tick range" and "Paste" for duplicating control patterns
+- Velocity editing (currently read-only in the dialog)
+- Note duration editing with a spinner (alternative to mouse drag for precision)
+
+### Step 10.4 — Automation in Save Pipeline
+
+Make sure ALL control event types round-trip through the save pipeline:
+- Currently handled: BEND, BENDR, VOL, PAN (from canvas `_control_events`)
+- Need to add: MOD, MODT, LFOS, LFODL, TUNE
+- KEYSH and TEMPO are track-level (tick 0), not per-note — handle separately
+- Running-status optimization on save: when the same control command is repeated at consecutive ticks, emit bare values after the first (matching mid2agb output style)
+- Verify round-trip by: load song → save → reload → compare control event counts and values
+
+### Step 10.5 — Automation Playback in Sequencer
+
+Make the realtime sequencer respond to ALL control types during playback:
+- Currently handled: BEND, BENDR (pitch), VOL, PAN
+- Need to add: MOD + MODT + LFOS + LFODL (LFO-based vibrato/tremolo/autopan)
+- TUNE (fine pitch offset, additive with BEND)
+- TEMPO changes mid-song (update BPM live)
+- LFO implementation: sine oscillator at LFOS rate, delayed by LFODL ticks, depth from MOD, target from MODT (0=pitch, 1=volume, 2=pan)
+
+### Step 10.6 — Automation Import from MIDI
+
+When importing a MIDI via the MIDI Import wizard, preserve all automation:
+- Pitch wheel → BEND (mid2agb already does this)
+- CC7 (Volume) → VOL
+- CC10 (Pan) → PAN
+- CC1 (Mod Wheel) → MOD
+- Verify mid2agb is converting these correctly
+- If mid2agb drops any automation, post-process the .s file to add it back from the MIDI data using `mido`
 
 ---
 
