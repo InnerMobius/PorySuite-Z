@@ -154,6 +154,7 @@ class TileSheet:
     tiles_high: int = 0     # number of tile rows
     tile_count: int = 0
     source_path: str = ""
+    is_8bpp: bool = False   # True if >16 colors (256-color mode)
 
     @staticmethod
     def from_file(path: str) -> "TileSheet":
@@ -162,12 +163,16 @@ class TileSheet:
             raise FileNotFoundError(f"Cannot load image: {path}")
         tw = max(1, img.width() // TILE_PX)
         th = max(1, img.height() // TILE_PX)
+        # Detect 8bpp: indexed image with >16 colors in the color table
+        ct = img.colorTable()
+        is_8bpp = len(ct) > 16 if ct else False
         return TileSheet(
             image=img,
             tiles_wide=tw,
             tiles_high=th,
             tile_count=tw * th,
             source_path=path,
+            is_8bpp=is_8bpp,
         )
 
     def get_tile_image(
@@ -246,15 +251,48 @@ class PaletteSet:
         """Number of slots with real palette data."""
         return len(self._loaded_slots)
 
+    def get_flat_colors(self) -> List[Color]:
+        """Return all palettes flattened into a single 256-entry color list.
+
+        Used for 8bpp rendering where pixel values index directly into
+        a flat 256-color table (palettes[0] = indices 0-15,
+        palettes[1] = indices 16-31, etc.)
+        """
+        flat: List[Color] = []
+        for slot in range(min(16, len(self.palettes))):
+            flat.extend(self.palettes[slot][:16])
+            # Pad sub-palette to 16 if short
+            while len(flat) % 16 != 0:
+                flat.append((0, 0, 0))
+        # Pad to 256 total
+        while len(flat) < 256:
+            flat.append((0, 0, 0))
+        return flat[:256]
+
     @staticmethod
     def from_pal_files(paths: List[str]) -> "PaletteSet":
-        """Load palettes from a list of .pal files."""
+        """Load palettes from a list of .pal files.
+
+        Handles both 16-color .pal files (one file = one palette slot) and
+        256-color .pal files (one file = 16 palette slots, split into groups
+        of 16 colors).
+        """
         from ui.palette_utils import read_jasc_pal
         palettes = []
         loaded = set()
         for p in paths:
             colors = read_jasc_pal(p)
-            if colors:
+            if not colors:
+                continue
+            if len(colors) > 16:
+                # 256-color palette file — split into 16-color sub-palettes
+                for i in range(0, len(colors), 16):
+                    chunk = colors[i:i + 16]
+                    while len(chunk) < 16:
+                        chunk.append((0, 0, 0))
+                    loaded.add(len(palettes))
+                    palettes.append(chunk)
+            else:
                 loaded.add(len(palettes))
                 palettes.append(colors)
         return PaletteSet(palettes=palettes, source_paths=list(paths),
@@ -304,6 +342,11 @@ def render_tilemap(
     recolored using the palette specified in each tilemap entry. Otherwise,
     tiles are drawn as-is from the PNG.
 
+    For 8bpp tile sheets (>16 colors), the full 256-color palette is applied
+    to each tile — pixel values index directly into the flat color table,
+    and the palette bits in the tilemap entry are ignored (matching GBA
+    hardware behavior in 256-color BG mode).
+
     tile_offset: The VRAM tile offset where this sheet is loaded.
     Tilemap indices between tile_offset and tile_offset+sheet.tile_count
     map to tiles 0..N in the sheet. Indices outside that range render blank.
@@ -317,6 +360,11 @@ def render_tilemap(
         and palette_set.palette_count() > 0
         and sheet.image.format() == QImage.Format.Format_Indexed8
     )
+
+    # Pre-build the 8bpp flat color table once for the whole render
+    flat_ct_8bpp = None
+    if use_palettes and sheet.is_8bpp:
+        flat_ct_8bpp = build_flat_color_table(palette_set)
 
     painter = QPainter(result)
     for row in range(tilemap.height):
@@ -337,7 +385,10 @@ def render_tilemap(
 
             # Recolor with palette if applicable
             if use_palettes and tile_img.format() == QImage.Format.Format_Indexed8:
-                tile_img = _recolor_tile(tile_img, entry.palette, palette_set)
+                if sheet.is_8bpp and flat_ct_8bpp:
+                    tile_img = _recolor_tile_8bpp(tile_img, flat_ct_8bpp)
+                else:
+                    tile_img = _recolor_tile(tile_img, entry.palette, palette_set)
 
             painter.drawImage(col * TILE_PX, row * TILE_PX, tile_img)
 
@@ -379,6 +430,42 @@ def _recolor_tile(
             else:
                 new_ct.append(qRgb(r, g, b))
         recolored.setColorTable(new_ct)
+    return recolored
+
+
+def build_flat_color_table(palette_set: PaletteSet) -> List[int]:
+    """Build a flat 256-entry Qt color table from a PaletteSet.
+
+    Returns a list of qRgb/qRgba values suitable for setColorTable().
+    Index 0 is transparent (matching GBA behavior).
+    """
+    flat_colors = palette_set.get_flat_colors()
+    ct = []
+    for i, (r, g, b) in enumerate(flat_colors):
+        if i == 0:
+            ct.append(qRgba(r, g, b, 0))
+        else:
+            ct.append(qRgb(r, g, b))
+    return ct
+
+
+def _recolor_tile_8bpp(
+    tile: QImage,
+    flat_ct: List[int],
+) -> QImage:
+    """Replace the color table of an 8bpp tile with a flat 256-entry table.
+
+    In GBA 256-color BG mode, each pixel's 8-bit value indexes directly
+    into the full 256-entry palette. The palette bits in the tilemap entry
+    are ignored by hardware.
+    """
+    recolored = QImage(tile)
+    # Extend or trim the flat color table to match what the tile needs
+    ct_size = max(len(tile.colorTable()), 256)
+    ct = list(flat_ct[:ct_size])
+    while len(ct) < ct_size:
+        ct.append(qRgb(0, 0, 0))
+    recolored.setColorTable(ct)
     return recolored
 
 
@@ -546,7 +633,16 @@ def discover_assets(bin_path: str) -> TilemapAssets:
             matching_pals.append(p)
         else:
             other_pals.append(p)
+
+    # If a name-matching .pal has 256 colors, it covers all 16 palette slots
+    # on its own — don't load unrelated sibling .pal files on top of it.
     best_pals = matching_pals + other_pals
+    if matching_pals:
+        from ui.palette_utils import read_jasc_pal
+        first_colors = read_jasc_pal(matching_pals[0])
+        if len(first_colors) > 16:
+            # 256-color file — this one palette covers everything
+            best_pals = matching_pals[:1]
 
     return TilemapAssets(
         bin_path=bin_path,

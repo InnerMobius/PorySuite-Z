@@ -27,9 +27,11 @@ def clamp_to_gba(r: int, g: int, b: int) -> Color:
     return (q(r), q(g), q(b))
 
 
-def read_jasc_pal(path: str) -> List[Color]:
+def read_jasc_pal(path: str, max_colors: int = 0) -> List[Color]:
     """Read a JASC-PAL file and return a list of (r,g,b) tuples.
 
+    If max_colors is 0, returns all colors declared in the file (16 or 256).
+    If max_colors is set, caps at that many.
     Returns an empty list on any failure.
     """
     try:
@@ -57,10 +59,13 @@ def read_jasc_pal(path: str) -> List[Color]:
             colors.append((r, g, b))
         except Exception:
             continue
-    # Pad to 16 if short
+    # Cap if requested
+    if max_colors > 0:
+        colors = colors[:max_colors]
+    # Pad to at least 16
     while len(colors) < 16:
         colors.append((0, 0, 0))
-    return colors[:16]
+    return colors
 
 
 def write_jasc_pal(path: str, colors: List[Color]) -> bool:
@@ -70,12 +75,14 @@ def write_jasc_pal(path: str, colors: List[Color]) -> bool:
     except Exception:
         pass
     try:
-        # Always write 16 colors, GBA-clamped
+        # Write GBA-clamped colors — 16 or 256 depending on input
         padded = list(colors)
-        while len(padded) < 16:
+        # If >16 colors, write as 256-entry palette; otherwise 16
+        target_count = 256 if len(padded) > 16 else 16
+        while len(padded) < target_count:
             padded.append((0, 0, 0))
-        padded = [clamp_to_gba(*c) for c in padded[:16]]
-        lines = ["JASC-PAL", "0100", "16"]
+        padded = [clamp_to_gba(*c) for c in padded[:target_count]]
+        lines = ["JASC-PAL", "0100", str(target_count)]
         for (r, g, b) in padded:
             lines.append(f"{r} {g} {b}")
         # pokefirered .pal files end with CRLF on Windows typically.  Use

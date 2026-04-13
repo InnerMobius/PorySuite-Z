@@ -1,3 +1,18 @@
+## [2026-04-13] — Phase 10A: Tilemap Editor — 8bpp, UI Rework, Paint Fix
+
+### Type
+Fix / Feature
+
+### Summary
+Added full 8bpp (256-color) tilemap rendering support. The title screen logo and other 8bpp tilemaps now render correctly — auto-detects 4bpp vs 8bpp from PNG color table size. In 8bpp mode, the full 256-color palette is applied per GBA hardware behavior (palette bits ignored). Fixed `read_jasc_pal` truncating 256-entry .pal files to 16 colors. Fixed `from_pal_files` not splitting 256-color files into sub-palettes. Fixed `discover_assets` loading unrelated sibling .pal files when a 256-color name-match exists (was showing "19 palettes" for title screen instead of 16). Fixed paint tool not erasing tiles (QPainter alpha compositing let old tiles show through transparent pixels — switched to CompositionMode_Source). Reworked right panel layout: compact control bar (Paint/Pick/Tile/Pal/H/V all in one row), tile sheet as the dominant area, palette editor auto-sizes to only show loaded/used slots. Added visible Import .pal and Export .pal buttons with 16-color and 256-color modes. Palette header shows "256-color" or "16-color" mode. Status bar shows accurate palette info (slot count, .pal file count).
+
+### Files Changed
+- core/tilemap_data.py — `TileSheet.is_8bpp`, `PaletteSet.get_flat_colors()`, `build_flat_color_table()`, `_recolor_tile_8bpp()`, `render_tilemap()` 8bpp path, `from_pal_files()` 256-color splitting, `discover_assets()` smart 256-color .pal detection
+- ui/tilemap_editor_tab.py — 8bpp rendering everywhere, CompositionMode_Source paint fix, compact control row, auto-sizing PaletteEditorWidget (only visible slots), Import/Export .pal buttons with 16/256 mode menus, palette slot picker dialog, dynamic palette header label
+- ui/palette_utils.py — `read_jasc_pal()` reads full 256 entries, `write_jasc_pal()` writes 256 when >16 colors
+
+---
+
 ## [2026-04-13] — Phase 10A: Tilemap Editor — Palette Fallback & Controls
 
 ### Type

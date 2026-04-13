@@ -419,6 +419,14 @@ Tracked bugs, confirmed root causes, and fix status. This file persists across s
 - **Fix:** Added "Tile Offset" spinbox. User can set the VRAM base offset for the current sheet. Tiles outside the sheet's range render as blank (dark background), so user can see which tiles belong to the current sheet and which come from elsewhere.
 - **DO NOT REMOVE:** The `tile_offset` parameter in `render_tilemap()` and the offset spinbox in the toolbar.
 
+### BUG: 8bpp tilemap rendering with wrong colors (title screen logo garbled)
+- **Status:** FIXED (2026-04-13)
+- **File:** `core/tilemap_data.py`, `ui/tilemap_editor_tab.py`, `ui/palette_utils.py`
+- **Evidence:** game_title_logo.bin (title screen) rendered with garbled colors. The PNG has 256 colors (8bpp) across 13 sub-palettes, but the renderer was applying only a single 16-color sub-palette per tile (4bpp logic).
+- **Root cause:** Three issues: (1) `_recolor_tile` always set a 16-entry color table, but 8bpp tiles have pixel values 0-255 that need a 256-entry table. Pixels with index >15 had no color and rendered black/wrong. (2) `read_jasc_pal` in palette_utils.py truncated all .pal files to 16 colors, destroying the 256-color palette data. (3) `from_pal_files` treated each .pal file as one palette slot, never splitting 256-entry files into sub-palettes.
+- **Fix:** Added `is_8bpp` detection to `TileSheet` (checks color table size >16). Added `_recolor_tile_8bpp` that applies a flat 256-entry color table. `render_tilemap` detects 8bpp sheets and uses the flat table. `read_jasc_pal` now reads all colors (16 or 256). `from_pal_files` splits 256-color .pal files into 16-color sub-palettes. Palette spinner disabled in 8bpp mode (hardware ignores palette bits). Tile picker uses full 256-color table in 8bpp mode.
+- **DO NOT REMOVE:** The `is_8bpp` detection, `_recolor_tile_8bpp`, `build_flat_color_table`, and the 256-color .pal file handling in `read_jasc_pal` / `from_pal_files`.
+
 ---
 
 ## Corrupted Test Files

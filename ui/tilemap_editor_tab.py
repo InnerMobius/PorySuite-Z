@@ -52,10 +52,10 @@ SWATCH = 14  # pixels per color swatch
 
 
 class PaletteEditorWidget(QWidget):
-    """Shows 16 palette slots as color swatch rows with import/export.
+    """Shows palette slots as color swatch rows with import/export.
 
-    Each slot is a row of 16 colored squares. Slots used by the current
-    tilemap are highlighted. Right-click any slot for import/export options.
+    Only shows slots that are loaded or referenced by the tilemap — no wasted
+    rows for empty unused slots. Right-click any slot for import/export options.
     """
 
     palette_changed = pyqtSignal()  # emitted when any palette slot changes
@@ -65,30 +65,44 @@ class PaletteEditorWidget(QWidget):
         self._palette_set = None
         self._pals_used: set = set()  # palette indices the tilemap uses
         self._selected_slot = 0
+        self._visible_slots: list = list(range(16))  # which slots to draw
         self.setMinimumWidth(16 * SWATCH + 60)
-        self.setMinimumHeight(16 * (SWATCH + 2) + 4)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
     def set_palette_set(self, ps):
         self._palette_set = ps
+        self._rebuild_visible()
         self.update()
 
     def set_pals_used(self, used: set):
         self._pals_used = used
+        self._rebuild_visible()
         self.update()
 
     def palette_set(self):
         return self._palette_set
 
+    def _rebuild_visible(self):
+        """Only show slots that are loaded or used by the tilemap."""
+        visible = set(self._pals_used)
+        if self._palette_set:
+            for s in range(min(16, self._palette_set.palette_count())):
+                if self._palette_set.is_slot_loaded(s):
+                    visible.add(s)
+        self._visible_slots = sorted(visible) if visible else [0]
+        row_h = SWATCH + 2
+        needed = len(self._visible_slots) * row_h + 4
+        self.setFixedHeight(needed)
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         sw = SWATCH
-        label_w = 36  # width for "P00:" label
+        label_w = 28  # width for "P0" label
 
-        for slot in range(16):
-            y = slot * (sw + 2) + 2
+        for draw_row, slot in enumerate(self._visible_slots):
+            y = draw_row * (sw + 2) + 2
             # Slot label
             used = slot in self._pals_used
             loaded = (self._palette_set and
@@ -127,7 +141,10 @@ class PaletteEditorWidget(QWidget):
         p.end()
 
     def _slot_at_y(self, y: int) -> int:
-        return max(0, min(15, (y - 2) // (SWATCH + 2)))
+        row = max(0, (y - 2) // (SWATCH + 2))
+        if row < len(self._visible_slots):
+            return self._visible_slots[row]
+        return self._visible_slots[-1] if self._visible_slots else 0
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -170,10 +187,22 @@ class PaletteEditorWidget(QWidget):
             return
         from ui.palette_utils import read_jasc_pal
         colors = read_jasc_pal(path)
-        if colors:
+        if not colors:
+            return
+        if len(colors) > 16:
+            # 256-color .pal — split into sub-palettes and fill all slots
+            for sub in range(0, len(colors), 16):
+                idx = sub // 16
+                if idx >= 16:
+                    break
+                chunk = colors[sub:sub + 16]
+                while len(chunk) < 16:
+                    chunk.append((0, 0, 0))
+                self._palette_set.set_palette_at(idx, chunk)
+        else:
             self._palette_set.set_palette_at(slot, colors)
-            self.palette_changed.emit()
-            self.update()
+        self.palette_changed.emit()
+        self.update()
 
     def _export_pal(self, slot: int):
         if not self._palette_set or not self._palette_set.is_slot_loaded(slot):
@@ -204,34 +233,72 @@ class PaletteEditorWidget(QWidget):
         if not ct:
             QMessageBox.warning(self, "Error", "Not an indexed image")
             return
-        colors = []
-        for c in ct[:16]:
-            r = (c >> 16) & 0xFF
-            g = (c >> 8) & 0xFF
-            b = c & 0xFF
-            colors.append((r, g, b))
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
-        self._palette_set.set_palette_at(slot, colors)
+
+        if len(ct) > 16:
+            # 8bpp image — extract all sub-palettes at once
+            for sub in range(min(16, (len(ct) + 15) // 16)):
+                start = sub * 16
+                chunk = ct[start:start + 16]
+                colors = []
+                for c in chunk:
+                    r = (c >> 16) & 0xFF
+                    g = (c >> 8) & 0xFF
+                    b = c & 0xFF
+                    colors.append((r, g, b))
+                while len(colors) < 16:
+                    colors.append((0, 0, 0))
+                self._palette_set.set_palette_at(sub, colors)
+        else:
+            # 4bpp image — extract to the selected slot
+            colors = []
+            for c in ct[:16]:
+                r = (c >> 16) & 0xFF
+                g = (c >> 8) & 0xFF
+                b = c & 0xFF
+                colors.append((r, g, b))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+            self._palette_set.set_palette_at(slot, colors)
+
         self.palette_changed.emit()
         self.update()
 
     def _export_all_pals(self):
         if not self._palette_set:
             return
-        dir_path = QFileDialog.getExistingDirectory(
-            self, "Export All Palettes to Directory")
-        if not dir_path:
-            return
-        from ui.palette_utils import write_jasc_pal
-        count = 0
-        for slot in range(min(16, self._palette_set.palette_count())):
-            if self._palette_set.is_slot_loaded(slot):
-                path = os.path.join(dir_path, f"palette_{slot:02d}.pal")
-                write_jasc_pal(path, self._palette_set.palettes[slot])
-                count += 1
-        QMessageBox.information(
-            self, "Export", f"Exported {count} palette(s) to {dir_path}")
+
+        menu = QMenu(self)
+        act_separate = menu.addAction("Export as separate 16-color .pal files...")
+        act_combined = menu.addAction("Export as single 256-color .pal file...")
+        action = menu.exec(self.mapToGlobal(self.rect().center()))
+
+        if action == act_separate:
+            dir_path = QFileDialog.getExistingDirectory(
+                self, "Export All Palettes to Directory")
+            if not dir_path:
+                return
+            from ui.palette_utils import write_jasc_pal
+            count = 0
+            for slot in range(min(16, self._palette_set.palette_count())):
+                if self._palette_set.is_slot_loaded(slot):
+                    path = os.path.join(dir_path, f"palette_{slot:02d}.pal")
+                    write_jasc_pal(path, self._palette_set.palettes[slot])
+                    count += 1
+            QMessageBox.information(
+                self, "Export", f"Exported {count} palette(s) to {dir_path}")
+
+        elif action == act_combined:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export Combined 256-Color Palette",
+                "palette_256.pal",
+                "JASC Palette (*.pal)")
+            if not path:
+                return
+            from ui.palette_utils import write_jasc_pal
+            all_colors = self._palette_set.get_flat_colors()
+            write_jasc_pal(path, all_colors)
+            QMessageBox.information(
+                self, "Export", f"Exported 256-color palette to {path}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -296,7 +363,9 @@ class TilemapCanvas(QWidget):
         """Re-render a single tile and update display."""
         if not self._tilemap or not self._sheet or not self._rendered:
             return
-        from core.tilemap_data import _recolor_tile
+        from core.tilemap_data import (
+            _recolor_tile, _recolor_tile_8bpp, build_flat_color_table,
+        )
         entry = self._tilemap.get(col, row)
 
         # Apply tile offset
@@ -313,9 +382,16 @@ class TilemapCanvas(QWidget):
             and self._sheet.image.format() == QImage.Format.Format_Indexed8
         )
         if use_palettes and tile_img.format() == QImage.Format.Format_Indexed8:
-            tile_img = _recolor_tile(tile_img, entry.palette, self._palettes)
+            if self._sheet.is_8bpp:
+                flat_ct = build_flat_color_table(self._palettes)
+                tile_img = _recolor_tile_8bpp(tile_img, flat_ct)
+            else:
+                tile_img = _recolor_tile(tile_img, entry.palette, self._palettes)
 
         painter = QPainter(self._rendered)
+        # Use Source mode so transparent pixels overwrite (erase) old content
+        # instead of alpha-blending on top of the previous tile
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
         painter.drawImage(col * TILE_PX, row * TILE_PX, tile_img)
         painter.end()
         self.update()
@@ -420,6 +496,7 @@ class TilePickerWidget(QWidget):
         self._sheet = sheet
         self._palettes = palettes
         self._selected = 0
+        self._recolored_img = None  # cached recolored sheet image
         self._update_size()
         self.update()
 
@@ -454,9 +531,17 @@ class TilePickerWidget(QWidget):
         # Draw the tile sheet
         if (self._palettes and self._palettes.palette_count() > 0
                 and img.format() == QImage.Format.Format_Indexed8):
-            # Recolor with selected palette for preview
-            from core.tilemap_data import _recolor_tile
-            recolored = _recolor_tile(img, self._pal_idx, self._palettes)
+            if self._sheet.is_8bpp:
+                # 8bpp: apply full 256-color table
+                from core.tilemap_data import (
+                    _recolor_tile_8bpp, build_flat_color_table,
+                )
+                flat_ct = build_flat_color_table(self._palettes)
+                recolored = _recolor_tile_8bpp(img, flat_ct)
+            else:
+                # 4bpp: recolor with selected sub-palette
+                from core.tilemap_data import _recolor_tile
+                recolored = _recolor_tile(img, self._pal_idx, self._palettes)
             p.drawImage(
                 QRect(0, 0, img.width() * z, img.height() * z),
                 recolored,
@@ -602,8 +687,9 @@ class TilemapEditorTab(QWidget):
 
         root.addWidget(tb)
 
-        # -- Main splitter: canvas left, picker right --
+        # -- Main splitter: canvas left, right panel --
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter = splitter
 
         # Left: tilemap canvas in scroll area
         self._canvas = TilemapCanvas()
@@ -617,103 +703,123 @@ class TilemapEditorTab(QWidget):
         canvas_scroll.setMinimumWidth(300)
         splitter.addWidget(canvas_scroll)
 
-        # Right panel: tile picker + controls
+        # ── Right panel ─────────────────────────────────────────────────
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(4, 0, 4, 0)
+        right_layout.setSpacing(2)
 
-        # -- Tool mode --
-        tool_group = QGroupBox("Tool")
-        tool_lay = QHBoxLayout(tool_group)
+        # -- Compact controls bar: Tool + Tile info in one row --
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(6)
+
+        # Tool buttons (compact)
         self._btn_paint = QPushButton("Paint")
         self._btn_paint.setCheckable(True)
         self._btn_paint.setChecked(True)
+        self._btn_paint.setFixedWidth(50)
         self._btn_paint.clicked.connect(lambda: self._set_tool("paint"))
-        self._btn_pick = QPushButton("Pick (Eyedropper)")
+        self._btn_pick = QPushButton("Pick")
         self._btn_pick.setCheckable(True)
+        self._btn_pick.setFixedWidth(40)
+        self._btn_pick.setToolTip("Eyedropper — click tilemap to pick tile")
         self._btn_pick.clicked.connect(lambda: self._set_tool("pick"))
-        tool_lay.addWidget(self._btn_paint)
-        tool_lay.addWidget(self._btn_pick)
-        right_layout.addWidget(tool_group)
+        ctrl_row.addWidget(self._btn_paint)
+        ctrl_row.addWidget(self._btn_pick)
 
-        # -- Current tile info --
-        info_group = QGroupBox("Selected Tile")
-        info_lay = QVBoxLayout(info_group)
+        # Separator
+        sep = QLabel("|")
+        sep.setStyleSheet("color: #555;")
+        ctrl_row.addWidget(sep)
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Index:"))
+        # Tile index
+        ctrl_row.addWidget(QLabel("Tile:"))
         self._tile_idx_label = QLabel("0")
         self._tile_idx_label.setStyleSheet("font-weight: bold;")
-        row1.addWidget(self._tile_idx_label)
-        row1.addStretch()
-        info_lay.addLayout(row1)
+        self._tile_idx_label.setMinimumWidth(24)
+        ctrl_row.addWidget(self._tile_idx_label)
 
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("Palette:"))
+        # Palette
+        ctrl_row.addWidget(QLabel("Pal:"))
         self._pal_spin = QSpinBox()
         self._pal_spin.setRange(0, 15)
+        self._pal_spin.setFixedWidth(46)
         self._pal_spin.valueChanged.connect(self._on_pal_changed)
-        row2.addWidget(self._pal_spin)
-        row2.addStretch()
-        info_lay.addLayout(row2)
+        ctrl_row.addWidget(self._pal_spin)
 
-        row3 = QHBoxLayout()
-        self._hflip_check = QCheckBox("H-Flip")
+        # Flip checkboxes
+        self._hflip_check = QCheckBox("H")
+        self._hflip_check.setToolTip("Horizontal flip")
         self._hflip_check.toggled.connect(self._on_hflip_changed)
-        self._vflip_check = QCheckBox("V-Flip")
+        self._vflip_check = QCheckBox("V")
+        self._vflip_check.setToolTip("Vertical flip")
         self._vflip_check.toggled.connect(self._on_vflip_changed)
-        row3.addWidget(self._hflip_check)
-        row3.addWidget(self._vflip_check)
-        row3.addStretch()
-        info_lay.addLayout(row3)
+        ctrl_row.addWidget(self._hflip_check)
+        ctrl_row.addWidget(self._vflip_check)
 
-        # Preview of selected tile
+        # Tile preview (compact, inline)
         self._tile_preview = QLabel()
-        self._tile_preview.setFixedSize(64, 64)
+        self._tile_preview.setFixedSize(32, 32)
         self._tile_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._tile_preview.setStyleSheet(
             "background: #222; border: 1px solid #555;")
-        info_lay.addWidget(self._tile_preview)
+        ctrl_row.addWidget(self._tile_preview)
 
-        right_layout.addWidget(info_group)
+        ctrl_row.addStretch()
+        right_layout.addLayout(ctrl_row)
 
-        # -- Tile picker --
-        picker_group = QGroupBox("Tile Sheet")
-        picker_lay = QVBoxLayout(picker_group)
-
+        # -- Tile sheet picker — THE FOCUS of the right panel --
         self._picker = TilePickerWidget()
         self._picker.tile_selected.connect(self._on_tile_picked)
 
         picker_scroll = QScrollArea()
         picker_scroll.setWidget(self._picker)
         picker_scroll.setWidgetResizable(False)
-        picker_lay.addWidget(picker_scroll)
-        right_layout.addWidget(picker_group, 1)
+        right_layout.addWidget(picker_scroll, 1)  # stretch=1, takes all space
 
-        # -- Palette editor --
-        pal_group = QGroupBox("Palettes (right-click slot to import/export .pal)")
-        pal_lay = QVBoxLayout(pal_group)
+        # -- Palette bar (compact, at bottom) --
+        # Header row with source combo and action buttons
+        pal_header = QHBoxLayout()
+        pal_header.setSpacing(4)
+        pal_header.setContentsMargins(0, 4, 0, 0)
+        self._pal_header_label = QLabel("Palettes")
+        self._pal_header_label.setStyleSheet(
+            "font-weight: bold; color: #aaa; font-size: 11px;")
+        pal_header.addWidget(self._pal_header_label)
 
-        # Palette source toggle
-        pal_src_row = QHBoxLayout()
-        pal_src_row.addWidget(QLabel("Source:"))
         self._pal_source_combo = _NoScrollCombo()
-        self._pal_source_combo.addItem("Auto (.pal files)", "pal")
-        self._pal_source_combo.addItem("Tile sheet colors", "png")
-        self._pal_source_combo.currentIndexChanged.connect(self._on_pal_source_changed)
-        pal_src_row.addWidget(self._pal_source_combo)
-        pal_lay.addLayout(pal_src_row)
+        self._pal_source_combo.addItem("Auto .pal", "pal")
+        self._pal_source_combo.addItem("PNG colors", "png")
+        self._pal_source_combo.setFixedWidth(100)
+        self._pal_source_combo.setToolTip(
+            "Palette source:\n"
+            "  Auto .pal — load from .pal files in the tilemap's directory\n"
+            "  PNG colors — extract from the tile sheet image's color table")
+        self._pal_source_combo.currentIndexChanged.connect(
+            self._on_pal_source_changed)
+        pal_header.addWidget(self._pal_source_combo)
 
-        # Visual palette editor in scroll area
+        pal_header.addStretch()
+
+        # Import / Export buttons (visible)
+        btn_import = QPushButton("Import .pal")
+        btn_import.setFixedWidth(80)
+        btn_import.setToolTip("Import a JASC .pal file (16 or 256 colors)")
+        btn_import.clicked.connect(self._on_import_pal_clicked)
+        pal_header.addWidget(btn_import)
+
+        btn_export = QPushButton("Export .pal")
+        btn_export.setFixedWidth(80)
+        btn_export.setToolTip("Export palettes as .pal file(s)")
+        btn_export.clicked.connect(self._on_export_pal_clicked)
+        pal_header.addWidget(btn_export)
+
+        right_layout.addLayout(pal_header)
+
+        # Palette swatches — only shows loaded/used slots, auto-sizes height
         self._pal_editor = PaletteEditorWidget()
         self._pal_editor.palette_changed.connect(self._on_palette_edited)
-        pal_scroll = QScrollArea()
-        pal_scroll.setWidget(self._pal_editor)
-        pal_scroll.setWidgetResizable(False)
-        pal_scroll.setMinimumHeight(100)
-        pal_lay.addWidget(pal_scroll)
-
-        right_layout.addWidget(pal_group)
+        right_layout.addWidget(self._pal_editor)  # no stretch, fixed height
 
         # -- Status --
         self._status = QLabel("No tilemap loaded")
@@ -721,8 +827,9 @@ class TilemapEditorTab(QWidget):
         right_layout.addWidget(self._status)
 
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
+
+        # Canvas gets ~55% width, right panel ~45% — user can drag to resize
+        splitter.setSizes([600, 500])
 
         root.addWidget(splitter, 1)
 
@@ -818,13 +925,24 @@ class TilemapEditorTab(QWidget):
         self._canvas.set_data(self._tilemap, self._sheet, self._palettes)
         self._picker.set_sheet(self._sheet, self._palettes)
 
+        # In 8bpp mode, palette bits are ignored by hardware — disable the
+        # per-tile palette spinner and show a tooltip explaining why
+        is_8bpp = self._sheet and self._sheet.is_8bpp
+        self._pal_spin.setEnabled(not is_8bpp)
+        if is_8bpp:
+            self._pal_spin.setToolTip(
+                "Palette slot is ignored in 8bpp mode.\n"
+                "All 256 colors are used directly from the full palette."
+            )
+        else:
+            self._pal_spin.setToolTip("")
+
         self._btn_save.setEnabled(True)
         self._dirty = False
 
         fname = os.path.basename(bin_path)
         parent = os.path.basename(os.path.dirname(bin_path))
         sheet_name = os.path.basename(assets.best_sheet) if assets.best_sheet else "none"
-        pal_count = self._palettes.palette_count() if self._palettes else 0
 
         # Show which palette indices are actually used by this tilemap
         pals_used = set()
@@ -834,11 +952,21 @@ class TilemapEditorTab(QWidget):
             if e.tile_index > max_idx:
                 max_idx = e.tile_index
 
+        is_8bpp = self._sheet and self._sheet.is_8bpp
+        bpp_mode = "8bpp" if is_8bpp else "4bpp"
+
+        # Palette info: show loaded slot count and .pal file count
+        loaded_slots = self._palettes.loaded_slot_count() if self._palettes else 0
+        pal_file_count = len(assets.best_pals)
+        if is_8bpp:
+            pal_info = f"256-color palette ({loaded_slots} sub-palettes from {pal_file_count} .pal)"
+        else:
+            pal_info = f"{loaded_slots} palette(s) from {pal_file_count} .pal"
+
         self._status.setText(
             f"{parent}/{fname} — {tilemap.width}x{tilemap.height} tiles"
-            f" — Sheet: {sheet_name}"
-            f" — {pal_count} palette(s)"
-            f" — Uses pals: {sorted(pals_used)}"
+            f" — Sheet: {sheet_name} ({bpp_mode})"
+            f" — {pal_info}"
             f" — Max tile: {max_idx}"
         )
 
@@ -876,6 +1004,17 @@ class TilemapEditorTab(QWidget):
         # Re-extract palette from new sheet if no .pal files loaded
         if not self._palettes or self._palettes.palette_count() == 0:
             self._palettes = PaletteSet.from_indexed_image(self._sheet.image)
+
+        # Update palette spinner availability based on bpp mode
+        is_8bpp = self._sheet.is_8bpp
+        self._pal_spin.setEnabled(not is_8bpp)
+        if is_8bpp:
+            self._pal_spin.setToolTip(
+                "Palette slot is ignored in 8bpp mode.\n"
+                "All 256 colors are used directly from the full palette."
+            )
+        else:
+            self._pal_spin.setToolTip("")
 
         self._refresh_canvas()
         self._picker.set_sheet(self._sheet, self._palettes)
@@ -980,6 +1119,94 @@ class TilemapEditorTab(QWidget):
         self._refresh_canvas()
         self._picker.set_sheet(self._sheet, self._palettes)
 
+    def _on_import_pal_clicked(self):
+        """Import a .pal file — choose 16-color (to a slot) or 256-color (all slots)."""
+        if not self._palettes:
+            from core.tilemap_data import PaletteSet
+            self._palettes = PaletteSet()
+
+        menu = QMenu(self)
+        act_16 = menu.addAction("Import 16-color .pal to a slot...")
+        act_256 = menu.addAction("Import 256-color .pal (fills all slots)...")
+        action = menu.exec(self.cursor().pos())
+        if not action:
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import JASC Palette",
+            "", "JASC Palette (*.pal);;All files (*)")
+        if not path:
+            return
+        from ui.palette_utils import read_jasc_pal
+        colors = read_jasc_pal(path)
+        if not colors:
+            QMessageBox.warning(self, "Error", "Could not read palette file.")
+            return
+
+        if action == act_256:
+            # Fill all sub-palette slots from a 256-color file
+            for sub in range(0, min(len(colors), 256), 16):
+                idx = sub // 16
+                chunk = colors[sub:sub + 16]
+                while len(chunk) < 16:
+                    chunk.append((0, 0, 0))
+                self._palettes.set_palette_at(idx, chunk)
+        else:
+            # 16-color import — pick which slot
+            slot, ok = self._ask_palette_slot()
+            if not ok:
+                return
+            self._palettes.set_palette_at(slot, colors[:16])
+
+        self._refresh_canvas()
+        self._picker.set_sheet(self._sheet, self._palettes)
+        self._update_pal_editor()
+
+    def _ask_palette_slot(self):
+        """Ask the user which palette slot (0-15) to import into."""
+        from PyQt6.QtWidgets import QInputDialog
+        slot, ok = QInputDialog.getInt(
+            self, "Palette Slot",
+            "Import to slot (0-15):", 0, 0, 15)
+        return slot, ok
+
+    def _on_export_pal_clicked(self):
+        """Export palettes — offers separate .pal files or combined 256-color."""
+        if not self._palettes or self._palettes.loaded_slot_count() == 0:
+            QMessageBox.information(
+                self, "Export", "No palettes loaded to export.")
+            return
+        menu = QMenu(self)
+        act_separate = menu.addAction("Export as separate 16-color .pal files...")
+        act_combined = menu.addAction("Export as single 256-color .pal file...")
+        action = menu.exec(self.cursor().pos())
+        if action == act_separate:
+            dir_path = QFileDialog.getExistingDirectory(
+                self, "Export All Palettes to Directory")
+            if not dir_path:
+                return
+            from ui.palette_utils import write_jasc_pal
+            count = 0
+            for slot in range(min(16, self._palettes.palette_count())):
+                if self._palettes.is_slot_loaded(slot):
+                    path = os.path.join(dir_path, f"palette_{slot:02d}.pal")
+                    write_jasc_pal(path, self._palettes.palettes[slot])
+                    count += 1
+            QMessageBox.information(
+                self, "Export", f"Exported {count} palette(s) to {dir_path}")
+        elif action == act_combined:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export Combined 256-Color Palette",
+                "palette_256.pal",
+                "JASC Palette (*.pal)")
+            if not path:
+                return
+            from ui.palette_utils import write_jasc_pal
+            all_colors = self._palettes.get_flat_colors()
+            write_jasc_pal(path, all_colors)
+            QMessageBox.information(
+                self, "Export", f"Exported 256-color palette to {path}")
+
     def _reload_pal_files(self):
         """Reload palettes from .pal files associated with the current tilemap."""
         if not self._tilemap or not self._tilemap.source_path:
@@ -1006,6 +1233,13 @@ class TilemapEditorTab(QWidget):
                 pals_used.add(e.palette)
         self._pal_editor.set_pals_used(pals_used)
         self._pal_editor.set_palette_set(self._palettes)
+
+        # Update header label
+        is_8bpp = self._sheet and self._sheet.is_8bpp
+        if is_8bpp:
+            self._pal_header_label.setText("Palettes (256-color)")
+        else:
+            self._pal_header_label.setText("Palettes (16-color)")
 
     def _on_dimensions_changed(self):
         """Re-interpret the tilemap with new width/height.
@@ -1072,11 +1306,18 @@ class TilemapEditorTab(QWidget):
             self._current_tile, self._hflip, self._vflip)
         if (self._palettes and self._palettes.palette_count() > 0
                 and tile.format() == QImage.Format.Format_Indexed8):
-            from core.tilemap_data import _recolor_tile
-            tile = _recolor_tile(tile, self._current_pal, self._palettes)
-        # Scale up for preview
+            if self._sheet.is_8bpp:
+                from core.tilemap_data import (
+                    _recolor_tile_8bpp, build_flat_color_table,
+                )
+                flat_ct = build_flat_color_table(self._palettes)
+                tile = _recolor_tile_8bpp(tile, flat_ct)
+            else:
+                from core.tilemap_data import _recolor_tile
+                tile = _recolor_tile(tile, self._current_pal, self._palettes)
+        # Scale up for preview (matches the 32x32 inline preview widget)
         scaled = tile.scaled(
-            64, 64,
+            32, 32,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation,
         )
