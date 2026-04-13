@@ -1097,6 +1097,7 @@ class _TrainerDetailPanel(QWidget):
     rename_requested = pyqtSignal(str)   # emits current const
     setup_battle_requested = pyqtSignal()  # emitted when "Set up battle" button clicked
     edit_tier_gates_requested = pyqtSignal()  # open rematch settings dialog
+    add_to_rematch_requested = pyqtSignal(str)  # emits trainer const to add
     _loading         = False  # True while populating fields — suppresses changed signal
 
     def __init__(
@@ -1357,6 +1358,21 @@ class _TrainerDetailPanel(QWidget):
 
         self._tier_frame.setVisible(False)
         layout.addWidget(self._tier_frame)
+
+        # ── "Add to Rematch Table" button (visible when NOT in rematch table) ──
+        self._add_rematch_btn = QPushButton("Add to VS Seeker Rematch Table")
+        self._add_rematch_btn.setToolTip(
+            "Add this trainer to the VS Seeker rematch system.\n"
+            "Creates an entry in sRematches[] in vs_seeker.c with\n"
+            "empty rematch tiers that you can fill in.")
+        self._add_rematch_btn.setStyleSheet(
+            "QPushButton { background: #1a2a1a; color: #aaffaa; "
+            "border: 1px solid #2a3a2a; border-radius: 4px; "
+            "padding: 4px 12px; font-weight: bold; }"
+            "QPushButton:hover { background: #2a3a2a; }")
+        self._add_rematch_btn.clicked.connect(self._on_add_to_rematch)
+        self._add_rematch_btn.setVisible(False)
+        layout.addWidget(self._add_rematch_btn)
 
         # ── Party type selector ──────────────────────────────────────────
         type_row = QHBoxLayout()
@@ -1805,6 +1821,8 @@ class _TrainerDetailPanel(QWidget):
 
         has_rematches = info is not None
         self._tier_frame.setVisible(has_rematches)
+        # Show "Add to Rematch Table" button when trainer is NOT in the table
+        self._add_rematch_btn.setVisible(not has_rematches)
 
         if not has_rematches:
             self._rematch_tiers = []
@@ -1914,6 +1932,11 @@ class _TrainerDetailPanel(QWidget):
     def _on_edit_tier_gates(self):
         """Open the rematch settings dialog."""
         self.edit_tier_gates_requested.emit()
+
+    def _on_add_to_rematch(self):
+        """Request adding the current trainer to the VS Seeker rematch table."""
+        if self._current_const:
+            self.add_to_rematch_requested.emit(self._current_const)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _populate_class_combo(self):
@@ -2468,6 +2491,7 @@ class TrainersTabWidget(QWidget):
         self._detail_panel.rename_requested.connect(self.rename_requested.emit)
         self._detail_panel.setup_battle_requested.connect(self._on_setup_battle)
         self._detail_panel.edit_tier_gates_requested.connect(self._on_edit_tier_gates)
+        self._detail_panel.add_to_rematch_requested.connect(self._on_add_to_rematch)
         self._detail_scroll.setWidget(self._detail_panel)
 
         self._rebuild_list()
@@ -2898,6 +2922,78 @@ class TrainersTabWidget(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             # Reload everything — the file changed on disk
             self._reload_after_rematch_edit()
+
+    def _find_trainer_map(self, trainer_const: str) -> str:
+        """Find which map contains this trainer's trainerbattle command.
+        Searches all data/maps/*/scripts.inc for the trainer constant."""
+        maps_dir = os.path.join(self._project_root, "data", "maps")
+        if not os.path.isdir(maps_dir):
+            return ""
+        for map_name in sorted(os.listdir(maps_dir)):
+            scripts_path = os.path.join(maps_dir, map_name, "scripts.inc")
+            if not os.path.isfile(scripts_path):
+                continue
+            try:
+                with open(scripts_path, encoding="utf-8", errors="replace") as f:
+                    if trainer_const in f.read():
+                        return f"MAP_{map_name.upper()}"
+            except Exception:
+                continue
+        return ""
+
+    def _on_add_to_rematch(self, trainer_const: str):
+        """Add a trainer to the VS Seeker rematch table in vs_seeker.c."""
+        if not trainer_const or not self._project_root:
+            return
+
+        # Check if already in the table
+        if trainer_const in self._rematch_any_map:
+            QMessageBox.information(self, "Already in Rematch Table",
+                f"{trainer_const} is already in the VS Seeker rematch table.")
+            return
+
+        # Auto-detect which map the trainer is on by searching scripts
+        map_name = self._find_trainer_map(trainer_const)
+        if not map_name:
+            QMessageBox.warning(self, "Map Not Found",
+                f"Could not find {trainer_const} in any map's scripts.inc.\n\n"
+                f"The trainer needs to be placed on a map with a trainerbattle\n"
+                f"command before it can be added to the rematch table.")
+            return
+
+        friendly_map = map_name.replace("MAP_", "").replace("_", " ").title()
+        reply = QMessageBox.question(
+            self, "Add to Rematch Table",
+            f"Add {trainer_const} to the VS Seeker rematch table?\n\n"
+            f"Map: {friendly_map}\n\n"
+            f"This creates a new entry in sRematches[] in vs_seeker.c\n"
+            f"with empty rematch tiers you can fill in.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Create new entry with the trainer as base and empty tiers
+        max_tiers = len(self._gate_flags) if self._gate_flags else 6
+        trainers = [trainer_const] + [""] * (max_tiers - 1)
+        new_entry = {"trainers": trainers, "map": map_name}
+        self._rematch_entries.append(new_entry)
+
+        # Write updated table to vs_seeker.c
+        final_lines = _write_rematch_table(self._rematch_raw_lines,
+                                            self._rematch_entries)
+        path = os.path.join(self._project_root, "src", "vs_seeker.c")
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.writelines(final_lines)
+        except Exception as e:
+            QMessageBox.warning(self, "Write Error",
+                f"Failed to write vs_seeker.c:\n{e}")
+            self._rematch_entries.pop()  # revert in-memory
+            return
+
+        # Reload rematch data from disk
+        self._reload_after_rematch_edit()
+        self.changed.emit()
 
     def _reload_after_rematch_edit(self):
         """Reload rematch data after the settings dialog saved changes."""

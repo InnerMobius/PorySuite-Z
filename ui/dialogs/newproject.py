@@ -287,7 +287,7 @@ class NewProject(QDialog):
 
             project_name = self.project_info["project_name"]
 
-            d.try_get_nproc_from_container()
+            d.get_nproc()
 
             repo = self.selected_plugin.project_base_repo
             branch = self.selected_plugin.project_base_branch
@@ -330,7 +330,7 @@ class NewProject(QDialog):
             if self.error_encountered:
                 return
 
-            nproc = d.try_get_nproc_from_container()
+            nproc = d.get_nproc()
             run_command(wdir=dest_source,
                         args=["make", f"-j{nproc}"] if nproc is not None else ["make"], logger=self.logSignal)
             if self.error_encountered:

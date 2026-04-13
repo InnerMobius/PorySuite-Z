@@ -102,11 +102,37 @@ Purpose: prevent re-investigating solved problems and avoid regressions from bad
 - **Fix**: `notes_to_track_commands` in song_writer.py now strips PATT/PEND entirely and writes fully linear tracks. PATT cannot survive the flatten→edit→save round-trip.
 - **Verified**: MUS_EVIL round-trips correctly — 205 notes, correct instruments, correct volumes
 
-### 15. VOL/TEMPO double-evaluation on save (2026-04-08)
+### 15. Fractional BEND pitch interpolation (2026-04-07)
+- **Problem**: All pitch bends quantized to whole semitones — audible stairstepping on smooth bend sweeps
+- **Root cause**: `_midi_key_to_freq()` computed `val1` and `val2` from GBA scale table but only used `val1`, discarding the `fineAdjust` interpolation. Both renderers then truncated/rounded midi_note to int before passing to the engine.
+- **GBA behavior**: MidiKeyToFreq interpolates: `val = val1 + (val2 - val1) * fineAdjust / 256`. The BEND command produces fractional semitone offsets.
+- **Fix**: (1) `_midi_key_to_freq()` now accepts float key and interpolates between val1/val2 matching GBA. (2) All render functions accept float midi_note. (3) track_renderer passes fractional pitch (not int-truncated). (4) realtime_sequencer passes float bend (not rounded).
+- **Also fixed**: Realtime sequencer pan formula changed from simple `pan/127` to GBA's linear crossfade `(127-signed_pan)/255, (signed_pan+128)/255` matching track_renderer's `apply_pan()`.
+- **Verified**: Continuous pitch interpolation between semitones, matching GBA hardware behavior.
+
+### 16. VOL/TEMPO double-evaluation on save (2026-04-08)
 - **Problem**: Volume halved every save cycle (127→89→63→44...). TEMPO similarly degraded.
 - **Root cause**: Parser evaluates `127*mvl/mxv` → 89 (byte value). Writer wrote `89*mvl/mxv` — applying the multiplier again.
 - **Fix**: Added `_raw_vol()` and `_raw_tempo()` in song_writer.py that reverse the evaluation. All 5 VOL and 2 TEMPO write sites use them.
 - **Verified**: `127*mvl/mxv` round-trips perfectly. Minor ±1 rounding on non-127 values due to integer truncation.
+
+### 17. Piano roll loop uses wrong loop_end (max across all tracks) (2026-04-08)
+- **Problem**: Piano roll cursor continued way past where notes end before looping back. mus_evil loop_end was 1343 (67+ seconds at 50 BPM) but audible notes ended around tick 1151.
+- **Root cause**: `load_song_data` computed loop_end as `max()` across all tracks' `get_flattened_loop_info()` results. Different tracks had GOTOs at different tick positions after PATT flattening. Track 0's GOTO was at 1151 but another track's was at 1343.
+- **Fix**: Canvas loop region overridden with track 0's `get_flattened_loop_info()` values after loading. Track 0 is the structural authority (matches Song Structure panel display).
+- **Verified**: Loop wraps at correct tick, cursor jumps back promptly.
+
+### 18. Piano roll loop save loses edited GOTO position (2026-04-08)
+- **Problem**: User set loop back to tick 960 in Song Structure, saved, reopened — loop was back to 1151.
+- **Root cause**: `notes_to_track_commands` appended the loop GOTO *after* processing all timeline events. If notes existed past the loop end tick, `current_tick` was already past the desired position, so GOTO landed at ~1151 instead of 960.
+- **Fix**: Loop GOTO inserted into timeline at the correct tick (priority 3). Emit loop now `break`s on GOTO/FINE, excluding post-loop notes from the saved .s file.
+- **Verified**: Loop back position persists through save/reload cycle.
+
+### 19. Keysplit routing broken by float midi_note (2026-04-08)
+- **Problem**: Songs with keysplit instruments produced silence after BEND pitch was changed to float.
+- **Root cause**: Keysplit table lookups and drum kit slot lookups need integer indices. Passing float midi_note caused silent failures (no matching slot found → no audio rendered).
+- **Fix**: Added `int()` conversion specifically for keysplit slot lookups and drum kit indexing while keeping float for audio rendering interpolation.
+- **Verified**: mus_evil plays correctly with both keysplit and BEND instruments.
 
 ---
 

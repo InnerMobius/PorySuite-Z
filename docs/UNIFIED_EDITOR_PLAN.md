@@ -6,9 +6,9 @@ Merge PorySuite (data editor) and EVENTide (script editor) into a single window 
 
 ---
 
-## Current State (2026-04-08)
+## Current State (2026-04-13)
 
-Phases 1 through 6 are **complete**. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE**. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding. **Song Writer Optimizations — COMPLETE**: TIE/EOT for long notes, redundant control filtering, proper song deletion cleanup. **ROM Diagnostics Tab — COMPLETE**: ROM size, EWRAM/IWRAM usage, section breakdown, build info. **Piano Roll Save Pipeline Fixes (2026-04-08) — COMPLETE**: PATT subroutine corruption fixed (stripped to linear on save), VOL/TEMPO double-evaluation fixed (reverse-evaluation helpers), BEND loop reset fixed. **Note Properties Dialog — COMPLETE**: Right-click note editing for BEND/control events. **MIDI Import Dropdowns — COMPLETE**: Named instrument dropdowns replace number spinners.
+Phases 1 through 6 are **complete**. **Phase 9 — Pokédex Habitat/Area Display — COMPLETE**: Wild Encounters card on detail panel shows per-species locations with color-coded method dots, level ranges, fishing rod sub-groups, and multi-floor merging. Fully compatible with custom maps and non-vanilla hacks. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE** — overhauled 2026-04-09 with **52 battle templates** achieving **74/74 detection of all vanilla abilities**. Every ability now shows an editable template, not a "no editable template" fallback. Templates cover: status immunity, contact effects, type absorb, weather, stat boost, intimidate, pinch boosts, type immunity, weather recovery, type trap, crit prevention, OHKO prevention, evasion weather, stat double, type resist, block stat/flinch, accuracy boost, guts, weather speed, prevent escape, natural cure, pressure, wonder guard, recoil immunity, type change+boost (Pixilate), dual intimidate, Trick Room/Tailwind, multi-type resist, weather suppress, shed skin, truant, sound block, color change, synchronize, suction cups, sticky hold, shield dust, lightning rod, serene grace, hustle, marvel scale, early bird, liquid ooze, plus/minus, damp, contact flinch, trace, forecast, block specific stat. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding. **Song Writer Optimizations — COMPLETE**: TIE/EOT for long notes, redundant control filtering, proper song deletion cleanup. **ROM Diagnostics Tab — COMPLETE**: ROM size, EWRAM/IWRAM usage, section breakdown, build info. **Piano Roll Save Pipeline Fixes (2026-04-08) — COMPLETE**: PATT subroutine corruption fixed (stripped to linear on save), VOL/TEMPO double-evaluation fixed (reverse-evaluation helpers), BEND loop reset fixed. **Note Properties Dialog — COMPLETE**: Right-click note editing for BEND/control events. **MIDI Import Dropdowns — COMPLETE**: Named instrument dropdowns replace number spinners. **Piano Roll Loop & Save Fixes (2026-04-08) — COMPLETE**: Loop playback used wrong loop_end (max across all tracks), fixed to use track 0's flattened value. GOTO save placed at wrong tick when notes existed past loop end, fixed with timeline insertion. Phantom dirty flag on close after Sound Editor save, fixed. **Piano Roll UX Polish (2026-04-08) — COMPLETE**: Double-click note placement (prevents accidental), Ctrl+Z undo, default snap 1/16, sidebar track sets active instead of filtering, .s reimport/overwrite, git pull refreshes Sound Editor. **Fractional Pitch Bending (2026-04-08) — COMPLETE**: Sub-semitone GBA MidiKeyToFreq interpolation in both renderers, keysplit int() fix, GBA linear pan crossfade. **Piano Roll Control Event & Scroll Fixes (2026-04-08) — COMPLETE**: Control event explosion dedup (PATT flattening duplicated PAN/BEND), PATT label filtering in Song Structure, loop tick drift fix (WAIT before LABEL), label name preservation from Song Structure panel, horizontal scroll by default (wheel), middle-click zoom anchored to cursor. **MIDI Import Robustness (2026-04-08) — COMPLETE**: No Loop mode uses parse→flatten→rewrite pipeline, meta event allowlist cleaning, Type 0→1 MIDI conversion, default import mode changed to "No Loop (clean)". **GM Voicegroup Drum Fix (2026-04-08) — COMPLETE**: 21 drum samples added to mapping, unplaced DirectSound samples recovered into empty slots. **Orphaned Song Registration Cleanup (2026-04-08) — COMPLETE**: Auto-cleanup on project load detects and removes MUS_* entries with missing .s files from all config files. Failed MIDI import cleanup fixed (wrong filename). **Phantom Dirty Flag Fix (2026-04-09) — COMPLETE**: "Unsaved Changes" dialog no longer appears on close/refresh after saving. Root causes: deferred items loader re-dirtying on startup, and gfx_combo repopulation during save marking EVENTide dirty. Fixed with deferred dirty clear, blockSignals during combo refresh, and unconditional EVENTide dirty clear after save. **Pre-Build .s Protection (2026-04-09) — COMPLETE**: `_on_make()` touches all .s files before every build as defense-in-depth against mid2agb overwriting tool-edited songs. **Phase 8B Dirty Flag & Editor Fixes (2026-04-09) — COMPLETE**: Structural dirty-marking loop covers all UI widgets. Abilities effect detection fixed (was using wrong `local_util`). Starter ability combo boxes enabled and saved. "Add to VS Seeker Rematch Table" button with auto map detection. Instrument loop dirty marking. `_on_child_modified()` suppression. **Phase 10A — Tilemap Editor + Palette Editor — PARTIALLY COMPLETE**: Full tilemap viewer/editor with auto-discovery, paint/eyedropper tools, zoom/grid, palette-aware rendering, tile offset for VRAM mapping, visual palette editor with JASC .pal import/export and PNG palette extraction, smart palette-0 fallback for single-palette PNGs. Core: `core/tilemap_data.py`, UI: `ui/tilemap_editor_tab.py`. Remaining in 10A: metatile builder. Remaining: 10B tile animation viewer, 10C animation creator + pixel editor.
 
 **17 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Diagnostics, Event Editor, Maps, Layouts & Tilesets, Region Map, UI (Text Content), Config.
 
@@ -939,10 +939,14 @@ Right panel — Detail view (4 sections):
    - This is what shows on the in-game Pokemon Summary screen
 
 3. **Battle Effect Editor**
-   - Category dropdown with 13 templates: Status Immunity, Contact Status Infliction, Type Absorb (HP), Type Absorb (Power Boost), Weather on Switch-In, End-of-Turn Stat Boost, Intimidate, Contact Recoil, Low-HP Type Power Boost, Type Immunity, Weather HP Recovery, Type Trap, Critical Hit Prevention
-   - Dynamic parameter widgets per category (which status/type/stat/weather, chance %, HP fraction)
+   - Category dropdown with 31 templates organized into groups:
+     - **Original 13**: Status Immunity, Contact Status Infliction, Type Absorb (HP), Type Absorb (Power Boost), Weather on Switch-In, End-of-Turn Stat Boost, Intimidate, Contact Recoil, Low-HP Type Power Boost, Type Immunity, Weather HP Recovery, Type Trap, Critical Hit Prevention
+     - **Inline-detected 14**: OHKO Prevention (Sturdy), Evasion Weather (Sand Veil), Stat Double (Huge Power/Pure Power), Type Resist Halve, Block Stat Reduction (Clear Body), Block Flinch (Inner Focus), Accuracy Boost (Compound Eyes), Guts Boost, Weather Speed (Swift Swim/Chlorophyll), Prevent Escape (Shadow Tag/Arena Trap), Natural Cure, Pressure, Wonder Guard, Recoil Immunity (Rock Head)
+     - **Advanced 4**: Move Type Change + Boost (Pixilate/Aerilate/Refrigerate), Dual Stat Intimidate ("Scare"), Switch-In Field Effect (Trick Room/Tailwind), Multi-Type Resist (Thick Fat)
+   - Dynamic parameter widgets per category (which status/type/stat/weather, chance %, HP fraction, power boost %, dual stat selection)
    - Live C code preview showing what will be written to source files
-   - Auto-detects existing effect by parsing C source when loading an ability
+   - Auto-detects existing effect by parsing C source when loading an ability — scans battle_util.c (case blocks), battle_script_commands.c (inline checks), pokemon.c (damage calc), and battle_main.c (flee/speed) using tight per-line context (±5 lines) to avoid false positives
+   - **"Known Effect" fallback labels**: When detection can't match an editable template, but the ability has a known effect in the hardcoded category database, a green info label shows a human-readable description instead of "(none)"
 
 4. **Field Effect Editor**
    - Category dropdown with 8 templates: Reduce Encounter Rate, Increase Encounter Rate, Type Encounter Rate Boost (pick type), Post-Battle Item Pickup (pick chance), Guaranteed Wild Escape, Faster Egg Hatching, Nature Sync, Gender Attract
@@ -986,7 +990,8 @@ Right panel — Detail view (4 sections):
 
 **What this editor does NOT do:**
 - Does not add a third ability slot (Gen 3 struct has `abilities[2]` only — expanding requires struct + save format changes, out of scope)
-- Some niche effects (Trace, Forecast, Wonder Guard, Synchronize status-pass) don't have configurable templates yet — the editor shows "(none)" for these and they must be edited in C manually
+- Some niche effects (Trace, Forecast, Synchronize status-pass) don't have configurable templates yet — the editor shows the "Known Effect" green label for these so users know the effect exists, but they must be edited in C manually
+- Rock Head is implemented in battle scripts (.s assembly file), not C — detected via hardcoded category lookup, not source scanning
 - Complex multi-file effects (e.g. Hustle modifies both attack and accuracy in different files) are handled for the primary file but may need manual review for secondary locations
 
 **Files created/modified:**
@@ -994,7 +999,7 @@ Right panel — Detail view (4 sections):
 | File | Action |
 |------|--------|
 | `ui/abilities_tab_widget.py` | **Created** — main editor widget (browser, detail panel, effect editors, add/delete/rename) |
-| `core/ability_effect_templates.py` | **Created** — 13 battle + 8 field effect templates, detection, code generation, file manipulation |
+| `core/ability_effect_templates.py` | **Created** — 52 battle + 8 field effect templates (74/74 vanilla ability detection), inline + case-block + name-based detection across 4 C files, code generation, file manipulation |
 | `core/refactor_service.py` | **Modified** — added `rename_ability()` + apply_pending handler |
 | `ui/custom_widgets/rename_dialog.py` | **Modified** — added Ability to name limits |
 | `ui/mainwindow.py` | **Modified** — ability rename handler, save pipeline with effect code writing |
@@ -1005,7 +1010,7 @@ Right panel — Detail view (4 sections):
 **Sound Test / Cry Preview:**
 - **Pokemon tab + Pokedex tab — COMPLETE (2026-04-05)**: "▶ Play Cry" button added to both tabs. Plays `sound/direct_sound_samples/cries/<slug>.wav` for the currently selected species via the shared `ui/audio_player.py` `AudioPlayer` (QMediaPlayer + QAudioOutput). Shows a clear "no cry sample found, expected path: …" warning for custom Fakemon without a cry file.
 - **Event Editor `playmoncry` — COMPLETE (2026-04-05)**: species picker in the Play Pokémon Cry command widget now has a "▶ Preview" button right next to it.
-- **Sound Editor (2026-04-07) — Phases 1-9 COMPLETE (all steps)**: Full GBA M4A audio engine built in Python. Parses song .s files, voicegroups, samples, and renders all 347 songs using the project's actual instruments. Songs Tab with browse/filter/play. Instruments Tab with 144 unique instruments, editable detail panel, piano keyboard with octave shift, sample management (export/import/replace with auto-resampling/delete). Phase 5: Voicegroups Tab — browse all 77 voicegroups, full 128-slot editor, add/clone/delete with reference checking, saves to `voice_groups.inc`. Phase 6 COMPLETE: EVENTide integration (▶ Preview, ■ Stop, 🔊 Open in Sound Editor), F8 shortcut, save pipeline, Sound Settings (volume, loop count, auto-downsample, stereo/mono output mode), constants sync (Sound Editor → EVENTide refresh), Porymap reads songs.h directly. Phase 7 COMPLETE: MIDI Import wizard — 5-page flow: file picker with track preview, voicegroup + settings, per-track instrument mapping (GM → VG slot with auto-match), song structure (full section sequencer — define named sections by measure range, drag/reorder play order, set loop start position; quick presets for simple cases; post-processor generates GOTO/PATT/PEND assembly), mid2agb conversion + registration. `MidiFileInfo` includes `total_measures`, `time_sig_num`, `time_sig_den`. **Phase 8 Steps 8.1-8.5 COMPLETE**: Step 8.1 — Read-only piano roll view with playback. Step 8.2 — Full note editing (place, move, resize, delete, selection, copy/paste, snap grid, cursors). Step 8.3 — Track management sidebar with per-track volume/pan/mute/solo, add/remove/duplicate. Step 8.4 — Real-time sequencer: notes synthesized on-the-fly as cursor crosses them (no pre-rendering), play/pause/resume/seek, ruler drag-to-scrub with red triangle position marker, 32-voice polyphony, per-track mute/solo/volume/pan. Background render thread (note rendering off audio callback for stable tempo), vectorized looping sample resample, PATT/PEND/GOTO flattening for full song structure. All playback bugs fixed (2026-04-07): voicegroup and instrument swaps update live sequencer in-place, track volume/pan sliders wired, pause/resume edge cases handled. Step 8.5 — GM Voicegroup Generator: scans all voicegroups, maps 89 samples to GM program numbers by SC-88 Pro/SD-90 name matching, builds 128-slot GM voicegroup, "Generate GM" button in Voicegroups tab and MIDI Import dialog, auto-detect existing GM voicegroup. Step 8.6 COMPLETE — Round-trip editing: `core/sound/song_writer.py` converts piano roll notes back to .s assembly, follows PorySuite save pipeline (modified signal → File → Save), preserves PATT/GOTO structure. UI overhaul: ruler extracted to fixed `RulerWidget` above scroll area (always visible, drag-to-scrub), toolbar compacted (track tabs → combo box, song info → status bar). See `docs/SOUND_EDITOR_PLAN.md` for full roadmap.
+- **Sound Editor (2026-04-07) — Phases 1-9 COMPLETE (all steps)**: Full GBA M4A audio engine built in Python. Parses song .s files, voicegroups, samples, and renders all 347 songs using the project's actual instruments. Songs Tab with browse/filter/play. Instruments Tab with 144 unique instruments, editable detail panel, piano keyboard with octave shift, sample management (export/import/replace with auto-resampling/delete). Phase 5: Voicegroups Tab — browse all 77 voicegroups, full 128-slot editor, add/clone/delete with reference checking, saves to `voice_groups.inc`. Phase 6 COMPLETE: EVENTide integration (▶ Preview, ■ Stop, 🔊 Open in Sound Editor), F8 shortcut, save pipeline, Sound Settings (volume, loop count, auto-downsample, stereo/mono output mode), constants sync (Sound Editor → EVENTide refresh), Porymap reads songs.h directly. Phase 7 COMPLETE: MIDI Import wizard — 5-page flow: file picker with track preview, voicegroup + settings, per-track instrument mapping (GM → VG slot with auto-match), song structure (full section sequencer — define named sections by measure range, drag/reorder play order, set loop start position; quick presets for simple cases; post-processor generates GOTO/PATT/PEND assembly), mid2agb conversion + registration. `MidiFileInfo` includes `total_measures`, `time_sig_num`, `time_sig_den`. **Phase 8 Steps 8.1-8.5 COMPLETE**: Step 8.1 — Read-only piano roll view with playback. Step 8.2 — Full note editing (place, move, resize, delete, selection, copy/paste, snap grid, cursors). Step 8.3 — Track management sidebar with per-track volume/pan/mute/solo, add/remove/duplicate. Step 8.4 — Real-time sequencer: notes synthesized on-the-fly as cursor crosses them (no pre-rendering), play/pause/resume/seek, ruler drag-to-scrub with red triangle position marker, 32-voice polyphony, per-track mute/solo/volume/pan. Background render thread (note rendering off audio callback for stable tempo), vectorized looping sample resample, PATT/PEND/GOTO flattening for full song structure. All playback bugs fixed (2026-04-07): voicegroup and instrument swaps update live sequencer in-place, track volume/pan sliders wired, pause/resume edge cases handled. Step 8.5 — GM Voicegroup Generator: scans all voicegroups, maps 89 samples to GM program numbers by SC-88 Pro/SD-90 name matching, builds 128-slot GM voicegroup, "Generate GM" button in Voicegroups tab and MIDI Import dialog, auto-detect existing GM voicegroup. Step 8.6 COMPLETE — Round-trip editing: `core/sound/song_writer.py` converts piano roll notes back to .s assembly, follows PorySuite save pipeline (modified signal → File → Save), preserves PATT/GOTO structure. UI overhaul: ruler extracted to fixed `RulerWidget` above scroll area (always visible, drag-to-scrub), toolbar compacted (track tabs → combo box, song info → status bar). **Orphaned Song Cleanup + .s Overwrite Protection (2026-04-08) — COMPLETE**: `cleanup_orphaned_songs()` auto-runs on Sound Editor load — removes MUS_* entries with no .s file from all config files + stray .mid files. `write_midi_cfg()` touches all .s files after writing (midi.cfg is a Makefile dependency for ALL .s files). Every .s write path backdates .mid by 2 seconds. Critical invariant: .s must always be newer than both .mid and midi.cfg. **Sample Loop Controls (2026-04-08) — COMPLETE**: Instruments tab has loop toggle + seconds-based loop point editor with draggable waveform + hold-to-sustain piano preview. Reads/writes .bin file headers directly. Sample data lazy-loads on tab switch. **Instrument Export/Import (2026-04-08) — COMPLETE**: `.psinst` preset format (zip with JSON + .bin). Export/Import buttons in left panel (always visible). Import creates real instruments in voicegroups (replaces filler slots). Handles existing sample conflicts by replacing audio. **Instrument Save Pipeline Fix (2026-04-08) — COMPLETE**: Instruments tab now marks voicegroups dirty via cross-link so edits actually persist on save. PorySuite `isWindowModified` flag cleared after save. **WAV Import/Replace Rate Picker (2026-04-08) — COMPLETE**: Rate/size dialog always shown (was hidden for low-rate WAVs), offers 8000 Hz tier, size warning for large samples. Replace lets user choose rate instead of force-matching original. **Duplicate Loop Label Fix (2026-04-08) — COMPLETE**: Per-track unique assembly labels (prefixed with track name). Song Structure panel strips prefixes for display. Fixes "symbol already defined" assembler error. See `docs/SOUND_EDITOR_PLAN.md` for full roadmap.
 
 **Palette Importer (Graphics tab) — COMPLETE (2026-04-05):**
 - **Location**: "Import Palette from PNG" group box in the right column of the Graphics tab, between the Shiny Palette swatches and the Icon Palette section.
@@ -1061,24 +1066,153 @@ Right panel — Detail view (4 sections):
 
 ---
 
-### Phase 9: Pokedex Habitat / Area Display
+### Phase 8B: Dirty Flag & Editor Fixes — COMPLETE
 
-Add a "Habitat" or "Area" section to the Pokedex tab that shows where each species can be found in the wild. Cross-references `wild_encounters.json` to build a per-species location list.
+Seven bugs reported and fixed 2026-04-09.
 
-**What it shows:**
-- Read-only location list on the Pokedex detail panel (e.g. "Route 1 — Grass (Lv 2-5), Route 2 — Grass (Lv 3-6)")
-- Encounter method (grass, water, fishing, rock smash) and level range per location
-- Optionally highlight locations as dots on the region map image (like the in-game Pokedex "Area" screen)
-- "Not found in wild" message for species that only come from gifts, trades, or evolutions
+**Bug 1: _on_child_modified() phantom dirty** — FIXED. Added suppress flag checks.
+**Bug 2: Abilities effect detection completely broken** — FIXED. `self.source_data.local_util` doesn't exist — was silently failing, so `project_root` was always empty and detection never ran. Fixed to use `self.local_util`.
+**Bug 3: Add to Rematch Table** — FIXED. New button on Party tab auto-detects trainer's map from scripts.inc, writes sRematches[] entry to vs_seeker.c.
+**Bug 4: Starter ability combo boxes** — FIXED. Enabled, populated, loaded, saved.
+**Bug 5: Structural dirty marking** — FIXED. Single loop connects ALL QComboBox/QSpinBox/QSlider/QLineEdit/QTextEdit widgets in the UI form. Covers 21+ previously unwired widgets (stats, EVs, held items, types, egg groups, catch rate, etc.).
+**Bug 6: Instrument loop dirty** — FIXED. `_mark_loop_dirty()` helper in all loop handlers.
 
-**How it works:**
-- On project load, parse `src/data/wild_encounters.json` and build a reverse lookup: species → list of (map, method, level range, encounter rate)
-- Display as a collapsible section on the Pokedex tab detail panel
-- Re-reads encounter data when Porymap signals `wild_encounters_saved` via the bridge
+---
+
+### Phase 9: Pokedex Habitat / Area Display — COMPLETE
+
+Wild Encounters card on the Pokédex detail panel shows every location where a species can be found, with color-coded encounter method dots and level ranges.
+
+**What was built:**
+- `core/encounter_data.py` — reverse species→locations parser. Reads `wild_encounters.json`, resolves map names via `data/maps/*/map.json` + `region_map_sections.json`, falls back to folder name or MAP_ constant cleanup for custom maps
+- Color-coded method dots: Grass (green), Surfing (blue), Rock Smash (brown), Old Rod/Good Rod/Super Rod (grey/indigo/purple)
+- Fishing sub-groups split by rod type from the `groups` field definition
+- Multi-floor dungeons and FR/LG variants merge into single entries per (location, method)
+- "Not found in the wild" message for gift/trade/evolution-only species
+- Re-parses on F5 refresh (encounter DB reloaded in `load_data()`)
+- Graphical map overlay deferred (region map dot highlighting)
 
 **What it does NOT do:**
 - Does not edit encounter tables — that stays in Porymap's Wild Encounters tab
 - Does not duplicate Porymap's per-map encounter editor
+
+---
+
+### Phase 10: Tileset, Metatile & Tile Animation Editor
+
+A visual editor for the parts of tileset workflow that Porymap doesn't cover — building metatiles from raw tiles, editing palettes, painting tilemaps, and creating/editing tile animations.
+
+#### 10A — Tilemap Editor + Palette Editor — PARTIALLY COMPLETE
+
+**Tilemap Editor — COMPLETE:**
+- Open any `.bin` tilemap from the project's `graphics/` directory via file dialog
+- Auto-discovers tile sheet (`.png`) and palettes (`.pal`) from same directory, parent directory, or `palettes/` subdirectory
+- Smart tile sheet selection: reads max tile index from tilemap, scores PNGs by tile coverage and width
+- Tilemap canvas with zoom (1x-8x, Ctrl+scroll), grid overlay toggle
+- Paint tool: select tile from tile sheet picker, click/drag to place on tilemap
+- Eyedropper tool: click tilemap to pick tile index, palette, and flip flags
+- Tile picker panel: click tiles from the tile sheet, palette-aware preview
+- Per-tile controls: palette selector (0-15), H-flip, V-flip checkboxes
+- Tile sheet dropdown: switch between all discovered PNGs in the directory
+- Tilemap dimension re-wrap: changing W auto-recalculates H to keep all entries (and vice versa) — never truncates data
+- Tile Offset spinbox: adjusts VRAM base offset so tilemap indices map correctly to the current sheet; tiles outside the sheet's range render blank
+- Save back to `.bin`
+- Status bar shows: file path, dimensions, sheet name, palette count, which palette indices the tilemap uses, max tile index
+
+**Visual Palette Editor — COMPLETE:**
+- 16 palette slots displayed as color swatch rows (16 colors each)
+- Color-coded slot labels: white = loaded + used by tilemap, red = needed but missing (falls back to pal 0), grey = loaded but unused, dark = empty and unused
+- Palette source toggle: "Auto (.pal files)" or "Tile sheet colors" (extracts from PNG color table)
+- Smart palette fallback: when a tilemap references a palette slot with no real data, `_recolor_tile` uses palette 0 instead. This handles the common case where 4bpp PNGs have one palette but the tilemap references multiple VRAM slots.
+- `PaletteSet` tracks `_loaded_slots` to distinguish real palettes from `ensure_slots()` padding
+- Right-click any slot for context menu: Import .pal, Export .pal, Extract from PNG, Export All Loaded
+- JASC-PAL import/export uses existing `palette_utils.py` (read_jasc_pal / write_jasc_pal)
+- Scrollable palette panel (fits screens of all sizes)
+- All combo boxes use `_NoScrollCombo` per project rules
+
+**Files:** `core/tilemap_data.py`, `ui/tilemap_editor_tab.py`, `ui/unified_mainwindow.py`, `res/icons/toolbar/tilesets.png`
+
+**Remaining in 10A:** Metatile builder (read/write `metatiles.bin` + `metatile_attributes.bin`, 2x2 tile builder with attribute editing)
+
+**Metatile Builder (not yet started):**
+- Display `tiles.png` as a grid of 8x8 tiles with selectable palette overlay
+- Drag tiles into a 2x2 metatile builder — assign tile index, palette (0-15), horizontal/vertical flip per slot
+- Read/write `metatiles.bin` (4 x u16 per metatile: tile_index 10 bits + flip_h 1 bit + flip_v 1 bit + palette 4 bits)
+- Read/write `metatile_attributes.bin` (u32 per metatile: behavior 9 bits, terrain 5 bits, encounter type 3 bits, layer type 2 bits)
+- Metatile list with visual preview — click to edit, reorder, add, delete
+- Attribute editor panel: behavior dropdown (parsed from `constants/metatile_behaviors.h`), terrain type, encounter type, layer type
+- Support both primary and secondary tilesets
+
+**Palette Editor:**
+- Display all 16 palettes as color swatch rows (16 colors each)
+- Click swatch → Qt color picker with 15-bit GBA color clamping (reuse `palette_utils.py` from Graphics tab)
+- Read `.pal` (PaintShop Pro format) → edit → write back
+- Live preview: changing a palette instantly updates the tile and metatile displays
+- Import/export palette as `.pal` or raw `.gbapal`
+
+**Tilemap Viewer/Editor:**
+- Load `data/layouts/*/map.bin` — display the map grid as placed metatiles
+- Each cell is u16: metatile ID (bits 0-9) + collision (bits 10-11) + elevation (bits 12-15)
+- Paint metatiles onto the map grid — pick from the metatile list, click/drag to place
+- Collision and elevation overlay toggles
+- Does NOT replace Porymap's full map editor — this is a lightweight tilemap tool for quick metatile placement and visual verification
+- Read/write `map.bin` directly
+
+**Data formats (all well-documented, straightforward binary):**
+- `tiles.png` — standard indexed PNG, parsed by Qt's QImage
+- `metatiles.bin` — 8 bytes per metatile, no compression
+- `metatile_attributes.bin` — 4 bytes per metatile, bit-packed
+- `palettes/*.pal` — PaintShop Pro text format (16 colors, 15-bit RGB)
+- `data/layouts/*/map.bin` — raw u16 grid
+
+#### 10B — Tile Animation Viewer + Frame Editor
+
+**Animation Viewer:**
+- Parse `src/tileset_anims.c` to extract animation definitions: frame file paths, target tile index, frame count, timing (frame rate)
+- List all animations grouped by tileset (primary general: flower/water/sand, secondary: fountain/steam/door/flowers)
+- Filmstrip display: show all frames side-by-side with frame numbers
+- Animated preview: play animation at correct GBA frame rate (60 fps base, divided by the modulo timing)
+- Show which tiles in the tileset are animated — highlight them in the Metatile Builder's tile grid
+
+**Frame Editor:**
+- Open individual frame PNGs for editing — swap in replacement graphics
+- Import new frame images (must match tile dimensions and palette constraints)
+- Reorder frames, add/remove frames, adjust timing
+- Live preview updates as frames change
+
+**What it parses from C source:**
+- `INCBIN_U16("data/tilesets/*/anim/*/*.4bpp")` → frame file paths
+- `TILE_OFFSET_4BPP(N)` → target tile index
+- `timer % N == M` patterns → frame rate and phase
+- `AppendTilesetAnimToBuffer(...)` calls → frame-to-tile mapping
+- `sPrimaryTilesetAnimCounterMax` / `sSecondaryTilesetAnimCounterMax` → cycle duration
+
+#### 10C — Animation Creator + Tile Pixel Editor
+
+**Animation Creator:**
+- GUI to define new tile animations: pick target tiles from tileset, set frame count, set timing
+- Auto-generate: frame PNG templates (correct dimensions, palette), C callback function, `INCBIN` frame arrays, callback registration in tileset header
+- Code generation follows same pattern as Abilities editor — writes valid pokefirered C
+- Generates into `src/tileset_anims.c` (new callback + arrays) and `src/data/tilesets/headers.h` (callback assignment)
+
+**Tile Pixel Editor:**
+- Paint 8x8 tiles with palette constraints (4bpp = 16 colors from selected palette)
+- Pencil, fill, eyedropper, mirror tools
+- Shared between: tileset tile editing, animation frame painting, metatile preview touch-up
+- Palette-aware: only colors from the assigned palette are available
+- Write back to `tiles.png` (tileset editing) or frame PNGs (animation editing)
+
+#### What Porymap already covers (NOT duplicated):
+- Map event placement (warps, NPCs, items, triggers)
+- Wild encounter table editing
+- Map header/connection editing
+- Border metatile editing
+- Full map navigation and multi-map workflows
+
+#### Toolbar integration:
+- New "Tilesets" toolbar icon between existing Layouts & Tilesets and Region Map
+- Metatile Builder, Palette Editor, Tilemap Viewer as sub-tabs within the page
+- Animation Viewer/Editor as a separate sub-tab or a dock panel
 
 ---
 

@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QComboBox, QFrame, QSizePolicy, QScrollArea,
     QSpinBox, QSlider, QFileDialog, QMessageBox,
-    QInputDialog,
+    QInputDialog, QCheckBox,
 )
 
 from ui.custom_widgets.scroll_guard import install_scroll_guard
@@ -67,7 +67,8 @@ def _is_filler_instrument(inst) -> bool:
 class PianoKeyboard(QWidget):
     """A clickable 2-octave piano keyboard for previewing instruments."""
 
-    note_clicked = pyqtSignal(int)  # emits MIDI note number (0-127)
+    note_clicked = pyqtSignal(int)   # emits MIDI note number on press
+    note_released = pyqtSignal(int)  # emits MIDI note number on release
 
     # Which notes in an octave are black keys (sharps/flats)
     _BLACK_KEYS = {1, 3, 6, 8, 10}  # C#, D#, F#, G#, A#
@@ -187,8 +188,11 @@ class PianoKeyboard(QWidget):
             self.note_clicked.emit(note)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        released = self._pressed_note
         self._pressed_note = None
         self.update()
+        if released is not None:
+            self.note_released.emit(released)
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +309,146 @@ def _midi_to_name(midi: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Loop waveform mini-view
+# ---------------------------------------------------------------------------
+
+class _LoopWaveformWidget(QWidget):
+    """Tiny waveform display with a draggable loop-start marker.
+
+    Shows the sample's waveform as a compact visualization with a
+    vertical orange line at the loop start position.  The user can
+    click or drag anywhere on the widget to move the loop point.
+    """
+
+    loop_dragged = pyqtSignal(float)  # emits 0.0–1.0 fraction
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pcm_peaks: list[tuple[int, int]] = []  # (min, max) per column
+        self._loop_frac: float = 0.0   # 0.0–1.0
+        self._enabled = False
+        self._dragging = False
+        self.setFixedHeight(40)
+        self.setMinimumWidth(200)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(
+            "Waveform with loop point.\n"
+            "Click or drag to set the loop start position.\n"
+            "Orange line = where the loop begins.\n"
+            "Left of the line plays once (attack), right loops.")
+        self.setVisible(False)
+
+    def set_sample(self, pcm_data: bytes, loop_frac: float, enabled: bool):
+        """Load sample data and configure the display."""
+        self._enabled = enabled
+        self._loop_frac = max(0.0, min(1.0, loop_frac))
+        self._build_peaks(pcm_data)
+        self.setVisible(True)
+        self.update()
+
+    def set_loop_frac(self, frac: float):
+        """Update just the loop marker position."""
+        self._loop_frac = max(0.0, min(1.0, frac))
+        self.update()
+
+    def clear(self):
+        """Hide the waveform."""
+        self._pcm_peaks = []
+        self._enabled = False
+        self.setVisible(False)
+
+    def _build_peaks(self, pcm_data: bytes):
+        """Downsample PCM to per-pixel min/max peaks."""
+        w = max(self.width(), 200)
+        n = len(pcm_data)
+        if n == 0:
+            self._pcm_peaks = []
+            return
+        peaks = []
+        for col in range(w):
+            start = col * n // w
+            end = (col + 1) * n // w
+            if start >= end:
+                end = start + 1
+            chunk = pcm_data[start:min(end, n)]
+            if not chunk:
+                peaks.append((0, 0))
+                continue
+            # Signed 8-bit: 0-127 = positive, 128-255 = negative
+            vals = [b if b < 128 else b - 256 for b in chunk]
+            peaks.append((min(vals), max(vals)))
+        self._pcm_peaks = peaks
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        w, h = self.width(), self.height()
+        mid = h // 2
+
+        # Background
+        p.fillRect(0, 0, w, h, QColor(30, 30, 30))
+
+        if not self._pcm_peaks:
+            p.end()
+            return
+
+        # Waveform
+        wave_color = QColor(80, 180, 80) if self._enabled else QColor(80, 80, 80)
+        p.setPen(QPen(wave_color, 1))
+        n_peaks = len(self._pcm_peaks)
+        for col in range(min(w, n_peaks)):
+            mn, mx = self._pcm_peaks[col]
+            y_top = mid - int(mx * mid / 128)
+            y_bot = mid - int(mn * mid / 128)
+            if y_top == y_bot:
+                y_bot = y_top + 1
+            p.drawLine(col, y_top, col, y_bot)
+
+        # Center line
+        p.setPen(QPen(QColor(60, 60, 60), 1))
+        p.drawLine(0, mid, w, mid)
+
+        # Loop marker
+        if self._enabled:
+            lx = int(self._loop_frac * w)
+            p.setPen(QPen(QColor(255, 160, 0), 2))
+            p.drawLine(lx, 0, lx, h)
+            # Label
+            p.setPen(QColor(255, 160, 0))
+            p.setFont(QFont("", 7))
+            p.drawText(lx + 3, 10, "LOOP")
+
+        p.end()
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if not self._enabled or event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._dragging = True
+        self._emit_position(event.position().x())
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self._dragging:
+            self._emit_position(event.position().x())
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        self._dragging = False
+
+    def _emit_position(self, x: float):
+        w = self.width()
+        if w <= 0:
+            return
+        frac = max(0.0, min(1.0, x / w))
+        self._loop_frac = frac
+        self.update()
+        self.loop_dragged.emit(frac)
+
+    def resizeEvent(self, event):
+        # Rebuild peaks when widget resizes
+        # (we don't have the raw PCM here, so peaks stay as-is until next set_sample)
+        super().resizeEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Instruments Tab
 # ---------------------------------------------------------------------------
 
@@ -321,6 +465,7 @@ class InstrumentsTab(QWidget):
         self._voicegroup_data = None
         self._sample_data = None
         self._audio_player = None
+        self._voicegroups_tab_ref = None  # set by sound_editor_tab for dirty tracking
         self._current_instrument = None
         self._current_vg_name = ""
         self._editing = False  # guard against feedback loops
@@ -378,6 +523,32 @@ class InstrumentsTab(QWidget):
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._inst_tree.currentItemChanged.connect(self._on_instrument_selected)
         left_layout.addWidget(self._inst_tree)
+
+        # Action buttons at the bottom of the list (always visible)
+        list_btn_row = QHBoxLayout()
+        self._btn_import_sample = QPushButton("Import WAV")
+        self._btn_import_sample.setToolTip(
+            "Import a WAV file as a new GBA instrument.\n\n"
+            "Creates the sample and adds it to a voicegroup\n"
+            "as a new instrument you can use in songs.\n\n"
+            "Requirements:\n"
+            "• Mono or stereo (stereo mixed to mono)\n"
+            "• Any bit depth or sample rate\n"
+            "• Shorter is better — GBA has limited audio memory")
+        self._btn_import_sample.clicked.connect(self._on_import_sample)
+        self._btn_import_sample.setEnabled(False)
+        list_btn_row.addWidget(self._btn_import_sample)
+
+        self._btn_import_inst = QPushButton("Import Instrument")
+        self._btn_import_inst.setToolTip(
+            "Load a .psinst file exported from another project.\n"
+            "Imports the sample audio, creates a new instrument\n"
+            "with the saved settings (ADSR, base key, pan, loop).")
+        self._btn_import_inst.clicked.connect(self._on_import_instrument)
+        self._btn_import_inst.setEnabled(False)
+        list_btn_row.addWidget(self._btn_import_inst)
+        list_btn_row.addStretch()
+        left_layout.addLayout(list_btn_row)
 
         splitter.addWidget(left)
 
@@ -528,6 +699,58 @@ class InstrumentsTab(QWidget):
         self._sample_info_label.setWordWrap(True)
         samp_layout.addWidget(self._sample_info_label)
 
+        # Sample loop controls
+        loop_row = QHBoxLayout()
+        self._chk_loop = QCheckBox("Loop")
+        self._chk_loop.setToolTip(
+            "Enable sample looping.\n"
+            "When ON, the GBA replays from the loop point to the end\n"
+            "for as long as the note is held. Without this, the sample\n"
+            "plays once and stops — long notes go silent.\n"
+            "Essential for sustained instruments (strings, winds, pads).")
+        self._chk_loop.stateChanged.connect(self._on_loop_toggled)
+        loop_row.addWidget(self._chk_loop)
+
+        loop_row.addWidget(QLabel("at"))
+
+        # Time-based spinner (seconds with 3 decimal places = milliseconds)
+        from PyQt6.QtWidgets import QDoubleSpinBox
+        self._spin_loop_seconds = QDoubleSpinBox()
+        self._spin_loop_seconds.setRange(0.0, 999.999)
+        self._spin_loop_seconds.setDecimals(3)
+        self._spin_loop_seconds.setSuffix(" s")
+        self._spin_loop_seconds.setSingleStep(0.001)
+        self._spin_loop_seconds.setFixedWidth(100)
+        self._spin_loop_seconds.setToolTip(
+            "Loop start time in seconds.\n"
+            "Matches Audacity's timeline — set this to the\n"
+            "exact timestamp where you want the loop to begin.\n"
+            "The GBA plays the full sample once, then jumps\n"
+            "back to this point and repeats.")
+        install_scroll_guard(self._spin_loop_seconds)
+        self._spin_loop_seconds.valueChanged.connect(self._on_loop_seconds_changed)
+        loop_row.addWidget(self._spin_loop_seconds)
+
+        self._loop_detail_label = QLabel("")
+        self._loop_detail_label.setStyleSheet("color: grey; font-size: 10px;")
+        self._loop_detail_label.setToolTip(
+            "Byte offset and percentage.\n"
+            "The GBA stores the loop point as a byte offset\n"
+            "into the sample data. This shows the exact value.")
+        loop_row.addWidget(self._loop_detail_label)
+        loop_row.addStretch()
+        samp_layout.addLayout(loop_row)
+
+        # Hidden byte-level spinner (used internally, not shown)
+        self._spin_loop_start = QSpinBox()
+        self._spin_loop_start.setRange(0, 999999)
+        self._spin_loop_start.setVisible(False)
+
+        # Waveform mini-view with loop marker
+        self._loop_waveform = _LoopWaveformWidget()
+        self._loop_waveform.loop_dragged.connect(self._on_loop_waveform_dragged)
+        samp_layout.addWidget(self._loop_waveform)
+
         # Sample management buttons (Export / Replace / Delete)
         self._sample_btn_row = QHBoxLayout()
         self._btn_export_sample = QPushButton("Export WAV")
@@ -569,25 +792,19 @@ class InstrumentsTab(QWidget):
         info_layout.addWidget(edit_frame)
         right_layout.addWidget(info_group)
 
-        # -- Import new sample button (always visible) --
-        import_row = QHBoxLayout()
-        self._btn_import_sample = QPushButton("Import New Sample (WAV)")
-        self._btn_import_sample.setToolTip(
-            "Import a WAV file as a new GBA instrument sample.\n\n"
-            "Requirements:\n"
-            "• Mono or stereo (stereo is mixed down to mono)\n"
-            "• Any bit depth: 8, 16, 24, or 32-bit\n"
-            "• Any sample rate, but GBA typically uses 8000–22050 Hz\n"
-            "  (higher rates sound better but use more ROM space)\n"
-            "• Shorter is better — GBA has very limited audio memory\n"
-            "  (a few seconds max per sample is typical)\n\n"
-            "The audio is converted to signed 8-bit PCM\n"
-            "with a GBA WaveData header automatically.")
-        self._btn_import_sample.clicked.connect(self._on_import_sample)
-        self._btn_import_sample.setEnabled(False)
-        import_row.addWidget(self._btn_import_sample)
-        import_row.addStretch()
-        right_layout.addLayout(import_row)
+        # -- Export instrument preset (needs a selected instrument) --
+        preset_row = QHBoxLayout()
+        self._btn_export_inst = QPushButton("Export Instrument")
+        self._btn_export_inst.setToolTip(
+            "Save this instrument as a .psinst file.\n"
+            "Includes the sample audio, loop settings, ADSR,\n"
+            "base key, pan — everything needed to recreate it\n"
+            "in another project.")
+        self._btn_export_inst.clicked.connect(self._on_export_instrument)
+        self._btn_export_inst.setEnabled(False)
+        preset_row.addWidget(self._btn_export_inst)
+        preset_row.addStretch()
+        right_layout.addLayout(preset_row)
 
         # -- ADSR envelope (editable) --
         adsr_group = QGroupBox("Envelope (ADSR)")
@@ -701,8 +918,11 @@ class InstrumentsTab(QWidget):
         piano_row.addWidget(self._btn_octave_down)
 
         self._piano = PianoKeyboard(start_octave=3, num_octaves=3)
-        self._piano.setToolTip("Click a key to preview the instrument at that pitch")
+        self._piano.setToolTip(
+            "Click and HOLD a key to preview.\n"
+            "Release to stop — hear how the loop sustains.")
         self._piano.note_clicked.connect(self._on_piano_key)
+        self._piano.note_released.connect(self._on_piano_key_released)
         piano_row.addWidget(self._piano)
 
         self._btn_octave_up = QPushButton("▶")
@@ -740,10 +960,16 @@ class InstrumentsTab(QWidget):
         self._unique_instruments: dict = {}  # key -> (inst, vg_names)
         self._populate_instrument_list()
         self._btn_import_sample.setEnabled(bool(project_root))
+        self._btn_import_inst.setEnabled(bool(project_root))
 
     def set_sample_data(self, sample_data):
         """Receive sample data (lazy-loaded) for preview playback."""
         self._sample_data = sample_data
+        # Refresh the current instrument display so loop controls populate
+        if self._current_instrument and self._voicegroup_data:
+            vg = self._voicegroup_data.get_voicegroup(self._current_vg_name)
+            if vg:
+                self._show_instrument_details(self._current_instrument, vg)
 
     @staticmethod
     def _inst_identity_key(inst) -> str:
@@ -980,14 +1206,55 @@ class InstrumentsTab(QWidget):
             sample_text = f"Sample: {short_name}"
             if 'no_resample' in inst.voice_type:
                 sample_text += "  (fixed pitch)"
+
+            # Populate loop controls from sample header
+            sample = None
             if self._sample_data:
                 sample = self._sample_data.direct_sound.get(inst.sample_label)
                 if sample:
-                    loop_str = "Yes" if sample.has_loop else "No"
                     sample_text += (
                         f"\nRate: {sample.sample_rate} Hz  |  "
-                        f"Length: {sample.duration_seconds:.2f}s  |  "
-                        f"Loop: {loop_str}")
+                        f"Length: {sample.duration_seconds:.2f}s")
+
+                    rate = sample.header.sample_rate or 1
+                    size = sample.header.size
+                    loop_bytes = sample.header.loop_start
+                    loop_sec = loop_bytes / rate if rate > 0 else 0.0
+
+                    # Block signals to avoid feedback loops
+                    self._chk_loop.blockSignals(True)
+                    self._spin_loop_seconds.blockSignals(True)
+
+                    self._chk_loop.setChecked(sample.has_loop)
+                    self._spin_loop_seconds.setMaximum(
+                        size / rate if rate > 0 else 999.999)
+                    self._spin_loop_seconds.setValue(loop_sec)
+                    self._spin_loop_seconds.setEnabled(sample.has_loop)
+                    self._spin_loop_start.setValue(loop_bytes)
+                    self._spin_loop_start.setMaximum(max(size - 1, 0))
+
+                    # Detail label: byte offset + percentage
+                    if size > 0:
+                        pct = loop_bytes * 100 / size
+                        self._loop_detail_label.setText(
+                            f"(byte {loop_bytes:,} — {pct:.0f}%)")
+                    else:
+                        self._loop_detail_label.setText("")
+
+                    # Waveform with loop marker
+                    loop_frac = loop_bytes / size if size > 0 else 0.0
+                    self._loop_waveform.set_sample(
+                        sample.pcm_data, loop_frac,
+                        enabled=sample.has_loop)
+
+                    self._chk_loop.blockSignals(False)
+                    self._spin_loop_seconds.blockSignals(False)
+
+            if sample is None:
+                self._loop_waveform.clear()
+            self._chk_loop.setEnabled(sample is not None)
+            self._spin_loop_seconds.setEnabled(
+                sample is not None and self._chk_loop.isChecked())
             self._sample_info_label.setText(sample_text)
 
         elif inst.is_square:
@@ -1055,6 +1322,9 @@ class InstrumentsTab(QWidget):
         can_preview = not inst.is_keysplit
         self._btn_play.setEnabled(can_preview)
 
+        # Instrument export
+        self._btn_export_inst.setEnabled(inst.is_directsound and bool(inst.sample_label))
+
         self._editing = False
 
     def _update_usage_info(self, inst):
@@ -1093,6 +1363,8 @@ class InstrumentsTab(QWidget):
         self._sample_frame.hide()
         self._base_key_hint.hide()
         self._sample_info_label.setText("")
+        self._loop_waveform.clear()
+        self._loop_detail_label.setText("")
         self._adsr_display.set_adsr(0, 0, 0, 0)
         for p in ('attack', 'decay', 'sustain', 'release'):
             self._adsr_sliders[p].setValue(0)
@@ -1101,6 +1373,7 @@ class InstrumentsTab(QWidget):
         self._adsr_scale_label.setText("")
         self._usage_label.setText("—")
         self._btn_play.setEnabled(False)
+        self._btn_export_inst.setEnabled(False)
         self._preview_status.setText("")
         self._editing = False
 
@@ -1120,6 +1393,7 @@ class InstrumentsTab(QWidget):
         if not info:
             return
 
+        changed_vgs = []
         for vg_name in info['vg_set']:
             vg = self._voicegroup_data.get_voicegroup(vg_name)
             if not vg:
@@ -1127,6 +1401,11 @@ class InstrumentsTab(QWidget):
             for other in vg.instruments:
                 if self._inst_identity_key(other) == key:
                     setattr(other, attr, value)
+            changed_vgs.append(vg_name)
+
+        # Tell the voicegroups tab which voicegroups need saving
+        if changed_vgs and self._voicegroups_tab_ref:
+            self._voicegroups_tab_ref.mark_voicegroups_dirty(changed_vgs)
 
         self.modified.emit()
 
@@ -1186,18 +1465,166 @@ class InstrumentsTab(QWidget):
         )
 
     # ═══════════════════════════════════════════════════════════════════════
+    # Sample loop controls
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _get_current_sample(self):
+        """Get the DirectSoundSample for the current instrument, or None."""
+        inst = self._current_instrument
+        if not inst or not inst.sample_label or not self._sample_data:
+            return None
+        sample = self._sample_data.direct_sound.get(inst.sample_label)
+        if not sample or not sample.pcm_data:
+            return None
+        return sample
+
+    def _write_loop_to_bin(self, sample, loop_on: bool, loop_start: int):
+        """Write updated loop settings to the .bin file and update memory."""
+        from core.sound.sample_loader import _write_gba_bin
+        _write_gba_bin(
+            sample.file_path,
+            sample.header.sample_rate,
+            sample.pcm_data,
+            loop=loop_on,
+            loop_start=loop_start,
+        )
+        sample.header.status = 0x4000 if loop_on else 0
+        sample.header.loop_start = loop_start
+
+    def _update_loop_ui(self, sample, loop_on: bool, loop_bytes: int):
+        """Sync all loop-related UI widgets after a change."""
+        rate = sample.header.sample_rate or 1
+        size = sample.header.size
+
+        # Time spinner
+        self._spin_loop_seconds.blockSignals(True)
+        self._spin_loop_seconds.setValue(loop_bytes / rate)
+        self._spin_loop_seconds.setEnabled(loop_on)
+        self._spin_loop_seconds.blockSignals(False)
+
+        # Detail label
+        if size > 0:
+            pct = loop_bytes * 100 / size
+            self._loop_detail_label.setText(
+                f"(byte {loop_bytes:,} — {pct:.0f}%)")
+        else:
+            self._loop_detail_label.setText("")
+
+        # Waveform marker
+        frac = loop_bytes / size if size > 0 else 0.0
+        self._loop_waveform.set_loop_frac(frac)
+        self._loop_waveform._enabled = loop_on
+        self._loop_waveform.update()
+
+    def _mark_loop_dirty(self):
+        """Mark all voicegroups that use the current instrument as dirty.
+        Loop changes write to the .bin file but don't go through
+        _apply_to_all_copies, so we need to mark dirty separately."""
+        inst = self._current_instrument
+        if not inst or not self._voicegroup_data:
+            return
+        key = self._inst_identity_key(inst)
+        info = self._unique_instruments.get(key)
+        if not info:
+            return
+        changed_vgs = list(info['vg_set'])
+        if changed_vgs and self._voicegroups_tab_ref:
+            self._voicegroups_tab_ref.mark_voicegroups_dirty(changed_vgs)
+
+    def _on_loop_toggled(self, state):
+        """User toggled the loop checkbox — update the .bin file header."""
+        if self._editing:
+            return
+        sample = self._get_current_sample()
+        if not sample:
+            return
+
+        loop_on = bool(state)
+        loop_start = sample.header.loop_start if loop_on else 0
+
+        try:
+            self._write_loop_to_bin(sample, loop_on, loop_start)
+            self._update_loop_ui(sample, loop_on, loop_start)
+            self._mark_loop_dirty()
+            self.modified.emit()
+            _log.info("Loop %s for %s", "enabled" if loop_on else "disabled",
+                       self._current_instrument.sample_label)
+        except Exception as e:
+            _log.error("Failed to update loop setting: %s", e)
+            QMessageBox.warning(self, "Loop Error",
+                                f"Failed to update sample loop:\n{e}")
+
+    def _on_loop_seconds_changed(self, seconds: float):
+        """User typed a time in seconds — convert to bytes and save."""
+        if self._editing:
+            return
+        sample = self._get_current_sample()
+        if not sample or not self._chk_loop.isChecked():
+            return
+
+        rate = sample.header.sample_rate or 1
+        loop_bytes = max(0, min(int(seconds * rate), sample.header.size - 1))
+
+        try:
+            self._write_loop_to_bin(sample, True, loop_bytes)
+            self._update_loop_ui(sample, True, loop_bytes)
+            self._mark_loop_dirty()
+            self.modified.emit()
+        except Exception as e:
+            _log.error("Failed to update loop start: %s", e)
+            QMessageBox.warning(self, "Loop Error",
+                                f"Failed to update loop point:\n{e}")
+
+    def _on_loop_waveform_dragged(self, frac: float):
+        """User dragged the loop marker on the waveform."""
+        if self._editing:
+            return
+        sample = self._get_current_sample()
+        if not sample or not self._chk_loop.isChecked():
+            return
+
+        size = sample.header.size
+        loop_bytes = max(0, min(int(frac * size), size - 1))
+
+        try:
+            self._write_loop_to_bin(sample, True, loop_bytes)
+            # Update time spinner and detail label (waveform already updated by drag)
+            rate = sample.header.sample_rate or 1
+            self._spin_loop_seconds.blockSignals(True)
+            self._spin_loop_seconds.setValue(loop_bytes / rate)
+            self._spin_loop_seconds.blockSignals(False)
+            if size > 0:
+                pct = loop_bytes * 100 / size
+                self._loop_detail_label.setText(
+                    f"(byte {loop_bytes:,} — {pct:.0f}%)")
+            self._mark_loop_dirty()
+            self.modified.emit()
+        except Exception as e:
+            _log.error("Failed to update loop start: %s", e)
+
+    def _on_loop_start_changed(self, value: int):
+        """Internal byte-level handler (kept for compatibility)."""
+        pass  # All loop changes go through seconds or waveform now
+
+    # ═══════════════════════════════════════════════════════════════════════
     # Preview playback
     # ═══════════════════════════════════════════════════════════════════════
 
     def _on_piano_key(self, midi_note: int):
-        """User clicked a piano key — preview the selected instrument."""
+        """User pressed a piano key — start sustained preview."""
         self._preview_note_label.setText(
             f"{_midi_to_name(midi_note)} ({midi_note})")
-        self._play_instrument_note(midi_note)
+        self._play_instrument_note(midi_note, sustain=True)
+
+    def _on_piano_key_released(self, midi_note: int):
+        """User released a piano key — stop playback."""
+        if self._audio_player:
+            self._audio_player.stop()
+            self._audio_player = None
 
     def _on_play_preview(self):
-        """Play button clicked — preview at middle C (60)."""
-        self._play_instrument_note(60)
+        """Play button clicked — short preview at middle C (60)."""
+        self._play_instrument_note(60, sustain=False)
 
     def _on_octave_down(self):
         """Shift piano keyboard down one octave."""
@@ -1218,8 +1645,13 @@ class InstrumentsTab(QWidget):
         high = low + self._piano._num_octaves - 1
         self._piano_range_label.setText(f"C{low} – B{high}")
 
-    def _play_instrument_note(self, midi_note: int):
-        """Render and play the current instrument at the given MIDI note."""
+    def _play_instrument_note(self, midi_note: int, sustain: bool = False):
+        """Render and play the current instrument at the given MIDI note.
+
+        If sustain=True, renders a long note (10 seconds) so the user can
+        hear the loop sustain. Playback stops on key release.
+        If sustain=False, renders a short 800ms preview.
+        """
         inst = self._current_instrument
         if inst is None or inst.is_keysplit:
             return
@@ -1251,6 +1683,9 @@ class InstrumentsTab(QWidget):
         self._preview_status.setText("Rendering...")
         self._btn_play.setEnabled(False)
 
+        # Sustain = long render so you can hear the loop
+        duration_ms = 10000 if sustain else 800
+
         # Render in a thread to keep UI responsive
         sample_data = self._sample_data
         vg_data = self._voicegroup_data
@@ -1260,7 +1695,7 @@ class InstrumentsTab(QWidget):
                 from core.sound.track_renderer import render_instrument_preview
                 audio = render_instrument_preview(
                     inst, midi_note, sample_data, vg_data,
-                    duration_ms=800, velocity=100)
+                    duration_ms=duration_ms, velocity=100)
                 self._preview_audio = audio
                 self._preview_done.emit()
             except Exception as e:
@@ -1370,26 +1805,81 @@ class InstrumentsTab(QWidget):
         if not path:
             return
 
-        orig_rate = sample.header.sample_rate
-        reply = QMessageBox.question(
-            self, "Replace Sample?",
-            f"Replace the audio for '{sample.friendly_name}' with the "
-            f"selected WAV file?\n\n"
-            f"Your audio will be resampled to {orig_rate} Hz to match\n"
-            f"the original, so pitch stays correct in-game.\n"
-            f"Loop settings are preserved from the original.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+        import os
+        from core.sound.sample_loader import peek_wav_info
 
         try:
-            replace_sample_from_wav(path, sample)
+            info = peek_wav_info(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Bad WAV", str(e))
+            return
+
+        wav_rate = info['rate']
+        wav_dur = info['duration']
+        orig_rate = sample.header.sample_rate
+
+        # Build rate options — always let the user choose
+        target_rate = 0  # 0 = keep original rate
+        options = []
+
+        # Offer to match original rate first (preserves pitch in-game)
+        if wav_rate != orig_rate:
+            match_size = int(wav_dur * orig_rate) + 16
+            options.append(
+                f"Match original ({orig_rate} Hz) — "
+                f"{match_size / 1024:.1f} KB")
+
+        # Keep WAV's native rate
+        raw_size = info['mono_8bit_size'] + 16
+        options.append(
+            f"Keep WAV rate ({wav_rate} Hz) — "
+            f"{raw_size / 1024:.1f} KB")
+
+        # Standard downsample tiers
+        for tier_rate, tier_desc in [
+            (22050, "good quality"),
+            (13379, "typical GBA"),
+            (8000,  "small / lo-fi"),
+        ]:
+            if wav_rate > tier_rate and tier_rate != orig_rate:
+                tier_size = int(wav_dur * tier_rate) + 16
+                options.append(
+                    f"Downsample to {tier_rate} Hz ({tier_desc}) — "
+                    f"{tier_size / 1024:.1f} KB")
+
+        choice, ok = QInputDialog.getItem(
+            self, "Replace Sample — Rate & Size",
+            f"Replacing '{sample.friendly_name}' audio.\n"
+            f"Original rate: {orig_rate} Hz\n"
+            f"New WAV: {wav_rate} Hz, {wav_dur:.2f}s\n\n"
+            f"Loop settings will be preserved (scaled to new length).\n\n"
+            f"Choose a sample rate:",
+            options, 0, False)
+        if not ok:
+            return
+
+        # Parse the chosen rate
+        if "Match original" in choice:
+            target_rate = orig_rate
+        elif "Keep WAV rate" in choice:
+            target_rate = wav_rate
+        elif "22050" in choice:
+            target_rate = 22050
+        elif "13379" in choice:
+            target_rate = 13379
+        elif "8000" in choice:
+            target_rate = 8000
+
+        try:
+            replace_sample_from_wav(path, sample, target_rate=target_rate)
             # Refresh the detail display
             self._show_instrument_details(inst, None)
             self.modified.emit()
             QMessageBox.information(
                 self, "Replaced",
-                f"Sample '{sample.friendly_name}' audio has been replaced.")
+                f"Sample '{sample.friendly_name}' audio replaced.\n\n"
+                f"Rate: {sample.header.sample_rate} Hz\n"
+                f"Size: {os.path.getsize(sample.file_path) / 1024:.1f} KB")
         except Exception as e:
             QMessageBox.critical(
                 self, "Replace Failed", str(e))
@@ -1446,6 +1936,73 @@ class InstrumentsTab(QWidget):
             QMessageBox.critical(
                 self, "Delete Failed", str(e))
 
+    def _assign_sample_to_slot(self, sample_label: str):
+        """Assign a sample to an instrument slot.
+
+        If a DirectSound instrument is currently selected, assigns to that.
+        Otherwise, asks the user which voicegroup to add it to and finds
+        a filler slot to replace.
+
+        Returns the target Instrument or None.
+        """
+        # If a DirectSound instrument is selected, use that slot
+        inst = self._current_instrument
+        if inst and inst.is_directsound:
+            self._apply_to_all_copies('sample_label', sample_label)
+            return inst
+
+        # No suitable slot selected — ask the user which voicegroup
+        if not self._voicegroup_data:
+            return None
+
+        vg_names = sorted(self._voicegroup_data.voicegroups.keys())
+        if not vg_names:
+            return None
+
+        vg_name, ok = QInputDialog.getItem(
+            self, "Add to Voicegroup",
+            "Which voicegroup should this new instrument be added to?",
+            vg_names, 0, False)
+        if not ok:
+            return None
+
+        vg = self._voicegroup_data.get_voicegroup(vg_name)
+        if not vg:
+            return None
+
+        # Find a filler slot to replace
+        filler_idx = None
+        for i, slot_inst in enumerate(vg.instruments):
+            if _is_filler_instrument(slot_inst):
+                filler_idx = i
+                break
+
+        if filler_idx is None:
+            QMessageBox.warning(
+                self, "No Empty Slots",
+                f"All 128 slots in {vg_name} are in use.\n"
+                f"Pick a different voicegroup or replace an existing "
+                f"instrument.")
+            return None
+
+        # Set up the filler slot as a new DirectSound instrument
+        target = vg.instruments[filler_idx]
+        target.voice_type = 'voice_directsound'
+        target.type_byte = 0x00
+        target.sample_label = sample_label
+        target.base_midi_key = 60
+        target.pan = 0
+        target.attack = 255
+        target.decay = 0
+        target.sustain = 255
+        target.release = 0
+
+        # Mark the voicegroup dirty so it gets saved
+        if self._voicegroups_tab_ref:
+            self._voicegroups_tab_ref.mark_voicegroups_dirty([vg_name])
+
+        return target
+
     def _on_import_sample(self):
         """Import a new WAV file as a GBA DirectSound sample."""
         if not self._project_root or not self._sample_data:
@@ -1497,78 +2054,345 @@ class InstrumentsTab(QWidget):
         wav_dur = info['duration']
         raw_size = info['mono_8bit_size'] + 16  # +16 for header
 
-        # Suggest a target rate if the WAV is higher than typical GBA
-        GBA_MAX_TYPICAL = 13379  # most common GBA instrument rate
+        # Always show rate/size options — even "GBA-friendly" rates
+        # can be wasteful for long samples.  Let the user decide.
         target_rate = 0  # 0 = keep original
 
-        if wav_rate > GBA_MAX_TYPICAL:
-            # Calculate sizes at various rates
-            size_original = raw_size
-            size_13379 = int(wav_dur * 13379) + 16
-            size_22050 = int(wav_dur * 22050) + 16
+        size_original = raw_size
+        options = []
+        options.append(
+            f"Keep original ({wav_rate} Hz) — "
+            f"{size_original / 1024:.1f} KB")
 
-            # Build the rate selection dialog
-            options = []
-            options.append(
-                f"Keep original ({wav_rate} Hz) — "
-                f"{size_original / 1024:.1f} KB")
-            if wav_rate > 22050:
+        # Offer standard downsample tiers (only those below current rate)
+        for tier_rate, tier_desc in [
+            (22050, "good quality"),
+            (13379, "typical GBA"),
+            (8000,  "small / lo-fi"),
+        ]:
+            if wav_rate > tier_rate:
+                tier_size = int(wav_dur * tier_rate) + 16
                 options.append(
-                    f"Downsample to 22050 Hz (good quality) — "
-                    f"{size_22050 / 1024:.1f} KB")
-            options.append(
-                f"Downsample to 13379 Hz (typical GBA) — "
-                f"{size_13379 / 1024:.1f} KB")
+                    f"Downsample to {tier_rate} Hz ({tier_desc}) — "
+                    f"{tier_size / 1024:.1f} KB")
 
-            choice, ok = QInputDialog.getItem(
-                self, "Sample Rate & ROM Space",
-                f"This WAV is {wav_rate} Hz, {wav_dur:.2f}s long.\n"
-                f"At full rate it will use {size_original / 1024:.1f} KB "
-                f"of ROM space.\n\n"
-                f"GBA instruments typically use 8,000–13,379 Hz.\n"
-                f"Lower rates save ROM space but reduce audio quality.\n\n"
-                f"Choose a sample rate:",
-                options, 0, False)
-            if not ok:
-                return
+        # Size warning for large samples
+        size_warn = ""
+        if size_original > 10 * 1024:
+            size_warn = (
+                f"\n⚠ {size_original / 1024:.1f} KB is large for a GBA "
+                f"instrument.\nMost built-in samples are 1–5 KB. "
+                f"Consider a lower rate.\n")
 
-            # Parse which rate they picked
-            if "Keep original" in choice:
-                target_rate = 0  # no resample
-            elif "22050" in choice:
-                target_rate = 22050
-            elif "13379" in choice:
-                target_rate = 13379
-        else:
-            # Rate is already GBA-friendly — show a simple confirmation
-            reply = QMessageBox.question(
-                self, "Import Sample?",
-                f"Import '{os.path.basename(path)}' as a new GBA sample?\n\n"
-                f"Rate: {wav_rate} Hz\n"
-                f"Duration: {wav_dur:.2f}s\n"
-                f"ROM space: {raw_size / 1024:.1f} KB\n",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+        choice, ok = QInputDialog.getItem(
+            self, "Sample Rate & ROM Space",
+            f"'{os.path.basename(path)}' — "
+            f"{wav_rate} Hz, {wav_dur:.2f}s\n"
+            f"At full rate: {size_original / 1024:.1f} KB of ROM space.\n"
+            f"{size_warn}\n"
+            f"GBA instruments typically use 8,000–13,379 Hz.\n"
+            f"Lower rates save ROM space but reduce audio quality.\n\n"
+            f"Choose a sample rate:",
+            options, 0, False)
+        if not ok:
+            return
+
+        # Parse which rate they picked
+        if "Keep original" in choice:
+            target_rate = 0
+        elif "22050" in choice:
+            target_rate = 22050
+        elif "13379" in choice:
+            target_rate = 13379
+        elif "8000" in choice:
+            target_rate = 8000
 
         # ── Do the import ─────────────────────────────────────────────────
         try:
-            new_sample = import_wav_as_sample(
-                self._project_root, path, name, self._sample_data,
-                target_rate=target_rate)
+            full_label = f"DirectSoundWaveData_{name}"
+
+            # Check if this sample already exists
+            if full_label in self._sample_data.direct_sound:
+                existing = self._sample_data.direct_sound[full_label]
+                # Replace the old audio with the new WAV
+                from core.sound.sample_loader import replace_sample_from_wav
+                replace_sample_from_wav(
+                    path, existing,
+                    target_rate=target_rate if target_rate > 0
+                    else existing.header.sample_rate)
+                new_sample = existing
+            else:
+                new_sample = import_wav_as_sample(
+                    self._project_root, path, name, self._sample_data,
+                    target_rate=target_rate)
 
             final_size = os.path.getsize(new_sample.file_path)
             final_rate = new_sample.header.sample_rate
 
+            # Assign the new sample to an instrument slot
+            target_inst = self._assign_sample_to_slot(new_sample.label)
+
             self._populate_instrument_list()
             self.modified.emit()
+
+            if target_inst:
+                self._show_instrument_details(target_inst, None)
+
             QMessageBox.information(
                 self, "Imported",
-                f"New sample '{new_sample.friendly_name}' added.\n\n"
+                f"Sample '{new_sample.friendly_name}' imported.\n\n"
                 f"Rate: {final_rate} Hz\n"
-                f"ROM space: {final_size / 1024:.1f} KB\n\n"
-                "To use it in a song, assign it to a voicegroup slot "
-                "in the Voicegroups tab.")
+                f"ROM space: {final_size / 1024:.1f} KB")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Import Failed", str(e))
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Instrument Export / Import (.psinst)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _on_export_instrument(self):
+        """Export the current instrument as a .psinst file.
+
+        The .psinst file is a zip containing:
+          - instrument.json — all instrument settings
+          - the .bin sample file (GBA WaveData header + signed 8-bit PCM)
+        """
+        inst = self._current_instrument
+        if not inst or not inst.is_directsound:
+            return
+
+        sample = self._get_current_sample()
+        if not sample:
+            QMessageBox.warning(
+                self, "No Sample",
+                "This instrument has no sample data to export.")
+            return
+
+        # Suggest a filename from the instrument's friendly name
+        suggested_name = re.sub(r'[^a-zA-Z0-9_ -]', '_',
+                                inst.friendly_name).strip('_ ')
+        if not suggested_name:
+            suggested_name = "instrument"
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Instrument Preset",
+            suggested_name + ".psinst",
+            "PorySuite Instrument (*.psinst)")
+        if not path:
+            return
+
+        import json
+        import zipfile
+        import os
+
+        try:
+            # Build the manifest
+            manifest = {
+                'format': 'psinst',
+                'version': 1,
+                'name': inst.friendly_name,
+                'voice_type': inst.voice_type,
+                'type_byte': inst.type_byte,
+                'base_midi_key': inst.base_midi_key,
+                'pan': inst.pan,
+                'attack': inst.attack,
+                'decay': inst.decay,
+                'sustain': inst.sustain,
+                'release': inst.release,
+                'sample_label_suffix': sample.friendly_name.replace(' ', '_').lower(),
+                'sample_rate': sample.sample_rate,
+                'loop_enabled': sample.has_loop,
+                'loop_start_bytes': sample.header.loop_start,
+                'sample_size_bytes': sample.header.size,
+            }
+
+            # Read the raw .bin file
+            bin_filename = os.path.basename(sample.file_path)
+            with open(sample.file_path, 'rb') as f:
+                bin_data = f.read()
+
+            # Write the .psinst zip
+            with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('instrument.json',
+                            json.dumps(manifest, indent=2))
+                zf.writestr(bin_filename, bin_data)
+
+            QMessageBox.information(
+                self, "Exported",
+                f"Instrument preset saved to:\n{path}\n\n"
+                f"Contains: {inst.friendly_name}\n"
+                f"Sample: {bin_filename} "
+                f"({len(bin_data) / 1024:.1f} KB)")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Export Failed", str(e))
+
+    def _on_import_instrument(self):
+        """Import a .psinst file as a new instrument.
+
+        Copies the .bin sample into the project, registers it in
+        direct_sound_data.inc, and applies all instrument settings.
+        If a DirectSound slot is selected, uses that. Otherwise,
+        asks which voicegroup to add it to and finds a filler slot.
+        """
+        if not self._project_root or not self._sample_data:
+            QMessageBox.warning(
+                self, "Not Ready",
+                "Project data must be loaded first.")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Instrument Preset",
+            "", "PorySuite Instrument (*.psinst)")
+        if not path:
+            return
+
+        import json
+        import zipfile
+        import os
+        from core.sound.sample_loader import (
+            read_bin_sample, DirectSoundSample)
+
+        try:
+            with zipfile.ZipFile(path, 'r') as zf:
+                # Read and validate the manifest
+                if 'instrument.json' not in zf.namelist():
+                    raise ValueError(
+                        "Invalid .psinst file — missing instrument.json")
+
+                manifest = json.loads(zf.read('instrument.json'))
+
+                if manifest.get('format') != 'psinst':
+                    raise ValueError(
+                        "Invalid .psinst file — wrong format field")
+
+                # Find the .bin file in the archive
+                bin_files = [n for n in zf.namelist()
+                             if n.endswith('.bin')]
+                if not bin_files:
+                    raise ValueError(
+                        "Invalid .psinst file — no .bin sample found")
+                bin_archive_name = bin_files[0]
+
+                # Ask the user for a sample name (label suffix)
+                suggested = manifest.get('sample_label_suffix', 'imported')
+                suggested = re.sub(r'[^a-zA-Z0-9_]', '_', suggested).strip('_')
+
+                name, ok = QInputDialog.getText(
+                    self, "Sample Name",
+                    f"Importing: {manifest.get('name', 'Unknown')}\n\n"
+                    f"Enter a name for the sample in this project.\n"
+                    f"(letters, numbers, underscores)\n"
+                    f"Example: 'zoot_clarinet' creates "
+                    f"'DirectSoundWaveData_zoot_clarinet'",
+                    text=suggested)
+                if not ok or not name:
+                    return
+
+                name = re.sub(r'[^a-zA-Z0-9_]', '_', name).strip('_')
+                if not name:
+                    QMessageBox.warning(
+                        self, "Invalid Name",
+                        "The name must contain at least one letter.")
+                    return
+
+                label = f"DirectSoundWaveData_{name}"
+
+                # Check for conflicts
+                if label in self._sample_data.direct_sound:
+                    reply = QMessageBox.question(
+                        self, "Sample Already Exists",
+                        f"A sample named '{label}' already exists.\n\n"
+                        f"Use the existing sample instead of importing "
+                        f"a new copy?",
+                        QMessageBox.StandardButton.Yes |
+                        QMessageBox.StandardButton.No)
+                    if reply == QMessageBox.StandardButton.Yes:
+                        # Use existing — just apply settings below
+                        new_sample = self._sample_data.direct_sound[label]
+                    else:
+                        return
+                else:
+                    # Write .bin to project
+                    bin_name = f"{name}.bin"
+                    bin_rel = f"sound/direct_sound_samples/{bin_name}"
+                    bin_abs = os.path.join(
+                        self._project_root, 'sound',
+                        'direct_sound_samples', bin_name)
+
+                    if os.path.exists(bin_abs):
+                        raise ValueError(
+                            f"File already exists: {bin_abs}\n"
+                            f"Choose a different name.")
+
+                    bin_data = zf.read(bin_archive_name)
+                    with open(bin_abs, 'wb') as f:
+                        f.write(bin_data)
+
+                    # Register in direct_sound_data.inc
+                    inc_path = os.path.join(
+                        self._project_root, 'sound',
+                        'direct_sound_data.inc')
+                    entry = (f"\n\t.align 2\n{label}::\n"
+                             f"\t.incbin \"{bin_rel}\"\n")
+                    with open(inc_path, 'a', encoding='utf-8') as f:
+                        f.write(entry)
+
+                    # Load the new sample into memory
+                    header, pcm_loaded = read_bin_sample(bin_abs)
+                    new_sample = DirectSoundSample(
+                        label=label,
+                        file_path=bin_abs,
+                        header=header,
+                        pcm_data=pcm_loaded,
+                    )
+                    self._sample_data.direct_sound[label] = new_sample
+                    self._sample_data._ds_label_to_path[label] = bin_rel
+
+            # Assign the sample to an instrument slot
+            target_inst = self._assign_sample_to_slot(label)
+            if not target_inst:
+                # User cancelled voicegroup selection — sample is still
+                # imported, they can assign it later
+                self._populate_instrument_list()
+                return
+
+            # Apply full instrument settings from the manifest
+            settings = {
+                'base_midi_key': manifest.get('base_midi_key', 60),
+                'pan': manifest.get('pan', 0),
+                'attack': manifest.get('attack', 0),
+                'decay': manifest.get('decay', 0),
+                'sustain': manifest.get('sustain', 0),
+                'release': manifest.get('release', 0),
+            }
+            # If we used _assign_sample_to_slot with existing instrument,
+            # apply to all copies. Otherwise the target is already set up.
+            if self._current_instrument and target_inst == self._current_instrument:
+                for attr, val in settings.items():
+                    self._apply_to_all_copies(attr, val)
+            else:
+                for attr, val in settings.items():
+                    setattr(target_inst, attr, val)
+
+            # Refresh the display to show the new instrument
+            self._populate_instrument_list()
+            self._show_instrument_details(target_inst, None)
+            self.modified.emit()
+
+            QMessageBox.information(
+                self, "Imported",
+                f"Instrument preset applied!\n\n"
+                f"Sample: {new_sample.friendly_name}\n"
+                f"Rate: {new_sample.sample_rate} Hz\n"
+                f"Loop: {'Yes' if manifest.get('loop_enabled') else 'No'}\n"
+                f"ADSR: {manifest.get('attack', 0)} / "
+                f"{manifest.get('decay', 0)} / "
+                f"{manifest.get('sustain', 0)} / "
+                f"{manifest.get('release', 0)}")
+
         except Exception as e:
             QMessageBox.critical(
                 self, "Import Failed", str(e))

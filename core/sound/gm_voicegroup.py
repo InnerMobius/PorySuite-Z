@@ -177,6 +177,31 @@ _SAMPLE_TO_GM: dict[str, list[int]] = {
     'DirectSoundWaveData_bicycle_bell': [112],
     'DirectSoundWaveData_sc88pro_tambourine': [113],
 
+    # Drum kit samples — these normally live in a keysplit drumkit
+    # (voicegroup002) but we also map them to the nearest GM percussion
+    # range slot so they show up in the GM voicegroup.
+    'DirectSoundWaveData_sc88pro_rnd_kick': [117],         # Melodic Tom → kick
+    'DirectSoundWaveData_drum_and_percussion_kick': [117],  # Melodic Tom → kick
+    'DirectSoundWaveData_sc88pro_rnd_snare': [118],        # Synth Drum → snare
+    'DirectSoundWaveData_sc88pro_orchestra_snare': [118],
+    'DirectSoundWaveData_sd90_solo_snare': [118],
+    'DirectSoundWaveData_unknown_snare': [118],
+    'DirectSoundWaveData_unknown_synth_snare': [118],
+    'DirectSoundWaveData_sc88pro_tr909_hand_clap': [119],  # Reverse Cymbal → clap
+    'DirectSoundWaveData_sd90_open_triangle': [114],       # Steel Drums → triangle
+    'DirectSoundWaveData_sc88pro_orchestra_cymbal_crash': [119],
+    'DirectSoundWaveData_trinity_cymbal_crash': [119],
+    'DirectSoundWaveData_unknown_close_hihat': [114],
+    'DirectSoundWaveData_sd90_ambient_tom': [117],
+    'DirectSoundWaveData_unused_sc55_tom': [117],
+    'DirectSoundWaveData_sd90_cowbell': [114],
+    'DirectSoundWaveData_sc88pro_mute_high_conga': [113],
+    'DirectSoundWaveData_sc88pro_open_low_conga': [113],
+    'DirectSoundWaveData_dance_drums_ride_bell': [112],
+    'DirectSoundWaveData_unused_heart_of_asia_indian_drum': [116],
+    'DirectSoundWaveData_unused_sc88pro_unison_slap': [113],
+    'DirectSoundWaveData_sc88pro_timpani_with_snare': [47],  # Timpani
+
     # Misc
     'DirectSoundWaveData_trinity_big_boned': [87],
     'DirectSoundWaveData_sd90_special_scream_drive': [85],
@@ -417,20 +442,42 @@ def generate_gm_voicegroup(
             if inst:
                 gm_slots[slot] = inst
 
-    # Any remaining unique instruments go in the first empty slots
+    # Collect ALL placed sample labels so we can find unplaced DS samples
+    placed_labels: set[str] = set()
+    for inst in gm_slots:
+        if inst is not None and inst.is_directsound and inst.sample_label:
+            placed_labels.add(inst.sample_label)
+
+    # DirectSound samples that didn't win a slot in the GM mapping
+    unplaced_ds = [
+        catalog[label] for label in sorted(catalog.keys())
+        if label not in placed_labels
+    ]
+
+    # Any remaining instruments (both unplaced DS and non-DS) go in empty slots
     placed_ids = {id(inst) for inst in gm_slots if inst is not None}
-    remaining = [i for i in non_ds_instruments if id(i) not in placed_ids]
-    rem_iter = iter(remaining)
+    remaining_non_ds = [i for i in non_ds_instruments if id(i) not in placed_ids]
+    # Prioritize DirectSound over square/noise variants to avoid bloat
+    all_remaining = unplaced_ds + remaining_non_ds
+    rem_iter = iter(all_remaining)
     for slot in range(128):
         if gm_slots[slot] is None:
             inst = next(rem_iter, None)
             if inst:
                 gm_slots[slot] = inst
 
-    # Find the highest slot that has a real instrument — no need to pad
-    # all the way to 128 if nothing lives up there
+    # If there are still unplaced DirectSound or programmable wave instruments,
+    # extend past 128 slots. Skip square/noise overflow — those are mostly
+    # duplicates with slightly different ADSR, and bloating to 300+ slots
+    # isn't useful.
+    overflow = [i for i in rem_iter
+                if i.is_directsound or i.is_programmable_wave]
+    for inst in overflow:
+        gm_slots.append(inst)
+
+    # Find the highest slot that has a real instrument
     highest_slot = -1
-    for slot in range(128):
+    for slot in range(len(gm_slots)):
         if gm_slots[slot] is not None:
             highest_slot = slot
     num_slots = highest_slot + 1 if highest_slot >= 0 else 0

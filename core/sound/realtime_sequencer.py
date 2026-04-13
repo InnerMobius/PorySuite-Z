@@ -15,10 +15,25 @@ This is how a real DAW piano roll works:
 
 from __future__ import annotations
 
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
+
+_DEBUG_LOG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "sound_debug.log",
+)
+
+def _dbg(msg: str):
+    import time
+    ts = time.strftime("%H:%M:%S")
+    try:
+        with open(_DEBUG_LOG, "a") as f:
+            f.write(f"[{ts}] SEQ: {msg}\n")
+    except Exception:
+        pass
 
 import numpy as np
 
@@ -53,7 +68,7 @@ class _ActiveVoice:
 class _RenderRequest:
     """A note waiting to be rendered by the worker thread."""
     voice_slot: int
-    pitch: int
+    pitch: float
     velocity: int
     duration_samples: int
     release_samples: int
@@ -141,6 +156,8 @@ class RealtimeSequencer:
         # Loop region
         self._loop_start: Optional[int] = None
         self._loop_end: Optional[int] = None
+        self._loop_wrap_count: int = 0  # debug
+        self._dbg_next_tick_log: float = 100.0  # debug: log tick every 100 ticks
 
         # Background render thread
         self._render_queue: deque[_RenderRequest] = deque()
@@ -188,6 +205,7 @@ class RealtimeSequencer:
 
     def set_loop(self, start: Optional[int], end: Optional[int]):
         """Set loop region. None = no loop."""
+        _dbg(f"set_loop called: start={start}, end={end}")
         with self._lock:
             self._loop_start = start
             self._loop_end = end
@@ -262,6 +280,9 @@ class RealtimeSequencer:
             self._active_voices.clear()
             self._render_queue.clear()
             self._playing = True
+            self._loop_wrap_count = 0
+            _dbg(f"play: start_tick={start_tick} loop_start={self._loop_start} "
+                 f"loop_end={self._loop_end} notes={len(self._notes)}")
 
         # Start the background render thread
         self._render_stop.clear()
@@ -400,7 +421,8 @@ class RealtimeSequencer:
         """
         outdata[:] = 0
 
-        with self._lock:
+        try:
+          with self._lock:
             if not self._playing:
                 return
 
@@ -444,9 +466,12 @@ class RealtimeSequencer:
                         continue
                     usable = min(chunk_len, remaining)
                     chunk = voice.audio[voice.position:voice.position + usable]
-                    pan_f = voice.pan / 127.0
-                    outdata[write_pos:write_pos + usable, 0] += chunk * (1.0 - pan_f) * vol
-                    outdata[write_pos:write_pos + usable, 1] += chunk * pan_f * vol
+                    # GBA linear crossfade (matches ChnVolSetAsm / apply_pan)
+                    signed_pan = voice.pan - 64
+                    left_gain = (127 - signed_pan) / 255.0
+                    right_gain = (signed_pan + 128) / 255.0
+                    outdata[write_pos:write_pos + usable, 0] += chunk * left_gain * vol
+                    outdata[write_pos:write_pos + usable, 1] += chunk * right_gain * vol
                     voice.position += usable
 
                 # Advance tick clock
@@ -457,6 +482,11 @@ class RealtimeSequencer:
                 if (self._loop_end is not None
                         and self._loop_start is not None
                         and self._tick_accumulator >= self._loop_end):
+                    self._loop_wrap_count += 1
+                    if self._loop_wrap_count <= 3:
+                        _dbg(f"LOOP WRAP #{self._loop_wrap_count}: "
+                             f"tick={self._tick_accumulator:.1f} -> {self._loop_start} "
+                             f"(end={self._loop_end})")
                     self._tick_accumulator = float(self._loop_start)
                     self._note_index = self._find_note_index(self._loop_start)
                     self._active_voices.clear()
@@ -508,6 +538,16 @@ class RealtimeSequencer:
                                    if not v.finished]
             self._current_tick = int(self._tick_accumulator)
 
+            # Debug: log tick position periodically
+            if self._tick_accumulator >= self._dbg_next_tick_log:
+                _dbg(f"TICK={self._tick_accumulator:.1f} "
+                     f"note_idx={self._note_index}/{len(notes)} "
+                     f"voices={len(self._active_voices)} "
+                     f"loop={self._loop_start}-{self._loop_end}")
+                self._dbg_next_tick_log = self._tick_accumulator + 200
+        except Exception as e:
+            _dbg(f"CALLBACK ERROR: {e}")
+
     def _queue_note(self, note: dict, ts: Optional[TrackPlayState]):
         """Build a render request and add it to the queue for the worker."""
         voice_slot = ts.voice if ts else 0
@@ -517,9 +557,9 @@ class RealtimeSequencer:
 
         if ts:
             pitch += ts.key_shift
-            # Apply current pitch bend (BEND command offset in semitones)
-            pitch += round(ts.bend)
-        pitch = max(0, min(127, pitch))
+            # Apply current pitch bend (fractional semitones for smooth bending)
+            pitch = float(pitch) + ts.bend
+        pitch = max(0.0, min(127.0, float(pitch)))
 
         # Convert duration ticks to samples.
         # Cap at 60 seconds — TIE notes in slow songs can sustain for

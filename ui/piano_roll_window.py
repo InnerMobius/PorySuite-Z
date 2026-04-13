@@ -121,6 +121,7 @@ class PianoRollWindow(QMainWindow):
         self._snap_combo = QComboBox()
         install_scroll_guard(self._snap_combo)
         self._snap_combo.addItems(list(SNAP_VALUES.keys()))
+        self._snap_combo.setCurrentText('1/16')  # default to 1/16 for better grid alignment
         self._snap_combo.setToolTip("Grid snap resolution.")
         self._snap_combo.setFixedWidth(90)
         self._snap_combo.currentTextChanged.connect(self._on_snap_changed)
@@ -284,6 +285,18 @@ class PianoRollWindow(QMainWindow):
 
         # Load structure panel (sections, loops, patterns, end markers)
         self._structure_panel.load_from_song(song, self._total_ticks)
+
+        # Use the Song Structure panel's loop region as the authority.
+        # It reads track 0's GOTO/LABEL items — the same values the user
+        # sees and can edit.  The canvas computation (max across all
+        # tracks) can disagree, and get_flattened_loop_info can miscalculate
+        # loop_start for songs where the LABEL tick doesn't match the
+        # WAIT-accumulated tick.  The structure panel's raw ticks are
+        # always correct for what the user expects.
+        sp_loop_s, sp_loop_e = self._structure_panel.get_loop_region()
+        if sp_loop_s is not None and sp_loop_e is not None:
+            loop_s, loop_e = sp_loop_s, sp_loop_e
+            self._piano_roll.canvas.set_loop_region(loop_s, loop_e)
 
         note_count = len(self._piano_roll.canvas.get_notes())
         loop_text = ""
@@ -593,8 +606,12 @@ class PianoRollWindow(QMainWindow):
     # ═══════════════════════════════════════════════════════════════════
 
     def _on_sidebar_track_selected(self, index: int):
-        if 0 <= index + 1 < self._track_combo.count():
-            self._track_combo.setCurrentIndex(index + 1)
+        """User clicked a track in the sidebar — set it as the active track
+        for placing new notes, but do NOT change the track filter/visibility.
+        The Track dropdown and M/S buttons are for controlling visibility."""
+        self._piano_roll.canvas._active_track = max(0, index)
+        self._status.showMessage(
+            f"Active track: {index + 1} (new notes go here)", 3000)
 
     def _on_track_muted(self, index: int, muted: bool):
         self._apply_mute_solo()
@@ -898,10 +915,21 @@ class PianoRollWindow(QMainWindow):
                         value=evt.get('value', 64),
                     ))
 
-            # Determine loop label for this track
-            track_loop_label = track.loop_label
-            if not track_loop_label and loop_start is not None:
-                track_loop_label = f'{track.label}_B1'
+            # Determine loop label for this track.
+            # The user's friendly name (e.g. "intro") is stored once in
+            # track 0.  Every track gets a UNIQUE assembly label by
+            # prefixing the track label (e.g. mus_kakariko_1_intro,
+            # mus_kakariko_2_intro).  Assembly labels must be file-global
+            # unique — using the bare name in every track causes
+            # "symbol already defined" errors.
+            structure_label = self._structure_panel.get_loop_label()
+            friendly_label = structure_label or track.loop_label
+            if not friendly_label and loop_start is not None:
+                friendly_label = 'B1'
+            if friendly_label:
+                track_loop_label = f'{track.label}_{friendly_label}'
+            else:
+                track_loop_label = None
 
             track.commands = notes_to_track_commands(
                 notes, i, voice, volume, pan,

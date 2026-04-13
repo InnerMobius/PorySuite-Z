@@ -44,7 +44,9 @@ class _SImportWorker(QThread):
     def __init__(self, project_root: str, source_s_path: str,
                  constant: str, label: str, music_player: int,
                  target_vg_name: str, source_vg_name: str,
-                 reverb: int, volume: int, priority: int):
+                 reverb: int, volume: int, priority: int,
+                 overwrite: bool = False,
+                 skip_registration: bool = False):
         super().__init__()
         self._project_root = project_root
         self._source_s_path = source_s_path
@@ -56,6 +58,8 @@ class _SImportWorker(QThread):
         self._reverb = reverb
         self._volume = volume
         self._priority = priority
+        self._overwrite = overwrite
+        self._skip_registration = skip_registration
 
     def run(self):
         try:
@@ -63,13 +67,13 @@ class _SImportWorker(QThread):
             dest_filename = self._label + ".s"
             dest_path = os.path.join(dest_dir, dest_filename)
 
-            # Check destination doesn't already exist
-            if os.path.isfile(dest_path):
+            # Check destination doesn't already exist (unless overwrite was approved)
+            if os.path.isfile(dest_path) and not self._overwrite:
                 self.finished.emit(False, "",
                                    f"File already exists: sound/songs/midi/{dest_filename}")
                 return
 
-            # Copy the .s file
+            # Copy the .s file (overwrites if approved)
             shutil.copy2(self._source_s_path, dest_path)
 
             # Create a placeholder .mid so the Makefile's wildcard picks up
@@ -77,9 +81,14 @@ class _SImportWorker(QThread):
             # .mid the .s never gets assembled into a .o and the link fails.
             self._create_placeholder_mid(dest_dir)
 
-            # Touch the .s so its mtime is newer than the .mid — make will
-            # skip the mid2agb step and just assemble the existing .s.
+            # Ensure .s is newer than .mid — make's %.s:%.mid rule runs
+            # mid2agb when .mid is newer, which would overwrite our .s.
+            # Touch .s to now AND backdate the .mid by 2 seconds.
             os.utime(dest_path)
+            mid_file = os.path.join(dest_dir, self._label + ".mid")
+            if os.path.isfile(mid_file):
+                s_mtime = os.stat(dest_path).st_mtime
+                os.utime(mid_file, (s_mtime - 2, s_mtime - 2))
 
             # Rewrite label references if the source label differs from our target label
             self._rewrite_labels(dest_path)
@@ -90,36 +99,38 @@ class _SImportWorker(QThread):
                 self._rewrite_voicegroup(dest_path)
 
             # Register in song_table.inc, songs.h, midi.cfg
-            from core.sound.midi_importer import register_song, Mid2AgbSettings
+            # (skipped when reimporting — the song is already registered)
+            if not self._skip_registration:
+                from core.sound.midi_importer import register_song, Mid2AgbSettings
 
-            # Extract voicegroup number for midi.cfg
-            vg_num = 0
-            m = re.search(r'(\d+)', self._target_vg_name or self._source_vg_name)
-            if m:
-                vg_num = int(m.group(1))
+                # Extract voicegroup number for midi.cfg
+                vg_num = 0
+                m = re.search(r'(\d+)', self._target_vg_name or self._source_vg_name)
+                if m:
+                    vg_num = int(m.group(1))
 
-            settings = Mid2AgbSettings(
-                voicegroup_num=vg_num,
-                reverb=self._reverb,
-                master_volume=self._volume,
-                priority=self._priority,
-            )
+                settings = Mid2AgbSettings(
+                    voicegroup_num=vg_num,
+                    reverb=self._reverb,
+                    master_volume=self._volume,
+                    priority=self._priority,
+                )
 
-            ok, err = register_song(
-                self._project_root,
-                self._label,
-                self._constant,
-                self._music_player,
-                settings,
-            )
-            if not ok:
-                # Clean up copied file on registration failure
-                try:
-                    os.remove(dest_path)
-                except OSError:
-                    pass
-                self.finished.emit(False, "", err)
-                return
+                ok, err = register_song(
+                    self._project_root,
+                    self._label,
+                    self._constant,
+                    self._music_player,
+                    settings,
+                )
+                if not ok:
+                    # Clean up copied file on registration failure
+                    try:
+                        os.remove(dest_path)
+                    except OSError:
+                        pass
+                    self.finished.emit(False, "", err)
+                    return
 
             self.finished.emit(True, dest_path, "")
 
@@ -490,7 +501,7 @@ class SFileImportDialog(QDialog):
                 return
             from core.sound.midi_importer import validate_constant_name
             valid, err = validate_constant_name(constant, self._project_root)
-            if not valid:
+            if not valid and "already exists" not in err:
                 QMessageBox.warning(self, "Invalid Name", err)
                 return
 
@@ -613,6 +624,10 @@ class SFileImportDialog(QDialog):
         if valid:
             self._name_status.setText("Name is available")
             self._name_status.setStyleSheet("color: #6a6; font-size: 10px;")
+        elif "already exists" in err:
+            # Existing song — reimport is allowed (will overwrite)
+            self._name_status.setText(f"{constant} exists — will reimport/overwrite")
+            self._name_status.setStyleSheet("color: #c90; font-size: 10px;")
         else:
             self._name_status.setText(err)
             self._name_status.setStyleSheet("color: #c66; font-size: 10px;")
@@ -684,6 +699,37 @@ class SFileImportDialog(QDialog):
 
         source_vg = song.voicegroup or ""
 
+        # Check if file and/or constant already exist (reimport scenario)
+        dest_path = os.path.join(
+            self._project_root, "sound", "songs", "midi", label + ".s")
+        file_exists = os.path.isfile(dest_path)
+
+        from core.sound.midi_importer import validate_constant_name
+        _, const_err = validate_constant_name(constant, self._project_root)
+        constant_exists = "already exists" in const_err
+
+        overwrite = False
+        skip_registration = False
+
+        if file_exists or constant_exists:
+            # Ask the user before overwriting
+            parts = []
+            if file_exists:
+                parts.append(f"The file {label}.s already exists on disk.")
+            if constant_exists:
+                parts.append(f"The constant {constant} is already registered.")
+            parts.append("\nDo you want to overwrite and reimport?")
+            ans = QMessageBox.question(
+                self, "Song Already Exists",
+                "\n".join(parts),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            overwrite = True
+            skip_registration = constant_exists
+
         # Switch to progress page
         self._stack.setCurrentIndex(_PAGE_PROGRESS)
         self._update_step_label()
@@ -706,6 +752,8 @@ class SFileImportDialog(QDialog):
             self._reverb_spin.value(),
             self._vol_spin.value(),
             self._priority_spin.value(),
+            overwrite=overwrite,
+            skip_registration=skip_registration,
         )
         self._worker.finished.connect(self._on_import_done)
         self._worker.start()

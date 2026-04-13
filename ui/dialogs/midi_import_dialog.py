@@ -120,42 +120,95 @@ def _postprocess_structure(s_path: str, loop_config: dict):
     """Rewrite the .s file structure based on the user's section sequencer.
 
     For 'automatic' mode, does nothing — mid2agb's output is kept as-is.
-    For 'no_loop' mode, strips any GOTO and ensures FINE at the end.
-    For 'custom' mode, rebuilds the track structure using PATT/PEND for
-    section references and GOTO for the loop point.
+    For 'no_loop' mode, fully linearizes the file — removes ALL PATT/PEND/
+      GOTO/internal labels and writes clean linear tracks ending with FINE.
+    For 'custom' mode, rebuilds the track structure using the section
+      sequencer's loop point.
     """
     mode = loop_config.get('mode', 'automatic')
     if mode == 'automatic':
         return
 
-    with open(s_path, encoding="utf-8") as f:
-        text = f.read()
-
-    lines = text.split('\n')
-
     if mode == 'no_loop':
-        # Strip all GOTO commands, keep FINE
-        out = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('.byte') and 'GOTO' in stripped:
-                continue
-            if stripped.startswith('.word') and '_grp' in stripped:
-                # GOTO target word — skip if after a GOTO byte
-                continue
-            out.append(line)
-        # Ensure there's a FINE
-        has_fine = any('.byte\tFINE' in l or '.byte FINE' in l for l in out)
-        if not has_fine:
-            # Insert FINE before the last .end or at the end
-            for i in range(len(out) - 1, -1, -1):
-                if out[i].strip().startswith('.end'):
-                    out.insert(i, '\t.byte\tFINE')
-                    break
-            else:
-                out.append('\t.byte\tFINE')
-        with open(s_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write('\n'.join(out))
+        # Parse → flatten → rewrite as clean linear tracks.
+        # This strips ALL mid2agb structure: PATT calls, PEND markers,
+        # GOTO loops, and internal pattern labels (e.g. mus_name_3_007).
+        # The result is a clean file with just notes, waits, and controls.
+        from core.sound.song_parser import parse_song_file
+        from core.sound.track_renderer import flatten_track_commands
+        from core.sound.song_parser import TrackCommand, extract_tie_notes
+        from core.sound.song_writer import notes_to_track_commands, write_song
+
+        song = parse_song_file(s_path)
+
+        for i, track in enumerate(song.tracks):
+            flat_cmds = flatten_track_commands(track.commands, loop_count=0)
+
+            # Extract notes from flattened commands
+            notes = []
+            for cmd in flat_cmds:
+                if cmd.cmd == 'NOTE' and cmd.pitch is not None:
+                    notes.append({
+                        'tick': cmd.tick,
+                        'pitch': cmd.pitch,
+                        'duration': cmd.duration,
+                        'velocity': cmd.velocity if cmd.velocity else 100,
+                        'track': i,
+                    })
+            # Extract TIE/EOT notes
+            from core.sound.song_parser import Track as _Track
+            _flat_track = _Track(index=i, label=track.label)
+            _flat_track.commands = flat_cmds
+            for note_dict in extract_tie_notes(_flat_track):
+                note_dict['track'] = i
+                notes.append(note_dict)
+
+            # Extract control commands (only non-duplicated)
+            _CONTROL_CMDS = {
+                'VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR',
+                'LFOS', 'LFODL', 'MODT', 'TUNE', 'TEMPO', 'KEYSH',
+                'XCMD', 'PRIO',
+            }
+            controls = []
+            _seen: set[tuple[int, str, int]] = set()
+            for cmd in flat_cmds:
+                if cmd.cmd in _CONTROL_CMDS and cmd.value is not None:
+                    key = (cmd.tick, cmd.cmd, cmd.value)
+                    if key not in _seen:
+                        _seen.add(key)
+                        controls.append(cmd)
+
+            # Get voice/vol/pan from tick-0 controls
+            voice = 0
+            volume = 100
+            pan = 64
+            for cmd in controls:
+                if cmd.tick == 0:
+                    if cmd.cmd == 'VOICE':
+                        voice = cmd.value
+                    elif cmd.cmd == 'VOL':
+                        volume = cmd.value
+                    elif cmd.cmd == 'PAN':
+                        pan = cmd.value
+
+            # Rebuild as clean linear track — no loops, no structure
+            track.commands = notes_to_track_commands(
+                notes, i, voice, volume, pan,
+                loop_start_tick=None, loop_end_tick=None,
+                loop_label=None, original_commands=controls,
+            )
+
+        content = write_song(song)
+        with open(s_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(content)
+
+        # Protect against mid2agb overwrite: backdate the .mid so it's
+        # older than the .s we just wrote.  make's %.s:%.mid rule skips
+        # mid2agb when .s is newer.
+        mid_path = s_path.rsplit('.', 1)[0] + '.mid'
+        if os.path.isfile(mid_path):
+            s_mtime = os.stat(s_path).st_mtime
+            os.utime(mid_path, (s_mtime - 2, s_mtime - 2))
         return
 
     # Custom mode: we need to understand measure boundaries in the .s file.
@@ -204,6 +257,7 @@ def _postprocess_structure(s_path: str, loop_config: dict):
             out.append(line)
         with open(s_path, "w", encoding="utf-8", newline="\n") as f:
             f.write('\n'.join(out))
+        _backdate_mid(s_path)
         return
 
     # Has a loop point: we need to insert loop-back labels and GOTO
@@ -280,6 +334,20 @@ def _postprocess_structure(s_path: str, loop_config: dict):
 
     with open(s_path, "w", encoding="utf-8", newline="\n") as f:
         f.write('\n'.join(out_lines))
+    _backdate_mid(s_path)
+
+
+def _backdate_mid(s_path: str) -> None:
+    """Backdate the .mid file so it's older than the .s we just wrote.
+
+    pokefirered's Makefile has a %.s:%.mid rule — if .mid is newer than
+    .s, make runs mid2agb which OVERWRITES the .s.  Backdating prevents
+    that from wiping tool-edited assembly.
+    """
+    mid_path = s_path.rsplit('.', 1)[0] + '.mid'
+    if os.path.isfile(mid_path):
+        s_mtime = os.stat(s_path).st_mtime
+        os.utime(mid_path, (s_mtime - 2, s_mtime - 2))
 
 
 # ── Filler detection (same logic as voicegroups_tab) ───────────────────────
@@ -826,7 +894,7 @@ class MidiImportDialog(QDialog):
         layout.addLayout(preset_row)
 
         # ── Mode indicator ──
-        self._structure_mode_label = QLabel("Mode: Automatic")
+        self._structure_mode_label = QLabel("Mode: No Loop (clean)")
         self._structure_mode_label.setStyleSheet(
             "color: #888; font-size: 10px; margin-bottom: 4px;")
         layout.addWidget(self._structure_mode_label)
@@ -955,7 +1023,10 @@ class MidiImportDialog(QDialog):
         # Play order: list of section indices into self._sections
         self._play_order: list[int] = []
         # 'custom' or 'automatic' or 'no_loop'
-        self._structure_mode = 'automatic'
+        # Default to 'no_loop' — most users don't want mid2agb's internal
+        # PATT/PEND subroutine structure cluttering the Song Structure panel.
+        # Users who want the raw mid2agb output can click "Automatic".
+        self._structure_mode = 'no_loop'
 
         self._stack.addWidget(page)
 
@@ -1114,7 +1185,7 @@ class MidiImportDialog(QDialog):
         labels = {
             'automatic': "Mode: Automatic — mid2agb handles structure from MIDI",
             'custom': "Mode: Custom — sections arranged manually",
-            'no_loop': "Mode: No Loop — plays once then stops",
+            'no_loop': "Mode: No Loop (clean) — strips all labels, plays once then stops",
         }
         self._structure_mode_label.setText(labels.get(mode, f"Mode: {mode}"))
 
@@ -1159,6 +1230,11 @@ class MidiImportDialog(QDialog):
             total = self._midi_info.total_measures
             self._sec_end_spin.setMaximum(total)
             self._sec_start_spin.setMaximum(total)
+
+            # If no sections defined yet (first visit), apply the default
+            # no_loop preset so the data matches the default mode.
+            if not self._sections:
+                self._preset_no_loop()
 
     # ── Page 4: Progress & result ──────────────────────────────────────
 

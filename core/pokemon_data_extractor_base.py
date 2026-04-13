@@ -48,7 +48,7 @@ class PokemonDataExtractor(ABC):
         self.project_dir = project_info["dir"]
         self.DATA_FILE = data_file
         self.FILES = dict(files) if files else {}
-        self.docker_util = LocalUtil(self.project_info)
+        self.local_util = LocalUtil(self.project_info)
         # Collect informational messages during extraction
         self.messages: list[str] = []
 
@@ -65,7 +65,7 @@ class PokemonDataExtractor(ABC):
 
         :returns: The path of the data file.
         """
-        return os.path.join(self.docker_util.repo_root(), "src", "data", self.DATA_FILE)
+        return os.path.join(self.local_util.repo_root(), "src", "data", self.DATA_FILE)
 
     def check_json_newer_than_files(self) -> bool:
         """
@@ -82,7 +82,7 @@ class PokemonDataExtractor(ABC):
             return False
         json_file_mod_time = os.path.getmtime(json_file)
         for file in self.FILES:
-            file_mod_time = self.docker_util.getmtime(
+            file_mod_time = self.local_util.getmtime(
                 f"{self.FILES[file]['original']}"
             )
             if file_mod_time is None:

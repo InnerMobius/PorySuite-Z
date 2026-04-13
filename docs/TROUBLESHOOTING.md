@@ -56,7 +56,11 @@ Save first (Ctrl+S). The shared data layer sends a signal to refresh EVENTide's 
 New sprites added via the Overworld Graphics tab push their `OBJ_EVENT_GFX_*` constant directly into the Event Editor's dropdown through cross-tab sync — no save or refresh needed. If the sprite still doesn't appear, switch to any EVENTide page and back to trigger a constants refresh, or use File > Refresh (F5).
 
 ### Deleting a song still causes build failures
-Fixed (2026-04-07). Previously, deleting a song from PorySuite only removed the `.s` file but left the `.mid` placeholder behind. The Makefile's wildcard found the orphan `.mid`, tried to build from it, and failed. Now `delete_song()` also removes the `.mid` file and any `.o` build artifacts. Additionally, `write_song_table()` was missing the required `dummy_song_header` footer — this could corrupt `song_table.inc` on any write operation. Fixed.
+Fixed (2026-04-08). Two rounds of fixes:
+
+**Round 1 (2026-04-07):** `delete_song()` wasn't deleting `.mid` files or `.o` artifacts. Also `write_song_table()` was missing the `dummy_song_header` footer. Both fixed.
+
+**Round 2 (2026-04-08):** Orphaned registrations — songs deleted from the UI (or with failed imports) could leave entries in `song_table.inc`, `songs.h`, and `midi.cfg` with no `.s` file on disk. Build failed with "undefined reference" errors. Root cause: failed MIDI imports cleaned up the wrong filename (original name instead of label-based name), leaving stray `.mid` files. Also, no mechanism existed to detect registrations without matching `.s` files. Fix: (1) `import_midi()` now cleans up `label + ".mid"` on failure. (2) New `cleanup_orphaned_songs()` function scans for MUS_* entries with missing `.s` files and removes them from all config files. (3) Sound Editor runs this cleanup automatically on every project load.
 
 ### Piano roll notes longer than 4 beats get cut short
 Fixed (2026-04-07). Notes longer than 96 ticks (4 beats at 24 ticks/beat) were silently truncated to N96 — the maximum single-note duration in GBA M4A. Now the song writer generates TIE + EOT commands for long notes, which is exactly what mid2agb does. Notes sustain for their full drawn duration.
@@ -72,6 +76,82 @@ Fixed (2026-04-08). Volume dropped from 90 to 63 to 44 on successive saves. The 
 
 ### Piano roll BEND effects stop working after the song loops
 Fixed (2026-04-08). The piano roll sequencer was resetting pitch bend state to zero every time the playback looped. The real GBA engine doesn't do this — BEND state carries through GOTO loops. Now the piano roll matches the GBA behavior.
+
+### Piano roll loop playback ignores the loop region — cursor keeps going
+Fixed (2026-04-08). The loop region was computed as the maximum GOTO tick across ALL tracks. Different tracks can have GOTOs at different tick positions (especially with PATT expansions), so the loop end was much later than where audible notes actually ended. Now the loop region comes from track 0's flattened GOTO position — the structural authority that matches what Song Structure shows.
+
+### Editing loop back position in Song Structure doesn't persist after save/reload
+Fixed (2026-04-08). When you set the loop back to tick 960 and saved, the GOTO was being appended after ALL notes in the timeline. If notes existed past tick 960, the GOTO landed at the wrong tick (~1151). Now the GOTO is inserted into the timeline at the correct position, and the writer stops emitting events after a GOTO or FINE.
+
+### "Unsaved Changes" dialog appears after saving from the Sound Editor
+Fixed (2026-04-08). The Sound Editor marks the window dirty when you do things like import songs or rename. When you hit Save, if no sub-component individually reports changes (because the work was already written to disk), the dirty flag never got cleared. Now the dirty flag always clears after a save attempt.
+
+### "Unsaved Changes" dialog appears on close/refresh even after saving or with no edits
+Fixed (2026-04-09). Two separate causes:
+1. **On startup with no edits:** PorySuite's items editor loads on a deferred timer. By the time it fires, the unified window's dirty-flag override is installed, so the items loading marks everything dirty. The dirty clear at end of load ran *before* the deferred load.
+2. **After saving:** The save pipeline refreshes EVENTide's graphics dropdown (`gfx_combo`). Clearing and repopulating the dropdown fires `currentIndexChanged` → marks EVENTide dirty. The save code only cleared EVENTide's dirty flag if a map was loaded — if you never opened a map, the flag stayed stuck.
+
+Fix: (1) Deferred dirty clear 200ms after load/refresh. (2) `gfx_combo` blocks signals during repopulation. (3) EVENTide's dirty flag always clears after save regardless of map state.
+
+### Git pull doesn't refresh Sound Editor data
+Fixed (2026-04-08). Git pull and F5 refresh now explicitly reload the Sound Editor and Credits Editor alongside PorySuite and EVENTide data.
+
+### Accidentally placing notes by clicking in the piano roll
+Fixed (2026-04-08). Single-clicking empty space used to create a note. Now single-click just deselects. Double-click to place a note. Double-click an existing note to open its properties.
+
+### Clicking a track name in piano roll sidebar hides other tracks
+Fixed (2026-04-08). Clicking a track in the sidebar was changing the Track filter dropdown, hiding all other tracks. Now it only sets the active track for placing new notes — all tracks stay visible.
+
+### Can't reimport a .s file that already exists
+Fixed (2026-04-08). The .s import dialog now allows overwriting when a file already exists, showing an amber confirmation instead of a blocking error.
+
+### Piano roll save explodes control events (PAN goes from 18 to 1829)
+Fixed (2026-04-08). PATT flattening duplicated control events per subroutine call. A song with 18 PAN commands could balloon to 1,829 after save. Fixed with deduplication at both load time and save time using (tick, cmd, value) sets.
+
+### Song Structure dropdown shows internal PATT subroutine labels
+Fixed (2026-04-08). The "Loop Back" dropdown was listing labels like `mus_evil_3_007` that are mid2agb's internal subroutine targets, not user-visible sections. The Song Structure panel now filters out PATT target labels.
+
+### Loop position drifts by 2 ticks on every save/reload (192→190)
+Fixed (2026-04-08). The LABEL command was emitted in the .s file before the preceding WAIT gap was calculated. The parser then read the wrong tick position. Fix: WAIT is now calculated and emitted before the LABEL line.
+
+### User's loop label name reverts to auto-generated `_B1` on save
+Fixed (2026-04-08). The save pipeline checked `track.loop_label` (empty for fresh imports) and fell back to auto-generated `_B1`. Now it reads the Song Structure panel's label first.
+
+### Scroll wheel goes vertical in the piano roll instead of horizontal
+Fixed (2026-04-08). Qt's QScrollArea intercepts wheel events before the parent widget sees them. Fixed with an eventFilter on the scroll area + viewport. Plain scroll = horizontal, Shift = vertical, Ctrl = zoom.
+
+### MIDI import leaves PATT/PEND labels even when "No Loop" is selected
+Fixed (2026-04-08). The default import mode was "Automatic" which keeps all mid2agb internal structure. Even if the user didn't click a preset, the import kept PATT/PEND labels. Default changed to "No Loop (clean)" — all imports now strip labels unless you explicitly click "Automatic."
+
+### MIDI import fails with "failed to read event text" on some files
+Fixed (2026-04-08). mid2agb can't handle most MIDI meta events (track names, text, lyrics, markers, etc.). The importer now strips all meta events except tempo, time signature, and end-of-track before passing to mid2agb. Also converts Type 0 MIDIs (all channels in one track) to Type 1 (per-channel tracks).
+
+### Generate GM voicegroup is missing drums (no kick, snare, triangle, etc.)
+Fixed (2026-04-08). The GM mapping table had no drum kit samples. Added kick, snare, hi-hat, triangle, cymbals, toms, hand clap, cowbell, and more. Also fixed a bug where DirectSound samples that lost their slot in the mapping were silently dropped — they now get placed in any remaining empty slots.
+
+### Building after editing songs wipes music (mid2agb overwrites .s files)
+Fixed (2026-04-08). pokefirered's Makefile has a `%.s: %.mid midi.cfg` rule — if midi.cfg or the .mid file is newer than the .s, mid2agb regenerates the .s from the .mid. For tool-edited songs, the .mid is a tiny placeholder, so mid2agb produces empty output that destroys the real music. This was the root cause of mus_evil losing all its data.
+
+Two-layer protection now in place:
+1. **midi.cfg writes touch all .s files** — `write_midi_cfg()` in `song_table_manager.py` runs `os.utime()` on every .s after writing midi.cfg, so they're always newer.
+2. **Every .s write backdates the .mid** — all paths that write .s files (piano roll save, MIDI import, .s import, song replace) set the .mid timestamp 2 seconds in the past.
+
+If you're writing new code that touches midi.cfg, .s files, or .mid files, you MUST maintain this timestamp ordering: .s newer than both .mid and midi.cfg.
+
+### Instrument loop checkbox shows unchecked even though the sample has looping
+Fixed (2026-04-08). Sample data was lazy-loaded — only loaded when you first tried playing audio. If you selected an instrument before playing anything, `_sample_data` was None and the loop controls stayed empty. Now samples load automatically when you switch to the Instruments or Voicegroups tab, and the display refreshes when sample data arrives.
+
+### Imported WAV sample doesn't show up as an instrument
+Fixed (2026-04-08). Import WAV used to create a .bin file but never assign it to any voicegroup slot, so it was invisible. Now the import asks which voicegroup to add it to and replaces a filler slot. If the sample label already exists from a previous import, it replaces the old audio with your new WAV instead of silently reusing stale data. Import buttons are now in the left panel (always visible), not hidden inside another instrument's details.
+
+### Instrument edits don't save / "unsaved changes" after saving
+Fixed (2026-04-08). Two issues: (1) The Instruments tab edited instrument objects in memory but never told the Voicegroups tab they were dirty, so `voice_groups.inc` was never written on save. Now the Instruments tab marks affected voicegroups dirty via a cross-link. (2) PorySuite's `isWindowModified` flag was never cleared after save, so the app always thought there were unsaved changes. Now properly cleared.
+
+### WAV import only shows Yes/No with no rate options
+Fixed (2026-04-08). The rate/size picker dialog was only shown for WAVs above 13379 Hz. Lower-rate WAVs got a simple yes/no confirmation even when the file was 30+ KB. Now the rate picker always shows, with downsample options including 8000 Hz. Same fix applied to the Replace button.
+
+### Build error: "symbol 'intro' is already defined" after piano roll save
+Fixed (2026-04-08). When you named a loop section (e.g. "intro"), the same bare label was written into every track in the .s file. Assembly labels are file-global, so this caused duplicate symbol errors. The save now generates unique per-track labels (e.g. `mus_kakariko_1_intro`, `mus_kakariko_2_intro`). The Song Structure panel strips these prefixes when displaying, so you still see your friendly name.
 
 ### Settings dialog looks different
 The settings dialog was rebuilt with a sidebar. All your old settings (diagnostics, notification preferences) are still there under the same INI keys. Autosave and Porymap path settings were removed (they were dead code that never did anything).

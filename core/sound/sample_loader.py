@@ -536,13 +536,17 @@ def _resample_linear(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
 def replace_sample_from_wav(
     wav_path: str,
     existing_sample: DirectSoundSample,
+    target_rate: int = 0,
 ) -> DirectSoundSample:
     """Replace an existing sample's audio data from a new WAV file.
 
     Keeps the same label and .bin file path. Overwrites the .bin file
-    with the converted audio.  Resamples the WAV to match the original
-    sample's rate so pitch stays correct in-game.  Preserves the
-    original loop flag (loop point is scaled proportionally).
+    with the converted audio.  Preserves the original loop flag
+    (loop point is scaled proportionally).
+
+    Args:
+        target_rate: If > 0, resample to this rate instead of matching
+            the original.  If 0, matches the original sample's rate.
     """
     bin_abs = existing_sample.file_path
 
@@ -551,6 +555,9 @@ def replace_sample_from_wav(
     orig_loop = (existing_sample.header.status & 0x4000) != 0
     orig_loop_start = existing_sample.header.loop_start
     orig_size = existing_sample.header.size
+
+    # Use target rate or match original
+    final_rate = target_rate if target_rate > 0 else orig_rate
 
     # Back up the original
     backup_path = bin_abs + '.bak'
@@ -564,9 +571,9 @@ def replace_sample_from_wav(
         if len(pcm) == 0:
             raise ValueError("WAV file contains no audio data")
 
-        # Resample to match the original sample rate so pitch is correct
-        if wav_rate != orig_rate and orig_rate > 0:
-            pcm = _resample_linear(pcm, wav_rate, orig_rate)
+        # Resample to the target rate
+        if wav_rate != final_rate and final_rate > 0:
+            pcm = _resample_linear(pcm, wav_rate, final_rate)
 
         # Scale loop point proportionally if the original looped
         loop_start = 0
@@ -575,8 +582,8 @@ def replace_sample_from_wav(
             loop_frac = orig_loop_start / orig_size
             loop_start = int(loop_frac * len(pcm))
 
-        # Write the GBA .bin with original rate and loop settings
-        _write_gba_bin(bin_abs, orig_rate, pcm,
+        # Write the GBA .bin with chosen rate and loop settings
+        _write_gba_bin(bin_abs, final_rate, pcm,
                        loop=orig_loop, loop_start=loop_start)
 
         # Reload the sample data

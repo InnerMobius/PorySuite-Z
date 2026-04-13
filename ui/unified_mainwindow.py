@@ -206,6 +206,12 @@ class UnifiedMainWindow(QMainWindow):
 
         _add_separator(tb)
 
+        # ── Tilemap Editor ───────────────────────────────────────────────────
+        btn = self._make_page_button("tilesets", "Tilemap Editor")
+        tb.addWidget(btn)
+
+        _add_separator(tb)
+
         # ── Settings / Info pages ────────────────────────────────────────────
         settings_pages = [
             ("diagnostics", "ROM Diagnostics"),
@@ -560,6 +566,12 @@ class UnifiedMainWindow(QMainWindow):
         idx = self.stack.addWidget(self._diagnostics_tab)
         self._page_indices["diagnostics"] = idx
 
+        # ── Tilemap Editor ──────────────────────────────────────────────────
+        from ui.tilemap_editor_tab import TilemapEditorTab
+        self._tilemap_editor = TilemapEditorTab()
+        idx = self.stack.addWidget(self._tilemap_editor)
+        self._page_indices["tilesets"] = idx
+
         # ── Disconnect PorySuite's own tab-change handler ────────────────────
         # Pages have been reparented out of mainTabs, so PorySuite's
         # on_main_tab_changed would fire spuriously and set dirty flags.
@@ -705,7 +717,6 @@ class UnifiedMainWindow(QMainWindow):
         # ── Forward PorySuite dirty tracking ─────────────────────────────────
         # Override PorySuite's setWindowModified to also update ours.
         _original_set_modified = porysuite_main.setWindowModified
-
         def _unified_set_modified(modified):
             if modified and (self._suppress_dirty
                              or getattr(porysuite_main, '_ps_suppress_dirty', False)):
@@ -769,6 +780,22 @@ class UnifiedMainWindow(QMainWindow):
                 pass
 
         self.setWindowModified(False)
+        if self._porysuite_window:
+            self._porysuite_window.setWindowModified(False)
+        if self._eventide_window:
+            self._eventide_window.setWindowModified(False)
+        # Deferred loads (e.g. _deferred_load_items via QTimer.singleShot(0))
+        # fire after the event loop resumes, populating widgets that emit
+        # change signals through the dirty override.  Schedule a clear AFTER
+        # those deferred loads have settled.
+        from PyQt6.QtCore import QTimer
+        def _clear_load_dirty():
+            if self._porysuite_window:
+                self._porysuite_window.setWindowModified(False)
+            if self._eventide_window:
+                self._eventide_window.setWindowModified(False)
+            self.setWindowModified(False)
+        QTimer.singleShot(200, _clear_load_dirty)
         self._git_refresh_status_bar()
         self.log_message(f"Loaded project: {project_name}")
 
@@ -799,6 +826,7 @@ class UnifiedMainWindow(QMainWindow):
         if self._porysuite_window:
             try:
                 self._porysuite_window.update_save()
+                self._porysuite_window.setWindowModified(False)
                 saved_porysuite = True
             except Exception as e:
                 self.log_message(f"Error saving PorySuite data: {e}")
@@ -809,10 +837,14 @@ class UnifiedMainWindow(QMainWindow):
             if getattr(eet, '_map_dir', None) and getattr(eet, '_map_data', None):
                 try:
                     eet._on_save()
-                    self._eventide_window.setWindowModified(False)
                     saved_eventide = True
                 except Exception as e:
                     self.log_message(f"Error saving EVENTide data: {e}")
+            # Always clear EVENTide dirty flag after save — even if no map
+            # is loaded.  The gfx_combo refresh during save fires
+            # currentIndexChanged → _mark_dirty, leaving EVENTide dirty
+            # with nothing actually needing saving.
+            self._eventide_window.setWindowModified(False)
 
         # Emit change signals so the other side picks up changes
         if saved_porysuite and hasattr(self, 'project_data'):
@@ -880,19 +912,45 @@ class UnifiedMainWindow(QMainWindow):
                 except Exception as e:
                     self.log_message(f"Error saving song table: {e}")
 
+        # Always clear the dirty flag after save — even if no sub-component
+        # reported changes.  The Sound Editor (and others) can emit modified()
+        # for actions that are immediately persisted (e.g. .s file import
+        # writes to disk, piano roll Save button), leaving the unified window
+        # dirty with nothing left to actually save.
+        self.setWindowModified(False)
+
         if (saved_porysuite or saved_eventide or saved_credits
                 or saved_labels or saved_sound):
-            self.setWindowModified(False)
             self.statusBar().showMessage("All changes saved.", 4000)
         else:
             self.statusBar().showMessage("Nothing to save.", 2000)
 
     def _on_make(self, extra_args: list):
         """Delegate make to PorySuite's existing _run_make method."""
-        if self._porysuite_window:
-            self._porysuite_window._run_make(extra_args)
-        else:
+        if not self._porysuite_window:
             self.log_message("Cannot build — no project loaded.")
+            return
+        # Pre-build safety: touch every .s file in the midi directory so they
+        # are all newer than midi.cfg and their .mid placeholders.  This
+        # prevents make's `%.s: %.mid midi.cfg` rule from running mid2agb
+        # which would overwrite tool-edited .s files with empty skeletons.
+        try:
+            project_dir = self.project_info.get("dir", "")
+            midi_dir = os.path.join(project_dir, "sound", "songs", "midi")
+            if os.path.isdir(midi_dir):
+                touched = 0
+                for fn in os.listdir(midi_dir):
+                    if fn.endswith('.s'):
+                        try:
+                            os.utime(os.path.join(midi_dir, fn))
+                            touched += 1
+                        except OSError:
+                            pass
+                if touched:
+                    self.log_message(f"Pre-build: touched {touched} .s files to prevent mid2agb overwrite")
+        except Exception as e:
+            self.log_message(f"Pre-build .s protection warning: {e}")
+        self._porysuite_window._run_make(extra_args)
 
     def _on_expand_rom(self):
         """Patch the project's Makefile to allow 32 MB ROMs."""
@@ -1096,6 +1154,10 @@ class UnifiedMainWindow(QMainWindow):
             project_dir = (self.project_info or {}).get("dir", "")
             if project_dir and hasattr(self, '_diagnostics_tab'):
                 self._diagnostics_tab.set_project(project_dir)
+        elif page_name == "tilesets":
+            project_dir = (self.project_info or {}).get("dir", "")
+            if project_dir and hasattr(self, '_tilemap_editor'):
+                self._tilemap_editor.set_project(project_dir)
 
     # ── Phase 3: Cross-editor navigation handlers ─────────────────────────
 
@@ -1226,7 +1288,35 @@ class UnifiedMainWindow(QMainWindow):
             except Exception:
                 pass
 
+        # Refresh Sound Editor (Songs / Instruments / Voicegroups)
+        if project_dir and hasattr(self, "_sound_editor"):
+            try:
+                self._sound_editor.load_project(project_dir)
+            except Exception as e:
+                self.log_message(f"Sound editor refresh error: {e}")
+
+        # Refresh Credits Editor
+        if project_dir and hasattr(self, "_credits_editor"):
+            try:
+                self._credits_editor.load_project(project_dir)
+            except Exception:
+                pass
+
+        # Clear dirty flags on all sub-editors immediately AND after deferred
+        # widget loads (QTimer.singleShot(0) in PorySuite's load path).
+        if self._porysuite_window:
+            self._porysuite_window.setWindowModified(False)
+        if self._eventide_window:
+            self._eventide_window.setWindowModified(False)
         self.setWindowModified(False)
+        from PyQt6.QtCore import QTimer
+        def _clear_refresh_dirty():
+            if self._porysuite_window:
+                self._porysuite_window.setWindowModified(False)
+            if self._eventide_window:
+                self._eventide_window.setWindowModified(False)
+            self.setWindowModified(False)
+        QTimer.singleShot(200, _clear_refresh_dirty)
         self.statusBar().showMessage("Everything refreshed from disk.", 4000)
         self.log_message("Full refresh complete — all data reloaded from disk.")
 
@@ -1374,6 +1464,12 @@ class UnifiedMainWindow(QMainWindow):
 
     def _on_child_modified(self):
         """Called when a child window reports modifications."""
+        if self._suppress_dirty:
+            return
+        # Also check PorySuite's navigation suppress flag
+        ps = self._porysuite_window
+        if ps and getattr(ps, '_ps_suppress_dirty', False):
+            return
         self.setWindowModified(True)
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -1390,6 +1486,11 @@ class UnifiedMainWindow(QMainWindow):
             return True
         if hasattr(self, "_label_manager") and self._label_manager.has_unsaved_changes():
             return True
+        # Sound editor voicegroups
+        if hasattr(self, '_sound_editor'):
+            vg_tab = getattr(self._sound_editor, '_voicegroups_tab', None)
+            if vg_tab and vg_tab.has_unsaved_changes():
+                return True
         return False
 
     def closeEvent(self, event):
@@ -1498,6 +1599,19 @@ class UnifiedMainWindow(QMainWindow):
                         ew = self._eventide_window
                         if ew.project_info:
                             ew.load_data(ew.project_info)
+                    except Exception:
+                        pass
+                # Refresh Sound Editor (lives in unified window, not PorySuite)
+                project_dir = self.project_info.get("dir", "") if self.project_info else ""
+                if project_dir and hasattr(self, "_sound_editor"):
+                    try:
+                        self._sound_editor.load_project(project_dir)
+                    except Exception:
+                        pass
+                # Refresh Credits Editor
+                if project_dir and hasattr(self, "_credits_editor"):
+                    try:
+                        self._credits_editor.load_project(project_dir)
                     except Exception:
                         pass
             target._git_pull(use_upstream=use_upstream,

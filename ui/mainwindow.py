@@ -383,7 +383,7 @@ QTabBar::tab:hover:!selected {
         self.project_info = None
         self.source_data = None
         self.plugin = None
-        self.docker_util = None
+        self.local_util = None
         self.previous_main_tab = self.ui.mainTabs.currentIndex()
         self.previous_selected_species = None
         self.previous_selected_form = None
@@ -671,6 +671,35 @@ QTabBar::tab:hover:!selected {
         self.ui.starter2_item.installEventFilter(self)
         self.ui.starter3_species.installEventFilter(self)
         self.ui.starter3_item.installEventFilter(self)
+
+        # ── Structural dirty-marking for ALL editable widgets ────────────────
+        # Instead of connecting each widget individually (whack-a-mole), we
+        # iterate every QComboBox, QSpinBox, QDoubleSpinBox, QSlider, QLineEdit,
+        # and QTextEdit in the UI form and connect the appropriate change signal
+        # to setWindowModified(True). This catches everything — starters, stats,
+        # EVs, types, held items, abilities, egg groups, catch rate, etc.
+        from PyQt6.QtWidgets import (QComboBox, QSpinBox, QDoubleSpinBox,
+                                      QSlider, QLineEdit, QTextEdit, QPlainTextEdit)
+        _dirty = lambda *_a: self.setWindowModified(True)
+        for attr_name in dir(self.ui):
+            if attr_name.startswith('_'):
+                continue
+            w = getattr(self.ui, attr_name, None)
+            if w is None:
+                continue
+            try:
+                if isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                    w.valueChanged.connect(_dirty)
+                elif isinstance(w, QSlider):
+                    w.valueChanged.connect(_dirty)
+                elif isinstance(w, QComboBox):
+                    w.currentIndexChanged.connect(_dirty)
+                elif isinstance(w, QLineEdit):
+                    w.textChanged.connect(_dirty)
+                elif isinstance(w, (QTextEdit, QPlainTextEdit)):
+                    w.textChanged.connect(_dirty)
+            except Exception:
+                pass  # some attrs aren't real widgets
 
         # Connect selection change signals
         self.ui.tree_pokemon.itemSelectionChanged.connect(self.update_tree_pokemon)
@@ -2363,6 +2392,19 @@ QTabBar::tab:hover:!selected {
         # Configure description line limits/width based on the opened project
         self._configure_description_limits()
 
+        # Load wild encounter data for the Pokédex Habitat/Area display
+        self._encounter_db = None
+        try:
+            from core.encounter_data import load_encounter_database
+            proj_dir = self.project_info.get("dir", "")
+            if proj_dir:
+                self._encounter_db = load_encounter_database(proj_dir)
+        except Exception:
+            pass
+
+        # Setup the LocalUtil early — abilities editor and other loaders need it
+        self.local_util = LocalUtil(self.project_info)
+
         # Create the data manager directly (no plugin discovery needed)
         try:
             self.source_data = _core.create_data_manager(
@@ -2514,7 +2556,7 @@ QTabBar::tab:hover:!selected {
         # The JSON cache only stores {name, id}; the real display names
         # live in src/data/text/abilities.h.
         try:
-            root = self.source_data.docker_util.repo_root()
+            root = self.local_util.repo_root()
             self._enrich_abilities_from_text(root, abilities)
         except Exception:
             pass
@@ -2642,6 +2684,20 @@ QTabBar::tab:hover:!selected {
         self._nat_order_cache: list[str] | None = None
         self._kanto_cutoff_const: str | None = None
 
+        # ── Populate and enable starter ability combo boxes ─────────────────
+        # The game's abilityNum selects which of the species' ability slots
+        # to use: -1 = default (random), 0 = slot 1, 1 = slot 2.
+        for ab_box in (self.ui.starter1_ability_num,
+                       self.ui.starter2_ability_num,
+                       self.ui.starter3_ability_num):
+            ab_box.setEnabled(True)
+            ab_box.clear()
+            ab_box.addItem("Default (random)", -1)
+            ab_box.addItem("Ability Slot 1", 0)
+            ab_box.addItem("Ability Slot 2", 1)
+            ab_box.currentIndexChanged.connect(
+                lambda *_a: self.setWindowModified(True))
+
         # Set starter data without warnings if fewer than three
         starters = self.source_data.get_pokemon_starters()
         widgets = [
@@ -2649,22 +2705,25 @@ QTabBar::tab:hover:!selected {
                 self.ui.starter1_species,
                 self.ui.starter1_level,
                 self.ui.starter1_item,
+                self.ui.starter1_ability_num,
             ),
             (
                 self.ui.starter2_species,
                 self.ui.starter2_level,
                 self.ui.starter2_item,
+                self.ui.starter2_ability_num,
             ),
             (
                 self.ui.starter3_species,
                 self.ui.starter3_level,
                 self.ui.starter3_item,
+                self.ui.starter3_ability_num,
             ),
         ]
         for idx, starter in enumerate(starters):
             if idx >= len(widgets):
                 break
-            species_box, level_spin, item_box = widgets[idx]
+            species_box, level_spin, item_box, ability_box = widgets[idx]
             species_idx = species_box.findData(starter.get("species"))
             if species_idx == -1:
                 species_idx = 0
@@ -2674,6 +2733,12 @@ QTabBar::tab:hover:!selected {
             if item_idx == -1:
                 item_idx = 0
             item_box.setCurrentIndex(item_idx)
+            # Restore ability slot selection
+            ability_val = starter.get("ability_num", -1)
+            ab_idx = ability_box.findData(ability_val)
+            if ab_idx == -1:
+                ab_idx = 0  # Default
+            ability_box.setCurrentIndex(ab_idx)
 
         # Add moves to move combo boxes
         self.ui.starter1_move.clear()
@@ -2733,9 +2798,6 @@ QTabBar::tab:hover:!selected {
             if species:
                 item.setIcon(self._species_list_icon(species))
             self.ui.list_pokedex_regional.addItem(item)
-
-        # Setup the LocalUtil
-        self.docker_util = LocalUtil(self.project_info)
 
         # Populate the items editor after the event loop has finished the current
         # layout pass, so the QListWidget is fully visible when items are added.
@@ -4203,6 +4265,10 @@ QTabBar::tab:hover:!selected {
                 species_name=species_name,
                 sprite_path=sprite_path,
             )
+            # Wild encounters for this species
+            enc_db = getattr(self, "_encounter_db", None)
+            if enc_db:
+                self._pokedex_panel.set_encounters(enc_db.get(species))
             self._current_dex_const = nat_const
 
     def update_pokedex_entry(self):
@@ -4328,6 +4394,10 @@ QTabBar::tab:hover:!selected {
                     species_name=species_name,
                     sprite_path=sprite_path,
                 )
+                # Wild encounters for this species
+                enc_db = getattr(self, "_encounter_db", None)
+                if enc_db:
+                    self._pokedex_panel.set_encounters(enc_db.get(species))
                 self._current_dex_const = nat_const
 
         finally:
@@ -4768,6 +4838,9 @@ QTabBar::tab:hover:!selected {
                 self.source_data.set_starter_data(
                     0, "custom_move", self.ui.starter1_move.currentData()
                 )
+                self.source_data.set_starter_data(
+                    0, "ability_num", self.ui.starter1_ability_num.currentData()
+                )
 
                 self.source_data.set_starter_data(
                     1, "species", self.ui.starter2_species.currentData()
@@ -4781,6 +4854,9 @@ QTabBar::tab:hover:!selected {
                 self.source_data.set_starter_data(
                     1, "custom_move", self.ui.starter2_move.currentData()
                 )
+                self.source_data.set_starter_data(
+                    1, "ability_num", self.ui.starter2_ability_num.currentData()
+                )
 
                 self.source_data.set_starter_data(
                     2, "species", self.ui.starter3_species.currentData()
@@ -4793,6 +4869,9 @@ QTabBar::tab:hover:!selected {
                 )
                 self.source_data.set_starter_data(
                     2, "custom_move", self.ui.starter3_move.currentData()
+                )
+                self.source_data.set_starter_data(
+                    2, "ability_num", self.ui.starter3_ability_num.currentData()
                 )
             elif self.previous_main_tab == 4:  # Trainers
                 self._save_trainers_editor()
@@ -5456,7 +5535,7 @@ QTabBar::tab:hover:!selected {
         # file the name decapitalizer reads/writes).
         root = ""
         try:
-            root = self.source_data.docker_util.repo_root()
+            root = self.local_util.repo_root()
         except Exception:
             pass
         if root:
@@ -5535,6 +5614,27 @@ QTabBar::tab:hover:!selected {
         if not abilities:
             return
 
+        # Register new abilities in the data layer so they persist on reload
+        new_abs = self.abilities_tab.get_new_abilities()
+        for const in new_abs:
+            data = abilities.get(const)
+            if data and not self.source_data.get_ability_data(const, "id"):
+                self.source_data.add_ability(
+                    const,
+                    data.get("id", 0),
+                    data.get("display_name", ""),
+                    data.get("description", ""),
+                )
+        self.abilities_tab.clear_new_abilities()
+
+        # Remove deleted abilities from the data layer
+        deleted_abs = self.abilities_tab.get_deleted_abilities()
+        for const in deleted_abs:
+            existing = self.source_data.get_pokemon_abilities()
+            if const in existing:
+                del existing[const]
+        self.abilities_tab.clear_deleted_abilities()
+
         # Update in-memory data layer
         for const, data in abilities.items():
             self.source_data.set_ability_data(const, "display_name",
@@ -5546,7 +5646,7 @@ QTabBar::tab:hover:!selected {
         root = self.source_data.data.get("repo_root") or ""
         if not root:
             try:
-                root = self.source_data.docker_util.repo_root()
+                root = self.local_util.repo_root()
             except Exception:
                 pass
         if not root:

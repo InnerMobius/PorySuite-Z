@@ -498,15 +498,19 @@ def notes_to_track_commands(
     structure_events: list[TrackCommand] = []
     has_patt_structure = False  # True if original uses PATT/PEND subroutines
     if original_commands:
-        # Filter out redundant consecutive control commands (same cmd + value)
-        _seen_control: dict[str, int] = {}
+        # Deduplicate control events by (tick, cmd, value).
+        # PATT flattening can produce N copies of the same event at the
+        # same tick (one per subroutine call).  Without this dedup, a song
+        # with 18 PAN commands in subroutines called 7x becomes 1800+ PANs
+        # that flood the timeline and bloat the saved file.
+        _seen_ctrl_exact: set[tuple[int, str, int]] = set()
         for cmd in original_commands:
             if cmd.cmd in _CONTROL_CMDS:
-                # Only keep if value actually changed from last time
-                if cmd.value is not None and _seen_control.get(cmd.cmd) == cmd.value:
-                    continue  # redundant — skip
                 if cmd.value is not None:
-                    _seen_control[cmd.cmd] = cmd.value
+                    key = (cmd.tick, cmd.cmd, cmd.value)
+                    if key in _seen_ctrl_exact:
+                        continue  # duplicate from PATT expansion — skip
+                    _seen_ctrl_exact.add(key)
                 control_events.append(cmd)
             elif cmd.cmd in _STRUCTURE_CMDS:
                 structure_events.append(cmd)
@@ -623,6 +627,15 @@ def notes_to_track_commands(
         elif cmd.cmd in ('GOTO', 'PATT', 'PEND'):
             timeline.append((cmd.tick, 3, cmd))
 
+    # Add user-edited loop GOTO into the timeline at the correct tick.
+    # This must be in the timeline (not appended after) so it sorts
+    # before any notes/events past the loop end.  Without this, the
+    # GOTO would be placed after all notes — at the wrong tick.
+    if (loop_start_tick is not None and loop_end_tick is not None
+            and loop_label and not has_orig_structure):
+        timeline.append((loop_end_tick, 3, TrackCommand(
+            cmd='GOTO', tick=loop_end_tick, target_label=loop_label)))
+
     # Sort by tick, then priority
     timeline.sort(key=lambda x: (x[0], x[1]))
 
@@ -641,16 +654,20 @@ def notes_to_track_commands(
     has_goto = False
     has_fine = False
     for tick, priority, cmd in timeline:
-        if cmd.cmd == 'LABEL':
-            commands.append(cmd)
-            continue
-
-        # Emit WAIT to advance to this tick
+        # Emit WAIT to advance to this tick — including for LABELs.
+        # The WAIT must come BEFORE the label so the parser sees the
+        # correct tick position when it encounters the label line.
+        # Without this, a label at tick 192 after an EOT at tick 190
+        # would be placed at tick 190 on reload (W02 appeared after label).
         gap = tick - current_tick
         if gap > 0:
             commands.append(TrackCommand(
                 cmd='WAIT', tick=current_tick, duration=gap))
             current_tick += gap
+
+        if cmd.cmd == 'LABEL':
+            commands.append(cmd)
+            continue
 
         if cmd.cmd == 'NOTE':
             commands.append(cmd)
@@ -664,24 +681,13 @@ def notes_to_track_commands(
             commands.append(cmd)
             if cmd.cmd == 'GOTO':
                 has_goto = True
+                break  # GOTO terminates the track — skip remaining events
             if cmd.cmd == 'FINE':
                 has_fine = True
+                break  # FINE terminates the track
         else:
             # Control command
             commands.append(cmd)
-
-    # Add loop GOTO if needed and original didn't have one
-    if (loop_start_tick is not None and loop_end_tick is not None
-            and loop_label and not has_goto):
-        # Advance to loop end
-        gap = loop_end_tick - current_tick
-        if gap > 0:
-            commands.append(TrackCommand(
-                cmd='WAIT', tick=current_tick, duration=gap))
-            current_tick += gap
-        commands.append(TrackCommand(
-            cmd='GOTO', tick=current_tick, target_label=loop_label))
-        has_goto = True
 
     # End marker if no GOTO or FINE yet
     if not has_goto and not has_fine:
@@ -761,6 +767,13 @@ def save_song_file(song: SongData, path: Optional[str] = None) -> str:
     """Write a SongData to its .s file. Returns the path written to.
 
     If path is None, uses song.file_path (the original location).
+
+    After writing, ensures the .s file's mtime is newer than the
+    corresponding .mid file (if one exists).  pokefirered's Makefile has
+    a `%.s: %.mid` rule — if .mid is newer than .s, `make` runs mid2agb
+    which OVERWRITES the .s with whatever the .mid produces.  For songs
+    edited through the piano roll (where .s is the source of truth and
+    .mid is just a placeholder), this would destroy the user's work.
     """
     output_path = path or song.file_path
     if not output_path:
@@ -769,5 +782,17 @@ def save_song_file(song: SongData, path: Optional[str] = None) -> str:
     content = write_song(song)
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(content)
+
+    # Protect against mid2agb overwrite: ensure .s is newer than .mid.
+    # Writing the file already sets mtime to now, but we also backdate
+    # the .mid to guarantee the ordering even if both happen in the same
+    # second (filesystem resolution can be 1-2 seconds on FAT/NTFS).
+    import os
+    mid_path = output_path.rsplit('.', 1)[0] + '.mid'
+    if os.path.isfile(mid_path):
+        s_stat = os.stat(output_path)
+        # Set .mid mtime to 2 seconds before the .s mtime
+        past = s_stat.st_mtime - 2
+        os.utime(mid_path, (past, past))
 
     return output_path

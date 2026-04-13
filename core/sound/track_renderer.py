@@ -291,8 +291,15 @@ def render_track(
     state.tempo = bpm
     state.key_shift = song_key_shift
 
+    import os, time as _t2
+    _dbg2 = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'sound_debug.log')
+    def _tlog(msg):
+        with open(_dbg2, 'a', encoding='utf-8') as _f:
+            _f.write(f"[{_t2.strftime('%H:%M:%S')}]   track: {msg}\n")
+
     # Flatten the command list (expand PATT/PEND and GOTO)
     flat_cmds = flatten_track_commands(track.commands, loop_count)
+    _tlog(f"flat_cmds={len(flat_cmds)} raw_cmds={len(track.commands)} loop_count={loop_count}")
 
     # Find total duration from the flattened commands
     flat_max_tick = 0
@@ -307,7 +314,10 @@ def render_track(
         effective_ticks = flat_max_tick
 
     total_samples = ticks_to_samples(effective_ticks, bpm, tbs)
+    _tlog(f"flat_max_tick={flat_max_tick} max_duration_ticks={max_duration_ticks} "
+          f"effective_ticks={effective_ticks} total_samples={total_samples} bpm={bpm} tbs={tbs}")
     if total_samples <= 0:
+        _tlog("EMPTY — total_samples <= 0, returning empty")
         return np.zeros((0, 2), dtype=np.float32)
 
     # Add padding for release tails
@@ -367,13 +377,13 @@ def render_track(
             else:
                 note_duration = cmd.duration
 
-            midi_note = cmd.pitch + state.key_shift
+            midi_note = float(cmd.pitch + state.key_shift)
 
             if state.bend != 0:
                 # bend is -64 to +63, scale to -1.0 to +1.0 then multiply by range
                 bend_semitones = (state.bend / 64.0) * state.bend_range
                 midi_note += bend_semitones
-            midi_note = int(max(0, min(127, midi_note)))
+            midi_note = max(0.0, min(127.0, midi_note))
 
             velocity = cmd.velocity if cmd.velocity is not None else 100
 
@@ -447,12 +457,22 @@ def render_song(
     Returns:
         Stereo float32 array of shape (N, 2).
     """
+    import os, time as _t
+    _dbg = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'sound_debug.log')
+    def _log(msg):
+        with open(_dbg, 'a', encoding='utf-8') as _f:
+            _f.write(f"[{_t.strftime('%H:%M:%S')}] {msg}\n")
+
     bpm = get_song_tempo(song)
     tbs = song.tempo_base if song.tempo_base else 1
+    _log(f"render_song: label={song.label} bpm={bpm} tbs={tbs} vg={song.voicegroup} tracks={len(song.tracks)}")
 
     # Resolve the voicegroup
+    available_vgs = list(voicegroup_data.voicegroups.keys())[:10] if hasattr(voicegroup_data, 'voicegroups') else ['(no .voicegroups attr)']
+    _log(f"  available voicegroups (first 10): {available_vgs}")
     vg = voicegroup_data.get_voicegroup(song.voicegroup)
     if vg is None:
+        _log(f"  ERROR: voicegroup '{song.voicegroup}' not found!")
         return np.zeros((OUTPUT_SAMPLE_RATE, 2), dtype=np.float32)
 
     # Determine song length from flattened commands
@@ -475,14 +495,22 @@ def render_song(
         if progress_callback:
             progress_callback(i, total_tracks)
 
-        stereo = render_track(
-            track, vg, sample_data, voicegroup_data,
-            bpm, tbs, song.master_volume, song.key_shift,
-            max_duration_ticks=max_duration_ticks,
-            loop_count=loop_count,
-        )
+        try:
+            stereo = render_track(
+                track, vg, sample_data, voicegroup_data,
+                bpm, tbs, song.master_volume, song.key_shift,
+                max_duration_ticks=max_duration_ticks,
+                loop_count=loop_count,
+            )
+        except Exception as exc:
+            import traceback
+            _log(f"  Track {i} EXCEPTION: {exc}")
+            _log(traceback.format_exc())
+            continue
 
+        _log(f"  Track {i}: rendered {len(stereo)} samples, peak={np.max(np.abs(stereo)):.4f}")
         if len(stereo) == 0:
+            _log(f"  Track {i}: EMPTY — skipping")
             continue
 
         # render_track now returns stereo with per-note panning applied

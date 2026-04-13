@@ -6427,6 +6427,10 @@ class EventEditorTab(QWidget):
         so the event editor immediately sees new OBJ_EVENT_GFX_ constants.
         """
         prev = self.gfx_combo.currentText()
+        # Block signals during repopulation — changing the combo index
+        # fires currentIndexChanged → _mark_dirty, which falsely marks
+        # EVENTide as having unsaved changes.
+        self.gfx_combo.blockSignals(True)
         self.gfx_combo.clear()
         for gfx_const in sorted(ConstantsManager.OBJECT_GFX):
             self.gfx_combo.addItem(gfx_const)
@@ -6435,6 +6439,7 @@ class EventEditorTab(QWidget):
             idx = self.gfx_combo.findText(prev)
             if idx >= 0:
                 self.gfx_combo.setCurrentIndex(idx)
+        self.gfx_combo.blockSignals(False)
 
     def refresh_gfx_constants(self) -> None:
         """Public method for cross-tab refresh of GFX constants.

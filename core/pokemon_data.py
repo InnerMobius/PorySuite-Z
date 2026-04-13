@@ -984,7 +984,7 @@ class PokemonItems(pokemon_data.PokemonItems):
             if header_used:
                 candidates.append(header_used)
         candidates.extend(self.HEADER_CANDIDATES)
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         for rel in candidates:
             if not rel:
                 continue
@@ -1676,7 +1676,7 @@ class PokemonTrainers(pokemon_data.PokemonTrainers):
     def missing_required_sources(self) -> list[str]:
         # Only TRAINERS_H is required; the rename-sync files are optional.
         import os as _os
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         trainers_h = self.FILES.get("TRAINERS_H", {}).get("original")
         if not trainers_h:
             return []
@@ -2037,7 +2037,7 @@ class PokemonMoves(pokemon_data.PokemonMoves):
 
         # Update in-game move names in move_names.h (in-place patching)
         names_h = os.path.join(
-            self.docker_util.repo_root(), "src", "data", "text", "move_names.h"
+            self.local_util.repo_root(), "src", "data", "text", "move_names.h"
         )
         if os.path.isfile(names_h):
             try:
@@ -2067,7 +2067,7 @@ class PokemonMoves(pokemon_data.PokemonMoves):
         # that don't have a variable yet, add the variable + pointer entry.
         desc_edits = self.data.get("move_descriptions", {})
         if desc_edits:
-            descs_c = os.path.join(self.docker_util.repo_root(), "src", "move_descriptions.c")
+            descs_c = os.path.join(self.local_util.repo_root(), "src", "move_descriptions.c")
             if os.path.isfile(descs_c):
                 try:
                     import re as _re

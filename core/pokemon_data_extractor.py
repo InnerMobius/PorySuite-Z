@@ -345,7 +345,7 @@ class SpeciesDataExtractor(PokemonDataExtractor):
     def _get_species_header_lines(self) -> list[str]:
         """Return cached ``species_info.h`` lines."""
         if self._species_header_lines is None:
-            self._species_header_lines = _read_header(self.docker_util, self.HEADER_FILE)
+            self._species_header_lines = _read_header(self.local_util, self.HEADER_FILE)
         return self._species_header_lines
 
     def parse_value_by_key(self, key: str, value: str) -> tuple:
@@ -628,7 +628,7 @@ class SpeciesDataExtractor(PokemonDataExtractor):
 
         # Parse evolutions.h for evolution data
         evo_lines = _read_header(
-            self.docker_util,
+            self.local_util,
             "src",
             "data",
             "pokemon",
@@ -663,7 +663,7 @@ class SpeciesDataExtractor(PokemonDataExtractor):
         # a stable set. Also include SPECIES_EGG when present in headers.
         if not species:
             try:
-                names = parse_species_names(self.docker_util.repo_root())
+                names = parse_species_names(self.local_util.repo_root())
                 if names:
                     defaults = {"baseHP": 1, "types": ["TYPE_NORMAL", "TYPE_NONE"], "abilities": ["ABILITY_NONE", "ABILITY_NONE", "ABILITY_NONE"], "evolutions": []}
                     for const in names.keys():
@@ -676,8 +676,8 @@ class SpeciesDataExtractor(PokemonDataExtractor):
                 pass
 
         # Load species names and validate count
-        names = parse_species_names(self.docker_util.repo_root())
-        expected_count = _parse_species_count(self.docker_util.repo_root())
+        names = parse_species_names(self.local_util.repo_root())
+        expected_count = _parse_species_count(self.local_util.repo_root())
         if expected_count and len(names) != expected_count:
             msg = (
                 f"Warning: expected {expected_count} species names but parsed {len(names)}."
@@ -751,7 +751,7 @@ class SpeciesDataExtractor(PokemonDataExtractor):
             print(f"Warning: {sp} missing from Pokédex list")
 
         # Merge detailed Pokédex info from pokedex_entries.h
-        dex_details = parse_pokedex_entries(self.docker_util)
+        dex_details = parse_pokedex_entries(self.local_util)
         for sp, info in dex_details.items():
             if sp in valid:
                 valid[sp]["pokedex"] = info
@@ -782,11 +782,11 @@ class SpeciesDataExtractor(PokemonDataExtractor):
 
     def extract_data(self) -> dict:
         self.messages = []
-        json_path = os.path.join(self.docker_util.repo_root(), "src", "data", self.DATA_FILE)
+        json_path = os.path.join(self.local_util.repo_root(), "src", "data", self.DATA_FILE)
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
 
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         source_headers = [
             os.path.join(root, self.HEADER_FILE),
             os.path.join(root, "src", "data", "pokemon", "evolution.h"),
@@ -877,13 +877,13 @@ class SpeciesGraphicsDataExtractor(PokemonDataExtractor):
     def extract_data(self) -> dict:
         self.messages = []
         json_path = os.path.join(
-            self.docker_util.repo_root(), "src", "data", self.DATA_FILE
+            self.local_util.repo_root(), "src", "data", self.DATA_FILE
         )
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
 
         header = os.path.join(
-            self.docker_util.repo_root(), "src", "data", "graphics", "pokemon.h"
+            self.local_util.repo_root(), "src", "data", "graphics", "pokemon.h"
         )
         data = _load_json(json_path, source_headers=[header])
         if data is not None:
@@ -934,13 +934,13 @@ class AbilitiesDataExtractor(PokemonDataExtractor):
     def extract_data(self) -> dict:
         self.messages = []
         json_path = os.path.join(
-            self.docker_util.repo_root(), "src", "data", self.DATA_FILE
+            self.local_util.repo_root(), "src", "data", self.DATA_FILE
         )
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
 
         # Search for a header defining abilities
-        header = _find_abilities_header(self.docker_util.repo_root())
+        header = _find_abilities_header(self.local_util.repo_root())
         source_headers = [header] if header else []
         data = _load_json(json_path, source_headers=source_headers)
         if data is not None:
@@ -974,7 +974,7 @@ class AbilitiesDataExtractor(PokemonDataExtractor):
 
     def _enrich_abilities(self, abilities: dict) -> None:
         """Parse display names and descriptions from src/data/text/abilities.h."""
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         text_path = os.path.join(root, "src", "data", "text", "abilities.h")
         if not os.path.isfile(text_path):
             return
@@ -1041,7 +1041,7 @@ class ItemsDataExtractor(PokemonDataExtractor):
         self.items_order = []
 
         json_path = self.get_data_file_path()
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         source_headers = [
             os.path.join(root, c) for c in self._candidate_headers()
         ]
@@ -1054,7 +1054,7 @@ class ItemsDataExtractor(PokemonDataExtractor):
         items, order, header_used = self._parse_items_header()
         if not items:
             header_rel = header_used or self.HEADER_CANDIDATES[0]
-            header_path = os.path.join(self.docker_util.repo_root(), header_rel)
+            header_path = os.path.join(self.local_util.repo_root(), header_rel)
             print(
                 f"Warning: {os.path.abspath(header_path)} missing or unreadable; no item entries found; no item data loaded"
             )
@@ -1097,7 +1097,7 @@ class ItemsDataExtractor(PokemonDataExtractor):
         self,
     ) -> tuple[OrderedDict[str, dict], list[str], str | None]:
         for rel in self._candidate_headers():
-            lines = _read_header(self.docker_util, rel)
+            lines = _read_header(self.local_util, rel)
             if not lines:
                 continue
 
@@ -1226,7 +1226,7 @@ class TrainersDataExtractor(PokemonDataExtractor):
     def extract_data(self) -> dict:
         self.messages = []
         # 1. try cached JSON
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         json_path = os.path.join(root, "src", "data", self.DATA_FILE)
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
@@ -1236,7 +1236,7 @@ class TrainersDataExtractor(PokemonDataExtractor):
             return data
 
         # 2. parse the header
-        lines = _read_header(self.docker_util, self.HEADER_FILE)
+        lines = _read_header(self.local_util, self.HEADER_FILE)
         trainers: dict[str, dict] = {}
         current: str | None = None
 
@@ -1308,7 +1308,7 @@ class PokemonConstantsExtractor(PokemonDataExtractor):
             return True
 
         path = os.path.join(
-            self.docker_util.repo_root(), "src", "data", self.DATA_FILE
+            self.local_util.repo_root(), "src", "data", self.DATA_FILE
         )
         try:
             with open(path, encoding="utf-8") as f:
@@ -1324,10 +1324,10 @@ class PokemonConstantsExtractor(PokemonDataExtractor):
     def extract_data(self) -> dict:
         self.messages = []
         path = os.path.join(
-            self.docker_util.repo_root(), "src", "data", self.DATA_FILE
+            self.local_util.repo_root(), "src", "data", self.DATA_FILE
         )
         header = os.path.join(
-            self.docker_util.repo_root(), "include", "constants", "pokemon.h"
+            self.local_util.repo_root(), "include", "constants", "pokemon.h"
         )
         data = _load_json(path, source_headers=[header]) or {}
         if data.get("types") and data.get("evolution_types"):
@@ -1406,11 +1406,11 @@ class StartersDataExtractor(PokemonDataExtractor):
     def extract_data(self) -> list | None:
         self.messages = []
         json_path = os.path.join(
-            self.docker_util.repo_root(), "src", "data", self.DATA_FILE
+            self.local_util.repo_root(), "src", "data", self.DATA_FILE
         )
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         source_headers = [
             os.path.join(root, self.HEADER_FILE),
             os.path.join(root, "src", "battle_setup.c"),
@@ -1420,7 +1420,7 @@ class StartersDataExtractor(PokemonDataExtractor):
             print(f"Loaded {len(data)} starters [OK]")
             return data
 
-        lines = _read_header(self.docker_util, self.HEADER_FILE)
+        lines = _read_header(self.local_util, self.HEADER_FILE)
         starters: list[dict] = []
 
         file_text = "\n".join(_clean_line(ln) for ln in lines)
@@ -1445,7 +1445,7 @@ class StartersDataExtractor(PokemonDataExtractor):
                 }
             )
 
-        battle_lines = _read_header(self.docker_util, "src", "battle_setup.c")
+        battle_lines = _read_header(self.local_util, "src", "battle_setup.c")
         battle_text = "\n".join(_clean_line(ln) for ln in battle_lines)
         func = re.search(r"CB2_GiveStarter\(void\)(.*?)}", battle_text, re.S)
         if func:
@@ -1541,7 +1541,7 @@ class MovesDataExtractor(PokemonDataExtractor):
 
     def extract_data(self) -> dict | None:
         self.messages = []
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         json_path = os.path.join(root, "src", "data", self.DATA_FILE)
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
@@ -1581,7 +1581,7 @@ class MovesDataExtractor(PokemonDataExtractor):
             print("Rebuilding species move caches from headers (missing or invalid species_moves)")
 
         moves = {"moves": {}, "move_descriptions": {}, "constants": {}}
-        lines = _read_header(self.docker_util, self.HEADER_MOVES)
+        lines = _read_header(self.local_util, self.HEADER_MOVES)
         current = None
         awaiting_brace = False
         i = 0
@@ -1625,7 +1625,7 @@ class MovesDataExtractor(PokemonDataExtractor):
                     k, v = self.parse_value_by_key(kv.group(1), kv.group(2).strip())
                     moves["moves"][current][k] = v
 
-        desc_lines = _read_header(self.docker_util, self.HEADER_DESCS)
+        desc_lines = _read_header(self.local_util, self.HEADER_DESCS)
         pattern = re.compile(r"\[(MOVE_[A-Z0-9_]+)\]\s*=\s*_(?:\(\"(.*)\"\))?")
         for ln in desc_lines:
             d = pattern.search(ln)
@@ -1633,7 +1633,7 @@ class MovesDataExtractor(PokemonDataExtractor):
                 moves["move_descriptions"][d.group(1)] = (d.group(2) or "").replace("\\n", "\n")
 
         # Extract in-game move names from move_names.h
-        name_lines = _read_header(self.docker_util, self.HEADER_NAMES)
+        name_lines = _read_header(self.local_util, self.HEADER_NAMES)
         name_pat = re.compile(r"\[(MOVE_[A-Z0-9_]+)\]\s*=\s*_\(\"([^\"]*)\"\)")
         for ln in name_lines:
             nm = name_pat.search(ln)
@@ -1662,8 +1662,8 @@ class MovesDataExtractor(PokemonDataExtractor):
             species_moves.setdefault(sp, [])
         try:
             # Level-up
-            ptr_lines = _read_header(self.docker_util, "src", "data", "pokemon", "level_up_learnset_pointers.h")
-            lvl_lines = _read_header(self.docker_util, "src", "data", "pokemon", "level_up_learnsets.h")
+            ptr_lines = _read_header(self.local_util, "src", "data", "pokemon", "level_up_learnset_pointers.h")
+            lvl_lines = _read_header(self.local_util, "src", "data", "pokemon", "level_up_learnsets.h")
             if ptr_lines and lvl_lines:
                 lvl_text = "\n".join(lvl_lines)
                 ptr_pat = re.compile(r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*(s\w+LevelUpLearnset)")
@@ -1690,7 +1690,7 @@ class MovesDataExtractor(PokemonDataExtractor):
             pass
         try:
             # TM/HM
-            tm_lines = _read_header(self.docker_util, "src", "data", "pokemon", "tmhm_learnsets.h")
+            tm_lines = _read_header(self.local_util, "src", "data", "pokemon", "tmhm_learnsets.h")
             if tm_lines:
                 sp_pat = re.compile(r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*TMHM_LEARNSET\((.*?)\)\s*\,", re.S)
                 tok_pat = re.compile(r"TMHM\((TM\d+_[A-Z0-9_]+|HM\d+_[A-Z0-9_]+)\)")
@@ -1708,7 +1708,7 @@ class MovesDataExtractor(PokemonDataExtractor):
             pass
         try:
             # Tutor
-            tutor_lines = _read_header(self.docker_util, "src", "data", "pokemon", "tutor_learnsets.h")
+            tutor_lines = _read_header(self.local_util, "src", "data", "pokemon", "tutor_learnsets.h")
             if tutor_lines:
                 sp_pat = re.compile(r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*((?:.|\n)*?)\,", re.S)
                 mv_pat = re.compile(r"TUTOR\((MOVE_[A-Z0-9_]+)\)")
@@ -1723,7 +1723,7 @@ class MovesDataExtractor(PokemonDataExtractor):
             pass
         try:
             # Egg moves
-            egg_lines = _read_header(self.docker_util, "src", "data", "pokemon", "egg_moves.h")
+            egg_lines = _read_header(self.local_util, "src", "data", "pokemon", "egg_moves.h")
             if egg_lines:
                 eg_pat = re.compile(r"egg_moves\(([^\)]+)\)")
                 blob = "\n".join(egg_lines)
@@ -1762,16 +1762,16 @@ class PokedexDataExtractor(PokemonDataExtractor):
 
     def extract_data(self) -> dict | None:
         self.messages = []
-        json_path = os.path.join(self.docker_util.repo_root(), "src", "data", self.DATA_FILE)
+        json_path = os.path.join(self.local_util.repo_root(), "src", "data", self.DATA_FILE)
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
-        header_abs = os.path.join(self.docker_util.repo_root(), self.HEADER_FILE)
+        header_abs = os.path.join(self.local_util.repo_root(), self.HEADER_FILE)
         data = _load_json(json_path, source_headers=[header_abs])
         if data is not None:
             print(f"Loaded {len(data['national_dex'])} pokedex entries [OK]")
             return data
 
-        lines = _read_header(self.docker_util, self.HEADER_FILE)
+        lines = _read_header(self.local_util, self.HEADER_FILE)
         if not lines:
             print("Missing file or empty read for pokedex header")
 
@@ -1811,8 +1811,8 @@ class PokedexDataExtractor(PokemonDataExtractor):
         valid = [d for d in dex_entries if d.get("dex_num") is not None]
 
         # Merge detailed pokedex information for each species
-        details = parse_pokedex_entries(self.docker_util)
-        text_strings = parse_pokedex_texts(self.docker_util)
+        details = parse_pokedex_entries(self.local_util)
+        text_strings = parse_pokedex_texts(self.local_util)
         for entry in valid:
             info = details.get(entry["species"], {})
             entry.update(info)
@@ -1869,17 +1869,17 @@ class PokemonEvolutionsExtractor(PokemonDataExtractor):
     def extract_data(self) -> dict | None:
         self.messages = []
         json_path = os.path.join(
-            self.docker_util.repo_root(), "src", "data", self.DATA_FILE
+            self.local_util.repo_root(), "src", "data", self.DATA_FILE
         )
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
-        header_abs = os.path.join(self.docker_util.repo_root(), self.HEADER_FILE)
+        header_abs = os.path.join(self.local_util.repo_root(), self.HEADER_FILE)
         data = _load_json(json_path, source_headers=[header_abs])
         if data is not None:
             print(f"Loaded {len(data)} evolution lists [OK]")
             return data
 
-        lines = _read_header(self.docker_util, self.HEADER_FILE)
+        lines = _read_header(self.local_util, self.HEADER_FILE)
         if not lines:
             print("Missing file or empty read for evolution header")
 

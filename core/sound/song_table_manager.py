@@ -310,6 +310,23 @@ def write_midi_cfg(project_root: str, data: SongTableData):
     with open(cfg_path, 'w', encoding='utf-8') as f:
         f.writelines(lines)
 
+    # CRITICAL: midi.cfg is a Makefile dependency for EVERY .s file.
+    # Rewriting midi.cfg makes its mtime newer than all .s files, so the
+    # next `make` will re-run mid2agb on EVERY song.  For songs with
+    # placeholder .mid files (e.g. .s-imported or piano-roll-edited songs),
+    # mid2agb produces empty/garbage output that wipes the real music.
+    #
+    # Fix: touch every .s file so they're all newer than midi.cfg.
+    midi_dir = os.path.dirname(cfg_path)
+    cfg_mtime = os.stat(cfg_path).st_mtime
+    for fn in os.listdir(midi_dir):
+        if fn.endswith('.s'):
+            s_path = os.path.join(midi_dir, fn)
+            try:
+                os.utime(s_path)
+            except OSError:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # Rename / Delete operations
@@ -415,6 +432,83 @@ def delete_song(
             f'{label}.o')
         if os.path.isfile(obj_path):
             os.remove(obj_path)
+
+
+def cleanup_orphaned_songs(project_root: str) -> list[str]:
+    """Find and remove orphaned song registrations AND stray MIDI files.
+
+    Two kinds of cleanup:
+
+    1. **Orphaned registrations** — a MUS_* entry in song_table.inc / songs.h /
+       midi.cfg whose .s assembly file is missing on disk.  Removes from all
+       three config files and re-indexes.
+
+    2. **Stray MIDI files** — .mid files in the midi directory whose stem
+       doesn't match any registered song label.  These are leftovers from
+       imports that used the original filename instead of the label name.
+       The Makefile's wildcard picks them up and tries to build from them,
+       causing "can't open .s for reading" errors.  Deleted silently.
+
+    Returns a list of names describing what was cleaned up.
+    """
+    data = load_song_table(project_root)
+    midi_dir = os.path.join(project_root, 'sound', 'songs', 'midi')
+    cleaned: list[str] = []
+
+    # ── 1. Orphaned registrations (MUS_* with no .s file) ─────────────
+    orphans: list[SongEntry] = []
+    for entry in data.entries:
+        if not entry.constant.startswith('MUS_'):
+            continue
+        if entry.constant == 'MUS_DUMMY':
+            continue
+        s_path = os.path.join(midi_dir, f'{entry.label}.s')
+        if not os.path.isfile(s_path):
+            orphans.append(entry)
+
+    if orphans:
+        for orphan in orphans:
+            cleaned.append(orphan.constant)
+            data.entries.remove(orphan)
+
+        # Re-index remaining entries (no gaps)
+        for i, e in enumerate(data.entries):
+            e.index = i
+
+        # Rewrite all three config files
+        write_songs_h(project_root, data)
+        write_song_table(project_root, data)
+        write_midi_cfg(project_root, data)
+        data.rebuild_indices()
+
+        # Clean up orphaned .mid files and build artifacts
+        for orphan in orphans:
+            mid_path = os.path.join(midi_dir, f'{orphan.label}.mid')
+            if os.path.isfile(mid_path):
+                os.remove(mid_path)
+            for build_dir_name in ('build/firered_modern', 'build/firered'):
+                obj_path = os.path.join(
+                    project_root, build_dir_name, 'sound', 'songs', 'midi',
+                    f'{orphan.label}.o')
+                if os.path.isfile(obj_path):
+                    os.remove(obj_path)
+
+    # ── 2. Stray .mid files (not matching any registered song label) ──
+    known_labels = {e.label for e in data.entries}
+    if os.path.isdir(midi_dir):
+        for fn in os.listdir(midi_dir):
+            if not fn.endswith('.mid'):
+                continue
+            stem = fn[:-4]  # strip '.mid'
+            if stem not in known_labels:
+                stray_path = os.path.join(midi_dir, fn)
+                try:
+                    os.remove(stray_path)
+                    cleaned.append(f'stray:{fn}')
+                except OSError:
+                    pass
+
+    return cleaned
 
 
 def find_song_references(project_root: str, constant: str) -> list[str]:

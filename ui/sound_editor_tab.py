@@ -336,6 +336,18 @@ class SoundEditorTab(QWidget):
         self._tab_widget.addTab(self._voicegroups_tab, "Voicegroups")
         self._voicegroups_tab.modified.connect(self.modified.emit)
 
+        # Cross-link: instruments tab marks voicegroups dirty when editing
+        self._instruments_tab._voicegroups_tab_ref = self._voicegroups_tab
+
+        # Load samples automatically when switching to Instruments/Voicegroups
+        self._tab_widget.currentChanged.connect(self._on_tab_changed)
+
+    def _on_tab_changed(self, index: int):
+        """Load sample data when switching to tabs that need it."""
+        widget = self._tab_widget.widget(index)
+        if widget in (self._instruments_tab, self._voicegroups_tab):
+            self._ensure_samples_loaded()
+
     # ═════════════════════════════════════════════════════════════════════════
     # Project loading
     # ═════════════════════════════════════════════════════════════════════════
@@ -348,8 +360,17 @@ class SoundEditorTab(QWidget):
         self._samples_loaded = False
 
         try:
-            from core.sound.song_table_manager import load_song_table
+            from core.sound.song_table_manager import (
+                load_song_table, cleanup_orphaned_songs)
             from core.sound.voicegroup_parser import load_voicegroup_data
+
+            # Auto-clean orphaned song registrations (entries in config files
+            # with no .s file on disk). This catches leftovers from failed
+            # imports, manual file deletions, or any other inconsistency.
+            removed = cleanup_orphaned_songs(project_root)
+            if removed:
+                _log.info("Cleaned up %d orphaned song(s): %s",
+                          len(removed), ', '.join(removed))
 
             self._song_table = load_song_table(project_root)
             self._voicegroup_data = load_voicegroup_data(project_root)
@@ -809,8 +830,13 @@ class SoundEditorTab(QWidget):
                     mf.write(_SImportWorker._make_placeholder_mid())
                 _log.info("Created placeholder .mid for %s", entry.label)
 
-            # Touch the .s so it's newer than the .mid — prevents mid2agb
+            # Ensure .s is newer than .mid — make's %.s:%.mid rule runs
+            # mid2agb when .mid is newer, which would overwrite our .s.
+            # Touch .s to now AND backdate the .mid by 2 seconds.
             os.utime(dest_path)
+            if os.path.isfile(mid_path):
+                s_mtime = os.stat(dest_path).st_mtime
+                os.utime(mid_path, (s_mtime - 2, s_mtime - 2))
 
             # Clear cached parse so it re-reads from disk
             self._all_songs.pop(entry.label, None)

@@ -200,6 +200,59 @@ def _find_mid2agb(project_root: str) -> Optional[str]:
     return None
 
 
+def _split_type0_to_type1(mid: mido.MidiFile) -> mido.MidiFile:
+    """Convert a Type 0 MIDI (single track, all channels) to Type 1.
+
+    mid2agb expects one MIDI track per channel. Type 0 files have everything
+    in one track, so we split channel messages into separate tracks and put
+    global meta events (tempo, time sig) in a conductor track.
+    """
+    src = mid.tracks[0]
+
+    # Separate messages by channel; meta/sysex go to conductor track (key -1)
+    buckets: dict[int, list] = {-1: []}  # -1 = conductor
+    abs_time = 0
+    for msg in src:
+        abs_time += msg.time
+        tagged = msg.copy(time=abs_time)  # store absolute time temporarily
+        if msg.is_meta:
+            buckets[-1].append(tagged)
+        elif hasattr(msg, 'channel'):
+            buckets.setdefault(msg.channel, []).append(tagged)
+        else:
+            # sysex or other — put in conductor
+            buckets[-1].append(tagged)
+
+    # Build new MidiFile
+    out = mido.MidiFile(type=1, ticks_per_beat=mid.ticks_per_beat)
+
+    # Ensure conductor track has end_of_track
+    conductor = buckets.pop(-1)
+    _abs_to_delta(conductor)
+    if not any(m.type == 'end_of_track' for m in conductor):
+        conductor.append(mido.MetaMessage('end_of_track', time=0))
+    out.tracks.append(mido.MidiTrack(conductor))
+
+    # One track per channel, sorted by channel number
+    for ch in sorted(buckets.keys()):
+        msgs = buckets[ch]
+        _abs_to_delta(msgs)
+        if not any(m.type == 'end_of_track' for m in msgs):
+            msgs.append(mido.MetaMessage('end_of_track', time=0))
+        out.tracks.append(mido.MidiTrack(msgs))
+
+    return out
+
+
+def _abs_to_delta(msgs: list) -> None:
+    """Convert absolute-time messages back to delta-time (in place)."""
+    prev = 0
+    for msg in msgs:
+        abs_t = msg.time
+        msg.time = abs_t - prev
+        prev = abs_t
+
+
 def run_mid2agb(
     project_root: str,
     midi_path: str,
@@ -226,10 +279,36 @@ def run_mid2agb(
     midi_dir = os.path.join(project_root, "sound", "songs", "midi")
     os.makedirs(midi_dir, exist_ok=True)
 
-    # Copy MIDI to the project's midi directory if not already there
-    midi_dest = os.path.join(midi_dir, os.path.basename(midi_path))
-    if os.path.abspath(midi_path) != os.path.abspath(midi_dest):
-        shutil.copy2(midi_path, midi_dest)
+    # Copy MIDI to the project's midi directory, cleaning problematic
+    # meta events that mid2agb can't handle ("failed to read event text").
+    # mid2agb chokes on text events, lyrics, markers, cue points, etc.
+    # Also converts Type 0 (single-track) MIDIs to Type 1 (multi-track)
+    # because mid2agb expects one track per channel.
+    # Save as <label>.mid, NOT the original filename. Using the original
+    # name (e.g. "battletest_FINAL.mid") leaves a stray .mid that the
+    # Makefile's wildcard picks up and tries to build, breaking make.
+    midi_dest = os.path.join(midi_dir, output_label + ".mid")
+    try:
+        _KEEP_META = {'set_tempo', 'time_signature', 'end_of_track'}
+        mid = mido.MidiFile(midi_path)
+
+        # Strip unsupported meta events from all tracks
+        for track in mid.tracks:
+            track[:] = [
+                msg for msg in track
+                if not msg.is_meta or msg.type in _KEEP_META
+            ]
+
+        # Convert Type 0 → Type 1: split single track into per-channel tracks
+        if mid.type == 0 and len(mid.tracks) == 1:
+            mid = _split_type0_to_type1(mid)
+
+        mid.save(midi_dest)
+    except Exception:
+        # If mido can't parse it either, just copy raw and let mid2agb
+        # report the real error
+        if os.path.abspath(midi_path) != os.path.abspath(midi_dest):
+            shutil.copy2(midi_path, midi_dest)
 
     # Output .s file goes alongside the .mid
     s_filename = output_label + ".s"
@@ -393,6 +472,18 @@ def register_song(
         with open(cfg_path, "a", encoding="utf-8", newline="\n") as f:
             f.write(cfg_line)
 
+        # CRITICAL: midi.cfg is a Makefile dependency for EVERY .s file.
+        # Appending to it makes midi.cfg newer than all existing .s files.
+        # Touch every .s so make doesn't re-run mid2agb on songs whose
+        # .mid is a placeholder (which would wipe them to 0-track garbage).
+        midi_dir = os.path.dirname(cfg_path)
+        for fn in os.listdir(midi_dir):
+            if fn.endswith('.s'):
+                try:
+                    os.utime(os.path.join(midi_dir, fn))
+                except OSError:
+                    pass
+
     return True, ""
 
 
@@ -440,9 +531,10 @@ def import_midi(
     ok, s_path, err = run_mid2agb(project_root, midi_path, label, settings)
     if not ok:
         # Clean up the .mid copy so a failed import doesn't leave orphan files
-        # that break the build system
+        # that break the build system.  The MIDI was saved as <label>.mid, NOT
+        # the original filename — must match what run_mid2agb() wrote.
         midi_dir = os.path.join(project_root, "sound", "songs", "midi")
-        midi_copy = os.path.join(midi_dir, os.path.basename(midi_path))
+        midi_copy = os.path.join(midi_dir, label + ".mid")
         if os.path.isfile(midi_copy):
             try:
                 os.remove(midi_copy)

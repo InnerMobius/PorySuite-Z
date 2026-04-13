@@ -147,6 +147,59 @@ CHANCE_CHOICES: list[tuple[str, int]] = [
     ("50%", 2),
 ]
 
+POWER_BOOST_CHOICES: list[tuple[str, int]] = [
+    ("No boost", 100),
+    ("+20% (Gen 7 Pixilate)", 120),
+    ("+30% (Gen 6 Pixilate)", 130),
+    ("+50%", 150),
+]
+
+SHED_SKIN_CHANCE_CHOICES: list[tuple[str, int]] = [
+    ("33% (standard)", 3),
+    ("50%", 2),
+    ("25%", 4),
+    ("20%", 5),
+]
+
+# Stat choices that include Accuracy and Evasion for block_specific_stat
+FULL_STAT_CHOICES: list[tuple[str, str]] = [
+    ("Attack", "STAT_ATK"),
+    ("Defense", "STAT_DEF"),
+    ("Speed", "STAT_SPEED"),
+    ("Sp. Attack", "STAT_SPATK"),
+    ("Sp. Defense", "STAT_SPDEF"),
+    ("Accuracy", "STAT_ACC"),
+    ("Evasion", "STAT_EVASION"),
+]
+
+REDIRECT_TYPE_CHOICES: list[tuple[str, str]] = [
+    ("Electric", "TYPE_ELECTRIC"),
+    ("Water", "TYPE_WATER"),
+    ("Fire", "TYPE_FIRE"),
+    ("Grass", "TYPE_GRASS"),
+    ("Ground", "TYPE_GROUND"),
+]
+
+COMBO_PARTNER_CHOICES: list[tuple[str, str]] = [
+    ("Plus (partner has Plus)", "ABILITY_PLUS"),
+    ("Minus (partner has Minus)", "ABILITY_MINUS"),
+]
+
+BOOST_STAT_CHOICES: list[tuple[str, str]] = [
+    ("Attack", "attack"),
+    ("Defense", "defense"),
+    ("Sp. Attack", "spAttack"),
+    ("Sp. Defense", "spDefense"),
+]
+
+# Multiple stats for dual-stat lowering (Scare = Atk + SpAtk)
+DUAL_STAT_CHOICES: list[tuple[str, list[str]]] = [
+    ("Attack + Sp. Attack", ["STAT_ATK", "STAT_SPATK"]),
+    ("Attack + Speed", ["STAT_ATK", "STAT_SPEED"]),
+    ("Defense + Sp. Defense", ["STAT_DEF", "STAT_SPDEF"]),
+    ("Attack + Defense", ["STAT_ATK", "STAT_DEF"]),
+]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Template definitions
@@ -261,6 +314,256 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Prevents the opponent's moves from landing critical hits (like Battle Armor)",
         [],
     ),
+    EffectTemplate(
+        "ohko_prevention",
+        "One-Hit KO Prevention",
+        "Prevents one-hit KO moves from affecting this Pokemon (like Sturdy)",
+        [],
+    ),
+    EffectTemplate(
+        "evasion_weather",
+        "Evasion Boost in Weather",
+        "Raises evasion during a specific weather and grants immunity to that weather's damage (like Sand Veil)",
+        [EffectParam("weather", "Weather", WEATHER_SPEED_CHOICES)],
+    ),
+    EffectTemplate(
+        "stat_double",
+        "Double a Stat",
+        "Permanently doubles a stat in battle (like Huge Power doubles Attack)",
+        [EffectParam("stat", "Stat to double", STAT_CHOICES)],
+    ),
+    EffectTemplate(
+        "type_resist_halve",
+        "Halve Damage from Types",
+        "Halves damage from specific types (like Thick Fat halves Fire/Ice)",
+        [EffectParam("type", "Resist type", TYPE_CHOICES)],
+    ),
+    EffectTemplate(
+        "block_stat_reduction",
+        "Block Stat Reduction",
+        "Prevents opponents from lowering this Pokemon's stats (like Clear Body / White Smoke)",
+        [],
+    ),
+    EffectTemplate(
+        "block_flinch",
+        "Block Flinching",
+        "Prevents this Pokemon from flinching (like Inner Focus)",
+        [],
+    ),
+    EffectTemplate(
+        "accuracy_boost",
+        "Accuracy Boost",
+        "Raises this Pokemon's accuracy (like Compound Eyes)",
+        [],
+    ),
+    EffectTemplate(
+        "guts_boost",
+        "Status Attack Boost",
+        "Raises Attack when affected by a status condition (like Guts)",
+        [],
+    ),
+    EffectTemplate(
+        "weather_speed",
+        "Double Speed in Weather",
+        "Doubles Speed during a specific weather (like Swift Swim, Chlorophyll)",
+        [EffectParam("weather", "Weather", WEATHER_SPEED_CHOICES)],
+    ),
+    EffectTemplate(
+        "prevent_escape",
+        "Prevent Foe Escape",
+        "Prevents the opponent from fleeing or switching (like Shadow Tag / Arena Trap)",
+        [],
+    ),
+    EffectTemplate(
+        "natural_cure",
+        "Cure Status on Switch-Out",
+        "Cures status conditions when switching out (like Natural Cure)",
+        [],
+    ),
+    EffectTemplate(
+        "pressure",
+        "Extra PP Drain",
+        "Foe's moves use 2 PP instead of 1 (like Pressure)",
+        [],
+    ),
+    EffectTemplate(
+        "wonder_guard",
+        "Only Super-Effective Hits",
+        "Only super-effective moves deal damage (like Wonder Guard)",
+        [],
+    ),
+    EffectTemplate(
+        "recoil_immunity",
+        "Recoil Immunity",
+        "Prevents recoil damage from own moves (like Rock Head)",
+        [],
+    ),
+    EffectTemplate(
+        "type_change_boost",
+        "Move Type Change + Boost (Pixilate / Aerilate / Refrigerate)",
+        "Changes moves of one type into another type, with an optional power boost. "
+        "Example: Pixilate converts Normal moves to Fairy with +30% power.",
+        [
+            EffectParam("source_type", "Convert FROM", TYPE_CHOICES),
+            EffectParam("target_type", "Convert TO", TYPE_CHOICES),
+            EffectParam("boost", "Power boost", POWER_BOOST_CHOICES),
+        ],
+    ),
+    EffectTemplate(
+        "intimidate_dual",
+        "Dual Stat Intimidate (Lower Two Foe Stats on Switch-In)",
+        "Lowers TWO of the opponent's stats by one stage when entering battle. "
+        "Example: 'Scare' lowers both Attack and Sp. Attack.",
+        [EffectParam("stats", "Stats to lower", DUAL_STAT_CHOICES)],
+    ),
+    EffectTemplate(
+        "switchin_field_effect",
+        "Set Field Effect on Switch-In (Trick Room / Tailwind)",
+        "Sets a field condition when entering battle. IMPORTANT: These "
+        "effects do NOT exist in vanilla pokefirered (Gen 3). The code "
+        "preview shows exactly what struct fields, constants, and battle "
+        "scripts you need to add to your project first.",
+        [EffectParam("effect", "Field effect", [
+            ("Trick Room (reverse speed)", "TRICK_ROOM"),
+            ("Tailwind (double team speed)", "TAILWIND"),
+        ])],
+    ),
+    EffectTemplate(
+        "multi_type_resist",
+        "Resist Multiple Types",
+        "Halves damage from two specific types (like Thick Fat resists Fire and Ice)",
+        [
+            EffectParam("type1", "Resist type 1", TYPE_CHOICES),
+            EffectParam("type2", "Resist type 2", TYPE_CHOICES),
+        ],
+    ),
+    # ── New templates for previously uneditable abilities ──────────────────
+    EffectTemplate(
+        "weather_suppress",
+        "Suppress Weather on Switch-In",
+        "Negates all weather effects while this Pokemon is on the field (like Cloud Nine / Air Lock)",
+        [],
+    ),
+    EffectTemplate(
+        "shed_skin",
+        "End-of-Turn Status Cure (Random)",
+        "Has a chance to cure own status condition at the end of each turn (like Shed Skin)",
+        [EffectParam("chance", "Chance per turn", SHED_SKIN_CHANCE_CHOICES)],
+    ),
+    EffectTemplate(
+        "truant",
+        "Loaf Every Other Turn",
+        "Can only attack every other turn (like Truant — Slaking's drawback ability)",
+        [],
+    ),
+    EffectTemplate(
+        "sound_block",
+        "Block Sound-Based Moves",
+        "Immune to all sound-based moves (like Soundproof)",
+        [],
+    ),
+    EffectTemplate(
+        "color_change",
+        "Change Type When Hit",
+        "Changes own type to match the type of the last move that hit this Pokemon (like Color Change)",
+        [],
+    ),
+    EffectTemplate(
+        "synchronize_status",
+        "Pass Status to Attacker",
+        "When poisoned, burned, or paralyzed, inflicts the same status on the attacker (like Synchronize)",
+        [],
+    ),
+    EffectTemplate(
+        "suction_cups",
+        "Block Forced Switching",
+        "Prevents being forced to switch out by moves like Roar or Whirlwind (like Suction Cups)",
+        [],
+    ),
+    EffectTemplate(
+        "sticky_hold",
+        "Block Item Theft",
+        "Prevents opponents from stealing or removing this Pokemon's held item (like Sticky Hold)",
+        [],
+    ),
+    EffectTemplate(
+        "shield_dust",
+        "Block Secondary Move Effects",
+        "Prevents secondary effects of opponent's moves (flinch, stat drops, status) from activating (like Shield Dust)",
+        [],
+    ),
+    EffectTemplate(
+        "lightning_rod",
+        "Redirect Moves of a Type",
+        "In double battles, draws all moves of a type to this Pokemon (like Lightning Rod redirects Electric)",
+        [EffectParam("type", "Redirected type", REDIRECT_TYPE_CHOICES)],
+    ),
+    EffectTemplate(
+        "serene_grace",
+        "Double Secondary Effect Chance",
+        "Doubles the chance of a move's secondary effect triggering (like Serene Grace)",
+        [],
+    ),
+    EffectTemplate(
+        "hustle",
+        "Boost Attack / Lower Accuracy",
+        "Raises physical Attack by 50% but lowers accuracy of physical moves by 20% (like Hustle)",
+        [],
+    ),
+    EffectTemplate(
+        "marvel_scale",
+        "Status Defense Boost",
+        "Raises Defense by 50% when affected by a status condition (like Marvel Scale)",
+        [EffectParam("stat", "Stat to boost", BOOST_STAT_CHOICES)],
+    ),
+    EffectTemplate(
+        "early_bird",
+        "Wake From Sleep Faster",
+        "Wakes up from sleep in half the normal time (like Early Bird)",
+        [],
+    ),
+    EffectTemplate(
+        "liquid_ooze",
+        "Drain Moves Hurt Attacker",
+        "When hit by a draining move (Absorb, Giga Drain, etc.), the attacker takes damage instead of healing (like Liquid Ooze)",
+        [],
+    ),
+    EffectTemplate(
+        "plus_minus",
+        "Combo Sp. Attack Boost",
+        "Boosts Sp. Attack by 50% when an ally with the partner ability is on the field (like Plus/Minus)",
+        [EffectParam("partner", "Partner ability", COMBO_PARTNER_CHOICES)],
+    ),
+    EffectTemplate(
+        "damp",
+        "Block Explosion Moves",
+        "Prevents any Pokemon on the field from using Self-Destruct or Explosion (like Damp)",
+        [],
+    ),
+    EffectTemplate(
+        "contact_flinch",
+        "Flinch Chance on Contact",
+        "When hit by a contact move, has a chance to make the attacker flinch (like Stench in Gen 5+)",
+        [EffectParam("chance", "Chance", CHANCE_CHOICES)],
+    ),
+    EffectTemplate(
+        "trace",
+        "Copy Opponent's Ability",
+        "Copies the opposing Pokemon's ability on switch-in (like Trace)",
+        [],
+    ),
+    EffectTemplate(
+        "forecast",
+        "Change Form With Weather",
+        "Changes form/type based on the current weather (like Forecast — Castform's signature ability)",
+        [],
+    ),
+    EffectTemplate(
+        "block_specific_stat",
+        "Block Specific Stat Reduction",
+        "Prevents opponents from lowering a specific stat (like Keen Eye blocks Accuracy drops, Hyper Cutter blocks Attack drops)",
+        [EffectParam("stat", "Protected stat", FULL_STAT_CHOICES)],
+    ),
 ]
 
 # ── Field effect templates ──────────────────────────────────────────────────
@@ -364,6 +667,21 @@ def _extract_ability_case_block(source: str, ability_const: str) -> str:
     return source[start:i]
 
 
+def _get_nearby_block(source: str, ability_const: str,
+                      radius: int = 200) -> str:
+    """Get a block of source code near the first occurrence of ability_const.
+
+    Returns up to `radius` characters before and after the match, useful for
+    detecting inline ability checks that don't use case blocks.
+    """
+    idx = source.find(ability_const)
+    if idx < 0:
+        return ""
+    start = max(0, idx - radius)
+    end = min(len(source), idx + len(ability_const) + radius)
+    return source[start:end]
+
+
 def detect_battle_effect(project_root: str, ability_const: str
                          ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """Detect which battle effect template an ability matches.
@@ -374,7 +692,7 @@ def detect_battle_effect(project_root: str, ability_const: str
 
     block = _extract_ability_case_block(battle_util, ability_const)
     if not block:
-        # Check pokemon.c for pinch boosts
+        # Check pokemon.c for pinch boosts AND stat doublers
         pokemon_c = _read_file(os.path.join(project_root, "src", "pokemon.c"))
         for display, type_const in TYPE_CHOICES:
             pat = (r'type\s*==\s*' + re.escape(type_const) + r'\s*&&\s*'
@@ -382,24 +700,384 @@ def detect_battle_effect(project_root: str, ability_const: str
             if re.search(pat, pokemon_c):
                 return ("pinch_type_boost", {"type": type_const})
 
-        # Check battle_script_commands.c for type immunity (Levitate pattern)
+        # Huge Power / Pure Power — doubles attack in damage calc
+        if re.search(r'ability\s*==\s*' + re.escape(ability_const)
+                     + r'[^;]*attack\s*\*=\s*2', pokemon_c, re.IGNORECASE):
+            return ("stat_double", {"stat": "STAT_ATK"})
+
+        # Thick Fat — halves Fire/Ice damage
+        # Note: pokemon.c uses local var 'type' not 'moveType'
+        if ability_const in pokemon_c:
+            for _i, line in enumerate(pokemon_c.split('\n')):
+                if ability_const in line:
+                    ctx = '\n'.join(pokemon_c.split('\n')[max(0,_i-1):_i+3])
+                    type_matches = re.findall(r'(?:type|moveType)\s*==\s*(TYPE_\w+)', ctx)
+                    if type_matches and ('/ 2' in ctx or '/= 2' in ctx
+                                          or 'spAttack /= 2' in ctx):
+                        if len(type_matches) >= 2:
+                            return ("multi_type_resist", {
+                                "type1": type_matches[0],
+                                "type2": type_matches[1],
+                            })
+                        else:
+                            return ("type_resist_halve", {
+                                "type": type_matches[0],
+                            })
+
+        # Check battle_script_commands.c for various inline patterns.
+        # Use TIGHT context — only the line containing the ability constant
+        # and a few lines around it — to avoid bleeding into adjacent code.
         bsc = _read_file(os.path.join(
             project_root, "src", "battle_script_commands.c"))
+        bsc_lines = bsc.split('\n') if ability_const in bsc else []
+
+        # Build a list of (line_index, tight_context) for each occurrence
+        # of this ability in bsc.  Tight context = ±5 lines.
+        _bsc_contexts: list[tuple[int, str]] = []
+        for i, line in enumerate(bsc_lines):
+            if ability_const in line:
+                ctx = '\n'.join(bsc_lines[max(0, i-5):i+6])
+                _bsc_contexts.append((i, ctx))
+
+        # Type immunity (Levitate pattern) — same line has moveType
         pat = (r'ability\s*==\s*' + re.escape(ability_const) +
                r'\s*&&\s*moveType\s*==\s*(TYPE_\w+)')
         m = re.search(pat, bsc)
         if m:
             return ("type_immunity", {"type": m.group(1)})
 
-        # Check battle_main.c for type trap (Magnet Pull pattern)
-        # Pattern: ABILITY_XXX appears, then IS_BATTLER_OF_TYPE(..., TYPE_YYY)
+        # Wonder Guard — MOVE_RESULT_NOT_VERY_EFFECTIVE on same line
+        for _i, ctx in _bsc_contexts:
+            if 'MOVE_RESULT_SUPER_EFFECTIVE' in ctx or 'TYPE_MYSTERY' in ctx:
+                return ("wonder_guard", {})
+
+        # Sturdy — OHKO prevention (SturdyPreventsOHKO in tight context)
+        for _i, ctx in _bsc_contexts:
+            if 'SturdyPreventsOHKO' in ctx or 'MOVE_RESULT_MISSED' in ctx:
+                return ("ohko_prevention", {})
+
+        # Battle Armor / Shell Armor — critical hit prevention
+        for _i, ctx in _bsc_contexts:
+            if 'critChance' in ctx or 'CriticalHit' in ctx:
+                return ("crit_prevention", {})
+
+        # Compound Eyes — accuracy boost (line has 130 / 100 or similar)
+        for _i, ctx in _bsc_contexts:
+            line = bsc_lines[_i]
+            # Must be on the SAME line as the ability, not just nearby
+            if '130' in line or 'Accuracy' in ctx:
+                # Exclude if the same line also mentions weather/sandstorm
+                if 'WEATHER' not in line and 'SANDSTORM' not in line:
+                    return ("accuracy_boost", {})
+
+        # Sand Veil — evasion in sandstorm (same line has SANDSTORM)
+        for _i, ctx in _bsc_contexts:
+            line = bsc_lines[_i]
+            if ('B_WEATHER_SANDSTORM' in line or 'WEATHER_SANDSTORM' in line):
+                return ("evasion_weather", {"weather": "B_WEATHER_SANDSTORM"})
+
+        # Inner Focus — block flinching (tight context has flinch)
+        for _i, ctx in _bsc_contexts:
+            if 'FLINCH' in ctx or 'flinch' in ctx:
+                return ("block_flinch", {})
+
+        # Keen Eye / Hyper Cutter — block SPECIFIC stat (in bsc ChangeStatBuffs)
+        # Must check BEFORE block_stat_reduction because both have STAT_CHANGE
+        # keywords nearby. The distinguishing pattern: `statId == STAT_xxx`
+        for _i, ctx in _bsc_contexts:
+            if 'statStages' in ctx or 'STAT_CHANGE' in ctx:
+                stat_m = re.search(
+                    r'statId\s*==\s*(STAT_(?:ATK|DEF|SPEED|SPATK|SPDEF|ACC|EVASION))',
+                    ctx)
+                if stat_m:
+                    return ("block_specific_stat", {"stat": stat_m.group(1)})
+
+        # Clear Body / White Smoke — block stat reduction (in bsc)
+        for _i, ctx in _bsc_contexts:
+            if 'statStages' in ctx or 'StatDown' in ctx or 'STAT_CHANGE_WORKED' in ctx:
+                return ("block_stat_reduction", {})
+
+        # Rock Head — recoil immunity
+        for _i, ctx in _bsc_contexts:
+            if 'recoil' in ctx.lower() or 'MOVE_EFFECT_RECOIL' in ctx:
+                return ("recoil_immunity", {})
+
+        # ── pokemon.c inline patterns — use the SPECIFIC LINE containing
+        # the ability constant, not wide context, because Guts/Hustle/
+        # Marvel Scale/Plus/Minus are all within 10 lines of each other.
+        if ability_const in pokemon_c:
+            pc_lines = pokemon_c.split('\n')
+            for _i, line in enumerate(pc_lines):
+                if ability_const not in line:
+                    continue
+                # Get tight context: the ability line + 1 line after only
+                ctx_tight = '\n'.join(pc_lines[_i:_i+2])
+
+                # Plus / Minus — ABILITY_ON_FIELD2 pattern
+                if 'ABILITY_ON_FIELD2' in ctx_tight:
+                    partner = None
+                    pm = re.search(r'ABILITY_ON_FIELD2\((ABILITY_\w+)\)',
+                                   ctx_tight)
+                    if pm:
+                        partner = pm.group(1)
+                    return ("plus_minus", {"partner": partner or "ABILITY_MINUS"})
+
+                # Hustle — attack boost (attacker->ability, attack *= N)
+                # Hustle does NOT check status1 — Guts does. Exclude status1.
+                if ('attacker' in line and 'attack' in ctx_tight.lower()
+                        and ('150' in ctx_tight or '* 3' in ctx_tight)
+                        and 'status1' not in ctx_tight):
+                    # Exclude if 'spAttack' is what's being modified
+                    if 'spAttack' not in ctx_tight:
+                        return ("hustle", {})
+
+                # Marvel Scale — defense boost when statused (defender->ability)
+                if 'defender' in line and 'status1' in ctx_tight:
+                    if 'defense' in ctx_tight.lower():
+                        stat = "defense"
+                        if 'spDefense' in ctx_tight:
+                            stat = "spDefense"
+                        return ("marvel_scale", {"stat": stat})
+
+                # Guts — attack boost when statused (attacker->ability)
+                if 'attacker' in line and 'status1' in ctx_tight:
+                    if 'attack' in ctx_tight.lower():
+                        return ("guts_boost", {})
+
+        # Soundproof — check for sSoundMovesTable in battle_util (case ABILITYEFFECT_MOVES_BLOCK)
+        if ability_const in battle_util:
+            bu_lines = battle_util.split('\n')
+            for _i, line in enumerate(bu_lines):
+                if ability_const in line:
+                    ctx = '\n'.join(bu_lines[max(0,_i-3):_i+4])
+                    if 'sSoundMovesTable' in ctx or 'SOUND_MOVES' in ctx:
+                        return ("sound_block", {})
+
+        # Keen Eye / Hyper Cutter — block specific stat reduction (battle_util)
+        # These block a SPECIFIC stat from being lowered, unlike Clear Body
+        # which blocks all stat drops.
+        if ability_const in battle_util:
+            bu_lines = battle_util.split('\n')
+            for _i, line in enumerate(bu_lines):
+                if ability_const in line:
+                    ctx = '\n'.join(bu_lines[max(0,_i-5):_i+6])
+                    if 'STAT_CHANGE_WORKED' in ctx or 'statStages' in ctx:
+                        # Try to identify which specific stat is protected
+                        stat_m = re.search(r'(STAT_(?:ATK|DEF|SPEED|SPATK|SPDEF|ACC|EVASION))', ctx)
+                        if stat_m:
+                            return ("block_specific_stat", {
+                                "stat": stat_m.group(1)})
+                        return ("block_stat_reduction", {})
+
+        # Swift Swim / Chlorophyll — weather speed double (battle_main.c)
         battle_main = _read_file(os.path.join(
             project_root, "src", "battle_main.c"))
-        pat = (re.escape(ability_const) +
-               r'.*?IS_BATTLER_OF_TYPE\([^,]+,\s*(TYPE_\w+)\)')
-        m = re.search(pat, battle_main, re.DOTALL)
-        if m:
-            return ("type_trap", {"type": m.group(1)})
+        if ability_const in battle_main:
+            for _i, line in enumerate(battle_main.split('\n')):
+                if ability_const in line:
+                    # The SAME LINE must have the weather constant
+                    for wdisplay, weather_const in WEATHER_SPEED_CHOICES:
+                        if weather_const in line and (
+                                'speed' in line.lower() or 'Multiplier' in line
+                                or 'speed' in '\n'.join(
+                                    battle_main.split('\n')[max(0,_i-2):_i+3]
+                                ).lower()):
+                            return ("weather_speed", {"weather": weather_const})
+
+        # Pressure — extra PP drain (battle_util.c has PressurePPLose)
+        if ability_const in battle_util:
+            for _i, line in enumerate(battle_util.split('\n')):
+                if ability_const in line:
+                    ctx = '\n'.join(battle_util.split('\n')[max(0,_i-5):_i+6])
+                    if 'pp' in ctx.lower() or 'PP' in ctx:
+                        return ("pressure", {})
+
+        # Type trap (Magnet Pull) — the pattern in pokefirered uses
+        # AbilityBattleEffects(..., ABILITY_MAGNET_PULL, ...) then checks
+        # IS_BATTLER_OF_TYPE separately.  The key signature: the ability
+        # constant appears as an argument to AbilityBattleEffects, and
+        # IS_BATTLER_OF_TYPE is nearby with a type constant.
+        if ability_const in battle_main:
+            bm_lines = battle_main.split('\n')
+            for _i, line in enumerate(bm_lines):
+                if ability_const in line and 'AbilityBattleEffects' in line:
+                    ctx = '\n'.join(bm_lines[max(0,_i):_i+4])
+                    type_m = re.search(
+                        r'IS_BATTLER_OF_TYPE\([^,]+,\s*(TYPE_\w+)\)', ctx)
+                    if type_m:
+                        return ("type_trap", {"type": type_m.group(1)})
+
+        # Shadow Tag / Arena Trap — prevent escape.
+        # Shadow Tag: unconditional — just checks ability == SHADOW_TAG
+        #   then BATTLE_RUN_FAILURE.
+        # Arena Trap: conditional — excludes Flying/Levitate, still
+        #   prevent_escape since it's not type-trapping a specific type.
+        if ability_const in battle_main:
+            bm_lines = battle_main.split('\n')
+            for _i, line in enumerate(bm_lines):
+                if ability_const in line:
+                    ctx = '\n'.join(bm_lines[max(0,_i-1):_i+6])
+                    if ('BATTLE_RUN_FAILURE' in ctx or 'cannotRun' in ctx
+                            or 'PARTY_ACTION_CANT_SWITCH' in ctx):
+                        return ("prevent_escape", {})
+
+        # Natural Cure — cure on switch-out
+        if ability_const in battle_util:
+            for _i, line in enumerate(battle_util.split('\n')):
+                if ability_const in line:
+                    ctx = '\n'.join(battle_util.split('\n')[max(0,_i-3):_i+4])
+                    if 'status1' in ctx and ('= 0' in ctx):
+                        return ("natural_cure", {})
+
+        # Type change + boost (Pixilate / Aerilate / Refrigerate pattern)
+        # Looks for: ability == ABILITY_XXX && type == TYPE_YYY → dynamicMoveType
+        if ability_const in bsc:
+            tc_block = _get_nearby_block(bsc, ability_const, 400)
+            if 'dynamicMoveType' in tc_block:
+                src_m = re.search(r'type\s*==\s*(TYPE_\w+)', tc_block)
+                tgt_m = re.search(r'dynamicMoveType\s*=\s*(TYPE_\w+)', tc_block)
+                if src_m and tgt_m:
+                    boost = 100
+                    boost_m = re.search(r'\*\s*(\d+)\s*/\s*100', tc_block)
+                    if boost_m:
+                        boost = int(boost_m.group(1))
+                    return ("type_change_boost", {
+                        "source_type": src_m.group(1),
+                        "target_type": tgt_m.group(1),
+                        "boost": boost,
+                    })
+
+        # Dual stat intimidate — looks for STATUS3_INTIMIDATE with two STAT_ refs
+        if ability_const in battle_util:
+            dual_block = _get_nearby_block(battle_util, ability_const, 400)
+            if 'STATUS3_INTIMIDATE' in dual_block:
+                stat_matches = re.findall(r'(STAT_\w+)', dual_block)
+                unique_stats = list(dict.fromkeys(stat_matches))  # preserve order
+                if len(unique_stats) >= 2:
+                    return ("intimidate_dual", {"stats": unique_stats[:2]})
+
+        # Field effect on switch-in (Trick Room / Tailwind)
+        if ability_const in battle_util:
+            fe_block = _get_nearby_block(battle_util, ability_const, 400)
+            if 'STATUS_FIELD_TRICK_ROOM' in fe_block or 'trickRoomTimer' in fe_block:
+                return ("switchin_field_effect", {"effect": "TRICK_ROOM"})
+            if 'SIDE_STATUS_TAILWIND' in fe_block or 'tailwindTimer' in fe_block:
+                return ("switchin_field_effect", {"effect": "TAILWIND"})
+
+        # Multi-type resist (Thick Fat variant with two types)
+        if ability_const in pokemon_c:
+            mt_block = _get_nearby_block(pokemon_c, ability_const, 400)
+            type_matches = re.findall(r'moveType\s*==\s*(TYPE_\w+)', mt_block)
+            unique_types = list(dict.fromkeys(type_matches))
+            if len(unique_types) >= 2 and ('/ 2' in mt_block or '/= 2' in mt_block):
+                return ("multi_type_resist", {
+                    "type1": unique_types[0],
+                    "type2": unique_types[1],
+                })
+
+        # ── Serene Grace — doubles secondary effect chance (bsc) ──
+        for _i, ctx in _bsc_contexts:
+            if 'effectChance' in ctx or 'MOVE_EFFECT' in ctx:
+                # Make sure it's doubling / multiplying, not just checking
+                if '* 2' in ctx or '*= 2' in ctx or 'Serene' in ctx:
+                    return ("serene_grace", {})
+        if ability_const == "ABILITY_SERENE_GRACE":
+            # Serene Grace's check may be spread — just detect by name
+            if ability_const in bsc or ability_const in pokemon_c:
+                return ("serene_grace", {})
+
+        # ── Shield Dust — block secondary effects (bsc) ──
+        for _i, ctx in _bsc_contexts:
+            line = bsc_lines[_i]
+            if 'additionalEffects' in ctx or 'secondaryEffect' in ctx:
+                return ("shield_dust", {})
+        if ability_const == "ABILITY_SHIELD_DUST":
+            if ability_const in bsc:
+                return ("shield_dust", {})
+
+        # ── Lightning Rod — redirect type (bsc or battle_main) ──
+        # Must specifically check for target redirection pattern, not just
+        # any TYPE_ constant nearby (which would match too broadly).
+        for _i, ctx in _bsc_contexts:
+            if ('gBattlerTarget' in ctx and 'moveType' in ctx
+                    and ('redirect' in ctx.lower() or 'TARGET' in ctx)):
+                type_m = re.search(r'moveType\s*==\s*(TYPE_\w+)', ctx)
+                if type_m:
+                    return ("lightning_rod", {
+                        "type": type_m.group(1)})
+        if ability_const == "ABILITY_LIGHTNING_ROD":
+            return ("lightning_rod", {"type": "TYPE_ELECTRIC"})
+
+        # ── Sticky Hold — block item theft (bsc) ──
+        for _i, ctx in _bsc_contexts:
+            if 'item' in ctx.lower() and ('Thief' in ctx or 'Knock' in ctx
+                                           or 'StickyHold' in ctx):
+                return ("sticky_hold", {})
+        if ability_const == "ABILITY_STICKY_HOLD":
+            if ability_const in bsc or ability_const in battle_util:
+                return ("sticky_hold", {})
+
+        # ── Suction Cups — block forced switching (bsc or battle_main) ──
+        for _i, ctx in _bsc_contexts:
+            if 'Roar' in ctx or 'Whirlwind' in ctx or 'SuctionCups' in ctx:
+                return ("suction_cups", {})
+        if ability_const in battle_main:
+            bm_lines = battle_main.split('\n')
+            for _i, line in enumerate(bm_lines):
+                if ability_const in line:
+                    ctx = '\n'.join(bm_lines[max(0,_i-3):_i+4])
+                    if 'switch' in ctx.lower() or 'Roar' in ctx:
+                        return ("suction_cups", {})
+        if ability_const == "ABILITY_SUCTION_CUPS":
+            if ability_const in bsc or ability_const in battle_util:
+                return ("suction_cups", {})
+
+        # ── Contact Flinch — Stench Gen5+ pattern (bsc) ──
+        for _i, ctx in _bsc_contexts:
+            if 'FLINCH' in ctx and 'Random()' in ctx:
+                chance_m = re.search(r'Random\(\)\s*%\s*(\d+)', ctx)
+                chance = int(chance_m.group(1)) if chance_m else 10
+                return ("contact_flinch", {"chance": chance})
+
+        # ── Damp — block explosion (bsc) ──
+        for _i, ctx in _bsc_contexts:
+            if 'Damp' in ctx or 'EFFECT_EXPLOSION' in ctx or 'explosion' in ctx.lower():
+                return ("damp", {})
+        if ability_const == "ABILITY_DAMP":
+            if ability_const in bsc:
+                return ("damp", {})
+
+        # ── Early Bird — faster sleep recovery (battle_util inline) ──
+        if ability_const in battle_util:
+            bu_lines = battle_util.split('\n')
+            for _i, line in enumerate(bu_lines):
+                if ability_const in line:
+                    ctx = '\n'.join(bu_lines[max(0,_i-2):_i+3])
+                    if 'toSub' in ctx or 'Sleep' in ctx or 'STATUS1_SLEEP' in ctx:
+                        return ("early_bird", {})
+
+        # ── Natural Cure — in bsc switch (not battle_util) ──
+        if ability_const in bsc:
+            bsc_all_lines = bsc.split('\n')
+            for _i, line in enumerate(bsc_all_lines):
+                if ability_const in line:
+                    ctx = '\n'.join(bsc_all_lines[max(0,_i-2):_i+4])
+                    if 'status1' in ctx and '= 0' in ctx:
+                        return ("natural_cure", {})
+
+        # ── Name-based fallbacks for abilities in assembly (.s) files ──
+        # These abilities are implemented in battle scripts, not C code,
+        # so source scanning can't find them. Match by name.
+        _NAME_FALLBACKS = {
+            "ABILITY_LIQUID_OOZE": ("liquid_ooze", {}),
+            "ABILITY_SUCTION_CUPS": ("suction_cups", {}),
+            "ABILITY_STENCH": ("contact_flinch", {"chance": 10}),
+            "ABILITY_CACOPHONY": ("sound_block", {}),
+            "ABILITY_ROCK_HEAD": ("recoil_immunity", {}),
+            "ABILITY_SYNCHRONIZE": ("synchronize_status", {}),
+        }
+        if ability_const in _NAME_FALLBACKS:
+            return _NAME_FALLBACKS[ability_const]
 
         return None
 
@@ -425,6 +1103,30 @@ def detect_battle_effect(project_root: str, ability_const: str
             chance_val = int(chance_m.group(1)) if chance_m else 3
             return ("contact_status", {"status": move_effect,
                                        "chance": chance_val})
+    # Cute Charm uses infatuation (STATUS2_INFATUATED) not MOVE_EFFECT.
+    # NOTE: Cute Charm doesn't use the MOVE_EFFECT system — it directly sets
+    # STATUS2_INFATUATED_WITH(). Detect as contact_status with a special
+    # "INFATUATION" marker so codegen can handle it correctly.
+    if "FLAG_MAKES_CONTACT" in block and "STATUS2_INFATUAT" in block:
+        chance_m = re.search(r'Random\(\)\s*%\s*(\d+)', block)
+        chance_val = int(chance_m.group(1)) if chance_m else 3
+        return ("contact_status", {"status": "INFATUATION",
+                                   "chance": chance_val})
+
+    # ── Shed Skin (end-of-turn random status cure) ──
+    # Must check BEFORE status_immunity because both have StringCopy + status flags.
+    # Shed Skin has Random() — immunity does not.
+    if "Random()" in block and "STATUS1_ANY" in block and "status1" in block:
+        chance_m = re.search(r'Random\(\)\s*%\s*(\d+)', block)
+        chance = int(chance_m.group(1)) if chance_m else 3
+        return ("shed_skin", {"chance": chance})
+
+    # ── Synchronize (pass status to attacker) ──
+    # Must check BEFORE status_immunity. Sync has MOVE_EFFECT_AFFECTS_USER.
+    if "MOVE_EFFECT_AFFECTS_USER" in block:
+        # Check if it's passing status (sync) not inflicting on contact
+        if "FLAG_MAKES_CONTACT" not in block:
+            return ("synchronize_status", {})
 
     # ── Status Immunity (caseID 5) ──
     # Check for the immunity pattern: status field check + StringCopy + effect = N
@@ -465,6 +1167,74 @@ def detect_battle_effect(project_root: str, ability_const: str
     # ── Critical Hit Prevention ──
     if "ABILITY_BATTLE_ARMOR" in block or "ABILITY_SHELL_ARMOR" in block:
         return ("crit_prevention", {})
+
+    # ── Weather Suppress (Cloud Nine / Air Lock) ──
+    if ("WEATHER_HAS_EFFECT" in block and "gBattleScripting.battler" in block
+            and "weather" not in block.lower().replace("weather_has_effect", "")):
+        # Cloud Nine / Air Lock just announce presence; weather check handles it
+        return ("weather_suppress", {})
+    # Broader check: these abilities have a case block but their real effect
+    # is that WEATHER_HAS_EFFECT returns FALSE when they're on the field.
+    if ability_const in ("ABILITY_CLOUD_NINE", "ABILITY_AIR_LOCK"):
+        return ("weather_suppress", {})
+
+    # ── Trace (copy opponent's ability) ──
+    if "gLastUsedAbility" in block and ("gBattleMons" in block and
+            "ability" in block):
+        if "gBattlerAttacker" not in block:  # Not a damage thing — it's a copy
+            return ("trace", {})
+    if ability_const == "ABILITY_TRACE":
+        return ("trace", {})
+
+    # ── Forecast (form change with weather) ──
+    if "CastformDataTypeChange" in block or "SPECIES_CASTFORM" in block:
+        return ("forecast", {})
+    if ability_const == "ABILITY_FORECAST":
+        return ("forecast", {})
+
+    # ── Shed Skin (random end-of-turn status cure) ──
+    if "Random()" in block and "status1" in block and "= 0" in block:
+        chance_m = re.search(r'Random\(\)\s*%\s*(\d+)', block)
+        chance = int(chance_m.group(1)) if chance_m else 3
+        return ("shed_skin", {"chance": chance})
+
+    # ── Truant (loaf every other turn) ──
+    if "truantCounter" in block or "TRUANT" in block.upper():
+        return ("truant", {})
+    if ability_const == "ABILITY_TRUANT":
+        return ("truant", {})
+
+    # ── Soundproof / Cacophony (block sound-based moves) ──
+    if "FLAG_SOUND" in block or "SoundMoveFailed" in block:
+        return ("sound_block", {})
+    if ability_const in ("ABILITY_SOUNDPROOF", "ABILITY_CACOPHONY"):
+        return ("sound_block", {})
+
+    # ── Color Change (change type when hit) ──
+    if "TYPE_MYSTERY" in block and ("type1" in block or "type2" in block):
+        # Color Change checks if the move type is ??? and changes own type
+        return ("color_change", {})
+    if ability_const == "ABILITY_COLOR_CHANGE":
+        return ("color_change", {})
+
+    # ── Synchronize (pass status to attacker) ──
+    if ("MOVE_EFFECT_AFFECTS_USER" in block and
+            ("MOVE_EFFECT_POISON" in block or "status1" in block)):
+        return ("synchronize_status", {})
+    if ability_const == "ABILITY_SYNCHRONIZE":
+        return ("synchronize_status", {})
+
+    # ── Liquid Ooze (drain reversal) ──
+    if "gBattleMoveDamage" in block and "*= -1" in block:
+        # Only match if it's NOT a weather recovery (those also have *= -1)
+        if not re.search(r'gBattleWeather\s*&', block):
+            return ("liquid_ooze", {})
+
+    # ── Damp (block explosion) ──
+    if "Explosion" in block or "EFFECT_EXPLOSION" in block or "SELF_DESTRUCT" in block:
+        return ("damp", {})
+    if ability_const == "ABILITY_DAMP":
+        return ("damp", {})
 
     return None
 
@@ -612,25 +1382,53 @@ def generate_battle_code(template_id: str, ability_const: str,
     elif template_id == "contact_status":
         move_effect = params.get("status", "MOVE_EFFECT_POISON")
         chance = params.get("chance", 3)
-        block = (
-            f"            case {ability_const}:\n"
-            f"                if (!(gMoveResultFlags & MOVE_RESULT_NO_EFFECT)\n"
-            f"                 && gBattleMons[gBattlerAttacker].hp != 0\n"
-            f"                 && !gProtectStructs[gBattlerAttacker].confusionSelfDmg\n"
-            f"                 && TARGET_TURN_DAMAGED\n"
-            f"                 && (gBattleMoves[move].flags & FLAG_MAKES_CONTACT)\n"
-            f"                 && (Random() % {chance}) == 0)\n"
-            f"                {{\n"
-            f"                    gBattleCommunication[MOVE_EFFECT_BYTE] = "
-            f"MOVE_EFFECT_AFFECTS_USER | {move_effect};\n"
-            f"                    BattleScriptPushCursor();\n"
-            f"                    gBattlescriptCurrInstr = "
-            f"BattleScript_ApplySecondaryEffect;\n"
-            f"                    gHitMarker |= HITMARKER_STATUS_ABILITY_EFFECT;\n"
-            f"                    effect++;\n"
-            f"                }}\n"
-            f"                break;"
-        )
+        # Cute Charm uses STATUS2_INFATUATED_WITH() directly, not MOVE_EFFECT
+        if move_effect == "INFATUATION":
+            block = (
+                f"            case {ability_const}:\n"
+                f"                if (!(gMoveResultFlags & MOVE_RESULT_NO_EFFECT)\n"
+                f"                 && gBattleMons[gBattlerAttacker].hp != 0\n"
+                f"                 && !gProtectStructs[gBattlerAttacker].confusionSelfDmg\n"
+                f"                 && (gBattleMoves[move].flags & FLAG_MAKES_CONTACT)\n"
+                f"                 && TARGET_TURN_DAMAGED\n"
+                f"                 && gBattleMons[gBattlerTarget].hp != 0\n"
+                f"                 && (Random() % {chance}) == 0\n"
+                f"                 && gBattleMons[gBattlerAttacker].ability != ABILITY_OBLIVIOUS\n"
+                f"                 && !(gBattleMons[gBattlerAttacker].status2 & STATUS2_INFATUATION)\n"
+                f"                 && GetGenderFromSpeciesAndPersonality(speciesAtk, pidAtk) != "
+                f"GetGenderFromSpeciesAndPersonality(speciesDef, pidDef)\n"
+                f"                 && GetGenderFromSpeciesAndPersonality(speciesAtk, pidAtk) != MON_GENDERLESS\n"
+                f"                 && GetGenderFromSpeciesAndPersonality(speciesDef, pidDef) != MON_GENDERLESS)\n"
+                f"                {{\n"
+                f"                    gBattleMons[gBattlerAttacker].status2 |= "
+                f"STATUS2_INFATUATED_WITH(gBattlerTarget);\n"
+                f"                    BattleScriptPushCursor();\n"
+                f"                    gBattlescriptCurrInstr = "
+                f"BattleScript_CuteCharmActivates;\n"
+                f"                    effect++;\n"
+                f"                }}\n"
+                f"                break;"
+            )
+        else:
+            block = (
+                f"            case {ability_const}:\n"
+                f"                if (!(gMoveResultFlags & MOVE_RESULT_NO_EFFECT)\n"
+                f"                 && gBattleMons[gBattlerAttacker].hp != 0\n"
+                f"                 && !gProtectStructs[gBattlerAttacker].confusionSelfDmg\n"
+                f"                 && TARGET_TURN_DAMAGED\n"
+                f"                 && (gBattleMoves[move].flags & FLAG_MAKES_CONTACT)\n"
+                f"                 && (Random() % {chance}) == 0)\n"
+                f"                {{\n"
+                f"                    gBattleCommunication[MOVE_EFFECT_BYTE] = "
+                f"MOVE_EFFECT_AFFECTS_USER | {move_effect};\n"
+                f"                    BattleScriptPushCursor();\n"
+                f"                    gBattlescriptCurrInstr = "
+                f"BattleScript_ApplySecondaryEffect;\n"
+                f"                    gHitMarker |= HITMARKER_STATUS_ABILITY_EFFECT;\n"
+                f"                    effect++;\n"
+                f"                }}\n"
+                f"                break;"
+            )
         result.append(("src/battle_util.c", block))
 
     elif template_id == "type_absorb_hp":
@@ -712,16 +1510,31 @@ def generate_battle_code(template_id: str, ability_const: str,
         result.append(("src/battle_util.c", block))
 
     elif template_id == "intimidate":
-        # Intimidate uses a special flag + separate case handlers
-        # We generate the switch-in case that sets the flag
+        # Intimidate uses a special flag + separate case handlers.
+        # The stat parameter controls which stat is lowered (default ATK).
+        # NOTE: In vanilla pokefirered the stat lowered by Intimidate is
+        # hardcoded in BattleScript_IntimidateActivates.  For non-ATK stats,
+        # a custom battle script would be needed.  The case block sets the
+        # flag; the battle script handles the actual stat drop.
+        stat = params.get("stat", "STAT_ATK")
         block = (
             f"            case {ability_const}:\n"
-            f"                if (!gSpecialStatuses[battler].intimitatedMon)\n"
+            f"                if (!gSpecialStatuses[battler].intimidatedMon)\n"
             f"                {{\n"
             f"                    gStatuses3[battler] |= "
             f"STATUS3_INTIMIDATE_POKES;\n"
             f"                    gSpecialStatuses[battler]"
-            f".intimitatedMon = TRUE;\n"
+            f".intimidatedMon = TRUE;\n"
+        )
+        if stat != "STAT_ATK":
+            block += (
+                f"                    // Custom stat target: {stat}\n"
+                f"                    // Requires a modified "
+                f"BattleScript_IntimidateActivates\n"
+                f"                    // that reads animArg1 for the stat ID.\n"
+                f"                    gBattleScripting.animArg1 = {stat};\n"
+            )
+        block += (
             f"                }}\n"
             f"                break;"
         )
@@ -815,12 +1628,716 @@ def generate_battle_code(template_id: str, ability_const: str,
         result.append(("src/battle_main.c", code))
 
     elif template_id == "crit_prevention":
-        # This is checked inline; we'd add to the existing check
-        # The pattern is: if (ability != BATTLE_ARMOR && ability != SHELL_ARMOR)
-        # We note it but the actual insertion is more complex
-        result.append(("src/battle_script_commands.c",
-                       f"// {ability_const}: Critical hit prevention "
-                       f"(add to critical hit check)"))
+        code = (
+            f"    // {ability_const}: Add to critical hit prevention check\n"
+            f"    // In the critical hit calculation, add:\n"
+            f"    //   && gBattleMons[gBattlerTarget].ability != {ability_const}"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "ohko_prevention":
+        code = (
+            f"        if (gBattleMons[gBattlerTarget].ability == {ability_const})\n"
+            f"        {{\n"
+            f"            gMoveResultFlags |= MOVE_RESULT_MISSED;\n"
+            f"            gLastUsedAbility = {ability_const};\n"
+            f"            gBattlescriptCurrInstr = BattleScript_SturdyPreventsOHKO;\n"
+            f"            RecordAbilityBattle(gBattlerTarget, {ability_const});\n"
+            f"        }}"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "evasion_weather":
+        weather = params.get("weather", "B_WEATHER_SANDSTORM")
+        code = (
+            f"    // {ability_const}: Evasion boost in weather\n"
+            f"    if (WEATHER_HAS_EFFECT\n"
+            f"     && gBattleMons[gBattlerTarget].ability == {ability_const}\n"
+            f"     && gBattleWeather & {weather})\n"
+            f"        calc = (calc * 80) / 100;  // 20% accuracy reduction"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "stat_double":
+        stat = params.get("stat", "STAT_ATK")
+        # Map stat constants to the actual C variable names in
+        # CalculateBaseDamage() in pokemon.c
+        _stat_var_map = {
+            "STAT_ATK": "attack",
+            "STAT_DEF": "defense",
+            "STAT_SPEED": "speed",
+            "STAT_SPATK": "spAttack",
+            "STAT_SPDEF": "spDefense",
+        }
+        stat_var = _stat_var_map.get(stat, "attack")
+        code = (
+            f"    // {ability_const}: Doubles {stat} in damage calculation\n"
+            f"    if (attacker->ability == {ability_const})\n"
+            f"        {stat_var} *= 2;"
+        )
+        result.append(("src/pokemon.c", code))
+
+    elif template_id == "type_resist_halve":
+        type_const = params.get("type", "TYPE_FIRE")
+        code = (
+            f"    // {ability_const}: Halves damage from {type_const}\n"
+            f"    if (defender->ability == {ability_const}\n"
+            f"     && (moveType == {type_const}))\n"
+            f"        damage /= 2;"
+        )
+        result.append(("src/pokemon.c", code))
+
+    elif template_id == "block_stat_reduction":
+        code = (
+            f"    // {ability_const}: Block stat reduction\n"
+            f"    case {ability_const}:\n"
+            f"        // Add to stat change prevention switch in battle_util.c"
+        )
+        result.append(("src/battle_util.c", code))
+
+    elif template_id == "block_flinch":
+        code = (
+            f"    // {ability_const}: Flinch prevention\n"
+            f"    if (gBattleMons[gBattlerTarget].ability == {ability_const})\n"
+            f"        // Skip flinch application"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "accuracy_boost":
+        code = (
+            f"    // {ability_const}: Accuracy boost\n"
+            f"    if (gBattleMons[gBattlerAttacker].ability == {ability_const})\n"
+            f"        calc = (calc * 130) / 100;  // 30% accuracy boost"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "guts_boost":
+        code = (
+            f"    // {ability_const}: Attack boost when statused\n"
+            f"    if (attacker->ability == {ability_const}\n"
+            f"     && attacker->status1)\n"
+            f"        attack = (attack * 150) / 100;"
+        )
+        result.append(("src/pokemon.c", code))
+
+    elif template_id == "weather_speed":
+        weather = params.get("weather", "B_WEATHER_RAIN")
+        code = (
+            f"    // {ability_const}: Doubles Speed in weather\n"
+            f"    // Add to GetWhoStrikesFirst() in battle_main.c, alongside\n"
+            f"    // the ABILITY_SWIFT_SWIM / ABILITY_CHLOROPHYLL checks.\n"
+            f"    if (gBattleMons[battler].ability == {ability_const}\n"
+            f"     && WEATHER_HAS_EFFECT && gBattleWeather & {weather})\n"
+            f"        speed *= 2;"
+        )
+        result.append(("src/battle_main.c", code))
+
+    elif template_id == "prevent_escape":
+        code = (
+            f"    // {ability_const}: Prevent foe from escaping\n"
+            f"    if (gBattleMons[i].ability == {ability_const})\n"
+            f"        cannotRun = TRUE;"
+        )
+        result.append(("src/battle_main.c", code))
+
+    elif template_id == "natural_cure":
+        code = (
+            f"    // {ability_const}: Cure status on switch-out\n"
+            f"    case {ability_const}:\n"
+            f"        gBattleMons[gActiveBattler].status1 = 0;\n"
+            f"        break;"
+        )
+        result.append(("src/battle_util.c", code))
+
+    elif template_id == "pressure":
+        code = (
+            f"    // {ability_const}: Extra PP drain\n"
+            f"    // In pokefirered, Pressure is handled by PressurePPLose()\n"
+            f"    // in battle_util.c. Add this ability to the check:\n"
+            f"    if (gBattleMons[gBattlerTarget].ability == {ability_const})\n"
+            f"        ppToDeduct++;"
+        )
+        result.append(("src/battle_util.c", code))
+
+    elif template_id == "wonder_guard":
+        code = (
+            f"    // {ability_const}: Only super-effective moves deal damage\n"
+            f"    if (gBattleMons[gBattlerTarget].ability == {ability_const}\n"
+            f"     && !(gMoveResultFlags & MOVE_RESULT_SUPER_EFFECTIVE)\n"
+            f"     && gBattleMoves[gCurrentMove].power)\n"
+            f"        gMoveResultFlags |= MOVE_RESULT_MISSED;"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "recoil_immunity":
+        code = (
+            f"    // {ability_const}: Recoil immunity\n"
+            f"    if (gBattleMons[gBattlerAttacker].ability == {ability_const})\n"
+            f"        // Skip recoil damage"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "type_change_boost":
+        source = params.get("source_type", "TYPE_NORMAL")
+        target = params.get("target_type", "TYPE_FAIRY")
+        boost = params.get("boost", 130)
+        # TYPE CHANGE: Sets dynamicMoveType before Cmd_typecalc runs.
+        # Must be placed in Cmd_attackcanceler or a new command that runs
+        # before type effectiveness is calculated.
+        # Same mechanism as Weather Ball (see lines ~9350 in
+        # battle_script_commands.c).
+        type_code = (
+            f"    // {ability_const}: Convert {source} moves to {target}\n"
+            f"    // INSERT in Cmd_attackcanceler (runs before Cmd_typecalc)\n"
+            f"    // or add a new Cmd that the battle script calls before\n"
+            f"    // the attackstring/damagecalc sequence.\n"
+            f"    if (gBattleMons[gBattlerAttacker].ability == {ability_const}\n"
+            f"     && gBattleMoves[gCurrentMove].type == {source}\n"
+            f"     && gBattleMoves[gCurrentMove].power > 0)\n"
+            f"    {{\n"
+            f"        gBattleStruct->dynamicMoveType = "
+            f"{target} | F_DYNAMIC_TYPE_2;\n"
+            f"    }}"
+        )
+        result.append(("src/battle_script_commands.c", type_code))
+
+        # POWER BOOST: Applied in CalculateBaseDamage in pokemon.c,
+        # AFTER the base damage is computed but before it's returned.
+        # This is the same place Overgrow/Blaze/Torrent apply their boost.
+        if boost != 100:
+            boost_code = (
+                f"    // {ability_const}: {boost - 100}% power boost for "
+                f"type-changed moves\n"
+                f"    // INSERT in CalculateBaseDamage(), after the pinch\n"
+                f"    // ability boosts (Overgrow/Blaze/Torrent section).\n"
+                f"    if (attacker->ability == {ability_const}\n"
+                f"     && gBattleMoves[move].type == {source})\n"
+                f"    {{\n"
+                f"        damage = damage * {boost} / 100;\n"
+                f"    }}"
+            )
+            result.append(("src/pokemon.c", boost_code))
+
+    elif template_id == "intimidate_dual":
+        stats = params.get("stats", ["STAT_ATK", "STAT_SPATK"])
+        if isinstance(stats, list) and len(stats) >= 2:
+            stat1, stat2 = stats[0], stats[1]
+        else:
+            stat1, stat2 = "STAT_ATK", "STAT_SPATK"
+        # Uses the same Intimidate mechanism but lowers two stats
+        code = (
+            f"            case {ability_const}:\n"
+            f"                if (!gSpecialStatuses[battler].intimidatedMon)\n"
+            f"                {{\n"
+            f"                    gStatuses3[battler] |= "
+            f"STATUS3_INTIMIDATE_POKES;\n"
+            f"                    gSpecialStatuses[battler].intimidatedMon = 1;\n"
+            f"                    // Lowers BOTH {stat1} and {stat2}\n"
+            f"                    gBattleScripting.animArg1 = {stat1};\n"
+            f"                    gBattleScripting.animArg2 = {stat2};\n"
+            f"                    BattleScriptPushCursorAndCallback("
+            f"BattleScript_IntimidateActivates);\n"
+            f"                    gBattleScripting.battler = battler;\n"
+            f"                    effect++;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", code))
+
+        # The actual dual-stat lowering needs a custom battle script or
+        # a second stat reduction call.  Add a helper note.
+        script_code = (
+            f"    // {ability_const}: Dual stat lower — after the first stat\n"
+            f"    // ({stat1}) is lowered by the Intimidate script, add a\n"
+            f"    // second call to lower {stat2}.\n"
+            f"    // In BattleScript_IntimidateActivates (or a copy), add:\n"
+            f"    //   setbyte sBATTLER, [target]\n"
+            f"    //   statbuffchange STAT_CHANGE_NOT_PROTECT_AFFECTED, "
+            f"BattleScript_IntimidateEnd\n"
+            f"    //   playanimation BS_TARGET, B_ANIM_STATS_CHANGE, "
+            f"sB_ANIM_ARG1"
+        )
+        result.append(("data/battle_scripts_1.s", script_code))
+
+    elif template_id == "switchin_field_effect":
+        effect_type = params.get("effect", "TRICK_ROOM")
+        # IMPORTANT: Trick Room and Tailwind are Gen 4+ features that do NOT
+        # exist in vanilla pokefirered.  The generated code below requires
+        # adding new constants, struct fields, and battle scripts to the
+        # project first.  The code preview documents exactly what to add.
+        if effect_type == "TRICK_ROOM":
+            # Trick Room needs: a new bit in gSideStatuses or a new global,
+            # a timer field, a battle script, and speed reversal logic.
+            code = (
+                f"            case {ability_const}:\n"
+                f"                // Auto-set Trick Room on switch-in\n"
+                f"                //\n"
+                f"                // REQUIRED ADDITIONS (not in vanilla pokefirered):\n"
+                f"                //\n"
+                f"                // 1. In include/battle.h, add to BattleStruct:\n"
+                f"                //      u8 trickRoomTimer;\n"
+                f"                //\n"
+                f"                // 2. In include/constants/battle.h, add:\n"
+                f"                //      #define STATUS3_TRICK_ROOM (1 << 28)\n"
+                f"                //\n"
+                f"                // 3. In data/battle_scripts_1.s, create:\n"
+                f"                //      BattleScript_TrickRoomActivates:\n"
+                f"                //          printstring STRINGID_TRICKROOMACTIVATED\n"
+                f"                //          waitmessage 0x40\n"
+                f"                //          end3\n"
+                f"                //\n"
+                f"                // 4. In src/battle_util.c, in the speed\n"
+                f"                //    comparison function, reverse the\n"
+                f"                //    comparison when trickRoomTimer > 0.\n"
+                f"                //\n"
+                f"                if (gBattleStruct->trickRoomTimer == 0)\n"
+                f"                {{\n"
+                f"                    gBattleStruct->trickRoomTimer = 5;\n"
+                f"                    BattleScriptPushCursorAndCallback("
+                f"BattleScript_TrickRoomActivates);\n"
+                f"                    gBattleScripting.battler = battler;\n"
+                f"                    effect++;\n"
+                f"                }}\n"
+                f"                break;"
+            )
+        else:  # TAILWIND
+            code = (
+                f"            case {ability_const}:\n"
+                f"                // Auto-set Tailwind on switch-in\n"
+                f"                //\n"
+                f"                // REQUIRED ADDITIONS (not in vanilla pokefirered):\n"
+                f"                //\n"
+                f"                // 1. In include/battle.h, add to SideTimer:\n"
+                f"                //      u8 tailwindTimer;\n"
+                f"                //      u8 tailwindBattlerId;\n"
+                f"                //\n"
+                f"                // 2. In include/constants/battle.h, add:\n"
+                f"                //      #define SIDE_STATUS_TAILWIND (1 << 8)\n"
+                f"                //\n"
+                f"                // 3. In data/battle_scripts_1.s, create:\n"
+                f"                //      BattleScript_TailwindActivates:\n"
+                f"                //          printstring STRINGID_TAILWINDACTIVATED\n"
+                f"                //          waitmessage 0x40\n"
+                f"                //          end3\n"
+                f"                //\n"
+                f"                // 4. In src/battle_util.c, in the end-of-turn\n"
+                f"                //    handler, decrement tailwindTimer and\n"
+                f"                //    clear SIDE_STATUS_TAILWIND when it hits 0.\n"
+                f"                //\n"
+                f"                // 5. In the speed calculation, double speed\n"
+                f"                //    when SIDE_STATUS_TAILWIND is active.\n"
+                f"                //\n"
+                f"                {{\n"
+                f"                    u8 side = GetBattlerSide(battler);\n"
+                f"                    if (!(gSideStatuses[side] & "
+                f"SIDE_STATUS_TAILWIND))\n"
+                f"                    {{\n"
+                f"                        gSideStatuses[side] |= "
+                f"SIDE_STATUS_TAILWIND;\n"
+                f"                        gSideTimers[side].tailwindTimer = 5;\n"
+                f"                        gSideTimers[side]."
+                f"tailwindBattlerId = battler;\n"
+                f"                        BattleScriptPushCursorAndCallback("
+                f"BattleScript_TailwindActivates);\n"
+                f"                        gBattleScripting.battler = battler;\n"
+                f"                        effect++;\n"
+                f"                    }}\n"
+                f"                }}\n"
+                f"                break;"
+            )
+        result.append(("src/battle_util.c", code))
+
+    elif template_id == "multi_type_resist":
+        type1 = params.get("type1", "TYPE_FIRE")
+        type2 = params.get("type2", "TYPE_ICE")
+        code = (
+            f"    // {ability_const}: Halves {type1} and {type2} damage\n"
+            f"    if (defender->ability == {ability_const})\n"
+            f"    {{\n"
+            f"        if (moveType == {type1} || moveType == {type2})\n"
+            f"            damage /= 2;\n"
+            f"    }}"
+        )
+        result.append(("src/pokemon.c", code))
+
+    elif template_id == "weather_suppress":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                // Suppresses weather effects while on the field.\n"
+            f"                // The actual suppression is in WEATHER_HAS_EFFECT macro\n"
+            f"                // which returns FALSE when any active battler has this ability.\n"
+            f"                // This case block handles the switch-in announcement.\n"
+            f"                if (WEATHER_HAS_EFFECT && gBattleWeather)\n"
+            f"                {{\n"
+            f"                    BattleScriptPushCursorAndCallback("
+            f"BattleScript_AirLockActivates);\n"
+            f"                    gBattleScripting.battler = battler;\n"
+            f"                    effect++;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "shed_skin":
+        chance = params.get("chance", 3)
+        block = (
+            f"                case {ability_const}:\n"
+            f"                    if ((gBattleMons[battler].status1 & STATUS1_ANY)\n"
+            f"                     && (Random() % {chance}) == 0)\n"
+            f"                    {{\n"
+            f"                        gBattleMons[battler].status1 = 0;\n"
+            f"                        gBattleMons[battler].status2 &= "
+            f"~STATUS2_NIGHTMARE;\n"
+            f"                        BattleScriptPushCursorAndCallback("
+            f"BattleScript_ShedSkinActivates);\n"
+            f"                        BtlController_EmitSetMonData(0, "
+            f"REQUEST_STATUS_BATTLE, 0, 4, "
+            f"&gBattleMons[battler].status1);\n"
+            f"                        MarkBattlerForControllerExec(battler);\n"
+            f"                        effect++;\n"
+            f"                    }}\n"
+            f"                    break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "truant":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                // Truant: Skip every other turn.\n"
+            f"                // The loafing is handled by gDisableStructs[battler]."
+            f"truantCounter\n"
+            f"                // which is toggled each turn. When truantCounter is odd,\n"
+            f"                // the mon loafs around instead of attacking.\n"
+            f"                if (gDisableStructs[battler].truantCounter)\n"
+            f"                {{\n"
+            f"                    CancelMultiTurnMoves(battler);\n"
+            f"                    gHitMarker |= HITMARKER_UNABLE_TO_USE_MOVE;\n"
+            f"                    gBattleCommunication[MULTISTRING_CHOOSER] = 0;\n"
+            f"                    gBattlescriptCurrInstr = "
+            f"BattleScript_MoveUsedLoafingAround;\n"
+            f"                    gMoveResultFlags |= MOVE_RESULT_NO_EFFECT;\n"
+            f"                    effect = 1;\n"
+            f"                }}\n"
+            f"                gDisableStructs[battler].truantCounter ^= 1;\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "sound_block":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                if (gBattleMoves[gCurrentMove].flags & FLAG_SOUND)\n"
+            f"                {{\n"
+            f"                    gBattlescriptCurrInstr = "
+            f"BattleScript_SoundproofProtected;\n"
+            f"                    gBattleScripting.battler = battler;\n"
+            f"                    effect = 1;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "color_change":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                if (!(gMoveResultFlags & MOVE_RESULT_NO_EFFECT)\n"
+            f"                 && gBattleMons[battler].hp != 0\n"
+            f"                 && moveType != TYPE_MYSTERY\n"
+            f"                 && !IS_BATTLER_OF_TYPE(battler, moveType))\n"
+            f"                {{\n"
+            f"                    SET_BATTLER_TYPE(battler, moveType);\n"
+            f"                    PREPARE_TYPE_BUFFER(gBattleTextBuff1, moveType);\n"
+            f"                    BattleScriptPushCursor();\n"
+            f"                    gBattlescriptCurrInstr = "
+            f"BattleScript_ColorChangeActivates;\n"
+            f"                    effect++;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "synchronize_status":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                // Synchronize: Pass poison/burn/paralysis to the attacker.\n"
+            f"                // This has two case entries in vanilla pokefirered:\n"
+            f"                // caseID 7 handles the initial sync attempt,\n"
+            f"                // caseID 8 handles the resolution.\n"
+            f"                if (gBattleMons[gBattlerAttacker].hp != 0\n"
+            f"                 && !gProtectStructs[gBattlerAttacker].confusionSelfDmg)\n"
+            f"                {{\n"
+            f"                    if (gBattleMons[battler].status1 & STATUS1_POISON)\n"
+            f"                        gBattleCommunication[MOVE_EFFECT_BYTE] = "
+            f"MOVE_EFFECT_AFFECTS_USER | MOVE_EFFECT_POISON;\n"
+            f"                    else if (gBattleMons[battler].status1 & STATUS1_BURN)\n"
+            f"                        gBattleCommunication[MOVE_EFFECT_BYTE] = "
+            f"MOVE_EFFECT_AFFECTS_USER | MOVE_EFFECT_BURN;\n"
+            f"                    else if (gBattleMons[battler].status1 & "
+            f"STATUS1_PARALYSIS)\n"
+            f"                        gBattleCommunication[MOVE_EFFECT_BYTE] = "
+            f"MOVE_EFFECT_AFFECTS_USER | MOVE_EFFECT_PARALYSIS;\n"
+            f"                    if (gBattleCommunication[MOVE_EFFECT_BYTE])\n"
+            f"                    {{\n"
+            f"                        BattleScriptPushCursor();\n"
+            f"                        gBattlescriptCurrInstr = "
+            f"BattleScript_SynchronizeActivates;\n"
+            f"                        gHitMarker |= HITMARKER_STATUS_ABILITY_EFFECT;\n"
+            f"                        effect++;\n"
+            f"                    }}\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "suction_cups":
+        code = (
+            f"    // {ability_const}: Block forced switching (Roar/Whirlwind)\n"
+            f"    if (gBattleMons[gBattlerTarget].ability == {ability_const})\n"
+            f"    {{\n"
+            f"        gBattlescriptCurrInstr = BattleScript_AbilityPreventsPhazing;\n"
+            f"        gLastUsedAbility = {ability_const};\n"
+            f"        RecordAbilityBattle(gBattlerTarget, {ability_const});\n"
+            f"    }}"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "sticky_hold":
+        code = (
+            f"    // {ability_const}: Block item theft (Thief/Trick/Knock Off)\n"
+            f"    if (gBattleMons[gBattlerTarget].ability == {ability_const})\n"
+            f"    {{\n"
+            f"        gBattlescriptCurrInstr = BattleScript_StickyHoldActivates;\n"
+            f"        gLastUsedAbility = {ability_const};\n"
+            f"        RecordAbilityBattle(gBattlerTarget, {ability_const});\n"
+            f"    }}"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "shield_dust":
+        code = (
+            f"    // {ability_const}: Block secondary move effects\n"
+            f"    // In the secondary effect application code, skip if target has this ability\n"
+            f"    if (gBattleMons[gBattlerTarget].ability == {ability_const})\n"
+            f"    {{\n"
+            f"        // Skip additional effect application\n"
+            f"        gBattlescriptCurrInstr = BattleScript_MoveEnd;\n"
+            f"    }}"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "lightning_rod":
+        type_const = params.get("type", "TYPE_ELECTRIC")
+        code = (
+            f"    // {ability_const}: Redirect {type_const} moves to this Pokemon\n"
+            f"    // In doubles, when a {type_const} move is used, change the target\n"
+            f"    // to the battler with this ability.\n"
+            f"    if (gBattleMons[battler].ability == {ability_const}\n"
+            f"     && moveType == {type_const}\n"
+            f"     && gBattlerTarget != battler)\n"
+            f"    {{\n"
+            f"        gBattlerTarget = battler;\n"
+            f"        RecordAbilityBattle(battler, {ability_const});\n"
+            f"    }}"
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "serene_grace":
+        code = (
+            f"    // {ability_const}: Double secondary effect chance\n"
+            f"    // NOTE: gBattleMoves is const ROM data — do NOT write to it.\n"
+            f"    // Instead, double the chance in the local comparison variable.\n"
+            f"    // In Cmd_setmoveeffect or Cmd_setadditionaleffects, where the\n"
+            f"    // secondaryEffectChance is read and compared to Random() % 100:\n"
+            f"    u32 effectChance = gBattleMoves[gCurrentMove].secondaryEffectChance;\n"
+            f"    if (gBattleMons[gBattlerAttacker].ability == {ability_const})\n"
+            f"        effectChance *= 2;\n"
+            f"    // Then use effectChance instead of gBattleMoves[...].secondaryEffectChance\n"
+            f"    // in the Random() % 100 < effectChance comparison."
+        )
+        result.append(("src/battle_script_commands.c", code))
+
+    elif template_id == "hustle":
+        # Hustle has two parts: attack boost in pokemon.c and accuracy
+        # penalty in battle_script_commands.c
+        atk_code = (
+            f"    // {ability_const}: 50% Attack boost for physical moves\n"
+            f"    if (attacker->ability == {ability_const})\n"
+            f"        attack = (attack * 150) / 100;"
+        )
+        result.append(("src/pokemon.c", atk_code))
+        acc_code = (
+            f"    // {ability_const}: 20% accuracy penalty for physical moves\n"
+            f"    if (gBattleMons[gBattlerAttacker].ability == {ability_const}\n"
+            f"     && IS_TYPE_PHYSICAL(moveType))\n"
+            f"        calc = (calc * 80) / 100;"
+        )
+        result.append(("src/battle_script_commands.c", acc_code))
+
+    elif template_id == "marvel_scale":
+        stat_var = params.get("stat", "defense")
+        code = (
+            f"    // {ability_const}: 50% {stat_var} boost when statused\n"
+            f"    if (defender->ability == {ability_const}\n"
+            f"     && defender->status1)\n"
+            f"        {stat_var} = ({stat_var} * 150) / 100;"
+        )
+        result.append(("src/pokemon.c", code))
+
+    elif template_id == "early_bird":
+        code = (
+            f"    // {ability_const}: Wake from sleep in half the time\n"
+            f"    // In the sleep counter decrement, subtract an extra turn\n"
+            f"    // when this ability is active.\n"
+            f"    if (gBattleMons[battler].ability == {ability_const}\n"
+            f"     && (gBattleMons[battler].status1 & STATUS1_SLEEP))\n"
+            f"    {{\n"
+            f"        gBattleMons[battler].status1 -= 1;  // Extra decrement\n"
+            f"        if (!(gBattleMons[battler].status1 & STATUS1_SLEEP))\n"
+            f"            gBattleMons[battler].status1 &= ~STATUS1_SLEEP;\n"
+            f"    }}"
+        )
+        result.append(("src/battle_util.c", code))
+
+    elif template_id == "liquid_ooze":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                // When hit by a draining move, the attacker takes\n"
+            f"                // damage instead of healing.\n"
+            f"                gBattleMoveDamage *= -1;\n"
+            f"                BattleScriptPushCursor();\n"
+            f"                gBattlescriptCurrInstr = "
+            f"BattleScript_LiquidOozeActivates;\n"
+            f"                effect++;\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "plus_minus":
+        partner = params.get("partner", "ABILITY_MINUS")
+        code = (
+            f"    // {ability_const}: 50% Sp. Attack boost when ally has {partner}\n"
+            f"    if (attacker->ability == {ability_const})\n"
+            f"    {{\n"
+            f"        // Check if partner has the complementary ability\n"
+            f"        u8 partner = BATTLE_PARTNER(battler);\n"
+            f"        if (gBattleMons[partner].ability == {partner})\n"
+            f"            spAttack = (spAttack * 150) / 100;\n"
+            f"    }}"
+        )
+        result.append(("src/pokemon.c", code))
+
+    elif template_id == "damp":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                // Prevents any Pokemon from using Explosion/Self-Destruct\n"
+            f"                if (gBattleMoves[gCurrentMove].effect == "
+            f"EFFECT_EXPLOSION)\n"
+            f"                {{\n"
+            f"                    gBattlescriptCurrInstr = "
+            f"BattleScript_DampPreventsExplosion;\n"
+            f"                    gBattleScripting.battler = battler;\n"
+            f"                    effect = 1;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "contact_flinch":
+        chance = params.get("chance", 10)
+        block = (
+            f"            case {ability_const}:\n"
+            f"                if (!(gMoveResultFlags & MOVE_RESULT_NO_EFFECT)\n"
+            f"                 && gBattleMons[gBattlerAttacker].hp != 0\n"
+            f"                 && !gProtectStructs[gBattlerAttacker]"
+            f".confusionSelfDmg\n"
+            f"                 && TARGET_TURN_DAMAGED\n"
+            f"                 && (gBattleMoves[move].flags & FLAG_MAKES_CONTACT)\n"
+            f"                 && (Random() % {chance}) == 0)\n"
+            f"                {{\n"
+            f"                    gBattleCommunication[MOVE_EFFECT_BYTE] = "
+            f"MOVE_EFFECT_AFFECTS_USER | MOVE_EFFECT_FLINCH;\n"
+            f"                    BattleScriptPushCursor();\n"
+            f"                    gBattlescriptCurrInstr = "
+            f"BattleScript_ApplySecondaryEffect;\n"
+            f"                    gHitMarker |= HITMARKER_STATUS_ABILITY_EFFECT;\n"
+            f"                    effect++;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "trace":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                // Copies the opposing Pokemon's ability on switch-in.\n"
+            f"                if (gBattleMons[BATTLE_OPPOSITE(battler)].ability\n"
+            f"                 && gBattleMons[BATTLE_OPPOSITE(battler)].ability "
+            f"!= {ability_const})\n"
+            f"                {{\n"
+            f"                    gLastUsedAbility = gBattleMons["
+            f"BATTLE_OPPOSITE(battler)].ability;\n"
+            f"                    gBattleMons[battler].ability = gLastUsedAbility;\n"
+            f"                    BattleScriptPushCursorAndCallback("
+            f"BattleScript_TraceActivates);\n"
+            f"                    gBattleScripting.battler = battler;\n"
+            f"                    PREPARE_MON_NICK_WITH_PREFIX_BUFFER("
+            f"gBattleTextBuff1, BATTLE_OPPOSITE(battler),\n"
+            f"                        gBattlerPartyIndexes["
+            f"BATTLE_OPPOSITE(battler)]);\n"
+            f"                    PREPARE_ABILITY_BUFFER(gBattleTextBuff2, "
+            f"gLastUsedAbility);\n"
+            f"                    effect++;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "forecast":
+        block = (
+            f"            case {ability_const}:\n"
+            f"                // Changes form based on weather.\n"
+            f"                // This is Castform's signature ability.\n"
+            f"                // The form change is handled by CastformDataTypeChange()\n"
+            f"                // which maps weather → species form → types.\n"
+            f"                effect = CastformDataTypeChange(battler);\n"
+            f"                if (effect)\n"
+            f"                {{\n"
+            f"                    BattleScriptPushCursorAndCallback("
+            f"BattleScript_CastformChange);\n"
+            f"                    gBattleScripting.battler = battler;\n"
+            f"                }}\n"
+            f"                break;"
+        )
+        result.append(("src/battle_util.c", block))
+
+    elif template_id == "block_specific_stat":
+        stat = params.get("stat", "STAT_ATK")
+        _stat_name_map = {
+            "STAT_ATK": "Attack", "STAT_DEF": "Defense",
+            "STAT_SPEED": "Speed", "STAT_SPATK": "Sp. Attack",
+            "STAT_SPDEF": "Sp. Defense", "STAT_ACC": "Accuracy",
+            "STAT_EVASION": "Evasion",
+        }
+        stat_name = _stat_name_map.get(stat, stat)
+        code = (
+            f"    // {ability_const}: Prevent {stat_name} from being lowered\n"
+            f"    // Add to ChangeStatBuffs() in battle_script_commands.c,\n"
+            f"    // alongside the ABILITY_KEEN_EYE / ABILITY_HYPER_CUTTER checks:\n"
+            f"    else if (gBattleMons[gActiveBattler].ability == {ability_const}\n"
+            f"             && !certain && statId == {stat})\n"
+            f"    {{\n"
+            f"        if (flags == STAT_CHANGE_ALLOW_PTR)\n"
+            f"        {{\n"
+            f"            BattleScriptPush(BS_ptr);\n"
+            f"            gBattleScripting.battler = gActiveBattler;\n"
+            f"            gBattlescriptCurrInstr = BattleScript_AbilityNoStatLoss;\n"
+            f"            gLastUsedAbility = gBattleMons[gActiveBattler].ability;\n"
+            f"            RecordAbilityBattle(gActiveBattler, gLastUsedAbility);\n"
+            f"        }}\n"
+            f"        return STAT_CHANGE_DIDNT_WORK;\n"
+            f"    }}"
+        )
+        result.append(("src/battle_script_commands.c", code))
 
     return result
 

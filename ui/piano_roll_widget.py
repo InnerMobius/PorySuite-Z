@@ -253,6 +253,7 @@ class _Mode:
     MOVING = 2        # dragging a note (or selection) to new position
     RESIZING = 3      # dragging the right edge of a note
     BOX_SELECT = 4    # rubber-band selection box
+    ZOOM_H = 5        # middle-click drag: up = zoom in, down = zoom out
     RULER_SCRUB = 5   # dragging on the ruler to scrub playback position
 
 
@@ -265,6 +266,7 @@ class PianoRollCanvas(QWidget):
 
     hovered_note_changed = pyqtSignal(str)
     notes_changed = pyqtSignal()       # emitted when user edits notes
+    zoom_changed = pyqtSignal(float)    # emitted with anchor tick when zoom changes
     status_message = pyqtSignal(str)   # transient status bar messages
     ruler_clicked = pyqtSignal(int)    # tick position — user clicked the ruler to seek
 
@@ -293,9 +295,9 @@ class PianoRollCanvas(QWidget):
 
         # Editing
         self._editable: bool = True
-        self._snap_ticks: int = 24       # snap to quarter note by default
+        self._snap_ticks: int = 6        # snap to 1/16 note by default
         self._default_velocity: int = 100
-        self._default_duration: int = 24  # one beat
+        self._default_duration: int = 6   # 1/16 note
         self._active_track: int = 0       # which track new notes go on
 
         # Selection
@@ -303,9 +305,17 @@ class PianoRollCanvas(QWidget):
         self._clipboard: list[dict] = []
         self._visible_tracks: Optional[set[int]] = None  # None = all visible
 
+        # Undo stack — stores snapshots of (notes, control_events)
+        self._undo_stack: list[tuple[list[dict], list[dict]]] = []
+        self._max_undo: int = 50
+
         # Drag state
         self._mode: int = _Mode.NONE
         self._drag_start: QPointF = QPointF()
+        self._zoom_drag_start_y: float = 0.0   # Y at middle-click start
+        self._zoom_drag_base_zx: float = 1.0   # zoom_x at middle-click start
+        self._zoom_anchor_tick: float = 0.0    # tick under cursor at zoom start
+        self._zoom_anchor_vp_rel: float = 0.0  # viewport-relative X at zoom start
         self._drag_note_idx: int = -1
         self._drag_offset_tick: int = 0
         self._drag_offset_pitch: int = 0
@@ -380,9 +390,33 @@ class PianoRollCanvas(QWidget):
             }
         self.update()
 
+    def push_undo(self):
+        """Save current state to the undo stack."""
+        snapshot = (
+            [dict(n) for n in self._notes],
+            [dict(e) for e in self._control_events],
+        )
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._max_undo:
+            self._undo_stack.pop(0)
+
+    def undo(self):
+        """Restore the most recent undo snapshot."""
+        if not self._undo_stack:
+            self.status_message.emit("Nothing to undo")
+            return
+        notes, controls = self._undo_stack.pop()
+        self._notes = notes
+        self._control_events = controls
+        self._selected.clear()
+        self.notes_changed.emit()
+        self.update()
+        self.status_message.emit("Undo")
+
     def delete_selected(self):
         if not self._selected:
             return
+        self.push_undo()
         keep = [n for i, n in enumerate(self._notes) if i not in self._selected]
         self._notes = keep
         self._selected.clear()
@@ -402,6 +436,7 @@ class PianoRollCanvas(QWidget):
     def paste(self, at_tick: int = 0):
         if not self._clipboard:
             return
+        self.push_undo()
         self._selected.clear()
         base = len(self._notes)
         for n in self._clipboard:
@@ -639,7 +674,15 @@ class PianoRollCanvas(QWidget):
                 self.setCursor(Qt.CursorShape.CrossCursor)
 
         # Handle active drag modes
-        if self._mode == _Mode.PLACING:
+        if self._mode == _Mode.ZOOM_H:
+            # Drag up = zoom in, drag down = zoom out
+            # Every 80px of vertical drag doubles/halves the zoom
+            delta_y = self._zoom_drag_start_y - pos.y()  # positive = up = zoom in
+            factor = 2.0 ** (delta_y / 80.0)
+            new_zx = self._zoom_drag_base_zx * factor
+            self.set_zoom(new_zx, self._zoom_y)
+            self.zoom_changed.emit(self._zoom_anchor_tick)
+        elif self._mode == _Mode.PLACING:
             self._drag_extend_note(pos)
         elif self._mode == _Mode.MOVING:
             self._drag_move_notes(pos)
@@ -712,6 +755,31 @@ class PianoRollCanvas(QWidget):
                 self._debug("  -> RIGHT-CLICK on empty space")
             return
 
+        if event.button() == Qt.MouseButton.MiddleButton:
+            # Middle-click drag: up zooms in horizontally, down zooms out
+            # Anchored to the tick under the cursor so content stays in place
+            self._mode = _Mode.ZOOM_H
+            self._zoom_drag_start_y = pos.y()
+            self._zoom_drag_base_zx = self._zoom_x
+            self._zoom_anchor_tick = self._x_to_tick(pos.x())
+            # pos.x() is in canvas widget coordinates; the viewport-relative
+            # X = canvas_x - scroll_offset.  We store this so the parent can
+            # keep the anchor tick visually pinned during zoom.
+            scroll_offset = 0
+            sa = self.parentWidget()
+            while sa is not None:
+                from PyQt6.QtWidgets import QScrollArea
+                if isinstance(sa, QScrollArea):
+                    scroll_offset = sa.horizontalScrollBar().value()
+                    break
+                sa = sa.parentWidget()
+            self._zoom_anchor_vp_rel = pos.x() - scroll_offset
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+            self._debug(
+                f"  -> MODE = ZOOM_H  start_y={pos.y():.0f} "
+                f"base_zx={self._zoom_x:.2f} anchor_tick={self._zoom_anchor_tick}")
+            return
+
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
@@ -746,6 +814,7 @@ class PianoRollCanvas(QWidget):
             if idx not in self._selected:
                 self._selected = {idx}
 
+            self.push_undo()
             self._drag_start = pos
             self._drag_note_idx = idx
             self._drag_original = dict(n)
@@ -779,26 +848,57 @@ class PianoRollCanvas(QWidget):
                 self._selection_rect = QRectF(pos, pos)
                 self._debug(f"  -> MODE = BOX_SELECT")
             else:
-                tick = self._snap(self._x_to_tick(pos.x()))
-                pitch = self._y_to_note(pos.y())
-                new_note = {
-                    'tick': tick,
-                    'pitch': pitch,
-                    'duration': self._snap_ticks,
-                    'velocity': self._default_velocity,
-                    'track': self._active_track,
-                }
-                self._notes.append(new_note)
-                new_idx = len(self._notes) - 1
-                self._selected = {new_idx}
-                self._drag_note_idx = new_idx
-                self._drag_start = pos
-                self._mode = _Mode.PLACING
-                self._debug(
-                    f"  -> PLACE new note #{new_idx}: {_note_name(pitch)} "
-                    f"tick={tick} dur={self._snap_ticks} track={self._active_track}")
-                self.notes_changed.emit()
+                # Single click on empty space — just deselect.
+                # Note placement requires DOUBLE-CLICK to prevent accidents.
+                self._selected.clear()
+                self._debug(f"  -> Deselected all (single click on empty)")
                 self.update()
+
+    # ── Mouse: double-click to place new notes ──────────────────────────
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """Double-click on empty space places a new note.
+
+        Single click just deselects — this prevents accidental note
+        placement when clicking around the canvas.
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self._editable:
+            return
+
+        pos = event.position()
+        if pos.x() <= _PIANO_WIDTH:
+            return
+
+        idx, _ = self._hit_test(pos)
+        if idx >= 0:
+            # Double-clicked an existing note — open properties
+            self._open_note_properties(idx)
+            return
+
+        # Double-click on empty space — place a new note
+        tick = self._snap(self._x_to_tick(pos.x()))
+        pitch = self._y_to_note(pos.y())
+        self.push_undo()
+        new_note = {
+            'tick': tick,
+            'pitch': pitch,
+            'duration': self._snap_ticks,
+            'velocity': self._default_velocity,
+            'track': self._active_track,
+        }
+        self._notes.append(new_note)
+        new_idx = len(self._notes) - 1
+        self._selected = {new_idx}
+        self._drag_note_idx = new_idx
+        self._drag_start = pos
+        self._mode = _Mode.PLACING
+        self._debug(
+            f"  -> DOUBLE-CLICK PLACE note #{new_idx}: {_note_name(pitch)} "
+            f"tick={tick} dur={self._snap_ticks} track={self._active_track}")
+        self.notes_changed.emit()
+        self.update()
 
     # ── Mouse: release ─────────────────────────────────────────────────
 
@@ -807,6 +907,14 @@ class PianoRollCanvas(QWidget):
         self._debug(
             f"RELEASE pos=({pos.x():.1f},{pos.y():.1f}) mode={self._mode} "
             f"drag_idx={self._drag_note_idx} total_notes={len(self._notes)}")
+
+        if event.button() == Qt.MouseButton.MiddleButton:
+            if self._mode == _Mode.ZOOM_H:
+                self._debug(f"  -> ZOOM_H end, final zoom_x={self._zoom_x:.2f}")
+                self._mode = _Mode.NONE
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                self.update()
+            return
 
         if event.button() != Qt.MouseButton.LeftButton:
             return
@@ -918,6 +1026,7 @@ class PianoRollCanvas(QWidget):
         if chosen == act_props:
             self._open_note_properties(idx)
         elif chosen == act_delete:
+            self.push_undo()
             n = self._notes[idx]
             self._debug(
                 f"  -> CONTEXT DELETE note #{idx}: {_note_name(n['pitch'])} "
@@ -946,6 +1055,7 @@ class PianoRollCanvas(QWidget):
             note, self._control_events, next_tick, parent=self)
 
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.push_undo()
             new_events = dlg.get_events()
 
             # Remove old control events in this note's range on this track
@@ -966,6 +1076,8 @@ class PianoRollCanvas(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
             self.delete_selected()
+        elif event.key() == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.undo()
         elif event.key() == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.select_all()
         elif event.key() == Qt.Key.Key_C and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -974,6 +1086,12 @@ class PianoRollCanvas(QWidget):
             # Paste at the current playback position or tick 0
             paste_tick = max(0, self._playback_tick) if self._playback_tick >= 0 else 0
             self.paste(paste_tick)
+        elif event.key() == Qt.Key.Key_E and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            # Open note properties for the first selected note
+            if self._selected:
+                idx = min(self._selected)
+                if 0 <= idx < len(self._notes):
+                    self._open_note_properties(idx)
         elif event.key() == Qt.Key.Key_Escape:
             self._selected.clear()
             self.update()
@@ -1119,6 +1237,7 @@ class PianoRollWidget(QWidget):
         self._canvas = PianoRollCanvas()
         self._canvas.hovered_note_changed.connect(self.hovered_note_changed.emit)
         self._canvas.notes_changed.connect(self.notes_changed.emit)
+        self._canvas.zoom_changed.connect(self._on_canvas_zoom_changed)
         self._canvas.status_message.connect(self.status_message.emit)
 
         self._scroll_area = QScrollArea()
@@ -1128,6 +1247,10 @@ class PianoRollWidget(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self._scroll_area.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        # Intercept wheel events on the scroll area and its viewport so
+        # plain scroll goes horizontal (through the timeline) not vertical.
+        self._scroll_area.installEventFilter(self)
+        self._scroll_area.viewport().installEventFilter(self)
 
         self._ruler = RulerWidget(self._canvas)
         self._ruler.ruler_clicked.connect(self.ruler_clicked.emit)
@@ -1213,9 +1336,19 @@ class PianoRollWidget(QWidget):
             # pitch bending and volume/pan automation during playback.
             # These are stored SEPARATELY from visual notes — they're not
             # drawn on the canvas but are merged when pushing to the sequencer.
+            #
+            # IMPORTANT: PATT flattening duplicates control events — if a
+            # subroutine has 10 PAN commands and is called 7 times, we get
+            # 70 PAN events instead of 10.  Deduplicate by (tick, type, value)
+            # so only unique events at each tick position survive.
             _CONTROL_EVENT_CMDS = {'BEND', 'BENDR', 'VOL', 'PAN'}
+            _seen_ctrl: set[tuple[int, str, int]] = set()
             for cmd in flat_cmds:
                 if cmd.cmd in _CONTROL_EVENT_CMDS and cmd.value is not None:
+                    key = (cmd.tick, cmd.cmd, cmd.value)
+                    if key in _seen_ctrl:
+                        continue
+                    _seen_ctrl.add(key)
                     control_events.append({
                         'tick': cmd.tick,
                         'type': cmd.cmd,
@@ -1223,16 +1356,20 @@ class PianoRollWidget(QWidget):
                         'track': ti,
                     })
 
-            # Collect loop info from ALL tracks — use the latest loop_end
-            # and earliest loop_start across all tracks.  The GBA M4A engine
-            # loops each track independently, but the piano roll has one
-            # global loop region, so we use the outermost boundaries.
+            # Collect loop info from ALL tracks.  The GBA M4A engine loops
+            # each track independently, but the piano roll has one global
+            # loop region.  Use the LATEST loop_start (longest intro) and
+            # latest loop_end so the visual loop region covers the full
+            # intro before looping.  Some tracks place the loop label at
+            # tick 0 (e.g. a sustained pad that loops its entire body)
+            # while others have a genuine intro section — using min would
+            # collapse the intro to 0 which is wrong.
             ls, le, dur = get_flattened_loop_info(track.commands)
             if le is not None:
                 if loop_end is None or le > loop_end:
                     loop_end = le
             if ls is not None:
-                if loop_start is None or ls < loop_start:
+                if loop_start is None or ls > loop_start:
                     loop_start = ls
             if dur > total_ticks:
                 total_ticks = dur
@@ -1269,17 +1406,46 @@ class PianoRollWidget(QWidget):
         if x < sb.value() or x > sb.value() + vp_w:
             sb.setValue(max(0, int(x - vp_w * 0.3)))
 
-    def wheelEvent(self, event: QWheelEvent):
-        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+    def _on_canvas_zoom_changed(self, anchor_tick: float):
+        """Canvas zoom changed (middle-click drag) — keep anchor tick in place.
+
+        The anchor tick should stay at the same viewport-relative X position
+        it was at when the user first pressed middle-click.
+        """
+        sb = self._scroll_area.horizontalScrollBar()
+        # Compute where the anchor tick is NOW in canvas coordinates
+        new_anchor_x = self._canvas._tick_to_x(anchor_tick)
+        # Scroll so the anchor stays at the same viewport-relative position
+        target = int(new_anchor_x - self._canvas._zoom_anchor_vp_rel)
+        sb.setValue(max(0, target))
+        self._ruler.update()
+
+    def eventFilter(self, obj, event):
+        """Intercept wheel events on the scroll area.
+
+        Plain scroll = horizontal (through the timeline).
+        Shift+scroll = vertical (through pitches).
+        Ctrl+scroll = horizontal zoom.
+        Ctrl+Shift+scroll = vertical zoom.
+        """
+        if (obj in (self._scroll_area, self._scroll_area.viewport())
+                and event.type() == event.Type.Wheel):
+            mods = event.modifiers()
             delta = event.angleDelta().y()
-            factor = 1.15 if delta > 0 else 1 / 1.15
-            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                new_zy = self._canvas.zoom_y() * factor
-                self._canvas.set_zoom(self._canvas.zoom_x(), new_zy)
+            if mods & Qt.KeyboardModifier.ControlModifier:
+                factor = 1.15 if delta > 0 else 1 / 1.15
+                if mods & Qt.KeyboardModifier.ShiftModifier:
+                    new_zy = self._canvas.zoom_y() * factor
+                    self._canvas.set_zoom(self._canvas.zoom_x(), new_zy)
+                else:
+                    new_zx = self._canvas.zoom_x() * factor
+                    self._canvas.set_zoom(new_zx, self._canvas.zoom_y())
+                self._ruler.update()
+            elif mods & Qt.KeyboardModifier.ShiftModifier:
+                vsb = self._scroll_area.verticalScrollBar()
+                vsb.setValue(vsb.value() - delta)
             else:
-                new_zx = self._canvas.zoom_x() * factor
-                self._canvas.set_zoom(new_zx, self._canvas.zoom_y())
-            self._ruler.update()
-            event.accept()
-        else:
-            self._scroll_area.wheelEvent(event)
+                hsb = self._scroll_area.horizontalScrollBar()
+                hsb.setValue(hsb.value() - delta)
+            return True  # consumed
+        return super().eventFilter(obj, event)

@@ -100,14 +100,14 @@ class LocalUtil:
                 logger.emit(str(e))
             return None
 
-    def try_get_nproc_from_container(self) -> str | None:
+    def get_nproc(self) -> str | None:
         try:
             return str(os.cpu_count())
         except Exception:
             return None
 
 
-    def copy_file_to_host(self, source: str, dest: str):
+    def copy_file(self, source: str, dest: str):
         src_path = os.path.join(self.repo_root(), os.path.normpath(source))
         dest_path = dest if os.path.isabs(dest) else os.path.join(self.project_dir, os.path.normpath(dest))
         if not os.path.exists(src_path):
@@ -115,7 +115,7 @@ class LocalUtil:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         shutil.copyfile(src_path, dest_path)
 
-    def write_file_to_volume(self, fileobj: io.StringIO, dest: str):
+    def write_file(self, fileobj: io.StringIO, dest: str):
         dest_path = dest if os.path.isabs(dest) else os.path.join(self.repo_root(), dest.lstrip("/"))
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         fileobj.seek(0)
@@ -146,7 +146,7 @@ class LocalUtil:
     def try_export_rom(self, logger: pyqtSignal):
         logger.emit("5")
         version = self.project_info["version"]
-        nproc = self.try_get_nproc_from_container()
+        nproc = self.get_nproc()
         logger.emit("10")
         rom_name = f'{self.project_dir_name}_v{version["major"]}_{version["minor"]}_{version["patch"]}.gba'
         make_args = ["make", f"ROM_NAME={rom_name}", f"MODERN_ROM_NAME={rom_name}"]
@@ -161,7 +161,7 @@ class LocalUtil:
         logger.emit("90")
         source_rom_path = rom_name
         build_rom_path = os.path.join("build", rom_name)
-        self.copy_file_to_host(source_rom_path, build_rom_path)
+        self.copy_file(source_rom_path, build_rom_path)
         os.remove(os.path.join(self.repo_root(), source_rom_path))
         logger.emit(f"Exported ROM: {os.path.join(self.project_dir, build_rom_path)}")
 

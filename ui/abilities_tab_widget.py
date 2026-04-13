@@ -538,6 +538,16 @@ _BATTLE_CATEGORIES: dict[str, str] = {
     "ABILITY_MINUS": "Combo: Boosts Sp.Atk with Plus ally",
     "ABILITY_DAMP": "Blocks: Self-destruct / Explosion",
     "ABILITY_STURDY": "Blocks: One-hit KO moves",
+    "ABILITY_STENCH": "On Contact: 10% chance to flinch (Gen 5+)",
+}
+
+# Extended categories for user-created abilities (Pixilate family etc.)
+# These get added if any project defines them
+_EXTENDED_BATTLE_CATEGORIES: dict[str, str] = {
+    "type_change_boost": "Converts moves of one type to another + power boost",
+    "intimidate_dual": "Lowers two of the opponent's stats on switch-in",
+    "switchin_field_effect": "Sets a field condition (Trick Room/Tailwind) on switch-in",
+    "multi_type_resist": "Halves damage from two specific types",
 }
 
 _FIELD_EFFECTS: dict[str, str] = {
@@ -675,6 +685,18 @@ class AbilityDetailPanel(QWidget):
         battle_v.addWidget(self._battle_params_widget)
         self._battle_param_combos: dict[str, QComboBox] = {}
 
+        # Known effect label (shown when detection has no editable template
+        # but the hardcoded category knows what this ability does)
+        self.lbl_battle_known = QLabel("")
+        self.lbl_battle_known.setWordWrap(True)
+        self.lbl_battle_known.setStyleSheet(
+            "color: #b0b0b0; font-size: 11px; padding: 4px 6px;"
+            " background-color: #1a2a1a; border: 1px solid #2a4a2a;"
+            " border-radius: 3px;"
+        )
+        self.lbl_battle_known.setVisible(False)
+        battle_v.addWidget(self.lbl_battle_known)
+
         # Code preview
         self.lbl_battle_preview = QLabel("")
         self.lbl_battle_preview.setWordWrap(True)
@@ -717,6 +739,17 @@ class AbilityDetailPanel(QWidget):
             Qt.AlignmentFlag.AlignRight)
         field_v.addWidget(self._field_params_widget)
         self._field_param_combos: dict[str, QComboBox] = {}
+
+        # Known effect label for field effects
+        self.lbl_field_known = QLabel("")
+        self.lbl_field_known.setWordWrap(True)
+        self.lbl_field_known.setStyleSheet(
+            "color: #b0b0b0; font-size: 11px; padding: 4px 6px;"
+            " background-color: #1a2a1a; border: 1px solid #2a4a2a;"
+            " border-radius: 3px;"
+        )
+        self.lbl_field_known.setVisible(False)
+        field_v.addWidget(self.lbl_field_known)
 
         # Code preview
         self.lbl_field_preview = QLabel("")
@@ -842,7 +875,9 @@ class AbilityDetailPanel(QWidget):
                                  self._battle_param_combos)
         self._clear_param_combos(self._field_params_layout,
                                  self._field_param_combos)
+        self.lbl_battle_known.setVisible(False)
         self.lbl_battle_preview.setVisible(False)
+        self.lbl_field_known.setVisible(False)
         self.lbl_field_preview.setVisible(False)
         self.lbl_usage_count.setText("—")
         self.tbl_species.setRowCount(0)
@@ -878,11 +913,17 @@ class AbilityDetailPanel(QWidget):
 
         battle_result, field_result = None, None
         if project_root:
-            battle_result, field_result = detect_all_effects(
-                project_root, const)
+            try:
+                battle_result, field_result = detect_all_effects(
+                    project_root, const)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Effect detection failed for %s: %s", const, e)
 
         # ── Battle effect ──
         self.cmb_battle_template.blockSignals(True)
+        self.lbl_battle_known.setVisible(False)
         if battle_result:
             tid, params = battle_result
             idx = self.cmb_battle_template.findData(tid)
@@ -890,18 +931,40 @@ class AbilityDetailPanel(QWidget):
                 self.cmb_battle_template.setCurrentIndex(idx)
                 self._rebuild_battle_params(tid, params)
             else:
-                self.cmb_battle_template.setCurrentIndex(0)
-                self._clear_param_combos(self._battle_params_layout,
-                                         self._battle_param_combos)
+                # Template detected but not in combo — add it on the fly
+                from core.ability_effect_templates import BATTLE_TEMPLATE_MAP
+                tmpl = BATTLE_TEMPLATE_MAP.get(tid)
+                if tmpl:
+                    self.cmb_battle_template.addItem(tmpl.name, tmpl.id)
+                    new_idx = self.cmb_battle_template.findData(tid)
+                    if new_idx >= 0:
+                        self.cmb_battle_template.setCurrentIndex(new_idx)
+                        self._rebuild_battle_params(tid, params)
+                    else:
+                        self.cmb_battle_template.setCurrentIndex(0)
+                        self._clear_param_combos(self._battle_params_layout,
+                                                 self._battle_param_combos)
+                else:
+                    self.cmb_battle_template.setCurrentIndex(0)
+                    self._clear_param_combos(self._battle_params_layout,
+                                             self._battle_param_combos)
         else:
             self.cmb_battle_template.setCurrentIndex(0)
             self._clear_param_combos(self._battle_params_layout,
                                      self._battle_param_combos)
+            # Fallback: show known effect from hardcoded category
+            known = _BATTLE_CATEGORIES.get(const)
+            if known:
+                self.lbl_battle_known.setText(
+                    f"Detected: {known}\n(No editable template — "
+                    f"effect is implemented as inline C code)")
+                self.lbl_battle_known.setVisible(True)
         self.cmb_battle_template.blockSignals(False)
         self._update_battle_preview()
 
         # ── Field effect ──
         self.cmb_field_template.blockSignals(True)
+        self.lbl_field_known.setVisible(False)
         if field_result:
             tid, params = field_result
             idx = self.cmb_field_template.findData(tid)
@@ -909,13 +972,34 @@ class AbilityDetailPanel(QWidget):
                 self.cmb_field_template.setCurrentIndex(idx)
                 self._rebuild_field_params(tid, params)
             else:
-                self.cmb_field_template.setCurrentIndex(0)
-                self._clear_param_combos(self._field_params_layout,
-                                         self._field_param_combos)
+                # Template detected but not in combo — add it on the fly
+                from core.ability_effect_templates import FIELD_TEMPLATE_MAP
+                tmpl = FIELD_TEMPLATE_MAP.get(tid)
+                if tmpl:
+                    self.cmb_field_template.addItem(tmpl.name, tmpl.id)
+                    new_idx = self.cmb_field_template.findData(tid)
+                    if new_idx >= 0:
+                        self.cmb_field_template.setCurrentIndex(new_idx)
+                        self._rebuild_field_params(tid, params)
+                    else:
+                        self.cmb_field_template.setCurrentIndex(0)
+                        self._clear_param_combos(self._field_params_layout,
+                                                 self._field_param_combos)
+                else:
+                    self.cmb_field_template.setCurrentIndex(0)
+                    self._clear_param_combos(self._field_params_layout,
+                                             self._field_param_combos)
         else:
             self.cmb_field_template.setCurrentIndex(0)
             self._clear_param_combos(self._field_params_layout,
                                      self._field_param_combos)
+            # Fallback: show known field effect
+            known = _FIELD_EFFECTS.get(const)
+            if known:
+                self.lbl_field_known.setText(
+                    f"Detected: {known}\n(No editable template — "
+                    f"effect is implemented as inline C code)")
+                self.lbl_field_known.setVisible(True)
         self.cmb_field_template.blockSignals(False)
         self._update_field_preview()
 
@@ -1494,8 +1578,14 @@ class AbilitiesTabWidget(QWidget):
             # ── Battle effect ──
             if battle_cfg is not None:
                 new_btid, new_bparams = battle_cfg
-                if new_btid != cur_btid or new_btid:
-                    # Remove old if template changed or params changed
+                cur_bparams = current_battle[1] if current_battle else {}
+                # Trigger write if template changed, params changed, or
+                # user selected a template (even same one — ensures code
+                # is written for abilities that had no effect before).
+                battle_changed = (new_btid != cur_btid
+                                  or new_bparams != cur_bparams)
+                if battle_changed or (new_btid and not cur_btid):
+                    # Remove old effect before writing new one
                     if cur_btid:
                         remove_battle_effect(self._project_root, const)
                     # Apply new
@@ -1512,7 +1602,10 @@ class AbilitiesTabWidget(QWidget):
             # ── Field effect ──
             if field_cfg is not None:
                 new_ftid, new_fparams = field_cfg
-                if new_ftid != cur_ftid or new_ftid:
+                cur_fparams = current_field[1] if current_field else {}
+                field_changed = (new_ftid != cur_ftid
+                                 or new_fparams != cur_fparams)
+                if field_changed or (new_ftid and not cur_ftid):
                     if cur_ftid:
                         remove_field_effect(self._project_root, const)
                     if new_ftid:

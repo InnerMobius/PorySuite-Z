@@ -46,7 +46,7 @@ class ReadSourceFile(object):
 
     def __init__(self, project_info: dict, file_path: str):
         util = LocalUtil(project_info)
-        self.docker_util = None
+        self.local_util = None
         root = util.repo_root()
 
         normalized = os.path.normpath(file_path)
@@ -54,12 +54,12 @@ class ReadSourceFile(object):
             normalized = os.path.relpath(normalized, root)
 
         if sys.platform == "win32":
-            self.docker_util = util
+            self.local_util = util
             from app_info import get_cache_dir
             temp_path = get_cache_dir(project_info.get("dir", ""))
             self.file_path = os.path.join(temp_path, normalized)
             os.makedirs(PureWindowsPath(self.file_path).parent, exist_ok=True)
-            self.docker_util.copy_file_to_host(normalized, self.file_path)
+            self.local_util.copy_file(normalized, self.file_path)
         else:
             self.file_path = os.path.join(root, normalized)
 
@@ -76,7 +76,7 @@ class WriteSourceFile(object):
 
     def __init__(self, project_info: dict, file_path: str, *, insert_header: bool = False, require_existing: bool = True):
         util = LocalUtil(project_info)
-        self.docker_util = None
+        self.local_util = None
         self.insert_header = insert_header
         self.require_existing = require_existing
         root = util.repo_root()
@@ -86,7 +86,7 @@ class WriteSourceFile(object):
             normalized = os.path.relpath(normalized, root)
 
         if sys.platform == "win32":
-            self.docker_util = util
+            self.local_util = util
         self.file_path = os.path.join(root, normalized)
 
         if self.require_existing and not os.path.exists(self.file_path):
@@ -96,7 +96,7 @@ class WriteSourceFile(object):
         parent_dir = os.path.dirname(self.file_path)
         if parent_dir and not os.path.exists(parent_dir):
             os.makedirs(parent_dir, exist_ok=True)
-        if self.docker_util is not None:
+        if self.local_util is not None:
             self.file = io.StringIO()
         else:
             self.file = open(self.file_path, "w", encoding="utf-8", newline="\n")
@@ -107,8 +107,8 @@ class WriteSourceFile(object):
         return self.file
 
     def __exit__(self, *args):
-        if self.docker_util is not None:
-            self.docker_util.write_file_to_volume(self.file, self.file_path)
+        if self.local_util is not None:
+            self.local_util.write_file(self.file, self.file_path)
         else:
             self.file.close()
 
@@ -165,7 +165,7 @@ class AbstractPokemonData(ABC):
         if "source_prefix" not in self.project_info:
             prefix = getattr(parent, "SOURCE_PREFIX", self.SOURCE_PREFIX)
             self.project_info["source_prefix"] = prefix
-        self.docker_util = LocalUtil(self.project_info)
+        self.local_util = LocalUtil(self.project_info)
 
     def default_data(self):
         """Return an empty structure appropriate for this data file."""
@@ -299,7 +299,7 @@ class AbstractPokemonData(ABC):
         """Return absolute paths for canonical sources that are missing on disk."""
 
         missing: list[str] = []
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         for info in self.FILES.values():
             original = info.get("original")
             if not original:
@@ -379,7 +379,7 @@ class AbstractPokemonData(ABC):
         if self.data != self.original_data:
             self.save()
 
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         for file in self.FILES:
             original, _ = self.__get_file_paths(file)
             original_path = os.path.join(root, original)
@@ -392,7 +392,7 @@ class AbstractPokemonData(ABC):
         self.pending_changes = False
 
     def restore_source_code(self):
-        root = self.docker_util.repo_root()
+        root = self.local_util.repo_root()
         for file in self.FILES:
             original, _ = self.__get_file_paths(file)
             content = self._in_memory_backups.get(original)
@@ -410,8 +410,8 @@ class AbstractPokemonData(ABC):
             path = self.GENERATED_FILES[file]
             if prefix:
                 path = os.path.join(prefix, path)
-            if self.docker_util.file_exists(path):
-                self.docker_util.removefile(path)
+            if self.local_util.file_exists(path):
+                self.local_util.removefile(path)
 
 
 class SpeciesData(AbstractPokemonData, ABC):

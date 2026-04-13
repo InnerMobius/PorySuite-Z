@@ -396,6 +396,21 @@ class PokedexDetailPanel(QWidget):
         scale_form.addRow(preview_row)
 
         root.addWidget(scale_card)
+
+        # ── Wild Encounters card ──────────────────────────────────────────────
+        enc_card, enc_form = _card("Wild Encounters")
+        self._enc_list = QLabel("Not found in the wild")
+        self._enc_list.setWordWrap(True)
+        self._enc_list.setTextFormat(Qt.TextFormat.RichText)
+        self._enc_list.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._enc_list.setStyleSheet(
+            "color: #c0c0c0; font-size: 11px; "
+            "padding: 4px; background: transparent;"
+        )
+        enc_form.addRow(self._enc_list)
+        root.addWidget(enc_card)
+        self._enc_card = enc_card
+
         root.addStretch(1)
 
         # ── signals ────────────────────────────────────────────────────────────
@@ -491,6 +506,46 @@ class PokedexDetailPanel(QWidget):
 
         self._update_preview()
 
+    def set_encounters(self, records: list) -> None:
+        """Set the wild encounter display from a list of EncounterRecord.
+
+        Each record has: location, method, min_level, max_level, slot_count.
+        """
+        if not records:
+            self._enc_list.setText(
+                '<span style="color: #777; font-style: italic;">'
+                'Not found in the wild</span>'
+            )
+            return
+
+        # Method icons (text-based, no actual graphics needed)
+        _METHOD_COLORS = {
+            "Grass":      "#4caf50",
+            "Surfing":    "#42a5f5",
+            "Rock Smash": "#8d6e63",
+            "Old Rod":    "#78909c",
+            "Good Rod":   "#5c6bc0",
+            "Super Rod":  "#7e57c2",
+        }
+
+        lines = []
+        for r in records:
+            color = _METHOD_COLORS.get(r.method, "#999")
+            if r.min_level == r.max_level:
+                lvl = f"Lv {r.min_level}"
+            else:
+                lvl = f"Lv {r.min_level}\u2013{r.max_level}"
+
+            line = (
+                f'<span style="color: {color};">\u25CF</span> '
+                f'<b>{r.location}</b> \u2014 '
+                f'<span style="color: {color};">{r.method}</span>'
+                f' <span style="color: #888;">({lvl})</span>'
+            )
+            lines.append(line)
+
+        self._enc_list.setText("<br>".join(lines))
+
     def collect(self, base: dict) -> dict:
         """Return updated copy of *base* with current field values."""
         d = dict(base)
@@ -523,5 +578,9 @@ class PokedexDetailPanel(QWidget):
             self._height_conv.setText("")
             self._weight_conv.setText("")
             self._size_preview.set_pokemon(None)
+            self._enc_list.setText(
+                '<span style="color: #777; font-style: italic;">'
+                'Not found in the wild</span>'
+            )
         finally:
             self._loading = False

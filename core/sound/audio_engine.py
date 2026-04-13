@@ -64,24 +64,39 @@ _GBA_FREQ_TABLE = [
 ]
 
 
-def _midi_key_to_freq(wav_freq_raw: int, key: int) -> float:
+def _midi_key_to_freq(wav_freq_raw: int, key: float) -> float:
     """Python port of the GBA's MidiKeyToFreq function.
+
+    Supports fractional keys for smooth pitch bending.  On the real GBA
+    the fractional part comes from the BEND command and is passed as
+    ``fineAdjust`` (0-255).  The hardware interpolates between two
+    adjacent scale-table entries:
+
+        val = val1 + (val2 - val1) * fineAdjust / 256
+        result = umul3232H32(wav->freq, val)
+
+    We replicate this exactly: the integer part of *key* selects val1/val2,
+    and the fractional part drives the interpolation.
 
     Args:
         wav_freq_raw: The raw freq field from the WaveData header (fixed-point).
-        key: MIDI note number (0-127).
+        key: MIDI note number, may be fractional (e.g. 60.5 for a half-semitone bend).
 
     Returns:
         Playback rate as a float (samples per output sample).
     """
-    key = max(0, min(178, key))
-    s1 = _GBA_SCALE_TABLE[key]
+    key = max(0.0, min(178.0, float(key)))
+    int_key = int(key)
+    fine_adjust = key - int_key  # 0.0 .. <1.0
+
+    s1 = _GBA_SCALE_TABLE[int_key]
     val1 = _GBA_FREQ_TABLE[s1 & 0xF] >> (s1 >> 4)
-    s2 = _GBA_SCALE_TABLE[key + 1]
+    s2 = _GBA_SCALE_TABLE[min(int_key + 1, 179)]
     val2 = _GBA_FREQ_TABLE[s2 & 0xF] >> (s2 >> 4)
-    # MidiKeyToFreq: umul3232H32(wav->freq, val1)
-    # With fineAdjust=0, the result is just: (wav_freq * val1) >> 32
-    playback_freq = (wav_freq_raw * val1) >> 32
+
+    # Interpolate between val1 and val2 (matches GBA fineAdjust)
+    val = val1 + (val2 - val1) * fine_adjust
+    playback_freq = (wav_freq_raw * val) / (1 << 32)
     # Convert to a ratio against our output sample rate
     return playback_freq / OUTPUT_SAMPLE_RATE
 
@@ -200,7 +215,7 @@ def generate_adsr_envelope(
 
 def render_directsound(
     sample: DirectSoundSample,
-    midi_note: int,
+    midi_note: float,
     base_midi_key: int,
     velocity: int,
     duration_samples: int,
@@ -319,7 +334,7 @@ DUTY_CYCLES = {
 
 
 def render_square_wave(
-    midi_note: int,
+    midi_note: float,
     velocity: int,
     duration_samples: int,
     duty_cycle: int = 2,
@@ -368,7 +383,7 @@ def render_square_wave(
 
 def render_programmable_wave(
     wave_sample: ProgrammableWaveSample,
-    midi_note: int,
+    midi_note: float,
     velocity: int,
     duration_samples: int,
     release_samples: int = 2048,
@@ -413,7 +428,7 @@ def render_programmable_wave(
 # ---------------------------------------------------------------------------
 
 def render_noise(
-    midi_note: int,
+    midi_note: float,
     velocity: int,
     duration_samples: int,
     period: int = 0,
@@ -474,7 +489,7 @@ def render_noise(
 
 def render_instrument(
     instrument: Instrument,
-    midi_note: int,
+    midi_note: float,
     velocity: int,
     duration_samples: int,
     sample_data: SampleData,
@@ -496,6 +511,20 @@ def render_instrument(
     if _depth > 5:
         return np.zeros(duration_samples + release_samples, dtype=np.float32)
 
+    # Debug logging for first few calls
+    if _depth == 0 and not hasattr(render_instrument, '_log_count'):
+        render_instrument._log_count = 0
+    if _depth == 0:
+        render_instrument._log_count = getattr(render_instrument, '_log_count', 0) + 1
+        if render_instrument._log_count <= 20:
+            import os, time as _t
+            _dbg = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'sound_debug.log')
+            with open(_dbg, 'a', encoding='utf-8') as _f:
+                _f.write(f"[{_t.strftime('%H:%M:%S')}] render_instrument: note={midi_note} vel={velocity} "
+                         f"dur={duration_samples} type={instrument.voice_type} "
+                         f"ds={instrument.is_directsound} sq={instrument.is_square} "
+                         f"ks={instrument.is_keysplit} sample={instrument.sample_label}\n")
+
     # --- Keysplit routing ---
     if instrument.is_keysplit:
         target_vg_name = instrument.target_voicegroup
@@ -508,9 +537,10 @@ def render_instrument(
 
         if instrument.keysplit_table:
             # Use keysplit table to find the right instrument slot
+            # (table lookup needs integer key — fractional pitch is for audio only)
             ks_table = voicegroup_data.keysplit_tables.get(instrument.keysplit_table)
             if ks_table:
-                slot = ks_table.get_instrument_index(midi_note)
+                slot = ks_table.get_instrument_index(int(midi_note))
             else:
                 slot = 0
             target_inst = target_vg.get_instrument(slot)
@@ -518,7 +548,7 @@ def render_instrument(
             # keysplit_all (0x80): use the MIDI note number as the index
             # into the target voicegroup — this is how drums/rhythm work.
             # On GBA, this can overflow into the next voicegroup in memory.
-            slot = midi_note
+            slot = int(midi_note)
             target_inst = voicegroup_data.get_instrument_overflow(
                 target_vg_name, slot)
 

@@ -76,6 +76,7 @@ class SongStructurePanel(QWidget):
         self._labels: list[str] = []   # available section names
         self._total_ticks: int = 0
         self._cursor_tick: int = 0     # current playback/ruler position
+        self._track0_prefix: str = ''  # e.g. 'mus_kakariko_1_' for stripping
         self._build_ui()
 
     def set_cursor_tick(self, tick: int):
@@ -169,29 +170,61 @@ class SongStructurePanel(QWidget):
 
     # ── Public API ──
 
+    def _strip_track_prefix(self, asm_label: str) -> str:
+        """Strip the track label prefix from an assembly label.
+
+        e.g. 'mus_kakariko_1_intro' → 'intro' when _track0_prefix
+        is 'mus_kakariko_1_'.  Falls back to the full label if no
+        prefix matches.
+        """
+        if self._track0_prefix and asm_label.startswith(self._track0_prefix):
+            return asm_label[len(self._track0_prefix):]
+        return asm_label
+
     def load_from_song(self, song_data, total_ticks: int):
         """Extract structural commands from all tracks and display them."""
         self._items.clear()
         self._labels.clear()
         self._total_ticks = total_ticks
 
-        # Collect all labels first
+        # Remember track 0's label prefix so we can strip it from
+        # assembly labels to show the user's friendly name.
+        # e.g. track 0 label = 'mus_kakariko_1' → prefix 'mus_kakariko_1_'
+        self._track0_prefix = ''
+        if song_data.tracks:
+            self._track0_prefix = song_data.tracks[0].label + '_'
+
+        # Collect PATT targets so we can exclude them — these are internal
+        # subroutine labels (e.g. mus_evil_3_007), not user-visible sections.
+        patt_targets: set[str] = set()
+        for track in song_data.tracks:
+            for cmd in track.commands:
+                if cmd.cmd == 'PATT' and cmd.target_label:
+                    patt_targets.add(cmd.target_label)
+
+        # Collect section labels (user-created or loop markers), skipping
+        # any label that exists only as a PATT subroutine target.
+        # Strip track prefixes so the user sees friendly names.
         for ti, track in enumerate(song_data.tracks):
             for cmd in track.commands:
                 if cmd.cmd == 'LABEL' and cmd.target_label:
-                    if cmd.target_label not in self._labels:
-                        self._labels.append(cmd.target_label)
+                    friendly = self._strip_track_prefix(cmd.target_label)
+                    if (friendly not in self._labels
+                            and cmd.target_label not in patt_targets):
+                        self._labels.append(friendly)
 
         # Only show structure from track 0 (all tracks should mirror)
         if song_data.tracks:
             track = song_data.tracks[0]
             for cmd in track.commands:
                 if cmd.cmd in ('LABEL', 'GOTO', 'PATT', 'PEND', 'FINE'):
+                    friendly = self._strip_track_prefix(
+                        cmd.target_label or '')
                     item = StructureItem(
                         cmd=cmd.cmd,
                         tick=cmd.tick,
-                        label=cmd.target_label or '',
-                        target=cmd.target_label or '',
+                        label=friendly,
+                        target=friendly,
                         track_index=0,
                     )
                     self._items.append(item)
@@ -222,6 +255,17 @@ class SongStructurePanel(QWidget):
                 return (item.tick, goto_item.tick)
 
         return (None, None)
+
+    def get_loop_label(self) -> str | None:
+        """Return the label name that the GOTO points to.
+
+        This is the user's chosen section name (e.g. 'intro'), NOT the
+        auto-generated '_B1' fallback. Returns None if no GOTO exists.
+        """
+        for item in self._items:
+            if item.cmd == 'GOTO':
+                return item.target
+        return None
 
     # ── List display ──
 

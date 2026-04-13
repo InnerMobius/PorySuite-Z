@@ -1647,6 +1647,12 @@ class VoicegroupsTab(QWidget):
     # Save — write voice_groups.inc
     # ═══════════════════════════════════════════════════════════════════════
 
+    def mark_voicegroups_dirty(self, names):
+        """Mark voicegroups as modified from an external source
+        (e.g. Instruments tab editing shared instrument objects)."""
+        for name in names:
+            self._dirty_voicegroups.add(name)
+
     def has_unsaved_changes(self) -> bool:
         """Check if any voicegroups have been modified."""
         return len(self._dirty_voicegroups) > 0
