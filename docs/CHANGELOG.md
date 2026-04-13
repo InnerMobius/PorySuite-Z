@@ -1,3 +1,22 @@
+## [2026-04-13] — Porymap Integration: Version Tracking, Self-Update Detection, Re-Patch Warning
+
+### Type
+Fix / Feature
+
+### Summary
+**Fixed "Check for Porymap Updates" always saying "can't reach GitHub"**: The function required a `.psinstalled` marker with a commit hash (which didn't exist for pre-marker installs), so it returned early without ever contacting the network. Rewrote to use the GitHub Releases API (HTTPS, no git required) — checks the latest release tag and compares against the version in Porymap's own CHANGELOG.md. Now correctly reports e.g. "Installed: 6.3.0, Latest: 6.3.1".
+
+**Porymap self-update detection**: If the user updates Porymap from within Porymap itself (its built-in updater), the stock binary replaces our patched build and removes all bridge code (map sync, event callbacks, etc.). PorySuite now detects this by storing the SHA-256 hash of porymap.exe in the `.psinstalled` marker after every build. On project load, it compares the current exe hash — if it changed, a warning dialog explains what happened and tells the user to re-patch via Tools → Update Porymap.
+
+**Menu reflects patch status**: When patches are detected as missing, the Tools menu changes from "Update Porymap..." to "⚠ Re-patch Porymap..." with a tooltip explaining the issue.
+
+### Files Changed
+- porymap_bridge/porymap_launcher.py — `check_porymap_update_available()` rewritten to use GitHub Releases API, new `_get_local_porymap_version()` reads Porymap's CHANGELOG.md, new `_exe_sha256()` helper, new `verify_patches_intact()` returns status dict, `get_installed_porymap_info()` now includes `exe_hash` and `patches_intact` fields
+- porymap_bridge/porymap_installer.py — `_do_deploy()` now stores SHA-256 hash of deployed exe in `.psinstalled` marker
+- ui/unified_mainwindow.py — `_check_porymap_updates()` now uses version strings instead of commit hashes, shows patch integrity warnings, added `_check_porymap_patch_integrity()` called on project load, menu label changes to "⚠ Re-patch Porymap..." when patches are missing
+
+---
+
 ## [2026-04-13] — Tilemap Editor Fixes + Tile Animation Editor Polish
 
 ### Type

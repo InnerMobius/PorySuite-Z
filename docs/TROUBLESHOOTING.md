@@ -618,6 +618,14 @@ If you still see bouncing, check that you're running the latest code — older v
 
 This is expected. The Install Porymap flow runs `git reset --hard` to ensure a clean source tree, then re-applies all patches via `apply_patches.py`. If a patch fails to apply (check the Output panel for errors), the binary will be missing features like `openMap` or `readCommandFile`. Report the specific error — it usually means an upstream Porymap change moved the anchor string the patcher looks for.
 
+### "Check for Porymap Updates" says "can't reach GitHub"
+
+Fixed (2026-04-13). The old code required a `.psinstalled` marker with a git commit hash, which didn't exist for pre-marker installs or stock Porymap. If the marker was missing, the function returned early without ever contacting the network, then showed a misleading "can't reach GitHub" error. Now uses the GitHub Releases API (no git needed) and reads the installed version from Porymap's own CHANGELOG.md.
+
+### Porymap updated itself and broke PorySuite bridge
+
+If you use Porymap's built-in "Check for Updates" to update, it downloads a stock release binary that replaces our patched build. All bridge features (map sync, event callbacks, etc.) stop working. PorySuite now detects this: on project load, it compares the SHA-256 hash of porymap.exe against what it stored during the last build. If they don't match, a warning dialog appears. Fix: go to Tools → Update Porymap (or "⚠ Re-patch Porymap...") to rebuild with patches. **Always update Porymap through PorySuite**, not through Porymap's own updater.
+
 ### EVENTide: Script changes not saving (shared sub-label overwrite)
 Fixed (2026-04-06). When multiple events share a script sub-label via `goto` (for example, three trigger events that all jump to the same `RivalBattle` label), editing one event's copy of that shared label and saving could lose the edit. The save loop processed events in order, and the last event's stale copy of the shared label overwrote the user's edit. Fixed: the currently-selected event is now processed last during save, so its edits always win.
 

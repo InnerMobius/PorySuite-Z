@@ -9,11 +9,14 @@ Responsible for:
 - Auto-injecting the bridge script into a project's config on every open
 """
 
+import hashlib
+import json as _json_mod
 import os
 import re
 import subprocess
 import ctypes
 import logging
+import urllib.request
 
 from PyQt6.QtCore import QStandardPaths
 
@@ -81,6 +84,160 @@ def is_porymap_patched() -> bool:
         return False
     marker = os.path.join(os.path.dirname(exe), ".psinstalled")
     return os.path.isfile(marker)
+
+
+def _exe_sha256(path: str) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def get_installed_porymap_info() -> dict:
+    """Read the .psinstalled marker and return build info.
+
+    Returns dict with keys: 'installed' (bool), 'patched' (bool),
+    'built' (str, date), 'commit' (str, short hash),
+    'exe_hash' (str, SHA-256 from marker), 'patches_intact' (bool).
+    """
+    info = {"installed": False, "patched": False, "built": "", "commit": "",
+            "exe_hash": "", "patches_intact": False}
+    exe = porymap_exe_path()
+    if not os.path.isfile(exe):
+        return info
+    info["installed"] = True
+    marker = os.path.join(os.path.dirname(exe), ".psinstalled")
+    if not os.path.isfile(marker):
+        return info
+    info["patched"] = True
+    try:
+        with open(marker, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("built:"):
+                    info["built"] = line.split(":", 1)[1].strip()
+                elif line.startswith("commit:"):
+                    info["commit"] = line.split(":", 1)[1].strip()[:10]
+                elif line.startswith("exe_hash:"):
+                    info["exe_hash"] = line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+
+    # Check if the binary has been replaced since we built it
+    if info["exe_hash"]:
+        current_hash = _exe_sha256(exe)
+        info["patches_intact"] = (current_hash == info["exe_hash"])
+    else:
+        # Old marker without hash — fall back to modification time comparison
+        try:
+            exe_mtime = os.path.getmtime(exe)
+            marker_mtime = os.path.getmtime(marker)
+            # If exe is newer than our marker by more than 60s, it was replaced
+            info["patches_intact"] = (exe_mtime <= marker_mtime + 60)
+        except OSError:
+            info["patches_intact"] = True  # Can't tell, assume OK
+
+    return info
+
+
+def _get_local_porymap_version() -> str:
+    """Try to determine the installed Porymap version string.
+
+    Checks CHANGELOG.md or RELEASE-README.txt in the porymap/ directory.
+    Returns a version string like '6.3.1' or '' if unknown.
+    """
+    runtime = os.path.dirname(porymap_exe_path())
+
+    # Try CHANGELOG.md — look for "## [X.Y.Z]" section headers (skip [Unreleased])
+    changelog = os.path.join(runtime, "CHANGELOG.md")
+    if os.path.isfile(changelog):
+        try:
+            with open(changelog, "r", encoding="utf-8") as f:
+                for line in f:
+                    # Match "## [6.3.0]" style headers (standard keepachangelog format)
+                    m = re.match(r"^##\s+\[(\d+\.\d+\.\d+)\]", line)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            pass
+
+    return ""
+
+
+def check_porymap_update_available() -> tuple:
+    """Check if a newer Porymap release exists on GitHub.
+
+    Uses the GitHub Releases API (HTTPS, no git required) so this
+    works whether or not we have a .psinstalled marker with commit info.
+
+    Returns (has_update: bool, local_version: str, remote_version: str).
+    local/remote are version strings like '6.3.1' or '' if unknown.
+    Returns (False, local, '') on network errors.
+    """
+    local = _get_local_porymap_version()
+    info = get_installed_porymap_info()
+
+    try:
+        url = "https://api.github.com/repos/huderlem/porymap/releases/latest"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "PorySuite-Z",
+            "Accept": "application/vnd.github.v3+json",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = _json_mod.loads(resp.read().decode("utf-8"))
+            remote_tag = data.get("tag_name", "")  # e.g. "6.3.1"
+            # Strip leading 'v' if present
+            remote = remote_tag.lstrip("v") if remote_tag else ""
+
+            if not remote:
+                return (False, local, "")
+
+            if not local:
+                # Can't compare — just report what's available
+                return (True, "unknown", remote)
+
+            has_update = (remote != local)
+            return (has_update, local, remote)
+    except Exception as e:
+        log.debug(f"GitHub releases API check failed: {e}")
+        return (False, local, "")
+
+
+def verify_patches_intact() -> dict:
+    """Check whether our patched Porymap binary is still intact.
+
+    Returns a dict:
+      'status': 'not_installed' | 'stock' | 'patched_ok' | 'patches_replaced'
+      'detail': human-readable explanation
+    """
+    exe = porymap_exe_path()
+    if not os.path.isfile(exe):
+        return {"status": "not_installed",
+                "detail": "Porymap is not installed."}
+
+    info = get_installed_porymap_info()
+    if not info["patched"]:
+        return {"status": "stock",
+                "detail": "Porymap is installed but has no PorySuite patches. "
+                          "Use Tools → Install Porymap to build a patched version."}
+
+    if not info["patches_intact"]:
+        return {"status": "patches_replaced",
+                "detail": "Porymap appears to have been updated outside PorySuite "
+                          "(the binary has changed since our build). "
+                          "Bridge patches are likely missing. "
+                          "Use Tools → Update Porymap to re-patch."}
+
+    return {"status": "patched_ok",
+            "detail": "Patched Porymap is installed and intact."}
 
 
 # ─── Config writing ──────────────────────────────────────────────────────────

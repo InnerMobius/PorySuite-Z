@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QMessageBox,
 )
 
-from porymap_bridge.porymap_launcher import porymap_exe_path, porymap_source_path
+from porymap_bridge.porymap_launcher import porymap_exe_path, porymap_source_path, _exe_sha256
 
 
 PORYMAP_REPO_URL = "https://github.com/huderlem/porymap.git"
@@ -394,10 +394,26 @@ class InstallWorker(QThread):
         # Drop a marker file so the launcher can tell this binary was built
         # with our patches (CLI map arg, bridge file writer, command reader).
         # Missing marker ⇒ treat as stock Porymap and degrade gracefully.
+        # Also stores the git commit hash so we can detect upstream updates.
         try:
+            commit_hash = ""
+            try:
+                result = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=src, capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    commit_hash = result.stdout.strip()
+            except Exception:
+                pass
+            import datetime
+            deployed_exe = os.path.join(runtime, "porymap.exe")
+            exe_hash = _exe_sha256(deployed_exe)
             with open(os.path.join(runtime, ".psinstalled"),
                       "w", encoding="utf-8") as mf:
                 mf.write("PORYSUITE-Z PATCHED PORYMAP\n")
+                mf.write(f"built: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+                mf.write(f"commit: {commit_hash}\n")
+                mf.write(f"exe_hash: {exe_hash}\n")
         except OSError:
             pass
 

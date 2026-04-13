@@ -144,7 +144,7 @@ PorySuite-Z integrates Porymap as a companion map/tile editor. The two apps comm
 - Bridge watcher (18 signals), launcher with config writing, bridge script auto-injection
 - C++ patcher survives `git reset --hard` (Install Porymap re-applies all patches)
 
-**All done.** Ctrl+E handler raises the unified window and logs selection feedback. Event create/delete/move callbacks all wired. Stock Porymap fallback via `.psinstalled` marker — launcher strips patched-only CLI args and skips command-file writes when missing.
+**All done.** Ctrl+E handler raises the unified window and logs selection feedback. Event create/delete/move callbacks all wired. Stock Porymap fallback via `.psinstalled` marker — launcher strips patched-only CLI args and skips command-file writes when missing. Version tracking via GitHub Releases API — "Check for Porymap Updates" compares installed version (from Porymap's own CHANGELOG.md) against latest release tag. Self-update detection: SHA-256 hash of porymap.exe stored in `.psinstalled` marker; on project load, PorySuite verifies the hash matches and warns if Porymap was replaced by its built-in updater. Menu label changes to "⚠ Re-patch Porymap..." when patches are missing.
 
 ### Event Editor enhancements (2026-04-05)
 - **Go To → button in command dialogs**: Any command that references a script label (call, goto, call_if_*, goto_if_*, etc.) now shows a Go To button in its edit popup. Saves edits and navigates to the target script.

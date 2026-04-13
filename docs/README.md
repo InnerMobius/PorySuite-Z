@@ -275,6 +275,13 @@ PorySuite-Z integrates [Porymap](https://github.com/huderlem/porymap) as a compa
 - Maps/Layouts tabs have right-click "Open in Porymap" context menus
 - Shared file watchers detect when Porymap saves a map and offer to reload in PorySuite-Z
 
+### Version tracking and updates
+
+- **Check for Porymap Updates** (in Tools menu) queries the GitHub Releases API and compares against the installed version
+- If Porymap is updated from within Porymap itself (its built-in updater), PorySuite detects that the patched binary was replaced and shows a warning on next project load
+- The Tools menu changes to "⚠ Re-patch Porymap..." when patches are detected as missing
+- Always update Porymap through PorySuite (Tools → Update Porymap) to keep bridge patches intact
+
 ### What gets patched
 
 The installer adds event callbacks, a bridge API, and CLI argument handling to Porymap's scripting engine via `porymap_patches/apply_patches.py`. This is a search-and-replace patcher (not fragile git patches) that survives upstream Porymap updates. The patched binary lives in `porymap/` (not committed to git -- built locally).

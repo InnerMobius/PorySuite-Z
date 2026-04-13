@@ -37,6 +37,9 @@ from porymap_bridge.porymap_launcher import (
     is_porymap_installed, launch_porymap, inject_bridge_script,
     _send_command,
     is_porymap_patched,
+    get_installed_porymap_info,
+    check_porymap_update_available,
+    verify_patches_intact,
 )
 from porymap_bridge.bridge_watcher import BridgeWatcher
 from porymap_bridge.shared_file_watcher import SharedFileWatcher
@@ -396,17 +399,42 @@ class UnifiedMainWindow(QMainWindow):
         tools_menu.addSeparator()
 
         # ── Porymap integration ──────────────────────────────────────────────
-        self._install_porymap_action = QAction("Install Porymap...", self)
+        pm_info = get_installed_porymap_info()
+        if pm_info["installed"]:
+            if pm_info["patched"] and not pm_info["patches_intact"]:
+                install_label = "⚠ Re-patch Porymap..."
+                install_tip = ("Porymap was updated outside PorySuite — "
+                               "bridge patches are missing. Click to rebuild.")
+            elif pm_info["built"]:
+                install_label = "Update Porymap..."
+                install_tip = (f"Currently installed: built {pm_info['built']}"
+                               f", commit {pm_info['commit'] or 'unknown'}")
+            else:
+                install_label = "Update Porymap..."
+                install_tip = "Reinstall or update to latest Porymap"
+        else:
+            install_label = "Install Porymap..."
+            install_tip = ("Downloads Porymap source from GitHub, applies "
+                           "PorySuite-Z bridge patches, downloads Qt SDK, "
+                           "and compiles a custom build. Requires internet.")
+
+        self._install_porymap_action = QAction(install_label, self)
+        self._install_porymap_action.setToolTip(install_tip)
         self._install_porymap_action.triggered.connect(self._install_porymap)
         tools_menu.addAction(self._install_porymap_action)
 
         self._open_porymap_action = QAction("Open in Porymap", self)
         self._open_porymap_action.setShortcut("Ctrl+F7")
         self._open_porymap_action.triggered.connect(self._open_in_porymap)
-        self._open_porymap_action.setEnabled(is_porymap_installed())
-        if not is_porymap_installed():
-            self._open_porymap_action.setToolTip("Install Porymap first (Tools → Install Porymap)")
+        self._open_porymap_action.setEnabled(pm_info["installed"])
+        if not pm_info["installed"]:
+            self._open_porymap_action.setToolTip("Install Porymap first (Tools → Install/Update Porymap)")
         tools_menu.addAction(self._open_porymap_action)
+
+        self._check_porymap_update_action = QAction("Check for Porymap Updates", self)
+        self._check_porymap_update_action.setEnabled(pm_info["installed"])
+        self._check_porymap_update_action.triggered.connect(self._check_porymap_updates)
+        tools_menu.addAction(self._check_porymap_update_action)
 
         # ── Git ──────────────────────────────────────────────────────────────
         self._git_menu = menubar.addMenu("&Git")
@@ -783,6 +811,9 @@ class UnifiedMainWindow(QMainWindow):
                 inject_bridge_script(project_dir)
             except Exception:
                 pass
+
+        # Check if Porymap patches are still intact (detects self-update)
+        self._check_porymap_patch_integrity()
 
         self.setWindowModified(False)
         if self._porysuite_window:
@@ -2067,33 +2098,134 @@ class UnifiedMainWindow(QMainWindow):
             pass
 
     def _install_porymap(self):
-        """Tools → Install Porymap. Downloads, patches, and builds Porymap."""
-        if is_porymap_installed():
+        """Tools → Install/Update Porymap. Downloads, patches, and builds."""
+        pm_info = get_installed_porymap_info()
+
+        if pm_info["installed"]:
+            built_str = f"\n\nCurrently installed: built {pm_info['built']}, commit {pm_info['commit']}" if pm_info["built"] else ""
             reply = QMessageBox.question(
-                self, "Porymap Already Installed",
-                "Porymap is already installed. Re-install / update?",
+                self, "Update Porymap",
+                "This will pull the latest Porymap source from GitHub, "
+                "re-apply PorySuite-Z bridge patches, and recompile.\n\n"
+                "Requires internet access.{}\n\n"
+                "Continue?".format(built_str),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+        else:
+            reply = QMessageBox.question(
+                self, "Install Porymap",
+                "This will:\n\n"
+                "  1. Download Porymap source from GitHub\n"
+                "  2. Apply PorySuite-Z bridge patches (adds bidirectional\n"
+                "     sync between PorySuite and Porymap)\n"
+                "  3. Download Qt 6 SDK (~400 MB, one-time)\n"
+                "  4. Compile Porymap from source\n"
+                "  5. Deploy the binary with required DLLs\n\n"
+                "Requires internet access. The Qt SDK download is large\n"
+                "but only happens once.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
 
-        # Defer to installer module (will be built next)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
         try:
             from porymap_bridge.porymap_installer import run_install
             run_install(self)
         except ImportError:
             QMessageBox.information(
                 self, "Not Yet Available",
-                "The Porymap installer is being built. Check back soon!",
+                "The Porymap installer module is missing.",
             )
             return
 
         # Refresh menu state
         installed = is_porymap_installed()
         self._open_porymap_action.setEnabled(installed)
+        self._check_porymap_update_action.setEnabled(installed)
         if installed:
+            new_info = get_installed_porymap_info()
+            label = "Update Porymap..."
+            tip = ""
+            if new_info["built"]:
+                tip = (f"Currently installed: built {new_info['built']}"
+                       f", commit {new_info['commit'] or 'unknown'}")
+            self._install_porymap_action.setText(label)
+            self._install_porymap_action.setToolTip(tip)
             self._open_porymap_action.setToolTip("")
             self.log_message("Porymap installed successfully")
+
+    def _check_porymap_updates(self):
+        """Tools → Check for Porymap Updates."""
+        self.statusBar().showMessage("Checking for Porymap updates...", 3000)
+        try:
+            has_update, local, remote = check_porymap_update_available()
+        except Exception as e:
+            QMessageBox.warning(self, "Update Check Failed", str(e))
+            return
+
+        # Also check patch integrity
+        patch_status = verify_patches_intact()
+        patch_warning = ""
+        if patch_status["status"] == "patches_replaced":
+            patch_warning = (
+                "\n\n⚠ WARNING: Your Porymap binary has changed since "
+                "PorySuite last built it. This usually means Porymap's "
+                "built-in updater replaced our patched version with a "
+                "stock build. Use Tools → Update Porymap to re-patch."
+            )
+        elif patch_status["status"] == "stock":
+            patch_warning = (
+                "\n\nNote: Your Porymap has no PorySuite patches. "
+                "Use Tools → Install Porymap to build a patched version "
+                "with bidirectional sync."
+            )
+
+        if has_update:
+            QMessageBox.information(
+                self, "Porymap Update Available",
+                f"A newer version of Porymap is available.\n\n"
+                f"  Installed: {local}\n"
+                f"  Latest:    {remote}\n\n"
+                f"Use Tools → Update Porymap to download the latest source, "
+                f"re-apply PorySuite bridge patches, and recompile.\n\n"
+                f"Important: Do NOT update Porymap from within Porymap itself — "
+                f"that replaces our patched build with stock Porymap and removes "
+                f"the bidirectional sync bridge.{patch_warning}"
+            )
+        elif not remote:
+            QMessageBox.information(
+                self, "Update Check",
+                "Could not reach the GitHub releases API to check for updates.\n"
+                "Make sure you have internet access and try again.\n\n"
+                "If this keeps happening, GitHub's API rate limit may be "
+                "temporarily blocking requests (resets after a few minutes)."
+                f"{patch_warning}"
+            )
+        else:
+            QMessageBox.information(
+                self, "Up to Date",
+                f"Your Porymap is up to date (version {local})."
+                f"{patch_warning}"
+            )
+
+    def _check_porymap_patch_integrity(self):
+        """Run on project load — warn if Porymap was updated outside PorySuite."""
+        if not is_porymap_installed():
+            return
+        patch_status = verify_patches_intact()
+        if patch_status["status"] == "patches_replaced":
+            QMessageBox.warning(
+                self, "Porymap Patches Missing",
+                "It looks like Porymap was updated outside of PorySuite — "
+                "the binary has changed since we last built it.\n\n"
+                "This happens when you use Porymap's built-in updater, "
+                "which replaces our patched version with stock Porymap.\n\n"
+                "The bidirectional sync bridge (map switching, event "
+                "callbacks, etc.) will NOT work until you re-patch.\n\n"
+                "Go to Tools → Update Porymap to rebuild with patches."
+            )
 
     def _open_in_porymap(self):
         """Tools → Open in Porymap. Launches Porymap at the current map."""
