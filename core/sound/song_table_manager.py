@@ -271,44 +271,76 @@ def write_songs_h(project_root: str, data: SongTableData):
 
 
 def write_midi_cfg(project_root: str, data: SongTableData):
-    """Write the midi.cfg file."""
+    """Write the midi.cfg file, preserving entries not in our data model.
+
+    midi.cfg contains build rules for ALL songs — both MUS_ (background music)
+    and SE_ (sound effects).  Our SongTableData only tracks entries from
+    song_table.inc, which may not include every SE_.  A full rewrite would
+    drop those untracked entries, breaking the build.
+
+    Strategy: read the existing file, update/add/remove only entries whose
+    label matches one in our data, and leave everything else untouched.
+    """
     cfg_path = os.path.join(project_root, 'sound', 'songs', 'midi', 'midi.cfg')
-    lines = []
 
-    # Collect entries that have midi config
-    cfg_entries = [e for e in data.entries if e.midi_filename or e.voicegroup_index is not None]
-
-    if not cfg_entries:
-        # Fall back to all entries
-        cfg_entries = data.entries
-
-    # Find max filename length for alignment
-    max_fn_len = max(
-        (len(e.midi_filename or (e.label + '.mid')) for e in cfg_entries),
-        default=20
-    )
-
-    for entry in cfg_entries:
+    # Build a set of midi filenames we manage
+    managed: dict[str, SongEntry] = {}
+    for entry in data.entries:
         midi_file = entry.midi_filename or (entry.label + '.mid')
-        padded_fn = (midi_file + ':').ljust(max_fn_len + 1)
+        managed[midi_file] = entry
 
-        flags = []
-        if entry.extra_flags:
-            flags.append(entry.extra_flags)
-        if entry.reverb is not None:
-            flags.append(f'-R{entry.reverb:02d}')
-        if entry.voicegroup_index is not None:
-            flags.append(f'-G{entry.voicegroup_index:03d}')
-        if entry.volume is not None:
-            flags.append(f'-V{entry.volume:03d}')
-        if entry.priority is not None:
-            flags.append(f'-P{entry.priority}')
+    # Read existing lines, tracking which managed entries we've seen
+    existing_lines: list[str] = []
+    seen_managed: set[str] = set()
+    if os.path.isfile(cfg_path):
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    existing_lines.append(line)
+                    continue
 
-        flag_str = ' '.join(flags)
-        lines.append(f'{padded_fn} {flag_str}\n')
+                m = _RE_CFG_LINE.match(stripped)
+                if m:
+                    midi_file = m.group(1)
+                    if midi_file in managed:
+                        # Replace with our version
+                        seen_managed.add(midi_file)
+                        entry = managed[midi_file]
+                        existing_lines.append(_format_cfg_line(entry) + '\n')
+                    else:
+                        # Not managed by us — preserve as-is
+                        existing_lines.append(line)
+                else:
+                    existing_lines.append(line)
+
+    # Append any managed entries that weren't already in the file
+    for midi_file, entry in managed.items():
+        if midi_file not in seen_managed:
+            existing_lines.append(_format_cfg_line(entry) + '\n')
 
     with open(cfg_path, 'w', encoding='utf-8') as f:
-        f.writelines(lines)
+        f.writelines(existing_lines)
+
+
+def _format_cfg_line(entry: SongEntry) -> str:
+    """Format a single midi.cfg line from a SongEntry."""
+    midi_file = entry.midi_filename or (entry.label + '.mid')
+    padded_fn = (midi_file + ':').ljust(30)
+
+    flags = []
+    if entry.extra_flags:
+        flags.append(entry.extra_flags)
+    if entry.reverb is not None:
+        flags.append(f'-R{entry.reverb:02d}')
+    if entry.voicegroup_index is not None:
+        flags.append(f'-G{entry.voicegroup_index:03d}')
+    if entry.volume is not None:
+        flags.append(f'-V{entry.volume:03d}')
+    if entry.priority is not None:
+        flags.append(f'-P{entry.priority}')
+
+    return f'{padded_fn} {" ".join(flags)}'
 
     # CRITICAL: midi.cfg is a Makefile dependency for EVERY .s file.
     # Rewriting midi.cfg makes its mtime newer than all .s files, so the

@@ -70,6 +70,14 @@ Tracked bugs, confirmed root causes, and fix status. This file persists across s
 - **Fix:** Removed the automatic `cleanup_orphaned_songs()` call from `load_project()`. Orphan cleanup should NEVER run automatically — it's a destructive operation that modifies source files. If needed in the future, it must be a manual action with a confirmation dialog.
 - **DO NOT CHANGE:** Do NOT re-add automatic orphan cleanup to `load_project()`. The .s files are build artifacts that may not exist until the project is compiled. Their absence does NOT mean the song is orphaned.
 
+### BUG: write_midi_cfg drops 124 SE sound effect entries, breaking build
+- **Status:** FIXED (2026-04-13)
+- **File:** `core/sound/song_table_manager.py`
+- **Evidence:** After any PorySuite save that touched songs, `se_bag_cursor.s` and 123 other SE entries disappeared from midi.cfg. Build fails with "can't open .s for reading" because mid2agb has no rule to generate them.
+- **Root cause:** `write_midi_cfg()` rewrote the entire file from `SongTableData.entries`, which only contains songs from `song_table.inc`. But `midi.cfg` also has entries for SE sound effects that are NOT in `song_table.inc` — they have their own build rules. A full rewrite dropped every SE entry not in our data model (124 of 256 SE entries).
+- **Fix:** `write_midi_cfg()` now reads the existing file first, updates only entries that match our data model, and preserves everything else untouched. New entries get appended. Unmanaged entries (like SE_ sound effects) are never dropped.
+- **DO NOT CHANGE:** The preserve-existing-lines strategy in `write_midi_cfg()`. Reverting to a full rewrite will silently drop SE entries and break builds.
+
 ---
 
 ## Piano Roll — Playback

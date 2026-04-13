@@ -1,3 +1,19 @@
+## [2026-04-13] — CRITICAL FIX: write_midi_cfg dropping 124 SE sound effect entries
+
+### Type
+Critical Bug Fix
+
+### Summary
+**write_midi_cfg() was doing a full rewrite of midi.cfg from SongTableData, which only contains entries from song_table.inc.** But midi.cfg also has entries for SE sound effects (se_bag_cursor, se_m_absorb, etc.) that are NOT in song_table.inc — they have separate build rules. Every PorySuite save that touched songs silently dropped 124 of 256 SE entries, causing build failures ("can't open se_bag_cursor.s for reading") because mid2agb had no rule to generate the missing .s files. This damage was committed to the user's upstream repo.
+
+**Fix:** write_midi_cfg() now reads the existing file first, updates only entries that match our data model, preserves everything else, and appends new entries at the end. Unmanaged entries are never dropped.
+
+### Files Changed
+- core/sound/song_table_manager.py — write_midi_cfg() rewritten to preserve-and-update instead of full rewrite, new _format_cfg_line() helper
+- docs/BUGS.md — New entry documenting the bug
+
+---
+
 ## [2026-04-13] — CRITICAL FIX: Sound Editor auto-deleting all songs on project load
 
 ### Type
