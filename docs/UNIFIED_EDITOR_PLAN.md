@@ -8,7 +8,7 @@ Merge PorySuite (data editor) and EVENTide (script editor) into a single window 
 
 ## Current State (2026-04-13)
 
-Phases 1 through 6 are **complete**. **Phase 9 — Pokédex Habitat/Area Display — COMPLETE**: Wild Encounters card on detail panel shows per-species locations with color-coded method dots, level ranges, fishing rod sub-groups, and multi-floor merging. Fully compatible with custom maps and non-vanilla hacks. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE** — overhauled 2026-04-09 with **52 battle templates** achieving **74/74 detection of all vanilla abilities**. Every ability now shows an editable template, not a "no editable template" fallback. Templates cover: status immunity, contact effects, type absorb, weather, stat boost, intimidate, pinch boosts, type immunity, weather recovery, type trap, crit prevention, OHKO prevention, evasion weather, stat double, type resist, block stat/flinch, accuracy boost, guts, weather speed, prevent escape, natural cure, pressure, wonder guard, recoil immunity, type change+boost (Pixilate), dual intimidate, Trick Room/Tailwind, multi-type resist, weather suppress, shed skin, truant, sound block, color change, synchronize, suction cups, sticky hold, shield dust, lightning rod, serene grace, hustle, marvel scale, early bird, liquid ooze, plus/minus, damp, contact flinch, trace, forecast, block specific stat. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding. **Song Writer Optimizations — COMPLETE**: TIE/EOT for long notes, redundant control filtering, proper song deletion cleanup. **ROM Diagnostics Tab — COMPLETE**: ROM size, EWRAM/IWRAM usage, section breakdown, build info. **Piano Roll Save Pipeline Fixes (2026-04-08) — COMPLETE**: PATT subroutine corruption fixed (stripped to linear on save), VOL/TEMPO double-evaluation fixed (reverse-evaluation helpers), BEND loop reset fixed. **Note Properties Dialog — COMPLETE**: Right-click note editing for BEND/control events. **MIDI Import Dropdowns — COMPLETE**: Named instrument dropdowns replace number spinners. **Piano Roll Loop & Save Fixes (2026-04-08) — COMPLETE**: Loop playback used wrong loop_end (max across all tracks), fixed to use track 0's flattened value. GOTO save placed at wrong tick when notes existed past loop end, fixed with timeline insertion. Phantom dirty flag on close after Sound Editor save, fixed. **Piano Roll UX Polish (2026-04-08) — COMPLETE**: Double-click note placement (prevents accidental), Ctrl+Z undo, default snap 1/16, sidebar track sets active instead of filtering, .s reimport/overwrite, git pull refreshes Sound Editor. **Fractional Pitch Bending (2026-04-08) — COMPLETE**: Sub-semitone GBA MidiKeyToFreq interpolation in both renderers, keysplit int() fix, GBA linear pan crossfade. **Piano Roll Control Event & Scroll Fixes (2026-04-08) — COMPLETE**: Control event explosion dedup (PATT flattening duplicated PAN/BEND), PATT label filtering in Song Structure, loop tick drift fix (WAIT before LABEL), label name preservation from Song Structure panel, horizontal scroll by default (wheel), middle-click zoom anchored to cursor. **MIDI Import Robustness (2026-04-08) — COMPLETE**: No Loop mode uses parse→flatten→rewrite pipeline, meta event allowlist cleaning, Type 0→1 MIDI conversion, default import mode changed to "No Loop (clean)". **GM Voicegroup Drum Fix (2026-04-08) — COMPLETE**: 21 drum samples added to mapping, unplaced DirectSound samples recovered into empty slots. **Orphaned Song Registration Cleanup (2026-04-08) — COMPLETE**: Auto-cleanup on project load detects and removes MUS_* entries with missing .s files from all config files. Failed MIDI import cleanup fixed (wrong filename). **Phantom Dirty Flag Fix (2026-04-09) — COMPLETE**: "Unsaved Changes" dialog no longer appears on close/refresh after saving. Root causes: deferred items loader re-dirtying on startup, and gfx_combo repopulation during save marking EVENTide dirty. Fixed with deferred dirty clear, blockSignals during combo refresh, and unconditional EVENTide dirty clear after save. **Pre-Build .s Protection (2026-04-09) — COMPLETE**: `_on_make()` touches all .s files before every build as defense-in-depth against mid2agb overwriting tool-edited songs. **Phase 8B Dirty Flag & Editor Fixes (2026-04-09) — COMPLETE**: Structural dirty-marking loop covers all UI widgets. Abilities effect detection fixed (was using wrong `local_util`). Starter ability combo boxes enabled and saved. "Add to VS Seeker Rematch Table" button with auto map detection. Instrument loop dirty marking. `_on_child_modified()` suppression. **Phase 10A — Tilemap Editor + Palette Editor — COMPLETE**: Full tilemap viewer/editor with 4bpp/8bpp auto-detection, paint/eyedropper tools, zoom/grid, palette-aware rendering, tile offset for VRAM mapping, visual palette editor with JASC .pal 16/256-color import/export, compact UI with auto-sizing palette display. Core: `core/tilemap_data.py`, UI: `ui/tilemap_editor_tab.py`. Remaining: 10B tile animation viewer, 10C animation creator + pixel editor.
+Phases 1 through 6 are **complete**. **Phase 9 — Pokédex Habitat/Area Display — COMPLETE**: Wild Encounters card on detail panel shows per-species locations with color-coded method dots, level ranges, fishing rod sub-groups, and multi-floor merging. Fully compatible with custom maps and non-vanilla hacks. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE** — overhauled 2026-04-09 with **52 battle templates** achieving **74/74 detection of all vanilla abilities**. Every ability now shows an editable template, not a "no editable template" fallback. Templates cover: status immunity, contact effects, type absorb, weather, stat boost, intimidate, pinch boosts, type immunity, weather recovery, type trap, crit prevention, OHKO prevention, evasion weather, stat double, type resist, block stat/flinch, accuracy boost, guts, weather speed, prevent escape, natural cure, pressure, wonder guard, recoil immunity, type change+boost (Pixilate), dual intimidate, Trick Room/Tailwind, multi-type resist, weather suppress, shed skin, truant, sound block, color change, synchronize, suction cups, sticky hold, shield dust, lightning rod, serene grace, hustle, marvel scale, early bird, liquid ooze, plus/minus, damp, contact flinch, trace, forecast, block specific stat. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding. **Song Writer Optimizations — COMPLETE**: TIE/EOT for long notes, redundant control filtering, proper song deletion cleanup. **ROM Diagnostics Tab — COMPLETE**: ROM size, EWRAM/IWRAM usage, section breakdown, build info. **Piano Roll Save Pipeline Fixes (2026-04-08) — COMPLETE**: PATT subroutine corruption fixed (stripped to linear on save), VOL/TEMPO double-evaluation fixed (reverse-evaluation helpers), BEND loop reset fixed. **Note Properties Dialog — COMPLETE**: Right-click note editing for BEND/control events. **MIDI Import Dropdowns — COMPLETE**: Named instrument dropdowns replace number spinners. **Piano Roll Loop & Save Fixes (2026-04-08) — COMPLETE**: Loop playback used wrong loop_end (max across all tracks), fixed to use track 0's flattened value. GOTO save placed at wrong tick when notes existed past loop end, fixed with timeline insertion. Phantom dirty flag on close after Sound Editor save, fixed. **Piano Roll UX Polish (2026-04-08) — COMPLETE**: Double-click note placement (prevents accidental), Ctrl+Z undo, default snap 1/16, sidebar track sets active instead of filtering, .s reimport/overwrite, git pull refreshes Sound Editor. **Fractional Pitch Bending (2026-04-08) — COMPLETE**: Sub-semitone GBA MidiKeyToFreq interpolation in both renderers, keysplit int() fix, GBA linear pan crossfade. **Piano Roll Control Event & Scroll Fixes (2026-04-08) — COMPLETE**: Control event explosion dedup (PATT flattening duplicated PAN/BEND), PATT label filtering in Song Structure, loop tick drift fix (WAIT before LABEL), label name preservation from Song Structure panel, horizontal scroll by default (wheel), middle-click zoom anchored to cursor. **MIDI Import Robustness (2026-04-08) — COMPLETE**: No Loop mode uses parse→flatten→rewrite pipeline, meta event allowlist cleaning, Type 0→1 MIDI conversion, default import mode changed to "No Loop (clean)". **GM Voicegroup Drum Fix (2026-04-08) — COMPLETE**: 21 drum samples added to mapping, unplaced DirectSound samples recovered into empty slots. **Orphaned Song Registration Cleanup (2026-04-08) — COMPLETE**: Auto-cleanup on project load detects and removes MUS_* entries with missing .s files from all config files. Failed MIDI import cleanup fixed (wrong filename). **Phantom Dirty Flag Fix (2026-04-09) — COMPLETE**: "Unsaved Changes" dialog no longer appears on close/refresh after saving. Root causes: deferred items loader re-dirtying on startup, and gfx_combo repopulation during save marking EVENTide dirty. Fixed with deferred dirty clear, blockSignals during combo refresh, and unconditional EVENTide dirty clear after save. **Pre-Build .s Protection (2026-04-09) — COMPLETE**: `_on_make()` touches all .s files before every build as defense-in-depth against mid2agb overwriting tool-edited songs. **Phase 8B Dirty Flag & Editor Fixes (2026-04-09) — COMPLETE**: Structural dirty-marking loop covers all UI widgets. Abilities effect detection fixed (was using wrong `local_util`). Starter ability combo boxes enabled and saved. "Add to VS Seeker Rematch Table" button with auto map detection. Instrument loop dirty marking. `_on_child_modified()` suppression. **Phase 10A — Tilemap Editor + Palette Editor — COMPLETE**: Full tilemap viewer/editor with 4bpp/8bpp auto-detection, paint/eyedropper tools, zoom/grid, palette-aware rendering, tile offset for VRAM mapping, visual palette editor with JASC .pal 16/256-color import/export, compact UI with auto-sizing palette display. Core: `core/tilemap_data.py`, UI: `ui/tilemap_editor_tab.py`. **Phase 10B — Tile Animation Editor (AnimEdit-Style) — COMPLETE**: Full AnimEdit-style rework. Navigation by Tileset + Animation Number (68 tilesets from headers.h). ALL properties editable and saved to C source: divisor, start tile (hex), tile amount, phase, counter max. Palette integration with 16 .pal file loading, editable swatches, import/export (shared with Porymap). Add/Remove Animation with full C source wiring. Side-by-side layout, display size (1x-8x), frame scrubber, tile grid with hex VRAM addresses and horizontal toggle. Covers all 77 animations (8 tileset BG, 32 door, 37 field effect). Core: `core/tileset_anim_data.py`, UI: `ui/tile_anim_viewer.py`. Remaining: 10C pixel editor.
 
 **18 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Diagnostics, Tilemap Editor, Event Editor, Maps, Layouts & Tilesets, Region Map, UI (Text Content), Config.
 
@@ -1167,35 +1167,62 @@ A visual editor for the parts of tileset workflow that Porymap doesn't cover —
 - `palettes/*.pal` — PaintShop Pro text format (16 colors, 15-bit RGB)
 - `data/layouts/*/map.bin` — raw u16 grid
 
-#### 10B — Tile Animation Viewer + Frame Editor
+#### 10B — Tile Animation Editor (AnimEdit-Style) — COMPLETE
 
-**Animation Viewer:**
-- Parse `src/tileset_anims.c` to extract animation definitions: frame file paths, target tile index, frame count, timing (frame rate)
-- List all animations grouped by tileset (primary general: flower/water/sand, secondary: fountain/steam/door/flowers)
-- Filmstrip display: show all frames side-by-side with frame numbers
-- Animated preview: play animation at correct GBA frame rate (60 fps base, divided by the modulo timing)
-- Show which tiles in the tileset are animated — highlight them in the Metatile Builder's tile grid
+Complete AnimEdit-style tile animation editor. Navigation by Tileset + Animation Number (68 tilesets from headers.h). Covers all 77 animations across three source systems: 8 tileset BG, 32 door, 37 field effect.
 
-**Frame Editor:**
-- Open individual frame PNGs for editing — swap in replacement graphics
-- Import new frame images (must match tile dimensions and palette constraints)
-- Reorder frames, add/remove frames, adjust timing
-- Live preview updates as frames change
+**Three Parsers in `core/tileset_anim_data.py` — COMPLETE:**
+- `parse_tileset_anims()` — parses `src/tileset_anims.c` dynamically: INCBIN_U16 frame paths, TILE_OFFSET_4BPP destinations, timer divisor/phase timing, AppendTilesetAnimToBuffer tile counts, counter max values, init function names. CamelCase-to-snake_case conversion matches C names to filesystem directories. 8 animations detected.
+- `parse_door_anims()` — parses `src/field_door.c`: door animation frame sequences, spritesheet paths, per-door timing. `DoorAnimation` dataclass. 32 animations detected.
+- `parse_field_effect_anims()` — parses `include/constants/object_event_graphics.h` + `src/data/field_effect_objects.h`: field effect spritesheet paths, frame dimensions, animation sequences. `FieldEffectAnimation` dataclass. 37 animations detected.
+- `parse_tilesets_from_headers()` — parses `src/data/tilesets/headers.h` for all 68 tilesets with callback detection
+- `load_tileset_palettes()` — loads all 16 .pal files per tileset with GBA 15-bit clamping
+- `parse_palette_hints()` — extracts `// palette: tileset NN` comments from tileset_anims.c
 
-**What it parses from C source:**
-- `INCBIN_U16("data/tilesets/*/anim/*/*.4bpp")` → frame file paths
-- `TILE_OFFSET_4BPP(N)` → target tile index
-- `timer % N == M` patterns → frame rate and phase
-- `AppendTilesetAnimToBuffer(...)` calls → frame-to-tile mapping
-- `sPrimaryTilesetAnimCounterMax` / `sSecondaryTilesetAnimCounterMax` → cycle duration
+**AnimEdit-Style Editor — COMPLETE:**
+- Tileset dropdown (68 tilesets, animated-first sorting) + Animation Number dropdown ("0: Flower", "1: Water")
+- Side-by-side splitter layout (410px left panel for controls, right panel for preview/grid)
+- All properties editable with save to C source: Speed/Divisor, Start Tile (hex 0x1A0 matching Porymap), Tile Amount, Phase, Counter Max
+- Palette slot selector (00-15) loading tileset .pal files, editable color swatches with GBA 15-bit clamping, import/export .pal (shared with Porymap)
+- Display size buttons (1x/2x/4x/8x)
+- Frame scrubber (prev/slider/next) for manual stepping through animation sequence
+- Filmstrip thumbnail strip showing all frames
+- Tile Grid decomposition into 8×8 cells with hex VRAM addresses (matching Porymap convention), horizontal/grid layout toggle
+- Add New Animation (+) — creates full C source wiring: INCBIN, frame array, QueueAnimTiles, dispatch call, Init function, headers.h callback
+- Remove Animation (−) — cleanly strips all C source references
+- Animated preview with speed slider
+- Info panel with animation metadata
 
-#### 10C — Animation Creator + Tile Pixel Editor
+**Palette Editor (all types) — COMPLETE:**
+- **Palette display** — 16 clickable swatches per palette slot, GBA 15-bit clamping
+- **Palette color picker** — click any swatch to edit; changes written back to .pal files
+- **Import .pal** — load JASC .pal file
+- **Export .pal** — save current palette as JASC .pal file
 
-**Animation Creator:**
-- GUI to define new tile animations: pick target tiles from tileset, set frame count, set timing
-- Auto-generate: frame PNG templates (correct dimensions, palette), C callback function, `INCBIN` frame arrays, callback registration in tileset header
-- Code generation follows same pattern as Abilities editor — writes valid pokefirered C
-- Generates into `src/tileset_anims.c` (new callback + arrays) and `src/data/tilesets/headers.h` (callback assignment)
+**Tileset-Only Editor Features — COMPLETE:**
+- **All property editing** — divisor, start tile (hex), tile amount, phase, counter max — saved to C source with confirmation dialog
+- **Replace Frame** — swap a frame's PNG (validates dimensions, warns on mismatch)
+- **Add Frame** — import PNG as next numbered frame, add INCBIN + array entry to C source
+- **Delete Frame** — remove from C source (INCBIN + array entry); PNG left for manual cleanup
+- Confirmation dialogs on all destructive actions
+
+**Door / Field Effect Features — COMPLETE:**
+- Read-only frame management (frames derived from spritesheets, not individually editable)
+- **Open spritesheet in Explorer** — opens source spritesheet file in OS file manager
+
+**UI Widgets:**
+- `_HexSpinBox` — QSpinBox with hex display/input (0x prefix, hex validation)
+- `_NoScrollCombo` / `_NoScrollSpin` — wheel-safe controls per project UI rules
+- `PaletteSwatch` / `PaletteSwatchRow` — editable color swatch grid
+- `AnimPreviewWidget` — QTimer-driven animated playback
+- `TileGridWidget` — 8×8 tile decomposition with hex VRAM labels, horizontal/grid toggle, tile_selected signal
+- `_AddAnimDialog` — new animation wizard (name, hex start tile, tile amount, divisor, PNG picker)
+
+**Files:** `core/tileset_anim_data.py` (three parsers + full write pipeline), `ui/tile_anim_viewer.py` (complete rewrite — `TileAnimEditorWidget`), `ui/tilemap_editor_tab.py` (tab integration)
+
+#### 10C — Tile Pixel Editor
+
+Animation Creator is now part of 10B (Add New Animation button with full C source wiring).
 
 **Tile Pixel Editor:**
 - Paint 8x8 tiles with palette constraints (4bpp = 16 colors from selected palette)

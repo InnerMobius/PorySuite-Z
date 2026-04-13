@@ -571,6 +571,11 @@ class UnifiedMainWindow(QMainWindow):
         self._tilemap_editor = TilemapEditorTab()
         idx = self.stack.addWidget(self._tilemap_editor)
         self._page_indices["tilesets"] = idx
+        # Connect tilemap + tile animation editor modified signals to window dirty
+        self._tilemap_editor.modified.connect(lambda: self.setWindowModified(True))
+        anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
+        if anim_ed and hasattr(anim_ed, 'modified'):
+            anim_ed.modified.connect(lambda: self.setWindowModified(True))
 
         # ── Disconnect PorySuite's own tab-change handler ────────────────────
         # Pages have been reparented out of mainTabs, so PorySuite's
@@ -912,6 +917,34 @@ class UnifiedMainWindow(QMainWindow):
                 except Exception as e:
                     self.log_message(f"Error saving song table: {e}")
 
+        # Save Tilemap Editor (.bin file) and Tile Animation Editor (C source)
+        saved_tilemap = False
+        saved_tile_anim = False
+        if hasattr(self, '_tilemap_editor'):
+            # Tilemap .bin
+            if hasattr(self._tilemap_editor, 'has_unsaved_changes') and self._tilemap_editor.has_unsaved_changes():
+                try:
+                    ok, errs = self._tilemap_editor.flush_to_disk()
+                    if ok > 0:
+                        saved_tilemap = True
+                        self.log_message("Saved tilemap .bin")
+                    if errs:
+                        self.log_message(f"Tilemap save errors: {', '.join(errs)}")
+                except Exception as e:
+                    self.log_message(f"Error saving tilemap: {e}")
+            # Tile animation properties
+            anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
+            if anim_ed and hasattr(anim_ed, 'has_unsaved_changes') and anim_ed.has_unsaved_changes():
+                try:
+                    ok, errs = anim_ed.flush_to_disk()
+                    if ok > 0:
+                        saved_tile_anim = True
+                        self.log_message(f"Saved {ok} tile animation property change(s)")
+                    if errs:
+                        self.log_message(f"Tile animation save errors: {', '.join(errs)}")
+                except Exception as e:
+                    self.log_message(f"Error saving tile animation properties: {e}")
+
         # Always clear the dirty flag after save — even if no sub-component
         # reported changes.  The Sound Editor (and others) can emit modified()
         # for actions that are immediately persisted (e.g. .s file import
@@ -920,7 +953,8 @@ class UnifiedMainWindow(QMainWindow):
         self.setWindowModified(False)
 
         if (saved_porysuite or saved_eventide or saved_credits
-                or saved_labels or saved_sound):
+                or saved_labels or saved_sound or saved_tile_anim
+                or saved_tilemap):
             self.statusBar().showMessage("All changes saved.", 4000)
         else:
             self.statusBar().showMessage("Nothing to save.", 2000)

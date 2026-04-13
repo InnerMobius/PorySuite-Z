@@ -137,17 +137,34 @@ Map renaming, group management, section renaming, move/delete maps, warp validat
 
 GBA `.bin` tilemap viewer and editor:
 
-- **Open any tilemap** from `graphics/` — auto-discovers matching tile sheet (`.png`) and palettes (`.pal` files)
+- **Open any tilemap** from `graphics/` — auto-discovers matching tile sheet (`.png`) and palettes (`.pal` files). File dialog remembers the last folder you opened from within a session.
 - **Rendered preview** with correct palettes, tile flips, and zoom (1-8x) with grid overlay
 - **Paint tool** — click/drag tiles from the tile picker onto the tilemap
 - **Eyedropper tool** — pick tiles from the tilemap
 - **Per-tile controls** — palette slot, horizontal/vertical flip
 - **Tile offset** — VRAM base address spinner (0-1023) for games that load tile sheets at non-zero offsets
 - **Dimension re-wrap** — changing width auto-recalculates height to keep all tilemap entries (never truncates)
-- **Visual palette editor** — 16 palette slots shown as color swatch rows. Right-click for Import .pal (JASC format), Export .pal, Extract from PNG, Export All. Color-coded slot labels: white = loaded & used, red = needed & missing, grey = loaded & unused
-- **Smart palette fallback** — when a tile references a palette slot with no data, falls back to palette 0 (handles 4bpp PNGs with a single palette used across multiple VRAM slots at runtime)
-- **Palette source toggle** — "Auto .pal files" (loads from project's palette directory) or "Tile sheet colors" (uses PNG color table)
-- **Save** back to `.bin`
+- **Visual palette editor** — 16 palette slots shown as color swatch rows. **Double-click any color swatch to edit it** with a color picker (GBA 15-bit clamped). Right-click for Import .pal (JASC format), Export .pal, Extract from PNG, Export All. Color-coded slot labels: white = loaded & used, red = needed & missing, grey = loaded & unused
+- **Smart palette loading** — only name-matching .pal files are auto-loaded (e.g. `solarbeam.bin` → `solarbeam.pal`). Non-matching .pal files in the same directory are excluded so PNG colors (almost always correct) are used by default when no dedicated .pal exists.
+- **Palette source toggle** — "Auto .pal files" (loads from project's palette directory) or "PNG colors" (uses tile sheet's own color table)
+- **Save** — integrated with the app's File → Save pipeline. Tile changes mark the window dirty; saving writes the `.bin` file alongside all other editors.
+
+**Tile Animation Editor** (second tab within Tilesets page):
+
+AnimEdit-style tile animation editor covering **all three GBA animation systems** — 77 animations in vanilla pokefirered, all discovered dynamically from source with no hardcoded names:
+
+- **Navigate by Tileset + Animation Number** — 68 tilesets parsed from `headers.h`, animated tilesets sorted first. Animations indexed ("0: Flower", "1: Water"). Works on any pokefirered project.
+- **All properties editable** — Speed/Divisor, Start Tile (hex, 0x1A0 matching Porymap), Tile Amount, Phase, Counter Max. Save back to C source with confirmation dialog.
+- **Palette integration** — loads all 16 tileset .pal files with GBA 15-bit clamping. Editable color swatches, palette slot selector (00-15), import/export .pal. Palettes are shared with Porymap.
+- **Add New Animation** (+) — creates brand new tileset animation with full C source wiring: INCBIN, frame array, QueueAnimTiles, dispatch, Init, headers.h callback registration.
+- **Remove Animation** (−) — cleanly strips all C source references.
+- **Display Size** — 1x/2x/4x/8x buttons for preview and frame inspection.
+- **Frame Scrubber** — prev/slider/next for manual stepping through animation frames.
+- **Tile Grid** — current frame decomposed into 8×8 tiles with hex VRAM addresses (matching Porymap convention). Toggle between grid and horizontal strip layout.
+- **Side-by-side layout** — 410px left panel (properties, palette, info) + right panel (preview, filmstrip, tile grid).
+- **Animated preview** with speed slider, filmstrip thumbnail strip, info panel.
+- **Tileset BG Animations (8)** — full editing of all properties + frame add/delete/replace.
+- **Door Animations (32)** / **Field Effect Animations (37)** — read-only frame display, open spritesheet in Explorer.
 
 ### Layouts
 

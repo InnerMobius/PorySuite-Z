@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QGroupBox, QHBoxLayout,
     QLabel, QMenu,
     QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter,
-    QToolBar, QVBoxLayout, QWidget,
+    QTabWidget, QToolBar, QVBoxLayout, QWidget,
 )
 
 
@@ -146,10 +146,46 @@ class PaletteEditorWidget(QWidget):
             return self._visible_slots[row]
         return self._visible_slots[-1] if self._visible_slots else 0
 
+    def _color_at(self, pos) -> tuple:
+        """Return (slot, color_index) for a position, or (slot, -1)."""
+        slot = self._slot_at_y(pos.y())
+        x = pos.x() - 32  # label_w(28) + 4
+        if x >= 0:
+            ci = x // SWATCH
+            if 0 <= ci < 16:
+                return (slot, ci)
+        return (slot, -1)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._selected_slot = self._slot_at_y(event.pos().y())
             self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        """Double-click a swatch to edit its color."""
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if not self._palette_set:
+            return
+        slot, ci = self._color_at(event.pos())
+        if ci < 0:
+            return
+        if not self._palette_set.is_slot_loaded(slot):
+            return
+        old_r, old_g, old_b = self._palette_set.palettes[slot][ci]
+        from PyQt6.QtWidgets import QColorDialog
+        color = QColorDialog.getColor(
+            QColor(old_r, old_g, old_b), self,
+            f"Edit Slot {slot} Color {ci}")
+        if not color.isValid():
+            return
+        # GBA 15-bit clamping
+        r = (color.red() >> 3) << 3
+        g = (color.green() >> 3) << 3
+        b = (color.blue() >> 3) << 3
+        self._palette_set.palettes[slot][ci] = (r, g, b)
+        self.update()
+        self.palette_changed.emit()
 
     def _show_context_menu(self, pos):
         slot = self._slot_at_y(pos.y())
@@ -604,17 +640,38 @@ class TilemapEditorTab(QWidget):
         self._dirty = False
         self._tool = "paint"  # "paint" or "pick"
         self._tile_offset = 0  # VRAM tile offset for current sheet
+        self._last_open_dir = ""  # remembers last Open dialog folder
         self._build_ui()
 
     def set_project(self, project_dir: str):
         self._project_dir = project_dir
+        if hasattr(self, '_anim_viewer'):
+            self._anim_viewer.set_project(project_dir)
 
     # ── UI Construction ──────────────────────────────────────────────────────
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(4)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # -- Tab widget: Tilemap Editor + Tile Animations --
+        self._tab_widget = QTabWidget()
+        root.addWidget(self._tab_widget)
+
+        # -- Tab 0: Tilemap Editor --
+        editor_page = QWidget()
+        editor_layout = QVBoxLayout(editor_page)
+        editor_layout.setContentsMargins(4, 4, 4, 4)
+        editor_layout.setSpacing(4)
+        self._tab_widget.addTab(editor_page, "Tilemap Editor")
+
+        # -- Tab 1: Tile Animations --
+        from ui.tile_anim_viewer import TileAnimEditorWidget
+        self._anim_viewer = TileAnimEditorWidget()
+        self._tab_widget.addTab(self._anim_viewer, "Tile Animations")
+
+        # ── Build the tilemap editor inside editor_page ──────────────────────
 
         # -- Toolbar --
         tb = QToolBar()
@@ -685,7 +742,7 @@ class TilemapEditorTab(QWidget):
         self._offset_spin.valueChanged.connect(self._on_offset_changed)
         tb.addWidget(self._offset_spin)
 
-        root.addWidget(tb)
+        editor_layout.addWidget(tb)
 
         # -- Main splitter: canvas left, right panel --
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -831,18 +888,19 @@ class TilemapEditorTab(QWidget):
         # Canvas gets ~55% width, right panel ~45% — user can drag to resize
         splitter.setSizes([600, 500])
 
-        root.addWidget(splitter, 1)
+        editor_layout.addWidget(splitter, 1)
 
     # ── File operations ──────────────────────────────────────────────────────
 
     def _open_file(self):
-        start_dir = ""
-        if self._project_dir:
+        # Use last-opened directory if available, else graphics/
+        if self._last_open_dir and os.path.isdir(self._last_open_dir):
+            start_dir = self._last_open_dir
+        elif self._project_dir:
             gfx = os.path.join(self._project_dir, "graphics")
-            if os.path.isdir(gfx):
-                start_dir = gfx
-            else:
-                start_dir = self._project_dir
+            start_dir = gfx if os.path.isdir(gfx) else self._project_dir
+        else:
+            start_dir = ""
 
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Tilemap",
@@ -852,6 +910,7 @@ class TilemapEditorTab(QWidget):
         if not path:
             return
 
+        self._last_open_dir = os.path.dirname(path)
         self._load_tilemap(path)
 
     def _load_tilemap(self, bin_path: str):
@@ -899,7 +958,9 @@ class TilemapEditorTab(QWidget):
             except Exception:
                 pass
 
-        # Load palettes
+        # Load palettes — prefer name-matching .pal files, otherwise
+        # use PNG's own color table (almost always the correct palette
+        # when there's no dedicated .pal file for this tilemap)
         self._palettes = None
         if assets.best_pals:
             try:
@@ -909,6 +970,12 @@ class TilemapEditorTab(QWidget):
         # Fallback: extract palette from tile sheet image
         if (not self._palettes or self._palettes.palette_count() == 0) and self._sheet:
             self._palettes = PaletteSet.from_indexed_image(self._sheet.image)
+            # Set palette source combo to "PNG colors" when using fallback
+            self._pal_source_combo.blockSignals(True)
+            idx = self._pal_source_combo.findText("PNG colors")
+            if idx >= 0:
+                self._pal_source_combo.setCurrentIndex(idx)
+            self._pal_source_combo.blockSignals(False)
 
         # Reset tile offset
         self._tile_offset = 0
@@ -983,6 +1050,20 @@ class TilemapEditorTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Save Error", str(e))
 
+    def has_unsaved_changes(self) -> bool:
+        return self._dirty
+
+    def flush_to_disk(self) -> tuple:
+        """Save the tilemap .bin file. Follows the flush_to_disk convention."""
+        if not self._tilemap or not self._tilemap.source_path or not self._dirty:
+            return (0, [])
+        try:
+            self._tilemap.save()
+            self._dirty = False
+            return (1, [])
+        except Exception as e:
+            return (0, [str(e)])
+
     def _on_sheet_changed(self, idx: int):
         if idx < 0:
             return
@@ -1055,6 +1136,7 @@ class TilemapEditorTab(QWidget):
         self._tilemap.set(col, row, entry)
         self._canvas.refresh_tile(col, row)
         self._dirty = True
+        self.modified.emit()
 
     def _on_canvas_click(self, col: int, row: int):
         """Show info for clicked tile."""

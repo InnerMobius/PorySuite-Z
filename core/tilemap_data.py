@@ -622,26 +622,25 @@ def discover_assets(bin_path: str) -> TilemapAssets:
         except OSError:
             pass
 
-    # Best palette guess: prioritize palettes whose name matches or starts
-    # with the tilemap base name (e.g. textbox.bin → textbox1.pal, textbox2.pal
-    # before healthbar.pal, healthbox.pal)
+    # Best palette guess: only auto-load .pal files that name-match the
+    # tilemap (e.g. textbox.bin → textbox.pal, textbox1.pal).  Non-matching
+    # .pal files (like bug.pal, sky.pal sitting in the same directory) should
+    # NOT be loaded by default — the PNG's own color table is almost always
+    # the correct palette for those cases.  The user can always import .pal
+    # files manually.
     matching_pals = []
-    other_pals = []
     for p in pals:
         pname = os.path.splitext(os.path.basename(p))[0]
         if pname == base_name or pname.startswith(base_name):
             matching_pals.append(p)
-        else:
-            other_pals.append(p)
 
     # If a name-matching .pal has 256 colors, it covers all 16 palette slots
-    # on its own — don't load unrelated sibling .pal files on top of it.
-    best_pals = matching_pals + other_pals
+    # on its own — don't load any others.
+    best_pals = matching_pals
     if matching_pals:
         from ui.palette_utils import read_jasc_pal
         first_colors = read_jasc_pal(matching_pals[0])
         if len(first_colors) > 16:
-            # 256-color file — this one palette covers everything
             best_pals = matching_pals[:1]
 
     return TilemapAssets(
