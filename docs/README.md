@@ -41,7 +41,7 @@ On first run, the **Project Selector** window appears. Use **Open Existing Proje
 
 ## Editor Pages
 
-PorySuite-Z has 17 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
+PorySuite-Z has 18 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
 
 ### Pokemon
 
@@ -55,7 +55,7 @@ Evolution chain editor with species, method, and parameter fields. Play Cry butt
 
 ### Pokedex
 
-National and Regional Dex editors. Add, remove, and reorder entries. Each entry shows a detail panel with classification, height/weight, description, and a size comparison preview (Pokemon sprite overlaid on trainer sprite). Play Cry button.
+National and Regional Dex editors. Add, remove, and reorder entries. Each entry shows a detail panel with classification, height/weight, description, and a size comparison preview (Pokemon sprite overlaid on trainer sprite). **Wild Encounters card** showing where each species can be found — method type (Grass, Water, Fishing, Rock Smash) with color-coded dots, friendly map names, and level ranges. Data parsed from `wild_encounters.json` with multi-floor merging and fishing rod sub-groups. Play Cry button.
 
 ### Items
 
@@ -104,32 +104,52 @@ Searchable ability browser with detail panel:
 
 Full GBA M4A sound engine built in Python. Four sub-tabs:
 
-- **Songs** -- Browse, filter, and play all songs. Right-click context menu: Rename, Replace with .s File, Export .s File, Delete. Import MIDI and Import .s buttons.
-- **Instruments** -- 144 unique instruments grouped by type (Samples, Square Waves, Prog. Waves, Noise, Keysplits). Editable ADSR, base key, pan, duty cycle. 3-octave piano keyboard preview. Sample management: export/import WAV, replace, delete with reference checking.
-- **Voicegroups** -- Browse all voicegroups with slot counts and song usage. Full 128-slot editor. Add, clone, delete. Generate GM button creates a General MIDI voicegroup mapped to real instruments.
-- **Piano Roll** -- Full note editor with real-time sequencer playback. Click to place notes, drag to move/resize, box selection, copy/paste. Track sidebar with volume/pan/mute/solo per track. Song Structure panel showing sections, loops, and patterns. Snap grid (1/4, 1/8, 1/16, 1/32, free). Save writes .s file directly.
+- **Songs** -- Browse, filter, and play all songs. Right-click context menu: Rename, Replace with .s File, Export .s File, Delete. Import MIDI and Import .s buttons. Orphaned song cleanup runs automatically on load.
+- **Instruments** -- 144 unique instruments grouped by type (Samples, Square Waves, Prog. Waves, Noise, Keysplits). Editable ADSR with visual curve, base key, pan, duty cycle. 3-octave piano keyboard preview with hold-to-sustain. Sample management: export/import WAV (with rate/size picker), replace, delete with reference checking. Loop toggle and loop point editor with draggable waveform visualization. `.psinst` instrument preset export/import (zip with JSON manifest + sample data).
+- **Voicegroups** -- Browse all voicegroups with slot counts and song usage. Full 128-slot editor. Add, clone, delete. Generate GM button creates a General MIDI voicegroup mapped to real instruments (with drum kit support). Friendly label system with auto-label from song usage.
+- **Piano Roll** -- Full note editor with real-time GBA-accurate sequencer playback. Double-click to place notes, drag to move/resize, box selection, copy/paste, Ctrl+Z undo. Track sidebar with volume/pan/mute/solo per track. Song Structure panel showing sections, loops, and patterns. Snap grid (1/4, 1/8, 1/16, 1/32, free). Right-click note → Edit Note Properties (BEND/VOL/PAN control events). Scroll wheel = horizontal scroll, Ctrl+wheel = zoom, middle-click drag = zoom. Save writes .s file directly with round-trip fidelity.
 
-**MIDI Import Wizard** -- 5-page flow: file picker with track preview, voicegroup + settings, per-track instrument mapping (GM to VG slot with auto-match), song structure sequencer (define sections, arrange play order, set loop point), conversion + registration.
+**MIDI Import Wizard** -- 5-page flow: file picker with track preview, voicegroup + settings, per-track instrument mapping (GM to VG slot with auto-match and named dropdowns), song structure sequencer (define sections, arrange play order, set loop point with presets), conversion + registration. Handles Type 0 MIDIs (auto-splits to per-channel tracks).
+
+**Import .s File** -- Import songs from other projects. 3-page wizard with voicegroup compatibility check, automatic label rewrite, and registration.
 
 ### Event Editor
 
 RMXP-style visual script editor. Key features:
 - All event types (NPCs, triggers, signs, hidden items, map scripts) with numbered condition pages
 - Hidden item editor -- dedicated property panel for data-only hidden items (no script needed)
-- RMXP-style color scheme (customizable), conditions box, Set Move Route editor
-- Position overrides from OnTransition scripts, cross-reference links
+- RMXP-style color scheme (customizable via Settings > Event Colors), conditions box, Set Move Route editor with 6 category tabs
+- Position overrides from OnTransition scripts, cross-reference links, Set Flag → Page linking
 - Script Lookup (Ctrl+Shift+F) -- project-wide search across 5,300+ labels
 - 84+ command widgets, drag-to-reorder, right-click context menu, Go To navigation
 - Go To button in command edit dialogs -- double-click a call/goto/conditional and navigate directly to the target script
 - Plain English display names for all constants (flags, vars, weather, sounds, fade types)
-- Move Camera cutscene tool -- pan, fade, shake, weather, sound, timing in one dialog
-- Sound preview buttons on playbgm/playse/playfanfare commands (plays in background without switching tabs)
+- Move Camera cutscene tool -- pan, slide, screen effects, weather, sound, timing in one 6-tab dialog
+- Sound preview buttons on playbgm/playse/playfanfare commands (plays in background without switching tabs), with "Open in Sound Editor" button
+- Script templates (NPC, Sign, Map Script, Standard Wrapper, Field Object)
+- Comprehensive tooltips on all controls, command dialogs, and command selector palette (toggleable in Settings)
 
 ### Maps
 
 Map renaming, group management, section renaming, move/delete maps, warp validation.
 
-### Layouts & Tilesets
+### Tilesets (Tilemap Editor)
+
+GBA `.bin` tilemap viewer and editor:
+
+- **Open any tilemap** from `graphics/` — auto-discovers matching tile sheet (`.png`) and palettes (`.pal` files)
+- **Rendered preview** with correct palettes, tile flips, and zoom (1-8x) with grid overlay
+- **Paint tool** — click/drag tiles from the tile picker onto the tilemap
+- **Eyedropper tool** — pick tiles from the tilemap
+- **Per-tile controls** — palette slot, horizontal/vertical flip
+- **Tile offset** — VRAM base address spinner (0-1023) for games that load tile sheets at non-zero offsets
+- **Dimension re-wrap** — changing width auto-recalculates height to keep all tilemap entries (never truncates)
+- **Visual palette editor** — 16 palette slots shown as color swatch rows. Right-click for Import .pal (JASC format), Export .pal, Extract from PNG, Export All. Color-coded slot labels: white = loaded & used, red = needed & missing, grey = loaded & unused
+- **Smart palette fallback** — when a tile references a palette slot with no data, falls back to palette 0 (handles 4bpp PNGs with a single palette used across multiple VRAM slots at runtime)
+- **Palette source toggle** — "Auto .pal files" (loads from project's palette directory) or "Tile sheet colors" (uses PNG color table)
+- **Save** back to `.bin`
+
+### Layouts
 
 Layout renaming/deletion, orphan cleanup, tileset reassignment, secondary tileset renaming.
 
@@ -147,7 +167,7 @@ Three sub-tabs for editing in-game text:
 
 ### Diagnostics
 
-ROM build diagnostics dashboard. Shows EWRAM/IWRAM/ROM usage bars, section-by-section memory breakdown, build warnings/errors summary, and quick links to problem files. Helps catch memory overflows before they become runtime crashes.
+ROM build diagnostics dashboard. Shows ROM size (progress bars for 16MB and 32MB limits), EWRAM usage (256 KB) and IWRAM usage (32 KB) with color-coded progress bars (green/amber/red), section breakdown (.text, .rodata, .data, .bss from ELF), build type (modern vs legacy), and song/map/species counts. Parses .map and .elf files. Helps catch memory overflows before they become runtime crashes.
 
 ### Config
 
