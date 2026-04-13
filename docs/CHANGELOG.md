@@ -1,3 +1,19 @@
+## [2026-04-13] — Audit Fix: rename/delete ghost entries + stray .mid safety
+
+### Type
+Bug Fix (found during audit)
+
+### Summary
+**Rename/delete leaving ghost entries in midi.cfg:** The new preserve-and-update logic in write_midi_cfg() would keep old entries that were renamed or deleted, because they appeared "unmanaged." Fixed by adding a `removed_midi_files` parameter — rename_song() and delete_song() now explicitly tell write_midi_cfg which old .mid basenames to remove.
+
+**Stray .mid cleanup deleting SE .mid files:** Part 2 of cleanup_orphaned_songs() only checked `known_labels` from song_table.inc when deciding if a .mid file was "stray." SE .mid files (not in song_table) would be incorrectly treated as stray and deleted. Fixed by also checking entries parsed from midi.cfg before deleting any .mid file.
+
+### Files Changed
+- core/sound/song_table_manager.py — write_midi_cfg() gains `removed_midi_files` param, rename_song()/delete_song()/cleanup_orphaned_songs() pass removed sets, stray .mid cleanup checks midi.cfg entries
+- docs/BUGS.md — Updated stale orphan cleanup entry
+
+---
+
 ## [2026-04-13] — CRITICAL FIX: write_midi_cfg dropping 124 SE sound effect entries
 
 ### Type

@@ -271,12 +271,12 @@ Tracked bugs, confirmed root causes, and fix status. This file persists across s
 - **DO NOT CHANGE:** The `os.utime()` calls in `write_midi_cfg()` (touches all .s) and the .mid backdating in the four .s-writing paths. Removing any of them allows `make` to overwrite tool-edited .s files with garbage from placeholder .mid files. This silently destroys user's music data.
 
 ### BUG: Orphaned song registrations left behind after failed imports or inconsistent deletes
-- **Status:** FIXED (2026-04-08)
+- **Status:** FIXED (2026-04-08), **REVISED (2026-04-13)**
 - **Files:** `core/sound/song_table_manager.py`, `core/sound/midi_importer.py`, `ui/sound_editor_tab.py`
-- **Evidence:** After deleting songs (mus_kakariko, mus_test, mus_battletest_final, mus_fairy_fountain, mus_fairy_fountain_2), their entries remained in `song_table.inc`, `songs.h`, and `midi.cfg`. Build failed with "undefined reference" errors because the .s files were gone but the registrations still existed.
-- **Root cause:** Two issues: (1) When a MIDI import fails (mid2agb error), the cleanup code tried to delete the original filename (`battletest_FINAL.mid`) instead of the label-based name (`mus_battletest_final.mid`) that was actually saved. The orphaned .mid broke the build, and partial import state could leave registrations without .s files. (2) No mechanism existed to detect or clean up orphaned registrations — songs registered in config files but with no .s file on disk.
-- **Fix:** (1) Fixed `import_midi()` cleanup path to use `label + ".mid"` matching what `run_mid2agb()` actually writes. (2) Added `cleanup_orphaned_songs()` function that does TWO things: scans for MUS_* entries with missing .s files and removes them from all three config files, AND scans for stray .mid files whose stem doesn't match any registered song label and deletes them. (3) Sound editor runs this cleanup automatically on project load and F5 refresh.
-- **DO NOT CHANGE:** The `cleanup_orphaned_songs()` auto-run in `sound_editor_tab.py`'s `load_project()`. Removing it means orphaned registrations and stray MIDIs silently accumulate and break builds. Also do not change the cleanup filename in `import_midi()` back to `os.path.basename(midi_path)` — must use `label + ".mid"`. Do not remove the stray .mid scanner — the Makefile wildcard picks up ALL .mid files in the directory and tries to build them.
+- **Evidence:** After deleting songs, their entries remained in `song_table.inc`, `songs.h`, and `midi.cfg`. Build failed with "undefined reference" errors.
+- **Root cause:** (1) MIDI import cleanup used wrong filename. (2) No mechanism to clean up orphaned registrations.
+- **Fix:** (1) Fixed `import_midi()` cleanup path to use `label + ".mid"`. (2) `cleanup_orphaned_songs()` exists for manual use but is **NO LONGER auto-run** on project load (see BUG above — auto-run destroyed all songs when .s files were absent after git pull). Stray .mid cleanup now also checks midi.cfg entries, not just song_table.inc labels, to avoid deleting SE sound effect .mid files.
+- **DO NOT CHANGE:** Do NOT re-add automatic `cleanup_orphaned_songs()` to `load_project()`. The .s files are build artifacts that don't exist until compilation. Also do not change the import cleanup filename back to `os.path.basename(midi_path)` — must use `label + ".mid"`.
 
 ---
 

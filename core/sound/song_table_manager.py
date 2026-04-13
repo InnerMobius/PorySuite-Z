@@ -270,7 +270,8 @@ def write_songs_h(project_root: str, data: SongTableData):
         f.writelines(lines)
 
 
-def write_midi_cfg(project_root: str, data: SongTableData):
+def write_midi_cfg(project_root: str, data: SongTableData,
+                   removed_midi_files: set[str] | None = None):
     """Write the midi.cfg file, preserving entries not in our data model.
 
     midi.cfg contains build rules for ALL songs — both MUS_ (background music)
@@ -280,8 +281,14 @@ def write_midi_cfg(project_root: str, data: SongTableData):
 
     Strategy: read the existing file, update/add/remove only entries whose
     label matches one in our data, and leave everything else untouched.
+
+    Args:
+        removed_midi_files: optional set of midi filenames (e.g. 'mus_old.mid')
+            that should be REMOVED from the file. Used by delete_song and
+            rename_song to clean up old entries.
     """
     cfg_path = os.path.join(project_root, 'sound', 'songs', 'midi', 'midi.cfg')
+    removed = removed_midi_files or set()
 
     # Build a set of midi filenames we manage
     managed: dict[str, SongEntry] = {}
@@ -303,7 +310,10 @@ def write_midi_cfg(project_root: str, data: SongTableData):
                 m = _RE_CFG_LINE.match(stripped)
                 if m:
                     midi_file = m.group(1)
-                    if midi_file in managed:
+                    if midi_file in removed:
+                        # Explicitly removed — skip this line
+                        continue
+                    elif midi_file in managed:
                         # Replace with our version
                         seen_managed.add(midi_file)
                         entry = managed[midi_file]
@@ -394,7 +404,7 @@ def rename_song(
     # Write all three config files
     write_songs_h(project_root, data)
     write_song_table(project_root, data)
-    write_midi_cfg(project_root, data)
+    write_midi_cfg(project_root, data, removed_midi_files={old_midi})
     data.rebuild_indices()
 
     # Rename the .s file
@@ -436,6 +446,7 @@ def delete_song(
         raise ValueError(f"Song '{constant}' not found in song table")
 
     label = entry.label
+    deleted_midi = entry.midi_filename or (label + '.mid')
 
     # Remove the entry
     data.entries.remove(entry)
@@ -447,7 +458,7 @@ def delete_song(
     # Write all three config files
     write_songs_h(project_root, data)
     write_song_table(project_root, data)
-    write_midi_cfg(project_root, data)
+    write_midi_cfg(project_root, data, removed_midi_files={deleted_midi})
     data.rebuild_indices()
 
     # Delete the .s file and .mid file
@@ -499,8 +510,10 @@ def cleanup_orphaned_songs(project_root: str) -> list[str]:
             orphans.append(entry)
 
     if orphans:
+        removed_midis = set()
         for orphan in orphans:
             cleaned.append(orphan.constant)
+            removed_midis.add(orphan.midi_filename or (orphan.label + '.mid'))
             data.entries.remove(orphan)
 
         # Re-index remaining entries (no gaps)
@@ -510,7 +523,7 @@ def cleanup_orphaned_songs(project_root: str) -> list[str]:
         # Rewrite all three config files
         write_songs_h(project_root, data)
         write_song_table(project_root, data)
-        write_midi_cfg(project_root, data)
+        write_midi_cfg(project_root, data, removed_midi_files=removed_midis)
         data.rebuild_indices()
 
         # Clean up orphaned .mid files and build artifacts
@@ -526,13 +539,21 @@ def cleanup_orphaned_songs(project_root: str) -> list[str]:
                     os.remove(obj_path)
 
     # ── 2. Stray .mid files (not matching any registered song label) ──
+    # NOTE: known_labels comes from song_table.inc, which does NOT include
+    # all SE_ entries that exist only in midi.cfg.  Only delete a .mid file
+    # if it also has NO entry in midi.cfg (check both sources).
     known_labels = {e.label for e in data.entries}
+    cfg_labels: set[str] = set()
+    existing_cfg = _parse_midi_cfg(os.path.join(midi_dir, 'midi.cfg'))
+    for midi_file in existing_cfg:
+        cfg_labels.add(midi_file[:-4] if midi_file.endswith('.mid') else midi_file)
+
     if os.path.isdir(midi_dir):
         for fn in os.listdir(midi_dir):
             if not fn.endswith('.mid'):
                 continue
             stem = fn[:-4]  # strip '.mid'
-            if stem not in known_labels:
+            if stem not in known_labels and stem not in cfg_labels:
                 stray_path = os.path.join(midi_dir, fn)
                 try:
                     os.remove(stray_path)
