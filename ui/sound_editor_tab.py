@@ -360,17 +360,15 @@ class SoundEditorTab(QWidget):
         self._samples_loaded = False
 
         try:
-            from core.sound.song_table_manager import (
-                load_song_table, cleanup_orphaned_songs)
+            from core.sound.song_table_manager import load_song_table
             from core.sound.voicegroup_parser import load_voicegroup_data
 
-            # Auto-clean orphaned song registrations (entries in config files
-            # with no .s file on disk). This catches leftovers from failed
-            # imports, manual file deletions, or any other inconsistency.
-            removed = cleanup_orphaned_songs(project_root)
-            if removed:
-                _log.info("Cleaned up %d orphaned song(s): %s",
-                          len(removed), ', '.join(removed))
+            # NOTE: Do NOT call cleanup_orphaned_songs() here.
+            # .s files are build artifacts — they don't exist until the project
+            # is compiled.  Treating missing .s as "orphaned" and auto-deleting
+            # from songs.h / song_table.inc / midi.cfg is catastrophic after a
+            # fresh git pull (all .s files are gitignored, so git clean removes
+            # them all, and the cleanup nukes every MUS_ entry).
 
             self._song_table = load_song_table(project_root)
             self._voicegroup_data = load_voicegroup_data(project_root)
@@ -469,6 +467,28 @@ class SoundEditorTab(QWidget):
         self._song_tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self._update_count_label()
 
+        # Check how many songs are missing .s files and show a build notice
+        midi_dir = os.path.join(self._project_root, "sound", "songs", "midi")
+        missing_count = 0
+        mus_count = 0
+        for entry in self._song_table.entries:
+            if not entry.constant.startswith("MUS_"):
+                continue
+            mus_count += 1
+            s_path = os.path.join(midi_dir, f"{entry.label}.s")
+            if not os.path.isfile(s_path):
+                missing_count += 1
+
+        if missing_count > 0 and missing_count == mus_count:
+            self._song_name_label.setText(
+                "Build required — no .s assembly files found. "
+                "Run Project > Make (Ctrl+M) to compile the project first, "
+                "then reopen this tab.")
+        elif missing_count > 0:
+            self._song_name_label.setText(
+                f"{missing_count} of {mus_count} songs are missing .s files. "
+                "Run Project > Make (Ctrl+M) to generate them.")
+
     def _update_count_label(self):
         """Update the visible/total count label."""
         visible = 0
@@ -544,7 +564,20 @@ class SoundEditorTab(QWidget):
         self._song_name_label.setText(entry.friendly_name)
         self._song_const_label.setText(f"{entry.constant}  (#{entry.index})")
 
-        if song:
+        if song == "MISSING_S_FILE":
+            # .s assembly file doesn't exist — needs a build
+            self._detail_voicegroup.setText(f"Voicegroup: VG{entry.voicegroup_index}")
+            self._btn_goto_vg.setVisible(False)
+            self._detail_tracks.setText(
+                "Build required — the .s assembly file for this song "
+                "does not exist yet. Run Project > Make (Ctrl+M) first.")
+            self._detail_tempo.setText("")
+            self._detail_reverb.setText("")
+            self._detail_volume.setText("")
+            self._detail_loop.setText("")
+            self._btn_play.setEnabled(False)
+            self._btn_piano_roll.setEnabled(False)
+        elif song:
             from core.sound.song_parser import get_song_tempo, get_loop_info
             bpm = get_song_tempo(song)
             loop_start, loop_end = get_loop_info(song)
@@ -859,6 +892,9 @@ class SoundEditorTab(QWidget):
         s_file = os.path.join(midi_dir, f"{entry.label}.s")
 
         if not os.path.isfile(s_file):
+            # Store a sentinel so the UI shows "build required" instead of
+            # silently treating it as an unparseable song
+            self._all_songs[entry.label] = "MISSING_S_FILE"
             return
 
         try:

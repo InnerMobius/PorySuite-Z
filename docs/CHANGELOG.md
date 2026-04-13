@@ -1,3 +1,19 @@
+## [2026-04-13] — CRITICAL FIX: Sound Editor auto-deleting all songs on project load
+
+### Type
+Critical Bug Fix
+
+### Summary
+**cleanup_orphaned_songs() was running automatically every time the Sound Editor tab loaded.** It checks for MUS_ entries whose .s assembly file doesn't exist on disk and deletes them from songs.h, song_table.inc, and midi.cfg. After a fresh `git pull` (which runs `git clean -fd` removing all .s files since they're gitignored build artifacts), the function treated EVERY song as "orphaned" and nuked all MUS_ constants. This caused build failures like `MUS_CAUGHT_INTRO undeclared` — the constant had been deleted from songs.h by PorySuite without the user saving.
+
+**Fix:** Removed the automatic `cleanup_orphaned_songs()` call from `load_project()`. The .s files are build artifacts that may not exist until the project is compiled — their absence does NOT mean the song is orphaned. Also added "Build required" notice in the song details panel and list header when .s files are missing, telling users to run Project > Make (Ctrl+M) first.
+
+### Files Changed
+- ui/sound_editor_tab.py — Removed automatic cleanup_orphaned_songs() call, added "MISSING_S_FILE" sentinel in _parse_song(), "Build required" message in song details when .s file missing, build notice banner in _populate_song_list() when all .s files are absent
+- docs/BUGS.md — New entry documenting the bug, root cause, and DO NOT CHANGE warning
+
+---
+
 ## [2026-04-13] — Porymap Integration: Version Tracking, Self-Update Detection, Re-Patch Warning
 
 ### Type

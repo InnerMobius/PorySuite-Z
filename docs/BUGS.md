@@ -60,6 +60,18 @@ Tracked bugs, confirmed root causes, and fix status. This file persists across s
 
 ---
 
+## Sound Editor — Data Corruption
+
+### BUG: Opening Sound Editor after git pull deletes all MUS_ songs from config files
+- **Status:** FIXED (2026-04-13)
+- **Files:** `ui/sound_editor_tab.py`, `core/sound/song_table_manager.py`
+- **Evidence:** Fresh `git fetch` + `git reset --hard` + `git clean -fd` → open Sound Editor → build fails with `MUS_CAUGHT_INTRO` undeclared. All MUS_ constants removed from songs.h.
+- **Root cause:** `cleanup_orphaned_songs()` runs automatically on Sound Editor tab load (line 370). It checks for every MUS_ entry whose `.s` assembly file doesn't exist on disk and DELETES the entry from songs.h, song_table.inc, and midi.cfg. After a fresh git pull, `git clean -fd` removes all `.s` files (they're gitignored build artifacts). So the cleanup sees EVERY song as "orphaned" and nukes them all. Also deletes their .mid files.
+- **Fix:** Removed the automatic `cleanup_orphaned_songs()` call from `load_project()`. Orphan cleanup should NEVER run automatically — it's a destructive operation that modifies source files. If needed in the future, it must be a manual action with a confirmation dialog.
+- **DO NOT CHANGE:** Do NOT re-add automatic orphan cleanup to `load_project()`. The .s files are build artifacts that may not exist until the project is compiled. Their absence does NOT mean the song is orphaned.
+
+---
+
 ## Piano Roll — Playback
 
 ### BUG: BEND state incorrectly reset on loop wrap
