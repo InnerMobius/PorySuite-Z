@@ -327,6 +327,49 @@ def inject_bridge_script(project_dir: str):
     _write_cfg(cfg_path, data)
 
 
+def ensure_bridge_gitignored(project_dir: str):
+    """Ensure PorySuite bridge files are in the project's .gitignore.
+
+    These files are ephemeral IPC artifacts that should never be committed:
+    - porysuite_bridge.json  (Porymap → PorySuite messages)
+    - porysuite_command.json (PorySuite → Porymap commands)
+    - porymap.user.cfg       (per-project Porymap settings, user-specific)
+    """
+    gitignore_path = os.path.join(project_dir, ".gitignore")
+    entries_needed = [
+        "porysuite_bridge.json",
+        "porysuite_command.json",
+        "porymap.user.cfg",
+    ]
+
+    # Read existing .gitignore
+    existing = ""
+    if os.path.isfile(gitignore_path):
+        try:
+            with open(gitignore_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+        except OSError:
+            return
+
+    # Check which entries are missing
+    lines = existing.splitlines()
+    missing = [e for e in entries_needed if e not in lines]
+    if not missing:
+        return
+
+    # Append missing entries
+    try:
+        with open(gitignore_path, "a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write("\n# PorySuite bridge files (auto-added, do not commit)\n")
+            for entry in missing:
+                f.write(f"{entry}\n")
+        log.info(f"Added {len(missing)} entries to {gitignore_path}")
+    except OSError:
+        pass
+
+
 # ─── Process detection ────────────────────────────────────────────────────────
 
 def is_porymap_running() -> bool:

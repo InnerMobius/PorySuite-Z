@@ -1567,6 +1567,9 @@ QTabBar::tab:hover:!selected {
                 "--exclude=project.json",
                 "--exclude=src/data/*.json",
                 "--exclude=temp",
+                "--exclude=porysuite_bridge.json",
+                "--exclude=porysuite_command.json",
+                "--exclude=porymap.user.cfg",
             ]
             _clean_label = "git clean -fd  (excluding PorySuite data files)"
             _steps.append((_clean_args, 60, _clean_label))

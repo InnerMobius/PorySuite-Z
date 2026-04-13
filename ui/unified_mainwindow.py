@@ -35,6 +35,7 @@ from app_info import get_settings_path
 from suppress_dialog import maybe_exec
 from porymap_bridge.porymap_launcher import (
     is_porymap_installed, launch_porymap, inject_bridge_script,
+    ensure_bridge_gitignored,
     _send_command,
     is_porymap_patched,
     get_installed_porymap_info,
@@ -809,6 +810,13 @@ class UnifiedMainWindow(QMainWindow):
         if project_dir and is_porymap_installed():
             try:
                 inject_bridge_script(project_dir)
+            except Exception:
+                pass
+
+        # Ensure bridge IPC files are in the project's .gitignore
+        if project_dir:
+            try:
+                ensure_bridge_gitignored(project_dir)
             except Exception:
                 pass
 
