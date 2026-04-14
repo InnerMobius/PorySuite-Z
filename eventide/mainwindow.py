@@ -444,8 +444,20 @@ class EventideMainWindow(QMainWindow):
                     pass
 
         lbl.setText(f"\u238b {branch}{dirty_part}{ab_part}")
+
+        # Color-code: red for main/master, default otherwise
+        if branch in ("main", "master"):
+            lbl.setStyleSheet(
+                "QLabel { color: #e06c75; font-weight: bold; padding: 0 6px; }"
+            )
+        else:
+            lbl.setStyleSheet(
+                "QLabel { padding: 0 6px; }"
+            )
+
         lbl.setToolTip(
             f"Branch: {branch}"
+            + (" ⚠ Protected branch!" if branch in ("main", "master") else "")
             + (f"\n{len(dirty_lines)} uncommitted file(s)" if dirty_lines else "")
             + (f"\n{ahead} commit(s) ahead of origin" if ahead else "")
             + (f"\n{behind} commit(s) behind origin" if behind else "")
@@ -901,6 +913,8 @@ class EventideMainWindow(QMainWindow):
         dlg.exec()
 
     def _git_push(self) -> None:
+        """Push to Remote — with branch selector, main/master protection,
+        and first-push detection."""
         if not self.project_info:
             return
         project_dir = self.project_info.get("dir", "")
@@ -912,32 +926,191 @@ class EventideMainWindow(QMainWindow):
         if not remote_url:
             QMessageBox.warning(
                 self, "Push to Remote",
-                "No remote is configured.\n\nUse Git \u2192 Configure Remote... to set one first."
+                "No remote is configured.\n\nUse Git \u2192 Configure Remote\u2026 to set one first."
             )
             return
 
-        _, branch = self._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
-        if not branch:
-            branch = "HEAD"
+        _, current_branch = self._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
+        current_branch = (current_branch or "HEAD").strip()
 
-        _, ahead_log = self._git_run(
-            "log", "--oneline", f"origin/{branch}..HEAD", timeout=10,
+        # Get all local branches
+        _, branches_out = self._git_run(
+            "branch", "--format=%(refname:short)", timeout=10
         )
-        ahead_label = f"\n\nCommits to push:\n{ahead_log}" if ahead_log else "\n\n(No commits ahead of origin — push anyway?)"
+        all_branches = [b.strip() for b in (branches_out or "").splitlines() if b.strip()]
+        if not all_branches:
+            all_branches = [current_branch]
 
-        ans = maybe_exec(
-            key="git_push_confirm",
-            parent=self,
-            title="Push to Remote",
-            text=f"Push branch  {branch}  \u2192  {remote_url}?{ahead_label}",
-            icon=QMessageBox.Icon.Question,
-            buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            default_button=QMessageBox.StandardButton.Yes,
+        # ── Build push dialog ─────────────────────────────────────────────────
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+            QPlainTextEdit, QPushButton,
         )
-        if ans != QMessageBox.StandardButton.Yes:
+        from PyQt6.QtGui import QFont
+        from PyQt6.QtCore import Qt as _Qt
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Push to Remote")
+        dlg.setMinimumWidth(520)
+        vlay = QVBoxLayout(dlg)
+
+        # Branch selector
+        branch_row = QHBoxLayout()
+        branch_row.addWidget(QLabel("<b>Branch to push:</b>"))
+        branch_combo = QComboBox()
+        branch_combo.setFocusPolicy(_Qt.FocusPolicy.StrongFocus)
+        branch_combo.installEventFilter(self._combo_wheel_filter())
+        for b in all_branches:
+            branch_combo.addItem(b)
+        idx = branch_combo.findText(current_branch)
+        if idx >= 0:
+            branch_combo.setCurrentIndex(idx)
+        branch_row.addWidget(branch_combo, 1)
+        vlay.addLayout(branch_row)
+
+        # Remote info
+        remote_lbl = QLabel(f"<b>Remote:</b>  {remote_url.strip()}")
+        remote_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        vlay.addWidget(remote_lbl)
+
+        # Warning label (updates dynamically)
+        warn_lbl = QLabel("")
+        warn_lbl.setWordWrap(True)
+        warn_lbl.setStyleSheet("font-size: 12px;")
+        vlay.addWidget(warn_lbl)
+
+        # Ahead log
+        ahead_text = QPlainTextEdit()
+        ahead_text.setReadOnly(True)
+        ahead_text.setFont(QFont("Courier New", 9))
+        ahead_text.setMaximumHeight(140)
+        vlay.addWidget(ahead_text)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        new_branch_btn = QPushButton("Create New Branch\u2026")
+        push_btn = QPushButton("Push")
+        push_btn.setDefault(True)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(new_branch_btn)
+        btn_row.addWidget(push_btn)
+        btn_row.addWidget(cancel_btn)
+        vlay.addLayout(btn_row)
+
+        PROTECTED = {"main", "master"}
+
+        def _refresh_push_info():
+            sel = branch_combo.currentText()
+            _, ahead_log = self._git_run(
+                "log", "--oneline", f"origin/{sel}..HEAD", timeout=10
+            )
+            ahead_lines = [l for l in (ahead_log or "").splitlines() if l.strip()]
+
+            if ahead_lines:
+                ahead_text.setPlainText("\n".join(ahead_lines))
+                ahead_text.show()
+            else:
+                ahead_text.setPlainText("")
+                ahead_text.hide()
+
+            # Check if branch exists on remote
+            _, remote_check = self._git_run(
+                "ls-remote", "--heads", "origin", sel, timeout=15
+            )
+            is_first_push = not bool((remote_check or "").strip())
+
+            parts = []
+            if sel in PROTECTED:
+                parts.append(
+                    f"\u26a0 <b>You are pushing directly to '{sel}'.</b><br>"
+                    f"This is the main branch \u2014 everyone pulling from this remote "
+                    f"will get these changes immediately. If your work is not ready, "
+                    f"consider creating a feature branch instead."
+                )
+            if is_first_push:
+                parts.append(
+                    f"\u2139  Branch '{sel}' does not exist on the remote yet. "
+                    f"This push will create it."
+                )
+            if not ahead_lines:
+                parts.append("No commits ahead of origin \u2014 nothing new to push.")
+
+            if parts:
+                warn_lbl.setText("<br><br>".join(parts))
+                if sel in PROTECTED:
+                    warn_lbl.setStyleSheet(
+                        "font-size: 12px; color: #e8a44a; "
+                        "background: #3a2a10; padding: 8px; border-radius: 4px;"
+                    )
+                else:
+                    warn_lbl.setStyleSheet("font-size: 12px; color: #aaa;")
+                warn_lbl.show()
+            else:
+                count = len(ahead_lines)
+                warn_lbl.setText(f"\u2713  {count} commit(s) ready to push to '{sel}'.")
+                warn_lbl.setStyleSheet("font-size: 12px; color: #7cbb5e;")
+                warn_lbl.show()
+
+            if sel in PROTECTED:
+                push_btn.setText("\u26a0 Push to " + sel)
+                push_btn.setStyleSheet(
+                    "QPushButton { background: #5a3a10; color: #e8a44a; font-weight: bold; }"
+                )
+            else:
+                push_btn.setText("Push")
+                push_btn.setStyleSheet("")
+
+        branch_combo.currentTextChanged.connect(lambda _: _refresh_push_info())
+        _refresh_push_info()
+
+        def _create_and_switch():
+            from PyQt6.QtWidgets import QInputDialog
+            name, ok = QInputDialog.getText(dlg, "New Branch", "Branch name:")
+            if not ok or not name.strip():
+                return
+            name = name.strip().replace(" ", "-")
+            ok2, msg = self._git_run("checkout", "-b", name, timeout=15)
+            if ok2:
+                branch_combo.addItem(name)
+                branch_combo.setCurrentText(name)
+                self._git_refresh_status_bar()
+            else:
+                QMessageBox.warning(dlg, "New Branch", f"Failed:\n{msg}")
+
+        new_branch_btn.clicked.connect(_create_and_switch)
+
+        chosen_branch = [None]
+
+        def _do_push():
+            sel = branch_combo.currentText()
+            if sel in PROTECTED:
+                ans = QMessageBox.warning(
+                    dlg,
+                    f"Push to {sel}?",
+                    f"You are about to push directly to '{sel}'.\n\n"
+                    f"This will update the remote immediately. Anyone pulling "
+                    f"from this remote will receive these changes.\n\n"
+                    f"Are you sure? Consider using a feature branch if your "
+                    f"work is incomplete.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    return
+            chosen_branch[0] = sel
+            dlg.accept()
+
+        push_btn.clicked.connect(_do_push)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted or not chosen_branch[0]:
             return
 
-        self.statusBar().showMessage(f"Pushing {branch} to origin...", 0)
+        branch = chosen_branch[0]
+
+        # ── Execute push in background thread ─────────────────────────────────
+        self.statusBar().showMessage(f"Pushing {branch} to origin\u2026", 0)
         self._refresh_action.setEnabled(False)
         self._git_set_all_enabled(False)
 
@@ -960,7 +1133,7 @@ class EventideMainWindow(QMainWindow):
                     out = (r.stdout + r.stderr).strip()
                     self.done.emit(r.returncode == 0, out)
                 except FileNotFoundError:
-                    self.done.emit(False, "git not found — install Git for Windows.")
+                    self.done.emit(False, "git not found \u2014 install Git for Windows.")
                 except subprocess.TimeoutExpired:
                     self.done.emit(False, "git push timed out after 3 minutes.")
                 except Exception as exc:
@@ -981,6 +1154,20 @@ class EventideMainWindow(QMainWindow):
 
         worker.done.connect(_on_done)
         worker.start()
+
+    def _combo_wheel_filter(self):
+        """Return a shared event filter that blocks wheel events on unfocused combo boxes."""
+        filt = getattr(self, "_wheel_filter_instance", None)
+        if filt is not None:
+            return filt
+        from PyQt6.QtCore import QObject, QEvent
+        class _WheelBlocker(QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.Type.Wheel and not obj.hasFocus():
+                    return True
+                return False
+        self._wheel_filter_instance = _WheelBlocker(self)
+        return self._wheel_filter_instance
 
     def _git_configure_remote(self) -> None:
         """Placeholder — handled by the git panel's remotes section."""

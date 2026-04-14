@@ -1,3 +1,24 @@
+## [2026-04-14] — Git Push Safeguards: Branch Selector, Main/Master Protection
+
+### Type
+Feature / Safety
+
+### Summary
+**Push dialog now includes a branch selector** populated with all real local branches. You can pick which branch to push instead of always pushing whatever you're currently on. A "Create New Branch…" button lets you make a feature branch right from the push dialog.
+
+**Main/master branch protection:** When pushing to `main` or `master`, the dialog shows an amber warning explaining this is the main branch and suggesting a feature branch. The Push button changes to "⚠ Push to main" with warning styling, and clicking it triggers a second confirmation dialog. The status bar branch indicator turns red when on main/master with a "Protected branch!" tooltip.
+
+**First-push detection:** When a branch doesn't exist on the remote yet, the dialog shows a notice that this push will create it.
+
+**Git panel push section** updated to show amber warning when commits are pending on main/master. All safeguards applied to both PorySuite and EVENTide.
+
+### Files Changed
+- ui/mainwindow.py — `_git_push()` rewritten with branch selector dialog, protection warnings, first-push detection; `_git_refresh_status_bar()` red styling for main/master; new `_combo_wheel_filter()` helper
+- eventide/mainwindow.py — Same `_git_push()` rewrite, status bar red styling, wheel filter helper
+- ui/dialogs/git_panel.py — Push section button renamed with tooltip, `_refresh_push()` shows amber warning for main/master
+
+---
+
 ## [2026-04-13] — Audit Fix: rename/delete ghost entries + stray .mid safety
 
 ### Type

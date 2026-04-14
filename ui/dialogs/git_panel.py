@@ -332,8 +332,9 @@ class GitPanel(QDialog):
         info_row.addWidget(self._push_ahead_lbl)
         lay.addLayout(info_row)
 
-        push_btn = QPushButton("⬆  Push to origin")
-        push_btn.setFixedWidth(150)
+        push_btn = QPushButton("⬆  Push to origin…")
+        push_btn.setFixedWidth(160)
+        push_btn.setToolTip("Opens the push dialog where you can choose a branch.")
         push_btn.clicked.connect(self._mw._git_push)
 
         btn_row = QHBoxLayout()
@@ -356,7 +357,14 @@ class GitPanel(QDialog):
         )
         ahead = [l for l in (ahead_out or "").splitlines() if l.strip()]
         if ahead:
-            self._push_ahead_lbl.setText(f"↑ {len(ahead)} commit(s) ready to push")
+            if branch in ("main", "master"):
+                self._push_ahead_lbl.setText(
+                    f"⚠ ↑ {len(ahead)} commit(s) on '{branch}' — consider a feature branch"
+                )
+                self._push_ahead_lbl.setStyleSheet("font-size: 11px; color: #e8a44a;")
+            else:
+                self._push_ahead_lbl.setText(f"↑ {len(ahead)} commit(s) ready to push")
+                self._push_ahead_lbl.setStyleSheet("font-size: 11px; color: #7cbb5e;")
         else:
             self._push_ahead_lbl.setText("Up to date with origin")
             self._push_ahead_lbl.setStyleSheet("font-size: 11px; color: #aaa;")
