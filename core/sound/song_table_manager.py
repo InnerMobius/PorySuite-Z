@@ -332,6 +332,22 @@ def write_midi_cfg(project_root: str, data: SongTableData,
     with open(cfg_path, 'w', encoding='utf-8') as f:
         f.writelines(existing_lines)
 
+    # CRITICAL: midi.cfg is a Makefile dependency for EVERY .s file.
+    # Rewriting midi.cfg makes its mtime newer than all .s files, so the
+    # next `make` will re-run mid2agb on EVERY song.  For songs with
+    # placeholder .mid files (e.g. .s-imported or piano-roll-edited songs),
+    # mid2agb produces empty/garbage output that wipes the real music.
+    #
+    # Fix: touch every .s file so they're all newer than midi.cfg.
+    midi_dir = os.path.dirname(cfg_path)
+    for fn in os.listdir(midi_dir):
+        if fn.endswith('.s'):
+            s_path = os.path.join(midi_dir, fn)
+            try:
+                os.utime(s_path)
+            except OSError:
+                pass
+
 
 def _format_cfg_line(entry: SongEntry) -> str:
     """Format a single midi.cfg line from a SongEntry."""
@@ -351,23 +367,6 @@ def _format_cfg_line(entry: SongEntry) -> str:
         flags.append(f'-P{entry.priority}')
 
     return f'{padded_fn} {" ".join(flags)}'
-
-    # CRITICAL: midi.cfg is a Makefile dependency for EVERY .s file.
-    # Rewriting midi.cfg makes its mtime newer than all .s files, so the
-    # next `make` will re-run mid2agb on EVERY song.  For songs with
-    # placeholder .mid files (e.g. .s-imported or piano-roll-edited songs),
-    # mid2agb produces empty/garbage output that wipes the real music.
-    #
-    # Fix: touch every .s file so they're all newer than midi.cfg.
-    midi_dir = os.path.dirname(cfg_path)
-    cfg_mtime = os.stat(cfg_path).st_mtime
-    for fn in os.listdir(midi_dir):
-        if fn.endswith('.s'):
-            s_path = os.path.join(midi_dir, fn)
-            try:
-                os.utime(s_path)
-            except OSError:
-                pass
 
 
 # ---------------------------------------------------------------------------
