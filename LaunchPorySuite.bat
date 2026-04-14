@@ -2,9 +2,18 @@
 REM ── Self-hide: if not already running hidden, delegate to the VBS launcher ─
 REM    PorySuite.vbs runs this bat with window-style 0 (invisible) and passes
 REM    _hidden_ so we skip this block on the second pass.
+REM    EXCEPTION: first-time setup (no venv yet) stays visible so the user
+REM    can see pip installing packages instead of staring at nothing.
 if /i not "%~1"=="_hidden_" (
-    wscript //nologo "%~dp0PorySuite.vbs"
-    exit /b 0
+    if exist "%~dp0cleanenv\Scripts\python.exe" (
+        wscript //nologo "%~dp0PorySuite.vbs"
+        exit /b 0
+    )
+    if exist "%~dp0.venv\Scripts\python.exe" (
+        wscript //nologo "%~dp0PorySuite.vbs"
+        exit /b 0
+    )
+    REM No venv yet — stay visible for first-time setup feedback
 )
 REM ──────────────────────────────────────────────────────────────────────────
 setlocal enableextensions
@@ -209,20 +218,31 @@ echo.
 where winget >nul 2>&1
 if %ERRORLEVEL%==0 (
     winget install --id Microsoft.VCRedist.2015+.x64 -e --silent --accept-package-agreements --accept-source-agreements
+    if %ERRORLEVEL% NEQ 0 (
+        echo winget VC++ install FAILED -- directing to manual download >> "%LAUNCH_LOG%"
+        goto :vcredist_manual
+    )
     echo winget VC++ install done >> "%LAUNCH_LOG%"
 ) else (
     echo winget not available -- directing to manual download >> "%LAUNCH_LOG%"
-    echo.
-    echo ============================================================
-    echo  Please download and install the Visual C++ Redistributable:
-    echo  https://aka.ms/vs/17/release/vc_redist.x64.exe
-    echo.
-    echo  After installing, RESTART YOUR PC and run this launcher again.
-    echo ============================================================
-    echo.
-    pause
-    goto :done_error
+    goto :vcredist_manual
 )
+goto :vcredist_done
+
+:vcredist_manual
+echo.
+echo ============================================================
+echo  Could not install Visual C++ runtime automatically.
+echo  Please download and install it manually:
+echo  https://aka.ms/vs/17/release/vc_redist.x64.exe
+echo.
+echo  After installing, RESTART YOUR PC and run this launcher again.
+echo ============================================================
+echo.
+pause
+goto :done_error
+
+:vcredist_done
 
 REM VC++ installs often require a reboot to take effect.
 REM Do NOT try to relaunch immediately -- the old DLL is still resident.

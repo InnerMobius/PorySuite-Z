@@ -19,6 +19,36 @@ from app_info import get_data_dir
 
 
 # ──────────────────────────────────────────────────────────────
+#  Suppress Windows system-error dialogs for bad/incompatible binaries
+# ──────────────────────────────────────────────────────────────
+
+def _suppress_win_error_dialogs():
+    """Suppress Windows 'Unsupported 16-Bit Application' and similar popups.
+
+    Calls SetErrorMode with SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+    SEM_NOOPENFILEERRORBOX so that running an incompatible .exe via subprocess
+    returns an error code instead of popping a system modal dialog.
+    Returns the previous error mode so it can be restored.
+    """
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+    SEM_FAILCRITICALERRORS = 0x0001
+    SEM_NOGPFAULTERRORBOX = 0x0002
+    SEM_NOOPENFILEERRORBOX = 0x8000
+    mode = SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+    return ctypes.windll.kernel32.SetErrorMode(mode)
+
+
+def _restore_win_error_mode(prev):
+    """Restore the previous Windows error mode."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+    ctypes.windll.kernel32.SetErrorMode(prev)
+
+
+# ──────────────────────────────────────────────────────────────
 #  Sentinel path (exported — used by app.py)
 # ──────────────────────────────────────────────────────────────
 
@@ -678,12 +708,15 @@ def _devkitarm_works() -> bool:
     gcc = r"C:\devkitPro\devkitARM\bin\arm-none-eabi-gcc.exe"
     if not os.path.isfile(gcc):
         return False
+    prev = _suppress_win_error_dialogs()
     try:
         r = subprocess.run([gcc, "--version"], capture_output=True, timeout=8,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False
+    finally:
+        _restore_win_error_mode(prev)
 
 
 # ── WSL helpers ────────────────────────────────────────────────
