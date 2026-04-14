@@ -48,8 +48,7 @@ class ProjectSelector(QMainWindow):
             '<span style="color: #999; font-size: 10px;">'
             "pokefirered projects only<br><br>"
             "Original PorySuite by jschoeny<br>"
-            "PorySuite-Z by InnerMobius<br>"
-            "Developed with Anthropic Claude Code"
+            "PorySuite-Z by InnerMobius"
             "</span>"
         )
         self.ui.label_3.setTextFormat(Qt.TextFormat.RichText)

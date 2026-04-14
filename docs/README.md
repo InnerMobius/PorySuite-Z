@@ -6,7 +6,7 @@ All edits are written back into the project's canonical `src/`, `include/`, and 
 
 ---
 
-> **WARNING: This application is developed with heavy use of AI-assisted coding. While functional, it may contain bugs that can corrupt or break your project files. ALWAYS keep backups of your decomp project (use git!) and test thoroughly after every editing session. You are responsible for verifying that your project still compiles and behaves correctly. The authors are not responsible for any lost or damaged work.**
+> **This application is in beta.** While functional, it may contain bugs that can corrupt or break your project files. **ALWAYS keep backups of your decomp project** (use git!) and test thoroughly after every editing session. You are responsible for verifying that your project still compiles and behaves correctly. The authors are not responsible for any lost or damaged work.
 
 ---
 
@@ -339,8 +339,9 @@ Build output streams in real time in-app.
 
 ---
 
-## License
+## Credits & Acknowledgements
 
-Original [PorySuite](https://github.com/jschoeny/PorySuite) by jschoeny.
-
-[Porymap](https://github.com/huderlem/porymap) by huderlem is a separate project and is **not included** in this repository. PorySuite-Z's optional installer clones and builds Porymap from its own GitHub repo on your machine. We do not distribute Porymap or any of its code.
+- **Original PorySuite** by [jschoeny](https://github.com/jschoeny/PorySuite)
+- **PorySuite-Z** by [InnerMobius](https://github.com/InnerMobius)
+- Built with the assistance of AI tools
+- [Porymap](https://github.com/huderlem/porymap) by huderlem is a separate project and is **not included** in this repository. PorySuite-Z's optional installer clones and builds Porymap from its own GitHub repo on your machine. We do not distribute Porymap or any of its code.

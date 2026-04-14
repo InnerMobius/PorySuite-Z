@@ -1538,7 +1538,7 @@ class UnifiedMainWindow(QMainWindow):
             "into a single window.</p>"
             "<p><b>Original PorySuite</b> by jschoeny<br>"
             "<b>PorySuite-Z</b> by InnerMobius<br>"
-            "Developed with <b>Anthropic Claude Code</b></p>"
+            "Built with the assistance of AI tools</p>"
         )
 
     def _refresh_eventide_constants(self):
