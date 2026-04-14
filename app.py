@@ -254,7 +254,12 @@ class App:
 
         # Create the unified window
         self.main = UnifiedMainWindow()
-        self.main.setup_pages(porysuite_win, eventide_win)
+        try:
+            self.main.setup_pages(porysuite_win, eventide_win)
+        except Exception as e:
+            print(f"[setup_pages] Error during page setup (app will continue): {e}")
+            import traceback
+            traceback.print_exc()
         self.loading_dialog.update_progress(85)
 
         # Load project info into unified window

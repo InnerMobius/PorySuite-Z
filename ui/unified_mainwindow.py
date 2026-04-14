@@ -555,10 +555,14 @@ class UnifiedMainWindow(QMainWindow):
             self._page_indices["overworld"] = idx
 
         # ── Credits editor (standalone page) ─────────────────────────────────
-        from credits_editor import CreditsEditorWidget
-        self._credits_editor = CreditsEditorWidget()
-        idx = self.stack.addWidget(self._credits_editor)
-        self._page_indices["credits"] = idx
+        try:
+            from credits_editor import CreditsEditorWidget
+            self._credits_editor = CreditsEditorWidget()
+            idx = self.stack.addWidget(self._credits_editor)
+            self._page_indices["credits"] = idx
+        except Exception as e:
+            print(f"[CreditsEditor] Failed to load: {e}")
+            import traceback; traceback.print_exc()
 
         # ── Sound Editor (standalone page) ───────────────────────────────────
         try:
@@ -584,27 +588,39 @@ class UnifiedMainWindow(QMainWindow):
             self._page_indices[name] = idx
 
         # ── Label Manager (standalone page) ─────────────────────────────────
-        from label_manager import LabelManagerWidget
-        self._label_manager = LabelManagerWidget()
-        idx = self.stack.addWidget(self._label_manager)
-        self._page_indices["labels"] = idx
+        try:
+            from label_manager import LabelManagerWidget
+            self._label_manager = LabelManagerWidget()
+            idx = self.stack.addWidget(self._label_manager)
+            self._page_indices["labels"] = idx
+        except Exception as e:
+            print(f"[LabelManager] Failed to load: {e}")
+            import traceback; traceback.print_exc()
 
         # ── ROM Diagnostics ─────────────────────────────────────────────────
-        from ui.diagnostics_tab import DiagnosticsTab
-        self._diagnostics_tab = DiagnosticsTab()
-        idx = self.stack.addWidget(self._diagnostics_tab)
-        self._page_indices["diagnostics"] = idx
+        try:
+            from ui.diagnostics_tab import DiagnosticsTab
+            self._diagnostics_tab = DiagnosticsTab()
+            idx = self.stack.addWidget(self._diagnostics_tab)
+            self._page_indices["diagnostics"] = idx
+        except Exception as e:
+            print(f"[Diagnostics] Failed to load: {e}")
+            import traceback; traceback.print_exc()
 
         # ── Tilemap Editor ──────────────────────────────────────────────────
-        from ui.tilemap_editor_tab import TilemapEditorTab
-        self._tilemap_editor = TilemapEditorTab()
-        idx = self.stack.addWidget(self._tilemap_editor)
-        self._page_indices["tilesets"] = idx
-        # Connect tilemap + tile animation editor modified signals to window dirty
-        self._tilemap_editor.modified.connect(lambda: self.setWindowModified(True))
-        anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
-        if anim_ed and hasattr(anim_ed, 'modified'):
-            anim_ed.modified.connect(lambda: self.setWindowModified(True))
+        try:
+            from ui.tilemap_editor_tab import TilemapEditorTab
+            self._tilemap_editor = TilemapEditorTab()
+            idx = self.stack.addWidget(self._tilemap_editor)
+            self._page_indices["tilesets"] = idx
+            # Connect tilemap + tile animation editor modified signals to window dirty
+            self._tilemap_editor.modified.connect(lambda: self.setWindowModified(True))
+            anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
+            if anim_ed and hasattr(anim_ed, 'modified'):
+                anim_ed.modified.connect(lambda: self.setWindowModified(True))
+        except Exception as e:
+            print(f"[TilemapEditor] Failed to load: {e}")
+            import traceback; traceback.print_exc()
 
         # ── Disconnect PorySuite's own tab-change handler ────────────────────
         # Pages have been reparented out of mainTabs, so PorySuite's

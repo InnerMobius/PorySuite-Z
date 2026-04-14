@@ -18,10 +18,18 @@ from typing import Optional
 from PIL import Image
 import numpy as np
 
-from ui.palette_utils import clamp_to_gba, write_jasc_pal, Color
+Color = tuple[int, int, int]  # (r, g, b) 0-255
 
 
 # ── GBA color helpers ────────────────────────────────────────────────────────
+
+def clamp_to_gba(r: int, g: int, b: int) -> Color:
+    """Round each channel down to a multiple of 8 (5-bit per channel)."""
+    def q(v: int) -> int:
+        v = max(0, min(255, int(v)))
+        return (v >> 3) << 3
+    return (q(r), q(g), q(b))
+
 
 def gba_clamp_palette(colors: list[Color]) -> list[Color]:
     """Clamp every color in a palette to GBA 15-bit (5 bits per channel)."""
@@ -382,7 +390,24 @@ def export_indexed_png(
 def export_palette(palette: list[Color], output_path: str) -> bool:
     """Save palette as JASC .pal file with GBA clamping."""
     clamped = gba_clamp_palette(palette)
-    return write_jasc_pal(output_path, clamped)
+    try:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    except Exception:
+        pass
+    try:
+        padded = list(clamped)
+        target_count = 256 if len(padded) > 16 else 16
+        while len(padded) < target_count:
+            padded.append((0, 0, 0))
+        padded = padded[:target_count]
+        lines = ["JASC-PAL", "0100", str(target_count)]
+        for (r, g, b) in padded:
+            lines.append(f"{r} {g} {b}")
+        with open(output_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        return True
+    except Exception:
+        return False
 
 
 # ── Image info ───────────────────────────────────────────────────────────────

@@ -672,9 +672,14 @@ class TilemapEditorTab(QWidget):
         self._tab_widget.addTab(self._anim_viewer, "Tile Animations")
 
         # -- Tab 2: Image Indexer --
-        from ui.image_indexer_tab import ImageIndexerWidget
-        self._image_indexer = ImageIndexerWidget()
-        self._tab_widget.addTab(self._image_indexer, "Image Indexer")
+        try:
+            from ui.image_indexer_tab import ImageIndexerWidget
+            self._image_indexer = ImageIndexerWidget()
+            self._tab_widget.addTab(self._image_indexer, "Image Indexer")
+        except Exception as e:
+            print(f"[ImageIndexer] Failed to load: {e}")
+            import traceback
+            traceback.print_exc()
 
         # ── Build the tilemap editor inside editor_page ──────────────────────
 

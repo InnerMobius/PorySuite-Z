@@ -28,7 +28,7 @@ from core.gba_image_utils import (
     export_indexed_png, export_palette, get_image_info,
     gba_clamp_palette, find_closest_color,
 )
-from ui.palette_utils import clamp_to_gba, read_jasc_pal, write_jasc_pal
+from ui.palette_utils import clamp_to_gba, read_jasc_pal
 
 
 # ── Stylesheets ──────────────────────────────────────────────────────────────
