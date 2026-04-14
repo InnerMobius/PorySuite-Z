@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 
 import res.resources_rc as resources_rc
 import crashlog
-from app_info import APP_NAME, AUTHOR, get_data_dir
+from app_info import APP_NAME, AUTHOR, VERSION, get_data_dir
 from loadingproject import LoadingProject
 from mainwindow import MainWindow
 from projectselector import ProjectSelector
@@ -129,6 +129,9 @@ class App:
             with open(setup_path, "w") as f:
                 f.write("complete")
 
+        # First-run disclaimer — shown once, ever
+        self._show_disclaimer_if_needed()
+
         # Get projects from projects.json
         projects = App.get_projects(data_dir)
 
@@ -211,6 +214,10 @@ class App:
 
         merged_info = p_info | local_p_info
 
+        # Per-project backup reminder — shown once per project
+        if not self._show_backup_reminder_if_needed(p_info, projects, data_dir):
+            sys.exit()
+
         self._launch_unified(merged_info, projects, data_dir)
 
         # Log where this session’s JSON log lives for easy discovery
@@ -286,6 +293,91 @@ class App:
                 self.main.windowState() | _Qt.WindowState.WindowMaximized
             )
         QTimer.singleShot(0, _force_maximize)
+
+        # Check for updates after the window is visible (non-blocking)
+        QTimer.singleShot(2000, lambda: self._check_for_updates(self.main))
+
+    # ── Disclaimer, backup reminder, update check ─────────────────────────
+
+    def _show_disclaimer_if_needed(self):
+        """Show the beta disclaimer once, ever.  Saves acceptance to settings."""
+        from PyQt6.QtCore import QSettings
+        from app_info import get_settings_path
+        s = QSettings(get_settings_path(), QSettings.Format.IniFormat)
+        if s.value("disclaimer_accepted", False, type=bool):
+            return
+        from ui.dialogs.startup_dialogs import DisclaimerDialog
+        dlg = DisclaimerDialog()
+        dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            sys.exit()
+        s.setValue("disclaimer_accepted", True)
+
+    def _show_backup_reminder_if_needed(
+        self, p_info: dict, projects: dict, data_dir: str,
+    ) -> bool:
+        """Show backup reminder the first time a project is opened.
+
+        Returns True to continue, False to abort.
+        """
+        project_dir = p_info.get("dir", "")
+        if not project_dir:
+            return True
+
+        from PyQt6.QtCore import QSettings
+        from app_info import get_settings_path
+        s = QSettings(get_settings_path(), QSettings.Format.IniFormat)
+
+        # Track acknowledged projects as a list in settings
+        acked = s.value("backup_acknowledged_projects", [], type=list) or []
+        if project_dir in acked:
+            return True
+
+        from ui.dialogs.startup_dialogs import BackupReminderDialog
+        name = p_info.get("name", os.path.basename(project_dir))
+        dlg = BackupReminderDialog(name)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+
+        acked.append(project_dir)
+        s.setValue("backup_acknowledged_projects", acked)
+        return True
+
+    @staticmethod
+    def _check_for_updates(parent_window):
+        """Check GitHub for a newer release.  Runs in the main thread
+        but is called via QTimer.singleShot so it doesn't block startup."""
+        try:
+            from core.updater import check_for_update, download_and_install, RELEASES_PAGE
+            release = check_for_update()
+            if release is None:
+                return  # Up to date or offline
+
+            from ui.dialogs.startup_dialogs import UpdateDialog
+            dlg = UpdateDialog(release, parent=parent_window)
+            dlg.exec()
+
+            if dlg.action == UpdateDialog.INSTALL:
+                zipball = release.get("zipball_url", "")
+                if not zipball:
+                    QMessageBox.warning(
+                        parent_window, "Update Error",
+                        "No download URL found in the release.",
+                    )
+                    return
+                try:
+                    msg = download_and_install(zipball)
+                    QMessageBox.information(
+                        parent_window, "Update Complete",
+                        f"{msg}\n\nPlease close and reopen PorySuite-Z.",
+                    )
+                except Exception as e:
+                    QMessageBox.warning(
+                        parent_window, "Update Error",
+                        f"Failed to install update:\n{e}",
+                    )
+        except Exception:
+            pass  # Silently fail — never block the app over an update check
 
     @staticmethod
     def _migrate_from_appdata(data_dir: str) -> None:

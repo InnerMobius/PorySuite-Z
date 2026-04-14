@@ -500,6 +500,12 @@ class UnifiedMainWindow(QMainWindow):
         # ── Help ─────────────────────────────────────────────────────────────
         help_menu = menubar.addMenu("&Help")
 
+        update_action = QAction("Check for Updates...", self)
+        update_action.triggered.connect(self._check_for_updates)
+        help_menu.addAction(update_action)
+
+        help_menu.addSeparator()
+
         about_action = QAction("About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -1481,6 +1487,46 @@ class UnifiedMainWindow(QMainWindow):
                     json.dump(cfg, f, indent=4)
             except Exception:
                 pass
+
+    def _check_for_updates(self):
+        """Manual check for updates from Help menu."""
+        from PyQt6.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            from core.updater import check_for_update, download_and_install
+            release = check_for_update()
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Update Check Failed", str(e))
+            return
+        QApplication.restoreOverrideCursor()
+
+        if release is None:
+            from core.app_info import VERSION
+            QMessageBox.information(
+                self, "Up to Date",
+                f"You are running the latest version ({VERSION}).",
+            )
+            return
+
+        from ui.dialogs.startup_dialogs import UpdateDialog
+        dlg = UpdateDialog(release, parent=self)
+        dlg.exec()
+        if dlg.action == UpdateDialog.INSTALL:
+            zipball = release.get("zipball_url", "")
+            if not zipball:
+                QMessageBox.warning(self, "Update Error", "No download URL found.")
+                return
+            try:
+                msg = download_and_install(zipball)
+                QMessageBox.information(
+                    self, "Update Complete",
+                    f"{msg}\n\nPlease close and reopen PorySuite-Z.",
+                )
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Update Error", f"Failed to install:\n{e}",
+                )
 
     def _show_about(self):
         from core.app_info import VERSION
