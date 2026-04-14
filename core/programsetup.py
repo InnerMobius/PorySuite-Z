@@ -150,6 +150,16 @@ class _InAppBuildDialog(QDialog):
 
     def closeEvent(self, event):
         if self._proc.state() != QProcess.ProcessState.NotRunning:
+            from PyQt6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self, "Process Running",
+                "A build is still running. Cancel it and close?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
             self._proc.kill()
             self._proc.waitForFinished(2000)
         super().closeEvent(event)
@@ -688,7 +698,9 @@ def _install_devkitpro():
     try:
         subprocess.Popen(
             ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            creationflags=(subprocess.CREATE_NEW_CONSOLE
+                           | subprocess.CREATE_NEW_PROCESS_GROUP),
+            close_fds=True,
         )
     except Exception:
         webbrowser.open("https://devkitpro.org/wiki/Getting_Started")

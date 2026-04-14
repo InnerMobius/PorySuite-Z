@@ -238,13 +238,14 @@ class App:
         eventide_win = EventideMainWindow()
 
         # Show loading dialog on PorySuite (the heavier one)
-        self.loading_dialog = LoadingProject(porysuite_win)
+        self.loading_dialog = LoadingProject()
         self.loading_dialog.show()
-        self.loading_dialog.update_progress(10)
+        self.loading_dialog.update_progress(5, "Initializing…")
 
         # Load PorySuite data
+        self.loading_dialog.update_progress(10, "Loading PorySuite data…")
         porysuite_win.load_data(merged_info)
-        self.loading_dialog.update_progress(40)
+        self.loading_dialog.update_progress(40, "PorySuite data loaded")
 
         # Select first Pokemon so the tree is initialized
         try:
@@ -253,11 +254,11 @@ class App:
             porysuite_win.setWindowModified(False)
         except Exception:
             pass
-        self.loading_dialog.update_progress(50)
+        self.loading_dialog.update_progress(50, "Loading EVENTide data…")
 
         # Load EVENTide data
         eventide_win.load_data(merged_info)
-        self.loading_dialog.update_progress(70)
+        self.loading_dialog.update_progress(70, "Building editor window…")
 
         # Create the unified window
         self.main = UnifiedMainWindow()
@@ -267,13 +268,13 @@ class App:
             print(f"[setup_pages] Error during page setup (app will continue): {e}")
             import traceback
             traceback.print_exc()
-        self.loading_dialog.update_progress(85)
+        self.loading_dialog.update_progress(85, "Loading project info…")
 
         # Load project info into unified window
         self.main.load_data(merged_info)
         self.main.setWindowFilePath(merged_info.get("dir", ""))
 
-        self.loading_dialog.update_progress(100)
+        self.loading_dialog.update_progress(100, "Done")
         self.loading_dialog.close()
 
         # Keep references to prevent garbage collection

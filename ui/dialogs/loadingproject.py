@@ -13,7 +13,10 @@ class LoadingProject(QDialog):
         self.ui.setupUi(self)
         self.progress.connect(self.update_progress)
 
-    def update_progress(self, progress: int):
+    def update_progress(self, progress: int, status: str = ""):
+        if status:
+            self.ui.label.setText(status)
         self.ui.progressBar.setValue(progress)
         self.ui.progressBar.update()
+        self.repaint()
         QApplication.processEvents()

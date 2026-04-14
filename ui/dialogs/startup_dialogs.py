@@ -139,8 +139,7 @@ class DisclaimerDialog(QDialog):
         warning = QLabel(
             f'<h2>Welcome to PorySuite-Z {VERSION}</h2>'
             '<p style="font-size: 12px;">'
-            'This application is in <b>beta</b> and is <b>experimental</b>. '
-            'It was developed with the assistance of <b>Anthropic Claude Code</b>.</p>'
+            'This application is in <b>beta</b> and is <b>experimental</b>.</p>'
             '<p style="font-size: 12px;">'
             'PorySuite-Z directly reads and writes files inside your '
             '<b>pokefirered</b> project folder. While every effort has been '
