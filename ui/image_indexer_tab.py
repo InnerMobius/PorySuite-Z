@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QRadioButton, QScrollArea, QSplitter,
+    QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter,
     QVBoxLayout, QWidget,
 )
 
@@ -500,14 +500,38 @@ class ImageIndexerWidget(QWidget):
         top_bar.addWidget(self._info_label, 1)
 
         top_bar.addWidget(QLabel("Target:"))
-        self._color_16_rb = QRadioButton("16 colors")
+        self._color_16_rb = QRadioButton("16")
         self._color_16_rb.setChecked(True)
         self._color_16_rb.setToolTip("4bpp — standard for sprites and tiles")
+        self._color_16_rb.toggled.connect(self._on_target_radio_changed)
         top_bar.addWidget(self._color_16_rb)
 
-        self._color_256_rb = QRadioButton("256 colors")
+        self._color_256_rb = QRadioButton("256")
         self._color_256_rb.setToolTip("8bpp — for backgrounds with many colors")
+        self._color_256_rb.toggled.connect(self._on_target_radio_changed)
         top_bar.addWidget(self._color_256_rb)
+
+        self._color_custom_rb = QRadioButton("Custom:")
+        self._color_custom_rb.setToolTip(
+            "Any number of colors (2-256). Useful when building a larger "
+            "palette piece by piece — e.g. 37 colors for a castle, 45 for sky"
+        )
+        self._color_custom_rb.toggled.connect(self._on_target_radio_changed)
+        top_bar.addWidget(self._color_custom_rb)
+
+        self._color_custom_spin = QSpinBox()
+        self._color_custom_spin.setRange(2, 256)
+        self._color_custom_spin.setValue(32)
+        self._color_custom_spin.setFixedWidth(60)
+        self._color_custom_spin.setEnabled(False)
+        self._color_custom_spin.setToolTip("Number of palette colors (2-256)")
+        self._color_custom_spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Wheel-scroll protection
+        self._color_custom_spin.wheelEvent = lambda e: (
+            QSpinBox.wheelEvent(self._color_custom_spin, e)
+            if self._color_custom_spin.hasFocus() else e.ignore()
+        )
+        top_bar.addWidget(self._color_custom_spin)
 
         self._dither_cb = QCheckBox("Dither")
         self._dither_cb.setChecked(True)
@@ -686,6 +710,31 @@ class ImageIndexerWidget(QWidget):
         splitter.addWidget(right_widget)
         splitter.setSizes([600, 300])
 
+    # ── Target color count ───────────────────────────────────────────────
+
+    def _get_max_colors(self) -> int:
+        """Return the target palette size from the radio buttons / spinbox."""
+        if self._color_16_rb.isChecked():
+            return 16
+        elif self._color_256_rb.isChecked():
+            return 256
+        else:
+            return self._color_custom_spin.value()
+
+    def _on_target_radio_changed(self, checked: bool):
+        """Enable/disable the custom spinbox when the Custom radio is toggled."""
+        self._color_custom_spin.setEnabled(self._color_custom_rb.isChecked())
+
+    def _set_target_radio(self, n: int):
+        """Set the target radio/spinbox to match a given color count."""
+        if n == 16:
+            self._color_16_rb.setChecked(True)
+        elif n == 256:
+            self._color_256_rb.setChecked(True)
+        else:
+            self._color_custom_rb.setChecked(True)
+            self._color_custom_spin.setValue(max(2, min(256, n)))
+
     # ── Palette row helpers ──────────────────────────────────────────────
 
     def _add_pal_row(self) -> _DraggablePaletteRow:
@@ -724,7 +773,7 @@ class ImageIndexerWidget(QWidget):
         """User clicked a swatch and picked a new colour."""
         if self._indexed_img is None:
             return
-        max_c = 16 if self._color_16_rb.isChecked() else 256
+        max_c = self._get_max_colors()
         self._palette = self._read_palette_from_rows()[:max_c]
         self._rebuild_image_palette()
         self._refresh_result_preview()
@@ -821,7 +870,8 @@ class ImageIndexerWidget(QWidget):
         ct = img.colorTable()
         if not ct:
             return
-        target = 16 if cc <= 16 else 256
+        # Use exact color count — 16/256 go to their presets, others go custom
+        target = min(cc, 256) if cc > 0 else 16
         colors = []
         for c in ct[:target]:
             r = (c >> 16) & 0xFF
@@ -837,17 +887,14 @@ class ImageIndexerWidget(QWidget):
         self._refresh_result_preview()
         self._pal_status.setText(f"Loaded existing {cc}-color palette")
         self._enable_export(True)
-        if target == 16:
-            self._color_16_rb.setChecked(True)
-        else:
-            self._color_256_rb.setChecked(True)
+        self._set_target_radio(target)
 
     # ── Quantize ─────────────────────────────────────────────────────────
 
     def _do_quantize(self):
         if self._source_img is None:
             return
-        max_colors = 16 if self._color_16_rb.isChecked() else 256
+        max_colors = self._get_max_colors()
         dither = self._dither_cb.isChecked()
         mode = self._mode_combo.currentData() or QMODE_BALANCED
 
@@ -909,7 +956,7 @@ class ImageIndexerWidget(QWidget):
         )
         if not path:
             return
-        max_colors = 16 if self._color_16_rb.isChecked() else 256
+        max_colors = self._get_max_colors()
         colors = read_jasc_pal(path, max_colors)
         if not colors:
             QMessageBox.warning(self, "Load Error", "Could not read .pal file")

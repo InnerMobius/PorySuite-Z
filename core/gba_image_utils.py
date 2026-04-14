@@ -593,7 +593,13 @@ def export_palette(palette: list[Color], output_path: str) -> bool:
         pass
     try:
         padded = list(clamped)
-        target_count = 256 if len(padded) > 16 else 16
+        # Pad to the nearest GBA-standard size (16 or 256) for tool
+        # compatibility.  Custom counts (e.g. 37) pad up to 256 since
+        # they're building towards a full 8bpp palette.
+        if len(padded) <= 16:
+            target_count = 16
+        else:
+            target_count = 256
         while len(padded) < target_count:
             padded.append((0, 0, 0))
         padded = padded[:target_count]
