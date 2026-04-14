@@ -3,8 +3,7 @@ import os
 APP_NAME = "PorySuite"
 APP_DISPLAY_NAME = "PorySuite-Z"
 VERSION = "0.0.1b"
-AUTHOR = "jschoeny"           # Used by platformdirs for legacy data migration — do not change
-AUTHOR_DISPLAY = "InnerMobius" # PorySuite-Z author for display/credits
+AUTHOR = "InnerMobius"
 
 # Root directory of the application (where app.py / app_info.py live)
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
