@@ -77,7 +77,8 @@ class UnifiedMainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("PorySuite-Z[*]")
+        from core.app_info import VERSION
+        self.setWindowTitle(f"PorySuite-Z {VERSION}[*]")
         self.setMinimumSize(1024, 768)
         self.project_info = None
 
@@ -1482,12 +1483,17 @@ class UnifiedMainWindow(QMainWindow):
                 pass
 
     def _show_about(self):
+        from core.app_info import VERSION
         QMessageBox.about(
             self, "About PorySuite-Z",
-            "PorySuite-Z\n\n"
-            "Unified editor for pokefirered decomp projects.\n"
-            "Combines PorySuite (data editing) and EVENTide (map/script editing)\n"
-            "into a single window.")
+            f"<h2>PorySuite-Z {VERSION}</h2>"
+            "<p>Unified editor for <b>pokefirered</b> decomp projects.<br>"
+            "Combines PorySuite (data editing) and EVENTide (map/script editing) "
+            "into a single window.</p>"
+            "<p><b>Original PorySuite</b> by jschoeny<br>"
+            "<b>PorySuite-Z</b> by InnerMobius<br>"
+            "Developed with <b>Anthropic Claude Code</b></p>"
+        )
 
     def _refresh_eventide_constants(self):
         """Reload EVENTide's constants so its dropdowns pick up PorySuite changes."""

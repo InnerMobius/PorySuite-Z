@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QInputDialog,
 )
 
-from app_info import APP_NAME, AUTHOR, get_data_dir
+from app_info import APP_NAME, AUTHOR, get_data_dir, VERSION
 from app_util import reveal_directory, condense_path
 import core as _core
 from newproject import NewProject
@@ -30,6 +30,7 @@ class ProjectSelector(QMainWindow):
         super().__init__(parent)
         self.ui = Ui_ProjectSelector()
         self.ui.setupUi(self)
+        self.setWindowTitle(f"PorySuite-Z {VERSION}")
         self.setWindowFlags(Qt.WindowType.Window |
                             Qt.WindowType.CustomizeWindowHint |
                             Qt.WindowType.WindowTitleHint)
@@ -40,6 +41,19 @@ class ProjectSelector(QMainWindow):
         movie = QMovie(gif_path)
         self.ui.label_icon.setMovie(movie)
         movie.start()
+
+        # Version and credits below the title
+        self.ui.label.setText(f"PorySuite-Z\n{VERSION}")
+        self.ui.label_3.setText(
+            '<span style="color: #999; font-size: 10px;">'
+            "pokefirered projects only<br><br>"
+            "Original PorySuite by jschoeny<br>"
+            "PorySuite-Z by InnerMobius<br>"
+            "Developed with Anthropic Claude Code"
+            "</span>"
+        )
+        self.ui.label_3.setTextFormat(Qt.TextFormat.RichText)
+
         # Hide buttons that are no longer needed in unified mode
         self.ui.button_newproject.hide()
         self.ui.button_plugins.hide()
