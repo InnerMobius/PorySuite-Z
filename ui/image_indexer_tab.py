@@ -216,18 +216,24 @@ class _DraggablePaletteRow(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(2)
         self._swatches: list[_DragSwatch] = []
+        # Build initial swatches in order, then add stretch at the end
         for i in range(n):
-            self._add_swatch(i)
+            s = _DragSwatch(i)
+            s.color_changed.connect(self._on_color_changed)
+            s.drop_received.connect(self._on_drop)
+            self._swatches.append(s)
+            self._layout.addWidget(s)
         self._layout.addStretch(1)
 
     def _add_swatch(self, idx: int) -> _DragSwatch:
+        """Add a swatch after construction (inserts before the trailing stretch)."""
         s = _DragSwatch(idx)
         s.color_changed.connect(self._on_color_changed)
         s.drop_received.connect(self._on_drop)
         self._swatches.append(s)
-        # Insert before the stretch
-        pos = self._layout.count() - 1 if self._layout.count() > 0 else 0
-        self._layout.insertWidget(pos, s)
+        # Insert before the stretch (last item in layout)
+        stretch_pos = self._layout.count() - 1
+        self._layout.insertWidget(max(0, stretch_pos), s)
         return s
 
     def set_colors(self, colors: list[tuple[int, int, int]]):
