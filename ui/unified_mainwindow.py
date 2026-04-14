@@ -1518,11 +1518,14 @@ class UnifiedMainWindow(QMainWindow):
                 QMessageBox.warning(self, "Update Error", "No download URL found.")
                 return
             try:
+                from core.updater import launch_update_and_exit
                 msg = download_and_install(zipball)
                 QMessageBox.information(
-                    self, "Update Complete",
-                    f"{msg}\n\nPlease close and reopen PorySuite-Z.",
+                    self, "Applying Update",
+                    "Update downloaded. PorySuite-Z will now close "
+                    "and apply the update, then relaunch automatically.",
                 )
+                launch_update_and_exit()
             except Exception as e:
                 QMessageBox.warning(
                     self, "Update Error", f"Failed to install:\n{e}",

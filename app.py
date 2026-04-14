@@ -367,11 +367,14 @@ class App:
                     )
                     return
                 try:
+                    from core.updater import launch_update_and_exit
                     msg = download_and_install(zipball)
                     QMessageBox.information(
-                        parent_window, "Update Complete",
-                        f"{msg}\n\nPlease close and reopen PorySuite-Z.",
+                        parent_window, "Applying Update",
+                        "Update downloaded. PorySuite-Z will now close "
+                        "and apply the update, then relaunch automatically.",
                     )
+                    launch_update_and_exit()
                 except Exception as e:
                     QMessageBox.warning(
                         parent_window, "Update Error",
