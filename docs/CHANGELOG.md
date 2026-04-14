@@ -1,3 +1,44 @@
+## [2026-04-14] — Phase 11E+F: Saved Search Persistence + UI Tab Migration Complete
+
+### Type
+Feature (Phase 11 — completion)
+
+### Summary
+**Phase 11E — Saved Searches persist across sessions.** Bookmarked search groups are stored in `porysuite_text_bookmarks.json` in the project directory. Saved on every change, loaded on project open. Right-click context menus on saved search groups: Rename Group, Delete Group, Remove Stale Entries. Right-click saved entries: Remove from Group. Right-click regular tree entries: Add to Saved Searches (submenu of existing groups). Stale bookmarks (labels that no longer exist in the project) show grayed as "(not found)" and can be bulk-cleaned.
+
+**Phase 11F — UI Tab Migration complete.** Old `ui/ui_tab_widget.py` deleted. Toolbar icon tooltip renamed from "UI Settings" to "Text Editor". View menu renamed. `name_decapitalizer.py` updated to handle the new TextEditorTab gracefully (returns empty when old `_key_strings` attribute not found).
+
+### Files Changed
+- ui/text_editor_tab.py — Bookmark persistence (load/save JSON), right-click context menus, stale label detection, QInputDialog for group naming
+- ui/unified_mainwindow.py — Toolbar tooltip and View menu label changed from "UI Settings" to "Text Editor"
+- ui/name_decapitalizer.py — `_find_ui_tab()` updated to find new TextEditorTab, graceful fallback
+- ui/ui_tab_widget.py — DELETED (replaced by text_editor_tab.py)
+
+---
+
+## [2026-04-14] — Phase 11A–D: Text Editor Tab (replaces UI Settings)
+
+### Type
+Feature (Phase 11)
+
+### Summary
+**New Text Editor tab replaces the old "UI Settings" tab.** The old tab had three tiny sub-tabs (Name Pools, Location Names, Key Strings) covering a small fraction of the game's text. The new tab is a full project-wide text browser and editor covering ALL game-visible text.
+
+**Phase 11A — core/text_index.py:** Unified text index that parses all 7 text source types dynamically — `src/strings.c`, `src/battle_message.c`, `data/text/new_game_intro.inc`, `data/maps/*/text.inc` (all project maps), `data/scripts/*.inc` (all common scripts), `data/text/*.h` (trainer class, nature names, quest log, teachy TV), and `region_map_sections.json`. All parsers use directory listing — whatever maps/scripts exist in the user's project show up. Full save-back pipeline for all formats. Script cross-reference builder for `msgbox` lookups.
+
+**Phase 11B — Tree browser:** 11 collapsible categories (Game UI & Menus, New Game Intro, Location Names, Map Dialogue, Common Scripts, Battle Messages, Teachy TV, Fame Checker, Quest Log, Trainer Class Names, Nature Names). Each category has an italic description line. Subcategories group entries (e.g., per-map, per-script file). Modified entries show yellow dot.
+
+**Phase 11C — Search & replace:** Search bar at the top with match case, whole word, and regex options. Results grouped by category with counts. "Save Search" pins results as a tree section. Replace bar (toggled) with Replace Selected and Replace All in Results.
+
+**Phase 11D — Editor panel + EVENTide integration:** Right panel: GameTextEdit with context-appropriate character limits, file/label header, script cross-reference display. "Open in EVENTide" button visible for ALL map dialogue and common script entries (not just cross-referenced ones — derives scripts.inc path from text.inc). Dialogue entries have 200 max_lines so users can write long multi-page NPC speeches without hitting a wall. Revert button to undo changes per-entry.
+
+### Files Changed
+- core/text_index.py — NEW: TextEntry dataclass, TextIndex class, 7 parsers, save-back writers, script xref builder
+- ui/text_editor_tab.py — NEW: TextEditorTab widget (tree browser + search + editor panel + EVENTide integration)
+- ui/mainwindow.py — Import changed from UITabWidget to TextEditorTab; init and save step descriptions updated
+
+---
+
 ## [2026-04-14] — Git Push Safeguards: Branch Selector, Main/Master Protection
 
 ### Type

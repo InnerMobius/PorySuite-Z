@@ -219,7 +219,7 @@ class UnifiedMainWindow(QMainWindow):
         # ── Settings / Info pages ────────────────────────────────────────────
         settings_pages = [
             ("diagnostics", "ROM Diagnostics"),
-            ("ui",          "UI Settings"),
+            ("ui",          "Text Editor"),
             ("config",      "Config"),
         ]
         for icon_name, tooltip in settings_pages:
@@ -345,7 +345,7 @@ class UnifiedMainWindow(QMainWindow):
         view_menu.addSeparator()
 
         # Settings/config
-        for icon_name, label in [("ui", "UI Settings"), ("config", "Config")]:
+        for icon_name, label in [("ui", "Text Editor"), ("config", "Config")]:
             act = QAction(label, self)
             act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
             view_menu.addAction(act)

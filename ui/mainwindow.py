@@ -253,7 +253,7 @@ from ui.dex_description_edit import attach_dex_limit_ui
 from ui.moves_tab_widget import MovesTabWidget
 from ui.abilities_tab_widget import AbilitiesTabWidget
 from ui.config_tab_widget import ConfigTabWidget
-from ui.ui_tab_widget import UITabWidget
+from ui.text_editor_tab import TextEditorTab
 
 
 
@@ -447,8 +447,8 @@ QTabBar::tab:hover:!selected {
         self.ui.tab_config_grid.addWidget(self.config_tab, 0, 0, 1, 1)
         self.config_tab.modified.connect(lambda: self.setWindowModified(True))
 
-        # ── UI content tab ───────────────────────────────────────────────────
-        self.ui_tab = UITabWidget(self.ui.tab_ui)
+        # ── Text Editor tab (replaces old UI Settings) ───────────────────────
+        self.ui_tab = TextEditorTab(self.ui.tab_ui)
         self.ui.tab_ui_grid.addWidget(self.ui_tab, 0, 0, 1, 1)
         self.ui_tab.modified.connect(lambda: self.setWindowModified(True))
 
@@ -8154,12 +8154,12 @@ QTabBar::tab:hover:!selected {
                 except Exception:
                     pass
 
-                # Save UI content tab (names, location names, strings) if dirty
-                dlg.step("Writing UI strings")
+                # Save Text Editor tab (all game text) if dirty
+                dlg.step("Writing game text")
                 try:
                     if hasattr(self, "ui_tab") and self.ui_tab.has_changes():
                         self.ui_tab.save()
-                        dlg.log_line("Name pools / location names / key strings updated")
+                        dlg.log_line("Game text entries updated")
                 except Exception:
                     pass
 

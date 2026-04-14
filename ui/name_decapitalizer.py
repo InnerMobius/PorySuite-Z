@@ -476,19 +476,21 @@ def _scan_ui_strings(ps, skip: list[str], unified_win) -> list[Entry]:
 
 
 def _find_ui_tab(unified_win, ps):
-    """Best-effort lookup of the UITabWidget instance."""
-    # Try common paths
+    """Best-effort lookup of the Text Editor tab instance.
+
+    Returns the old UITabWidget or new TextEditorTab (or None).
+    The name decapitalizer only needs _key_strings._fields from the old
+    UITabWidget — the new TextEditorTab doesn't expose that, so callers
+    should handle None gracefully.
+    """
+    # Try the mainwindow's ui_tab attribute (covers both old and new)
+    obj = getattr(ps, "ui_tab", None)
+    if obj is not None:
+        return obj
     for attr in ("ui_tab_widget", "_ui_tab_widget", "ui_widget"):
         obj = getattr(ps, attr, None)
         if obj is not None:
             return obj
-    # Walk the unified window's stacked pages for a UITabWidget
-    try:
-        from ui.ui_tab_widget import UITabWidget
-    except Exception:
-        return None
-    for w in unified_win.findChildren(UITabWidget):
-        return w
     return None
 
 

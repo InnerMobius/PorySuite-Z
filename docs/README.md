@@ -177,13 +177,17 @@ Layout renaming/deletion, orphan cleanup, tileset reassignment, secondary tilese
 
 Visual region map editor with actual tileset graphics as background. Section assignment, region clone/rename/delete. Supports all 4 FireRed regions (Kanto + 3 Sevii). Dual layer (Map + Dungeon).
 
-### UI (Text Content)
+### Text Editor
 
-Three sub-tabs for editing in-game text:
+Project-wide text browser, editor, and search & replace for all game-visible strings. Replaces the old "UI Settings" tab.
 
-- **Name Pools** -- Player and rival name suggestions from `new_game_intro.inc`
-- **Location Names** -- Region map section names
-- **Key Strings** -- Miscellaneous game strings from `src/strings.c`
+- **Tree browser** with 11 collapsible categories: Game UI & Menus, New Game Intro, Location Names, Map Dialogue, Common Scripts, Battle Messages, Teachy TV, Fame Checker, Quest Log, Trainer Class Names, Nature Names
+- **Search bar** at the top with match case, whole word, and regex options. Results grouped by category with counts
+- **Replace bar** (toggled) -- Replace Selected or Replace All in Results
+- **Editor panel** -- GameTextEdit with context-appropriate character limits, file/label header, script cross-references
+- **"Open in EVENTide"** button for all map dialogue and common script entries -- jumps to the related script
+- **Saved searches** persist across sessions in `porysuite_text_bookmarks.json`. Right-click to rename/delete groups and manage entries
+- All parsers are dynamic -- whatever maps, scripts, and text files exist in your project are shown
 
 ### Diagnostics
 
