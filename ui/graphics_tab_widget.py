@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSpinBox,
     QCheckBox, QComboBox, QGroupBox, QPushButton, QColorDialog, QFrame,
     QSizePolicy, QDialog, QDialogButtonBox, QLineEdit, QFileDialog,
-    QRadioButton, QMessageBox, QButtonGroup,
+    QRadioButton, QMessageBox, QButtonGroup, QScrollArea,
 )
 
 from ui.graphics_data import (
@@ -589,8 +589,12 @@ class GraphicsTabWidget(QWidget):
 
         outer.addLayout(center, 1)
 
-        # ── RIGHT COLUMN ── palettes ────────────────────────────────────
-        right = QVBoxLayout()
+        # ── RIGHT COLUMN ── palettes (in a scroll area so they stay
+        # visible when the window is narrow) ──────────────────────────
+        right_container = QWidget()
+        right_container.setMinimumWidth(400)   # 16×22 swatches + spacing + margins
+        right = QVBoxLayout(right_container)
+        right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(10)
 
         # Normal palette
@@ -675,7 +679,12 @@ class GraphicsTabWidget(QWidget):
         right.addWidget(icon_group)
         right.addStretch(1)
 
-        outer.addLayout(right, 0)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setWidget(right_container)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setMinimumWidth(416)  # container + scrollbar margin
+        outer.addWidget(right_scroll, 0)
 
         # ── Wire signals ────────────────────────────────────────────────
         self._player_y.valueChanged.connect(self._on_player_y)

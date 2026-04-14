@@ -54,18 +54,16 @@ class EventideMainWindow(QMainWindow):
 
         # Placeholder tabs — replaced with real widgets once backends are ported
         from eventide.ui.maps_tab import MapsTab
-        from eventide.ui.layouts_tab import LayoutsTab
         from eventide.ui.region_map_tab import RegionMapTab
         from eventide.ui.event_editor_tab import EventEditorTab
 
         self.maps_tab = MapsTab(self)
-        self.layouts_tab = LayoutsTab(self)
+        self.layouts_tab = self.maps_tab.layouts_tab  # embedded sub-tab
         self.region_map_tab = RegionMapTab(self)
         self.event_editor_tab = EventEditorTab(self)
 
         self.tabs.addTab(self.event_editor_tab, "Event Editor")
         self.tabs.addTab(self.maps_tab, "Maps")
-        self.tabs.addTab(self.layouts_tab, "Layouts && Tilesets")
         self.tabs.addTab(self.region_map_tab, "Region Map")
 
         # ── Inter-tab refresh signals ────────────────────────────────────────
@@ -213,8 +211,7 @@ class EventideMainWindow(QMainWindow):
         self._git_set_all_enabled(True)
 
         # Notify tabs
-        self.maps_tab.load_project(project_info)
-        self.layouts_tab.load_project(project_info)
+        self.maps_tab.load_project(project_info)  # also loads layouts sub-tab
         self.region_map_tab.load_project(project_info)
         self.event_editor_tab.load_project(project_info)
 
@@ -243,15 +240,15 @@ class EventideMainWindow(QMainWindow):
     # ── Inter-tab refresh handlers ───────────────────────────────────────────
 
     def _on_maps_changed(self):
-        """Maps tab mutated data — refresh region map and layouts tabs."""
+        """Maps tab mutated data — refresh region map and layouts sub-tab."""
         if self.project_info:
             self.region_map_tab.load_project(self.project_info)
             self.layouts_tab.load_project(self.project_info)
 
     def _on_layouts_changed(self):
-        """Layouts tab mutated data — refresh maps tab (layout column)."""
+        """Layouts sub-tab mutated data — refresh the maps tree (layout column)."""
         if self.project_info:
-            self.maps_tab.load_project(self.project_info)
+            self.maps_tab._populate_tree()
 
     def _on_region_map_changed(self):
         """Region map tab mutated data — refresh maps tab (section column)."""

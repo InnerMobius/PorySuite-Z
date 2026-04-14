@@ -1,14 +1,13 @@
 # EVENTide
 
-The map/world management and event editing side of PorySuite-Z. EVENTide's editors (Event Editor, Maps, Layouts, Region Map) are toolbar pages inside the unified PorySuite-Z window — not a standalone app.
+The map/world management and event editing side of PorySuite-Z. EVENTide's editors (EVENTide, Maps, Layouts, Region Map) are toolbar pages inside the unified PorySuite-Z window — not a standalone app.
 
 ## Toolbar Pages
 
 | Page | Purpose |
 |------|---------|
-| **Event Editor** | RMXP-style visual script editor — the main editing surface |
-| **Maps** | Map renaming, group management, section renaming, move/delete maps, warp validation |
-| **Layouts & Tilesets** | Layout renaming/deletion, orphan cleanup, tileset reassignment |
+| **EVENTide** | RMXP-style visual script editor — the main editing surface |
+| **Maps** | Two sub-tabs: **Map Manager** (map renaming, group management, section renaming, move/delete maps, warp validation) and **Layouts & Tilesets** (layout renaming/deletion, orphan cleanup, tileset reassignment) |
 | **Region Map** | Visual region map editor — section assignment, region clone/rename/delete, dual layer (map + dungeon) |
 
 ## Event Editor
@@ -75,6 +74,7 @@ Only specific categories get colored — plain text/choices/structure stays defa
 - **`backend/eventide_utils.py`** — Script parser, text parser, save writers.
 - **`backend/constants_manager.py`** — Loads all project constants from C header files. Supports live push of new `OBJ_EVENT_GFX_*` constants from the Overworld Graphics tab via cross-tab sync.
 - **`backend/map_renamer.py`** — Map rename, group/section management, orphan cleanup.
+- **`ui/layouts_tab.py`** — Layouts & Tilesets sub-tab (embedded in Maps tab). Layout rename/delete, orphan cleanup, tileset assignment.
 - **`backend/layout_renamer.py`** — Layout rename/delete, orphan cleanup, tileset assignment.
 - **`backend/tileset_renamer.py`** — Secondary tileset renaming with repo-wide reference updates.
 - **`backend/warp_validator.py`** — Find and clean invalid warp destinations.

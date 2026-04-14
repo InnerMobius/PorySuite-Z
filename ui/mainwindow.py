@@ -3014,6 +3014,9 @@ QTabBar::tab:hover:!selected {
                 self.source_data.get_move_data(move, "name"), move
             )
 
+        # ── Starter sprite previews ──────────────────────────────────────
+        self._setup_starter_sprites()
+
         # Add species to national dex list
         self.ui.list_pokedex_national.clear()
         natdex = self.source_data.get_national_dex()
@@ -5289,6 +5292,12 @@ QTabBar::tab:hover:!selected {
 
             self.ui.tab_pokemon_info_grid.addWidget(sprite_panel, 0, 2, 1, 1)
 
+            # Let the form column (0) stretch to fill width; flags (1) and
+            # sprites (2) stay at their natural size.
+            self.ui.tab_pokemon_info_grid.setColumnStretch(0, 1)
+            self.ui.tab_pokemon_info_grid.setColumnStretch(1, 0)
+            self.ui.tab_pokemon_info_grid.setColumnStretch(2, 0)
+
             # ── 5. Animated icon: replace iconPic button with an animated QLabel ──
             self._icon_anim_lbl = QLabel(self.ui.tab_pokemon_graphics)
             self._icon_anim_lbl.setFixedSize(64, 64)
@@ -5317,10 +5326,14 @@ QTabBar::tab:hover:!selected {
             self._species_desc_counter.setStyleSheet(
                 "color: #555555; font-size: 10px; font-family: 'Courier New';"
             )
-            # Expand the description box a little so 3 lines fit comfortably
+            # Let the description box expand to fill available space
             try:
-                self.ui.species_description.setMinimumSize(330, 90)
-                self.ui.species_description.setMaximumSize(16777215, 110)
+                self.ui.species_description.setMinimumSize(0, 90)
+                self.ui.species_description.setMaximumSize(16777215, 16777215)
+                self.ui.species_description.setSizePolicy(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Expanding,
+                )
             except Exception:
                 pass
             # Add counter as the last row of the form (no label column)
@@ -5382,6 +5395,143 @@ QTabBar::tab:hover:!selected {
         if hasattr(self, "_info_icon_lbl"):
             self._info_icon_lbl.setPixmap(frame)
         self._icon_anim_frame ^= 1   # toggle 0 ↔ 1
+
+    # ── Starter sprite helpers ───────────────────────────────────────────────
+
+    def _setup_starter_sprites(self):
+        """Add front-sprite previews and type labels to each starter GroupBox."""
+        from PyQt6.QtWidgets import QLabel, QVBoxLayout, QHBoxLayout, QWidget, QFormLayout
+        from PyQt6.QtGui import QPixmap
+        from PyQt6.QtCore import Qt
+
+        # If already set up, just refresh the sprites
+        if hasattr(self, "_starter_sprite_labels") and self._starter_sprite_labels:
+            for i in range(3):
+                self._update_starter_sprite(i)
+            return
+
+        self._starter_sprite_labels = []
+        self._starter_type_labels = []
+
+        starter_groups = [
+            (self.ui.groupBox_starter1, self.ui.groupBox_starter1_form,
+             self.ui.starter1_species),
+            (self.ui.groupBox_starter2, self.ui.groupBox_starter2_form,
+             self.ui.starter2_species),
+            (self.ui.groupBox_starter3, self.ui.groupBox_starter3_form,
+             self.ui.starter3_species),
+        ]
+
+        for i, (group_box, form_layout, species_combo) in enumerate(starter_groups):
+            # Create a container for sprite + types above the form
+            sprite_container = QWidget()
+            sprite_container.setStyleSheet("background: transparent;")
+            sc_layout = QVBoxLayout(sprite_container)
+            sc_layout.setContentsMargins(0, 4, 0, 4)
+            sc_layout.setSpacing(4)
+            sc_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+            # Front sprite label — 64×64 scaled up 2× for visibility
+            sprite_lbl = QLabel()
+            sprite_lbl.setFixedSize(128, 128)
+            sprite_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            sprite_lbl.setStyleSheet(
+                "background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+                "stop:0 #2a2a3a, stop:1 #1a1a2a); "
+                "border: 1px solid #444; border-radius: 8px;"
+            )
+            sc_layout.addWidget(sprite_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+            self._starter_sprite_labels.append(sprite_lbl)
+
+            # Type label row
+            type_lbl = QLabel()
+            type_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            type_lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: #ccc;")
+            sc_layout.addWidget(type_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
+            self._starter_type_labels.append(type_lbl)
+
+            # Insert the sprite container at the top of the form layout
+            form_layout.insertRow(0, sprite_container)
+
+            # Connect species change to update sprite
+            species_combo.currentIndexChanged.connect(
+                lambda *_a, idx=i: self._update_starter_sprite(idx)
+            )
+
+            # Initial update
+            self._update_starter_sprite(i)
+
+    def _update_starter_sprite(self, starter_idx: int):
+        """Refresh the sprite and type labels for the given starter index."""
+        from PyQt6.QtGui import QPixmap
+        from PyQt6.QtCore import Qt
+
+        combos = [
+            self.ui.starter1_species,
+            self.ui.starter2_species,
+            self.ui.starter3_species,
+        ]
+        if starter_idx >= len(combos):
+            return
+
+        species_combo = combos[starter_idx]
+        species = species_combo.currentData()
+        if not species:
+            return
+
+        # Update sprite
+        try:
+            sprite_lbl = self._starter_sprite_labels[starter_idx]
+            front_pic = self.source_data.get_species_image_path(
+                species, "frontPic"
+            )
+            if front_pic:
+                pm = QPixmap(front_pic)
+                if not pm.isNull():
+                    # Scale to 128×128 with smooth transform for crisp pixel art
+                    scaled = pm.scaled(
+                        128, 128,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.FastTransformation
+                    )
+                    sprite_lbl.setPixmap(scaled)
+                else:
+                    sprite_lbl.setPixmap(QPixmap())
+            else:
+                sprite_lbl.setPixmap(QPixmap())
+        except Exception:
+            pass
+
+        # Update type labels
+        try:
+            type_lbl = self._starter_type_labels[starter_idx]
+            types = self.source_data.get_species_info(species, "types")
+            if isinstance(types, list) and types:
+                type_colors = {
+                    "TYPE_NORMAL": "#A8A878", "TYPE_FIRE": "#F08030",
+                    "TYPE_WATER": "#6890F0", "TYPE_ELECTRIC": "#F8D030",
+                    "TYPE_GRASS": "#78C850", "TYPE_ICE": "#98D8D8",
+                    "TYPE_FIGHTING": "#C03028", "TYPE_POISON": "#A040A0",
+                    "TYPE_GROUND": "#E0C068", "TYPE_FLYING": "#A890F0",
+                    "TYPE_PSYCHIC": "#F85888", "TYPE_BUG": "#A8B820",
+                    "TYPE_ROCK": "#B8A038", "TYPE_GHOST": "#705898",
+                    "TYPE_DRAGON": "#7038F8", "TYPE_DARK": "#705848",
+                    "TYPE_STEEL": "#B8B8D0", "TYPE_FAIRY": "#EE99AC",
+                }
+                parts = []
+                for t in types:
+                    name = t.replace("TYPE_", "").capitalize() if isinstance(t, str) else str(t)
+                    color = type_colors.get(t, "#aaa")
+                    parts.append(
+                        f'<span style="background:{color}; color:#fff; '
+                        f'padding:1px 6px; border-radius:3px;">{name}</span>'
+                    )
+                type_lbl.setText("  ".join(parts))
+                type_lbl.setTextFormat(Qt.TextFormat.RichText)
+            else:
+                type_lbl.setText("")
+        except Exception:
+            pass
 
     # ── Species tree icon helpers ─────────────────────────────────────────────
 

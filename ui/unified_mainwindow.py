@@ -106,13 +106,19 @@ class UnifiedMainWindow(QMainWindow):
         self.stack = QStackedWidget()
         splitter.addWidget(self.stack)
 
-        # ── Log panel ────────────────────────────────────────────────────────
+        # ── Log panel (hidden by default — toggle via View menu) ────────────
         self.log_panel = QTextEdit()
         self.log_panel.setReadOnly(True)
         self.log_panel.setMaximumHeight(160)
         self.log_panel.setFont(QFont("Courier New", 9))
         self.log_panel.setPlaceholderText("Log output will appear here...")
         splitter.addWidget(self.log_panel)
+
+        # Restore log panel visibility from settings (default: hidden)
+        _s = QSettings(get_settings_path(), QSettings.Format.IniFormat)
+        self.log_panel.setVisible(
+            _s.value("ui/show_log_panel", False, type=bool)
+        )
 
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 1)
@@ -199,9 +205,8 @@ class UnifiedMainWindow(QMainWindow):
 
         # ── EVENTide map/script editor pages ─────────────────────────────────
         eventide_pages = [
-            ("events",    "Event Editor"),
+            ("events",    "EVENTide"),
             ("maps",      "Maps"),
-            ("layouts",   "Layouts & Tilesets"),
             ("regionmap", "Region Map"),
             ("labels",    "Label Manager"),
         ]
@@ -335,8 +340,8 @@ class UnifiedMainWindow(QMainWindow):
 
         # Map/script editors
         for icon_name, label in [
-            ("events", "Event Editor"), ("maps", "Maps"),
-            ("layouts", "Layouts && Tilesets"), ("regionmap", "Region Map"),
+            ("events", "EVENTide"), ("maps", "Maps"),
+            ("regionmap", "Region Map"),
             ("labels", "Label Manager"),
         ]:
             act = QAction(label, self)
@@ -353,7 +358,9 @@ class UnifiedMainWindow(QMainWindow):
 
         view_menu.addSeparator()
 
-        self._toggle_log_action = QAction("Toggle Log Panel", self)
+        self._toggle_log_action = QAction("Show Log Panel", self)
+        self._toggle_log_action.setCheckable(True)
+        self._toggle_log_action.setChecked(self.log_panel.isVisible())
         self._toggle_log_action.triggered.connect(self._toggle_log_panel)
         view_menu.addAction(self._toggle_log_action)
 
@@ -586,7 +593,6 @@ class UnifiedMainWindow(QMainWindow):
         eventide_tabs = [
             ("events",    eventide_main.event_editor_tab),
             ("maps",      eventide_main.maps_tab),
-            ("layouts",   eventide_main.layouts_tab),
             ("regionmap", eventide_main.region_map_tab),
         ]
 
@@ -738,6 +744,8 @@ class UnifiedMainWindow(QMainWindow):
         # Event Editor → Label Manager (right-click "Edit Label")
         eventide_main.event_editor_tab.jump_to_label.connect(
             self._on_jump_to_label)
+        # Text Editor → EVENTide ("Open in EVENTide" button)
+        self.open_in_eventide_signal.connect(self._on_open_in_eventide)
         # Maps tab → Event Editor (double-click a map to open it)
         eventide_main.maps_tab.map_selected.connect(
             self._on_map_selected)
@@ -1178,7 +1186,7 @@ class UnifiedMainWindow(QMainWindow):
         # handful of header files. No-op if already current.
         _PS_PAGES = {"pokemon", "pokedex", "moves", "items", "starters",
                      "trainers", "ui", "config", "credits", "sound"}
-        _EV_PAGES = {"events", "maps", "layouts", "regionmap"}
+        _EV_PAGES = {"events", "maps", "regionmap"}
         if new_name in _EV_PAGES and old_name in _PS_PAGES:
             try:
                 from eventide.backend.constants_manager import ConstantsManager
@@ -1305,6 +1313,45 @@ class UnifiedMainWindow(QMainWindow):
             self._label_manager.select_constant(const)
         self.log_message(f'Jumped to label: {const}')
 
+    def _on_open_in_eventide(self, info: dict):
+        """Text Editor 'Open in EVENTide' — switch to events page and load map.
+
+        *info* has:
+          'file'       — absolute path to scripts.inc
+          'text_label' — the text constant (e.g. PalletTown_Text_FatManDialogue)
+        We extract the map folder name from the path, open that map in
+        EVENTide, and let it search every NPC's command tree for a msgbox
+        that references the text label — so it selects the right NPC
+        regardless of script chain depth.
+        """
+        import pathlib
+        file_path = info.get("file", "")
+        text_label = info.get("text_label", "")
+        # Extract map name from path like .../data/maps/PalletTown/scripts.inc
+        p = pathlib.PurePath(file_path)
+        parts = p.parts
+        map_name = ""
+        for i, part in enumerate(parts):
+            if part == "maps" and i + 1 < len(parts):
+                map_name = parts[i + 1]
+                break
+        if not map_name:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, "Cannot Open",
+                f"Could not determine map name from:\n{file_path}",
+            )
+            return
+        self._switch_to_page('events')
+        ev = self._eventide_window
+        if ev and hasattr(ev, 'event_editor_tab'):
+            ev.event_editor_tab.open_map_and_select(
+                map_name, text_label=text_label)
+        self.log_message(f'Opened map in EVENTide: {map_name}')
+        if text_label:
+            self.statusBar().showMessage(
+                f'Jumped to NPC with {text_label} in {map_name}', 8000)
+
     def _on_map_selected(self, map_folder: str):
         """Double-clicking a map in Maps tab opens it in Event Editor."""
         self._switch_to_page('events')
@@ -1342,8 +1389,12 @@ class UnifiedMainWindow(QMainWindow):
             self._sound_editor.stop_preview()
 
     def _toggle_log_panel(self):
-        """Show or hide the log panel."""
-        self.log_panel.setVisible(not self.log_panel.isVisible())
+        """Show or hide the log panel.  Saves preference to settings."""
+        visible = not self.log_panel.isVisible()
+        self.log_panel.setVisible(visible)
+        self._toggle_log_action.setChecked(visible)
+        s = QSettings(get_settings_path(), QSettings.Format.IniFormat)
+        s.setValue("ui/show_log_panel", visible)
 
     def _refresh_project(self):
         """Reload everything from disk — both PorySuite and EVENTide data."""

@@ -984,7 +984,7 @@ class TextEditorTab(QWidget):
         if hasattr(main, "open_in_eventide_signal"):
             main.open_in_eventide_signal.emit({
                 "file": full_path,
-                "label": script_label,
+                "text_label": entry.label,
             })
 
     # ── Font helpers ─────────────────────────────────────────────────────────

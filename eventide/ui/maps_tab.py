@@ -1,8 +1,9 @@
 """
-Maps tab — Map Manager + Warp Validator
+Maps tab — Map Manager + Warp Validator + Layouts & Tilesets
 
 Provides a tree view of map sections/groups/maps with rename, move, delete,
-and orphan cleanup. Warp validation lives at the bottom of this tab.
+and orphan cleanup. Warp validation lives at the bottom of the Maps sub-tab.
+Layouts & Tilesets is a sibling sub-tab for layout/tileset management.
 """
 
 import os
@@ -10,7 +11,7 @@ import json
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTabWidget,
     QTreeWidget, QTreeWidgetItem, QLineEdit, QCheckBox,
     QPushButton, QGroupBox, QTextEdit, QLabel, QMenu,
     QInputDialog, QMessageBox,
@@ -32,7 +33,16 @@ class MapsTab(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        # ── Sub-tab widget: Map Manager | Layouts & Tilesets ────────────────
+        self._sub_tabs = QTabWidget()
+        root.addWidget(self._sub_tabs)
+
+        # ── Sub-tab 1: Map Manager ──────────────────────────────────────────
+        maps_page = QWidget()
+        layout = QVBoxLayout(maps_page)
         layout.setContentsMargins(8, 8, 8, 8)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -111,6 +121,13 @@ class MapsTab(QWidget):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
 
+        self._sub_tabs.addTab(maps_page, "Map Manager")
+
+        # ── Sub-tab 2: Layouts & Tilesets ───────────────────────────────────
+        from eventide.ui.layouts_tab import LayoutsTab
+        self.layouts_tab = LayoutsTab(self._mw)
+        self._sub_tabs.addTab(self.layouts_tab, "Layouts && Tilesets")
+
         # ── Button connections ───────────────────────────────────────────────
         self.btn_rename_map.clicked.connect(self._on_rename_map)
         self.btn_rename_group.clicked.connect(self._on_rename_group)
@@ -149,6 +166,9 @@ class MapsTab(QWidget):
 
         self._populate_tree()
         self._mw.log_message(f"Maps tab: loaded {project_dir}")
+
+        # Also load the layouts sub-tab
+        self.layouts_tab.load_project(project_info)
 
     def _populate_tree(self):
         self.map_tree.clear()

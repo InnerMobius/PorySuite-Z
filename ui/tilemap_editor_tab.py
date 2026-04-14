@@ -767,7 +767,7 @@ class TilemapEditorTab(QWidget):
         canvas_scroll = QScrollArea()
         canvas_scroll.setWidget(self._canvas)
         canvas_scroll.setWidgetResizable(False)
-        canvas_scroll.setMinimumWidth(300)
+        canvas_scroll.setMinimumWidth(200)
         splitter.addWidget(canvas_scroll)
 
         # ── Right panel ─────────────────────────────────────────────────
@@ -893,10 +893,14 @@ class TilemapEditorTab(QWidget):
         self._status.setStyleSheet("color: #888; font-size: 11px;")
         right_layout.addWidget(self._status)
 
+        right.setMinimumWidth(250)
         splitter.addWidget(right)
 
-        # Canvas gets ~55% width, right panel ~45% — user can drag to resize
-        splitter.setSizes([600, 500])
+        # Canvas gets more space; both sides have minimums so neither
+        # can be crushed when dragging the splitter on small windows.
+        splitter.setStretchFactor(0, 3)   # canvas expands more
+        splitter.setStretchFactor(1, 2)   # right panel expands less
+        splitter.setSizes([600, 400])
 
         editor_layout.addWidget(splitter, 1)
 

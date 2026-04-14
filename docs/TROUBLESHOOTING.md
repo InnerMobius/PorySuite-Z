@@ -38,7 +38,7 @@ Fixed (2026-04-05). Pressing Ctrl+E (or clicking an event in Porymap) now raises
 This means the Porymap install is missing the patches PorySuite-Z expects. The installer normally drops a `.psinstalled` marker file next to `porymap.exe`. If that marker is missing, PorySuite-Z treats Porymap as "stock" and avoids commands it can't handle. To fix, re-run Tools → Install Porymap to rebuild with patches.
 
 ### An item (or flag/var/trainer) I renamed in PorySuite doesn't show up in the Event Editor dropdowns
-Switch to an EVENTide page (Event Editor / Maps / Layouts / Region Map) from any PorySuite page — the constants cache refreshes on that switch. If the rename hasn't been saved to the header files yet, you still need to Save-All first. In-memory-only renames that haven't touched disk require a dedicated bridge that isn't implemented yet.
+Switch to an EVENTide page (EVENTide / Maps / Region Map) from any PorySuite page — the constants cache refreshes on that switch. If the rename hasn't been saved to the header files yet, you still need to Save-All first. In-memory-only renames that haven't touched disk require a dedicated bridge that isn't implemented yet.
 
 ### Dialogue text shows {PLAY_BGM} and other commands in blue
 That's intentional — those are text commands that are part of the game's text system, not script leakage. `{PLAY_BGM}{MUS_ENCOUNTER_GYM_LEADER}` sets the battle music. `{PLAYER}` inserts the player's name. They're highlighted blue to distinguish them from regular text. Right-click in a text box to insert commands from a menu.

@@ -37,58 +37,45 @@ You can also use `LaunchPorySuite.bat` on Windows.
 
 On first run, the **Project Selector** window appears. Use **Open Existing Project** to point PorySuite at your pokefirered project directory. If build tools aren't detected, the Setup Wizard will walk you through installing everything.
 
+![Launcher](launcher.png)
+
 ---
 
 ## Editor Pages
 
-PorySuite-Z has 18 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
+PorySuite-Z has 17 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
 
 ### Pokemon
 
 Full species editor with three sub-tabs:
 
-- **Info** -- Species name, Dex number, category, description, types, abilities (including hidden), held items, gender ratio, egg groups/cycles, catch rate, friendship, growth rate, EXP yield, flags (Legendary, Mythical, etc.)
+- **Info** -- Species name, Dex number, category, description, types, abilities (including hidden), held items, gender ratio, egg groups/cycles, catch rate, friendship, growth rate, EXP yield, flags (Legendary, Mythical, etc.) with front sprite and animated icon preview
 - **Stats** -- Base stats (HP/ATK/DEF/SP.ATK/SP.DEF/SPEED) and EV yields
 - **Graphics** -- Battle scene preview (front/back sprites over background with shadow), Player Y/Enemy Y/Enemy Altitude, Normal and Shiny palette editors (16-swatch rows with color picker), Import Palette from PNG, Menu Icon with animated preview and palette index selector, footprint preview, Open Graphics Folder
 
 Evolution chain editor with species, method, and parameter fields. Play Cry button for audio preview.
 
+![Pokemon Info](pokemon.png)
+
+![Species Graphics](species%20graphics.png)
+
 ### Pokedex
 
 National and Regional Dex editors. Add, remove, and reorder entries. Each entry shows a detail panel with classification, height/weight, description, and a size comparison preview (Pokemon sprite overlaid on trainer sprite). **Wild Encounters card** showing where each species can be found — method type (Grass, Water, Fishing, Rock Smash) with color-coded dots, friendly map names, and level ranges. Data parsed from `wild_encounters.json` with multi-floor merging and fishing rod sub-groups. Play Cry button.
 
-### Items
-
-Searchable item list with a detail editor for each entry: constant name, display name, price, pocket type, item type, hold effect, field/battle use functions, description, and auto-resolved icon previews. Includes an **editable icon picker** -- change which sprite an item displays by picking from a dropdown of all available icons with thumbnails. Changes are saved to `item_icon_table.h`. An **"Open Icon in Folder"** button opens the current icon's PNG in your OS file manager for easy editing.
+![Pokedex](pokedex.png)
 
 ### Moves
 
 Searchable and filterable move list. Detail editor includes: display name, power, accuracy, PP, type (color-coded), category (Physical/Special/Status with Gen 3 auto-calculation), target, effect description with per-line character limits (42 chars x 3 lines), and move flags.
 
-### Trainers
+![Moves](moves.png)
 
-Three sub-tabs:
+### Items
 
-- **Trainers** -- Searchable trainer list grouped by trainer class. Detail editor includes: class, name, trainer pic (with visual preview), encounter music, AI flags, party type, and a full party editor with per-member level, species, held item, moves, and ability. VS Seeker rematch tier support with dynamic tier labels.
-- **Trainer Classes** -- Searchable class list with sprite thumbnails. Edit class display name (12-character limit), prize money multiplier, and default sprite (dropdown with thumbnails of all trainer pics). Create new classes with a button that writes to three files. View battle info, encounter music, facility class mappings, and usage counts.
-- **Graphics** -- Trainer sprite preview (128x160), editable 16-color palette swatch row, Import Palette from PNG (extracts color table from indexed PNG, GBA-clamps to 15-bit), Open Palettes Folder button.
+Searchable item list with a detail editor for each entry: constant name, display name, price, pocket type, item type, hold effect, field/battle use functions, description, and auto-resolved icon previews. Includes an **editable icon picker** -- change which sprite an item displays by picking from a dropdown of all available icons with thumbnails. Changes are saved to `item_icon_table.h`. An **"Open Icon in Folder"** button opens the current icon's PNG in your OS file manager for easy editing.
 
-### Starters
-
-Configure the three starter Pokemon. Each slot has: species, level, held item, custom move (optional), and ability selection.
-
-### Credits
-
-Visual credits editor. Edit the scrolling end credits text with line-by-line character limits and color coding.
-
-### Overworld GFX
-
-Sprite-first overworld editor:
-
-- **Left panel** -- Category filter, search bar, scrollable thumbnail grid of all sprites, "+ Add New Sprite..." button, Dynamic OW Palettes (DOWP) status/enable button
-- **Right panel** -- Sprite sheet view with animation-type-aware preview (walk cycles, surf, fishing, VS Seeker, inanimate, destroy sequences), palette editor with "Assign to" dropdown for palette reassignment, Import from PNG, "Show in Folder"
-- **Add New Sprite** -- Dialog auto-detects frame size/name/palette from PNG, writes all 6 C headers automatically, pushes new constant to EVENTide immediately
-- **DOWP patch** -- One-click patch to enable per-sprite palettes (patches 5 C source files)
+![Items](items.png)
 
 ### Abilities
 
@@ -99,6 +86,41 @@ Searchable ability browser with detail panel:
 - **Visual Field Effect Editor** -- Pick a category (Encounter Rate, Type Encounters, Pickup, Guaranteed Escape, Faster Hatching, Nature Sync, Gender Attract) and configure parameters.
 - Species usage table with double-click cross-navigation to Pokemon tab
 - Add, duplicate, rename, and delete abilities
+
+![Abilities](abilities.png)
+
+### Trainers
+
+Three sub-tabs:
+
+- **Trainers** -- Searchable trainer list grouped by trainer class. Detail editor includes: class, name, trainer pic (with visual preview), encounter music, AI flags, party type, and a full party editor with per-member level, species, held item, moves, and ability. VS Seeker rematch tier support with dynamic tier labels.
+- **Trainer Classes** -- Searchable class list with sprite thumbnails. Edit class display name (12-character limit), prize money multiplier, and default sprite (dropdown with thumbnails of all trainer pics). Create new classes with a button that writes to three files. View battle info, encounter music, facility class mappings, and usage counts.
+- **Graphics** -- Trainer sprite preview (128x160), editable 16-color palette swatch row, Import Palette from PNG (extracts color table from indexed PNG, GBA-clamps to 15-bit), Open Palettes Folder button.
+
+![Trainers](trainers.png)
+
+### Starters
+
+Configure the three starter Pokemon. Each slot shows a front sprite preview (updates live when you change species) with type badges, plus: species, level, held item, custom move (optional), and ability selection.
+
+![Starters](starters.png)
+
+### Overworld GFX
+
+Sprite-first overworld editor:
+
+- **Left panel** -- Category filter, search bar, scrollable thumbnail grid of all sprites, "+ Add New Sprite..." button, Dynamic OW Palettes (DOWP) status/enable button
+- **Right panel** -- Sprite sheet view with animation-type-aware preview (walk cycles, surf, fishing, VS Seeker, inanimate, destroy sequences), palette editor with "Assign to" dropdown for palette reassignment, Import from PNG, "Show in Folder"
+- **Add New Sprite** -- Dialog auto-detects frame size/name/palette from PNG, writes all 6 C headers automatically, pushes new constant to EVENTide immediately
+- **DOWP patch** -- One-click patch to enable per-sprite palettes (patches 5 C source files)
+
+![Overworld GFX](overworld.png)
+
+### Credits
+
+Visual credits editor. Edit the scrolling end credits text with line-by-line character limits and color coding, with a live in-game preview panel.
+
+![Credits](credits.png)
 
 ### Sound Editor
 
@@ -115,7 +137,11 @@ Full GBA M4A sound engine built in Python. Four sub-tabs:
 
 **Import .s File** -- Import songs from other projects. 3-page wizard with voicegroup compatibility check, automatic label rewrite, and registration.
 
-### Event Editor
+![Sound Editor](sound%20editor.png)
+
+![Piano Roll](piano%20roll.png)
+
+### EVENTide
 
 RMXP-style visual script editor. Key features:
 - All event types (NPCs, triggers, signs, hidden items, map scripts) with numbered condition pages
@@ -131,13 +157,38 @@ RMXP-style visual script editor. Key features:
 - Script templates (NPC, Sign, Map Script, Standard Wrapper, Field Object)
 - Comprehensive tooltips on all controls, command dialogs, and command selector palette (toggleable in Settings)
 
+![EVENTide](eventide.png)
+
+![Command Palette](eventidecommands.png)
+
 ### Maps
 
-Map renaming, group management, section renaming, move/delete maps, warp validation.
+Map and layout management with two sub-tabs:
+
+- **Map Manager** -- Map tree with rename, group management, section renaming, move/delete maps, warp validation
+- **Layouts & Tilesets** -- Layout renaming/deletion, orphan cleanup, tileset reassignment, secondary tileset renaming
+
+![Map Manager](map%20manager.png)
+
+![Layout Editor](layout%20editor.png)
+
+### Region Map
+
+Visual region map editor with actual tileset graphics as background. Section assignment, region clone/rename/delete. Supports all 4 FireRed regions (Kanto + 3 Sevii). Dual layer (Map + Dungeon).
+
+![Region Map](regionmap%20editor.png)
+
+### Label Manager
+
+Standalone toolbar page for managing constant labels. Add friendly names and notes to flags, vars, and other constants. Labels stored in `porysuite_labels.json`.
+
+![Label Manager](label%20manager.png)
 
 ### Tilesets (Tilemap Editor)
 
-GBA `.bin` tilemap viewer and editor:
+GBA `.bin` tilemap viewer and editor with three sub-tabs:
+
+**Tilemap Editor:**
 
 - **Open any tilemap** from `graphics/` -- auto-discovers matching tile sheet (`.png`) and palettes (`.pal` files). File dialog remembers the last folder you opened from within a session.
 - **4bpp and 8bpp support** -- auto-detects color depth from PNG color table size. Title screen logos and other 256-color tilemaps render correctly.
@@ -152,7 +203,28 @@ GBA `.bin` tilemap viewer and editor:
 - **Palette source toggle** -- "Auto .pal files" (loads from project's palette directory) or "PNG colors" (uses tile sheet's own color table)
 - **Save** -- integrated with the app's File > Save pipeline. Tile changes mark the window dirty; saving writes the `.bin` file alongside all other editors.
 
-**GBA Image Indexer** (third tab within Tilesets page):
+![Tilemap Editor](tilemap%20editor.png)
+
+**Tile Animation Editor:**
+
+AnimEdit-style tile animation editor covering **all three GBA animation systems** -- 77 animations in vanilla pokefirered, all discovered dynamically from source with no hardcoded names:
+
+- **Navigate by Tileset + Animation Number** -- 68 tilesets parsed from `headers.h`, animated tilesets sorted first. Animations indexed ("0: Flower", "1: Water"). Works on any pokefirered project.
+- **All properties editable** -- Speed/Divisor, Start Tile (hex, 0x1A0 matching Porymap), Tile Amount, Phase, Counter Max. Changes follow the app's normal save pipeline (mark dirty, File > Save writes to tileset_anims.c).
+- **Palette integration** -- loads all 16 tileset .pal files with GBA 15-bit clamping. Editable color swatches, palette slot selector (00-15), import/export .pal. Palettes are shared with Porymap.
+- **Add New Animation** (+) -- creates brand new tileset animation with full C source wiring: INCBIN, frame array, QueueAnimTiles, dispatch, Init, headers.h callback registration.
+- **Remove Animation** (-) -- cleanly strips all C source references.
+- **Preview controls** -- zoom dropdown (1x through 16x), 16x16 metatile checkbox (keeps 2x2 tile blocks together during wrapping), W/H tile layout controls for wrapping wide animations into a grid. Collapsible Frame Thumbnails and Tile Grid sections that collapse to zero height, giving more room to the preview.
+- **Frame Scrubber** -- prev/slider/next for manual stepping through animation frames.
+- **Tile Grid** -- current frame decomposed into 8x8 tiles with hex VRAM addresses and base tile display. Toggle between grid and horizontal strip layout.
+- **Fixed-panel layout** -- 310px left panel (navigation, properties, palette) + stretching right panel (preview, filmstrip, tile grid). No splitter gap.
+- **Animated preview** with speed slider, filmstrip thumbnail strip, info panel.
+- **Tileset BG Animations (8)** -- full editing of all properties + frame add/delete/replace.
+- **Door Animations (32)** / **Field Effect Animations (37)** -- read-only frame display, open spritesheet in Explorer.
+
+![Tile Animation Editor](tile%20animation%20editor.png)
+
+**GBA Image Indexer:**
 
 Convert any PNG image to GBA-compatible indexed format:
 
@@ -170,50 +242,33 @@ Convert any PNG image to GBA-compatible indexed format:
 - **RGBA transparency** -- transparent pixels auto-assigned to index 0
 - **Export** -- save indexed PNG, JASC `.pal`, or both to the same folder. Compatible with Porymap, GRIT, and other GBA tools
 
-**Tile Animation Editor** (second tab within Tilesets page):
-
-AnimEdit-style tile animation editor covering **all three GBA animation systems** -- 77 animations in vanilla pokefirered, all discovered dynamically from source with no hardcoded names:
-
-- **Navigate by Tileset + Animation Number** -- 68 tilesets parsed from `headers.h`, animated tilesets sorted first. Animations indexed ("0: Flower", "1: Water"). Works on any pokefirered project.
-- **All properties editable** -- Speed/Divisor, Start Tile (hex, 0x1A0 matching Porymap), Tile Amount, Phase, Counter Max. Changes follow the app's normal save pipeline (mark dirty, File > Save writes to tileset_anims.c).
-- **Palette integration** -- loads all 16 tileset .pal files with GBA 15-bit clamping. Editable color swatches, palette slot selector (00-15), import/export .pal. Palettes are shared with Porymap.
-- **Add New Animation** (+) -- creates brand new tileset animation with full C source wiring: INCBIN, frame array, QueueAnimTiles, dispatch, Init, headers.h callback registration.
-- **Remove Animation** (-) -- cleanly strips all C source references.
-- **Preview controls** -- zoom dropdown (1x through 16x), 16x16 metatile checkbox (keeps 2x2 tile blocks together during wrapping), W/H tile layout controls for wrapping wide animations into a grid. Collapsible Frame Thumbnails and Tile Grid sections that collapse to zero height, giving more room to the preview.
-- **Frame Scrubber** -- prev/slider/next for manual stepping through animation frames.
-- **Tile Grid** -- current frame decomposed into 8x8 tiles with hex VRAM addresses and base tile display. Toggle between grid and horizontal strip layout.
-- **Fixed-panel layout** -- 310px left panel (navigation, properties, palette) + stretching right panel (preview, filmstrip, tile grid). No splitter gap.
-- **Animated preview** with speed slider, filmstrip thumbnail strip, info panel.
-- **Tileset BG Animations (8)** -- full editing of all properties + frame add/delete/replace.
-- **Door Animations (32)** / **Field Effect Animations (37)** -- read-only frame display, open spritesheet in Explorer.
-
-### Layouts
-
-Layout renaming/deletion, orphan cleanup, tileset reassignment, secondary tileset renaming.
-
-### Region Map
-
-Visual region map editor with actual tileset graphics as background. Section assignment, region clone/rename/delete. Supports all 4 FireRed regions (Kanto + 3 Sevii). Dual layer (Map + Dungeon).
+![Image Indexer](image%20indexer.png)
 
 ### Text Editor
 
-Project-wide text browser, editor, and search & replace for all game-visible strings. Replaces the old "UI Settings" tab.
+Project-wide text browser, editor, and search & replace for all game-visible strings.
 
 - **Tree browser** with 11 collapsible categories: Game UI & Menus, New Game Intro, Location Names, Map Dialogue, Common Scripts, Battle Messages, Teachy TV, Fame Checker, Quest Log, Trainer Class Names, Nature Names
 - **Search bar** at the top with match case, whole word, and regex options. Results grouped by category with counts
 - **Replace bar** (toggled) -- Replace Selected or Replace All in Results
 - **Editor panel** -- GameTextEdit with context-appropriate character limits, file/label header, script cross-references
-- **"Open in EVENTide"** button for all map dialogue and common script entries -- jumps to the related script
+- **"Open in EVENTide"** button for map dialogue and common script entries -- switches to EVENTide, loads the map, and selects the exact NPC whose script contains that text (searches the full command tree, works regardless of script chain depth)
 - **Saved searches** persist across sessions in `porysuite_text_bookmarks.json`. Right-click to rename/delete groups and manage entries
 - All parsers are dynamic -- whatever maps, scripts, and text files exist in your project are shown
+
+![Text Editor](text%20editor.png)
 
 ### Diagnostics
 
 ROM build diagnostics dashboard. Shows ROM size (progress bars for 16MB and 32MB limits), EWRAM usage (256 KB) and IWRAM usage (32 KB) with color-coded progress bars (green/amber/red), section breakdown (.text, .rodata, .data, .bss from ELF), build type (modern vs legacy), and song/map/species counts. Parses .map and .elf files. Helps catch memory overflows before they become runtime crashes.
 
+![Diagnostics](rom%20diagnostics.png)
+
 ### Config
 
 Edit build configuration (`config.mk`) and game defines (`include/config.h`). Makefile variables and C preprocessor `#define` values are organized into collapsible section cards with toggle support.
+
+![Config](config.png)
 
 ---
 
@@ -232,6 +287,13 @@ Edit build configuration (`config.mk`) and game defines (`include/config.h`). Ma
 | Action | Description |
 |--------|-------------|
 | Name Decapitalizer | Batch-convert ALL-CAPS names to Smart Title Case across 7 categories (species, moves, items, trainers, trainer classes, abilities, UI strings). Preview table, editable skip-list, per-row control. |
+
+### View
+
+| Action | Description |
+|--------|-------------|
+| (Editor pages) | Switch to any editor page (same as clicking toolbar icons) |
+| Show Log Panel | Toggle the developer log panel at the bottom of the window (hidden by default, persists across sessions) |
 
 ### Project
 
@@ -277,7 +339,7 @@ Accessible from Tools > Settings:
 - **Notifications** -- Re-enable previously suppressed dialogs
 - **Build Environment** -- Open the Setup Wizard to install/verify build tools
 - **Event Colors** -- Customize colors for constant types and command categories. Changes apply immediately.
-- **Event Editor Tooltips** -- Toggle descriptive hover tooltips on/off (on by default)
+- **EVENTide Tooltips** -- Toggle descriptive hover tooltips on/off (on by default)
 - **Sound** -- Preview volume, loop count, auto-downsample rate, stereo/mono output mode
 
 ---
@@ -296,8 +358,8 @@ PorySuite-Z integrates [Porymap](https://github.com/huderlem/porymap) as a compa
 
 - **Open in Porymap** (Ctrl+F7) -- opens Porymap to whatever map you're editing in PorySuite-Z
 - If Porymap is already running, it switches to the requested map instead of opening a second window
-- Clicking an event in Porymap updates PorySuite-Z's Event Editor to show that event's script
-- Maps/Layouts tabs have right-click "Open in Porymap" context menus
+- Clicking an event in Porymap updates PorySuite-Z's EVENTide to show that event's script
+- Maps tab has right-click "Open in Porymap" context menus
 - Shared file watchers detect when Porymap saves a map and offer to reload in PorySuite-Z
 
 ### Version tracking and updates

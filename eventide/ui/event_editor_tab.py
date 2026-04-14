@@ -6477,13 +6477,17 @@ class EventEditorTab(QWidget):
         self._load_map(maps_dir / choice)
 
     def open_map_and_select(self, map_name: str, local_id: str = '',
-                            trainer_const: str = ''):
+                            trainer_const: str = '',
+                            text_label: str = ''):
         """Public API: load a map and optionally select an NPC or find a trainer.
 
         Called by the unified window for cross-editor navigation.
         *map_name*: folder name like "PalletTown"
         *local_id*: object local_id to select (e.g. "LOCALID_PALLET_FAT_MAN")
         *trainer_const*: trainer constant to find (e.g. "TRAINER_HIKER_FATBOY")
+        *text_label*: text constant to find (e.g. "PalletTown_Text_CanStoreItemsAndMonsInPC")
+                      — searches every NPC's full command tree for a msgbox
+                      referencing this text, regardless of script chain depth.
         """
         if not self._root_dir:
             return
@@ -6498,6 +6502,20 @@ class EventEditorTab(QWidget):
                 if obj.get('local_id') == local_id:
                     self.obj_combo.setCurrentIndex(i)
                     return
+
+        # Try to find NPC whose script tree contains a msgbox with this text
+        if text_label:
+            for i, obj in enumerate(self._objects):
+                for page in obj.get('_pages', []):
+                    for cmd in page.get('commands', []):
+                        if not cmd or len(cmd) < 2:
+                            continue
+                        if cmd[0] in ('msgbox', 'message'):
+                            # Args may be separate elements or comma-joined
+                            args = ' '.join(str(a) for a in cmd[1:])
+                            if text_label in args:
+                                self.obj_combo.setCurrentIndex(i)
+                                return
 
         # Try to find NPC with trainerbattle referencing this trainer constant
         if trainer_const:

@@ -1044,7 +1044,7 @@ class Ui_MainWindow(object):
         self.groupBox_starter3_form.setRowWrapPolicy(
             QtWidgets.QFormLayout.RowWrapPolicy.DontWrapRows
         )
-        self.groupBox_starter3_form.setVerticalSpacing(30)
+        self.groupBox_starter3_form.setVerticalSpacing(12)
         self.groupBox_starter3_form.setObjectName("groupBox_starter3_form")
         self.label_37 = QtWidgets.QLabel(parent=self.groupBox_starter3)
         self.label_37.setObjectName("label_37")
@@ -1124,7 +1124,7 @@ class Ui_MainWindow(object):
         self.groupBox_starter2_form.setRowWrapPolicy(
             QtWidgets.QFormLayout.RowWrapPolicy.DontWrapRows
         )
-        self.groupBox_starter2_form.setVerticalSpacing(30)
+        self.groupBox_starter2_form.setVerticalSpacing(12)
         self.groupBox_starter2_form.setObjectName("groupBox_starter2_form")
         self.label_36 = QtWidgets.QLabel(parent=self.groupBox_starter2)
         self.label_36.setObjectName("label_36")
@@ -1204,7 +1204,7 @@ class Ui_MainWindow(object):
         self.groupBox_starter1_form.setRowWrapPolicy(
             QtWidgets.QFormLayout.RowWrapPolicy.DontWrapRows
         )
-        self.groupBox_starter1_form.setVerticalSpacing(30)
+        self.groupBox_starter1_form.setVerticalSpacing(12)
         self.groupBox_starter1_form.setObjectName("groupBox_starter1_form")
         self.label_35 = QtWidgets.QLabel(parent=self.groupBox_starter1)
         self.label_35.setObjectName("label_35")
@@ -1275,6 +1275,11 @@ class Ui_MainWindow(object):
             4, QtWidgets.QFormLayout.ItemRole.FieldRole, self.horizontalLayout_14
         )
         self.tab_starters_grid.addWidget(self.groupBox_starter1, 0, 0, 1, 1)
+        # Equal column widths and push content to top
+        self.tab_starters_grid.setColumnStretch(0, 1)
+        self.tab_starters_grid.setColumnStretch(1, 1)
+        self.tab_starters_grid.setColumnStretch(2, 1)
+        self.tab_starters_grid.setRowStretch(1, 1)
         self.mainTabs.addTab(self.tab_starters, "")
         self.tab_trainers = QtWidgets.QWidget()
         self.tab_trainers.setObjectName("tab_trainers")
