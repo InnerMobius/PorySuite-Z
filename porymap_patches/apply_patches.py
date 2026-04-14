@@ -7,9 +7,12 @@ Each patch function finds a known anchor string and inserts code relative
 to it, making the patches resilient to unrelated changes in Porymap.
 
 Patches applied:
-    1. New callback types (11) in scripting.h and scripting.cpp
-    2. writeBridgeFile() and query functions in scriptutility.h/.cpp
-    3. Callback invocation hooks in mainwindow.cpp and editor.cpp
+    1. Callback types (onEventSelected, onMapSaved) in scripting.h/.cpp
+    2. writeBridgeFile(), readCommandFile(), and query functions in
+       scriptutility.h / apiutility.cpp
+    3. Callback invocation hooks in mainwindow.cpp (save + event selection)
+    4. openMap() Q_INVOKABLE on MainWindow for script-based navigation
+    5. CLI project path argument support in main.cpp
 
 Usage:
     python apply_patches.py <porymap_source_dir>
@@ -72,16 +75,7 @@ def patch_scripting_h(src_dir: str):
         f"""
     {SENTINEL}
     OnEventSelected,
-    OnEventCreated,
-    OnEventDeleted,
-    OnEventMoved,
-    OnMapSaved,
-    OnLayoutSaved,
-    OnConnectionChanged,
-    OnWildEncountersSaved,
-    OnHealLocationChanged,
-    OnMapHeaderChanged,
-    OnTilesetChanged,""",
+    OnMapSaved,""",
         label="CallbackType enum",
     )
 
@@ -92,16 +86,7 @@ def patch_scripting_h(src_dir: str):
         """
     // PorySuite-Z callbacks
     static void cb_EventSelected(const QString &eventType, int eventIndex, const QString &scriptLabel, int x, int y);
-    static void cb_EventCreated(const QString &eventType, int eventIndex);
-    static void cb_EventDeleted(const QString &eventType, int eventIndex);
-    static void cb_EventMoved(const QString &eventType, int eventIndex, int oldX, int oldY, int newX, int newY);
-    static void cb_MapSaved(const QString &mapName);
-    static void cb_LayoutSaved(const QString &layoutId);
-    static void cb_ConnectionChanged(const QString &mapName, const QString &direction, const QString &targetMap);
-    static void cb_WildEncountersSaved(const QString &mapName);
-    static void cb_HealLocationChanged(const QString &mapName, int x, int y);
-    static void cb_MapHeaderChanged(const QString &mapName, const QString &property, const QString &value);
-    static void cb_TilesetChanged(const QString &primaryTileset, const QString &secondaryTileset);""",
+    static void cb_MapSaved(const QString &mapName);""",
         label="callback declarations",
     )
 
@@ -111,16 +96,7 @@ def patch_scripting_h(src_dir: str):
         "static void cb_BorderVisibilityToggled(bool) {};",
         """
     static void cb_EventSelected(const QString &, int, const QString &, int, int) {};
-    static void cb_EventCreated(const QString &, int) {};
-    static void cb_EventDeleted(const QString &, int) {};
-    static void cb_EventMoved(const QString &, int, int, int, int, int) {};
-    static void cb_MapSaved(const QString &) {};
-    static void cb_LayoutSaved(const QString &) {};
-    static void cb_ConnectionChanged(const QString &, const QString &, const QString &) {};
-    static void cb_WildEncountersSaved(const QString &) {};
-    static void cb_HealLocationChanged(const QString &, int, int) {};
-    static void cb_MapHeaderChanged(const QString &, const QString &, const QString &) {};
-    static void cb_TilesetChanged(const QString &, const QString &) {};""",
+    static void cb_MapSaved(const QString &) {};""",
         label="no-op stubs",
     )
 
@@ -145,16 +121,7 @@ def patch_scripting_cpp(src_dir: str):
         f"""
     {SENTINEL}
     {{OnEventSelected, "onEventSelected"}},
-    {{OnEventCreated, "onEventCreated"}},
-    {{OnEventDeleted, "onEventDeleted"}},
-    {{OnEventMoved, "onEventMoved"}},
-    {{OnMapSaved, "onMapSaved"}},
-    {{OnLayoutSaved, "onLayoutSaved"}},
-    {{OnConnectionChanged, "onConnectionChanged"}},
-    {{OnWildEncountersSaved, "onWildEncountersSaved"}},
-    {{OnHealLocationChanged, "onHealLocationChanged"}},
-    {{OnMapHeaderChanged, "onMapHeaderChanged"}},
-    {{OnTilesetChanged, "onTilesetChanged"}},""",
+    {{OnMapSaved, "onMapSaved"}},""",
         label="callbackFunctions map",
     )
 
@@ -163,9 +130,7 @@ def patch_scripting_cpp(src_dir: str):
         content,
         "QJSValue Scripting::fromBlock(Block block) {",
         """
-// ═══════════════════════════════════════════════════════════════════════════
-// PorySuite-Z event & save callbacks
-// ═══════════════════════════════════════════════════════════════════════════
+// PorySuite-Z: event selection and map save callbacks
 
 void Scripting::cb_EventSelected(const QString &eventType, int eventIndex,
                                   const QString &scriptLabel, int x, int y) {
@@ -174,70 +139,10 @@ void Scripting::cb_EventSelected(const QString &eventType, int eventIndex,
     instance->invokeCallback(OnEventSelected, args);
 }
 
-void Scripting::cb_EventCreated(const QString &eventType, int eventIndex) {
-    if (!instance) return;
-    QJSValueList args {eventType, eventIndex};
-    instance->invokeCallback(OnEventCreated, args);
-}
-
-void Scripting::cb_EventDeleted(const QString &eventType, int eventIndex) {
-    if (!instance) return;
-    QJSValueList args {eventType, eventIndex};
-    instance->invokeCallback(OnEventDeleted, args);
-}
-
-void Scripting::cb_EventMoved(const QString &eventType, int eventIndex,
-                               int oldX, int oldY, int newX, int newY) {
-    if (!instance) return;
-    QJSValueList args {eventType, eventIndex, oldX, oldY, newX, newY};
-    instance->invokeCallback(OnEventMoved, args);
-}
-
 void Scripting::cb_MapSaved(const QString &mapName) {
     if (!instance) return;
     QJSValueList args {mapName};
     instance->invokeCallback(OnMapSaved, args);
-}
-
-void Scripting::cb_LayoutSaved(const QString &layoutId) {
-    if (!instance) return;
-    QJSValueList args {layoutId};
-    instance->invokeCallback(OnLayoutSaved, args);
-}
-
-void Scripting::cb_ConnectionChanged(const QString &mapName,
-                                      const QString &direction,
-                                      const QString &targetMap) {
-    if (!instance) return;
-    QJSValueList args {mapName, direction, targetMap};
-    instance->invokeCallback(OnConnectionChanged, args);
-}
-
-void Scripting::cb_WildEncountersSaved(const QString &mapName) {
-    if (!instance) return;
-    QJSValueList args {mapName};
-    instance->invokeCallback(OnWildEncountersSaved, args);
-}
-
-void Scripting::cb_HealLocationChanged(const QString &mapName, int x, int y) {
-    if (!instance) return;
-    QJSValueList args {mapName, x, y};
-    instance->invokeCallback(OnHealLocationChanged, args);
-}
-
-void Scripting::cb_MapHeaderChanged(const QString &mapName,
-                                     const QString &property,
-                                     const QString &value) {
-    if (!instance) return;
-    QJSValueList args {mapName, property, value};
-    instance->invokeCallback(OnMapHeaderChanged, args);
-}
-
-void Scripting::cb_TilesetChanged(const QString &primaryTileset,
-                                   const QString &secondaryTileset) {
-    if (!instance) return;
-    QJSValueList args {primaryTileset, secondaryTileset};
-    instance->invokeCallback(OnTilesetChanged, args);
 }
 
 """,
@@ -249,7 +154,7 @@ void Scripting::cb_TilesetChanged(const QString &primaryTileset,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Patch 3: Add writeBridgeFile to ScriptUtility
+# Patch 3: Add bridge communication functions to ScriptUtility
 # ═════════════════════════════════════════════════════════════════════════════
 
 def patch_scriptutility_h(src_dir: str):
@@ -258,7 +163,6 @@ def patch_scriptutility_h(src_dir: str):
     if _is_patched(content):
         return
 
-    # Add writeBridgeFile and query functions after the last Q_INVOKABLE
     content = _insert_after(
         content,
         "Q_INVOKABLE bool isSecondaryTileset(QString tilesetName);",
@@ -268,8 +172,7 @@ def patch_scriptutility_h(src_dir: str):
     Q_INVOKABLE QString readCommandFile();
     Q_INVOKABLE QJSValue getMapHeader();
     Q_INVOKABLE QJSValue getCurrentTilesets();
-    Q_INVOKABLE QJSValue getMapConnections();
-    Q_INVOKABLE QJSValue getMapEvents();""",
+    Q_INVOKABLE QJSValue getMapConnections();""",
         label="Q_INVOKABLE declarations",
     )
 
@@ -283,7 +186,6 @@ def patch_apiutility_cpp(src_dir: str):
     if _is_patched(content):
         return
 
-    # Need QFile for writeBridgeFile (mainwindow.h already pulls in editor.h -> project.h)
     if "#include <QFile>" not in content:
         content = _insert_after(
             content,
@@ -292,15 +194,12 @@ def patch_apiutility_cpp(src_dir: str):
             label="QFile include",
         )
 
-    # Add implementations before the final #endif
     content = _insert_before(
         content,
         "\n#endif // QT_QML_LIB",
         f"""
 {SENTINEL}
-// ═══════════════════════════════════════════════════════════════════════════
-// PorySuite-Z bridge API
-// ═══════════════════════════════════════════════════════════════════════════
+// PorySuite-Z bridge communication + map data queries
 
 QString ScriptUtility::readCommandFile() {{
     if (!window || !window->editor || !window->editor->project)
@@ -320,7 +219,6 @@ QString ScriptUtility::readCommandFile() {{
 }}
 
 void ScriptUtility::writeBridgeFile(QString jsonData) {{
-    // Write JSON data to porysuite_bridge.json in the project root
     if (!window) return;
     QString projectDir;
     if (window->editor && window->editor->project) {{
@@ -395,32 +293,6 @@ QJSValue ScriptUtility::getMapConnections() {{
     }}
     return arr;
 }}
-
-QJSValue ScriptUtility::getMapEvents() {{
-    if (!window || !window->editor || !window->editor->map)
-        return QJSValue();
-    auto engine = Scripting::getEngine();
-    if (!engine) return QJSValue();
-
-    Map *map = window->editor->map.data();
-    QJSValue arr = engine->newArray();
-    int idx = 0;
-    for (auto *event : map->getEvents()) {{
-        QJSValue eObj = engine->newObject();
-        eObj.setProperty("type", Event::typeToString(event->getEventType()));
-        eObj.setProperty("group", Event::groupToString(event->getEventGroup()));
-        eObj.setProperty("index", event->getEventIndex());
-        eObj.setProperty("x", event->getX());
-        eObj.setProperty("y", event->getY());
-        // Use getScripts() — returns the script labels for this event type
-        QStringList scripts = event->getScripts();
-        if (!scripts.isEmpty() && !scripts.first().isEmpty()) {{
-            eObj.setProperty("script", scripts.first());
-        }}
-        arr.setProperty(idx++, eObj);
-    }}
-    return arr;
-}}
 """,
         label="bridge API implementations",
     )
@@ -430,7 +302,7 @@ QJSValue ScriptUtility::getMapEvents() {{
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Patch 4: Wire callbacks into MainWindow save and event selection
+# Patch 4: Wire callbacks into MainWindow (save + event selection)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def patch_mainwindow_cpp(src_dir: str):
@@ -440,7 +312,6 @@ def patch_mainwindow_cpp(src_dir: str):
         return
 
     # ── Add map save callback after successful save ─────────────────────────
-    # Anchor: the one-time reload message check — unique to save()
     content = _insert_before(
         content,
         "if (success && !porymapConfig.shownInGameReloadMessage)",
@@ -455,10 +326,6 @@ def patch_mainwindow_cpp(src_dir: str):
     )
 
     # ── Add event selection callback ────────────────────────────────────────
-    # The updateSelectedEvents method runs whenever event selection changes.
-    # We hook after the single-event selection to notify scripts.
-    # Find the line after the single-event setup (after isProgrammaticEventTabChange = true)
-    # Insert at the end of the single-event case block
     content = _insert_after(
         content,
         'this->isProgrammaticEventTabChange = true;',
@@ -491,9 +358,8 @@ def patch_mainwindow_h(src_dir: str):
     path = os.path.join(src_dir, "include", "mainwindow.h")
     content = _read(path)
     if "Q_INVOKABLE bool openMap" in content:
-        return  # Already has it
+        return
 
-    # Add after the last Q_INVOKABLE in the public section
     content = _insert_after(
         content,
         "Q_INVOKABLE void setFloorNumber(int floorNumber);",
@@ -510,9 +376,8 @@ def patch_mainwindow_openmap(src_dir: str):
     path = os.path.join(src_dir, "src", "mainwindow.cpp")
     content = _read(path)
     if "MainWindow::openMap(const QString" in content:
-        return  # Already has it
+        return
 
-    # Add the implementation before setLayoutOnlyMode
     content = _insert_before(
         content,
         "// These parts of the UI only make sense when editing maps.",
@@ -544,7 +409,6 @@ def patch_main_cpp(src_dir: str):
     if _is_patched(content):
         return
 
-    # Add includes at the top
     content = _insert_after(
         content,
         '#include <QApplication>',
@@ -556,8 +420,6 @@ def patch_main_cpp(src_dir: str):
         label="main.cpp includes",
     )
 
-    # Add CLI arg handling before MainWindow construction
-    # Must set org/app name first so config paths resolve correctly
     content = _insert_before(
         content,
         'porysplash = new PorymapLoadingScreen;',

@@ -1950,10 +1950,9 @@ class UnifiedMainWindow(QMainWindow):
         # Map data changes — reload when Porymap saves
         bw.map_saved.connect(self._on_bridge_map_saved)
 
-        # Event lifecycle
-        bw.event_created.connect(self._on_bridge_event_created)
-        bw.event_deleted.connect(self._on_bridge_event_deleted)
-        bw.event_moved.connect(self._on_bridge_event_moved)
+        # Event lifecycle callbacks removed — these were patched into Porymap's
+        # scripting layer but never wired to actual C++ invocation sites, so they
+        # never fired. Cleaned up in v0.0.55b.
 
     def _on_bridge_map_opened(self, map_name: str, *_args):
         """Porymap opened a map — navigate Event Editor there."""
@@ -2067,78 +2066,6 @@ class UnifiedMainWindow(QMainWindow):
             pass
         finally:
             self._porymap_initiated_load = False
-
-    def _on_bridge_event_created(self, map_name: str, event_type: str,
-                                  event_index: int):
-        """Porymap created a new event — reload and select it."""
-        self._on_bridge_map_saved(map_name)
-        # Attempt to select the newly created event after reload
-        ew = self._eventide_window
-        if ew and hasattr(ew, "event_editor_tab"):
-            tab = ew.event_editor_tab
-            if (hasattr(tab, "_current_map")
-                    and tab._current_map == map_name):
-                try:
-                    self._porymap_initiated_load = True
-                    tab.select_event_by_bridge(event_type, event_index, '')
-                except Exception:
-                    pass
-                finally:
-                    self._porymap_initiated_load = False
-        self.log_message(
-            f"Porymap: new {event_type} #{event_index} on {map_name}")
-
-    def _on_bridge_event_deleted(self, map_name: str, event_type: str,
-                                  event_index: int):
-        """Porymap deleted an event — reload."""
-        self._on_bridge_map_saved(map_name)
-        self.log_message(
-            f"Porymap: deleted {event_type} #{event_index} from {map_name}")
-
-    def _on_bridge_event_moved(self, map_name: str, event_type: str,
-                                event_index: int,
-                                old_x: int, old_y: int,
-                                new_x: int, new_y: int):
-        """Porymap moved an event — reflect the new position in the Event
-        Editor's X/Y spinboxes without marking dirty. If the user has other
-        unsaved edits, we skip the reflect and just log — the user's work is
-        preserved and the next Porymap save will trigger the normal watcher
-        prompt."""
-        ew = self._eventide_window
-        if not ew or not hasattr(ew, "event_editor_tab"):
-            return
-        tab = ew.event_editor_tab
-        # Only react if we're looking at the same map
-        if not (hasattr(tab, "_current_map")
-                and tab._current_map == map_name):
-            return
-        # If user has unsaved edits, don't touch the spinboxes — the move
-        # will surface via the next watcher event anyway.
-        if self.isWindowModified():
-            self.log_message(
-                f"Porymap: moved {event_type} #{event_index} on {map_name} "
-                f"({old_x},{old_y}) → ({new_x},{new_y}) "
-                f"— skipped (unsaved edits present)")
-            return
-        try:
-            self._porymap_initiated_load = True
-            if tab.select_event_by_bridge(event_type, event_index, ''):
-                if hasattr(tab, "x_spin") and hasattr(tab, "y_spin"):
-                    # Suppress dirty marking while reflecting the move.
-                    prev = getattr(tab, "_loading", False)
-                    tab._loading = True
-                    try:
-                        tab.x_spin.setValue(new_x)
-                        tab.y_spin.setValue(new_y)
-                    finally:
-                        tab._loading = prev
-        except Exception:
-            pass
-        finally:
-            self._porymap_initiated_load = False
-        self.log_message(
-            f"Porymap: moved {event_type} #{event_index} on {map_name} "
-            f"({old_x},{old_y}) → ({new_x},{new_y})")
 
     # ═════════════════════════════════════════════════════════════════════════
     # Shared file watcher — detects external edits to project files

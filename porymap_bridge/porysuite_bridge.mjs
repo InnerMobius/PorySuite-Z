@@ -1,7 +1,7 @@
 // PorySuite-Z Bridge Script for Porymap
 //
-// This script runs inside Porymap's JavaScript engine. It listens to all
-// available callbacks and writes structured JSON messages to a bridge file
+// This script runs inside Porymap's JavaScript engine. It listens to
+// callbacks and writes structured JSON messages to a bridge file
 // that PorySuite-Z watches.
 //
 // Stock Porymap callbacks (work without patches):
@@ -11,10 +11,7 @@
 //   onBorderVisibilityToggled
 //
 // Patched callbacks (require our C++ additions):
-//   onEventSelected, onEventCreated, onEventDeleted, onEventMoved,
-//   onMapSaved, onLayoutSaved, onConnectionChanged,
-//   onWildEncountersSaved, onHealLocationChanged, onMapHeaderChanged,
-//   onTilesetChanged
+//   onEventSelected, onMapSaved
 
 let currentMap = "";
 let currentProject = "";
@@ -101,7 +98,6 @@ export function onBorderVisibilityToggled(visible) {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Patched callbacks (only fire if Porymap has our C++ patches applied)
-// If these functions exist but the callbacks don't fire, they're harmless.
 // ═══════════════════════════════════════════════════════════════════════════
 
 export function onEventSelected(eventType, eventIndex, scriptLabel, x, y) {
@@ -116,63 +112,8 @@ export function onEventSelected(eventType, eventIndex, scriptLabel, x, y) {
     });
 }
 
-export function onEventCreated(eventType, eventIndex) {
-    writeBridge({
-        type: "event_created", map: currentMap,
-        eventType: eventType, eventIndex: eventIndex
-    });
-}
-
-export function onEventDeleted(eventType, eventIndex) {
-    writeBridge({
-        type: "event_deleted", map: currentMap,
-        eventType: eventType, eventIndex: eventIndex
-    });
-}
-
-export function onEventMoved(eventType, eventIndex, oldX, oldY, newX, newY) {
-    writeBridge({
-        type: "event_moved", map: currentMap,
-        eventType: eventType, eventIndex: eventIndex,
-        oldX: oldX, oldY: oldY, newX: newX, newY: newY
-    });
-}
-
 export function onMapSaved(mapName) {
     writeBridge({type: "map_saved", map: mapName});
-}
-
-export function onLayoutSaved(layoutId) {
-    writeBridge({type: "layout_saved", layout: layoutId});
-}
-
-export function onConnectionChanged(mapName, direction, targetMap) {
-    writeBridge({
-        type: "connection_changed", map: mapName,
-        direction: direction, target: targetMap
-    });
-}
-
-export function onWildEncountersSaved(mapName) {
-    writeBridge({type: "wild_encounters_saved", map: mapName});
-}
-
-export function onHealLocationChanged(mapName, x, y) {
-    writeBridge({type: "heal_location_changed", map: mapName, x: x, y: y});
-}
-
-export function onMapHeaderChanged(mapName, property, value) {
-    writeBridge({
-        type: "header_changed", map: mapName,
-        property: property, value: value
-    });
-}
-
-export function onTilesetChanged(primaryTileset, secondaryTileset) {
-    writeBridge({
-        type: "tileset_changed", map: currentMap,
-        primary: primaryTileset, secondary: secondaryTileset
-    });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

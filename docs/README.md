@@ -6,6 +6,8 @@ All edits are written back into the project's canonical `src/`, `include/`, and 
 
 ---
 
+> **AI Disclosure:** The vast majority of this codebase was written with [Claude](https://claude.ai) (Anthropic's AI assistant). The human developer (InnerMobius) directs the architecture, tests all features, and makes final decisions — but Claude writes most of the code. This project originally forked from [jschoeny's PorySuite](https://github.com/jschoeny/PorySuite), but has been almost entirely rewritten — very little of the original code remains. If AI-assisted code is a dealbreaker for you, this isn't your project.
+
 > **This application is in beta.** While functional, it may contain bugs that can corrupt or break your project files. **ALWAYS keep backups of your decomp project** (use git!) and test thoroughly after every editing session. You are responsible for verifying that your project still compiles and behaves correctly. The authors are not responsible for any lost or damaged work.
 
 ---
@@ -403,7 +405,7 @@ Build output streams in real time in-app.
 
 ## Credits & Acknowledgements
 
-- **Original PorySuite** by [jschoeny](https://github.com/jschoeny/PorySuite)
+- **Original PorySuite** by [jschoeny](https://github.com/jschoeny/PorySuite) — PorySuite-Z was originally forked from this project, but has been almost entirely rewritten. Very little of the original codebase remains.
 - **PorySuite-Z** by [InnerMobius](https://github.com/InnerMobius)
-- Built with the assistance of AI tools
+- **Built with Claude** (Anthropic) — the vast majority of the code in this project was written by AI. The human developer directs architecture, tests features, files bugs, and makes all design decisions. Claude writes the code. Every commit in the git history that includes a `Co-Authored-By: Claude` line was AI-assisted.
 - [Porymap](https://github.com/huderlem/porymap) by huderlem is a separate project and is **not included** in this repository. PorySuite-Z's optional installer clones and builds Porymap from its own GitHub repo on your machine. We do not distribute Porymap or any of its code.

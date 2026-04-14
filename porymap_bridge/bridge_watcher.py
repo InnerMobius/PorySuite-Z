@@ -42,39 +42,12 @@ class BridgeWatcher(QObject):
     event_selected = pyqtSignal(str, str, int, str, int, int)
     # (mapName, eventType, eventIndex, scriptLabel, x, y)
 
-    event_created = pyqtSignal(str, str, int)
-    # (mapName, eventType, eventIndex)
-
-    event_deleted = pyqtSignal(str, str, int)
-    # (mapName, eventType, eventIndex)
-
-    event_moved = pyqtSignal(str, str, int, int, int, int, int)
-    # (mapName, eventType, eventIndex, oldX, oldY, newX, newY)
-
     edit_requested = pyqtSignal(str, int, int)
     # (mapName, x, y)
 
     # ── Map data change signals ─────────────────────────────────────────────
     map_saved = pyqtSignal(str)
     # (mapName)
-
-    layout_saved = pyqtSignal(str)
-    # (layoutId)
-
-    connection_changed = pyqtSignal(str, str, str)
-    # (mapName, direction, targetMap)
-
-    wild_encounters_saved = pyqtSignal(str)
-    # (mapName)
-
-    heal_location_changed = pyqtSignal(str, int, int)
-    # (mapName, x, y)
-
-    header_changed = pyqtSignal(str, str, str)
-    # (mapName, property, value)
-
-    tileset_changed = pyqtSignal(str, str, str)
-    # (mapName, primaryTileset, secondaryTileset)
 
     tileset_updated = pyqtSignal(str)
     # (tilesetName)
@@ -201,31 +174,6 @@ class BridgeWatcher(QObject):
                     data.get("y", 0),
                 )
 
-            elif msg_type == "event_created":
-                self.event_created.emit(
-                    data.get("map", ""),
-                    data.get("eventType", ""),
-                    data.get("eventIndex", 0),
-                )
-
-            elif msg_type == "event_deleted":
-                self.event_deleted.emit(
-                    data.get("map", ""),
-                    data.get("eventType", ""),
-                    data.get("eventIndex", 0),
-                )
-
-            elif msg_type == "event_moved":
-                self.event_moved.emit(
-                    data.get("map", ""),
-                    data.get("eventType", ""),
-                    data.get("eventIndex", 0),
-                    data.get("oldX", 0),
-                    data.get("oldY", 0),
-                    data.get("newX", 0),
-                    data.get("newY", 0),
-                )
-
             elif msg_type == "edit_request":
                 self.edit_requested.emit(
                     data.get("map", ""),
@@ -235,40 +183,6 @@ class BridgeWatcher(QObject):
 
             elif msg_type == "map_saved":
                 self.map_saved.emit(data.get("map", ""))
-
-            elif msg_type == "layout_saved":
-                self.layout_saved.emit(data.get("layout", ""))
-
-            elif msg_type == "connection_changed":
-                self.connection_changed.emit(
-                    data.get("map", ""),
-                    data.get("direction", ""),
-                    data.get("target", ""),
-                )
-
-            elif msg_type == "wild_encounters_saved":
-                self.wild_encounters_saved.emit(data.get("map", ""))
-
-            elif msg_type == "heal_location_changed":
-                self.heal_location_changed.emit(
-                    data.get("map", ""),
-                    data.get("x", 0),
-                    data.get("y", 0),
-                )
-
-            elif msg_type == "header_changed":
-                self.header_changed.emit(
-                    data.get("map", ""),
-                    data.get("property", ""),
-                    str(data.get("value", "")),
-                )
-
-            elif msg_type == "tileset_changed":
-                self.tileset_changed.emit(
-                    data.get("map", ""),
-                    data.get("primary", ""),
-                    data.get("secondary", ""),
-                )
 
             elif msg_type == "tileset_updated":
                 self.tileset_updated.emit(data.get("tileset", ""))
