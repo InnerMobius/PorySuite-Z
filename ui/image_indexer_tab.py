@@ -5,29 +5,29 @@ reorder palettes, set transparent/background color, export indexed PNGs
 and JASC .pal files.
 
 Sub-tab of the Tilemap Editor page.
+
+Uses the same PaletteSwatchRow used by species graphics, trainers, etc.
+No external dependencies beyond PyQt6 + numpy (already in requirements.txt).
 """
 from __future__ import annotations
 
 import os
-from typing import Optional
 
-from PIL import Image
-
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPixmap, QPainter
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog,
-    QFrame, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QRadioButton, QScrollArea, QSizePolicy,
-    QSlider, QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QFileDialog,
+    QGroupBox, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from core.gba_image_utils import (
-    quantize_image, remap_to_palette, reorder_palette,
+    quantize_image, remap_to_palette,
     move_color_to_index, swap_palette_entries,
     export_indexed_png, export_palette, get_image_info,
-    gba_clamp_palette, find_closest_color,
+    gba_clamp_palette,
 )
+from ui.graphics_tab_widget import PaletteSwatchRow
 from ui.palette_utils import clamp_to_gba, read_jasc_pal
 
 
@@ -49,143 +49,10 @@ QGroupBox::title {
 """
 
 
-# ── Palette swatch widget (clickable, reorderable) ──────────────────────────
-
-class _PaletteSwatch(QWidget):
-    """Single clickable color swatch for the indexer palette."""
-    clicked = pyqtSignal(int)  # emits index
-    double_clicked = pyqtSignal(int)  # emits index for color editing
-
-    def __init__(self, index: int, parent=None):
-        super().__init__(parent)
-        self.index = index
-        self._color = QColor(0, 0, 0)
-        self.setFixedSize(24, 24)
-        self.setToolTip(f"Index {index}")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def set_color(self, r: int, g: int, b: int):
-        self._color = QColor(r, g, b)
-        self.setToolTip(
-            f"Index {self.index}: ({r}, {g}, {b})"
-        )
-        self.update()
-
-    def color_tuple(self) -> tuple[int, int, int]:
-        return (self._color.red(), self._color.green(), self._color.blue())
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.fillRect(0, 0, 24, 24, self._color)
-        # Border
-        p.setPen(QColor("#555555"))
-        p.drawRect(0, 0, 23, 23)
-        # Index number
-        if self.index == 0:
-            p.setPen(QColor("#ff6666"))
-            p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
-            p.drawText(2, 12, "BG")
-        p.end()
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.index)
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.double_clicked.emit(self.index)
-
-
-class _PaletteGrid(QWidget):
-    """Grid of palette swatches with selection and double-click editing."""
-    color_selected = pyqtSignal(int)  # emits selected index
-    color_edit_requested = pyqtSignal(int)  # emits index to edit
-
-    def __init__(self, max_colors: int = 16, parent=None):
-        super().__init__(parent)
-        self._max_colors = max_colors
-        self._selected = -1
-        self._swatches: list[_PaletteSwatch] = []
-        self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(1)
-        self._build(max_colors)
-
-    def _build(self, n: int):
-        # Clear existing
-        for s in self._swatches:
-            s.setParent(None)
-            s.deleteLater()
-        self._swatches.clear()
-
-        # Wrap in a flow-like layout (rows of 16)
-        if hasattr(self, '_inner'):
-            self._inner.setParent(None)
-            self._inner.deleteLater()
-
-        self._inner = QWidget()
-        inner_layout = QVBoxLayout(self._inner)
-        inner_layout.setContentsMargins(0, 0, 0, 0)
-        inner_layout.setSpacing(1)
-
-        row_layout = None
-        for i in range(n):
-            if i % 16 == 0:
-                row_layout = QHBoxLayout()
-                row_layout.setContentsMargins(0, 0, 0, 0)
-                row_layout.setSpacing(1)
-                inner_layout.addLayout(row_layout)
-            s = _PaletteSwatch(i)
-            s.clicked.connect(self._on_click)
-            s.double_clicked.connect(self._on_double_click)
-            self._swatches.append(s)
-            if row_layout:
-                row_layout.addWidget(s)
-
-        if row_layout:
-            row_layout.addStretch(1)
-        inner_layout.addStretch(1)
-
-        # Replace layout content
-        while self._layout.count():
-            item = self._layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-        self._layout.addWidget(self._inner)
-
-    def set_palette(self, colors: list[tuple[int, int, int]]):
-        n = len(colors)
-        if n != len(self._swatches):
-            self._build(n)
-        for i, (r, g, b) in enumerate(colors):
-            if i < len(self._swatches):
-                self._swatches[i].set_color(r, g, b)
-
-    def get_palette(self) -> list[tuple[int, int, int]]:
-        return [s.color_tuple() for s in self._swatches]
-
-    def selected_index(self) -> int:
-        return self._selected
-
-    def _on_click(self, idx: int):
-        self._selected = idx
-        self.color_selected.emit(idx)
-        # Visual highlight
-        for s in self._swatches:
-            s.setStyleSheet(
-                "border: 2px solid #1565c0;" if s.index == idx
-                else ""
-            )
-
-    def _on_double_click(self, idx: int):
-        self._selected = idx
-        self.color_edit_requested.emit(idx)
-
-
 # ── Image preview widget ────────────────────────────────────────────────────
 
 class _ImagePreview(QLabel):
-    """Zoomable image preview with checkerboard background for transparency."""
+    """Zoomable image preview."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -194,27 +61,23 @@ class _ImagePreview(QLabel):
         self.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333;")
         self._pixmap: QPixmap | None = None
 
-    def set_image(self, img: Image.Image | None):
+    def set_image(self, img: QImage | QPixmap | None):
         if img is None:
             self.clear()
             self._pixmap = None
             return
-
-        # Convert PIL → QPixmap
-        if img.mode == "P":
-            img = img.convert("RGBA")
-        elif img.mode != "RGBA":
-            img = img.convert("RGBA")
-
-        data = img.tobytes("raw", "RGBA")
-        qimg = QImage(data, img.width, img.height, QImage.Format.Format_RGBA8888)
-        self._pixmap = QPixmap.fromImage(qimg)
+        if isinstance(img, QImage):
+            # Convert indexed to ARGB for display
+            if img.format() == QImage.Format.Format_Indexed8:
+                img = img.convertToFormat(QImage.Format.Format_ARGB32)
+            self._pixmap = QPixmap.fromImage(img)
+        else:
+            self._pixmap = img
         self._update_display()
 
     def _update_display(self):
         if self._pixmap is None:
             return
-        # Scale to fit the label, maintaining aspect ratio
         w = self.width() - 4
         h = self.height() - 4
         if w < 1 or h < 1:
@@ -237,14 +100,20 @@ class ImageIndexerWidget(QWidget):
     """
     GBA Image Indexer — load any PNG, quantize to 16 or 256 GBA colors,
     reorder palette, export indexed PNG and .pal files.
+
+    Uses PaletteSwatchRow from the species graphics tab — click any swatch
+    to open the GBA-clamped colour picker (same as every other editor).
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._source_path: str = ""
-        self._source_img: Image.Image | None = None
-        self._indexed_img: Image.Image | None = None
+        self._source_img: QImage | None = None
+        self._indexed_img: QImage | None = None
         self._palette: list[tuple[int, int, int]] = []
+        self._selected_idx: int = -1
+        self._swap_mode: bool = False
+        self._swap_first: int = -1
         self._build_ui()
 
     def _build_ui(self):
@@ -361,23 +230,26 @@ class ImageIndexerWidget(QWidget):
         right_layout.setContentsMargins(4, 0, 0, 0)
         right_layout.setSpacing(6)
 
-        # Palette display
+        # Palette display — uses the same PaletteSwatchRow as species/trainers
         pal_group = QGroupBox("Palette")
         pal_group.setStyleSheet(_GROUP_SS)
         pal_inner = QVBoxLayout(pal_group)
         pal_inner.setSpacing(4)
 
         pal_desc = QLabel(
-            "Click a color to select it. Double-click to edit it with a "
-            "color picker (GBA-clamped). Index 0 (marked BG) is the "
-            "transparent/background color."
+            "Click any swatch to edit its colour (GBA 15-bit clamped). "
+            "Index 0 is the transparent/background color on GBA."
         )
         pal_desc.setWordWrap(True)
         pal_desc.setStyleSheet(_NOTE_SS)
         pal_inner.addWidget(pal_desc)
 
-        self._pal_grid = _PaletteGrid(16)
-        pal_inner.addWidget(self._pal_grid)
+        # We use one row for 16-color mode. For 256 we stack up to 16 rows.
+        self._pal_rows: list[PaletteSwatchRow] = []
+        self._pal_rows_container = QVBoxLayout()
+        self._pal_rows_container.setSpacing(2)
+        self._add_palette_row()  # Start with one row (16 colors)
+        pal_inner.addLayout(self._pal_rows_container)
 
         # Palette action buttons
         pal_btns = QHBoxLayout()
@@ -385,7 +257,8 @@ class ImageIndexerWidget(QWidget):
 
         self._move_bg_btn = QPushButton("Set as BG (index 0)")
         self._move_bg_btn.setToolTip(
-            "Move the selected color to palette index 0 (background/transparent)"
+            "Move the selected color to palette index 0 (background/transparent). "
+            "Select a swatch first by clicking it, then click this button."
         )
         self._move_bg_btn.setEnabled(False)
         self._move_bg_btn.clicked.connect(self._move_to_bg)
@@ -393,30 +266,14 @@ class ImageIndexerWidget(QWidget):
 
         self._swap_btn = QPushButton("Swap with...")
         self._swap_btn.setToolTip(
-            "Swap the selected color with another palette entry"
+            "Swap two palette entries. Click this, then click two swatches."
         )
         self._swap_btn.setEnabled(False)
         self._swap_btn.clicked.connect(self._start_swap)
         pal_btns.addWidget(self._swap_btn)
 
-        self._edit_color_btn = QPushButton("Edit Color...")
-        self._edit_color_btn.setToolTip(
-            "Open a color picker to change this palette entry "
-            "(double-click a swatch for the same thing)"
-        )
-        self._edit_color_btn.setEnabled(False)
-        self._edit_color_btn.clicked.connect(self._edit_selected_color)
-        pal_btns.addWidget(self._edit_color_btn)
-
         pal_btns.addStretch(1)
         pal_inner.addLayout(pal_btns)
-
-        # Selected color info
-        self._color_info = QLabel("No color selected")
-        self._color_info.setStyleSheet(
-            "color: #cccccc; font-size: 11px; font-family: Consolas, monospace;"
-        )
-        pal_inner.addWidget(self._color_info)
 
         self._pal_status = QLabel("")
         self._pal_status.setStyleSheet("color: #888; font-size: 10px;")
@@ -461,11 +318,69 @@ class ImageIndexerWidget(QWidget):
         splitter.addWidget(right_widget)
         splitter.setSizes([600, 300])
 
-        # Palette selection handler
-        self._pal_grid.color_selected.connect(self._on_palette_select)
-        self._pal_grid.color_edit_requested.connect(self._edit_color_at)
-        self._swap_mode = False
-        self._swap_first = -1
+    # ── Palette row management ───────────────────────────────────────────
+
+    def _add_palette_row(self) -> PaletteSwatchRow:
+        row = PaletteSwatchRow()
+        row.colors_changed.connect(self._on_palette_edited)
+        self._pal_rows.append(row)
+        self._pal_rows_container.addWidget(row)
+        return row
+
+    def _set_palette_display(self, palette: list[tuple[int, int, int]]):
+        """Update the swatch rows to show the given palette."""
+        n_rows_needed = max(1, (len(palette) + 15) // 16)
+
+        # Add/remove rows as needed
+        while len(self._pal_rows) < n_rows_needed:
+            self._add_palette_row()
+        while len(self._pal_rows) > n_rows_needed:
+            row = self._pal_rows.pop()
+            row.setParent(None)
+            row.deleteLater()
+
+        # Fill colours
+        for row_i, row in enumerate(self._pal_rows):
+            start = row_i * 16
+            chunk = palette[start:start + 16]
+            while len(chunk) < 16:
+                chunk.append((0, 0, 0))
+            row.set_colors(chunk)
+
+    def _read_palette_from_rows(self) -> list[tuple[int, int, int]]:
+        """Read current palette from all swatch rows."""
+        result = []
+        for row in self._pal_rows:
+            result.extend(row.colors())
+        return result
+
+    def _on_palette_edited(self):
+        """A swatch was clicked and edited via the colour picker."""
+        if self._indexed_img is None:
+            return
+        new_pal = self._read_palette_from_rows()
+        max_colors = 16 if self._color_16_rb.isChecked() else 256
+        self._palette = new_pal[:max_colors]
+
+        # Update the indexed image's colour table
+        self._rebuild_image_palette()
+        self._result_preview.set_image(self._indexed_img)
+        self._pal_status.setText("Palette colour edited")
+        self._enable_export(True)
+
+    def _rebuild_image_palette(self):
+        """Apply self._palette to the indexed QImage's colour table."""
+        if self._indexed_img is None:
+            return
+        if self._indexed_img.format() != QImage.Format.Format_Indexed8:
+            return
+        ct = []
+        for i, (r, g, b) in enumerate(self._palette):
+            alpha = 0 if i == 0 else 255  # Index 0 = transparent
+            ct.append((alpha << 24) | (r << 16) | (g << 8) | b)
+        while len(ct) < 256:
+            ct.append(0xFF000000)
+        self._indexed_img.setColorTable(ct)
 
     # ── Load image ───────────────────────────────────────────────────────
 
@@ -477,10 +392,9 @@ class ImageIndexerWidget(QWidget):
         if not path:
             return
 
-        try:
-            img = Image.open(path)
-        except Exception as e:
-            QMessageBox.warning(self, "Load Error", f"Could not open image:\n{e}")
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(self, "Load Error", f"Could not open image:\n{path}")
             return
 
         self._source_path = path
@@ -490,45 +404,47 @@ class ImageIndexerWidget(QWidget):
 
         # Show info
         info = get_image_info(path)
-        mode = info.get("mode", "?")
         w, h = info.get("width", 0), info.get("height", 0)
         cc = info.get("color_count", 0)
         cc_str = f"{cc} colors" if cc >= 0 else "many colors"
         is_idx = info.get("is_indexed", False)
+        mode = info.get("mode", "?")
 
         self._info_label.setText(
-            f"{os.path.basename(path)}  |  {w}x{h}  |  {mode}  |  "
-            f"{'Indexed' if is_idx else 'RGB'}  |  {cc_str}"
+            f"{os.path.basename(path)}  |  {w}x{h}  |  {mode}  |  {cc_str}"
         )
 
         # Show original preview
         self._orig_preview.set_image(img)
         self._result_preview.set_image(None)
 
-        # If already indexed with <=16 or <=256 colors, auto-load its palette
-        if is_idx and cc <= 256:
+        # If already indexed with <=256 colors, auto-load its palette
+        if is_idx:
             self._auto_load_indexed(img, cc)
 
         self._quantize_btn.setEnabled(True)
         self._load_pal_btn.setEnabled(True)
 
-    def _auto_load_indexed(self, img: Image.Image, cc: int):
+    def _auto_load_indexed(self, img: QImage, cc: int):
         """Auto-load palette from an already-indexed image."""
-        pal = img.getpalette()
-        if not pal:
+        ct = img.colorTable()
+        if not ct:
             return
 
         target = 16 if cc <= 16 else 256
         colors = []
-        for i in range(min(target, cc)):
-            r, g, b = pal[i * 3], pal[i * 3 + 1], pal[i * 3 + 2]
+        for c in ct[:target]:
+            r = (c >> 16) & 0xFF
+            g = (c >> 8) & 0xFF
+            b = c & 0xFF
             colors.append(clamp_to_gba(r, g, b))
         while len(colors) < target:
             colors.append((0, 0, 0))
 
         self._palette = colors
-        self._indexed_img = img.copy() if img.mode == "P" else img.quantize(target)
-        self._pal_grid.set_palette(colors)
+        self._indexed_img = img.copy()
+        self._rebuild_image_palette()
+        self._set_palette_display(colors)
         self._result_preview.set_image(self._indexed_img)
         self._pal_status.setText(f"Loaded existing {cc}-color palette from image")
         self._enable_export(True)
@@ -554,7 +470,7 @@ class ImageIndexerWidget(QWidget):
             )
             self._indexed_img = indexed
             self._palette = palette
-            self._pal_grid.set_palette(palette)
+            self._set_palette_display(palette)
             self._result_preview.set_image(indexed)
             self._pal_status.setText(
                 f"Quantized to {len(palette)} GBA-safe colors"
@@ -596,7 +512,7 @@ class ImageIndexerWidget(QWidget):
             remapped = remap_to_palette(self._source_img, colors, dither)
             self._indexed_img = remapped
             self._palette = colors
-            self._pal_grid.set_palette(colors)
+            self._set_palette_display(colors)
             self._result_preview.set_image(remapped)
             self._pal_status.setText(
                 f"Remapped to {os.path.basename(path)} palette "
@@ -610,27 +526,17 @@ class ImageIndexerWidget(QWidget):
 
     # ── Palette reordering ───────────────────────────────────────────────
 
-    def _on_palette_select(self, idx: int):
-        if self._swap_mode:
-            self._complete_swap(idx)
-            return
-        has_img = self._indexed_img is not None
-        self._move_bg_btn.setEnabled(idx > 0 and has_img)
-        self._swap_btn.setEnabled(has_img)
-        self._edit_color_btn.setEnabled(has_img)
-        # Show color info
-        if 0 <= idx < len(self._palette):
-            r, g, b = self._palette[idx]
-            self._color_info.setText(
-                f"Index {idx}:  R={r}  G={g}  B={b}    "
-                f"(#{r:02X}{g:02X}{b:02X})"
-            )
-        else:
-            self._color_info.setText("No color selected")
-
     def _move_to_bg(self):
-        idx = self._pal_grid.selected_index()
-        if idx <= 0 or self._indexed_img is None:
+        """Move the last-edited swatch's colour to index 0."""
+        # We need the user to tell us which index. For now, prompt.
+        from PyQt6.QtWidgets import QInputDialog
+        max_idx = len(self._palette) - 1
+        idx, ok = QInputDialog.getInt(
+            self, "Set as Background",
+            f"Enter the palette index (1–{max_idx}) to move to index 0:",
+            1, 1, max_idx,
+        )
+        if not ok or self._indexed_img is None:
             return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -640,7 +546,7 @@ class ImageIndexerWidget(QWidget):
             )
             self._indexed_img = new_img
             self._palette = new_pal
-            self._pal_grid.set_palette(new_pal)
+            self._set_palette_display(new_pal)
             self._result_preview.set_image(new_img)
             self._pal_status.setText(
                 f"Moved color from index {idx} to index 0 (background)"
@@ -651,119 +557,36 @@ class ImageIndexerWidget(QWidget):
             QApplication.restoreOverrideCursor()
 
     def _start_swap(self):
-        idx = self._pal_grid.selected_index()
-        if idx < 0 or self._indexed_img is None:
-            return
-        self._swap_mode = True
-        self._swap_first = idx
-        self._pal_status.setText(
-            f"Click another color to swap with index {idx}..."
+        """Swap two palette entries by index."""
+        from PyQt6.QtWidgets import QInputDialog
+        max_idx = len(self._palette) - 1
+        a, ok_a = QInputDialog.getInt(
+            self, "Swap Palette Entries",
+            f"First index (0–{max_idx}):", 0, 0, max_idx,
         )
-        self._swap_btn.setText("Cancel swap")
-        self._swap_btn.clicked.disconnect()
-        self._swap_btn.clicked.connect(self._cancel_swap)
-
-    def _complete_swap(self, idx_b: int):
-        self._swap_mode = False
-        self._swap_btn.setText("Swap with...")
-        self._swap_btn.clicked.disconnect()
-        self._swap_btn.clicked.connect(self._start_swap)
-
-        if idx_b == self._swap_first or self._indexed_img is None:
-            self._pal_status.setText("Swap cancelled")
+        if not ok_a or self._indexed_img is None:
+            return
+        b, ok_b = QInputDialog.getInt(
+            self, "Swap Palette Entries",
+            f"Second index (0–{max_idx}):", 1, 0, max_idx,
+        )
+        if not ok_b or a == b:
             return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             new_img, new_pal = swap_palette_entries(
-                self._indexed_img, self._palette,
-                self._swap_first, idx_b,
+                self._indexed_img, self._palette, a, b,
             )
             self._indexed_img = new_img
             self._palette = new_pal
-            self._pal_grid.set_palette(new_pal)
+            self._set_palette_display(new_pal)
             self._result_preview.set_image(new_img)
-            self._pal_status.setText(
-                f"Swapped index {self._swap_first} with index {idx_b}"
-            )
+            self._pal_status.setText(f"Swapped index {a} with index {b}")
         except Exception as e:
             QMessageBox.warning(self, "Swap Error", str(e))
         finally:
             QApplication.restoreOverrideCursor()
-
-    def _cancel_swap(self):
-        self._swap_mode = False
-        self._swap_btn.setText("Swap with...")
-        self._swap_btn.clicked.disconnect()
-        self._swap_btn.clicked.connect(self._start_swap)
-        self._pal_status.setText("Swap cancelled")
-
-    # ── Color editing ───────────────────────────────────────────────────
-
-    def _edit_selected_color(self):
-        """Edit the currently selected palette color via the button."""
-        idx = self._pal_grid.selected_index()
-        if idx < 0 or self._indexed_img is None:
-            return
-        self._edit_color_at(idx)
-
-    def _edit_color_at(self, idx: int):
-        """Open a color picker for palette entry at idx, GBA-clamp result."""
-        if idx < 0 or idx >= len(self._palette) or self._indexed_img is None:
-            return
-
-        old_r, old_g, old_b = self._palette[idx]
-        initial = QColor(old_r, old_g, old_b)
-
-        color = QColorDialog.getColor(
-            initial, self,
-            f"Edit Palette Color — Index {idx}",
-            QColorDialog.ColorDialogOption.DontUseNativeDialog,
-        )
-        if not color.isValid():
-            return
-
-        # GBA-clamp the chosen color to 15-bit (multiples of 8)
-        new_r = (color.red() >> 3) << 3
-        new_g = (color.green() >> 3) << 3
-        new_b = (color.blue() >> 3) << 3
-
-        if (new_r, new_g, new_b) == (old_r, old_g, old_b):
-            return  # No change
-
-        # Update palette
-        self._palette[idx] = (new_r, new_g, new_b)
-
-        # Rebuild the indexed image with the new palette
-        self._apply_palette_to_image()
-
-        # Update UI
-        self._pal_grid.set_palette(self._palette)
-        self._result_preview.set_image(self._indexed_img)
-        self._color_info.setText(
-            f"Index {idx}:  R={new_r}  G={new_g}  B={new_b}    "
-            f"(#{new_r:02X}{new_g:02X}{new_b:02X})"
-        )
-        self._pal_status.setText(
-            f"Changed index {idx}: ({old_r},{old_g},{old_b}) → "
-            f"({new_r},{new_g},{new_b})  [GBA-clamped]"
-        )
-
-    def _apply_palette_to_image(self):
-        """Rebuild the indexed image's internal palette from self._palette."""
-        if self._indexed_img is None or not self._palette:
-            return
-        img = self._indexed_img
-        if img.mode != "P":
-            return
-        # Build a flat palette list [r0, g0, b0, r1, g1, b1, ...]
-        flat_pal = []
-        for r, g, b in self._palette:
-            flat_pal.extend([r, g, b])
-        # Pad to 256 entries (768 values) — PIL requires this
-        while len(flat_pal) < 768:
-            flat_pal.extend([0, 0, 0])
-        img.putpalette(flat_pal[:768])
 
     # ── Export ───────────────────────────────────────────────────────────
 
@@ -771,6 +594,8 @@ class ImageIndexerWidget(QWidget):
         self._export_png_btn.setEnabled(enabled)
         self._export_pal_btn.setEnabled(enabled)
         self._export_both_btn.setEnabled(enabled)
+        self._move_bg_btn.setEnabled(enabled)
+        self._swap_btn.setEnabled(enabled)
 
     def _export_png(self):
         if self._indexed_img is None:
@@ -829,9 +654,7 @@ class ImageIndexerWidget(QWidget):
         ok_pal = export_palette(self._palette, pal_path)
 
         if ok_png and ok_pal:
-            self._pal_status.setText(
-                f"Saved {base}_indexed.png + {base}.pal"
-            )
+            self._pal_status.setText(f"Saved {base}_indexed.png + {base}.pal")
         else:
             parts = []
             if not ok_png:

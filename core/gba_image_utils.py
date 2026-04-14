@@ -2,6 +2,8 @@
 core/gba_image_utils.py
 GBA-compatible image utilities — quantize, index, palette reorder, and export.
 
+Uses QImage + numpy only (no PIL dependency).
+
 Handles:
   - Quantizing any PNG (RGB/RGBA) to 16 or 256 GBA-safe colors
   - Closest-color remapping when importing an image with too many colors
@@ -15,8 +17,8 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from PIL import Image
 import numpy as np
+from PyQt6.QtGui import QImage, QColor
 
 Color = tuple[int, int, int]  # (r, g, b) 0-255
 
@@ -53,287 +55,289 @@ def find_closest_color(color: Color, palette: list[Color]) -> int:
     return best_idx
 
 
+# ── QImage ↔ numpy helpers ──────────────────────────────────────────────────
+
+def _qimage_to_rgb_array(img: QImage) -> tuple[np.ndarray, np.ndarray | None]:
+    """Convert any QImage to an (H, W, 3) uint8 RGB array.
+
+    Returns (rgb_array, alpha_array_or_None).
+    """
+    # Normalise to ARGB32
+    if img.format() == QImage.Format.Format_Indexed8:
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+    elif img.format() != QImage.Format.Format_ARGB32:
+        img = img.convertToFormat(QImage.Format.Format_ARGB32)
+
+    w, h = img.width(), img.height()
+    ptr = img.bits()
+    ptr.setsize(h * w * 4)
+    arr = np.frombuffer(ptr, dtype=np.uint8).reshape(h, w, 4).copy()
+    # ARGB32 byte order is BGRA on little-endian
+    b_ch = arr[:, :, 0]
+    g_ch = arr[:, :, 1]
+    r_ch = arr[:, :, 2]
+    a_ch = arr[:, :, 3]
+    rgb = np.stack([r_ch, g_ch, b_ch], axis=2)
+
+    alpha = a_ch if np.any(a_ch < 255) else None
+    return rgb, alpha
+
+
+def _indexed_array_to_qimage(
+    indices: np.ndarray,
+    palette: list[Color],
+    transparent_index: int = 0,
+) -> QImage:
+    """Build a QImage Format_Indexed8 from an index array and palette."""
+    h, w = indices.shape
+    img = QImage(indices.data.tobytes(), w, h, w, QImage.Format.Format_Indexed8)
+    # QImage doesn't copy the data — force a deep copy
+    img = img.copy()
+
+    # Build color table
+    ct = []
+    for i, (r, g, b) in enumerate(palette):
+        alpha = 0 if i == transparent_index else 255
+        ct.append((alpha << 24) | (r << 16) | (g << 8) | b)
+    # Pad to 256
+    while len(ct) < 256:
+        ct.append(0xFF000000)
+    img.setColorTable(ct)
+    return img
+
+
+# ── Median-cut quantization ─────────────────────────────────────────────────
+
+def _median_cut(pixels: np.ndarray, n_colors: int) -> list[Color]:
+    """Median-cut colour quantization. Returns up to n_colors centroids."""
+    if len(pixels) == 0:
+        return [(0, 0, 0)]
+
+    buckets = [pixels]
+    while len(buckets) < n_colors:
+        # Find the bucket with the widest range on any channel
+        best_i = 0
+        best_range = -1
+        best_ch = 0
+        for i, bk in enumerate(buckets):
+            if len(bk) < 2:
+                continue
+            for ch in range(3):
+                rng = int(bk[:, ch].max()) - int(bk[:, ch].min())
+                if rng > best_range:
+                    best_range = rng
+                    best_i = i
+                    best_ch = ch
+        if best_range <= 0:
+            break  # Can't split further
+        bk = buckets.pop(best_i)
+        median = int(np.median(bk[:, best_ch]))
+        lo = bk[bk[:, best_ch] <= median]
+        hi = bk[bk[:, best_ch] > median]
+        if len(lo) == 0:
+            lo = hi[:1]
+            hi = hi[1:]
+        elif len(hi) == 0:
+            hi = lo[-1:]
+            lo = lo[:-1]
+        buckets.append(lo)
+        buckets.append(hi)
+
+    # Compute centroid of each bucket
+    result: list[Color] = []
+    for bk in buckets:
+        if len(bk) == 0:
+            continue
+        mean = bk.mean(axis=0).astype(int)
+        result.append((int(mean[0]), int(mean[1]), int(mean[2])))
+    return result[:n_colors]
+
+
 # ── Quantization ─────────────────────────────────────────────────────────────
 
 def quantize_image(
-    img: Image.Image,
+    img: QImage,
     max_colors: int = 16,
     dither: bool = True,
     gba_clamp: bool = True,
-) -> tuple[Image.Image, list[Color]]:
+) -> tuple[QImage, list[Color]]:
     """
     Quantize an image to at most `max_colors` colors.
 
     Parameters:
-        img:        PIL Image (any mode — RGB, RGBA, P, L, etc.)
+        img:        QImage (any format)
         max_colors: 16 for 4bpp, 256 for 8bpp
         dither:     True for Floyd-Steinberg dithering
         gba_clamp:  True to round all colors to GBA 15-bit after quantization
 
     Returns:
-        (indexed_image, palette) where indexed_image is mode 'P'
-        and palette is a list of (r, g, b) tuples.
+        (indexed_qimage, palette) where indexed_qimage is Format_Indexed8.
     """
-    # Ensure RGB(A)
-    if img.mode == "P":
-        img = img.convert("RGBA")
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGB")
+    rgb, alpha = _qimage_to_rgb_array(img)
+    h, w = rgb.shape[:2]
 
-    # Track alpha for transparency handling
-    has_alpha = img.mode == "RGBA"
-    alpha_mask = None
-    if has_alpha:
-        alpha_mask = np.array(img)[:, :, 3]
-        # Replace fully transparent pixels with a consistent background
-        # so quantization doesn't waste colors on invisible pixels
-        rgb = img.convert("RGB")
-        arr = np.array(rgb)
-        arr[alpha_mask == 0] = [0, 0, 0]
-        rgb = Image.fromarray(arr, "RGB")
+    # Zero out transparent pixels so they don't waste palette entries
+    if alpha is not None:
+        rgb[alpha == 0] = [0, 0, 0]
+
+    # Count unique colours — skip quantization if already within limit
+    flat = rgb.reshape(-1, 3)
+    unique = np.unique(flat, axis=0)
+
+    if len(unique) <= max_colors:
+        palette = [tuple(c) for c in unique.tolist()]
     else:
-        rgb = img.convert("RGB")
+        palette = _median_cut(flat, max_colors)
 
-    # If already has fewer colors than target, just extract palette
-    existing_colors = rgb.getcolors(maxcolors=max_colors + 1)
-    if existing_colors is not None and len(existing_colors) <= max_colors:
-        # Already within limit — just convert to indexed
-        indexed = rgb.quantize(
-            colors=max_colors,
-            dither=Image.Dither.NONE,
-        )
-    else:
-        # Quantize
-        dither_mode = (
-            Image.Dither.FLOYDSTEINBERG if dither
-            else Image.Dither.NONE
-        )
-        indexed = rgb.quantize(
-            colors=max_colors,
-            dither=dither_mode,
-        )
+    # GBA clamp
+    if gba_clamp:
+        palette = gba_clamp_palette(palette)
 
-    # Extract the palette
-    raw_pal = indexed.getpalette()
-    if raw_pal is None:
-        raw_pal = [0] * (max_colors * 3)
+    # Deduplicate after clamping
+    seen: dict[Color, int] = {}
+    deduped: list[Color] = []
+    for c in palette:
+        if c not in seen:
+            seen[c] = len(deduped)
+            deduped.append(c)
+    palette = deduped
 
-    palette: list[Color] = []
-    for i in range(min(max_colors, len(raw_pal) // 3)):
-        r, g, b = raw_pal[i * 3], raw_pal[i * 3 + 1], raw_pal[i * 3 + 2]
-        if gba_clamp:
-            r, g, b = clamp_to_gba(r, g, b)
-        palette.append((r, g, b))
-
-    # Pad palette to target size
+    # Pad to target
     while len(palette) < max_colors:
         palette.append((0, 0, 0))
+    palette = palette[:max_colors]
 
-    # If GBA clamping, remap pixels to the clamped palette
-    if gba_clamp:
-        indexed = _remap_to_clamped(indexed, palette)
+    # Map each pixel to nearest palette entry
+    indices = _remap_pixels(rgb, palette, dither)
 
-    # Restore transparency at index 0 if the original had alpha
-    if has_alpha and alpha_mask is not None:
-        indexed, palette = _apply_transparency(indexed, palette, alpha_mask)
-
-    return indexed, palette
-
-
-def _remap_to_clamped(
-    indexed: Image.Image, palette: list[Color]
-) -> Image.Image:
-    """Rebuild the indexed image with the GBA-clamped palette applied."""
-    # Build a flat palette list for PIL
-    flat = []
-    for r, g, b in palette:
-        flat.extend([r, g, b])
-    # Pad to 256 entries (PIL requires 256*3 for 'P' mode)
-    while len(flat) < 768:
-        flat.extend([0, 0, 0])
-    indexed.putpalette(flat)
-    return indexed
-
-
-def _apply_transparency(
-    indexed: Image.Image,
-    palette: list[Color],
-    alpha_mask: np.ndarray,
-) -> tuple[Image.Image, list[Color]]:
-    """
-    Ensure fully transparent pixels use index 0 and set palette[0]
-    to the background color (black by default for GBA transparency).
-    """
-    arr = np.array(indexed)
-
-    # Find what index transparent pixels currently map to (most common)
-    trans_pixels = arr[alpha_mask == 0]
-    if len(trans_pixels) == 0:
-        return indexed, palette
-
-    # Move the transparent color to index 0 if it isn't already
-    # We'll just set index 0 = (0, 0, 0) and remap transparent pixels
-    old_idx_0_color = palette[0]
-
-    # Set transparent pixels to index 0
-    arr[alpha_mask == 0] = 0
-
-    # If palette[0] wasn't (0,0,0), swap it
-    if old_idx_0_color != (0, 0, 0):
-        # Find if (0,0,0) exists elsewhere
-        black_idx = None
-        for i, c in enumerate(palette):
-            if c == (0, 0, 0) and i != 0:
-                black_idx = i
-                break
-
-        if black_idx is not None:
-            # Swap palette entries
+    # Handle transparency — force transparent pixels to index 0
+    if alpha is not None:
+        # Make sure index 0 is the BG colour (0,0,0)
+        if palette[0] != (0, 0, 0):
+            # Find black or insert it
+            try:
+                black_idx = palette.index((0, 0, 0))
+            except ValueError:
+                black_idx = len(palette) - 1
+                palette[black_idx] = (0, 0, 0)
+            # Swap in index array
+            mask_0 = indices == 0
+            mask_b = indices == black_idx
+            indices[mask_0] = black_idx
+            indices[mask_b] = 0
             palette[0], palette[black_idx] = palette[black_idx], palette[0]
-            # Remap pixels
-            mask_0 = arr == 0
-            mask_b = arr == black_idx
-            arr[mask_0] = black_idx
-            arr[mask_b] = 0
-            # Re-set transparent pixels
-            arr[alpha_mask == 0] = 0
-        else:
-            # Just set palette[0] to black
-            palette[0] = (0, 0, 0)
+        indices[alpha == 0] = 0
 
-    result = Image.fromarray(arr, "P")
-    result = _remap_to_clamped(result, palette)
+    result = _indexed_array_to_qimage(indices, palette, transparent_index=0)
     return result, palette
+
+
+def _remap_pixels(
+    rgb: np.ndarray,
+    palette: list[Color],
+    dither: bool,
+) -> np.ndarray:
+    """Map each pixel to the nearest palette index. Returns uint8 index array."""
+    h, w = rgb.shape[:2]
+    pal_arr = np.array(palette, dtype=np.int32)
+
+    if dither:
+        work = rgb.astype(np.float64)
+        out = np.zeros((h, w), dtype=np.uint8)
+        for y in range(h):
+            for x in range(w):
+                old = np.clip(work[y, x], 0, 255)
+                dists = np.sum((pal_arr - old.astype(np.int32)) ** 2, axis=1)
+                idx = int(np.argmin(dists))
+                out[y, x] = idx
+                error = old - np.array(palette[idx], dtype=np.float64)
+                if x + 1 < w:
+                    work[y, x + 1] += error * (7.0 / 16.0)
+                if y + 1 < h:
+                    if x > 0:
+                        work[y + 1, x - 1] += error * (3.0 / 16.0)
+                    work[y + 1, x] += error * (5.0 / 16.0)
+                    if x + 1 < w:
+                        work[y + 1, x + 1] += error * (1.0 / 16.0)
+    else:
+        flat = rgb.reshape(-1, 3).astype(np.int32)
+        diffs = flat[:, np.newaxis, :] - pal_arr[np.newaxis, :, :]
+        dists = np.sum(diffs ** 2, axis=2)
+        out = np.argmin(dists, axis=1).astype(np.uint8).reshape(h, w)
+
+    return out
 
 
 # ── Closest-color remapping ──────────────────────────────────────────────────
 
 def remap_to_palette(
-    img: Image.Image,
+    img: QImage,
     target_palette: list[Color],
     dither: bool = False,
-) -> Image.Image:
+) -> QImage:
     """
     Remap an image's colors to the nearest match in `target_palette`.
 
-    This is for when you already HAVE a palette (e.g., from a tileset)
-    and want to force an imported image to use only those colors.
-
-    Parameters:
-        img:            PIL Image (any mode)
-        target_palette: The palette to map to (16 or 256 colors)
-        dither:         True for error-diffusion dithering during remap
-
-    Returns:
-        Indexed PIL Image using target_palette.
+    Returns an indexed QImage using target_palette.
     """
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-
-    n_colors = len(target_palette)
-    arr = np.array(img)
-    h, w = arr.shape[:2]
-
-    # Build palette array for fast distance computation
-    pal_arr = np.array(target_palette, dtype=np.int32)
-
-    if dither:
-        # Floyd-Steinberg dithering with closest-color matching
-        work = arr.astype(np.float64)
-        out = np.zeros((h, w), dtype=np.uint8)
-
-        for y in range(h):
-            for x in range(w):
-                old_pixel = work[y, x].copy()
-                # Clamp to valid range
-                old_pixel = np.clip(old_pixel, 0, 255)
-                # Find closest palette color
-                dists = np.sum((pal_arr - old_pixel[:3].astype(np.int32)) ** 2, axis=1)
-                idx = int(np.argmin(dists))
-                out[y, x] = idx
-                # Compute error
-                new_pixel = np.array(target_palette[idx], dtype=np.float64)
-                error = old_pixel[:3] - new_pixel
-                # Distribute error
-                if x + 1 < w:
-                    work[y, x + 1, :3] += error * (7.0 / 16.0)
-                if y + 1 < h:
-                    if x > 0:
-                        work[y + 1, x - 1, :3] += error * (3.0 / 16.0)
-                    work[y + 1, x, :3] += error * (5.0 / 16.0)
-                    if x + 1 < w:
-                        work[y + 1, x + 1, :3] += error * (1.0 / 16.0)
-    else:
-        # Simple nearest-color, vectorized
-        flat = arr.reshape(-1, 3).astype(np.int32)
-        # Compute distances to all palette entries at once
-        # Shape: (n_pixels, n_colors)
-        diffs = flat[:, np.newaxis, :] - pal_arr[np.newaxis, :, :]
-        dists = np.sum(diffs ** 2, axis=2)
-        indices = np.argmin(dists, axis=1).astype(np.uint8)
-        out = indices.reshape(h, w)
-
-    result = Image.fromarray(out, "P")
-    result = _remap_to_clamped(result, target_palette)
-    return result
+    rgb, _alpha = _qimage_to_rgb_array(img)
+    indices = _remap_pixels(rgb, target_palette, dither)
+    return _indexed_array_to_qimage(indices, target_palette, transparent_index=0)
 
 
 # ── Palette reordering ───────────────────────────────────────────────────────
 
 def reorder_palette(
-    indexed_img: Image.Image,
+    indexed_img: QImage,
     palette: list[Color],
     new_order: list[int],
-) -> tuple[Image.Image, list[Color]]:
+) -> tuple[QImage, list[Color]]:
     """
     Reorder palette entries and remap all pixel indices to match.
 
-    Parameters:
-        indexed_img: PIL Image in mode 'P'
-        palette:     Current palette
-        new_order:   List of old indices in new position order.
-                     e.g., [3, 0, 1, 2] means old index 3 is now index 0,
-                     old index 0 is now index 1, etc.
-
-    Returns:
-        (reordered_image, reordered_palette)
+    new_order: list of old indices in new position order.
     """
     n = len(palette)
-    # Build the reverse mapping: old_idx → new_idx
     old_to_new = [0] * n
     for new_idx, old_idx in enumerate(new_order):
         if old_idx < n:
             old_to_new[old_idx] = new_idx
 
-    # Reorder palette
     new_palette: list[Color] = [(0, 0, 0)] * n
     for new_idx, old_idx in enumerate(new_order):
         if old_idx < len(palette):
             new_palette[new_idx] = palette[old_idx]
 
-    # Remap pixels
-    arr = np.array(indexed_img)
+    # Read pixel indices from the indexed QImage
+    arr = _qimage_index_array(indexed_img)
     lut = np.array(old_to_new, dtype=np.uint8)
-    # Clamp indices to valid range
     arr = np.clip(arr, 0, n - 1)
     new_arr = lut[arr]
 
-    result = Image.fromarray(new_arr, "P")
-    result = _remap_to_clamped(result, new_palette)
+    result = _indexed_array_to_qimage(new_arr, new_palette)
     return result, new_palette
 
 
+def _qimage_index_array(img: QImage) -> np.ndarray:
+    """Extract pixel index array from a Format_Indexed8 QImage."""
+    if img.format() != QImage.Format.Format_Indexed8:
+        raise ValueError("Image is not indexed (Format_Indexed8)")
+    w, h = img.width(), img.height()
+    # bytesPerLine may include padding
+    bpl = img.bytesPerLine()
+    ptr = img.bits()
+    ptr.setsize(h * bpl)
+    raw = np.frombuffer(ptr, dtype=np.uint8).reshape(h, bpl)
+    return raw[:, :w].copy()
+
+
 def move_color_to_index(
-    indexed_img: Image.Image,
+    indexed_img: QImage,
     palette: list[Color],
     from_idx: int,
     to_idx: int = 0,
-) -> tuple[Image.Image, list[Color]]:
-    """
-    Move a palette entry from one index to another (shifting others).
-
-    Common use: move background/transparent color to index 0.
-    """
+) -> tuple[QImage, list[Color]]:
+    """Move a palette entry from one index to another (shifting others)."""
     n = len(palette)
     order = list(range(n))
     order.remove(from_idx)
@@ -342,11 +346,11 @@ def move_color_to_index(
 
 
 def swap_palette_entries(
-    indexed_img: Image.Image,
+    indexed_img: QImage,
     palette: list[Color],
     idx_a: int,
     idx_b: int,
-) -> tuple[Image.Image, list[Color]]:
+) -> tuple[QImage, list[Color]]:
     """Swap two palette entries and remap all pixels."""
     n = len(palette)
     order = list(range(n))
@@ -357,34 +361,36 @@ def swap_palette_entries(
 # ── Export ───────────────────────────────────────────────────────────────────
 
 def export_indexed_png(
-    indexed_img: Image.Image,
+    indexed_img: QImage,
     palette: list[Color],
     output_path: str,
     transparent_index: int = 0,
 ) -> bool:
-    """
-    Save an indexed image as PNG with the given palette.
-
-    Parameters:
-        indexed_img:       PIL Image in mode 'P'
-        palette:           Color list
-        output_path:       Where to save
-        transparent_index: Which palette index is transparent (default 0)
-
-    Returns True on success.
-    """
+    """Save an indexed QImage as PNG. Returns True on success."""
     try:
-        # Ensure palette is applied
-        indexed_img = _remap_to_clamped(indexed_img, palette)
-        # Save with transparency info
-        indexed_img.save(
-            output_path,
-            transparency=transparent_index,
-            optimize=False,
-        )
-        return True
+        # Rebuild the colour table to make sure it matches our palette
+        img = _rebuild_color_table(indexed_img, palette, transparent_index)
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        return img.save(output_path, "PNG")
     except Exception:
         return False
+
+
+def _rebuild_color_table(
+    img: QImage, palette: list[Color], transparent_index: int = 0,
+) -> QImage:
+    """Ensure a Format_Indexed8 QImage has the correct color table."""
+    if img.format() != QImage.Format.Format_Indexed8:
+        return img
+    ct = []
+    for i, (r, g, b) in enumerate(palette):
+        alpha = 0 if i == transparent_index else 255
+        ct.append((alpha << 24) | (r << 16) | (g << 8) | b)
+    while len(ct) < 256:
+        ct.append(0xFF000000)
+    result = img.copy()
+    result.setColorTable(ct)
+    return result
 
 
 def export_palette(palette: list[Color], output_path: str) -> bool:
@@ -413,26 +419,33 @@ def export_palette(palette: list[Color], output_path: str) -> bool:
 # ── Image info ───────────────────────────────────────────────────────────────
 
 def get_image_info(path: str) -> dict:
-    """Get basic info about an image file."""
+    """Get basic info about an image file using QImage."""
     try:
-        img = Image.open(path)
+        img = QImage(path)
+        if img.isNull():
+            return {}
+        is_indexed = img.format() == QImage.Format.Format_Indexed8
+        ct = img.colorTable() if is_indexed else []
         info = {
-            "width": img.width,
-            "height": img.height,
-            "mode": img.mode,
-            "is_indexed": img.mode == "P",
-            "color_count": 0,
-            "has_alpha": img.mode in ("RGBA", "PA", "LA"),
+            "width": img.width(),
+            "height": img.height(),
+            "mode": "Indexed" if is_indexed else "RGB",
+            "is_indexed": is_indexed,
+            "color_count": len(ct) if is_indexed else -1,
+            "has_alpha": img.hasAlphaChannel(),
         }
-        if img.mode == "P":
-            pal = img.getpalette()
-            if pal:
-                info["color_count"] = len(pal) // 3
+        if not is_indexed:
+            # Count unique colours (cap to avoid slow scans on huge images)
+            rgb, _ = _qimage_to_rgb_array(img)
+            flat = rgb.reshape(-1, 3)
+            if len(flat) <= 262144:  # 512x512
+                unique = np.unique(flat, axis=0)
+                info["color_count"] = len(unique)
             else:
-                info["color_count"] = 0
-        else:
-            colors = img.convert("RGB").getcolors(maxcolors=65536)
-            info["color_count"] = len(colors) if colors else -1  # -1 = too many
+                # Sample for speed
+                sample = flat[::4]
+                unique = np.unique(sample, axis=0)
+                info["color_count"] = len(unique)
         return info
     except Exception:
         return {}
