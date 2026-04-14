@@ -2395,6 +2395,7 @@ QTabBar::tab:hover:!selected {
         # Build the GBA host tools (gbagfx.exe etc.) if they are missing.
         sample_tool = os.path.join(project_dir, 'tools', 'gbagfx', 'gbagfx.exe')
         needs_tools = not os.path.isfile(sample_tool)
+        tools_prefix = ''
         if needs_tools:
             # Newer MinGW GCC (14+) flags warnings in its own system headers
             # (string.h, assert.h).  pokefirered's tool Makefiles hardcode
