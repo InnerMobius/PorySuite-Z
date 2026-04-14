@@ -2401,23 +2401,30 @@ QTabBar::tab:hover:!selected {
             # (string.h, assert.h).  pokefirered's tool Makefiles hardcode
             # -Werror in CFLAGS, turning those into fatal errors.
             # Fix: build each affected tool individually, overriding CFLAGS
-            # on the make command line to remove -Werror.  Command-line vars
-            # override Makefile `=` assignments.  This only affects host tool
-            # compilation — the ROM uses arm-none-eabi-gcc from devkitPro.
+            # on the make command line.  Must use single quotes inside the
+            # bash -c string — double quotes get mangled by the QProcess →
+            # bash quoting chain.  -Wno-error cancels -Werror even if the
+            # Makefile re-adds it via CFLAGS +=.  This only affects host
+            # tool compilation — the ROM uses arm-none-eabi-gcc from devkitPro.
+            #
+            # pkg-config is expanded by bash at runtime (single quotes don't
+            # prevent $() expansion inside the outer double-quoted -c string).
             tools_prefix = (
-                'echo "Building host tools (with -Werror disabled for GCC compat)..."; '
-                'make -C tools/gbagfx "CFLAGS=-Wall -Wextra -Wno-sign-compare -std=c11 -O3 -flto -DPNG_SKIP_SETJMP_CHECK $(pkg-config --cflags libpng)" && '
-                'make -C tools/rsfont "CFLAGS=-Wall -Wextra -std=c11 -O2 -DPNG_SKIP_SETJMP_CHECK $(pkg-config --cflags libpng)" && '
-                'make -C tools/bin2c "CFLAGS=-Wall -Wextra -std=c11 -O2" && '
-                'make -C tools/gbafix && '
-                'make -C tools/mid2agb && '
-                'make -C tools/scaninc && '
-                'make -C tools/preproc && '
-                'make -C tools/ramscrgen && '
-                'make -C tools/jsonproc && '
-                'make -C tools/mapjson && '
-                'make -C tools/wav2agb && '
-                'echo "Host tools built successfully." && '
+                "echo 'Building host tools (with -Wno-error for GCC compat)...'; "
+                "make -C tools/gbagfx 'CFLAGS=-Wall -Wextra -Wno-error -Wno-sign-compare -std=c11 -O3 -flto -DPNG_SKIP_SETJMP_CHECK' "
+                "'LDFLAGS=$(pkg-config --libs-only-L libpng)' && "
+                "make -C tools/rsfont 'CFLAGS=-Wall -Wextra -Wno-error -std=c11 -O2 -DPNG_SKIP_SETJMP_CHECK' "
+                "'LDFLAGS=$(pkg-config --libs-only-L libpng)' && "
+                "make -C tools/bin2c 'CFLAGS=-Wall -Wextra -Wno-error -std=c11 -O2' && "
+                "make -C tools/gbafix && "
+                "make -C tools/mid2agb && "
+                "make -C tools/scaninc && "
+                "make -C tools/preproc && "
+                "make -C tools/ramscrgen && "
+                "make -C tools/jsonproc && "
+                "make -C tools/mapjson && "
+                "make -C tools/wav2agb && "
+                "echo 'Host tools built successfully.' && "
             )
             self.log("Host tools missing — will run 'make tools' first.")
 
