@@ -43,7 +43,7 @@ class ProjectSelector(QMainWindow):
         movie.start()
 
         # Version and credits below the title
-        self.ui.label.setText(f"PorySuite-Z\n{VERSION}")
+        self.ui.label.setText("PorySuite-Z\nEVENTide")
         self.ui.label_3.setText(
             '<span style="color: #999; font-size: 10px;">'
             "pokefirered projects only<br><br>"

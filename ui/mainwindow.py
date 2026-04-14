@@ -2338,6 +2338,8 @@ QTabBar::tab:hover:!selected {
             _devkitpro_env_exports,
             _win_path_to_msys,
             _InAppBuildDialog,
+            _suppress_win_error_dialogs,
+            _restore_win_error_mode,
         )
 
         # ── Check MSYS2 is available ───────────────────────────────────────────
@@ -2394,14 +2396,34 @@ QTabBar::tab:hover:!selected {
 
         # Build the GBA host tools if ANY critical one is missing or invalid.
         # Check all tools that are required for a full build — not just one.
+        # We also verify each .exe actually runs on this machine (not just that
+        # the file exists) — a leftover binary from a different OS/arch will
+        # fail to execute and gets rebuilt automatically.
         _required_tools = [
             'gbagfx', 'bin2c', 'gbafix', 'rsfont', 'mid2agb',
             'scaninc', 'preproc', 'ramscrgen', 'wav2agb',
         ]
-        needs_tools = any(
-            not os.path.isfile(os.path.join(project_dir, 'tools', t, t + '.exe'))
-            for t in _required_tools
-        )
+
+        def _tool_works(tool_name: str) -> bool:
+            """Return True only if the tool .exe exists AND can execute."""
+            exe = os.path.join(project_dir, 'tools', tool_name, tool_name + '.exe')
+            if not os.path.isfile(exe):
+                return False
+            prev = _suppress_win_error_dialogs()
+            try:
+                # Most tools print usage/version and exit 0 or 1 when called
+                # with no args.  We just need the OS to successfully load the
+                # binary — any return code is fine, OSError means it can't run.
+                import subprocess as _sp
+                _sp.run([exe], capture_output=True, timeout=5,
+                        creationflags=0x08000000)  # CREATE_NO_WINDOW
+                return True
+            except (OSError, _sp.TimeoutExpired):
+                return False
+            finally:
+                _restore_win_error_mode(prev)
+
+        needs_tools = any(not _tool_works(t) for t in _required_tools)
         tools_prefix = ''
         if needs_tools:
             # Newer MinGW GCC (14+) flags warnings in its own system headers
@@ -2417,6 +2439,9 @@ QTabBar::tab:hover:!selected {
             # pkg-config is expanded by bash at runtime (single quotes don't
             # prevent $() expansion inside the outer double-quoted -c string).
             tools_prefix = (
+                "echo 'Cleaning stale host tools...'; "
+                "for d in gbagfx bin2c gbafix rsfont mid2agb scaninc preproc ramscrgen wav2agb jsonproc mapjson; do "
+                "make -C tools/$d clean 2>/dev/null; done; "
                 "echo 'Building host tools (with -Wno-error for GCC compat)...'; "
                 "make -C tools/gbagfx 'CFLAGS=-Wall -Wextra -Wno-error -Wno-sign-compare -std=c11 -O3 -flto -DPNG_SKIP_SETJMP_CHECK' "
                 "'LDFLAGS=$(pkg-config --libs-only-L libpng)' && "
