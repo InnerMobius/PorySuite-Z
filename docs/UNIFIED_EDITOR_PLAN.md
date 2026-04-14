@@ -8,9 +8,11 @@ Merge PorySuite (data editor) and EVENTide (script editor) into a single window 
 
 ## Current State (2026-04-14)
 
-Phases 1 through 6 are **complete**. All Sound Editor phases (1-9) **complete**. All Piano Roll features **complete**. Abilities Editor (Phase 8A) **complete** with 52 battle templates, 74/74 detection. Phase 10A (Tilemap Editor) and 10B (Tile Animation Editor) **complete**. Remaining: 10C pixel editor.
+Phases 1 through 6 are **complete**. All Sound Editor phases (1-9) **complete**. All Piano Roll features **complete**. Abilities Editor (Phase 8A) **complete** with 52 battle templates, 74/74 detection. **Phase 10 — COMPLETE** (10A Tilemap Editor, 10B Tile Animation Editor done; 10C pixel editor and Metatile Builder superseded — Porymap covers metatiles, GIMP covers tile graphics).
 
 **Phase 11 — Text Editor: ALL SUB-PHASES (11A–11F) COMPLETE.** The old "UI Settings" tab has been fully replaced by a project-wide text browser and editor. Core text index (`core/text_index.py`) parses all 7 source types dynamically. Tree browser (`ui/text_editor_tab.py`) with 11 collapsible categories, search bar with match case / whole word / regex, replace bar, GameTextEdit with context-appropriate limits, "Open in EVENTide" for all map dialogue and common scripts. Saved searches persist across sessions via `porysuite_text_bookmarks.json` with right-click management. Old `ui_tab_widget.py` deleted, toolbar/menu renamed to "Text Editor".
+
+**Phase 12 — GBA Image Indexer: COMPLETE.** New sub-tab in Tilemap Editor for converting any PNG to GBA-compatible indexed format. Quantize to 16/256 colors with GBA 15-bit clamping and optional dithering. Load existing .pal files and remap via closest-color matching. Palette grid with reordering, BG color selection, swap. Export indexed PNG and JASC .pal. Core logic in `core/gba_image_utils.py`, UI in `ui/image_indexer_tab.py`.
 
 **18 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Diagnostics, Tilemap Editor, Event Editor, Maps, Layouts & Tilesets, Region Map, Text Editor, Config.
 
@@ -1100,7 +1102,7 @@ Wild Encounters card on the Pokédex detail panel shows every location where a s
 
 ---
 
-### Phase 10: Tileset, Metatile & Tile Animation Editor
+### Phase 10: Tileset, Metatile & Tile Animation Editor — COMPLETE
 
 A visual editor for the parts of tileset workflow that Porymap doesn't cover — building metatiles from raw tiles, editing palettes, painting tilemaps, and creating/editing tile animations.
 
@@ -1138,14 +1140,8 @@ A visual editor for the parts of tileset workflow that Porymap doesn't cover —
 
 **Files:** `core/tilemap_data.py`, `ui/tilemap_editor_tab.py`, `ui/palette_utils.py`, `ui/unified_mainwindow.py`, `res/icons/toolbar/tilesets.png`
 
-**Metatile Builder (not yet started):**
-- Display `tiles.png` as a grid of 8x8 tiles with selectable palette overlay
-- Drag tiles into a 2x2 metatile builder — assign tile index, palette (0-15), horizontal/vertical flip per slot
-- Read/write `metatiles.bin` (4 x u16 per metatile: tile_index 10 bits + flip_h 1 bit + flip_v 1 bit + palette 4 bits)
-- Read/write `metatile_attributes.bin` (u32 per metatile: behavior 9 bits, terrain 5 bits, encounter type 3 bits, layer type 2 bits)
-- Metatile list with visual preview — click to edit, reorder, add, delete
-- Attribute editor panel: behavior dropdown (parsed from `constants/metatile_behaviors.h`), terrain type, encounter type, layer type
-- Support both primary and secondary tilesets
+**Metatile Builder — SUPERSEDED:**
+Handled by Porymap. No need to duplicate.
 
 **Palette Editor:**
 - Display all 16 palettes as color swatch rows (16 colors each)
@@ -1222,16 +1218,9 @@ Complete AnimEdit-style tile animation editor. Navigation by Tileset + Animation
 
 **Files:** `core/tileset_anim_data.py` (three parsers + full write pipeline), `ui/tile_anim_viewer.py` (complete rewrite — `TileAnimEditorWidget`), `ui/tilemap_editor_tab.py` (tab integration)
 
-#### 10C — Tile Pixel Editor
+#### 10C — Tile Pixel Editor — SUPERSEDED
 
-Animation Creator is now part of 10B (Add New Animation button with full C source wiring).
-
-**Tile Pixel Editor:**
-- Paint 8x8 tiles with palette constraints (4bpp = 16 colors from selected palette)
-- Pencil, fill, eyedropper, mirror tools
-- Shared between: tileset tile editing, animation frame painting, metatile preview touch-up
-- Palette-aware: only colors from the assigned palette are available
-- Write back to `tiles.png` (tileset editing) or frame PNGs (animation editing)
+Not needed. Metatiles are handled by Porymap, and tile graphics can be swapped via GIMP or any image editor. The Tilemap Editor already saves tiles in strips and 8x8 chunks, which covers the practical workflow.
 
 #### What Porymap already covers (NOT duplicated):
 - Map event placement (warps, NPCs, items, triggers)
@@ -1247,7 +1236,7 @@ Animation Creator is now part of 10B (Add New Animation button with full C sourc
 
 ---
 
-### Phase 11: Text Editor — Project-Wide Text Browser, Search & Replace
+### Phase 11: Text Editor — Project-Wide Text Browser, Search & Replace — COMPLETE
 
 A text-first browser and project-wide find & replace tool. Covers all game-visible strings that don't already have a dedicated editor, plus unified search across the entire project's text. Replaces the existing "UI" tab (Name Pools, Location Names, Key Strings get absorbed into the tree). Inspired by Advance Text (the legacy binary ROM text editor used by GBA hackers since 2006), but built for decomp source code instead of raw ROM offsets.
 
@@ -1551,6 +1540,29 @@ Replaced the "UI" tab with the Text Editor tab. Old `ui_tab_widget.py` deleted. 
 | 11D — Editor Panel | **COMPLETE** | Right panel GameTextEdit, context header, EVENTide button for all map/script entries |
 | 11E — Saved Searches | **COMPLETE** | Persistent bookmark groups (porysuite_text_bookmarks.json), right-click management, stale detection |
 | 11F — UI Tab Migration | **COMPLETE** | Old file deleted, toolbar/menu renamed, name_decapitalizer updated |
+
+---
+
+### Phase 12: GBA Image Indexer — COMPLETE
+
+A sub-tab in the Tilemap Editor page for converting any PNG image to GBA-compatible indexed format.
+
+**Features:**
+- **Load any PNG** (RGB, RGBA, indexed, etc.) — shows original preview with dimensions, mode, color count
+- **Quantize to 16 or 256 colors** — reduces any image to 4bpp (standard sprites/tiles) or 8bpp (backgrounds). All output colors clamped to GBA 15-bit BGR555 (multiples of 8). Optional Floyd-Steinberg dithering for smoother gradients.
+- **Closest-color remapping** — load an existing JASC .pal file and remap the image to use only those exact palette colors (Euclidean distance in RGB space). Optional dithering on remap. Handles images with more colors than the target palette by automatically selecting the nearest match.
+- **Palette grid** — clickable swatches (rows of 16) with selection highlight. Index 0 marked "BG" (GBA transparent/background).
+- **Palette reordering** — "Set as BG (index 0)" moves any color to the background slot. "Swap with..." lets you swap any two palette entries. All pixel indices automatically remapped when palette changes.
+- **Transparency handling** — RGBA images automatically detect transparent pixels and assign them to index 0 with black (0,0,0) as the background color.
+- **Export indexed PNG** — saves with palette and transparency info. Default name: `originalname_indexed.png`.
+- **Export JASC .pal** — standard text-based palette file compatible with Porymap, GRIT, and other GBA tools.
+- **Export both** — save PNG + .pal to the same folder in one click.
+- **Auto-load palette** from already-indexed images (<=256 colors) on import.
+
+**Files:**
+- `core/gba_image_utils.py` — quantize_image, remap_to_palette, reorder_palette, move_color_to_index, swap_palette_entries, export_indexed_png, export_palette, get_image_info, gba_clamp_palette, find_closest_color
+- `ui/image_indexer_tab.py` — ImageIndexerWidget (full UI), _PaletteGrid, _PaletteSwatch, _ImagePreview
+- `ui/tilemap_editor_tab.py` — wired as third sub-tab ("Image Indexer") alongside Tilemap Editor and Tile Animations
 
 ---
 

@@ -671,6 +671,11 @@ class TilemapEditorTab(QWidget):
         self._anim_viewer = TileAnimEditorWidget()
         self._tab_widget.addTab(self._anim_viewer, "Tile Animations")
 
+        # -- Tab 2: Image Indexer --
+        from ui.image_indexer_tab import ImageIndexerWidget
+        self._image_indexer = ImageIndexerWidget()
+        self._tab_widget.addTab(self._image_indexer, "Image Indexer")
+
         # ── Build the tilemap editor inside editor_page ──────────────────────
 
         # -- Toolbar --

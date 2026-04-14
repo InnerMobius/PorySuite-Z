@@ -1,3 +1,21 @@
+## [2026-04-14] — Phase 12: GBA Image Indexer
+
+### Type
+Feature (Phase 12)
+
+### Summary
+**New Image Indexer sub-tab** in the Tilemap Editor page. Converts any PNG to GBA-compatible indexed format with 16 or 256 colors. All output colors clamped to GBA 15-bit BGR555 (multiples of 8).
+
+**Features:** Load PNG → quantize with optional Floyd-Steinberg dithering → palette grid with click-to-select → "Set as BG (index 0)" and "Swap with..." for palette reordering → export indexed PNG, JASC .pal, or both. Load existing .pal files and remap images via closest-color matching (Euclidean distance). RGBA transparency automatically assigned to index 0.
+
+### Files Changed
+- core/gba_image_utils.py — NEW: quantize_image, remap_to_palette, reorder_palette, move_color_to_index, swap_palette_entries, export_indexed_png, export_palette, get_image_info
+- ui/image_indexer_tab.py — NEW: ImageIndexerWidget, _PaletteGrid, _PaletteSwatch, _ImagePreview
+- ui/tilemap_editor_tab.py — Added Image Indexer as third sub-tab (Tab 2)
+- docs/UNIFIED_EDITOR_PLAN.md — Phase 12 added, Phase 11 header marked COMPLETE
+
+---
+
 ## [2026-04-14] — Phase 11E+F: Saved Search Persistence + UI Tab Migration Complete
 
 ### Type

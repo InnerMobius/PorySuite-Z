@@ -152,6 +152,19 @@ GBA `.bin` tilemap viewer and editor:
 - **Palette source toggle** -- "Auto .pal files" (loads from project's palette directory) or "PNG colors" (uses tile sheet's own color table)
 - **Save** -- integrated with the app's File > Save pipeline. Tile changes mark the window dirty; saving writes the `.bin` file alongside all other editors.
 
+**GBA Image Indexer** (third tab within Tilesets page):
+
+Convert any PNG image to GBA-compatible indexed format:
+
+- **Load any PNG** (RGB, RGBA, or already-indexed) -- shows original preview with dimensions, mode, and color count
+- **Quantize to 16 or 256 colors** -- 4bpp for sprites/tiles, 8bpp for backgrounds. All output colors clamped to GBA 15-bit BGR555 (multiples of 8)
+- **Floyd-Steinberg dithering** -- optional, creates smoother gradients. Turn off for pixel-art style
+- **Closest-color remapping** -- load an existing `.pal` file and force the image to use only those exact colors. Images with too many colors automatically get the nearest match
+- **Palette grid** -- clickable swatches with selection highlight. Index 0 marked "BG" (GBA transparent/background)
+- **Palette reordering** -- "Set as BG (index 0)" moves any color to background slot. "Swap with..." swaps any two entries. All pixel indices remapped automatically
+- **RGBA transparency** -- transparent pixels auto-assigned to index 0
+- **Export** -- save indexed PNG, JASC `.pal`, or both to the same folder. Compatible with Porymap, GRIT, and other GBA tools
+
 **Tile Animation Editor** (second tab within Tilesets page):
 
 AnimEdit-style tile animation editor covering **all three GBA animation systems** -- 77 animations in vanilla pokefirered, all discovered dynamically from source with no hardcoded names:
