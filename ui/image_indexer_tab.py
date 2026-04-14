@@ -19,19 +19,22 @@ import numpy as np
 
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint
 from PyQt6.QtGui import (
-    QColor, QDrag, QImage, QMouseEvent, QPainter, QPixmap,
+    QColor, QDrag, QFont, QImage, QMouseEvent, QPainter, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QFileDialog,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QRadioButton, QSplitter, QVBoxLayout, QWidget,
+    QPushButton, QRadioButton, QScrollArea, QSplitter,
+    QVBoxLayout, QWidget,
 )
 
 from core.gba_image_utils import (
     quantize_image, remap_to_palette,
     move_color_to_index, swap_palette_entries,
     export_indexed_png, export_palette, get_image_info,
-    gba_clamp_palette, _qimage_to_rgb_array,
+    gba_clamp_palette, get_quantize_candidates,
+    QMODE_BALANCED, QMODE_SMOOTH, QMODE_PRESERVE_RARE, QMODE_MANUAL,
 )
 from ui.palette_utils import clamp_to_gba, read_jasc_pal
 
@@ -52,6 +55,140 @@ QGroupBox::title {
     left: 10px; padding: 0 5px; color: #777; font-size: 9px;
 }
 """
+
+# ── Manual colour pick dialog ────────────────────────────────────────────────
+
+class _ManualPickDialog(QDialog):
+    """Shows ~24 candidate colours as clickable swatches.  User checks/unchecks
+    to choose which ones to keep.  Live count label and small preview."""
+
+    def __init__(self, candidates: list[tuple[int, int, int]],
+                 target: int, source_img: QImage, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Pick {target} colours from {len(candidates)} candidates")
+        self.setMinimumWidth(500)
+        self._target = target
+        self._candidates = candidates
+        self._source_img = source_img
+        self._checks: list[QCheckBox] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            f"The image was analysed and {len(self._candidates)} distinct colour "
+            f"groups were found.  Check the {self._target} you want to keep.  "
+            f"Unchecked colours will be mapped to the nearest checked colour."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self._count_label = QLabel("")
+        self._count_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        layout.addWidget(self._count_label)
+
+        # Grid of swatches + checkboxes
+        grid_widget = QWidget()
+        grid = QGridLayout(grid_widget)
+        grid.setSpacing(4)
+
+        cols = 8
+        for i, (r, g, b) in enumerate(self._candidates):
+            row = i // cols
+            col = i % cols
+
+            cell = QVBoxLayout()
+            cell.setSpacing(1)
+
+            swatch = QLabel()
+            swatch.setFixedSize(32, 32)
+            swatch.setStyleSheet(
+                f"background-color: rgb({r},{g},{b}); border: 1px solid #555;"
+            )
+            swatch.setToolTip(f"({r}, {g}, {b})")
+            cell.addWidget(swatch, alignment=Qt.AlignmentFlag.AlignCenter)
+
+            cb = QCheckBox()
+            cb.setChecked(i < self._target)  # Pre-check the first N
+            cb.toggled.connect(self._update_count)
+            self._checks.append(cb)
+            cell.addWidget(cb, alignment=Qt.AlignmentFlag.AlignCenter)
+
+            grid.addLayout(cell, row, col)
+
+        scroll = QScrollArea()
+        scroll.setWidget(grid_widget)
+        scroll.setWidgetResizable(True)
+        scroll.setMaximumHeight(300)
+        layout.addWidget(scroll)
+
+        # Preview
+        self._preview = QLabel()
+        self._preview.setFixedHeight(120)
+        self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._preview.setStyleSheet("background: #1a1a1a; border: 1px solid #333;")
+        layout.addWidget(self._preview)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        select_all = QPushButton("Select All")
+        select_all.clicked.connect(lambda: self._set_all(True))
+        btn_row.addWidget(select_all)
+        select_none = QPushButton("Select None")
+        select_none.clicked.connect(lambda: self._set_all(False))
+        btn_row.addWidget(select_none)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_count()
+
+    def _set_all(self, checked: bool):
+        for cb in self._checks:
+            cb.setChecked(checked)
+
+    def _update_count(self):
+        n = sum(1 for cb in self._checks if cb.isChecked())
+        color = "#66ff66" if n == self._target else (
+            "#ffaa00" if n > self._target else "#ff6666"
+        )
+        self._count_label.setText(
+            f'<span style="color:{color}">{n} / {self._target} selected</span>'
+        )
+        # Update preview
+        self._update_preview()
+
+    def _update_preview(self):
+        selected = self.selected_colors()
+        if not selected or self._source_img is None:
+            return
+        try:
+            preview_img = remap_to_palette(self._source_img, selected, dither=False)
+            argb = preview_img.convertToFormat(QImage.Format.Format_ARGB32)
+            pm = QPixmap.fromImage(argb)
+            scaled = pm.scaled(
+                self._preview.width() - 4, self._preview.height() - 4,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self._preview.setPixmap(scaled)
+        except Exception:
+            pass
+
+    def selected_colors(self) -> list[tuple[int, int, int]]:
+        return [
+            self._candidates[i]
+            for i, cb in enumerate(self._checks) if cb.isChecked()
+        ]
+
 
 # ── Draggable palette swatch ────────────────────────────────────────────────
 
@@ -124,7 +261,6 @@ class _DragSwatch(QLabel):
         # Index 0 label
         if self._index == 0:
             p.setPen(QColor("#ff6666"))
-            from PyQt6.QtGui import QFont
             p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
             p.drawText(2, 13, "BG")
         p.end()
@@ -282,14 +418,17 @@ class _ImagePreview(QLabel):
             self._pixmap = None
             return
         if isinstance(img, QImage):
-            if self._show_transparent:
-                # Render with transparency (index 0 = alpha 0)
-                argb = img.convertToFormat(QImage.Format.Format_ARGB32)
-                self._pixmap = QPixmap.fromImage(argb)
-            else:
-                # Force opaque
-                argb = img.convertToFormat(QImage.Format.Format_ARGB32)
-                self._pixmap = QPixmap.fromImage(argb)
+            argb = img.convertToFormat(QImage.Format.Format_ARGB32)
+            if not self._show_transparent:
+                # Force all pixels fully opaque so index 0 shows its colour
+                w, h = argb.width(), argb.height()
+                bpl = argb.bytesPerLine()
+                ptr = argb.bits()
+                ptr.setsize(h * bpl)
+                buf = np.frombuffer(ptr, dtype=np.uint8).reshape(h, bpl)
+                # ARGB32 on little-endian: bytes are B, G, R, A
+                buf[:, 3:w * 4:4] = 255  # set alpha channel to 255
+            self._pixmap = QPixmap.fromImage(argb)
         else:
             self._pixmap = img
         self._update_display()
@@ -377,6 +516,26 @@ class ImageIndexerWidget(QWidget):
             "Turn off for pixel-art style."
         )
         top_bar.addWidget(self._dither_cb)
+
+        top_bar.addWidget(QLabel("Mode:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # Wheel-scroll protection: only scroll when combo is focused (clicked)
+        self._mode_combo.wheelEvent = lambda e: (
+            QComboBox.wheelEvent(self._mode_combo, e)
+            if self._mode_combo.hasFocus() else e.ignore()
+        )
+        self._mode_combo.addItem("Balanced", QMODE_BALANCED)
+        self._mode_combo.addItem("Smooth Gradients", QMODE_SMOOTH)
+        self._mode_combo.addItem("Preserve Rare Colors", QMODE_PRESERVE_RARE)
+        self._mode_combo.addItem("Manual Pick", QMODE_MANUAL)
+        self._mode_combo.setToolTip(
+            "Balanced — fair representation of all unique colours\n"
+            "Smooth Gradients — preserves subtle shading (pixel-weighted)\n"
+            "Preserve Rare Colors — keeps unique colours even if they cover few pixels\n"
+            "Manual Pick — choose which colours to keep from a larger candidate set"
+        )
+        top_bar.addWidget(self._mode_combo)
 
         self._quantize_btn = QPushButton("Quantize")
         self._quantize_btn.setToolTip(
@@ -690,19 +849,48 @@ class ImageIndexerWidget(QWidget):
             return
         max_colors = 16 if self._color_16_rb.isChecked() else 256
         dither = self._dither_cb.isChecked()
+        mode = self._mode_combo.currentData() or QMODE_BALANCED
+
+        # Manual Pick: show candidate dialog first
+        manual_palette = None
+        if mode == QMODE_MANUAL:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                candidates = get_quantize_candidates(
+                    self._source_img,
+                    n_candidates=max(max_colors + 8, 24),
+                    gba_clamp=True,
+                )
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.warning(self, "Candidate Error", str(e))
+                return
+            QApplication.restoreOverrideCursor()
+
+            dlg = _ManualPickDialog(
+                candidates, max_colors, self._source_img, parent=self,
+            )
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            manual_palette = dlg.selected_colors()
+            if not manual_palette:
+                QMessageBox.warning(self, "No Colors", "No colours were selected.")
+                return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             indexed, palette = quantize_image(
                 self._source_img, max_colors, dither, gba_clamp=True,
+                mode=mode, manual_palette=manual_palette,
             )
             self._indexed_img = indexed
             self._palette = palette
             self._set_palette_display(palette)
             self._refresh_result_preview()
+            mode_name = self._mode_combo.currentText()
             self._pal_status.setText(
-                f"Quantized to {len(palette)} GBA-safe colors"
-                f" {'with' if dither else 'without'} dithering"
+                f"Quantized to {len(palette)} GBA-safe colors "
+                f"({mode_name}, {'dithered' if dither else 'no dither'})"
             )
             self._enable_export(True)
         except Exception as e:

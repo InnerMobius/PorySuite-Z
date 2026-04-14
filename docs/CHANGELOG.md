@@ -1,4 +1,4 @@
-## [2026-04-14] — Phase 12: GBA Image Indexer
+## [2026-04-14] — Phase 12: GBA Image Indexer (Complete)
 
 ### Type
 Feature (Phase 12)
@@ -6,13 +6,32 @@ Feature (Phase 12)
 ### Summary
 **New Image Indexer sub-tab** in the Tilemap Editor page. Converts any PNG to GBA-compatible indexed format with 16 or 256 colors. All output colors clamped to GBA 15-bit BGR555 (multiples of 8).
 
-**Features:** Load PNG → quantize with optional Floyd-Steinberg dithering → palette grid with click-to-select → "Set as BG (index 0)" and "Swap with..." for palette reordering → export indexed PNG, JASC .pal, or both. Load existing .pal files and remap images via closest-color matching (Euclidean distance). RGBA transparency automatically assigned to index 0.
+**Features:**
+- Load any PNG → quantize with optional Floyd-Steinberg dithering
+- **4 quantize modes**: Balanced (equal weight per unique color), Smooth Gradients (pixel-weighted, subtle shading), Preserve Rare Colors (oversampled farthest-point selection — keeps distinct colors even if they cover few pixels), Manual Pick (choose from ~24 candidates with live preview)
+- Drag-and-drop palette reordering (drop onto index 0 = set BG/transparent color)
+- Click any swatch to edit color via color picker (GBA-clamped)
+- Show Transparent toggle (index 0 as transparent or actual color)
+- Trim Unused Colors (compact 256-color palettes with wasted entries)
+- Load existing .pal and remap image via closest-color matching
+- Convert to Tilemap (8×8 tile deduplication with H/V flip detection, exports .bin + tile sheet PNG + .pal)
+- Export indexed PNG, JASC .pal, or both
+- RGBA transparency auto-assigned to index 0
+
+**Audit fixes (same day):**
+- Fixed memory bomb in majority filter for 256-color images (one-hot tensor would allocate ~2.4 GB; now uses per-pixel bincount for palettes > 32 colors)
+- Fixed Manual Pick dialog showing all-black swatches (stylesheet override clobbering palette-based background color)
+- Fixed Show Transparent toggle doing nothing (both code paths were identical; now forces alpha=255 when off)
+- Added empty palette guard in remap_to_palette (prevents crash)
+- Moved QFont import from paintEvent to module level
+- Removed unused _qimage_to_rgb_array import
+- Added 3×3 majority filter to clean orphan pixels when dithering is off (eliminates "accidental dithering" from nearest-color noise)
 
 ### Files Changed
-- core/gba_image_utils.py — NEW: quantize_image, remap_to_palette, reorder_palette, move_color_to_index, swap_palette_entries, export_indexed_png, export_palette, get_image_info
-- ui/image_indexer_tab.py — NEW: ImageIndexerWidget, _PaletteGrid, _PaletteSwatch, _ImagePreview
+- core/gba_image_utils.py — NEW: quantize_image (4 modes), remap_to_palette, reorder_palette, move_color_to_index, swap_palette_entries, export_indexed_png, export_palette, get_image_info, _majority_filter, _majority_filter_large, _balanced_quantize, _preserve_rare_quantize, get_quantize_candidates
+- ui/image_indexer_tab.py — NEW: ImageIndexerWidget, _ManualPickDialog, _DragSwatch, _DraggablePaletteRow, _ImagePreview
 - ui/tilemap_editor_tab.py — Added Image Indexer as third sub-tab (Tab 2)
-- docs/UNIFIED_EDITOR_PLAN.md — Phase 12 added, Phase 11 header marked COMPLETE
+- docs/UNIFIED_EDITOR_PLAN.md — Phase 12 updated with full feature list
 
 ---
 

@@ -12,7 +12,7 @@ Phases 1 through 6 are **complete**. All Sound Editor phases (1-9) **complete**.
 
 **Phase 11 — Text Editor: ALL SUB-PHASES (11A–11F) COMPLETE.** The old "UI Settings" tab has been fully replaced by a project-wide text browser and editor. Core text index (`core/text_index.py`) parses all 7 source types dynamically. Tree browser (`ui/text_editor_tab.py`) with 11 collapsible categories, search bar with match case / whole word / regex, replace bar, GameTextEdit with context-appropriate limits, "Open in EVENTide" for all map dialogue and common scripts. Saved searches persist across sessions via `porysuite_text_bookmarks.json` with right-click management. Old `ui_tab_widget.py` deleted, toolbar/menu renamed to "Text Editor".
 
-**Phase 12 — GBA Image Indexer: COMPLETE.** New sub-tab in Tilemap Editor for converting any PNG to GBA-compatible indexed format. Quantize to 16/256 colors with GBA 15-bit clamping and optional dithering. Load existing .pal files and remap via closest-color matching. Palette grid with reordering, BG color selection, swap. Export indexed PNG and JASC .pal. Core logic in `core/gba_image_utils.py`, UI in `ui/image_indexer_tab.py`.
+**Phase 12 — GBA Image Indexer: COMPLETE.** New sub-tab in Tilemap Editor for converting any PNG to GBA-compatible indexed format. Quantize to 16/256 colors with GBA 15-bit clamping and optional dithering. **4 quantize modes**: Balanced (unique-color-weighted), Smooth Gradients (pixel-weighted), Preserve Rare Colors (oversampled farthest-point selection), Manual Pick (choose from ~24 candidates with live preview). Drag-and-drop palette reordering (drop to index 0 = BG/transparent). Click-to-edit color picker. Show Transparent toggle. Trim Unused Colors. Load .pal and remap. Convert to Tilemap (8×8 tile dedup with H/V flips, exports .bin + tile sheet PNG + .pal). Export indexed PNG and JASC .pal. Majority filter cleans orphan pixels when dithering is off. Core logic in `core/gba_image_utils.py`, UI in `ui/image_indexer_tab.py`.
 
 **18 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Diagnostics, Tilemap Editor, Event Editor, Maps, Layouts & Tilesets, Region Map, Text Editor, Config.
 
@@ -1550,18 +1550,26 @@ A sub-tab in the Tilemap Editor page for converting any PNG image to GBA-compati
 **Features:**
 - **Load any PNG** (RGB, RGBA, indexed, etc.) — shows original preview with dimensions, mode, color count
 - **Quantize to 16 or 256 colors** — reduces any image to 4bpp (standard sprites/tiles) or 8bpp (backgrounds). All output colors clamped to GBA 15-bit BGR555 (multiples of 8). Optional Floyd-Steinberg dithering for smoother gradients.
-- **Closest-color remapping** — load an existing JASC .pal file and remap the image to use only those exact palette colors (Euclidean distance in RGB space). Optional dithering on remap. Handles images with more colors than the target palette by automatically selecting the nearest match.
-- **Palette grid** — clickable swatches (rows of 16) with selection highlight. Index 0 marked "BG" (GBA transparent/background).
-- **Palette reordering** — "Set as BG (index 0)" moves any color to the background slot. "Swap with..." lets you swap any two palette entries. All pixel indices automatically remapped when palette changes.
-- **Transparency handling** — RGBA images automatically detect transparent pixels and assign them to index 0 with black (0,0,0) as the background color.
+- **4 quantize modes:**
+  - **Balanced** — unique-color-weighted median-cut. Each unique color gets 1 vote regardless of how many pixels use it. Prevents large backgrounds from hogging palette slots. Default mode.
+  - **Smooth Gradients** — pixel-weighted median-cut. Best for backgrounds with subtle shading where preserving gradient smoothness matters more than color variety.
+  - **Preserve Rare Colors** — oversamples to 3× target via median-cut, then greedily picks the N most distinct colors using farthest-point selection. Maximizes inter-color distance so rare-but-important colors (e.g. red highlights on a mostly blue image) survive.
+  - **Manual Pick** — oversamples to ~24 candidates, shows them in a dialog with checkboxes and a live preview. User checks which colors to keep; unchecked colors are mapped to the nearest checked one.
+- **Majority filter** — when dithering is OFF, a 3×3 neighborhood filter cleans orphan pixels caused by nearest-color noise. Only replaces truly isolated outliers (5+ of 9 neighbors agree). Solid regions and real edges preserved. Memory-safe for 256-color palettes (uses per-pixel bincount instead of one-hot tensor).
+- **Drag-and-drop palette reordering** — drag any swatch to a new position. Drop onto index 0 (BG) to set the transparent/background color. All pixel indices automatically remapped.
+- **Click-to-edit colors** — click any swatch to open QColorDialog (GBA-clamped output).
+- **Show Transparent toggle** — view index 0 as transparent (checkerboard) or as its actual color.
+- **Trim Unused Colors** — compact 256-color palettes by removing unused and duplicate entries.
+- **Closest-color remapping** — load an existing JASC .pal file and remap the image to use only those exact palette colors (Euclidean distance in RGB space). Optional dithering on remap.
+- **Convert to Tilemap** — split indexed image into 8×8 tiles, deduplicate including H/V flip detection, export a .bin tilemap (GBA 16-bit format with tile index + hflip + vflip + palette bits) + tile sheet PNG + .pal file.
 - **Export indexed PNG** — saves with palette and transparency info. Default name: `originalname_indexed.png`.
 - **Export JASC .pal** — standard text-based palette file compatible with Porymap, GRIT, and other GBA tools.
 - **Export both** — save PNG + .pal to the same folder in one click.
 - **Auto-load palette** from already-indexed images (<=256 colors) on import.
 
 **Files:**
-- `core/gba_image_utils.py` — quantize_image, remap_to_palette, reorder_palette, move_color_to_index, swap_palette_entries, export_indexed_png, export_palette, get_image_info, gba_clamp_palette, find_closest_color
-- `ui/image_indexer_tab.py` — ImageIndexerWidget (full UI), _PaletteGrid, _PaletteSwatch, _ImagePreview
+- `core/gba_image_utils.py` — quantize_image (4 modes), remap_to_palette, reorder_palette, move_color_to_index, swap_palette_entries, export_indexed_png, export_palette, get_image_info, _majority_filter, _majority_filter_large, _balanced_quantize, _preserve_rare_quantize, get_quantize_candidates
+- `ui/image_indexer_tab.py` — ImageIndexerWidget (full UI), _ManualPickDialog, _DragSwatch, _DraggablePaletteRow, _ImagePreview
 - `ui/tilemap_editor_tab.py` — wired as third sub-tab ("Image Indexer") alongside Tilemap Editor and Tile Animations
 
 ---

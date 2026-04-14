@@ -449,6 +449,37 @@ Tracked bugs, confirmed root causes, and fix status. This file persists across s
 
 ---
 
+## GBA Image Indexer — Phase 12
+
+### BUG: Memory bomb in _majority_filter for 256-color images
+- **Status:** FIXED (2026-04-14)
+- **File:** `core/gba_image_utils.py`
+- **Root cause:** `_majority_filter` used a one-hot tensor `np.eye(n_pal)[neighbours]` of shape `(H, W, 9, n_pal)` with int32. For 256-color images, a 512×512 image would allocate `512*512*9*256*4 bytes = ~2.4 GB`, causing MemoryError or severe swapping.
+- **Fix:** Split into two paths: `_majority_filter` (one-hot, fast, safe for n_pal ≤ 32) and `_majority_filter_large` (per-pixel `np.bincount`, memory-safe for 256-color). Threshold at n_pal > 32 routes to the safe path.
+- **DO NOT REMOVE:** The `if n_pal > 32` guard that routes to `_majority_filter_large`.
+
+### BUG: Manual Pick dialog shows all-black swatches
+- **Status:** FIXED (2026-04-14)
+- **File:** `ui/image_indexer_tab.py`, `_ManualPickDialog._build_ui()`
+- **Root cause:** Setting `swatch.setPalette(p)` after `swatch.setStyleSheet("border: ...")` — stylesheet overrides palette-based background colors in Qt. All swatches rendered as black.
+- **Fix:** Put background color directly in the stylesheet string: `background-color: rgb(r,g,b); border: 1px solid #555;`.
+- **DO NOT REMOVE:** The inline `background-color` in the stylesheet. Do NOT split it into a separate `setPalette()` call.
+
+### BUG: Show Transparent toggle has no effect
+- **Status:** FIXED (2026-04-14)
+- **File:** `ui/image_indexer_tab.py`, `_ImagePreview.set_image()`
+- **Root cause:** Both the `show_transparent=True` and `show_transparent=False` branches did identical work (convert to ARGB32, make pixmap). Neither branch forced alpha=255 for the non-transparent case.
+- **Fix:** When `show_transparent` is False, force all alpha bytes to 255 in the ARGB32 buffer using numpy (sets `buf[:, 3:w*4:4] = 255`).
+- **DO NOT REMOVE:** The numpy alpha override in the `not self._show_transparent` branch.
+
+### BUG: remap_to_palette crashes on empty palette
+- **Status:** FIXED (2026-04-14)
+- **File:** `core/gba_image_utils.py`, `remap_to_palette()`
+- **Root cause:** Empty `target_palette` passed to `_remap_pixels` creates a zero-length axis in `np.argmin`, causing ValueError.
+- **Fix:** Guard at top of `remap_to_palette`: if palette is empty, default to `[(0, 0, 0)]`.
+
+---
+
 ## Corrupted Test Files
 
 ### MUS_EVIL (`porysuite/pokefirered/sound/songs/midi/mus_evil.s`)

@@ -158,10 +158,15 @@ Convert any PNG image to GBA-compatible indexed format:
 
 - **Load any PNG** (RGB, RGBA, or already-indexed) -- shows original preview with dimensions, mode, and color count
 - **Quantize to 16 or 256 colors** -- 4bpp for sprites/tiles, 8bpp for backgrounds. All output colors clamped to GBA 15-bit BGR555 (multiples of 8)
-- **Floyd-Steinberg dithering** -- optional, creates smoother gradients. Turn off for pixel-art style
-- **Closest-color remapping** -- load an existing `.pal` file and force the image to use only those exact colors. Images with too many colors automatically get the nearest match
-- **Palette grid** -- clickable swatches with selection highlight. Index 0 marked "BG" (GBA transparent/background)
-- **Palette reordering** -- "Set as BG (index 0)" moves any color to background slot. "Swap with..." swaps any two entries. All pixel indices remapped automatically
+- **4 quantize modes** -- Balanced (fair to small details, default), Smooth Gradients (preserves subtle shading), Preserve Rare Colors (keeps unique colors even if they cover few pixels), Manual Pick (choose which colors to keep from ~24 candidates with a live preview)
+- **Floyd-Steinberg dithering** -- optional, creates smoother gradients. Turn off for pixel-art style. Never forced by any mode
+- **Orphan pixel cleanup** -- when dithering is off, a 3×3 majority filter removes scattered single-pixel noise from nearest-color mapping while preserving real edges and detail
+- **Drag-and-drop palette reordering** -- drag any swatch to reorder. Drop onto index 0 to set the background/transparent color. All pixel indices remapped automatically
+- **Click to edit colors** -- click any swatch to open a color picker (output GBA-clamped)
+- **Show Transparent toggle** -- view index 0 as transparent or as its actual color
+- **Trim Unused Colors** -- compact 256-color palettes by removing unused and duplicate entries
+- **Closest-color remapping** -- load an existing `.pal` file and force the image to use only those exact colors, with optional dithering on remap
+- **Convert to Tilemap** -- split the indexed image into 8×8 tiles, deduplicate (including H/V flipped copies), export a `.bin` tilemap + tile sheet PNG + `.pal` file
 - **RGBA transparency** -- transparent pixels auto-assigned to index 0
 - **Export** -- save indexed PNG, JASC `.pal`, or both to the same folder. Compatible with Porymap, GRIT, and other GBA tools
 
