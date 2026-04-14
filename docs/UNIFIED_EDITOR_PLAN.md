@@ -10,7 +10,7 @@ Merge PorySuite (data editor) and EVENTide (script editor) into a single window 
 
 Phases 1 through 6 are **complete**. **Phase 9 — Pokédex Habitat/Area Display — COMPLETE**: Wild Encounters card on detail panel shows per-species locations with color-coded method dots, level ranges, fishing rod sub-groups, and multi-floor merging. Fully compatible with custom maps and non-vanilla hacks. Phase 5E (EVENTide Improvements) is **complete** — all features done including Move Camera Command, Comprehensive Tooltips, Live Settings Reload, and Hidden Item Editor. **Phase 7 — Porymap Integration** is functional — install, launch, bidirectional map sync, auto-sync on map switch, Go To button in command dialogs all working. Polish remaining. **Sound Editor Phases 1-9 — COMPLETE** including Piano Roll with Song Structure panel, Save button, instrument dropdown, voicegroup friendly labels, and .s file import from other projects. **Abilities Editor (Phase 8A) — COMPLETE** — overhauled 2026-04-09 with **52 battle templates** achieving **74/74 detection of all vanilla abilities**. Every ability now shows an editable template, not a "no editable template" fallback. Templates cover: status immunity, contact effects, type absorb, weather, stat boost, intimidate, pinch boosts, type immunity, weather recovery, type trap, crit prevention, OHKO prevention, evasion weather, stat double, type resist, block stat/flinch, accuracy boost, guts, weather speed, prevent escape, natural cure, pressure, wonder guard, recoil immunity, type change+boost (Pixilate), dual intimidate, Trick Room/Tailwind, multi-type resist, weather suppress, shed skin, truant, sound block, color change, synchronize, suction cups, sticky hold, shield dust, lightning rod, serene grace, hustle, marvel scale, early bird, liquid ooze, plus/minus, damp, contact flinch, trace, forecast, block specific stat. **Save & Git confirmation dialogs** added — File → Save, piano roll save, and git push/pull all require explicit confirmation before proceeding. **Song Writer Optimizations — COMPLETE**: TIE/EOT for long notes, redundant control filtering, proper song deletion cleanup. **ROM Diagnostics Tab — COMPLETE**: ROM size, EWRAM/IWRAM usage, section breakdown, build info. **Piano Roll Save Pipeline Fixes (2026-04-08) — COMPLETE**: PATT subroutine corruption fixed (stripped to linear on save), VOL/TEMPO double-evaluation fixed (reverse-evaluation helpers), BEND loop reset fixed. **Note Properties Dialog — COMPLETE**: Right-click note editing for BEND/control events. **MIDI Import Dropdowns — COMPLETE**: Named instrument dropdowns replace number spinners. **Piano Roll Loop & Save Fixes (2026-04-08) — COMPLETE**: Loop playback used wrong loop_end (max across all tracks), fixed to use track 0's flattened value. GOTO save placed at wrong tick when notes existed past loop end, fixed with timeline insertion. Phantom dirty flag on close after Sound Editor save, fixed. **Piano Roll UX Polish (2026-04-08) — COMPLETE**: Double-click note placement (prevents accidental), Ctrl+Z undo, default snap 1/16, sidebar track sets active instead of filtering, .s reimport/overwrite, git pull refreshes Sound Editor. **Fractional Pitch Bending (2026-04-08) — COMPLETE**: Sub-semitone GBA MidiKeyToFreq interpolation in both renderers, keysplit int() fix, GBA linear pan crossfade. **Piano Roll Control Event & Scroll Fixes (2026-04-08) — COMPLETE**: Control event explosion dedup (PATT flattening duplicated PAN/BEND), PATT label filtering in Song Structure, loop tick drift fix (WAIT before LABEL), label name preservation from Song Structure panel, horizontal scroll by default (wheel), middle-click zoom anchored to cursor. **MIDI Import Robustness (2026-04-08) — COMPLETE**: No Loop mode uses parse→flatten→rewrite pipeline, meta event allowlist cleaning, Type 0→1 MIDI conversion, default import mode changed to "No Loop (clean)". **GM Voicegroup Drum Fix (2026-04-08) — COMPLETE**: 21 drum samples added to mapping, unplaced DirectSound samples recovered into empty slots. **Orphaned Song Registration Cleanup (2026-04-08) — COMPLETE**: Auto-cleanup on project load detects and removes MUS_* entries with missing .s files from all config files. Failed MIDI import cleanup fixed (wrong filename). **Phantom Dirty Flag Fix (2026-04-09) — COMPLETE**: "Unsaved Changes" dialog no longer appears on close/refresh after saving. Root causes: deferred items loader re-dirtying on startup, and gfx_combo repopulation during save marking EVENTide dirty. Fixed with deferred dirty clear, blockSignals during combo refresh, and unconditional EVENTide dirty clear after save. **Pre-Build .s Protection (2026-04-09) — COMPLETE**: `_on_make()` touches all .s files before every build as defense-in-depth against mid2agb overwriting tool-edited songs. **Phase 8B Dirty Flag & Editor Fixes (2026-04-09) — COMPLETE**: Structural dirty-marking loop covers all UI widgets. Abilities effect detection fixed (was using wrong `local_util`). Starter ability combo boxes enabled and saved. "Add to VS Seeker Rematch Table" button with auto map detection. Instrument loop dirty marking. `_on_child_modified()` suppression. **Phase 10A — Tilemap Editor + Palette Editor — COMPLETE**: Full tilemap viewer/editor with 4bpp/8bpp auto-detection, paint/eyedropper tools, zoom/grid, palette-aware rendering, tile offset for VRAM mapping, visual palette editor with JASC .pal 16/256-color import/export, compact UI with auto-sizing palette display. Core: `core/tilemap_data.py`, UI: `ui/tilemap_editor_tab.py`. **Phase 10B — Tile Animation Editor (AnimEdit-Style) — COMPLETE**: Full AnimEdit-style rework. Navigation by Tileset + Animation Number (68 tilesets from headers.h). ALL properties editable and saved to C source: divisor, start tile (hex), tile amount, phase, counter max. Palette integration with 16 .pal file loading, editable swatches, import/export (shared with Porymap). Add/Remove Animation with full C source wiring. Side-by-side layout, display size (1x-8x), frame scrubber, tile grid with hex VRAM addresses and horizontal toggle. Covers all 77 animations (8 tileset BG, 32 door, 37 field effect). Core: `core/tileset_anim_data.py`, UI: `ui/tile_anim_viewer.py`. Remaining: 10C pixel editor.
 
-**18 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Diagnostics, Tilemap Editor, Event Editor, Maps, Layouts & Tilesets, Region Map, UI (Text Content), Config.
+**18 toolbar pages are live:** Pokemon, Pokedex, Moves, Items, Trainers, Starters, Credits, Overworld GFX, Abilities, Sound Editor, Diagnostics, Tilemap Editor, Event Editor, Maps, Layouts & Tilesets, Region Map, UI (Text Content), Config. **Phase 11 — Text Editor** is next on the roadmap: project-wide text browser, search & replace, and unified editing for all game strings that don't have a dedicated editor. Replaces the existing UI tab. Six sub-phases: 11A (core index), 11B (tree browser), 11C (search & replace), 11D (editor panel + EVENTide integration), 11E (saved searches), 11F (UI tab migration).
 
 ---
 
@@ -1245,6 +1245,315 @@ Animation Creator is now part of 10B (Add New Animation button with full C sourc
 
 ---
 
+### Phase 11: Text Editor — Project-Wide Text Browser, Search & Replace
+
+A text-first browser and project-wide find & replace tool. Covers all game-visible strings that don't already have a dedicated editor, plus unified search across the entire project's text. Replaces the existing "UI" tab (Name Pools, Location Names, Key Strings get absorbed into the tree). Inspired by Advance Text (the legacy binary ROM text editor used by GBA hackers since 2006), but built for decomp source code instead of raw ROM offsets.
+
+**What this tab owns (full editing):** Start menu strings, PC interface text, bag/inventory UI labels, battle UI labels, battle messages (status effects, abilities, moves, win/loss), New Game intro (Pikachu intro, Oak speech, name pools), all 290 maps' NPC/sign dialogue (`text.inc`), 38 common script templates (`data/scripts/*.inc`), Teachy TV, Fame Checker, Quest Log, trainer class names, nature names, and all remaining `strings.c` entries not owned by another tab.
+
+**What this tab does NOT own:** Items, abilities, moves, species names, pokedex entries, trainer parties/dialogue, credits, event scripts. Those stay in their existing tabs. Search results hitting those domains show grayed-out entries with "Edit in [Tab Name] →" links that switch you there.
+
+---
+
+#### 11A — Core Infrastructure & Text Index
+
+Build the data layer that powers everything else. Parse all text sources on project load into a searchable in-memory index.
+
+**Text source parsers (one per file format):**
+- `strings.c` parser — extracts `gText_*` / `gPCText_*` / `gStartMenuDesc_*` / `gBattleText_*` etc. from `const u8 varName[] = _("...");` pattern
+- `text.inc` parser — extracts labelled `.string` blocks from all 290 map `text.inc` files
+- `battle_message.c` parser — extracts battle message strings
+- `common scripts` parser — extracts text labels from `data/scripts/*.inc` (38 files)
+- `data/text/*.h` parser — extracts structured text tables (trainer class names, nature names, quest log, Teachy TV, Fame Checker)
+- `new_game_intro.inc` parser — extracts Oak speech, Pikachu intro pages, name pool definitions (absorbs existing `ui_tab_widget.py` parsing logic)
+
+**Unified text index:**
+- Flat list of `TextEntry` objects: `{label, content, file_path, line_number, category, char_limit, max_lines, is_multiline, msgbox_type, owning_tab}`
+- `owning_tab` field marks entries that belong to another editor (items, moves, etc.) — search can find them but editing routes elsewhere
+- Index builds on project load (target: under 2 seconds for ~6,000+ labels across ~350 files)
+- Script cross-reference map: parse all `scripts.inc` files for `msgbox LabelName, MSGBOX_TYPE` patterns, store which script references which text label and what msgbox type
+
+**Character limit lookup table:**
+- Map dialogue (MSGBOX_NPC): 36 chars/line, 20 max lines
+- Map dialogue (MSGBOX_SIGN): 36 chars/line, 4 max lines
+- Battle messages: 36 chars/line, 4 max lines
+- Start menu labels: 12 chars/line, 1 line
+- Start menu descriptions: 36 chars/line, 2 lines
+- Name pools: 7 chars (PLAYER_NAME_LENGTH), 1 line
+- Oak speech / intro: 36 chars/line, 20 max lines
+- PC interface: 36 chars/line, 6 max lines
+- Default fallback: 36 chars/line with "limit unknown" note
+
+**Save pipeline:**
+- Edits modify in-RAM buffer, mark the `TextEntry` dirty, emit `modified` signal
+- Window title shows unsaved dot (same pattern as all other tabs)
+- File → Save calls `flush_to_disk()` — writes all dirty buffers back to source files
+- For `text.inc`: reconstruct `.string` blocks using existing `_update_asm_string_label()` logic
+- For `strings.c` / `battle_message.c`: update `_("...")` content in-place using existing `_update_string_var()` logic
+- For `data/text/*.h`: format-specific writers per file
+- Dirty flags clear on save
+
+**Files:**
+- `core/text_index.py` — text source parsers, unified index builder, save-back writers
+- Absorbs and replaces parsing logic from `ui/ui_tab_widget.py`
+
+---
+
+#### 11B — Tree Browser & Category Organization
+
+The left panel: a collapsible tree of all editable text organized by game area and function. Every section has a one-line italic description explaining what it contains for user discoverability.
+
+**Tree structure (all sections collapsible):**
+
+```
+▾ ★ Saved Searches
+    "Your bookmarked search results. Right-click any result → Save to Saved Searches."
+    ▸ (user-created named groups)
+
+▾ Game UI & Menus
+    "Menu labels, button text, and system strings from strings.c"
+    ▸ Start Menu — NEW GAME, CONTINUE, OPTIONS, POKéMON, BAG, SAVE + descriptions
+    ▸ PC Interface — deposit, withdraw, move, release prompts
+    ▸ Bag & Inventory — pocket names, USE/TOSS/REGISTER labels, sort options
+    ▸ Battle UI — FIGHT, BAG, RUN, SWITCH, status labels
+    ▸ Gender & Naming — BOY, GIRL, naming screen prompts
+    ▸ Pokédex UI — region labels (KANTO, NATIONAL), evaluation text
+    ▸ Miscellaneous — all other strings.c entries not owned by another tab
+
+▾ New Game Intro
+    "The opening sequence: intro cutscene, Professor's speech, and name selection."
+    ▸ Intro Pages — title screen intro (3 pages)
+    ▸ Professor Speech — 13 sequential dialogue segments with {PLAYER}/{RIVAL} placeholders
+    ▸ Name Pools — Male, Female, Rival default name lists (absorbs existing UI tab)
+
+▾ Location Names
+    "Region map display names for each map section."
+    (absorbs existing UI tab Location Names sub-tab)
+
+▾ Map Dialogue (290 maps)
+    "NPC text, sign text, and scripted dialogue for each game location."
+    ▸ CeladonCity (12 labels)
+    ▸ CeruleanCity (8 labels)
+    ▸ PalletTown (6 labels)
+    ... (alphabetical, with modified count badge)
+
+▾ Common Scripts
+    "Shared dialogue templates used across multiple maps (data/scripts/)."
+    ▸ Pokémon Center — nurse healing dialogue
+    ▸ Move Tutors — teach/decline prompts
+    ▸ Day Care — deposit, level-up, egg messages
+    ▸ Shops & Marts — buy/sell/exit prompts
+    ▸ PC Scripts — box management dialogue
+    ▸ Safari Zone — entry, ball count, time-up
+    ▸ Trainer Tower, Cable Club, Pokemon League, etc.
+
+▾ Battle Messages
+    "Dynamic text shown during battles: status effects, ability triggers, move results."
+    ▸ Status Effects — sleep, poison, burn, freeze, paralysis, confusion
+    ▸ Ability Triggers — ability activation messages
+    ▸ Move Messages — charging, recoil, multi-hit, weather, etc.
+    ▸ Win/Loss/Exp — fainted, gained exp, level up, move learned
+
+▾ Teachy TV
+    "Tutorial dialogue from the in-game educational TV system."
+
+▾ Fame Checker
+    "NPC biography entries viewable through the Fame Checker item."
+
+▾ Quest Log
+    "Quest and objective description strings."
+
+▾ Trainer Class Names
+    "Display names for each trainer class (Gym Leader, Youngster, etc.)."
+
+▾ Nature Names
+    "The 25 Pokemon nature display names."
+```
+
+**Tree behavior:**
+- Every section collapsible with ▸/▾ toggle
+- Sections with modified entries show yellow dot + count: "Map Dialogue ● (3 modified)"
+- Map Dialogue maps sorted alphabetically with label count per map
+- Clicking a leaf node (label) loads it in the right-side editor
+- Double-clicking a grayed-out "owned by another tab" entry switches to that tab
+- Saved Searches section persists in project config file, survives app restart
+- Tree remembers expansion state within session
+
+**Description text:**
+- Each top-level section shows a one-line description in gray italic when expanded
+- Descriptions explain what the section contains in plain English, not jargon
+- Helps first-time users understand what they're looking at
+
+**Files:**
+- `ui/text_editor_tab.py` — tree widget, category population, selection handling
+
+---
+
+#### 11C — Search & Replace System
+
+The top bar: always visible, never scrolls away. Project-wide text search with case/word/regex options and full find & replace with preview.
+
+**Search bar (top of tab, always visible):**
+- Wide search input field (prominent, first thing you see)
+- **[Aa] toggle** — Match Case. OFF by default. When ON, "OAK" won't match "Oak"
+- **[W] toggle** — Whole Word. Prevents "Oak" matching inside "Soaking"
+- **[.*] toggle** — Regex mode for power users (standard Python regex)
+- **Scope dropdown:** All Text / Editable Only / Map Dialogue / System Strings / Battle Messages / Current Section / Current File
+- **Live result count** updates as you type (with debounce): "47 matches in 23 files"
+
+**Search results (replaces tree when searching):**
+- When the search field is active with text, the left panel switches from tree view to a flat results list
+- Each result shows: label name, file path, text snippet with match highlighted
+- Results grouped by file with collapsible headers
+- Click a result to load it in the editor panel
+- Right-click a result → "Save to Saved Searches" (creates/adds to a named bookmark group)
+- Results for entries owned by other tabs show grayed with "→ Edit in [Tab] tab" — clicking switches to that tab
+- Clear the search field to return to the tree view
+
+**Replace (collapsible row below search):**
+- Hidden by default — click a "Replace" toggle/icon to expand
+- Replace input field
+- "Replace" button (replaces current selected match)
+- "Replace All in Scope" button — but NOT instant. Shows a **preview dialog** first:
+  - List of every match with checkbox, file, line number, before→after preview
+  - User can uncheck individual matches to exclude them
+  - "Apply" executes the checked replacements
+  - All replacements modify in-RAM buffers (not written to disk until File → Save)
+- Replace only operates within string literals (inside `_("...")` and `.string "..."`) — won't accidentally rename C variable names, labels, or code
+- Undo support: each replace operation is tracked in the dirty buffer, reversible until save
+
+**Interaction with owned-by-other-tab entries:**
+- Search finds everything across the entire project, including items, moves, etc.
+- Replace can only modify entries this tab owns — entries owned by other tabs are shown in results but skipped by Replace All (with a note: "3 matches in Items tab skipped — edit those in the Items tab")
+
+**Files:**
+- `ui/text_search_bar.py` — search bar widget, result list, replace preview dialog
+- `core/text_index.py` — search engine (fast substring/regex search over the index)
+
+---
+
+#### 11D — Editor Panel & EVENTide Integration
+
+The right panel: context-aware text editor with proper character limits, command insertion, and cross-editor navigation.
+
+**Context header (top of editor panel):**
+- File path (which source file this string lives in)
+- Label name (the C/ASM label)
+- Category (which tree section it belongs to)
+- If referenced by a script: which script, what `msgbox` type (NPC, Sign, YesNo, Autoclose)
+- **"Open in EVENTide →" button** — visible when a text label is referenced by a map script's `msgbox` command. Opens EVENTide scrolled to that exact script label. Uses the script cross-reference map built in Phase 11A.
+
+**GameTextEdit widget (reused from existing codebase):**
+- Same `game_text_edit.py` widget used in trainers, events, pokedex
+- Context-appropriate character limit applied from the lookup table (Phase 11A)
+- Per-line counter below editor: `L1: 10/36  L2: 14/36` with grey/amber/red color coding
+- Overflow highlighting (red background for excess characters)
+- Max line enforcement (Enter blocked past limit)
+- Syntax highlighting for `{PLAYER}`, `{RIVAL}`, `\n`, `\p`, `\l`, color codes in blue
+
+**Command insert menu (right-click or toolbar button):**
+- Categorized submenus matching the existing GameTextEdit pattern:
+  - **Variables:** `{PLAYER}`, `{RIVAL}`, `{KUN}`, `{STR_VAR_1}`, `{STR_VAR_2}`, `{STR_VAR_3}`
+  - **Text Flow:** `\n` (line break), `\p` (page break/clear), `\l` (scroll line)
+  - **Music:** `{PLAY_BGM}`, `{PAUSE_MUSIC}`, `{RESUME_MUSIC}`, encounter music
+  - **Font:** `{FONT_NORMAL}`, `{FONT_MALE}`, `{FONT_FEMALE}`
+  - **Color:** text color codes (with color preview swatches)
+- Extended from the existing TEXT_COMMANDS list to include all FC/FD escape sequences
+
+**References panel (below editor):**
+- Shows every script that references the currently-selected text label
+- Parsed from the cross-reference map (Phase 11A)
+- Each reference shows: script label, file, msgbox type
+- Clickable — opens EVENTide at that script location
+- If no references found: "No script references found for this label"
+
+**Name Pools editor (special case within New Game Intro section):**
+- When a Name Pools entry is selected, the right panel shows the existing multi-name editor (from `_NamePoolSubTab`)
+- 7-character limit per name, shared-name tracking across pools
+- Absorbs the existing UI tab's name pool editing directly
+
+**Modified indicator:**
+- Yellow dot next to the label name in the header when the in-RAM value differs from disk
+- "Modified" means changed in this session only — not git-aware
+- Modified labels also show yellow dot in the tree/results list
+
+**Files:**
+- `ui/text_editor_tab.py` — editor panel, context header, references panel, EVENTide button
+- `ui/game_text_edit.py` — existing widget, extended with new command categories
+
+---
+
+#### 11E — Saved Searches & Bookmarks
+
+User-created bookmark groups that persist across sessions.
+
+**Creating saved searches:**
+- Right-click any search result → "Save to Saved Searches…"
+- Dialog: pick an existing group or create a new one (type a name)
+- The label is added to that group in the "★ Saved Searches" tree section
+
+**Managing saved searches:**
+- Groups appear as collapsible sub-sections under ★ Saved Searches
+- Right-click a group → Rename, Delete Group
+- Right-click an entry → Remove from Group
+- Drag-and-drop reordering within groups
+
+**Persistence:**
+- Saved searches stored in `porysuite_text_bookmarks.json` in the project directory
+- Format: `{ "group_name": ["label1", "label2", ...], ... }`
+- Loaded on project open, saved on any modification
+- If a bookmarked label no longer exists in the project (file was deleted/renamed), it shows as grayed with "(not found)" and can be cleaned up
+
+**Files:**
+- `ui/text_editor_tab.py` — saved searches section in tree
+- `core/text_index.py` — bookmark persistence
+
+---
+
+#### 11F — UI Tab Migration & Integration
+
+Replace the existing "UI" tab with the new Text Editor tab. Wire into the unified main window.
+
+**Migration from UITabWidget:**
+- Name Pools sub-tab → "New Game Intro → Name Pools" tree section
+- Location Names sub-tab → "Location Names" tree section
+- Key Strings sub-tab → split between "Game UI & Menus" and "New Game Intro → Professor Speech" tree sections
+- All parsing logic (`_parse_asm_string_label`, `_parse_string_var`, `_parse_name_labels_from_inc`, etc.) moves to `core/text_index.py`
+- `ui/ui_tab_widget.py` retired — replaced entirely by `ui/text_editor_tab.py`
+
+**Unified main window integration:**
+- New "Text" toolbar icon replaces "UI" icon
+- Same position in toolbar (between data editors and EVENTide editors)
+- `TextEditorTab` loaded and wired the same way `UITabWidget` was: `load()` on project open, `modified` signal → `setWindowModified`, `has_changes()` + `flush_to_disk()` in save pipeline
+- View menu entry: "Text Editor" replaces "UI Settings"
+
+**Toolbar & menu updates:**
+- Icon toolbar: `[...] [Text] [Config] [...]` replaces `[...] [UI] [Config] [...]`
+- View menu: "Text Editor" replaces "UI Settings"
+- Help text / tooltip: "Browse and edit all game text — dialogue, menus, battle messages. Project-wide search & replace."
+
+**Files:**
+- `ui/text_editor_tab.py` — main tab widget
+- `ui/unified_mainwindow.py` — toolbar/menu wiring, save pipeline integration
+- `ui/ui_tab_widget.py` — RETIRED (deleted after migration confirmed working)
+
+---
+
+#### Phase 11 Build Order
+
+| Sub-phase | Depends On | Deliverable |
+|-----------|-----------|-------------|
+| 11A — Core Infrastructure | Nothing | Text index, parsers, save pipeline, char limit table |
+| 11B — Tree Browser | 11A | Left panel tree with all categories, descriptions, modified dots |
+| 11C — Search & Replace | 11A | Top bar search, results list, replace with preview |
+| 11D — Editor Panel | 11A, 11B | Right panel editor, context header, EVENTide button, references |
+| 11E — Saved Searches | 11B, 11C | Bookmark groups, persistence, right-click save |
+| 11F — UI Tab Migration | 11A-11E all | Replace UI tab, wire into main window, retire old code |
+
+11A must be first (everything depends on it). 11B and 11C can be built in parallel after 11A. 11D needs 11A+11B. 11E needs 11B+11C. 11F is last — only after everything else works.
+
+---
+
 ## Architecture
 
 ### Menu Structure
@@ -1279,7 +1588,7 @@ View
   Region Map
   Labels
   ----------
-  UI Settings
+  Text Editor (replaces UI Settings — Phase 11)
   Config
   ----------
   Toggle Log Panel
