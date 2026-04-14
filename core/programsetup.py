@@ -916,7 +916,9 @@ DEPS = [
         "name": "gcc  (MinGW64)",
         "description": (
             "MinGW64 GCC compiler inside MSYS2 — needed to compile the GBA host tools "
-            "(gbagfx, bin2c, gbafix) for Windows and to build agbcc."
+            "(gbagfx, bin2c, gbafix) for Windows and to build agbcc. "
+            "GCC 14+ may show warnings when building host tools — PorySuite "
+            "handles this automatically."
         ),
         "platform": "win32",
         "check": lambda: os.path.isfile(r"C:\msys64\mingw64\bin\gcc.exe"),

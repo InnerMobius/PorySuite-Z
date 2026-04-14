@@ -2395,8 +2395,24 @@ QTabBar::tab:hover:!selected {
         # Build the GBA host tools (gbagfx.exe etc.) if they are missing.
         sample_tool = os.path.join(project_dir, 'tools', 'gbagfx', 'gbagfx.exe')
         needs_tools = not os.path.isfile(sample_tool)
-        tools_prefix = 'make tools && ' if needs_tools else ''
         if needs_tools:
+            # Newer MinGW GCC (14+) flags warnings in its own system headers
+            # (string.h, assert.h).  pokefirered's tool Makefiles hardcode
+            # -Werror in CFLAGS, turning those into fatal errors.
+            # We create a tiny gcc wrapper that appends -Wno-error to every
+            # invocation and put it first on PATH.  This only affects host
+            # tool compilation — the ROM uses arm-none-eabi-gcc from devkitPro.
+            tools_prefix = (
+                'WRAP_DIR=$(mktemp -d); '
+                'printf \'#!/bin/bash\\n/mingw64/bin/gcc.exe "$@" -Wno-error\\n\' '
+                '> "$WRAP_DIR/gcc"; '
+                'chmod +x "$WRAP_DIR/gcc"; '
+                'cp "$WRAP_DIR/gcc" "$WRAP_DIR/cc"; '
+                'export PATH="$WRAP_DIR:$PATH"; '
+                'make tools; TOOLS_RC=$?; '
+                'rm -rf "$WRAP_DIR"; '
+                'test $TOOLS_RC -eq 0 && '
+            )
             self.log("Host tools missing — will run 'make tools' first.")
 
         # devkitPro env: sets DEVKITPRO, DEVKITARM, and prepends devkitARM/bin
