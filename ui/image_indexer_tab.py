@@ -534,7 +534,7 @@ class ImageIndexerWidget(QWidget):
         top_bar.addWidget(self._color_custom_spin)
 
         self._dither_cb = QCheckBox("Dither")
-        self._dither_cb.setChecked(True)
+        self._dither_cb.setChecked(False)
         self._dither_cb.setToolTip(
             "Floyd-Steinberg dithering — smoother gradients. "
             "Turn off for pixel-art style."
