@@ -2392,9 +2392,16 @@ QTabBar::tab:hover:!selected {
         make_args = ' '.join(extra_args)
         make_cmd  = f'make {make_args}'.strip()
 
-        # Build the GBA host tools (gbagfx.exe etc.) if they are missing.
-        sample_tool = os.path.join(project_dir, 'tools', 'gbagfx', 'gbagfx.exe')
-        needs_tools = not os.path.isfile(sample_tool)
+        # Build the GBA host tools if ANY critical one is missing or invalid.
+        # Check all tools that are required for a full build — not just one.
+        _required_tools = [
+            'gbagfx', 'bin2c', 'gbafix', 'rsfont', 'mid2agb',
+            'scaninc', 'preproc', 'ramscrgen', 'wav2agb',
+        ]
+        needs_tools = any(
+            not os.path.isfile(os.path.join(project_dir, 'tools', t, t + '.exe'))
+            for t in _required_tools
+        )
         tools_prefix = ''
         if needs_tools:
             # Newer MinGW GCC (14+) flags warnings in its own system headers
