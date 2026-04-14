@@ -2400,19 +2400,24 @@ QTabBar::tab:hover:!selected {
             # Newer MinGW GCC (14+) flags warnings in its own system headers
             # (string.h, assert.h).  pokefirered's tool Makefiles hardcode
             # -Werror in CFLAGS, turning those into fatal errors.
-            # We create a tiny gcc wrapper that appends -Wno-error to every
-            # invocation and put it first on PATH.  This only affects host
-            # tool compilation — the ROM uses arm-none-eabi-gcc from devkitPro.
+            # Fix: build each affected tool individually, overriding CFLAGS
+            # on the make command line to remove -Werror.  Command-line vars
+            # override Makefile `=` assignments.  This only affects host tool
+            # compilation — the ROM uses arm-none-eabi-gcc from devkitPro.
             tools_prefix = (
-                'WRAP_DIR=$(mktemp -d); '
-                'printf \'#!/bin/bash\\n/mingw64/bin/gcc.exe "$@" -Wno-error\\n\' '
-                '> "$WRAP_DIR/gcc"; '
-                'chmod +x "$WRAP_DIR/gcc"; '
-                'cp "$WRAP_DIR/gcc" "$WRAP_DIR/cc"; '
-                'export PATH="$WRAP_DIR:$PATH"; '
-                'make tools; TOOLS_RC=$?; '
-                'rm -rf "$WRAP_DIR"; '
-                'test $TOOLS_RC -eq 0 && '
+                'echo "Building host tools (with -Werror disabled for GCC compat)..."; '
+                'make -C tools/gbagfx "CFLAGS=-Wall -Wextra -Wno-sign-compare -std=c11 -O3 -flto -DPNG_SKIP_SETJMP_CHECK $(pkg-config --cflags libpng)" && '
+                'make -C tools/rsfont "CFLAGS=-Wall -Wextra -std=c11 -O2 -DPNG_SKIP_SETJMP_CHECK $(pkg-config --cflags libpng)" && '
+                'make -C tools/bin2c "CFLAGS=-Wall -Wextra -std=c11 -O2" && '
+                'make -C tools/gbafix && '
+                'make -C tools/mid2agb && '
+                'make -C tools/scaninc && '
+                'make -C tools/preproc && '
+                'make -C tools/ramscrgen && '
+                'make -C tools/jsonproc && '
+                'make -C tools/mapjson && '
+                'make -C tools/wav2agb && '
+                'echo "Host tools built successfully." && '
             )
             self.log("Host tools missing — will run 'make tools' first.")
 
