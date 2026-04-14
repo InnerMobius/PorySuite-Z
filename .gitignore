@@ -48,3 +48,17 @@ tests/*.wav
 build/
 dist/
 *.egg-info/
+
+# ── Dev-only docs (Claude context, bug tracking, phase plans) ──
+# These stay on disk for development but aren't shipped with the app.
+docs/AGENTS.md
+docs/BUGS.md
+docs/CHANGELOG.md
+docs/CLAUDECONTEXT.md
+docs/DATAFLOW.md
+docs/renameplan.md
+docs/SOUND_EDITOR_PLAN.md
+docs/SOUND_ENGINE_DEBUG_LOG.md
+docs/UNIFIED_EDITOR_PLAN.md
+eventide/docs/CLAUDECONTEXT.md
+eventide/docs/eventide_whitelist.md
