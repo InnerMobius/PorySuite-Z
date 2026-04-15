@@ -12,7 +12,8 @@ import os
 import sys
 
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QSettings
-from PyQt6.QtGui import QAction, QFont, QIcon, QKeySequence, QShortcut
+from PyQt6.QtGui import (QAction, QBrush, QColor, QFont, QIcon, QKeySequence,
+                         QPainter, QPixmap, QShortcut)
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -127,6 +128,28 @@ class UnifiedMainWindow(QMainWindow):
         # Maps page name -> stack index.  Filled by _setup_pages().
         self._page_indices: dict[str, int] = {}
         self._page_buttons: dict[str, QToolButton] = {}
+        # Base (clean) QIcon for each toolbar button — used to repaint the
+        # amber dirty-dot overlay on top without losing the original art.
+        self._page_base_icons: dict[str, QIcon] = {}
+        # Per-page dirty section count.  Multiple logical sections share a
+        # single toolbar button (e.g. "species" + "pokedex" → "pokemon").
+        self._page_dirty_counts: dict[str, int] = {}
+        # Section-name → toolbar-button-name mapping.
+        self._section_to_page: dict[str, str] = {
+            "species": "pokemon",
+            "pokedex": "pokedex",
+            "moves": "moves",
+            "items": "items",
+            "abilities": "abilities",
+            "trainers": "trainers",
+            "starters": "starters",
+            "encounters": "trainers",
+            "credits": "credits",
+            "title": "settings",
+            "sound": "sound",
+            "overworld": "overworld",
+            "trainer_graphics": "trainers",
+        }
 
         # ── Build toolbar and menus ──────────────────────────────────────────
         self._build_toolbar()
@@ -251,15 +274,58 @@ class UnifiedMainWindow(QMainWindow):
     def _make_page_button(self, icon_name: str, tooltip: str) -> QToolButton:
         """Create a checkable toolbar button that switches the stacked widget."""
         btn = QToolButton()
-        btn.setIcon(_icon(icon_name))
+        base = _icon(icon_name)
+        btn.setIcon(base)
         btn.setToolTip(tooltip)
         btn.setCheckable(True)
         btn.setIconSize(QSize(32, 32))
         btn.setFixedSize(40, 40)
         self._page_button_group.addButton(btn)
         self._page_buttons[icon_name] = btn
+        self._page_base_icons[icon_name] = base
         btn.clicked.connect(lambda checked, name=icon_name: self._switch_page(name))
         return btn
+
+    def _icon_with_dirty_dot(self, base: QIcon) -> QIcon:
+        """Return a 32×32 QIcon with an amber 8×8 dot in the bottom-right."""
+        pm = base.pixmap(32, 32)
+        if pm.isNull():
+            pm = QPixmap(32, 32)
+            pm.fill(Qt.GlobalColor.transparent)
+        else:
+            pm = pm.copy()
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QBrush(QColor("#ffb74d")))
+        painter.setPen(QColor("#000000"))
+        # Bottom-right 8×8 dot.
+        painter.drawEllipse(22, 22, 8, 8)
+        painter.end()
+        return QIcon(pm)
+
+    def set_page_dirty(self, section: str, dirty: bool):
+        """Slot for porysuite_main.sectionDirtyChanged.
+
+        Tracks per-page dirty counts (multiple sections may map to the same
+        toolbar button) and toggles the amber dot overlay accordingly.
+        """
+        page = self._section_to_page.get(section)
+        if not page:
+            return
+        btn = self._page_buttons.get(page)
+        base = self._page_base_icons.get(page)
+        if btn is None or base is None:
+            return
+        prev = self._page_dirty_counts.get(section, 0)
+        new = 1 if dirty else 0
+        if new == prev:
+            return
+        self._page_dirty_counts[section] = new
+        # Recompute whether ANY section sharing this page is dirty.
+        any_dirty = any(
+            self._page_dirty_counts.get(s, 0) > 0
+            for s, p in self._section_to_page.items() if p == page)
+        btn.setIcon(self._icon_with_dirty_dot(base) if any_dirty else base)
 
     def _switch_page(self, name: str):
         """Switch the stacked widget to the page identified by name."""
@@ -783,14 +849,23 @@ class UnifiedMainWindow(QMainWindow):
         # Override PorySuite's setWindowModified to also update ours.
         _original_set_modified = porysuite_main.setWindowModified
         def _unified_set_modified(modified):
+            # Respect every suppression signal from the child window so the
+            # unified title bar can't light up while the child's own override
+            # is correctly blocking a spurious dirty mark (loading, flushing,
+            # bulk combo population, etc.).
             if modified and (self._suppress_dirty
-                             or getattr(porysuite_main, '_ps_suppress_dirty', False)):
-                return  # don't mark dirty during flush/load/navigation
+                             or getattr(porysuite_main, '_ps_suppress_dirty', False)
+                             or getattr(porysuite_main, '_loading_depth', 0) > 0):
+                return
             _original_set_modified(modified)
             if modified:
                 self.setWindowModified(True)
 
         porysuite_main.setWindowModified = _unified_set_modified
+
+        # ── Per-section dirty indicator on the sidebar tab icons ─────────────
+        if hasattr(porysuite_main, "sectionDirtyChanged"):
+            porysuite_main.sectionDirtyChanged.connect(self.set_page_dirty)
 
     # ═════════════════════════════════════════════════════════════════════════
     # Project loading

@@ -28,7 +28,7 @@ except Exception:
                 pass
 
     QTimer = None
-from PyQt6.QtGui import QFont, QIcon, QKeyEvent, QKeySequence, QPixmap
+from PyQt6.QtGui import QBrush, QColor, QFont, QIcon, QKeyEvent, QKeySequence, QPixmap
 try:
     from PyQt6.QtWidgets import (
         QApplication,
@@ -262,6 +262,10 @@ class MainWindow(QMainWindow):
     # (duplicate removed) _open_crashlogs_folder is defined earlier in this class
     loadAndSaveProjectSignal = pyqtSignal(dict)
     logSignal = pyqtSignal(str)
+    # Emitted when a logical section (species, pokedex, items, moves, ...)
+    # changes its unsaved-edits state. The unified window listens so it can
+    # overlay a small amber dot on the matching sidebar icon.
+    sectionDirtyChanged = pyqtSignal(str, bool)
     open_in_eventide_signal = pyqtSignal(dict)
 
     def __init__(self, parent=None):
@@ -420,7 +424,7 @@ QTabBar::tab:hover:!selected {
         # Add a global Moves editor main tab
         try:
             self.ui.moves_widget = MovesTabWidget()
-            self.ui.moves_widget.data_changed.connect(lambda: self.setWindowModified(True))
+            self.ui.moves_widget.data_changed.connect(self._on_move_edited)
             self.ui.moves_widget.rename_requested.connect(self._on_move_rename)
             self.ui.mainTabs.addTab(self.ui.moves_widget, "Moves")
             self.moves_main_tab_index = self.ui.mainTabs.indexOf(self.ui.moves_widget)
@@ -2648,6 +2652,19 @@ QTabBar::tab:hover:!selected {
         Returns:
             None
         """
+        # Everything in this method populates widgets programmatically
+        # (addItem, setCurrentIndex, clear, setText). Every such call can
+        # trip the `_dirty` auto-connect lambda. Guard the whole method so
+        # no spurious setWindowModified(True) fires during project load.
+        self._loading_depth += 1
+        try:
+            return self._load_data_impl(combined_project_info)
+        finally:
+            self._loading_depth -= 1
+            if self._loading_depth < 0:
+                self._loading_depth = 0
+
+    def _load_data_impl(self, combined_project_info):
         self.project_info = combined_project_info
         self.setWindowTitle(f"{self.project_info['dir']}[*]")
         self.statusbar_project_label.setText(self.project_info["plugin_identifier"])
@@ -3226,6 +3243,79 @@ QTabBar::tab:hover:!selected {
             self._loading_depth -= 1
             if self._loading_depth < 0:
                 self._loading_depth = 0
+
+    # Amber used to highlight list/tree items with unsaved edits. Replaces
+    # the old "append '*' to the name" pattern — a colored row is both more
+    # visible and doesn't tamper with the displayed text.
+    DIRTY_ITEM_COLOR = QColor("#ffb74d")
+
+    def _mark_list_item_dirty(self, widget, dirty: bool, *, match_col: int = 1, match_value=None, match_role=None):
+        """Color (or uncolor) one row of a QTreeWidget or QListWidget to
+        indicate unsaved changes. Pass `match_col=1, match_value=species`
+        for tree_pokemon. Pass `match_role=Qt.ItemDataRole.UserRole,
+        match_value=dex_const` for a QListWidget. If `match_value` is None,
+        apply to every row.
+        """
+        try:
+            from PyQt6.QtWidgets import QTreeWidget, QListWidget
+            brush = QBrush(self.DIRTY_ITEM_COLOR) if dirty else QBrush()
+            if isinstance(widget, QTreeWidget):
+                cols = widget.columnCount()
+                for i in range(widget.topLevelItemCount()):
+                    item = widget.topLevelItem(i)
+                    if match_value is not None and item.text(match_col) != match_value:
+                        continue
+                    for col in range(cols):
+                        item.setForeground(col, brush)
+                    if match_value is not None:
+                        break
+            elif isinstance(widget, QListWidget):
+                for i in range(widget.count()):
+                    item = widget.item(i)
+                    if match_value is not None:
+                        if match_role is not None:
+                            if item.data(match_role) != match_value:
+                                continue
+                        elif item.text() != match_value:
+                            continue
+                    item.setForeground(brush)
+                    if match_value is not None:
+                        break
+        except Exception:
+            pass
+
+    def _clear_all_dirty_markers(self):
+        """Called after a successful save — clears amber coloring from every
+        list/tree that uses the dirty-item marker, and tells the unified
+        window to wipe every section-dirty dot."""
+        try:
+            self._mark_list_item_dirty(self.ui.tree_pokemon, False)
+        except Exception:
+            pass
+        for list_name in ("list_pokedex_national", "list_pokedex_regional"):
+            lst = getattr(self.ui, list_name, None)
+            if lst is not None:
+                try:
+                    self._mark_list_item_dirty(lst, False)
+                except Exception:
+                    pass
+        # Moves widget owns its own QListWidget — wipe its amber rows too.
+        try:
+            mw = getattr(self.ui, "moves_widget", None)
+            if mw is not None:
+                lst = getattr(mw, "_list", None)
+                if lst is not None:
+                    self._mark_list_item_dirty(lst, False)
+        except Exception:
+            pass
+        # Clear every known section's dot indicator.
+        for section in ("species", "pokedex", "items", "moves", "abilities",
+                        "trainers", "starters", "encounters", "credits",
+                        "title", "sound", "overworld", "trainer_graphics"):
+            try:
+                self.sectionDirtyChanged.emit(section, False)
+            except Exception:
+                pass
 
     def setWindowModified(self, modified: bool) -> None:
         """Override: swallow dirty marks while a load is in progress.
@@ -4034,15 +4124,23 @@ QTabBar::tab:hover:!selected {
             pass
 
         # Keep pokedex panel widgets in sync so _flush_pokedex_panel
-        # doesn't clobber these values with stale widget text.
+        # doesn't clobber these values with stale widget text. This is a
+        # programmatic sync — suppress the panel's `changed` signal so it
+        # doesn't look like a user edit (which would dirty-mark the row).
         if hasattr(self, "_pokedex_panel") and hasattr(self, "_current_dex_const"):
             try:
                 nat_const = "NATIONAL_DEX_" + species[len("SPECIES_"):]
                 if self._current_dex_const == nat_const:
-                    if category_text:
-                        self._pokedex_panel.f_category.setText(category_text)
-                    if desc_text:
-                        self._pokedex_panel.f_description.setPlainText(desc_text)
+                    panel = self._pokedex_panel
+                    prev_loading = getattr(panel, "_loading", False)
+                    panel._loading = True
+                    try:
+                        if category_text:
+                            panel.f_category.setText(category_text)
+                        if desc_text:
+                            panel.f_description.setPlainText(desc_text)
+                    finally:
+                        panel._loading = prev_loading
             except Exception:
                 pass
 
@@ -4488,14 +4586,13 @@ QTabBar::tab:hover:!selected {
                 except Exception:
                     pass
                 if updated:
-                    # Mark previous species with '*'
-                    for i in range(self.ui.tree_pokemon.topLevelItemCount()):
-                        item = self.ui.tree_pokemon.topLevelItem(i)
-                        if item.text(1) == self.previous_selected_species:
-                            if not item.text(0).endswith("*"):
-                                item.setText(0, item.text(0) + "*")
-                                self.setWindowModified(True)
-                            break
+                    # Color the previous species amber to signal unsaved edits.
+                    self._mark_list_item_dirty(
+                        self.ui.tree_pokemon, True,
+                        match_col=1, match_value=self.previous_selected_species,
+                    )
+                    self.setWindowModified(True)
+                    self.sectionDirtyChanged.emit("species", True)
 
             # Determine selected species/form
             pokemon = selected_species[0].text(1)
@@ -5820,9 +5917,7 @@ QTabBar::tab:hover:!selected {
             self._pokedex_panel.setStyleSheet(
                 "PokedexDetailPanel { background-color: #1a1a1a; }"
             )
-            self._pokedex_panel.changed.connect(
-                lambda: self.setWindowModified(True)
-            )
+            self._pokedex_panel.changed.connect(self._on_pokedex_panel_edited)
             self._pokedex_panel.play_cry_requested.connect(
                 self._on_play_current_pokedex_cry
             )
@@ -5927,6 +6022,70 @@ QTabBar::tab:hover:!selected {
         except Exception:
             import logging
             logging.exception("_regional_dex_remove failed")
+
+    def _on_pokedex_panel_edited(self):
+        """Wired to `_pokedex_panel.changed`. Marks the project modified AND
+        colors the currently-selected dex list entry amber so the user can
+        see which entry has unsaved edits. Suppressed while a load or
+        programmatic sync is in flight."""
+        try:
+            import os, time, traceback
+            log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] _on_pokedex_panel_edited depth={self._loading_depth} current_dex={getattr(self, '_current_dex_const', None)!r}\n")
+                for line in traceback.format_stack(limit=10)[:-1]:
+                    f.write("  " + line.rstrip() + "\n")
+        except Exception:
+            pass
+        if self._loading_depth > 0:
+            return
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("pokedex", True)
+        # Color whichever dex list row is currently selected — that's the
+        # entry the panel is displaying.
+        const = getattr(self, "_current_dex_const", None)
+        if not const:
+            return
+        for list_name in ("list_pokedex_national", "list_pokedex_regional"):
+            lst = getattr(self.ui, list_name, None)
+            if lst is None:
+                continue
+            # National list uses nat const directly; regional list stores the
+            # HOENN_DEX_* form. Match by dex_const stored on each item's UserRole.
+            self._mark_list_item_dirty(
+                lst, True,
+                match_role=Qt.ItemDataRole.UserRole, match_value=const,
+            )
+            # Regional items store a different const — also try the HOENN form.
+            hoenn = const.replace("NATIONAL_DEX_", "HOENN_DEX_")
+            if hoenn != const:
+                self._mark_list_item_dirty(
+                    lst, True,
+                    match_role=Qt.ItemDataRole.UserRole, match_value=hoenn,
+                )
+
+    def _on_move_edited(self):
+        """Wired to `moves_widget.data_changed`. Marks the project modified,
+        emits the sectionDirtyChanged signal so the Moves tab icon shows the
+        amber dot, and colors the currently-selected move's row amber."""
+        if self._loading_depth > 0:
+            return
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("moves", True)
+        try:
+            mw = getattr(self.ui, "moves_widget", None)
+            if mw is None:
+                return
+            const = getattr(mw, "_current_move", None)
+            lst = getattr(mw, "_list", None)
+            if lst is None or not const:
+                return
+            self._mark_list_item_dirty(
+                lst, True,
+                match_role=Qt.ItemDataRole.UserRole, match_value=const,
+            )
+        except Exception:
+            pass
 
     def _flush_pokedex_panel(self):
         """Write panel edits back into the in-memory pokedex data,
@@ -8684,11 +8843,8 @@ QTabBar::tab:hover:!selected {
             self._save_in_progress = False
             self._species_already_captured = False
 
-        # Remove "*" from the names of modified Pokemon
-        for i in range(self.ui.tree_pokemon.topLevelItemCount()):
-            item = self.ui.tree_pokemon.topLevelItem(i)
-            if item.text(0).endswith("*"):
-                item.setText(0, item.text(0)[0:-1])
+        # Clear amber dirty markers from every tracked list/tree.
+        self._clear_all_dirty_markers()
 
         # Brief status bar confirmation
         self.statusBar().showMessage("Saved ✓", 3000)
