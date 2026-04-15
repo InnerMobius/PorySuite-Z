@@ -6221,31 +6221,39 @@ QTabBar::tab:hover:!selected {
             self.source_data.data["pokemon_items"].data = updated
 
     def load_moves_defs_table(self):
-        """Populate the global moves widget."""
+        """Populate the global moves widget.
+
+        Wrapped in _loading_guard: setting values on the detail panel during
+        populate emits data_changed for any signal that escapes the panel's
+        own _loading flag (DexDescriptionEdit's textChanged, spinbox
+        valueChanged-from-0-to-nonzero, etc.). The guard suppresses the
+        resulting _on_move_edited → sectionDirtyChanged chain so a fresh
+        open of the Moves tab doesn't amber-highlight the first row."""
         if not self.source_data or not hasattr(self.ui, "moves_widget"):
             return
-        moves = self.source_data.get_pokemon_moves() or {}
-        descriptions = {}
-        for mv in moves:
-            desc = self.source_data.get_move_description(mv)
-            if not desc:
-                # For new moves, the description lives in the move data dict
-                # (written there by set_move_data) but not yet in the
-                # move_descriptions overlay or C file.
-                desc = (moves[mv].get("description") or "")
-            if desc:
-                descriptions[mv] = desc
+        with self._loading_guard():
+            moves = self.source_data.get_pokemon_moves() or {}
+            descriptions = {}
+            for mv in moves:
+                desc = self.source_data.get_move_description(mv)
+                if not desc:
+                    # For new moves, the description lives in the move data dict
+                    # (written there by set_move_data) but not yet in the
+                    # move_descriptions overlay or C file.
+                    desc = (moves[mv].get("description") or "")
+                if desc:
+                    descriptions[mv] = desc
 
-        # Extract animation labels and per-move animation mapping from
-        # battle_anim_scripts.s so the detail panel can show/edit them.
-        anim_labels, move_anims = self._extract_move_animations()
-        for mv, anim in move_anims.items():
-            if mv in moves:
-                moves[mv]["animation"] = anim
+            # Extract animation labels and per-move animation mapping from
+            # battle_anim_scripts.s so the detail panel can show/edit them.
+            anim_labels, move_anims = self._extract_move_animations()
+            for mv, anim in move_anims.items():
+                if mv in moves:
+                    moves[mv]["animation"] = anim
 
-        self.ui.moves_widget.load_moves(moves, descriptions)
-        if anim_labels:
-            self.ui.moves_widget.populate_animations(anim_labels)
+            self.ui.moves_widget.load_moves(moves, descriptions)
+            if anim_labels:
+                self.ui.moves_widget.populate_animations(anim_labels)
 
     def save_moves_defs_table(self):
         """Flush the moves widget edits back to the data manager."""
