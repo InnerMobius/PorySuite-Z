@@ -1,104 +1,52 @@
 // PorySuite-Z Bridge Script for Porymap
 //
-// This script runs inside Porymap's JavaScript engine. It listens to
-// callbacks and writes structured JSON messages to a bridge file
-// that PorySuite-Z watches.
+// This script runs inside Porymap's JavaScript engine. It listens to a
+// minimal set of callbacks and writes JSON messages to a bridge file that
+// PorySuite-Z watches. It also polls for commands written by PorySuite-Z
+// and executes them (currently: open a specific map).
 //
-// Stock Porymap callbacks (work without patches):
-//   onProjectOpened, onProjectClosed, onMapOpened, onMainTabChanged,
-//   onMapViewTabChanged, onBlockHoverChanged, onBlockHoverCleared,
-//   onTilesetUpdated, onMapResized, onBorderResized, onMapShifted,
-//   onBorderVisibilityToggled
+// Stock Porymap callbacks used (work without patches):
+//   onProjectOpened     — register actions + start command poll
+//   onMapOpened         — tell PorySuite the current map
+//   onBlockHoverChanged — track cursor position for Ctrl+E edit requests
 //
-// Patched callbacks (require our C++ additions):
-//   onEventSelected, onMapSaved
+// Patched callbacks used (require our C++ additions):
+//   onEventSelected     — user clicked an event in Porymap
+//   onMapSaved          — user saved the map
+//
+// Everything else Porymap emits is intentionally NOT handled — adding
+// callbacks with no PorySuite-Z consumer is dead weight.
 
 let currentMap = "";
-let currentProject = "";
 let lastHoverX = 0;
 let lastHoverY = 0;
 let commandPollActive = false;
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Stock Porymap callbacks (always available)
+// Callbacks
 // ═══════════════════════════════════════════════════════════════════════════
 
 export function onProjectOpened(projectPath) {
-    currentProject = projectPath;
     utility.log("[PorySuite-Z Bridge] Project opened: " + projectPath);
     // Register PorySuite-Z actions in Porymap's Tools > Custom Actions menu
     utility.registerAction("editInPorySuite", "Edit in PorySuite-Z", "Ctrl+E");
     utility.registerAction("syncToPorySuite", "Sync Map to PorySuite-Z", "Ctrl+Shift+E");
-    writeBridge({type: "project_opened", project: projectPath});
     // Start polling for commands from PorySuite-Z
     utility.log("[PorySuite-Z Bridge] Starting command poll...");
     startCommandPoll();
 }
 
-export function onProjectClosed(projectPath) {
-    writeBridge({type: "project_closed"});
-}
-
 export function onMapOpened(mapName) {
     currentMap = mapName;
-    // Try to send full context (patched functions); fall back gracefully
-    let msg = {type: "map_opened", map: mapName};
-    try { msg.header = utility.getMapHeader(); } catch(e) { msg.header = {}; }
-    try { msg.tilesets = utility.getCurrentTilesets(); } catch(e) { msg.tilesets = {}; }
-    try { msg.connections = utility.getMapConnections(); } catch(e) { msg.connections = []; }
-    writeBridge(msg);
-}
-
-export function onMainTabChanged(oldTab, newTab) {
-    // Tabs: 0=Map, 1=Events, 2=Header, 3=Connections, 4=WildPokemon
-    writeBridge({type: "tab_changed", tab: newTab});
-}
-
-export function onMapViewTabChanged(oldTab, newTab) {
-    // Map view tabs: 0=Metatiles, 1=Collision, 2=Prefabs
-    writeBridge({type: "map_view_tab_changed", tab: newTab});
+    writeBridge({type: "map_opened", map: mapName});
 }
 
 export function onBlockHoverChanged(x, y) {
+    // Track cursor position so editInPorySuite knows where the user was pointing.
+    // Intentionally does not write to the bridge — way too noisy.
     lastHoverX = x;
     lastHoverY = y;
-    // Don't write to bridge on every hover — too noisy. Just track position.
 }
-
-export function onBlockHoverCleared() {
-    // No action needed
-}
-
-export function onTilesetUpdated(tilesetName) {
-    writeBridge({type: "tileset_updated", tileset: tilesetName});
-}
-
-export function onMapResized(oldWidth, oldHeight, delta) {
-    writeBridge({
-        type: "map_resized", map: currentMap,
-        oldWidth: oldWidth, oldHeight: oldHeight, delta: delta
-    });
-}
-
-export function onBorderResized(oldWidth, oldHeight, newWidth, newHeight) {
-    writeBridge({
-        type: "border_resized", map: currentMap,
-        oldWidth: oldWidth, oldHeight: oldHeight,
-        newWidth: newWidth, newHeight: newHeight
-    });
-}
-
-export function onMapShifted(xDelta, yDelta) {
-    writeBridge({type: "map_shifted", map: currentMap, xDelta: xDelta, yDelta: yDelta});
-}
-
-export function onBorderVisibilityToggled(visible) {
-    // Informational only, no action needed on PorySuite-Z side
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Patched callbacks (only fire if Porymap has our C++ patches applied)
-// ═══════════════════════════════════════════════════════════════════════════
 
 export function onEventSelected(eventType, eventIndex, scriptLabel, x, y) {
     writeBridge({
@@ -126,12 +74,8 @@ export function editInPorySuite() {
 }
 
 export function syncToPorySuite() {
-    // Ctrl+Shift+E — full map sync without specific event
-    let msg = {type: "sync_request", map: currentMap};
-    try { msg.header = utility.getMapHeader(); } catch(e) { msg.header = {}; }
-    try { msg.tilesets = utility.getCurrentTilesets(); } catch(e) { msg.tilesets = {}; }
-    try { msg.connections = utility.getMapConnections(); } catch(e) { msg.connections = []; }
-    writeBridge(msg);
+    // Ctrl+Shift+E — ask PorySuite-Z to focus the current map
+    writeBridge({type: "sync_request", map: currentMap});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -141,10 +85,10 @@ export function syncToPorySuite() {
 function writeBridge(data) {
     data.timestamp = Date.now();
     try {
-        // Use our patched writeBridgeFile if available
+        // Patched Q_INVOKABLE: writes JSON to porysuite_bridge.json in the project root
         utility.writeBridgeFile(JSON.stringify(data));
     } catch(e) {
-        // Fallback for stock Porymap: write to log (PorySuite-Z can tail it)
+        // Fallback for an unpatched Porymap: log so it's visible at least
         utility.log("PSBRIDGE:" + JSON.stringify(data));
     }
 }
@@ -161,8 +105,8 @@ function startCommandPoll() {
 
 let pollErrorCount = 0;
 function pollForCommand() {
-    // If readCommandFile isn't patched into this Porymap build, bail
-    // out after 3 consecutive errors so we don't log-spam forever.
+    // If readCommandFile isn't patched into this Porymap build, bail out so
+    // we don't log-spam forever.
     if (typeof utility.readCommandFile !== "function") {
         utility.log("[PorySuite-Z Bridge] readCommandFile not available — "
                     + "this Porymap is unpatched. Command poll disabled.");
@@ -170,12 +114,11 @@ function pollForCommand() {
         return;
     }
     try {
-        // Read command file (written by PorySuite-Z launcher, deleted after reading)
+        // Read command file (written by PorySuite-Z, deleted by the C++ reader)
         let raw = utility.readCommandFile();
         if (raw && raw.length > 0) {
             utility.log("[PorySuite-Z Bridge] Got command: " + raw);
-            let cmd = JSON.parse(raw);
-            handleCommand(cmd);
+            handleCommand(JSON.parse(raw));
         }
         pollErrorCount = 0;
     } catch(e) {
@@ -190,23 +133,21 @@ function pollForCommand() {
             return;
         }
     }
-    // Poll every 500ms
+    // Poll every 500ms. `utility.setTimeout` is Porymap's scripting API
+    // (see Porymap docs — utility object exposes setTimeout/setInterval).
     utility.setTimeout(pollForCommand, 500);
 }
 
 function handleCommand(cmd) {
     if (!cmd || !cmd.action) return;
-    utility.log("[PorySuite-Z Bridge] Handling command: " + cmd.action + " map=" + (cmd.map || ""));
+    utility.log("[PorySuite-Z Bridge] Handling command: " + cmd.action
+                + " map=" + (cmd.map || ""));
     if (cmd.action === "openMap" && cmd.map) {
         // map.openMap() is a Q_INVOKABLE we added to MainWindow
-        utility.log("[PorySuite-Z Bridge] Calling map.openMap('" + cmd.map + "')...");
         let ok = map.openMap(cmd.map);
         utility.log("[PorySuite-Z Bridge] openMap result: " + ok);
-        if (ok) {
-            writeBridge({type: "command_ack", action: "openMap", map: cmd.map, success: true});
-        } else {
+        if (!ok) {
             utility.warn("PorySuite-Z: Could not open map '" + cmd.map + "'");
-            writeBridge({type: "command_ack", action: "openMap", map: cmd.map, success: false});
         }
     }
 }

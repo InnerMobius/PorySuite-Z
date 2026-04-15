@@ -1954,7 +1954,7 @@ class UnifiedMainWindow(QMainWindow):
         # scripting layer but never wired to actual C++ invocation sites, so they
         # never fired. Cleaned up in v0.0.55b.
 
-    def _on_bridge_map_opened(self, map_name: str, *_args):
+    def _on_bridge_map_opened(self, map_name: str):
         """Porymap opened a map — navigate Event Editor there."""
         if not map_name:
             return

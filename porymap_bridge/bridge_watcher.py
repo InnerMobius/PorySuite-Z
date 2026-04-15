@@ -1,9 +1,15 @@
 """
-Bridge Watcher — monitors the porysuite_bridge.json file for messages from Porymap.
+Bridge Watcher — monitors porysuite_bridge.json for messages from Porymap.
 
-Porymap's JS companion script writes JSON messages to this file whenever something
-happens (map opened, event selected, etc.). This module watches the file and emits
-Qt signals that PorySuite-Z editors connect to.
+Porymap's JS companion script writes JSON messages to this file whenever
+something relevant happens (map opened, event selected, map saved, or the
+user invokes Ctrl+E / Ctrl+Shift+E). This module watches the file and
+emits Qt signals that PorySuite-Z editors connect to.
+
+Only the signals actually consumed by the app are exposed — anything the
+JS bridge doesn't emit, or that no PorySuite-Z editor listens for, is not
+defined here. Adding unused signals is dead weight that obscures what the
+bridge actually does.
 
 Usage:
     watcher = BridgeWatcher(project_dir)
@@ -23,37 +29,21 @@ from PyQt6.QtCore import QObject, QFileSystemWatcher, pyqtSignal, QTimer
 class BridgeWatcher(QObject):
     """Watches porysuite_bridge.json for messages from Porymap."""
 
-    # ── Map & Navigation signals ────────────────────────────────────────────
-    map_opened = pyqtSignal(str, dict, dict, list)
-    # (mapName, header, tilesets, connections)
+    # Porymap opened a map, OR the user invoked Ctrl+Shift+E to re-sync.
+    # Both deliver just the map name — that's all PorySuite-Z needs.
+    map_opened     = pyqtSignal(str)
+    sync_requested = pyqtSignal(str)
 
-    tab_changed = pyqtSignal(int)
-    # (tabIndex)  0=Map, 1=Events, 2=Header, 3=Connections, 4=WildPokemon
-
-    sync_requested = pyqtSignal(str, dict, dict, list)
-    # (mapName, header, tilesets, connections)
-
-    project_opened = pyqtSignal(str)
-    # (projectPath)
-
-    project_closed = pyqtSignal()
-
-    # ── Event signals ───────────────────────────────────────────────────────
+    # User clicked an event in Porymap's event list.
     event_selected = pyqtSignal(str, str, int, str, int, int)
     # (mapName, eventType, eventIndex, scriptLabel, x, y)
 
+    # User pressed Ctrl+E over a tile in Porymap.
     edit_requested = pyqtSignal(str, int, int)
     # (mapName, x, y)
 
-    # ── Map data change signals ─────────────────────────────────────────────
+    # User saved the map in Porymap — PorySuite-Z should reload if viewing it.
     map_saved = pyqtSignal(str)
-    # (mapName)
-
-    tileset_updated = pyqtSignal(str)
-    # (tilesetName)
-
-    map_resized = pyqtSignal(str, int, int, dict)
-    # (mapName, oldWidth, oldHeight, delta)
 
     def __init__(self, project_dir: str, parent=None):
         super().__init__(parent)
@@ -71,7 +61,8 @@ class BridgeWatcher(QObject):
     def start(self):
         """Start watching the bridge file."""
         self._active = True
-        # Record current time so we ignore stale messages from previous sessions
+        # Record current time so we ignore stale messages from previous sessions.
+        # Small leeway so a write that landed 1-2s before start() still counts.
         self._last_timestamp = int(time.time() * 1000) - 2000
 
         self._watcher = QFileSystemWatcher(parent=self)
@@ -100,7 +91,8 @@ class BridgeWatcher(QObject):
         if not self._active:
             return
         self._debounce_timer.start()
-        # Re-add the path (QFileSystemWatcher removes it after a signal on some platforms)
+        # Re-add the path — QFileSystemWatcher drops it on some platforms
+        # when the file is replaced rather than appended to.
         if self._watcher and path not in self._watcher.files():
             self._watcher.addPath(path)
 
@@ -127,42 +119,26 @@ class BridgeWatcher(QObject):
         except (json.JSONDecodeError, OSError):
             return
 
-        # Ignore stale messages (from a previous session or >2s old)
+        # Ignore stale messages (from a previous session or older than start)
         ts = data.get("timestamp", 0)
         if ts <= self._last_timestamp:
             return
         self._last_timestamp = ts
 
-        msg_type = data.get("type", "")
-        self._dispatch(msg_type, data)
+        self._dispatch(data.get("type", ""), data)
 
     def _dispatch(self, msg_type: str, data: dict):
-        """Route a bridge message to the correct signal."""
+        """Route a bridge message to the correct signal.
+
+        Unknown message types are silently ignored — if the JS bridge adds
+        a new message before the Python side is updated, that's fine.
+        """
         try:
-            if msg_type == "project_opened":
-                self.project_opened.emit(data.get("project", ""))
-
-            elif msg_type == "project_closed":
-                self.project_closed.emit()
-
-            elif msg_type == "map_opened":
-                self.map_opened.emit(
-                    data.get("map", ""),
-                    data.get("header", {}),
-                    data.get("tilesets", {}),
-                    data.get("connections", []),
-                )
-
-            elif msg_type == "tab_changed":
-                self.tab_changed.emit(data.get("tab", 0))
+            if msg_type == "map_opened":
+                self.map_opened.emit(data.get("map", ""))
 
             elif msg_type == "sync_request":
-                self.sync_requested.emit(
-                    data.get("map", ""),
-                    data.get("header", {}),
-                    data.get("tilesets", {}),
-                    data.get("connections", []),
-                )
+                self.sync_requested.emit(data.get("map", ""))
 
             elif msg_type == "event_selected":
                 self.event_selected.emit(
@@ -183,17 +159,6 @@ class BridgeWatcher(QObject):
 
             elif msg_type == "map_saved":
                 self.map_saved.emit(data.get("map", ""))
-
-            elif msg_type == "tileset_updated":
-                self.tileset_updated.emit(data.get("tileset", ""))
-
-            elif msg_type == "map_resized":
-                self.map_resized.emit(
-                    data.get("map", ""),
-                    data.get("oldWidth", 0),
-                    data.get("oldHeight", 0),
-                    data.get("delta", {}),
-                )
 
         except Exception:
             # Never crash PorySuite-Z because of a bad bridge message

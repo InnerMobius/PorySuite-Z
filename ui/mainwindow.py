@@ -6,6 +6,7 @@ import copy
 import datetime
 import subprocess
 import logging
+from contextlib import contextmanager
 try:
     from PyQt6.QtCore import pyqtSignal, Qt, QEvent, QSignalBlocker, QTimer, QSize, QEventLoop
 except Exception:
@@ -392,6 +393,14 @@ QTabBar::tab:hover:!selected {
         # Guard against re-entrant selection handlers
         self._is_updating_selection = False
 
+        # Loading guard — while > 0, the auto-connected `_dirty` lambda is
+        # suppressed so programmatic widget population (loading a species,
+        # switching tabs, refreshing lists) doesn't falsely mark the window
+        # modified. This is a counter, not a boolean, so nested loads don't
+        # clear the guard early. Use `self._loading_guard()` as a context
+        # manager around any code that programmatically sets widget values.
+        self._loading_depth = 0
+
         # Initialize status bar widgets
         self.statusbar_progressbar = QProgressBar()
         self.statusbar_progressbar.setMaximum(100)
@@ -680,7 +689,14 @@ QTabBar::tab:hover:!selected {
         # EVs, types, held items, abilities, egg groups, catch rate, etc.
         from PyQt6.QtWidgets import (QComboBox, QSpinBox, QDoubleSpinBox,
                                       QSlider, QLineEdit, QTextEdit, QPlainTextEdit)
-        _dirty = lambda *_a: self.setWindowModified(True)
+        # The dirty marker no-ops while a load is in progress. Programmatic
+        # setValue/setText/setCurrentIndex during species switching, tab load,
+        # etc. fires widget change signals — without this guard those would
+        # falsely mark the project modified just for viewing data.
+        def _dirty(*_a):
+            if self._loading_depth > 0:
+                return
+            self.setWindowModified(True)
         for attr_name in dir(self.ui):
             if attr_name.startswith('_'):
                 continue
@@ -3192,6 +3208,49 @@ QTabBar::tab:hover:!selected {
 
         return species_item
 
+    @contextmanager
+    def _loading_guard(self):
+        """Context manager: suppress dirty-marking while a load runs.
+
+        Use around any code that programmatically populates UI widgets
+        (selecting a species, switching tabs, loading a project, etc.) so
+        the window isn't falsely marked modified just for viewing data.
+
+        Re-entrant via a counter — nested `with self._loading_guard():` blocks
+        compose correctly.
+        """
+        self._loading_depth += 1
+        try:
+            yield
+        finally:
+            self._loading_depth -= 1
+            if self._loading_depth < 0:
+                self._loading_depth = 0
+
+    def setWindowModified(self, modified: bool) -> None:
+        """Override: swallow dirty marks while a load is in progress.
+
+        There are ~50 scattered `setWindowModified(True)` call sites across
+        this file (signal lambdas, direct calls in handlers that fire during
+        population, etc.). Intercepting at the one Qt method catches every
+        path at once, instead of whack-a-mole-ing each call site.
+
+        Clearing the modified state (passing False) always goes through —
+        only spurious "mark dirty" calls during load are suppressed.
+        """
+        try:
+            import traceback, os, time
+            log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] setWindowModified({modified}) depth={self._loading_depth}\n")
+                for line in traceback.format_stack(limit=8)[:-1]:
+                    f.write("  " + line.rstrip() + "\n")
+        except Exception:
+            pass
+        if modified and self._loading_depth > 0:
+            return
+        super().setWindowModified(modified)
+
     def update_data(self, species, form=None):
         """
         Update the data displayed in the UI for a given species and form.
@@ -3203,6 +3262,10 @@ QTabBar::tab:hover:!selected {
         Returns:
         None
         """
+        with self._loading_guard():
+            self._update_data_impl(species, form)
+
+    def _update_data_impl(self, species, form=None):
         # Update species information
         self.ui.species_name.setText(
             self.source_data.get_species_info(species, "speciesName", form) or ""
@@ -3869,9 +3932,37 @@ QTabBar::tab:hover:!selected {
         """
         updated = False
 
+        def _normalize(v):
+            # Normalize for comparison: strip, coerce numeric-looking strings to int,
+            # normalize None/missing to a sentinel, compare lists element-wise via
+            # the same normalization.
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple)):
+                return tuple(_normalize(x) for x in v)
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str):
+                s = v.strip()
+                try:
+                    return int(s)
+                except (TypeError, ValueError):
+                    return s
+            return v
+
         def update_if_needed(attribute, ui_value):
             nonlocal updated
-            if self.source_data.get_species_info(species, attribute, form) != ui_value:
+            stored = self.source_data.get_species_info(species, attribute, form)
+            if _normalize(stored) != _normalize(ui_value):
+                try:
+                    import os, time
+                    log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
+                    with open(log, "a", encoding="utf-8") as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] DIRTY {species} attr={attribute} stored={stored!r} ui={ui_value!r} norm_stored={_normalize(stored)!r} norm_ui={_normalize(ui_value)!r}\n")
+                except Exception:
+                    pass
                 self.source_data.set_species_info(
                     species, attribute, ui_value, form=form
                 )
@@ -3976,14 +4067,18 @@ QTabBar::tab:hover:!selected {
             hidden_const = "ABILITY_NONE"
         if not hidden_const:
             hidden_const = "ABILITY_NONE"
-        try:
-            hidden_id = str(self.source_data.get_ability(hidden_const)["id"])
-        except Exception:
-            hidden_id = "0"
+        # Store ability CONSTANTS (e.g. "ABILITY_OVERGROW"), not numeric ids.
+        # The source data holds constants; writing numeric ids created a
+        # permanent shape mismatch where every click-away re-saved the species
+        # with a different representation and reported updated=True.
+        def _ab_const(data):
+            if isinstance(data, str) and data:
+                return data
+            return "ABILITY_NONE"
         abilities = [
-            str(self.source_data.get_ability(self.ui.ability1.currentData())["id"]),
-            str(self.source_data.get_ability(self.ui.ability2.currentData())["id"]),
-            hidden_id,
+            _ab_const(self.ui.ability1.currentData()),
+            _ab_const(self.ui.ability2.currentData()),
+            hidden_const or "ABILITY_NONE",
         ]
         update_if_needed("abilities", abilities)
 
@@ -4011,6 +4106,10 @@ QTabBar::tab:hover:!selected {
         except Exception:
             genderless_checked = False
 
+        try:
+            cur = self.source_data.get_species_info(species, "genderRatio", form)
+        except Exception:
+            cur = None
         if genderless_checked:
             gr_val = 255
         else:
@@ -4020,10 +4119,16 @@ QTabBar::tab:hover:!selected {
                 pct = 0
             # Map UI percent 0-100 -> engine byte 0-254. Reserve 255 for Genderless.
             gr_val = int(round(pct * 254 / 100))
-        try:
-            cur = self.source_data.get_species_info(species, "genderRatio", form)
-        except Exception:
-            cur = None
+            # Lossless round-trip: if the stored byte maps back to the same percent
+            # the UI currently shows, reuse the stored byte to avoid a spurious
+            # dirty mark from a pure view-only click-through.
+            try:
+                if isinstance(cur, int) and cur != 255:
+                    cur_pct = int(round((cur * 100) / 254))
+                    if cur_pct == pct:
+                        gr_val = cur
+            except Exception:
+                pass
         try:
             print(f"[GENDER-DIAG] save_species_data: species={species} computed_gr={gr_val} current_gr={cur}")
         except Exception:
@@ -4108,11 +4213,13 @@ QTabBar::tab:hover:!selected {
                             if key == "IN_NATDEX":
                                 lst = list(pdata.get('national_dex', []))
                                 present = False
+                                changed_natdex = False
                                 for entry in lst:
                                     if isinstance(entry, dict) and entry.get('species') == species:
                                         present = True
                                         if not checked:
                                             lst = [e for e in lst if e is not entry]
+                                            changed_natdex = True
                                         break
                                 if checked and not present:
                                     const = self.source_data.get_species_data(species, 'dex_constant')
@@ -4123,6 +4230,7 @@ QTabBar::tab:hover:!selected {
                                         'dex_constant': const,
                                         'categoryName': self.source_data.get_species_info(species, 'categoryName') or '',
                                     })
+                                    changed_natdex = True
                                     # Also reflect in the UI list if not present
                                     try:
                                         # Add display text "Name - Category"
@@ -4145,23 +4253,31 @@ QTabBar::tab:hover:!selected {
                                                 break
                                     except Exception:
                                         pass
-                                pdata['national_dex'] = lst
-                                updated = True
+                                # Only mark as updated if the list actually changed.
+                                # Previously this always set updated=True, which falsely
+                                # reported every species in the natdex as "edited" on
+                                # every tab switch.
+                                if changed_natdex:
+                                    pdata['national_dex'] = lst
+                                    updated = True
                             # Regional Dex membership
                             if key == "IN_REGDEX":
                                 lst = list(pdata.get('regional_dex', []))
                                 nat = self.source_data.get_species_data(species, 'dex_constant')
                                 reg = nat  # store national dex constants for regional list
                                 present = False
+                                changed_regdex = False
                                 for entry in lst:
                                     const = entry.get('dex_constant') if isinstance(entry, dict) else entry
                                     if const == reg:
                                         present = True
                                         if not checked:
                                             lst = [e for e in lst if (e.get('dex_constant') if isinstance(e, dict) else e) != reg]
+                                            changed_regdex = True
                                         break
                                 if checked and not present and reg:
                                     lst.append({'dex_constant': reg})
+                                    changed_regdex = True
                                     # Reflect in the UI regional list
                                     try:
                                         name = self.source_data.get_species_data(species, 'name') or species
@@ -4182,8 +4298,11 @@ QTabBar::tab:hover:!selected {
                                                 break
                                     except Exception:
                                         pass
-                                pdata['regional_dex'] = lst
-                                updated = True
+                                # Only mark as updated if the list actually changed
+                                # (see IN_NATDEX note above).
+                                if changed_regdex:
+                                    pdata['regional_dex'] = lst
+                                    updated = True
                         else:
                             pass
                     except Exception:
@@ -4219,8 +4338,11 @@ QTabBar::tab:hover:!selected {
                     "param": param_val,
                 }
             )
-        current = self.source_data.get_evolutions(species)
-        if evolutions != current:
+        current = self.source_data.get_evolutions(species) or []
+        # Normalize both sides so `[] != None` doesn't falsely report an edit
+        # for species with no evolutions. `or []` above handles the None case;
+        # the explicit list() coerces any iterable-but-not-list result too.
+        if list(evolutions) != list(current):
             updated = True
             self.source_data.set_evolutions(species, evolutions)
         if self.save_species_learnset_table(species):
@@ -4341,6 +4463,12 @@ QTabBar::tab:hover:!selected {
         if getattr(self, "_is_updating_selection", False):
             return
         self._is_updating_selection = True
+        # NOTE: no outer loading-guard here. `save_species_data(previous)` runs
+        # below and legitimately needs to report real edits by marking the
+        # window modified + adding the '*' tree marker. The load portion
+        # (update_data / _refresh_pokedex_display) carries its own guard,
+        # and the `setWindowModified` override handles stray dirty marks
+        # fired by widget signals during population.
         try:
             selected_species = self.ui.tree_pokemon.selectedItems()
             if len(selected_species) != 1:
@@ -4352,6 +4480,13 @@ QTabBar::tab:hover:!selected {
                 )
                 # Do NOT persist to disk here. Only mark in-memory changes and
                 # set the window modified flag so the user can Save explicitly.
+                try:
+                    import os, time
+                    log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
+                    with open(log, "a", encoding="utf-8") as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] save_species_data({self.previous_selected_species}) returned updated={updated}\n")
+                except Exception:
+                    pass
                 if updated:
                     # Mark previous species with '*'
                     for i in range(self.ui.tree_pokemon.topLevelItemCount()):
@@ -4450,7 +4585,10 @@ QTabBar::tab:hover:!selected {
         ``update_tree_pokemon`` to keep the dex panel in sync cheaply."""
         if not species or not self.source_data:
             return
+        with self._loading_guard():
+            self._refresh_pokedex_display_impl(species)
 
+    def _refresh_pokedex_display_impl(self, species):
         # Resolve the national dex constant for this species
         dex_const = self.source_data.get_species_data(species, "dex_constant")
         if not dex_const:
@@ -4535,6 +4673,10 @@ QTabBar::tab:hover:!selected {
         if getattr(self, "_is_updating_selection", False):
             return
         self._is_updating_selection = True
+        # Guard against the auto-`_dirty` lambda firing on every programmatic
+        # setText/setCurrentIndex in this method — viewing a dex entry must
+        # never mark the project modified.
+        self._loading_depth += 1
         try:
             item = None
             origin = self.sender()
@@ -4661,6 +4803,9 @@ QTabBar::tab:hover:!selected {
 
         finally:
             self._is_updating_selection = False
+            self._loading_depth -= 1
+            if self._loading_depth < 0:
+                self._loading_depth = 0
 
     def update_gender_ratio_minus1(self):
         """
@@ -5796,8 +5941,15 @@ QTabBar::tab:hover:!selected {
             natdex = self.source_data.data["pokedex"].data.get("national_dex", [])
             for i, entry in enumerate(natdex):
                 if entry.get("dex_constant") == self._current_dex_const:
+                    before = dict(entry)
                     updated = self._pokedex_panel.collect(entry)
                     natdex[i] = updated
+                    if updated != before:
+                        try:
+                            self.source_data.data["pokedex"].pending_changes = True
+                        except Exception:
+                            pass
+                        self.setWindowModified(True)
                     # Sync category and description back to species_info
                     sp = updated.get("species")
                     if sp:

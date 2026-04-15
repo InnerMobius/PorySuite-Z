@@ -8,7 +8,7 @@ to it, making the patches resilient to unrelated changes in Porymap.
 
 Patches applied:
     1. Callback types (onEventSelected, onMapSaved) in scripting.h/.cpp
-    2. writeBridgeFile(), readCommandFile(), and query functions in
+    2. writeBridgeFile() + readCommandFile() bridge I/O in
        scriptutility.h / apiutility.cpp
     3. Callback invocation hooks in mainwindow.cpp (save + event selection)
     4. openMap() Q_INVOKABLE on MainWindow for script-based navigation
@@ -37,20 +37,34 @@ def _write(path: str, content: str):
         f.write(content)
 
 
+def _check_anchor(content: str, anchor: str, label: str):
+    """Verify anchor appears exactly once. Fail loudly if 0 or >1 matches.
+
+    This guards against silent mis-patching if upstream Porymap ever adds a
+    second match (e.g. a comment or a similarly-named symbol). Better to
+    break the patcher at apply time than to emit a broken Porymap build.
+    """
+    count = content.count(anchor)
+    if count == 0:
+        raise RuntimeError(f"Anchor not found ({label}): {anchor[:80]!r}")
+    if count > 1:
+        raise RuntimeError(
+            f"Anchor ambiguous ({label}): matches {count} locations — "
+            f"upstream Porymap may have changed. Anchor: {anchor[:80]!r}")
+
+
 def _insert_after(content: str, anchor: str, insertion: str, *, label: str = "") -> str:
-    """Insert text after the first occurrence of anchor."""
+    """Insert text after the single occurrence of anchor."""
+    _check_anchor(content, anchor, label)
     idx = content.find(anchor)
-    if idx < 0:
-        raise RuntimeError(f"Anchor not found{f' ({label})' if label else ''}: {anchor[:80]!r}")
     pos = idx + len(anchor)
     return content[:pos] + insertion + content[pos:]
 
 
 def _insert_before(content: str, anchor: str, insertion: str, *, label: str = "") -> str:
-    """Insert text before the first occurrence of anchor."""
+    """Insert text before the single occurrence of anchor."""
+    _check_anchor(content, anchor, label)
     idx = content.find(anchor)
-    if idx < 0:
-        raise RuntimeError(f"Anchor not found{f' ({label})' if label else ''}: {anchor[:80]!r}")
     return content[:idx] + insertion + content[idx:]
 
 
@@ -169,10 +183,7 @@ def patch_scriptutility_h(src_dir: str):
         f"""
     {SENTINEL}
     Q_INVOKABLE void writeBridgeFile(QString jsonData);
-    Q_INVOKABLE QString readCommandFile();
-    Q_INVOKABLE QJSValue getMapHeader();
-    Q_INVOKABLE QJSValue getCurrentTilesets();
-    Q_INVOKABLE QJSValue getMapConnections();""",
+    Q_INVOKABLE QString readCommandFile();""",
         label="Q_INVOKABLE declarations",
     )
 
@@ -199,7 +210,7 @@ def patch_apiutility_cpp(src_dir: str):
         "\n#endif // QT_QML_LIB",
         f"""
 {SENTINEL}
-// PorySuite-Z bridge communication + map data queries
+// PorySuite-Z bridge I/O: JS writes messages out, reads commands in.
 
 QString ScriptUtility::readCommandFile() {{
     if (!window || !window->editor || !window->editor->project)
@@ -232,66 +243,6 @@ void ScriptUtility::writeBridgeFile(QString jsonData) {{
         file.write(jsonData.toUtf8());
         file.close();
     }}
-}}
-
-QJSValue ScriptUtility::getMapHeader() {{
-    if (!window || !window->editor || !window->editor->map)
-        return QJSValue();
-    auto engine = Scripting::getEngine();
-    if (!engine) return QJSValue();
-
-    Map *map = window->editor->map.data();
-    auto *hdr = map->header();
-    QJSValue obj = engine->newObject();
-    obj.setProperty("name", map->name());
-    if (hdr) {{
-        obj.setProperty("song", hdr->song());
-        obj.setProperty("location", hdr->location());
-        obj.setProperty("requiresFlash", hdr->requiresFlash());
-        obj.setProperty("weather", hdr->weather());
-        obj.setProperty("type", hdr->type());
-        obj.setProperty("battleScene", hdr->battleScene());
-        obj.setProperty("showsLocationName", hdr->showsLocationName());
-        obj.setProperty("allowsRunning", hdr->allowsRunning());
-        obj.setProperty("allowsBiking", hdr->allowsBiking());
-        obj.setProperty("allowsEscaping", hdr->allowsEscaping());
-        obj.setProperty("floorNumber", hdr->floorNumber());
-    }}
-    return obj;
-}}
-
-QJSValue ScriptUtility::getCurrentTilesets() {{
-    if (!window || !window->editor || !window->editor->map)
-        return QJSValue();
-    auto engine = Scripting::getEngine();
-    if (!engine) return QJSValue();
-
-    QJSValue obj = engine->newObject();
-    auto *layout = window->editor->map.data()->layout();
-    if (layout) {{
-        obj.setProperty("primary", layout->tileset_primary_label);
-        obj.setProperty("secondary", layout->tileset_secondary_label);
-    }}
-    return obj;
-}}
-
-QJSValue ScriptUtility::getMapConnections() {{
-    if (!window || !window->editor || !window->editor->map)
-        return QJSValue();
-    auto engine = Scripting::getEngine();
-    if (!engine) return QJSValue();
-
-    Map *map = window->editor->map.data();
-    QJSValue arr = engine->newArray();
-    int idx = 0;
-    for (auto *conn : map->getConnections()) {{
-        QJSValue connObj = engine->newObject();
-        connObj.setProperty("direction", conn->direction());
-        connObj.setProperty("map", conn->targetMapName());
-        connObj.setProperty("offset", conn->offset());
-        arr.setProperty(idx++, connObj);
-    }}
-    return arr;
 }}
 """,
         label="bridge API implementations",
