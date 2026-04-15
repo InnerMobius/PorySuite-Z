@@ -323,7 +323,15 @@ class MainWindow(QMainWindow):
 
         self.items_editor = ItemsTabWidget()
         self.ui.tab_items_grid.addWidget(self.items_editor, 0, 0, 1, 1)
-        self.items_editor.item_modified.connect(lambda: self.setWindowModified(True))
+        self.items_editor.item_modified.connect(self._on_item_edited)
+        # The items editor's QListWidget carries its own QSS, so install the
+        # amber-dirty delegate to paint the tint under edited rows.
+        try:
+            _il = getattr(self.items_editor, "_list", None)
+            if _il is not None:
+                self._install_dirty_delegate(_il)
+        except Exception:
+            pass
         self.items_editor.reset_requested.connect(lambda: self.reset_to_vanilla("items"))
         self.items_editor.rename_requested.connect(self._on_item_rename)
 
@@ -518,7 +526,7 @@ QTabBar::tab:hover:!selected {
             )
             self.graphics_tab_widget = GraphicsTabWidget(_res_dir)
             self.graphics_tab_widget.modified.connect(
-                lambda: self.setWindowModified(True)
+                self._on_species_field_edited
             )
             self.ui.tab_pokemon_graphics_grid.addWidget(
                 self.graphics_tab_widget, 0, 0, 1, 1
@@ -705,8 +713,22 @@ QTabBar::tab:hover:!selected {
         # falsely mark the project modified just for viewing data.
         def _dirty(*_a):
             if self._loading_depth > 0:
+                try:
+                    import os, time
+                    log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
+                    with open(log, "a", encoding="utf-8") as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] _dirty SUPPRESSED depth={self._loading_depth}\n")
+                except Exception:
+                    pass
                 return
-            self.setWindowModified(True)
+            try:
+                import os, time
+                log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] _dirty FIRED species={getattr(self,'previous_selected_species', None)!r}\n")
+            except Exception:
+                pass
+            self._on_species_field_edited()
         for attr_name in dir(self.ui):
             if attr_name.startswith('_'):
                 continue
@@ -965,10 +987,37 @@ QTabBar::tab:hover:!selected {
         except Exception:
             pass
 
-        # Delegate the heavy work (delete JSON caches, re-parse C headers,
-        # load_data) to the existing rebuild_caches() method so there is a
-        # single implementation of that logic.
-        self.rebuild_caches()
+        # Refresh is supposed to DISCARD unsaved edits. Reset every data
+        # object to its original_data snapshot and tell rebuild_caches not
+        # to re-apply the species-edit stash (that stash exists to survive
+        # rename reloads, not to subvert a user-requested revert).
+        try:
+            self._reset_data_objects()
+        except Exception:
+            pass
+        # Moves widget owns its own in-memory _moves_data dict; wipe it so
+        # load_moves_defs_table re-reads from the reset source_data.
+        try:
+            mw = getattr(self.ui, "moves_widget", None)
+            if mw is not None:
+                mw._moves_data = {}
+                mw._move_descriptions = {}
+                mw._dirty = False
+                mw._current_move = None
+        except Exception:
+            pass
+        self._refresh_discarding = True
+        try:
+            # Delegate the heavy work (delete JSON caches, re-parse C headers,
+            # load_data) to the existing rebuild_caches() method so there is
+            # a single implementation of that logic.
+            self.rebuild_caches()
+        finally:
+            # NOTE: keep _refresh_discarding True across the panel-reload
+            # phase below — update_pokedex_entry() calls _flush_pokedex_panel
+            # first, and we must suppress that flush so the still-stale
+            # widget values don't overwrite the reset source_data.
+            pass
 
         # rebuild_caches() calls load_data() but does not reload Trainers or
         # Moves (they are lazy-loaded on tab-switch).  Force them now.
@@ -982,6 +1031,42 @@ QTabBar::tab:hover:!selected {
             pass
         try:
             self.load_abilities_editor()
+        except Exception:
+            pass
+
+        # Panels cache their displayed values independently of source_data
+        # (e.g. the Pokédex panel's height/weight spinboxes). Resetting the
+        # backing data is not enough — force the current selection to reload
+        # from the freshly-reset data so the UI values visibly revert.
+        try:
+            self._loading_depth += 1
+            try:
+                self.refresh_current_species()
+            finally:
+                self._loading_depth -= 1
+        except Exception:
+            pass
+        try:
+            self._loading_depth += 1
+            try:
+                self.update_pokedex_entry()
+            finally:
+                self._loading_depth -= 1
+        except Exception:
+            pass
+
+        # Reload phase complete — clear the discard flag now so subsequent
+        # user edits flush normally.
+        self._refresh_discarding = False
+
+        # Refresh wipes in-memory edits; clear every amber marker AND every
+        # sidebar tab dot so the UI matches the clean on-disk state.
+        try:
+            self._clear_all_dirty_markers()
+        except Exception:
+            pass
+        try:
+            self.setWindowModified(False)
         except Exception:
             pass
 
@@ -3349,6 +3434,15 @@ QTabBar::tab:hover:!selected {
                     self._mark_list_item_dirty(lst, False)
         except Exception:
             pass
+        # Items editor's QListWidget — same treatment.
+        try:
+            ie = getattr(self, "items_editor", None)
+            if ie is not None:
+                lst = getattr(ie, "_list", None)
+                if lst is not None:
+                    self._mark_list_item_dirty(lst, False)
+        except Exception:
+            pass
         # Clear every known section's dot indicator.
         for section in ("species", "pokedex", "items", "moves", "abilities",
                         "trainers", "starters", "encounters", "credits",
@@ -5275,7 +5369,7 @@ QTabBar::tab:hover:!selected {
             item.setData(1, Qt.ItemDataRole.UserRole, self.ui.evo_method.currentData())
         param = self._read_evo_param()
         item.setText(2, str(param))
-        self.setWindowModified(True)
+        self._on_species_field_edited()
 
     def _read_evo_param(self):
         """Return the current evo_param value for saving to the tree/data."""
@@ -5309,7 +5403,7 @@ QTabBar::tab:hover:!selected {
         else:
             self.ui.evolutions.addTopLevelItem(new_item)
         self.ui.evolutions.setCurrentItem(new_item)
-        self.setWindowModified(True)
+        self._on_species_field_edited()
 
     def delete_evolution(self):
         """Remove the selected evolution from the tree."""
@@ -5319,7 +5413,7 @@ QTabBar::tab:hover:!selected {
             if index != -1:
                 self.ui.evolutions.takeTopLevelItem(index)
         self.update_evolutions()
-        self.setWindowModified(True)
+        self._on_species_field_edited()
 
     def refresh_current_species(self, *_):
         """Reload the data for the currently selected species/form."""
@@ -6105,6 +6199,59 @@ QTabBar::tab:hover:!selected {
                     match_role=Qt.ItemDataRole.UserRole, match_value=hoenn,
                 )
 
+    def _on_species_field_edited(self):
+        """Unified dirty handler for every editable field under the Pokemon
+        Data tab (Stats, Evolutions, Learnsets, Graphics, Abilities sub-panel).
+
+        Does three things in sequence:
+          1. Marks the project modified (title-bar `*`).
+          2. Colors the currently-selected species row amber in the tree.
+          3. Emits sectionDirtyChanged("species", True) so the Pokémon
+             sidebar tab icon gets the amber dot.
+        Suppressed while `_loading_depth > 0` (programmatic populate)."""
+        if self._loading_depth > 0:
+            return
+        try:
+            self.setWindowModified(True)
+        except Exception:
+            pass
+        try:
+            self.sectionDirtyChanged.emit("species", True)
+        except Exception:
+            pass
+        try:
+            species = getattr(self, "previous_selected_species", None)
+            tree = getattr(self.ui, "tree_pokemon", None)
+            if species and tree is not None:
+                self._mark_list_item_dirty(
+                    tree, True, match_col=1, match_value=species,
+                )
+        except Exception:
+            pass
+
+    def _on_item_edited(self):
+        """Wired to `items_editor.item_modified`. Marks the project modified,
+        emits sectionDirtyChanged("items", True) so the Items sidebar icon
+        gets the amber dot, and colors the currently-selected item's row."""
+        if self._loading_depth > 0:
+            return
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("items", True)
+        try:
+            ie = getattr(self, "items_editor", None)
+            if ie is None:
+                return
+            const = getattr(ie, "_current", None)
+            lst = getattr(ie, "_list", None)
+            if lst is None or not const:
+                return
+            self._mark_list_item_dirty(
+                lst, True,
+                match_role=Qt.ItemDataRole.UserRole, match_value=const,
+            )
+        except Exception:
+            pass
+
     def _on_move_edited(self):
         """Wired to `moves_widget.data_changed`. Marks the project modified,
         emits the sectionDirtyChanged signal so the Moves tab icon shows the
@@ -6132,6 +6279,13 @@ QTabBar::tab:hover:!selected {
         """Write panel edits back into the in-memory pokedex data,
         and sync category/description into species_info so the stats
         page and C header writer see the same values."""
+        # During a programmatic load OR a refresh-discard, the panel
+        # widgets hold stale values that must NOT be written back into
+        # the freshly-reset source data.  Short-circuit in those cases.
+        if getattr(self, "_loading_depth", 0) > 0:
+            return
+        if getattr(self, "_refresh_discarding", False):
+            return
         try:
             if not (hasattr(self, "_pokedex_panel") and
                     hasattr(self, "_current_dex_const") and
@@ -7193,7 +7347,7 @@ QTabBar::tab:hover:!selected {
                 combo.blockSignals(False)
         self._sync_learnset_item(int(row), int(column), text)
         try:
-            self.setWindowModified(True)
+            self._on_species_field_edited()
         except Exception:
             pass
         if int(column) == 1:
@@ -7228,7 +7382,7 @@ QTabBar::tab:hover:!selected {
             text = ""
         self._sync_learnset_item(int(row), int(column), text)
         try:
-            self.setWindowModified(True)
+            self._on_species_field_edited()
         except Exception:
             pass
 
@@ -9983,6 +10137,12 @@ QTabBar::tab:hover:!selected {
         fields where the user's value differs from vanilla (meaning the user
         edited it).
         """
+        # If the user explicitly asked for a Refresh (F5 / File → Refresh),
+        # the point of the action is to throw away unsaved edits. Don't
+        # restore anything from the stash in that case.
+        if getattr(self, "_refresh_discarding", False):
+            self._stashed_species_edits = {}
+            return
         stash = getattr(self, "_stashed_species_edits", None)
         if not stash:
             return

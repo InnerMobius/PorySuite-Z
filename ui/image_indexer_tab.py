@@ -191,203 +191,27 @@ class _ManualPickDialog(QDialog):
 
 
 # ── Draggable palette swatch ────────────────────────────────────────────────
+#
+# DragSwatch + DraggablePaletteRow live in ui/draggable_palette_row.py so
+# the Pokemon Graphics, Trainer Graphics and Overworld editors can reuse
+# them. Local aliases preserve the original private names so the rest of
+# this file is unchanged.
 
-_SWATCH_SZ = 22
-
-class _DragSwatch(QLabel):
-    """Palette swatch: click to edit colour, drag to reorder."""
-
-    # Signals emitted to the parent row
-    color_changed = pyqtSignal(int, tuple)   # (index, (r,g,b))
-    drag_started = pyqtSignal(int)           # source index
-    drop_received = pyqtSignal(int, int)     # (from_index, to_index)
-
-    def __init__(self, index: int, parent=None):
-        super().__init__(parent)
-        self._index = index
-        self._color: tuple[int, int, int] = (0, 0, 0)
-        self.setFixedSize(_SWATCH_SZ, _SWATCH_SZ)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAutoFillBackground(True)
-        self.setAcceptDrops(True)
-        self._drag_start: QPoint | None = None
-        self._refresh_tooltip()
-        self._refresh()
-
-    # -- public api --
-
-    @property
-    def index(self) -> int:
-        return self._index
-
-    @index.setter
-    def index(self, v: int):
-        self._index = v
-        self._refresh_tooltip()
-
-    def color(self) -> tuple[int, int, int]:
-        return self._color
-
-    def set_color(self, c: tuple[int, int, int], emit: bool = False):
-        c = clamp_to_gba(*c)
-        if c != self._color:
-            self._color = c
-            self._refresh()
-            self._refresh_tooltip()
-            if emit:
-                self.color_changed.emit(self._index, c)
-
-    # -- painting --
-
-    def _refresh(self):
-        r, g, b = self._color
-        p = self.palette()
-        p.setColor(self.backgroundRole(), QColor(r, g, b))
-        self.setPalette(p)
-
-    def _refresh_tooltip(self):
-        r, g, b = self._color
-        self.setToolTip(
-            f"Index {self._index}: ({r}, {g}, {b})\n"
-            f"Click to edit  •  Drag to reorder"
-        )
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        p = QPainter(self)
-        # Thin border
-        p.setPen(QColor("#555"))
-        p.drawRect(0, 0, _SWATCH_SZ - 1, _SWATCH_SZ - 1)
-        # Index 0 label
-        if self._index == 0:
-            p.setPen(QColor("#ff6666"))
-            p.setFont(QFont("Arial", 7, QFont.Weight.Bold))
-            p.drawText(2, 13, "BG")
-        p.end()
-
-    # -- click to edit --
-
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start = event.pos()
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
-            # If release without significant drag → open colour picker
-            delta = event.pos() - self._drag_start
-            if delta.manhattanLength() < 5:
-                self._open_picker()
-        self._drag_start = None
-        super().mouseReleaseEvent(event)
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if self._drag_start is None:
-            return
-        if (event.pos() - self._drag_start).manhattanLength() < 5:
-            return
-        # Start drag
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setText(str(self._index))
-        drag.setMimeData(mime)
-        # Drag pixmap — colour swatch thumbnail
-        pm = QPixmap(_SWATCH_SZ, _SWATCH_SZ)
-        pm.fill(QColor(*self._color))
-        drag.setPixmap(pm)
-        drag.setHotSpot(QPoint(_SWATCH_SZ // 2, _SWATCH_SZ // 2))
-        self._drag_start = None
-        drag.exec(Qt.DropAction.MoveAction)
-
-    def _open_picker(self):
-        r, g, b = self._color
-        top = self.window()
-        dlg = QColorDialog(QColor(r, g, b), top)
-        dlg.setWindowTitle(f"Palette index {self._index}")
-        dlg.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog)
-        for lbl in dlg.findChildren(QLabel):
-            if lbl.text().rstrip(":").strip().upper() in ("HTML", "&HTML"):
-                lbl.setText("Hex:")
-        if dlg.exec() == QColorDialog.DialogCode.Accepted:
-            qc = dlg.currentColor()
-            if qc.isValid():
-                new = clamp_to_gba(qc.red(), qc.green(), qc.blue())
-                if new != self._color:
-                    self._color = new
-                    self._refresh()
-                    self._refresh_tooltip()
-                    self.color_changed.emit(self._index, new)
-
-    # -- drop target --
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasText():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        try:
-            src = int(event.mimeData().text())
-        except (ValueError, TypeError):
-            return
-        if src != self._index:
-            self.drop_received.emit(src, self._index)
-        event.acceptProposedAction()
+from ui.draggable_palette_row import (
+    DragSwatch as _DragSwatch,
+    DraggablePaletteRow as _SharedDraggablePaletteRow,
+    SWATCH_SZ as _SWATCH_SZ,
+)
 
 
-# ── Draggable palette row ───────────────────────────────────────────────────
-
-class _DraggablePaletteRow(QWidget):
-    """Row of _DragSwatch widgets — supports drag-reorder.
-
-    Emits palette_reordered(from_idx, to_idx) when a swatch is dropped
-    onto a different position.  Emits color_edited() when a colour is
-    changed via the picker.
-    """
-    palette_reordered = pyqtSignal(int, int)  # (from, to)
+class _DraggablePaletteRow(_SharedDraggablePaletteRow):
+    """Local alias bridging the legacy `color_edited` signal name to the
+    shared row's `colors_changed`."""
     color_edited = pyqtSignal()
 
     def __init__(self, n: int = 16, parent=None):
-        super().__init__(parent)
-        self._layout = QHBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(2)
-        self._swatches: list[_DragSwatch] = []
-        # Build initial swatches in order, then add stretch at the end
-        for i in range(n):
-            s = _DragSwatch(i)
-            s.color_changed.connect(self._on_color_changed)
-            s.drop_received.connect(self._on_drop)
-            self._swatches.append(s)
-            self._layout.addWidget(s)
-        self._layout.addStretch(1)
-
-    def _add_swatch(self, idx: int) -> _DragSwatch:
-        """Add a swatch after construction (inserts before the trailing stretch)."""
-        s = _DragSwatch(idx)
-        s.color_changed.connect(self._on_color_changed)
-        s.drop_received.connect(self._on_drop)
-        self._swatches.append(s)
-        # Insert before the stretch (last item in layout)
-        stretch_pos = self._layout.count() - 1
-        self._layout.insertWidget(max(0, stretch_pos), s)
-        return s
-
-    def set_colors(self, colors: list[tuple[int, int, int]]):
-        for i, s in enumerate(self._swatches):
-            c = colors[i] if i < len(colors) else (0, 0, 0)
-            s.set_color(c, emit=False)
-
-    def colors(self) -> list[tuple[int, int, int]]:
-        return [s.color() for s in self._swatches]
-
-    def count(self) -> int:
-        return len(self._swatches)
-
-    def _on_color_changed(self, idx: int, color: tuple):
-        self.color_edited.emit()
-
-    def _on_drop(self, src: int, dst: int):
-        self.palette_reordered.emit(src, dst)
+        super().__init__(n=n, parent=parent)
+        self.colors_changed.connect(self.color_edited.emit)
 
 
 # ── Image preview widget ────────────────────────────────────────────────────

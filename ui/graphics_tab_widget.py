@@ -37,6 +37,8 @@ from ui.graphics_data import (
     species_slug_from_const,
 )
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
+from ui.draggable_palette_row import DraggablePaletteRow
+from core.gba_image_utils import reorder_palette, export_indexed_png
 
 
 Color = Tuple[int, int, int]
@@ -476,6 +478,14 @@ class GraphicsTabWidget(QWidget):
         self._icon_palettes: Dict[int, List[Color]] = {}
         self._icon_pal_dirty: set[int] = set()
 
+        # Reordered front/back PNGs awaiting save.
+        # { species: { "front": (path, QImage), "back": (path, QImage) } }
+        # Populated by _on_palette_reordered; consumed by flush_to_disk.
+        self._pending_reindexed_pngs: Dict[str, Dict[str, Tuple[str, QImage]]] = {}
+        # Cache of post-reorder QImage for live preview (keyed by current
+        # species' role: "front" / "back"). Cleared on species switch.
+        self._live_indexed: Dict[str, QImage] = {}
+
         # Sprite-sheet source pixmaps (for recolour / animation)
         self._front_src: Optional[QPixmap] = None  # full 64x64
         self._back_src: Optional[QPixmap] = None
@@ -597,13 +607,23 @@ class GraphicsTabWidget(QWidget):
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(10)
 
-        # Normal palette
-        self._normal_row = PaletteSwatchRow()
-        right.addWidget(self._wrap("Normal Palette", self._normal_row))
+        # Normal palette — draggable so the user can pick which colour
+        # is treated as transparent (drop on index 0 = "BG").
+        self._normal_row = DraggablePaletteRow()
+        right.addWidget(self._wrap(
+            "Normal Palette  (drag to reorder — drop on first slot = transparent)",
+            self._normal_row,
+        ))
 
-        # Shiny palette
-        self._shiny_row = PaletteSwatchRow()
-        right.addWidget(self._wrap("Shiny Palette", self._shiny_row))
+        # Shiny palette — same drag-reorder behaviour. Reordering either
+        # the normal or shiny row applies the SAME order to the other
+        # palette + reindexes the front/back PNGs, keeping shiny visually
+        # correct in-game.
+        self._shiny_row = DraggablePaletteRow()
+        right.addWidget(self._wrap(
+            "Shiny Palette  (drag to reorder — drop on first slot = transparent)",
+            self._shiny_row,
+        ))
 
         # Import Palette from PNG button + Normal/Shiny target selector
         import_group = QGroupBox("Import Palette from PNG")
@@ -633,6 +653,15 @@ class GraphicsTabWidget(QWidget):
             "is not modified or copied."
         )
         ig_import.addWidget(self._import_png_btn)
+
+        self._import_pal_btn = QPushButton("Import .pal File...")
+        self._import_pal_btn.setToolTip(
+            "Pick a JASC .pal file and load its 16 colours into the\n"
+            "Normal or Shiny palette (whichever radio is selected above).\n"
+            "Click Save to write to disk."
+        )
+        ig_import.addWidget(self._import_pal_btn)
+
         right.addWidget(import_group)
 
         # Icon palette (0/1/2 + editable rows)
@@ -695,6 +724,14 @@ class GraphicsTabWidget(QWidget):
 
         self._normal_row.colors_changed.connect(self._on_normal_changed)
         self._shiny_row.colors_changed.connect(self._on_shiny_changed)
+        # Drag-reorder: either row drives a lockstep reorder of BOTH
+        # palettes plus a re-index of the front/back PNGs.
+        self._normal_row.palette_reordered.connect(
+            lambda f, t: self._on_palette_reordered("normal", f, t)
+        )
+        self._shiny_row.palette_reordered.connect(
+            lambda f, t: self._on_palette_reordered("shiny", f, t)
+        )
         self._icon_pal_combo.currentIndexChanged.connect(self._on_icon_idx)
         for i, row in enumerate(self._icon_rows):
             row.colors_changed.connect(
@@ -703,6 +740,7 @@ class GraphicsTabWidget(QWidget):
 
         self._open_folder_btn.clicked.connect(self._open_graphics_folder)
         self._import_png_btn.clicked.connect(self._import_palette_from_png)
+        self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
 
     def _make_thumb(self, display_size: int, title: str):
         box = QGroupBox(title)
@@ -756,6 +794,13 @@ class GraphicsTabWidget(QWidget):
                      icon_path: str = "", footprint_path: str = "") -> None:
         """Load all data + sprites for the given SPECIES_ constant."""
         self._current_species = species
+        # Live-preview cache is per-species — drop it when switching.
+        # If this species has unsaved reindexed PNGs, reload them so the
+        # preview keeps showing the post-reorder pixels.
+        self._live_indexed = {}
+        pending = self._pending_reindexed_pngs.get(species, {})
+        for role, (_p, img) in pending.items():
+            self._live_indexed[role] = img
         self._loading = True
         try:
             # Thumbnails (front/back full, footprint full, icon = first frame only)
@@ -864,17 +909,47 @@ class GraphicsTabWidget(QWidget):
             self._preview.set_front_pixmap(self._front_src)
             self._preview.set_back_pixmap(self._back_src)
             return
-        # Recolour front + back by swapping the indexed PNG's palette.
-        if self._front_src_path:
-            self._preview.set_front_pixmap(
-                _reskin_indexed_png(self._front_src_path, palette)
-                or self._front_src
-            )
-        if self._back_src_path:
-            self._preview.set_back_pixmap(
-                _reskin_indexed_png(self._back_src_path, palette)
-                or self._back_src
-            )
+
+        def _recolour(role: str, path: str, fallback: Optional[QPixmap]) -> Optional[QPixmap]:
+            # If the user reordered the palette, the on-disk PNG has the
+            # OLD pixel order — use the in-memory reindexed QImage instead
+            # so preview matches what will be saved.
+            live = self._live_indexed.get(role)
+            if live is not None:
+                try:
+                    img = QImage(live)  # copy so we don't mutate cache
+                    if img.format() != QImage.Format.Format_Indexed8:
+                        img = img.convertToFormat(QImage.Format.Format_Indexed8)
+                    # Build colour table from scratch — alpha=0 ONLY at
+                    # slot 0 (the "BG"/transparent slot), 255 elsewhere.
+                    # Don't preserve alpha-by-position from the previous
+                    # state; that breaks chained reorders where the
+                    # previous transparent slot should now be opaque.
+                    ct = []
+                    for i, (r, g, b) in enumerate(palette[:16]):
+                        a = 0 if i == 0 else 255
+                        ct.append((a << 24) | (r << 16) | (g << 8) | b)
+                    while len(ct) < 256:
+                        ct.append(0xFF000000)
+                    img.setColorTable(ct)
+                    # Convert to ARGB32 so alpha actually punches through
+                    # in the preview QPixmap (Format_Indexed8 + tRNS-style
+                    # alpha is unreliable through QPixmap.fromImage).
+                    return QPixmap.fromImage(
+                        img.convertToFormat(QImage.Format.Format_ARGB32)
+                    )
+                except Exception:
+                    pass
+            if path:
+                return _reskin_indexed_png(path, palette) or fallback
+            return fallback
+
+        self._preview.set_front_pixmap(
+            _recolour("front", self._front_src_path, self._front_src)
+        )
+        self._preview.set_back_pixmap(
+            _recolour("back", self._back_src_path, self._back_src)
+        )
 
     def _load_species_palettes(self, species: str) -> None:
         if not self._project_root:
@@ -960,6 +1035,94 @@ class GraphicsTabWidget(QWidget):
         # Live recolour preview if currently showing shiny
         if self._preview_shiny:
             self._refresh_preview_sprites()
+
+    def _on_palette_reordered(self, source: str, from_idx: int, to_idx: int) -> None:
+        """User dragged a swatch in the normal OR shiny row.
+
+        Normal and shiny palettes are independent — each owns its own
+        order. Only the normal palette is the one the PNG pixels are
+        indexed against.
+
+        Normal drag → reorder normal.pal + remap front/back PNG pixels
+                     so the image looks the same and slot 0 (transparent)
+                     points to the user's chosen colour. Shiny .pal is
+                     left alone (shiny visual will shift as a side effect
+                     of the PNG remap; that's an engine constraint).
+
+        Shiny drag → reorder shiny.pal only. PNG is untouched. Normal
+                    .pal is untouched. Shiny visual shifts because slot N
+                    in shiny.pal now holds a different colour.
+        """
+        if self._loading or not self._current_species or not self._project_root:
+            return
+        sp = self._current_species
+        n = 16
+        if from_idx == to_idx or not (0 <= from_idx < n) or not (0 <= to_idx < n):
+            return
+
+        # Make sure we have palettes loaded
+        if sp not in self._palettes:
+            self._load_species_palettes(sp)
+        normal_pal = list(self._palettes[sp].get("normal") or [(0, 0, 0)] * n)
+        shiny_pal = list(self._palettes[sp].get("shiny") or [(0, 0, 0)] * n)
+        while len(normal_pal) < n:
+            normal_pal.append((0, 0, 0))
+        while len(shiny_pal) < n:
+            shiny_pal.append((0, 0, 0))
+
+        new_order = list(range(n))
+        new_order.remove(from_idx)
+        new_order.insert(to_idx, from_idx)
+
+        if source == "normal":
+            # Remap the front + back indexed PNGs so pixels still point
+            # to the same colours — only which slot holds which colour
+            # (and therefore which pixels are transparent) changes.
+            cached_pending = self._pending_reindexed_pngs.get(sp, {})
+            for role, src_path in (
+                ("front", self._front_src_path),
+                ("back", self._back_src_path),
+            ):
+                if not src_path:
+                    continue
+                if role in cached_pending:
+                    img = cached_pending[role][1]
+                else:
+                    img = QImage(src_path)
+                    if img.isNull():
+                        continue
+                    if img.format() != QImage.Format.Format_Indexed8:
+                        img = img.convertToFormat(QImage.Format.Format_Indexed8)
+                try:
+                    new_img, _ = reorder_palette(img, normal_pal, new_order)
+                except Exception:
+                    continue
+                self._pending_reindexed_pngs.setdefault(sp, {})[role] = (
+                    src_path, new_img,
+                )
+                self._live_indexed[role] = new_img
+
+            new_normal = [normal_pal[old] for old in new_order]
+            self._palettes[sp]["normal"] = new_normal
+            self._loading = True
+            try:
+                self._normal_row.set_colors(new_normal)
+            finally:
+                self._loading = False
+        else:
+            # Shiny drag: reorder shiny.pal only. No PNG remap, no
+            # touching of the normal row.
+            new_shiny = [shiny_pal[old] for old in new_order]
+            self._palettes[sp]["shiny"] = new_shiny
+            self._loading = True
+            try:
+                self._shiny_row.set_colors(new_shiny)
+            finally:
+                self._loading = False
+
+        self._palette_dirty.add(sp)
+        self._refresh_preview_sprites()
+        self._mark_modified()
 
     def _on_icon_idx(self, v: int) -> None:
         # Always rebuild the preview (even during loading, since load_species
@@ -1107,11 +1270,91 @@ class GraphicsTabWidget(QWidget):
             "write the .pal file to disk.",
         )
 
+    def _import_palette_from_pal(self) -> None:
+        """Load colours from a JASC .pal file into Normal or Shiny."""
+        if not self._current_species:
+            QMessageBox.information(
+                self, "No Species Selected",
+                "Select a species first, then import a .pal file.",
+            )
+            return
+
+        # Default to this species' graphics folder
+        start_dir = ""
+        if self._project_root and self._current_species:
+            slug = species_slug_from_const(self._current_species)
+            candidate = os.path.join(
+                self._project_root, "graphics", "pokemon", slug
+            )
+            if os.path.isdir(candidate):
+                start_dir = candidate
+        if not start_dir:
+            start_dir = self._project_root or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select JASC .pal File",
+            start_dir,
+            "JASC Palette Files (*.pal);;All Files (*)",
+        )
+        if not path:
+            return
+
+        colors = read_jasc_pal(path)
+        if not colors:
+            QMessageBox.warning(
+                self, "Import Failed",
+                f"Could not read a JASC palette from:\n{path}\n\n"
+                "The file must be a JASC-PAL 0100 format with 16 RGB lines.",
+            )
+            return
+
+        # Pad / clamp to 16 entries
+        colors = [clamp_to_gba(*c) for c in colors[:16]]
+        while len(colors) < 16:
+            colors.append((0, 0, 0))
+
+        # Determine target (Normal or Shiny) from the same radio selector
+        # used by the PNG importer.
+        is_shiny = self._import_shiny_rb.isChecked()
+        target_label = "Shiny" if is_shiny else "Normal"
+        key = "shiny" if is_shiny else "normal"
+
+        self._palettes.setdefault(
+            self._current_species, {"normal": [], "shiny": []}
+        )[key] = colors
+        self._palette_dirty.add(self._current_species)
+
+        # Update the swatch row display
+        self._loading = True
+        try:
+            if is_shiny:
+                self._shiny_row.set_colors(colors)
+            else:
+                self._normal_row.set_colors(colors)
+        finally:
+            self._loading = False
+
+        # Refresh the battle scene preview if this side is currently shown
+        show_shiny = self._preview_shiny
+        if (is_shiny and show_shiny) or (not is_shiny and not show_shiny):
+            self._refresh_preview_sprites()
+
+        self._mark_modified()
+
+        QMessageBox.information(
+            self, "Palette Imported",
+            f"Loaded {len(colors)} colors from:\n"
+            f"{os.path.basename(path)}\n\n"
+            f"Applied to: {target_label} palette\n"
+            f"Species: {self._current_species}\n\n"
+            "Click File → Save to write the .pal file to disk.",
+        )
+
     # ────────────────────────────────────────────────────────── save hook ──
     def has_unsaved_changes(self) -> bool:
         return bool(
             (self._data and self._data.has_pending_changes())
             or self._palette_dirty or self._icon_pal_dirty
+            or self._pending_reindexed_pngs
         )
 
     def flush_to_disk(self) -> tuple[int, list[str]]:
@@ -1137,6 +1380,20 @@ class GraphicsTabWidget(QWidget):
                 else:
                     all_errors.append(f"pal-shiny:{sp}")
             self._palette_dirty.clear()
+            # Reindexed front/back PNGs — write each as an indexed PNG
+            # whose colour table reflects the (already-saved) normal palette
+            # with index 0 marked transparent.
+            for sp, role_map in list(self._pending_reindexed_pngs.items()):
+                pal = self._palettes.get(sp, {}).get("normal") or [(0, 0, 0)] * 16
+                for role, (path, img) in role_map.items():
+                    try:
+                        if export_indexed_png(img, pal, path, transparent_index=0):
+                            total_ok += 1
+                        else:
+                            all_errors.append(f"png-{role}:{sp}")
+                    except Exception:
+                        all_errors.append(f"png-{role}:{sp}")
+            self._pending_reindexed_pngs.clear()
             # Icon palettes
             for idx in list(self._icon_pal_dirty):
                 path = icon_palette_pal_path(self._project_root, idx)

@@ -853,6 +853,17 @@ class UnifiedMainWindow(QMainWindow):
             # unified title bar can't light up while the child's own override
             # is correctly blocking a spurious dirty mark (loading, flushing,
             # bulk combo population, etc.).
+            try:
+                import os, time
+                log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
+                with open(log, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{time.strftime('%H:%M:%S')}] _unified_set_modified({modified}) "
+                        f"suppress={self._suppress_dirty} "
+                        f"ps_suppress={getattr(porysuite_main, '_ps_suppress_dirty', False)} "
+                        f"depth={getattr(porysuite_main, '_loading_depth', 0)}\n")
+            except Exception:
+                pass
             if modified and (self._suppress_dirty
                              or getattr(porysuite_main, '_ps_suppress_dirty', False)
                              or getattr(porysuite_main, '_loading_depth', 0) > 0):
