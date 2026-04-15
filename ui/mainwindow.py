@@ -3258,7 +3258,13 @@ QTabBar::tab:hover:!selected {
         """
         try:
             from PyQt6.QtWidgets import QTreeWidget, QListWidget
-            brush = QBrush(self.DIRTY_ITEM_COLOR) if dirty else QBrush()
+            fg_brush = QBrush(self.DIRTY_ITEM_COLOR) if dirty else QBrush()
+            # Many tabs (moves, items, etc.) style their list items via QSS,
+            # which overrides setForeground. A semi-opaque amber background
+            # is not overridden by QSS color rules and makes the dirty marker
+            # visible everywhere.
+            bg_brush = (QBrush(QColor(255, 183, 77, 90))  # ~35% amber tint
+                        if dirty else QBrush())
             if isinstance(widget, QTreeWidget):
                 cols = widget.columnCount()
                 for i in range(widget.topLevelItemCount()):
@@ -3266,7 +3272,8 @@ QTabBar::tab:hover:!selected {
                     if match_value is not None and item.text(match_col) != match_value:
                         continue
                     for col in range(cols):
-                        item.setForeground(col, brush)
+                        item.setForeground(col, fg_brush)
+                        item.setBackground(col, bg_brush)
                     if match_value is not None:
                         break
             elif isinstance(widget, QListWidget):
@@ -3278,7 +3285,8 @@ QTabBar::tab:hover:!selected {
                                 continue
                         elif item.text() != match_value:
                             continue
-                    item.setForeground(brush)
+                    item.setForeground(fg_brush)
+                    item.setBackground(bg_brush)
                     if match_value is not None:
                         break
         except Exception:
