@@ -425,6 +425,12 @@ QTabBar::tab:hover:!selected {
         try:
             self.ui.moves_widget = MovesTabWidget()
             self.ui.moves_widget.data_changed.connect(self._on_move_edited)
+            # The moves list ships its own QSS that overrides per-item brushes,
+            # so install the dirty-highlight delegate to paint amber under
+            # edited rows.
+            _ml = getattr(self.ui.moves_widget, "_list", None)
+            if _ml is not None:
+                self._install_dirty_delegate(_ml)
             self.ui.moves_widget.rename_requested.connect(self._on_move_rename)
             self.ui.mainTabs.addTab(self.ui.moves_widget, "Moves")
             self.moves_main_tab_index = self.ui.mainTabs.indexOf(self.ui.moves_widget)
@@ -3248,6 +3254,30 @@ QTabBar::tab:hover:!selected {
     # the old "append '*' to the name" pattern — a colored row is both more
     # visible and doesn't tamper with the displayed text.
     DIRTY_ITEM_COLOR = QColor("#ffb74d")
+    # UserRole slot used to flag an individual list/tree row as dirty so the
+    # DirtyHighlightDelegate can paint the amber tint. Using a high UserRole
+    # offset avoids clashing with per-tab data (moves store type at +1, etc).
+    DIRTY_FLAG_ROLE = Qt.ItemDataRole.UserRole + 500
+
+    def _install_dirty_delegate(self, widget):
+        """Install the amber-tint delegate on a list/tree whose parent widget
+        has a QSS stylesheet (which would otherwise override setBackground).
+        Safe to call repeatedly — installs at most once per widget."""
+        if getattr(widget, "_dirty_delegate_installed", False):
+            return
+        from PyQt6.QtWidgets import QStyledItemDelegate
+        main_self = self
+
+        class _DirtyDelegate(QStyledItemDelegate):
+            def paint(self, painter, option, index):
+                if index.data(main_self.DIRTY_FLAG_ROLE):
+                    painter.save()
+                    painter.fillRect(option.rect, QColor(255, 183, 77, 90))
+                    painter.restore()
+                super().paint(painter, option, index)
+
+        widget.setItemDelegate(_DirtyDelegate(widget))
+        widget._dirty_delegate_installed = True
 
     def _mark_list_item_dirty(self, widget, dirty: bool, *, match_col: int = 1, match_value=None, match_role=None):
         """Color (or uncolor) one row of a QTreeWidget or QListWidget to
@@ -3265,6 +3295,7 @@ QTabBar::tab:hover:!selected {
             # visible everywhere.
             bg_brush = (QBrush(QColor(255, 183, 77, 90))  # ~35% amber tint
                         if dirty else QBrush())
+            flag_val = True if dirty else None
             if isinstance(widget, QTreeWidget):
                 cols = widget.columnCount()
                 for i in range(widget.topLevelItemCount()):
@@ -3274,6 +3305,7 @@ QTabBar::tab:hover:!selected {
                     for col in range(cols):
                         item.setForeground(col, fg_brush)
                         item.setBackground(col, bg_brush)
+                        item.setData(col, self.DIRTY_FLAG_ROLE, flag_val)
                     if match_value is not None:
                         break
             elif isinstance(widget, QListWidget):
@@ -3287,6 +3319,7 @@ QTabBar::tab:hover:!selected {
                             continue
                     item.setForeground(fg_brush)
                     item.setBackground(bg_brush)
+                    item.setData(self.DIRTY_FLAG_ROLE, flag_val)
                     if match_value is not None:
                         break
         except Exception:
