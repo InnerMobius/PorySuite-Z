@@ -17,12 +17,10 @@ import struct
 
 import numpy as np
 
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint
-from PyQt6.QtGui import (
-    QColor, QDrag, QFont, QImage, QMouseEvent, QPainter, QPixmap,
-)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QDialog,
+    QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QRadioButton, QScrollArea, QSpinBox, QSplitter,
@@ -30,8 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.gba_image_utils import (
-    quantize_image, remap_to_palette,
-    move_color_to_index, swap_palette_entries,
+    quantize_image, remap_to_palette, swap_palette_entries,
     export_indexed_png, export_palette, get_image_info,
     gba_clamp_palette, get_quantize_candidates,
     QMODE_BALANCED, QMODE_SMOOTH, QMODE_PRESERVE_RARE, QMODE_MANUAL,
@@ -198,9 +195,7 @@ class _ManualPickDialog(QDialog):
 # this file is unchanged.
 
 from ui.draggable_palette_row import (
-    DragSwatch as _DragSwatch,
     DraggablePaletteRow as _SharedDraggablePaletteRow,
-    SWATCH_SZ as _SWATCH_SZ,
 )
 
 
@@ -401,7 +396,22 @@ class ImageIndexerWidget(QWidget):
 
         self._load_pal_btn = QPushButton("Load .pal...")
         self._load_pal_btn.setToolTip(
-            "Load an existing JASC .pal and remap to those exact colors"
+            "Load an existing JASC .pal file and apply it to the working\n"
+            "image.\n\n"
+            "Three paths are tried in order, least-lossy first:\n"
+            "  1. If the image is already indexed (from an auto-loaded\n"
+            "     indexed PNG or a previous Quantize), pixel indices are\n"
+            "     kept exactly and the new palette's colours are slotted\n"
+            "     in position-by-position — NSE2 behaviour. Loading\n"
+            "     shiny.pal on a normal-indexed sprite gives the correct\n"
+            "     shiny look.\n"
+            "  2. If the image is RGB but has no more unique colours than\n"
+            "     the target palette can hold, each unique colour is\n"
+            "     auto-assigned to a slot (in first-appearance order) and\n"
+            "     the loaded palette is applied slot-by-slot. Lossless.\n"
+            "  3. Otherwise (RGB with too many colours, or Dither on\n"
+            "     remap checked), a closest-colour remap is used. Lossy.\n\n"
+            "The status line below the palette names which path ran."
         )
         self._load_pal_btn.setEnabled(False)
         self._load_pal_btn.clicked.connect(self._load_and_remap_palette)
@@ -409,7 +419,10 @@ class ImageIndexerWidget(QWidget):
 
         self._remap_dither_cb = QCheckBox("Dither on remap")
         self._remap_dither_cb.setToolTip(
-            "Apply dithering when remapping to an existing palette"
+            "Force a closest-colour remap (with dithering) when loading a\n"
+            ".pal file, even if the image is already indexed. Only useful\n"
+            "when the loaded palette is genuinely different from the one\n"
+            "the image was indexed with and you want a best-visual-match."
         )
         bar2.addWidget(self._remap_dither_cb)
 
@@ -565,6 +578,7 @@ class ImageIndexerWidget(QWidget):
         row = _DraggablePaletteRow(16)
         row.color_edited.connect(self._on_palette_color_edited)
         row.palette_reordered.connect(self._on_palette_reordered)
+        row.swatch_set_as_bg.connect(self._on_set_swatch_as_bg)
         self._pal_rows.append(row)
         self._pal_container.addWidget(row)
         return row
@@ -604,28 +618,99 @@ class ImageIndexerWidget(QWidget):
         self._pal_status.setText("Palette colour edited")
 
     def _on_palette_reordered(self, from_idx: int, to_idx: int):
-        """User dragged swatch from_idx and dropped it on to_idx."""
+        """User dragged swatch from_idx and dropped it on to_idx.
+
+        PALETTE-ONLY SWAP — matches the Pokemon Graphics tab exactly.
+        Only the two entries in ``self._palette`` are swapped; the indexed
+        image's pixel values are NEVER touched.  What changes visually is
+        WHICH colour shows at each slot — a pixel whose stored value is
+        ``from_idx`` will now display the colour previously at ``to_idx``,
+        and vice versa.  ``_rebuild_image_palette`` pushes the new colour
+        table onto ``_indexed_img`` so the preview picks it up.
+
+        Dropping onto slot 0 makes the dragged colour the transparent slot
+        (pokefirered convention: slot 0 is tRNS).
+        """
         if self._indexed_img is None or not self._palette:
             return
+        if from_idx == to_idx or from_idx < 0 or to_idx < 0:
+            return
+        # Defensive: make sure _palette is long enough to cover both drag
+        # indices. _set_palette_display always shows a multiple of 16
+        # swatches, so a drag from a padded swatch can land here with
+        # an index beyond a short palette — pad with black rather than
+        # IndexError below.
+        need = max(from_idx, to_idx) + 1
+        if len(self._palette) < need:
+            self._palette = list(self._palette) + \
+                [(0, 0, 0)] * (need - len(self._palette))
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            new_img, new_pal = move_color_to_index(
-                self._indexed_img, self._palette, from_idx, to_idx,
+            pal = list(self._palette)
+            pal[from_idx], pal[to_idx] = pal[to_idx], pal[from_idx]
+            self._palette = pal
+            # Push the new colour table onto the indexed image.  Pixel
+            # indices are untouched; only the colour table changes.
+            self._rebuild_image_palette()
+            self._set_palette_display(pal)
+            self._refresh_result_preview()
+            if to_idx == 0:
+                self._pal_status.setText(
+                    f"Swapped slot {from_idx} ↔ slot 0 (BG — transparent)"
+                )
+            else:
+                self._pal_status.setText(
+                    f"Swapped slot {from_idx} ↔ slot {to_idx}"
+                )
+        except Exception as e:
+            import traceback
+            QMessageBox.warning(
+                self, "Reorder Error",
+                f"{e}\n\n{traceback.format_exc()}",
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _on_set_swatch_as_bg(self, slot: int):
+        """Right-click → "Index as Background" on palette slot ``slot``.
+
+        Unlike the drag-reorder (palette-only swap), this operation is a
+        pixel+palette swap — pixels stored as value ``slot`` become value
+        ``0`` and vice versa, and palette entries ``0`` and ``slot`` trade
+        places. Net visible result: whichever colour the user right-clicked
+        is now transparent; whatever was transparent before is now showing
+        as that colour at the old slot. The saved Indexed PNG has slot 0
+        as the tRNS colour by convention, so this is how you pick "which
+        colour region of the image becomes transparent".
+        """
+        if self._indexed_img is None or not self._palette:
+            return
+        if slot <= 0:
+            return  # slot 0 itself is already BG
+        # Defensive pad — never crash if a padded-black swatch was clicked.
+        need = slot + 1
+        if len(self._palette) < need:
+            self._palette = list(self._palette) + \
+                [(0, 0, 0)] * (need - len(self._palette))
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            new_img, new_pal = swap_palette_entries(
+                self._indexed_img, self._palette, slot, 0,
             )
             self._indexed_img = new_img
             self._palette = new_pal
             self._set_palette_display(new_pal)
             self._refresh_result_preview()
-            if to_idx == 0:
-                self._pal_status.setText(
-                    f"Moved index {from_idx} to BG (index 0 — transparent)"
-                )
-            else:
-                self._pal_status.setText(
-                    f"Moved index {from_idx} → index {to_idx}"
-                )
+            self._pal_status.setText(
+                f"Indexed slot {slot} as background "
+                f"(swapped with slot 0 — transparent on save)"
+            )
         except Exception as e:
-            QMessageBox.warning(self, "Reorder Error", str(e))
+            import traceback
+            QMessageBox.warning(
+                self, "Index as Background Error",
+                f"{e}\n\n{traceback.format_exc()}",
+            )
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -702,7 +787,15 @@ class ImageIndexerWidget(QWidget):
             g = (c >> 8) & 0xFF
             b = c & 0xFF
             colors.append(clamp_to_gba(r, g, b))
-        while len(colors) < target:
+        # Pad _palette to the full visual swatch count (always a multiple of 16,
+        # at minimum 16) so that every on-screen swatch corresponds to a real
+        # palette entry. Without this, dragging from a "padded black" swatch
+        # past the real palette length would raise ValueError in the reorder
+        # helpers (indices beyond len(palette) aren't valid).
+        display_target = max(target, 16)
+        if display_target % 16:
+            display_target = ((display_target // 16) + 1) * 16
+        while len(colors) < display_target:
             colors.append((0, 0, 0))
         self._palette = colors
         self._indexed_img = img.copy()
@@ -790,22 +883,135 @@ class ImageIndexerWidget(QWidget):
             colors.append((0, 0, 0))
         dither = self._remap_dither_cb.isChecked()
 
+        # Three ways to apply a .pal to the working image.  We always try
+        # the least-lossy one that applies, and fall back to closest-colour
+        # remap only when nothing else fits.
+        #
+        # 1. Slot-preserving on existing indexed layout.
+        #    If we already have an indexed working image (from auto-load
+        #    of an indexed PNG, or from a previous Quantize), we keep its
+        #    pixel indices untouched and swap the colour table to the
+        #    loaded palette.  Pixel-value N renders as loaded_pal[N] —
+        #    this is NSE2 behaviour and is what makes "load shiny.pal on
+        #    a normal-indexed sprite" produce a correct shiny.
+        #
+        # 2. Slot-preserving on an RGB source with few unique colours.
+        #    If the source is RGB but has no more unique colours than the
+        #    target palette can hold, we first build an indexed version
+        #    by assigning each unique source colour to a slot in first-
+        #    appearance order, then apply the loaded palette as colour
+        #    table.  No colour information is lost — every pixel keeps a
+        #    1:1 identity, the loaded palette is applied in full, and the
+        #    user can drag-reorder after if the auto-assigned slot order
+        #    isn't what they want.
+        #
+        # 3. Closest-colour remap (the legacy path).
+        #    Used when the source is RGB with more unique colours than
+        #    the target, or when the user explicitly ticks "Dither on
+        #    remap".  Lossy by nature.
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            remapped = remap_to_palette(self._source_img, colors, dither)
-            self._indexed_img = remapped
-            self._palette = colors
+            status_detail: str
+            if not dither and self._working_image_is_indexed():
+                # Case 1: slot-preserving on existing indexed layout.
+                # If the original source was indexed and we haven't done
+                # a destructive quantize, rebase on the source so repeat
+                # Load .pal calls are idempotent.
+                if (self._indexed_img is None
+                        and self._source_img.format()
+                        == QImage.Format.Format_Indexed8):
+                    self._indexed_img = self._source_img.copy()
+                self._palette = colors
+                self._rebuild_image_palette()
+                status_detail = "slot-preserving swap"
+            elif not dither and self._try_auto_index_rgb(colors, max_colors):
+                # Case 2: success — _try_auto_index_rgb updated
+                # _indexed_img + _palette in place.
+                status_detail = "slot-preserving swap (RGB auto-indexed)"
+            else:
+                # Case 3: closest-colour remap.
+                self._indexed_img = remap_to_palette(
+                    self._source_img, colors, dither,
+                )
+                self._palette = colors
+                status_detail = (
+                    "closest-color, dither" if dither else "closest-color"
+                )
             self._set_palette_display(colors)
             self._refresh_result_preview()
             self._pal_status.setText(
-                f"Remapped to {os.path.basename(path)} "
-                f"({len(colors)} colors, closest-color)"
+                f"Loaded {os.path.basename(path)} "
+                f"({len(colors)} colors, {status_detail})"
             )
             self._enable_export(True)
         except Exception as e:
-            QMessageBox.warning(self, "Remap Error", str(e))
+            import traceback
+            QMessageBox.warning(
+                self, "Remap Error",
+                f"{e}\n\n{traceback.format_exc()}",
+            )
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _working_image_is_indexed(self) -> bool:
+        """Return True if there's an existing indexed layout to swap onto.
+
+        That's either the current working indexed image (from a prior
+        auto-load or Quantize) or a fresh indexed source PNG we haven't
+        processed yet.
+        """
+        if (self._indexed_img is not None
+                and self._indexed_img.format()
+                == QImage.Format.Format_Indexed8):
+            return True
+        if (self._source_img is not None
+                and self._source_img.format()
+                == QImage.Format.Format_Indexed8):
+            return True
+        return False
+
+    def _try_auto_index_rgb(
+        self, colors: list[tuple[int, int, int]], max_colors: int,
+    ) -> bool:
+        """Build an indexed working image from an RGB source that has no
+        more unique colours than the target palette can hold.
+
+        Unique colours are assigned to slots in first-appearance order
+        (top-to-bottom, left-to-right raster scan), then the loaded
+        palette is set as the colour table.  Returns True on success;
+        False means "too many unique colours, caller should fall back to
+        closest-colour remap" and leaves state untouched.
+        """
+        from core.gba_image_utils import (
+            _qimage_to_rgb_array, _indexed_array_to_qimage,
+        )
+        try:
+            rgb, _alpha = _qimage_to_rgb_array(self._source_img)
+        except Exception:
+            return False
+        h, w, _ = rgb.shape
+        # Pack RGB to a single uint32 so numpy.unique can work 1D.
+        packed = (
+            (rgb[:, :, 0].astype(np.uint32) << 16)
+            | (rgb[:, :, 1].astype(np.uint32) << 8)
+            | rgb[:, :, 2].astype(np.uint32)
+        ).reshape(-1)
+        uniq, first_idx = np.unique(packed, return_index=True)
+        if len(uniq) > max_colors:
+            return False
+        # Sort by first-appearance so slot order matches raster scan of
+        # the original image — deterministic and intuitive.
+        order = np.argsort(first_idx)
+        sorted_uniq = uniq[order]
+        # Assign each unique packed colour to a slot.
+        indices = np.zeros_like(packed, dtype=np.uint8)
+        for slot, packed_val in enumerate(sorted_uniq):
+            indices[packed == int(packed_val)] = slot
+        indices = indices.reshape(h, w)
+        new_img = _indexed_array_to_qimage(indices, colors, transparent_index=0)
+        self._indexed_img = new_img
+        self._palette = colors
+        return True
 
     # ── Trim unused / duplicate colours ──────────────────────────────────
 

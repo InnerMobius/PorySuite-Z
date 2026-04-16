@@ -10,13 +10,20 @@ Public API mirrors the simpler PaletteSwatchRow in ui/graphics_tab_widget.py:
   - colors() -> list[(r,g,b)]
   - signal: colors_changed              (compatible with PaletteSwatchRow)
 
-Plus the new reorder behaviour:
+Plus the new reorder + context-menu behaviours:
   - signal: palette_reordered(int from_idx, int to_idx)
+  - signal: swatch_set_as_bg(int slot)   # from right-click menu
 
 Drop a swatch onto index 0 to mark it as the "BG" / transparent slot.
-The widget itself does NOT remap any image pixels — callers wire the
-palette_reordered signal to reorder_palette() / move_color_to_index()
-from core.gba_image_utils for the indexed PNGs they own.
+Or right-click any non-zero swatch and pick "Index as Background" to
+request the same thing via menu.
+
+The widget itself does NOT remap any image pixels.  Callers wire:
+  - palette_reordered   → palette-only swap (no pixel remap)
+  - swatch_set_as_bg    → pixel + palette swap via
+                          core.gba_image_utils.swap_palette_entries,
+                          because a BG promotion has to remap which
+                          pixel values are transparent on disk.
 """
 from __future__ import annotations
 
@@ -25,7 +32,7 @@ from PyQt6.QtGui import (
     QColor, QDrag, QFont, QMouseEvent, QPainter, QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QColorDialog, QHBoxLayout, QLabel, QWidget,
+    QColorDialog, QHBoxLayout, QLabel, QMenu, QWidget,
 )
 
 from ui.palette_utils import clamp_to_gba
@@ -35,10 +42,12 @@ SWATCH_SZ = 22
 
 
 class DragSwatch(QLabel):
-    """Palette swatch: click to edit colour, drag to reorder."""
+    """Palette swatch: click to edit colour, drag to reorder, right-click
+    to promote to the transparent slot ("Index as Background")."""
 
     color_changed = pyqtSignal(int, tuple)   # (index, (r,g,b))
     drop_received = pyqtSignal(int, int)     # (from_index, to_index)
+    set_as_bg_requested = pyqtSignal(int)    # (index) — right-click menu
 
     def __init__(self, index: int, parent=None):
         super().__init__(parent)
@@ -82,9 +91,15 @@ class DragSwatch(QLabel):
 
     def _refresh_tooltip(self):
         r, g, b = self._color
+        if self._index == 0:
+            extra = "Click to edit  •  Drag to reorder"
+        else:
+            extra = (
+                "Click to edit  •  Drag to reorder\n"
+                "Right-click: Index as Background"
+            )
         self.setToolTip(
-            f"Index {self._index}: ({r}, {g}, {b})\n"
-            f"Click to edit  •  Drag to reorder"
+            f"Index {self._index}: ({r}, {g}, {b})\n{extra}"
         )
 
     def paintEvent(self, event):
@@ -147,6 +162,19 @@ class DragSwatch(QLabel):
                     self._refresh_tooltip()
                     self.color_changed.emit(self._index, new)
 
+    # right-click menu — "Index as Background"
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        act = menu.addAction("Index as Background")
+        if self._index == 0:
+            # Already the transparent slot by convention — no-op disabled.
+            act.setEnabled(False)
+            act.setText("Index as Background  (already BG)")
+        act.triggered.connect(
+            lambda: self.set_as_bg_requested.emit(self._index)
+        )
+        menu.exec(event.globalPos())
+
     # drop target
     def dragEnterEvent(self, event):
         if event.mimeData().hasText():
@@ -170,6 +198,7 @@ class DraggablePaletteRow(QWidget):
     """
     colors_changed = pyqtSignal()              # any swatch colour edited
     palette_reordered = pyqtSignal(int, int)   # (from, to)
+    swatch_set_as_bg = pyqtSignal(int)         # (slot) — right-click menu
 
     def __init__(self, n: int = 16, parent=None):
         super().__init__(parent)
@@ -181,6 +210,7 @@ class DraggablePaletteRow(QWidget):
             s = DragSwatch(i)
             s.color_changed.connect(self._on_color_changed)
             s.drop_received.connect(self._on_drop)
+            s.set_as_bg_requested.connect(self._on_set_as_bg)
             self._swatches.append(s)
             self._layout.addWidget(s)
         self._layout.addStretch(1)
@@ -201,3 +231,6 @@ class DraggablePaletteRow(QWidget):
 
     def _on_drop(self, src: int, dst: int):
         self.palette_reordered.emit(src, dst)
+
+    def _on_set_as_bg(self, slot: int):
+        self.swatch_set_as_bg.emit(slot)
