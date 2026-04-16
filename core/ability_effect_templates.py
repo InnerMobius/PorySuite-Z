@@ -2416,21 +2416,27 @@ def generate_field_code(template_id: str, ability_const: str,
 
     elif template_id == "egg_hatch_speed":
         # Adds a check in daycare.c TryProduceOrHatchEgg or ShouldEggHatch
-        # to halve egg steps when this ability is in the party
+        # to halve egg steps when this ability is in the party.
+        #
+        # NOTE: this block is inserted right after the opening brace of
+        # TryProduceOrHatchEgg, BEFORE the function's own `u32 i` is
+        # declared. Don't reference the outer function's `i` here —
+        # use locally-scoped variables (`p`, `q`) so the block compiles
+        # no matter where it gets inserted.
         code = (
             f"    // {ability_const}: halve egg hatch steps\n"
             f"    {{\n"
-            f"        u32 p;\n"
+            f"        u32 p, q;\n"
             f"        for (p = 0; p < PARTY_SIZE; p++)\n"
             f"        {{\n"
             f"            if (GetMonAbility(&gPlayerParty[p]) == "
             f"{ability_const})\n"
             f"            {{\n"
-            f"                for (i = 0; i < DAYCARE_MON_COUNT; i++)\n"
+            f"                for (q = 0; q < DAYCARE_MON_COUNT; q++)\n"
             f"                {{\n"
-            f"                    if (GetBoxMonData(&daycare->mons[i].mon,"
+            f"                    if (GetBoxMonData(&daycare->mons[q].mon,"
             f" MON_DATA_SANITY_HAS_SPECIES))\n"
-            f"                        daycare->mons[i].steps++;\n"
+            f"                        daycare->mons[q].steps++;\n"
             f"                }}\n"
             f"                break;\n"
             f"            }}\n"
@@ -2667,7 +2673,11 @@ def apply_field_effect(project_root: str, template_id: str,
         with open(filepath, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        # Remove existing code for this ability in this file
+        # Remove existing code for this ability in this file.
+        # Marker-block remover handles the `// ABILITY_*: description`
+        # + `{ ... }` pattern that field templates emit; the case/inline
+        # remover is a fallback for any legacy shape that may still exist.
+        _remove_marker_block(lines, ability_const)
         _remove_ability_from_lines(lines, ability_const)
 
         # Find insertion point based on which file and template
@@ -2793,12 +2803,68 @@ def remove_field_effect(project_root: str, ability_const: str) -> int:
         with open(filepath, "r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        count = _remove_ability_from_lines(lines, ability_const)
+        # Marker-block remover first (handles the `// ABILITY_*:` + braced
+        # block pattern used by field templates), then the generic remover
+        # as a fallback for any case/inline-style references.
+        count = _remove_marker_block(lines, ability_const)
+        count += _remove_ability_from_lines(lines, ability_const)
         if count > 0:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.writelines(lines)
             removed += count
 
+    return removed
+
+
+def _remove_marker_block(lines: list[str], ability_const: str) -> int:
+    """Remove a field-effect marker block for an ability (in-place).
+
+    Field-effect templates emit a marker comment line of the form
+    `// ABILITY_CONST: <description>` immediately above a single
+    braced statement (either a bare `{ ... }` block or an `if (...)`
+    / `for (...)` whose body is braced). This helper finds the
+    marker, then removes from the marker line through the matching
+    closing `}` that terminates the following block.
+
+    Returns the number of marker blocks removed.
+    """
+    import re as _re
+    marker_pat = _re.compile(
+        r'^\s*//\s*' + _re.escape(ability_const) + r'\s*:'
+    )
+    removed = 0
+    i = 0
+    while i < len(lines):
+        if marker_pat.match(lines[i]):
+            # Find the first `{` on this or subsequent non-empty lines.
+            # Must be on the same line or within the next few lines so we
+            # don't accidentally swallow unrelated code after a lone comment.
+            brace_line = None
+            for j in range(i, min(i + 5, len(lines))):
+                if '{' in lines[j]:
+                    brace_line = j
+                    break
+            if brace_line is None:
+                # Lone marker comment with no following block: remove
+                # just the comment line so it doesn't confuse detectors.
+                del lines[i]
+                removed += 1
+                continue
+
+            # Walk braces starting at brace_line. Some blocks have the
+            # opening `{` on a dedicated line; others have it inline
+            # with `if (...)`. Either way we start counting at brace_line.
+            depth = 0
+            end = brace_line
+            for j in range(brace_line, len(lines)):
+                depth += lines[j].count('{') - lines[j].count('}')
+                if depth <= 0 and j >= brace_line:
+                    end = j
+                    break
+            del lines[i:end + 1]
+            removed += 1
+            continue
+        i += 1
     return removed
 
 
