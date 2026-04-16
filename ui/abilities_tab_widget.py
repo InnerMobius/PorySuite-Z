@@ -36,6 +36,61 @@ ABILITY_DESC_LENGTH = 51   # 52-byte buffer on summary screen minus null termina
 DIRTY_FLAG_ROLE = Qt.ItemDataRole.UserRole + 500
 
 
+def _compose_template_notes(tmpl, params: dict) -> str:
+    """Build the notes text for a template, merging static `notes` with any
+    dynamic param-aware warnings.
+
+    Shared by `AddAbilityDialog` and `AbilityDetailPanel` so the guidance
+    the user sees is identical whether they're creating a new ability or
+    editing an existing one.  Returns an empty string if there is nothing
+    worth saying.
+    """
+    parts: list[str] = []
+    base = getattr(tmpl, "notes", "") or ""
+    if base:
+        parts.append(base)
+
+    # weather_switchin with Hail — confirm the tool will synthesize the
+    # missing BattleScript on Save.  ``weather`` may be either the info
+    # dict (fresh pick from the combo) or the display-name string (round-
+    # tripped from disk), so handle both forms — otherwise a loaded Hail
+    # ability silently loses its "✓ tool will write BattleScript" hint.
+    if getattr(tmpl, "id", "") == "weather_switchin":
+        from core.ability_effect_templates import WEATHER_CHOICES
+        weather = params.get("weather")
+        if isinstance(weather, dict):
+            script = weather.get("script", "")
+        elif isinstance(weather, str):
+            script = ""
+            for display, info in WEATHER_CHOICES:
+                if display == weather:
+                    script = info.get("script", "")
+                    break
+        else:
+            script = ""
+        if script == "BattleScript_SnowWarningActivates":
+            parts.append(
+                "✓ You picked Hail — on Save, the tool will append "
+                "BattleScript_SnowWarningActivates to "
+                "data/battle_scripts_1.s AND add the matching extern "
+                "declaration to include/battle_scripts.h (idempotent — "
+                "safe to Save multiple times).  Nothing else to do."
+            )
+
+    # stat_double with STAT_SPEED — the injection site doesn't own speed.
+    if getattr(tmpl, "id", "") == "stat_double":
+        if params.get("stat") == "STAT_SPEED":
+            parts.append(
+                "⚠ STAT_SPEED was picked.  The emitted C is injected "
+                "into CalculateBaseDamage which doesn't own the speed "
+                "stat — the auto-generated code is effectively a no-op "
+                "for speed.  You MUST hand-edit GetWhoStrikesFirst in "
+                "src/battle_main.c to double this Pokemon's speed for "
+                "the ability to do anything in game."
+            )
+    return "\n\n".join(parts)
+
+
 def _name_to_constant_suffix(display_name: str) -> str:
     """Derive an ALL_CAPS_UNDERSCORE constant suffix from a display name.
 
@@ -327,28 +382,6 @@ def copy_field_effects(project_root: str, source_const: str, new_const: str) -> 
     return copied, remaining_inline
 
 
-def get_abilities_with_battle_effects(project_root: str, abilities_data: dict) -> list[tuple[str, str]]:
-    """Return list of (ABILITY_CONST, description) for abilities that have battle code."""
-    result = []
-    for const in abilities_data:
-        effects = scan_ability_battle_effects(project_root, const)
-        if effects["case_blocks"] or effects["inline_refs"]:
-            desc = _BATTLE_CATEGORIES.get(const, "Has battle code")
-            result.append((const, desc))
-    return result
-
-
-def get_abilities_with_field_effects(project_root: str, abilities_data: dict) -> list[tuple[str, str]]:
-    """Return list of (ABILITY_CONST, description) for abilities that have field code."""
-    result = []
-    for const in abilities_data:
-        effects = scan_ability_field_effects(project_root, const)
-        if effects["case_blocks"] or effects["inline_refs"]:
-            desc = _FIELD_EFFECTS.get(const, "Has field code")
-            result.append((const, desc))
-    return result
-
-
 # ── Stylesheet fragments (matching moves/items editor style) ────────────────
 
 _LIST_SS = """
@@ -448,13 +481,6 @@ def _val_lbl(text: str = "") -> QLabel:
     lbl.setStyleSheet("color: #cccccc; font-size: 12px;")
     lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     return lbl
-
-
-def _separator() -> QFrame:
-    line = QFrame()
-    line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet("color: #2a2a2a;")
-    return line
 
 
 # ── Battle effect category parser ────────────────────────────────────────────
@@ -713,6 +739,21 @@ class AbilityDetailPanel(QWidget):
         self.lbl_battle_preview.setVisible(False)
         battle_v.addWidget(self.lbl_battle_preview)
 
+        # Implementation notes / prerequisites for the picked template.
+        # Mirrors the amber info box shown in the Add Ability dialog so the
+        # guidance stays consistent whether the user is creating a new
+        # ability or editing an existing one.
+        self.lbl_battle_notes = QLabel("")
+        self.lbl_battle_notes.setWordWrap(True)
+        self.lbl_battle_notes.setStyleSheet(
+            "color: #e8a838; font-size: 10px;"
+            " padding: 6px 8px; background-color: #1f1810;"
+            " border: 1px solid #3a2f18; border-radius: 3px;"
+            " margin-top: 4px;"
+        )
+        self.lbl_battle_notes.setVisible(False)
+        battle_v.addWidget(self.lbl_battle_notes)
+
         v.addWidget(grp_battle)
 
         # ── Field Effect Editor ────────────────────────────────────────────
@@ -766,6 +807,19 @@ class AbilityDetailPanel(QWidget):
         )
         self.lbl_field_preview.setVisible(False)
         field_v.addWidget(self.lbl_field_preview)
+
+        # Implementation notes / prerequisites for the picked template
+        # (mirrors the Add Ability dialog for consistency).
+        self.lbl_field_notes = QLabel("")
+        self.lbl_field_notes.setWordWrap(True)
+        self.lbl_field_notes.setStyleSheet(
+            "color: #e8a838; font-size: 10px;"
+            " padding: 6px 8px; background-color: #1f1810;"
+            " border: 1px solid #3a2f18; border-radius: 3px;"
+            " margin-top: 4px;"
+        )
+        self.lbl_field_notes.setVisible(False)
+        field_v.addWidget(self.lbl_field_notes)
 
         hint = QLabel(
             "Effect changes are written to C source files on save. "
@@ -888,8 +942,10 @@ class AbilityDetailPanel(QWidget):
                                  self._field_param_combos)
         self.lbl_battle_known.setVisible(False)
         self.lbl_battle_preview.setVisible(False)
+        self.lbl_battle_notes.setVisible(False)
         self.lbl_field_known.setVisible(False)
         self.lbl_field_preview.setVisible(False)
+        self.lbl_field_notes.setVisible(False)
         self.lbl_usage_count.setText("—")
         self.tbl_species.setRowCount(0)
         self._current_const = ""
@@ -1139,10 +1195,14 @@ class AbilityDetailPanel(QWidget):
 
     def _update_battle_preview(self):
         """Update the code preview label for battle effects."""
-        from core.ability_effect_templates import generate_battle_code
+        from core.ability_effect_templates import (
+            generate_battle_code, BATTLE_TEMPLATE_MAP,
+        )
         tid = self.cmb_battle_template.currentData()
         if not tid:
             self.lbl_battle_preview.setVisible(False)
+            self.lbl_battle_notes.clear()
+            self.lbl_battle_notes.setVisible(False)
             return
         const = getattr(self, "_current_const", "") or "ABILITY_NEW"
         params = self._collect_battle_params()
@@ -1157,12 +1217,25 @@ class AbilityDetailPanel(QWidget):
             self.lbl_battle_preview.setVisible(True)
         else:
             self.lbl_battle_preview.setVisible(False)
+        # Notes — same guidance as the Add Ability dialog.
+        tmpl = BATTLE_TEMPLATE_MAP.get(tid)
+        note_text = _compose_template_notes(tmpl, params) if tmpl else ""
+        if note_text:
+            self.lbl_battle_notes.setText(note_text)
+            self.lbl_battle_notes.setVisible(True)
+        else:
+            self.lbl_battle_notes.clear()
+            self.lbl_battle_notes.setVisible(False)
 
     def _update_field_preview(self):
-        from core.ability_effect_templates import generate_field_code
+        from core.ability_effect_templates import (
+            generate_field_code, FIELD_TEMPLATE_MAP,
+        )
         tid = self.cmb_field_template.currentData()
         if not tid:
             self.lbl_field_preview.setVisible(False)
+            self.lbl_field_notes.clear()
+            self.lbl_field_notes.setVisible(False)
             return
         const = getattr(self, "_current_const", "") or "ABILITY_NEW"
         params = self._collect_field_params()
@@ -1172,6 +1245,14 @@ class AbilityDetailPanel(QWidget):
             self.lbl_field_preview.setVisible(True)
         else:
             self.lbl_field_preview.setVisible(False)
+        tmpl = FIELD_TEMPLATE_MAP.get(tid)
+        note_text = _compose_template_notes(tmpl, params) if tmpl else ""
+        if note_text:
+            self.lbl_field_notes.setText(note_text)
+            self.lbl_field_notes.setVisible(True)
+        else:
+            self.lbl_field_notes.clear()
+            self.lbl_field_notes.setVisible(False)
 
     def get_battle_effect(self) -> tuple[str, dict]:
         """Return (template_id, params) for the current battle effect."""
@@ -1218,14 +1299,37 @@ class AddAbilityDialog(QDialog):
                  parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add New Ability")
-        self.setMinimumWidth(540)
+        # Two-column body needs more horizontal room; cap vertical to the
+        # user's screen so the OK/Cancel row can never slide off-screen on
+        # a small monitor.  Content scrolls inside a QScrollArea below.
+        self.setMinimumWidth(880)
+        try:
+            screen_h = self.screen().availableGeometry().height()
+            self.setMaximumHeight(max(600, int(screen_h * 0.92)))
+        except Exception:
+            pass
         self._existing = existing_constants
         self._project_root = project_root
         self._battle_param_combos: dict[str, QComboBox] = {}
         self._field_param_combos: dict[str, QComboBox] = {}
         self._loading = True   # suppresses preview churn during __init__
 
+        # Top-level dialog layout: scrollable body on top, button row pinned
+        # at the bottom so OK/Cancel are always reachable no matter how tall
+        # the content grows (long notes, large previews, etc.).
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # Scrollable content host — everything except the button box lives
+        # inside here.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(8)
 
         form = QFormLayout()
         form.setSpacing(8)
@@ -1260,6 +1364,12 @@ class AddAbilityDialog(QDialog):
             max_lines=1,
         )
         self.edit_desc.setFixedHeight(36)
+        # QPlainTextEdit defaults to Expanding vertical policy, which makes
+        # the form row soak up any extra dialog height when the template
+        # preview below shrinks.  Pin it to Fixed so the row height stays
+        # constant regardless of what happens elsewhere in the dialog.
+        self.edit_desc.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.edit_desc.setFont(QFont("Courier New", 10))
         self.edit_desc.setPlaceholderText("Short description for summary screen")
         self.lbl_desc_counter = QLabel("0/%d" % ABILITY_DESC_LENGTH)
@@ -1275,9 +1385,16 @@ class AddAbilityDialog(QDialog):
         self.lbl_id = QLabel(str(next_id))
         form.addRow("ID (auto):", self.lbl_id)
 
-        layout.addLayout(form)
+        content_layout.addLayout(form)
 
-        # ── Battle Effect group (template OR copy-from) ──────────────────────
+        # ── Battle + Field side-by-side columns ──────────────────────────────
+        # The two groupboxes used to stack vertically, which made the dialog
+        # taller than many screens once templates with long notes were
+        # picked.  Side-by-side halves the height and keeps the OK/Cancel
+        # button box reachable without scrolling on typical monitors.
+        columns = QHBoxLayout()
+        columns.setSpacing(10)
+
         from core.ability_effect_templates import (
             BATTLE_TEMPLATES, FIELD_TEMPLATES,
         )
@@ -1303,6 +1420,8 @@ class AddAbilityDialog(QDialog):
         b_v.addLayout(b_tmpl_row)
 
         self._battle_params_widget = QWidget()
+        self._battle_params_widget.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._battle_params_layout = QFormLayout(self._battle_params_widget)
         self._battle_params_layout.setContentsMargins(12, 0, 0, 0)
         self._battle_params_layout.setSpacing(3)
@@ -1312,6 +1431,8 @@ class AddAbilityDialog(QDialog):
 
         self.lbl_battle_tmpl_preview = QLabel("")
         self.lbl_battle_tmpl_preview.setWordWrap(True)
+        self.lbl_battle_tmpl_preview.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.lbl_battle_tmpl_preview.setStyleSheet(
             "color: #888888; font-size: 9px; font-family: 'Courier New';"
             " padding: 2px 4px; background-color: #161616;"
@@ -1319,6 +1440,21 @@ class AddAbilityDialog(QDialog):
         )
         self.lbl_battle_tmpl_preview.setVisible(False)
         b_v.addWidget(self.lbl_battle_tmpl_preview)
+
+        # Implementation notes / prerequisites for the picked template.
+        # Populated from EffectTemplate.notes + any param-specific warnings.
+        self.lbl_battle_tmpl_notes = QLabel("")
+        self.lbl_battle_tmpl_notes.setWordWrap(True)
+        self.lbl_battle_tmpl_notes.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.lbl_battle_tmpl_notes.setStyleSheet(
+            "color: #e8a838; font-size: 10px;"
+            " padding: 6px 8px; background-color: #1f1810;"
+            " border: 1px solid #3a2f18; border-radius: 3px;"
+            " margin-top: 4px;"
+        )
+        self.lbl_battle_tmpl_notes.setVisible(False)
+        b_v.addWidget(self.lbl_battle_tmpl_notes)
 
         b_or = QLabel("— or —")
         b_or.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1361,8 +1497,9 @@ class AddAbilityDialog(QDialog):
             "color: #888888; font-size: 10px; padding: 0 0 4px 0;"
         )
         b_v.addWidget(self.lbl_battle_preview)
+        b_v.addStretch(1)
 
-        layout.addWidget(grp_battle)
+        columns.addWidget(grp_battle, 1)
 
         # ── Field Effect group (template OR copy-from) ───────────────────────
         grp_field = QGroupBox("Field Effect (optional)")
@@ -1386,6 +1523,8 @@ class AddAbilityDialog(QDialog):
         f_v.addLayout(f_tmpl_row)
 
         self._field_params_widget = QWidget()
+        self._field_params_widget.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self._field_params_layout = QFormLayout(self._field_params_widget)
         self._field_params_layout.setContentsMargins(12, 0, 0, 0)
         self._field_params_layout.setSpacing(3)
@@ -1395,6 +1534,8 @@ class AddAbilityDialog(QDialog):
 
         self.lbl_field_tmpl_preview = QLabel("")
         self.lbl_field_tmpl_preview.setWordWrap(True)
+        self.lbl_field_tmpl_preview.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.lbl_field_tmpl_preview.setStyleSheet(
             "color: #888888; font-size: 9px; font-family: 'Courier New';"
             " padding: 2px 4px; background-color: #161616;"
@@ -1402,6 +1543,19 @@ class AddAbilityDialog(QDialog):
         )
         self.lbl_field_tmpl_preview.setVisible(False)
         f_v.addWidget(self.lbl_field_tmpl_preview)
+
+        self.lbl_field_tmpl_notes = QLabel("")
+        self.lbl_field_tmpl_notes.setWordWrap(True)
+        self.lbl_field_tmpl_notes.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.lbl_field_tmpl_notes.setStyleSheet(
+            "color: #e8a838; font-size: 10px;"
+            " padding: 6px 8px; background-color: #1f1810;"
+            " border: 1px solid #3a2f18; border-radius: 3px;"
+            " margin-top: 4px;"
+        )
+        self.lbl_field_tmpl_notes.setVisible(False)
+        f_v.addWidget(self.lbl_field_tmpl_notes)
 
         f_or = QLabel("— or —")
         f_or.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1438,17 +1592,25 @@ class AddAbilityDialog(QDialog):
             "color: #888888; font-size: 10px; padding: 0 0 4px 0;"
         )
         f_v.addWidget(self.lbl_field_preview)
+        f_v.addStretch(1)
 
-        layout.addWidget(grp_field)
+        columns.addWidget(grp_field, 1)
+        content_layout.addLayout(columns)
 
         self.lbl_hint = QLabel(
-            "Template effects write C on Save (not now).  Copy-from writes\n"
-            "C immediately on OK.  Leave everything (none) for a bare\n"
+            "Template effects write C on Save (not now).  Copy-from writes "
+            "C immediately on OK.  Leave everything (none) for a bare "
             "ability you'll customize later from the right-hand editor."
         )
         self.lbl_hint.setWordWrap(True)
         self.lbl_hint.setStyleSheet("color: #e8a838; font-size: 10px; padding: 6px 0;")
-        layout.addWidget(self.lbl_hint)
+        content_layout.addWidget(self.lbl_hint)
+
+        # Mount the content into the scroll area and the scroll area into
+        # the dialog.  Button box goes OUTSIDE the scroll area so Ok/Cancel
+        # are always visible regardless of content height.
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
 
         # Finish loading — now live previews can run.
         self._loading = False
@@ -1611,10 +1773,15 @@ class AddAbilityDialog(QDialog):
                 for pid, cmb in self._field_param_combos.items()}
 
     def _update_battle_tmpl_preview(self):
-        from core.ability_effect_templates import generate_battle_code
+        from core.ability_effect_templates import (
+            generate_battle_code, BATTLE_TEMPLATE_MAP,
+        )
         tid = self.cmb_battle_template.currentData()
         if not tid:
+            self.lbl_battle_tmpl_preview.clear()
             self.lbl_battle_tmpl_preview.setVisible(False)
+            self.lbl_battle_tmpl_notes.clear()
+            self.lbl_battle_tmpl_notes.setVisible(False)
             return
         const = self.get_constant() or "ABILITY_NEW"
         params = self._collect_battle_tmpl_params()
@@ -1627,13 +1794,28 @@ class AddAbilityDialog(QDialog):
             self.lbl_battle_tmpl_preview.setText(preview)
             self.lbl_battle_tmpl_preview.setVisible(True)
         else:
+            self.lbl_battle_tmpl_preview.clear()
             self.lbl_battle_tmpl_preview.setVisible(False)
+        # Notes (implementation guidance for this template / params).
+        tmpl = BATTLE_TEMPLATE_MAP.get(tid)
+        note_text = self._compose_template_notes(tmpl, params) if tmpl else ""
+        if note_text:
+            self.lbl_battle_tmpl_notes.setText(note_text)
+            self.lbl_battle_tmpl_notes.setVisible(True)
+        else:
+            self.lbl_battle_tmpl_notes.clear()
+            self.lbl_battle_tmpl_notes.setVisible(False)
 
     def _update_field_tmpl_preview(self):
-        from core.ability_effect_templates import generate_field_code
+        from core.ability_effect_templates import (
+            generate_field_code, FIELD_TEMPLATE_MAP,
+        )
         tid = self.cmb_field_template.currentData()
         if not tid:
+            self.lbl_field_tmpl_preview.clear()
             self.lbl_field_tmpl_preview.setVisible(False)
+            self.lbl_field_tmpl_notes.clear()
+            self.lbl_field_tmpl_notes.setVisible(False)
             return
         const = self.get_constant() or "ABILITY_NEW"
         params = self._collect_field_tmpl_params()
@@ -1646,7 +1828,34 @@ class AddAbilityDialog(QDialog):
             self.lbl_field_tmpl_preview.setText(preview)
             self.lbl_field_tmpl_preview.setVisible(True)
         else:
+            self.lbl_field_tmpl_preview.clear()
             self.lbl_field_tmpl_preview.setVisible(False)
+        tmpl = FIELD_TEMPLATE_MAP.get(tid)
+        note_text = self._compose_template_notes(tmpl, params) if tmpl else ""
+        if note_text:
+            self.lbl_field_tmpl_notes.setText(note_text)
+            self.lbl_field_tmpl_notes.setVisible(True)
+        else:
+            self.lbl_field_tmpl_notes.clear()
+            self.lbl_field_tmpl_notes.setVisible(False)
+
+    def _compose_template_notes(self, tmpl, params: dict) -> str:
+        """Thin wrapper around the module-level helper so the Add dialog and
+        the right-hand editor show identical guidance."""
+        return _compose_template_notes(tmpl, params)
+
+    def _resize_to_content(self):
+        """No-op now that the dialog body lives inside a QScrollArea.
+
+        Previously this method would clamp the dialog height to the layout
+        sizeHint so the description row didn't stretch when the preview
+        label shrank.  With the scroll-area + two-column refactor the
+        dialog height is already bounded (screen-height cap set in
+        __init__) and the scroll area absorbs any extra content, so no
+        manual resizing is needed.  Kept as a hook in case future template
+        changes need to trigger a geometry update.
+        """
+        return
 
     def _on_battle_template_changed(self, _idx: int):
         tid = self.cmb_battle_template.currentData() or ""
@@ -1655,12 +1864,14 @@ class AddAbilityDialog(QDialog):
         # Mutual exclusion: if a template is picked, grey out the copy-from
         # combo so the user can't accidentally double-up.
         self._sync_battle_mutual_exclusion()
+        self._resize_to_content()
 
     def _on_field_template_changed(self, _idx: int):
         tid = self.cmb_field_template.currentData() or ""
         self._rebuild_field_tmpl_params(tid)
         self._update_field_tmpl_preview()
         self._sync_field_mutual_exclusion()
+        self._resize_to_content()
 
     def _on_battle_copy_changed(self, _idx: int):
         self._sync_battle_mutual_exclusion()
@@ -2086,17 +2297,20 @@ class AbilitiesTabWidget(QWidget):
         # every fresh item whose const is in the set.
         self._dirty_consts.add(const)
 
-        # Copy-from path (writes to disk immediately — pre-existing
-        # behavior).  For each side, template takes precedence over
-        # copy-from (mutual exclusion is enforced visually by the dialog
-        # greying out the other combo when one is picked, but we also
-        # enforce it here as a safety-net so a template+copy combo never
-        # ends up with double-applied code on the new ability).
+        # Copy-from path.  Previously this wrote C files to disk the moment
+        # the user clicked OK on the Add dialog — inconsistent with every
+        # other editor in the tool, which defers to the toolbar Save button.
+        # Now we just stash the source constant on the ability dict and let
+        # the Save pipeline (`apply_effect_changes`) run the real copy.
+        # Template takes precedence over copy-from; the dialog's mutual
+        # exclusion greys out the other combo but we re-enforce it here as
+        # a safety net so a template+copy combo never double-applies.
         effective_battle_src = "" if btid else battle_src
         effective_field_src = "" if ftid else field_src
-        if effective_battle_src or effective_field_src:
-            self._apply_effect_copy(
-                const, effective_battle_src, effective_field_src)
+        if effective_battle_src:
+            self._abilities_data[const]["_battle_copy_from"] = effective_battle_src
+        if effective_field_src:
+            self._abilities_data[const]["_field_copy_from"] = effective_field_src
 
         self._dirty = True
         self.data_changed.emit()

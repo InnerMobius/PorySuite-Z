@@ -117,12 +117,28 @@ WEATHER_CHOICES: list[tuple[str, dict]] = [
         "set": "(B_WEATHER_SUN_PERMANENT | B_WEATHER_SUN_TEMPORARY)",
         "script": "BattleScript_DroughtActivates",
     }),
+    # Hail (pokefirered calls snow "hail" internally — B_WEATHER_HAIL is
+    # defined in include/constants/battle.h and the weather animation ships.
+    # What is NOT in vanilla is the battle script that sets it on switch-in
+    # (there's no "Snow Warning" ability).  The emitted C still compiles —
+    # it just references a script symbol the user needs to add themselves.
+    # The implementation note on the template explains the prerequisite.
+    ("Hail", {
+        "check": "B_WEATHER_HAIL_TEMPORARY",
+        "set": "B_WEATHER_HAIL",
+        "script": "BattleScript_SnowWarningActivates",
+    }),
 ]
 
 WEATHER_SPEED_CHOICES: list[tuple[str, str]] = [
     ("Rain", "B_WEATHER_RAIN"),
     ("Sandstorm", "B_WEATHER_SANDSTORM"),
     ("Sun", "B_WEATHER_SUN"),
+    # Hail/snow — pokefirered has B_WEATHER_HAIL wired up and the check
+    # path (WEATHER_HAS_EFFECT && gBattleWeather & B_WEATHER_HAIL) works
+    # with no extra prerequisites.  Safe to use for recovery / evasion /
+    # speed templates that only READ weather.
+    ("Hail / Snow", "B_WEATHER_HAIL"),
 ]
 
 CONTACT_STATUS_CHOICES: list[tuple[str, str]] = [
@@ -140,9 +156,13 @@ FRACTION_CHOICES: list[tuple[str, int]] = [
 ]
 
 CHANCE_CHOICES: list[tuple[str, int]] = [
+    # Each entry is (label, N) where the codegen emits `(Random() % N) == 0`,
+    # i.e. a 1/N probability.  Do NOT add a "30%" entry that reuses N=3 — the
+    # actual math for N=3 is 1/3 ≈ 33.33%, and a mislabeled "30%" would tell
+    # the user the wrong probability.  If you need a true 30%, implement a
+    # range-check codegen (`(Random() % 10) < 3`) and add a new choice set.
     ("10%", 10),
     ("20%", 5),
-    ("30%", 3),  # (Random() % 3) == 0
     ("33%", 3),
     ("50%", 2),
 ]
@@ -216,15 +236,23 @@ class EffectParam:
 
 
 class EffectTemplate:
-    """Base for battle/field effect templates."""
-    __slots__ = ("id", "name", "description", "params")
+    """Base for battle/field effect templates.
+
+    `notes` is an optional paragraph of implementation detail / prerequisites
+    shown in the Add Ability dialog below the C preview.  Use it for any
+    template that needs extra work to actually function (form-change tables,
+    BattleScript additions, struct fields that don't exist in vanilla
+    pokefirered, etc.).  Leave empty for drop-in templates that just work.
+    """
+    __slots__ = ("id", "name", "description", "params", "notes")
 
     def __init__(self, tid: str, name: str, description: str,
-                 params: list[EffectParam]):
+                 params: list[EffectParam], notes: str = ""):
         self.id = tid
         self.name = name
         self.description = description
         self.params = params
+        self.notes = notes
 
 
 # ── Battle effect templates ─────────────────────────────────────────────────
@@ -262,6 +290,18 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Set Weather on Switch-In",
         "Changes weather when entering battle (like Drizzle, Drought, Sand Stream)",
         [EffectParam("weather", "Weather", WEATHER_CHOICES)],
+        notes=(
+            "Drop-in for Rain, Sun, and Sandstorm — those scripts already "
+            "exist in vanilla pokefirered.\n\n"
+            "Hail has no 'Snow Warning' script in vanilla, but the tool "
+            "synthesizes one for you on Save: it appends "
+            "BattleScript_SnowWarningActivates to data/battle_scripts_1.s "
+            "(modelled on SandstreamActivates, using the existing "
+            "STRINGID_STARTEDHAIL announcement and B_ANIM_HAIL_CONTINUES "
+            "animation) AND adds the matching extern declaration to "
+            "include/battle_scripts.h so battle_util.c can link against "
+            "it.  No manual editing required."
+        ),
     ),
     EffectTemplate(
         "stat_boost_eot",
@@ -331,6 +371,17 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Double a Stat",
         "Permanently doubles a stat in battle (like Huge Power doubles Attack)",
         [EffectParam("stat", "Stat to double", STAT_CHOICES)],
+        notes=(
+            "Attack, Defense, Sp. Attack and Sp. Defense are patched into "
+            "CalculateBaseDamage in pokemon.c — those just work.\n\n"
+            "Speed is the odd one out: the damage function doesn't own the "
+            "speed stat.  Picking STAT_SPEED injects a comment pointing you "
+            "at GetWhoStrikesFirst in src/battle_main.c, which is where the "
+            "turn order is decided.  You'll need to hand-edit that function "
+            "(double gBattleMons[battlerId].speed for your ability) — the "
+            "auto-generated code alone will NOT give you a speed-doubling "
+            "ability."
+        ),
     ),
     EffectTemplate(
         "type_resist_halve",
@@ -391,6 +442,15 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Only Super-Effective Hits",
         "Only super-effective moves deal damage (like Wonder Guard)",
         [],
+        notes=(
+            "Extremely powerful — Wonder Guard was only ever given to "
+            "Shedinja, which has 1 HP to offset it.  If you put this on a "
+            "bulky species you'll create a Pokemon that's immune to most "
+            "of your game.  Status damage (poison, burn, sandstorm, hail) "
+            "still ignores Wonder Guard, which is usually the intended "
+            "counterplay — don't pair Wonder Guard with status immunities "
+            "on the same species unless you want it to be unkillable."
+        ),
     ),
     EffectTemplate(
         "recoil_immunity",
@@ -408,6 +468,15 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
             EffectParam("target_type", "Convert TO", TYPE_CHOICES),
             EffectParam("boost", "Power boost", POWER_BOOST_CHOICES),
         ],
+        notes=(
+            "Vanilla pokefirered does NOT have TYPE_FAIRY.  If you pick "
+            "Fairy as the target type here you must first add Fairy to "
+            "include/constants/pokemon.h, update the type-effectiveness "
+            "chart in src/data/battle_ai/ai_type_effectiveness.h, add a "
+            "type icon graphic, and extend the type-colour and type-name "
+            "tables in src/battle_message.c — otherwise the game will emit "
+            "???-type moves or crash on damage calculation."
+        ),
     ),
     EffectTemplate(
         "intimidate_dual",
@@ -427,6 +496,19 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
             ("Trick Room (reverse speed)", "TRICK_ROOM"),
             ("Tailwind (double team speed)", "TAILWIND"),
         ])],
+        notes=(
+            "Trick Room and Tailwind are Gen 4+ mechanics.  Vanilla "
+            "pokefirered has no struct fields, constants, or battle scripts "
+            "for them.  Picking this template writes the switch-in trigger "
+            "but the rest is on you:\n\n"
+            "• Add a field (e.g. 'u8 trickRoomTimer') to struct "
+            "BattleStruct in include/battle.h, plus a matching constant.\n"
+            "• Write a BattleScript (copy DrizzleActivates as a start) that "
+            "sets the field and plays a message.\n"
+            "• Patch the turn-order / speed code (GetWhoStrikesFirst in "
+            "battle_main.c) to honour the new field.\n\n"
+            "Without those additions the project will not compile."
+        ),
     ),
     EffectTemplate(
         "multi_type_resist",
@@ -455,6 +537,13 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Loaf Every Other Turn",
         "Can only attack every other turn (like Truant — Slaking's drawback ability)",
         [],
+        notes=(
+            "This is a drawback ability.  Make absolutely sure the species "
+            "you assign it to has stats high enough to justify skipping "
+            "every other turn — Slaking is balanced around it specifically. "
+            "Handing Truant to a mid-tier species is effectively a "
+            "permanent soft-ban from battle."
+        ),
     ),
     EffectTemplate(
         "sound_block",
@@ -467,6 +556,14 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Change Type When Hit",
         "Changes own type to match the type of the last move that hit this Pokemon (like Color Change)",
         [],
+        notes=(
+            "The generated hook sets both type1 and type2 to the incoming "
+            "move's type, which mirrors the original Kecleon behaviour.  If "
+            "your Pokemon has alternate forms tied to type (e.g. Arceus-"
+            "style), make sure the form table and front/back sprites don't "
+            "assume a fixed primary type, or the visuals will drift out of "
+            "sync with the actual type after a few hits."
+        ),
     ),
     EffectTemplate(
         "synchronize_status",
@@ -533,6 +630,15 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Combo Sp. Attack Boost",
         "Boosts Sp. Attack by 50% when an ally with the partner ability is on the field (like Plus/Minus)",
         [EffectParam("partner", "Partner ability", COMBO_PARTNER_CHOICES)],
+        notes=(
+            "Only meaningful in double battles — single battles never have "
+            "an ally on the field, so the boost never triggers.  The "
+            "partner side of the pair needs to exist too: if you pick "
+            "'Plus (partner has Plus)' here, you must also assign a second "
+            "ability (like Minus) to another species for it to chain.  "
+            "Leaving the partner slot pointing at a nonexistent ability is "
+            "a silent dead ability."
+        ),
     ),
     EffectTemplate(
         "damp",
@@ -551,12 +657,35 @@ BATTLE_TEMPLATES: list[EffectTemplate] = [
         "Copy Opponent's Ability",
         "Copies the opposing Pokemon's ability on switch-in (like Trace)",
         [],
+        notes=(
+            "Trace works out of the box for simple ability copying, but "
+            "copying a self-referential ability (e.g. tracing another "
+            "Trace, or Multitype) will no-op.  If you add abilities that "
+            "change form or hold-item state on switch-in, make sure Trace "
+            "re-triggers those switch-in hooks after copying — otherwise "
+            "the traced ability looks active but never actually runs."
+        ),
     ),
     EffectTemplate(
         "forecast",
         "Change Form With Weather",
         "Changes form/type based on the current weather (like Forecast — Castform's signature ability)",
         [],
+        notes=(
+            "The Forecast hook calls CastformDataTypeChange, which is "
+            "hard-coded to Castform.  For any OTHER species you'll need:\n\n"
+            "• Alternate forms of the species defined in "
+            "include/constants/species.h and src/data/pokemon/ tables "
+            "(base stats, front/back sprites, palettes — one per weather "
+            "variant).\n"
+            "• A species-specific type-change function modelled on "
+            "CastformDataTypeChange in src/pokemon.c that picks which form "
+            "to display for which weather.\n"
+            "• A dispatch edge in the Forecast switch so your ability calls "
+            "YOUR function instead of Castform's.\n\n"
+            "Without alternate form data the ability will compile but the "
+            "Pokemon will visually stay in its base form."
+        ),
     ),
     EffectTemplate(
         "block_specific_stat",
@@ -586,17 +715,38 @@ FIELD_TEMPLATES: list[EffectTemplate] = [
         "Increase Type Encounter Rate",
         "50% chance to force wild encounters to match a specific type (like Magnet Pull for Steel, Static for Electric)",
         [EffectParam("type", "Attract type", TYPE_CHOICES)],
+        notes=(
+            "If no species in the current map's wild encounter table has "
+            "the requested type, the biased roll falls back to a normal "
+            "roll — i.e. the ability silently does nothing in zones that "
+            "don't contain the type.  This is usually fine, but it does "
+            "mean the lead Pokemon's ability will appear 'broken' in most "
+            "of the overworld.  Consider pairing type-affinity abilities "
+            "with maps that actually host those types."
+        ),
     ),
     EffectTemplate(
         "pickup",
         "Post-Battle Item Pickup",
         "Chance to find an item after battle if not already holding one (like Pickup)",
+        # Inline chance list (not shared CHANCE_CHOICES so the "standard"
+        # label sticks on the 10% entry).  Do not re-add a "30%" entry with
+        # divisor 3 — it would mislabel 33% probability as 30% (see the note
+        # on CHANCE_CHOICES at the top of this file).
         [EffectParam("chance", "Chance", [
             ("10% (standard)", 10),
             ("20%", 5),
-            ("30%", 3),
+            ("33%", 3),
             ("50%", 2),
         ])],
+        notes=(
+            "The item pool is determined by sPickupItems in "
+            "src/battle_script_commands.c — all Pickup abilities share the "
+            "same table.  If you want this specific ability to pick from a "
+            "different pool (e.g. berries only), you'll need to add a "
+            "second table and branch on the ability constant inside the "
+            "generated block."
+        ),
     ),
     EffectTemplate(
         "guaranteed_escape",
@@ -609,18 +759,39 @@ FIELD_TEMPLATES: list[EffectTemplate] = [
         "Faster Egg Hatching",
         "Halves the number of steps needed to hatch eggs when in the party (like Flame Body / Magma Armor)",
         [],
+        notes=(
+            "Applies as long as the Pokemon is anywhere in the party, not "
+            "just in the lead slot.  Multiple Pokemon with this ability "
+            "don't stack — the hatch counter is only halved once regardless "
+            "of how many qualifying abilities are present."
+        ),
     ),
     EffectTemplate(
         "nature_sync",
         "Nature Sync (Wild Encounters)",
         "50% chance wild encounters match this Pokemon's nature when leading the party (like Synchronize)",
         [],
+        notes=(
+            "Field-effect only — this does NOT make synchronized status "
+            "conditions pass back to the attacker in battle (that's a "
+            "separate Battle Effect template called 'Pass Status to "
+            "Attacker').  Pick both if you want the classic Synchronize "
+            "behaviour in both contexts."
+        ),
     ),
     EffectTemplate(
         "gender_attract",
         "Gender Attract (Wild Encounters)",
         "66% chance wild encounters are the opposite gender of the lead Pokemon (like Cute Charm)",
         [],
+        notes=(
+            "Only works when both the lead Pokemon and the wild species "
+            "have a gender ratio that ISN'T 'genderless' or 'single-"
+            "gender'.  Leading with a genderless species makes this "
+            "ability a no-op.  Likewise, encountering species that are "
+            "100% one gender can't be flipped, so the biased roll quietly "
+            "falls back to the normal roll in those slots."
+        ),
     ),
 ]
 
@@ -1345,11 +1516,32 @@ def _get_status_info(status_display: str) -> dict:
     return STATUS_CHOICES[0][1]
 
 
-def _get_weather_info(weather_display: str) -> dict:
-    """Look up weather info dict by display name."""
-    for display, info in WEATHER_CHOICES:
-        if display == weather_display:
-            return info
+def _get_weather_info(weather: Any) -> dict:
+    """Look up weather info dict by display name, or pass a dict through.
+
+    The dialog/editor stores each weather param as whatever the combo's
+    ``currentData()`` returns — which for :data:`WEATHER_CHOICES` is the
+    full info dict (``{"check": ..., "set": ..., "script": ...}``).  On
+    the detect-from-disk round-trip, the same param is stored as the
+    display-name *string* (e.g. ``"Hail"``), because that's what the
+    extractor emits.  Accept both forms so downstream codegen never
+    silently falls through to the Rain default (which is exactly what
+    regressed funnylizard's Hail ability into Drizzle behaviour).
+
+    If ``weather`` is a dict, we verify it has the three expected keys
+    and return it as-is.  If it's a string, we look it up by display
+    name.  Anything else — or an unknown string — falls through to the
+    first choice (Rain) so the generator still emits valid C, but this
+    path should never happen in practice.
+    """
+    if isinstance(weather, dict) and all(
+        k in weather for k in ("check", "set", "script")
+    ):
+        return weather
+    if isinstance(weather, str):
+        for display, info in WEATHER_CHOICES:
+            if display == weather:
+                return info
     return WEATHER_CHOICES[0][1]
 
 
@@ -2598,15 +2790,6 @@ def _find_case_block_range(lines: list[str], ability_const: str
     return None
 
 
-def _find_inline_ability_line(lines: list[str], ability_const: str
-                              ) -> Optional[int]:
-    """Find a line containing an inline ability check (not a case block)."""
-    for i, line in enumerate(lines):
-        if ability_const in line and 'case ' not in line:
-            return i
-    return None
-
-
 def _find_insertion_point_battle_util(lines: list[str], template_id: str
                                      ) -> Optional[int]:
     """Find where to insert a new case block in AbilityBattleEffects.
@@ -2640,6 +2823,99 @@ def _find_insertion_point_battle_util(lines: list[str], template_id: str
     return None
 
 
+def _ensure_snow_warning_battle_script(project_root: str) -> bool:
+    """Make sure BattleScript_SnowWarningActivates is defined AND declared.
+
+    Vanilla pokefirered defines the hail weather flag, animation, and
+    announcement string (STRINGID_STARTEDHAIL / B_ANIM_HAIL_CONTINUES) but
+    NOT a switch-in battle script for a 'Snow Warning'-style ability.  When
+    the user picks Hail as the weather for a weather_switchin ability, the
+    emitted C references BattleScript_SnowWarningActivates — so the tool
+    must synthesize the script AND its extern declaration on Save,
+    otherwise the project won't compile / link.
+
+    Two writes are required:
+      1. ``data/battle_scripts_1.s`` — the script body, mirroring
+         BattleScript_SandstreamActivates (swaps the string ID and
+         animation to the hail equivalents).  Appended right after
+         Sandstream for locality.
+      2. ``include/battle_scripts.h`` — an ``extern const u8 ...[];``
+         declaration, without which battle_util.c fails to compile at the
+         line that references the symbol.
+
+    Returns True only if BOTH pieces are now present (either we wrote them
+    or they already existed).  Idempotent — safe to call on every Save.
+    Missing Sandstream anchor in either file returns False; we don't guess
+    at a location.
+    """
+    # ── 1. data/battle_scripts_1.s — the script definition ──────────────
+    s_path = os.path.join(project_root, "data", "battle_scripts_1.s")
+    if not os.path.isfile(s_path):
+        return False
+    try:
+        with open(s_path, "r", encoding="utf-8") as f:
+            s_text = f.read()
+    except OSError:
+        return False
+
+    if "BattleScript_SnowWarningActivates::" not in s_text:
+        new_block = (
+            "\n"
+            "BattleScript_SnowWarningActivates::\n"
+            "\tpause B_WAIT_TIME_SHORT\n"
+            "\tprintstring STRINGID_STARTEDHAIL\n"
+            "\twaitstate\n"
+            "\tplayanimation BS_BATTLER_0, B_ANIM_HAIL_CONTINUES\n"
+            "\tcall BattleScript_WeatherFormChanges\n"
+            "\tend3\n"
+        )
+        anchor = "BattleScript_SandstreamActivates::"
+        anchor_pos = s_text.find(anchor)
+        if anchor_pos < 0:
+            return False
+        end_pos = s_text.find("\n\n", anchor_pos)
+        if end_pos < 0:
+            end_pos = len(s_text)
+        else:
+            end_pos += 1  # past the first '\n' of the '\n\n' pair
+        s_text = s_text[:end_pos] + new_block + s_text[end_pos:]
+        try:
+            with open(s_path, "w", encoding="utf-8") as f:
+                f.write(s_text)
+        except OSError:
+            return False
+
+    # ── 2. include/battle_scripts.h — the extern declaration ────────────
+    h_path = os.path.join(project_root, "include", "battle_scripts.h")
+    if not os.path.isfile(h_path):
+        # Script body is there but header is missing entirely — can't
+        # declare the symbol, so callers will fail to compile.
+        return False
+    try:
+        with open(h_path, "r", encoding="utf-8") as f:
+            h_text = f.read()
+    except OSError:
+        return False
+
+    if "BattleScript_SnowWarningActivates" not in h_text:
+        extern_line = "extern const u8 BattleScript_SnowWarningActivates[];\n"
+        # Anchor on the Sandstream extern so the new line lives next to
+        # its sibling weather-activation scripts.
+        anchor = "extern const u8 BattleScript_SandstreamActivates[];"
+        anchor_pos = h_text.find(anchor)
+        if anchor_pos < 0:
+            return False
+        insert_pos = h_text.find("\n", anchor_pos) + 1
+        h_text = h_text[:insert_pos] + extern_line + h_text[insert_pos:]
+        try:
+            with open(h_path, "w", encoding="utf-8") as f:
+                f.write(h_text)
+        except OSError:
+            return False
+
+    return True
+
+
 def apply_battle_effect(project_root: str, template_id: str,
                         ability_const: str, params: Dict[str, Any],
                         old_template_id: str = None) -> int:
@@ -2647,6 +2923,17 @@ def apply_battle_effect(project_root: str, template_id: str,
 
     Returns the number of code blocks written.
     """
+    # Prerequisite scripts/strings: some templates reference symbols that
+    # don't exist in vanilla pokefirered.  Synthesize them before the
+    # generated C is emitted so the project links cleanly on rebuild.
+    if template_id == "weather_switchin":
+        # Use the same normalization generate_battle_code uses so a param
+        # in either form (dict from the dialog combo, or display-name
+        # string from a disk round-trip) reaches the same conclusion.
+        info = _get_weather_info(params.get("weather"))
+        if info.get("script") == "BattleScript_SnowWarningActivates":
+            _ensure_snow_warning_battle_script(project_root)
+
     code_blocks = generate_battle_code(template_id, ability_const, params)
     written = 0
 
@@ -3026,25 +3313,6 @@ def _remove_ability_from_lines(lines: list[str], ability_const: str) -> int:
                 continue
         i += 1
 
-    return removed
-
-
-def _remove_ability_field_line(lines: list[str], ability_const: str) -> int:
-    """Remove field effect lines for an ability from wild_encounter.c."""
-    removed = 0
-    i = 0
-    while i < len(lines):
-        if ability_const in lines[i] and "abilityEffect" in lines[i]:
-            del lines[i]
-            removed += 1
-            continue
-        # Handle two-line patterns (ability on one line, abilityEffect on next)
-        if ability_const in lines[i]:
-            if i + 1 < len(lines) and "abilityEffect" in lines[i + 1]:
-                del lines[i:i + 2]
-                removed += 1
-                continue
-        i += 1
     return removed
 
 
