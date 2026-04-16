@@ -1660,30 +1660,52 @@ def generate_battle_code(template_id: str, ability_const: str,
 
     elif template_id == "stat_double":
         stat = params.get("stat", "STAT_ATK")
-        # Map stat constants to the actual C variable names in
-        # CalculateBaseDamage() in pokemon.c
+        # NOTE: CalculateBaseDamage in pokefirered only declares local
+        # `attack`, `defense`, `spAttack`, `spDefense` variables — speed
+        # is resolved separately in GetWhoStrikesFirst, NOT here.  Emit
+        # a safe fallback for STAT_SPEED (comment-only; the user has to
+        # wire it up manually in battle_main.c) so we never reference
+        # an undeclared `speed` local and break the build.
         _stat_var_map = {
             "STAT_ATK": "attack",
             "STAT_DEF": "defense",
-            "STAT_SPEED": "speed",
             "STAT_SPATK": "spAttack",
             "STAT_SPDEF": "spDefense",
         }
-        stat_var = _stat_var_map.get(stat, "attack")
-        code = (
-            f"    // {ability_const}: Doubles {stat} in damage calculation\n"
-            f"    if (attacker->ability == {ability_const})\n"
-            f"        {stat_var} *= 2;"
-        )
+        stat_var = _stat_var_map.get(stat)
+        if stat_var is None:
+            # STAT_SPEED (or any unknown) — don't touch the damage calc.
+            code = (
+                f"    // {ability_const}: Doubles {stat} — NOT handled in\n"
+                f"    // CalculateBaseDamage (speed-class stats live in\n"
+                f"    // GetWhoStrikesFirst in battle_main.c).  Add the\n"
+                f"    // boost there manually; this block is a no-op so the\n"
+                f"    // build stays clean.\n"
+                f"    (void)0;"
+            )
+        else:
+            code = (
+                f"    // {ability_const}: Doubles {stat} in damage calculation\n"
+                f"    if (attacker->ability == {ability_const})\n"
+                f"        {stat_var} *= 2;"
+            )
         result.append(("src/pokemon.c", code))
 
     elif template_id == "type_resist_halve":
         type_const = params.get("type", "TYPE_FIRE")
+        # NOTE: the local in CalculateBaseDamage is `type`, not `moveType`.
+        # The old template referenced `moveType` which is undeclared here
+        # and broke the build.  `damage` is also not the working variable
+        # in pokefirered — the final computed damage is `gBattleMoveDamage`
+        # by the time ability resists are applied elsewhere — but in
+        # CalculateBaseDamage we have `damage` (s32 local) AND
+        # `gBattleMovePower`.  Prefer `gBattleMovePower` since that's
+        # what OVERGROW / BLAZE / TORRENT modify at the adjacent site.
         code = (
-            f"    // {ability_const}: Halves damage from {type_const}\n"
+            f"    // {ability_const}: Halves power from {type_const}\n"
             f"    if (defender->ability == {ability_const}\n"
-            f"     && (moveType == {type_const}))\n"
-            f"        damage /= 2;"
+            f"     && type == {type_const})\n"
+            f"        gBattleMovePower /= 2;"
         )
         result.append(("src/pokemon.c", code))
 
@@ -1950,12 +1972,15 @@ def generate_battle_code(template_id: str, ability_const: str,
     elif template_id == "multi_type_resist":
         type1 = params.get("type1", "TYPE_FIRE")
         type2 = params.get("type2", "TYPE_ICE")
+        # NOTE: CalculateBaseDamage's local is `type`, not `moveType`.
+        # Same fix-class as type_resist_halve above — using `moveType`
+        # would reference an undeclared variable at the auto-inject site.
         code = (
-            f"    // {ability_const}: Halves {type1} and {type2} damage\n"
+            f"    // {ability_const}: Halves {type1} and {type2} power\n"
             f"    if (defender->ability == {ability_const})\n"
             f"    {{\n"
-            f"        if (moveType == {type1} || moveType == {type2})\n"
-            f"            damage /= 2;\n"
+            f"        if (type == {type1} || type == {type2})\n"
+            f"            gBattleMovePower /= 2;\n"
             f"    }}"
         )
         result.append(("src/pokemon.c", code))
@@ -2214,13 +2239,16 @@ def generate_battle_code(template_id: str, ability_const: str,
 
     elif template_id == "plus_minus":
         partner = params.get("partner", "ABILITY_MINUS")
+        # NOTE: CalculateBaseDamage's battler-id parameter is `battlerIdAtk`,
+        # not `battler` — the old template referenced an undeclared `battler`
+        # and broke the build.  Declare the partner var inside its own `{ }`
+        # scope so the inner declaration is unambiguous under C89.
         code = (
             f"    // {ability_const}: 50% Sp. Attack boost when ally has {partner}\n"
             f"    if (attacker->ability == {ability_const})\n"
             f"    {{\n"
-            f"        // Check if partner has the complementary ability\n"
-            f"        u8 partner = BATTLE_PARTNER(battler);\n"
-            f"        if (gBattleMons[partner].ability == {partner})\n"
+            f"        u8 pm_partner = BATTLE_PARTNER(battlerIdAtk);\n"
+            f"        if (gBattleMons[pm_partner].ability == {partner})\n"
             f"            spAttack = (spAttack * 150) / 100;\n"
             f"    }}"
         )
@@ -2364,23 +2392,38 @@ def generate_field_code(template_id: str, ability_const: str,
 
     elif template_id == "type_encounter":
         type_const = params.get("type", "TYPE_STEEL")
-        # Adds a type-biased encounter check in ChooseWildMonIndex or
-        # equivalent. Inserts into wild_encounter.c near the encounter
-        # generation code.
+        # NOTE: this block is inserted inside TryProduceWildMon /
+        # TryGenerateWildMon AFTER the slot has been picked by
+        # ChooseWildMonIndex_* and BEFORE `level = ChooseWildMonLevel(...)`.
+        # `info` (const struct WildPokemonInfo *) and `slot` (u8) ARE in
+        # scope there; `wildMons` / `count` / `i` from the old template
+        # were NOT in scope at ANY pokefirered call site, which caused a
+        # guaranteed build break.  Everything here declares its own
+        # locally-scoped variables (`t_idx`, `t_max`, `t_sp`) so the
+        # block compiles no matter where it is inserted, and it never
+        # early-returns (the host function's control flow must remain
+        # linear).
         code = (
             f"    // {ability_const}: 50% chance to force {type_const} encounter\n"
-            f"    if (GetMonAbility(&gPlayerParty[0]) == {ability_const})\n"
             f"    {{\n"
-            f"        if (Random() % 2 == 0)\n"
+            f"        u8 t_idx;\n"
+            f"        u8 t_max;\n"
+            f"        u16 t_sp;\n"
+            f"        if (GetMonAbility(&gPlayerParty[0]) == {ability_const}\n"
+            f"         && (Random() % 2) == 0)\n"
             f"        {{\n"
-            f"            // Scan table for a {type_const} Pokemon\n"
-            f"            for (i = 0; i < count; i++)\n"
+            f"            if (area == WILD_AREA_LAND)       t_max = LAND_WILD_COUNT;\n"
+            f"            else if (area == WILD_AREA_WATER) t_max = WATER_WILD_COUNT;\n"
+            f"            else if (area == WILD_AREA_ROCKS) t_max = ROCK_WILD_COUNT;\n"
+            f"            else                              t_max = 0;\n"
+            f"            for (t_idx = 0; t_idx < t_max; t_idx++)\n"
             f"            {{\n"
-            f"                u16 species = wildMons[i].species;\n"
-            f"                if (gBaseStats[species].type1 == {type_const}"
-            f" || gBaseStats[species].type2 == {type_const})\n"
+            f"                t_sp = info->wildPokemon[t_idx].species;\n"
+            f"                if (gSpeciesInfo[t_sp].types[0] == {type_const}\n"
+            f"                 || gSpeciesInfo[t_sp].types[1] == {type_const})\n"
             f"                {{\n"
-            f"                    return i;\n"
+            f"                    slot = t_idx;\n"
+            f"                    break;\n"
             f"                }}\n"
             f"            }}\n"
             f"        }}\n"
@@ -2408,9 +2451,24 @@ def generate_field_code(template_id: str, ability_const: str,
         return [("src/battle_script_commands.c", code)]
 
     elif template_id == "guaranteed_escape":
-        # Adds ability to the run-away check in battle_main.c
+        # Adds a guaranteed-escape ability to TryRunFromBattle / similar.
+        # NOTE: the old template was a lone `|| gBattleMons[...].ability == X)`
+        # fragment meant to extend the existing `if (holdEffect == ...)` chain.
+        # The apply-function inserts it as a new line AFTER the closing `)`
+        # of that if, which produced a stray `||` + unbalanced `)` and broke
+        # the build.  Emit a self-contained `if (...) return BATTLE_RUN_SUCCESS;`
+        # block instead — the new apply-site places it right after the
+        # existing `return BATTLE_RUN_SUCCESS;` so control-flow is preserved.
+        # Wrap the body in `{ }` so `_remove_marker_block` can find its
+        # matching closing brace and remove the whole thing cleanly on
+        # edit/remove — a brace-less `if (...) <stmt>;` leaves the single
+        # statement orphaned when the marker comment is stripped.
         code = (
-            f"     || gBattleMons[gActiveBattler].ability == {ability_const})"
+            f"    // {ability_const}: guaranteed escape\n"
+            f"    if (gBattleMons[gActiveBattler].ability == {ability_const})\n"
+            f"    {{\n"
+            f"        return BATTLE_RUN_SUCCESS;\n"
+            f"    }}"
         )
         return [("src/battle_main.c", code)]
 
@@ -2446,18 +2504,34 @@ def generate_field_code(template_id: str, ability_const: str,
         return [("src/daycare.c", code)]
 
     elif template_id == "nature_sync":
-        # Adds a 50% nature sync check to wild encounter generation
+        # Adds a 50% nature sync check to wild encounter generation.
+        # NOTE 1: the old template used a compound literal `&(u32){...}`
+        # which is a GCC extension that's flaky across agbcc / modern-gcc
+        # builds.  Declare proper locals inside a `{ }` scope so the
+        # address-of is unambiguous.
+        # NOTE 2: `GetNatureFromPersonality` is declared `static` in
+        # pokemon.c in pokefirered, so it's NOT visible from
+        # wild_encounter.c.  Inline the `personality % NUM_NATURES`
+        # computation directly (NUM_NATURES == 25) — same math, no
+        # cross-TU function call.
         code = (
             f"    // {ability_const}: 50% chance wild nature matches lead\n"
-            f"    if (GetMonAbility(&gPlayerParty[0]) == {ability_const}"
-            f" && (Random() % 2) == 0)\n"
             f"    {{\n"
-            f"        SetMonData(&gEnemyParty[0], MON_DATA_PERSONALITY,\n"
-            f"                   &(u32){{(GetMonData(&gEnemyParty[0],"
-            f" MON_DATA_PERSONALITY) / 25 * 25)\n"
-            f"                   + GetNatureFromPersonality("
-            f"GetMonData(&gPlayerParty[0],"
-            f" MON_DATA_PERSONALITY))}});\n"
+            f"        u32 ns_lead_pid;\n"
+            f"        u32 ns_enemy_pid;\n"
+            f"        u32 ns_pid;\n"
+            f"        if (GetMonAbility(&gPlayerParty[0]) == {ability_const}\n"
+            f"         && (Random() % 2) == 0)\n"
+            f"        {{\n"
+            f"            ns_lead_pid = GetMonData(&gPlayerParty[0],"
+            f" MON_DATA_PERSONALITY);\n"
+            f"            ns_enemy_pid = GetMonData(&gEnemyParty[0],"
+            f" MON_DATA_PERSONALITY);\n"
+            f"            ns_pid = (ns_enemy_pid / 25) * 25"
+            f" + (ns_lead_pid % 25);\n"
+            f"            SetMonData(&gEnemyParty[0], MON_DATA_PERSONALITY,"
+            f" &ns_pid);\n"
+            f"        }}\n"
             f"    }}"
         )
         return [("src/wild_encounter.c", code)]
@@ -2692,26 +2766,52 @@ def apply_field_effect(project_root: str, template_id: str,
                         break
                     elif "ABILITY_STENCH" in line and "abilityEffect" in line:
                         insert_at = i + 1
-            else:
-                # type_encounter, nature_sync, gender_attract:
-                # Insert near the end of CreateWildMon or equivalent
-                # Look for the function that creates gEnemyParty[0]
+            elif template_id == "type_encounter":
+                # type_encounter needs `info` (WildPokemonInfo*) and `slot`
+                # (u8) in scope — only TryGenerateWildMon has those.  Insert
+                # AFTER the `switch (area)` block closes and BEFORE `level =
+                # ChooseWildMonLevel(...)`, so the slot override takes effect
+                # before the level is resolved.
                 for i, line in enumerate(lines):
-                    if "CreateMonWithNature" in line or "CreateMon(" in line:
-                        # Insert after the block that creates the wild mon
-                        depth = 0
-                        for j in range(i, len(lines)):
-                            depth += lines[j].count('{') - lines[j].count('}')
-                            if depth <= 0 and j > i:
-                                insert_at = j + 1
+                    if "TryGenerateWildMon" in line and "const struct WildPokemonInfo" in line:
+                        # Walk forward, find `level = ChooseWildMonLevel`
+                        for j in range(i, min(i + 60, len(lines))):
+                            if "level = ChooseWildMonLevel" in lines[j]:
+                                insert_at = j
                                 break
                         break
-                # Fallback: insert before the last closing brace of
-                # the first function that references gEnemyParty
+            else:
+                # nature_sync, gender_attract: insert AT THE END of
+                # GenerateWildMon's body, right before the final `}`.
+                # The old logic stopped at the first brace-balanced close
+                # after CreateMonWithNature, which landed BETWEEN the
+                # `if (species != SPECIES_UNOWN) { ... } else { ... }`
+                # halves and split the if/else — producing
+                # "'else' without a previous 'if'".
+                # Walk from the function signature, find the opening `{`,
+                # then find the matching closing `}`; insert before it.
+                for i, line in enumerate(lines):
+                    if "GenerateWildMon" in line and "static void" in line:
+                        # Find opening brace
+                        open_j = None
+                        for j in range(i, min(i + 5, len(lines))):
+                            if '{' in lines[j]:
+                                open_j = j
+                                break
+                        if open_j is None:
+                            continue
+                        depth = 0
+                        for j in range(open_j, len(lines)):
+                            depth += lines[j].count('{') - lines[j].count('}')
+                            if depth == 0 and j > open_j:
+                                insert_at = j  # insert before the `}`
+                                break
+                        break
+                # Fallback: insert before the last top-level `}` of the
+                # first function that references gEnemyParty.
                 if insert_at is None:
                     for i, line in enumerate(lines):
                         if "gEnemyParty" in line:
-                            # Go forward to find end of this function
                             for j in range(i + 1, len(lines)):
                                 if lines[j].strip() == '}' and \
                                         len(lines[j]) - len(lines[j].lstrip()) == 0:
@@ -2734,11 +2834,20 @@ def apply_field_effect(project_root: str, template_id: str,
                     break
 
         elif rel_path == "src/battle_main.c":
-            # Guaranteed escape: insert near ABILITY_RUN_AWAY
+            # Guaranteed escape: insert AFTER the existing
+            # `return BATTLE_RUN_SUCCESS;` that terminates the vanilla
+            # HOLD_EFFECT_CAN_ALWAYS_RUN / ABILITY_RUN_AWAY if-chain.
+            # Inserting BEFORE the return would hijack the vanilla `if`'s
+            # body with our own statement and break the flow.
             for i, line in enumerate(lines):
                 if "ABILITY_RUN_AWAY" in line and "BATTLE_RUN_SUCCESS" in \
                         ''.join(lines[max(0, i-2):i+3]):
-                    insert_at = i + 1
+                    # Find the next `return BATTLE_RUN_SUCCESS;` line and
+                    # insert after it.
+                    for j in range(i, min(i + 5, len(lines))):
+                        if "return BATTLE_RUN_SUCCESS" in lines[j]:
+                            insert_at = j + 1
+                            break
                     break
 
         elif rel_path == "src/daycare.c":
