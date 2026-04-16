@@ -10,7 +10,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox,
     QFormLayout, QFrame, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMessageBox,
@@ -55,6 +55,91 @@ class _NoScrollSpin(QSpinBox):
             event.ignore()
 
 
+# ── Searchable, non-free-text combo box ──────────────────────────────────────
+# A QComboBox that:
+#   • Permits type-to-search via an auto-completer popup (case-insensitive,
+#     contains-mode) — users still get fast filtering from the keyboard.
+#   • Refuses to save free text. If the user types something that does not
+#     match an existing item, the combo snaps back to the last valid selection
+#     on focus-out (or return-key). This prevents users from accidentally
+#     saving nonsense constants into trainer data files.
+#   • Still inherits the no-scroll-wheel-when-closed behaviour from
+#     `_NoScrollCombo`.
+#
+# Use `set_const(value)` to load a value. Unknown constants are preserved by
+# adding them as extra items so that `currentData()` round-trips correctly
+# through save → load cycles and `collect()` never needs a text fallback.
+
+class _SearchableConstCombo(_NoScrollCombo):
+    """Editable-for-search, locked-for-save combo box."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._last_valid_index = 0
+        try:
+            comp = self.completer()
+            if comp is not None:
+                comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+                comp.setFilterMode(Qt.MatchFlag.MatchContains)
+                comp.setCompletionMode(
+                    QCompleter.CompletionMode.PopupCompletion)
+        except Exception:
+            pass
+        self.currentIndexChanged.connect(self._remember_index)
+        try:
+            le = self.lineEdit()
+            if le is not None:
+                le.editingFinished.connect(self._snap_back_if_invalid)
+        except Exception:
+            pass
+
+    def _remember_index(self, idx: int):
+        if idx >= 0:
+            self._last_valid_index = idx
+
+    def _snap_back_if_invalid(self):
+        txt = self.currentText().strip()
+        # Exact match on visible label OR on stored data (constant).
+        for i in range(self.count()):
+            if self.itemText(i).strip() == txt or self.itemData(i) == txt:
+                self.setCurrentIndex(i)
+                self._last_valid_index = i
+                return
+        # Fall back to case-insensitive label match.
+        lo = txt.lower()
+        for i in range(self.count()):
+            if self.itemText(i).strip().lower() == lo:
+                self.setCurrentIndex(i)
+                self._last_valid_index = i
+                return
+        # Nothing matches — revert to last valid selection.
+        self.setCurrentIndex(self._last_valid_index)
+
+    def set_const(self, const: str):
+        """Select by data (constant). Unknown values are appended as new
+        items so ``currentData()`` always returns the selected constant —
+        no text-fallback needed in ``collect()``.
+        """
+        if not const:
+            if self.count() > 0:
+                self.blockSignals(True)
+                self.setCurrentIndex(0)
+                self.blockSignals(False)
+                self._last_valid_index = 0
+            return
+        idx = self.findData(const)
+        if idx < 0:
+            # Preserve unknown consts from disk so they round-trip.
+            self.addItem(const, const)
+            idx = self.findData(const)
+        self.blockSignals(True)
+        self.setCurrentIndex(idx)
+        self.blockSignals(False)
+        self._last_valid_index = idx
+
+
 # ── stylesheets ───────────────────────────────────────────────────────────────
 _LIST_SS = """
 QListWidget { background: #191919; border: none; outline: none; }
@@ -90,26 +175,43 @@ def _parse_trainer_class_names(root: str) -> dict[str, str]:
 
 
 def _parse_trainer_pic_map(root: str) -> dict[str, str]:
-    """Return {TRAINER_PIC_CONST: abs_png_path} by cross-referencing constants + graphics."""
-    # Build {lowercase_suffix: abs_png_path} from gTrainerFrontPic_* entries
-    path_by_suffix: dict[str, str] = {}
+    """Return {TRAINER_PIC_CONST: abs_png_path} by cross-referencing constants + graphics.
+
+    The bridge between the ``TRAINER_PIC_*`` constant and the on-disk PNG goes
+    through the ``gTrainerFrontPic_<Symbol>`` C symbol, NOT the filename. The
+    filename follows its own snake_case convention that doesn't always line up
+    with the constant — e.g. ``TRAINER_PIC_COOLTRAINER_M`` has the symbol
+    ``CooltrainerM`` but the PNG is named ``cool_trainer_m_front_pic.png``.
+    Matching constant suffix against filename directly would miss every
+    compound-word class (cooltrainer, pokemaniac, etc.).
+
+    Algorithm: lowercase-and-strip-underscores both the constant's suffix AND
+    the C symbol. Those two forms agree on every case we've seen.
+    """
+    # Build {symbol_key: abs_png_path} from gTrainerFrontPic_<Symbol> entries.
+    # symbol_key = symbol lowercased with underscores stripped, so that
+    # compound-word symbols (CooltrainerM, AquaLeaderArchie, RSCooltrainerM)
+    # collapse to a form the constant side can match.
+    path_by_symbol: dict[str, str] = {}
     gfx = os.path.join(root, "src", "data", "graphics", "trainers.h")
     if os.path.isfile(gfx):
-        pat = re.compile(r'gTrainerFrontPic_\w+\[\]\s*=\s*INCBIN_U32\("([^"]+front_pic\.4bpp\.lz)"\)')
+        pat = re.compile(
+            r'gTrainerFrontPic_(\w+)\[\]\s*=\s*INCBIN_U32\("([^"]+front_pic\.4bpp\.lz)"\)'
+        )
         try:
             with open(gfx, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     m = pat.search(line)
                     if m:
-                        rel = m.group(1)
-                        base = os.path.basename(rel)
-                        key = base.replace("_front_pic.4bpp.lz", "")  # "aqua_leader_archie"
-                        png = os.path.join(root, rel.replace(".4bpp.lz", ".png"))
-                        path_by_suffix[key] = png
+                        symbol = m.group(1)                       # CooltrainerM
+                        rel    = m.group(2)
+                        key    = symbol.replace("_", "").lower()   # cooltrainerm
+                        png    = os.path.join(root, rel.replace(".4bpp.lz", ".png"))
+                        path_by_symbol[key] = png
         except Exception as exc:
             log.warning("_parse_trainer_pic_map gfx: %s", exc)
 
-    # Build {TRAINER_PIC_CONST: abs_png_path} via TRAINER_PIC_X → suffix match
+    # Build {TRAINER_PIC_CONST: abs_png_path} via symbol-key match
     result: dict[str, str] = {}
     const_h = os.path.join(root, "include", "constants", "trainers.h")
     if os.path.isfile(const_h):
@@ -119,10 +221,11 @@ def _parse_trainer_pic_map(root: str) -> dict[str, str]:
                 for line in f:
                     m = pat2.search(line)
                     if m:
-                        const = m.group(1)                          # TRAINER_PIC_AQUA_LEADER_ARCHIE
-                        suffix = const[len("TRAINER_PIC_"):].lower()  # aqua_leader_archie
-                        if suffix in path_by_suffix:
-                            result[const] = path_by_suffix[suffix]
+                        const = m.group(1)                                   # TRAINER_PIC_COOLTRAINER_M
+                        suffix = const[len("TRAINER_PIC_"):]                 # COOLTRAINER_M
+                        key = suffix.replace("_", "").lower()                # cooltrainerm
+                        if key in path_by_symbol:
+                            result[const] = path_by_symbol[key]
         except Exception as exc:
             log.warning("_parse_trainer_pic_map consts: %s", exc)
     return result
@@ -650,6 +753,40 @@ def _write_rematch_table(raw_lines: list[str], entries: list[dict]) -> list[str]
 # Rematch Settings dialog
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _load_disk_flag_labels(project_root: str) -> dict[str, str]:
+    """Return ``{FLAG_CONST: user_label}`` read from ``porysuite_labels.json``.
+
+    Accepts both the canonical versioned wrapper
+    (``{"version": 1, "labels": {const: {label, notes}}}``) and a bare flat
+    dict for legacy / imported files.
+
+    Silently returns an empty dict on any I/O / JSON error — callers fall
+    back to displaying bare constants, which is a valid UX state.
+    """
+    out: dict[str, str] = {}
+    if not project_root:
+        return out
+    path = os.path.join(project_root, "porysuite_labels.json")
+    if not os.path.isfile(path):
+        return out
+    try:
+        import json as _json
+        with open(path, encoding="utf-8") as f:
+            raw = _json.load(f) or {}
+    except Exception:
+        return out
+    if isinstance(raw, dict) and "labels" in raw and isinstance(raw["labels"], dict):
+        raw = raw["labels"]
+    if not isinstance(raw, dict):
+        return out
+    for const, data in raw.items():
+        if isinstance(data, dict):
+            lbl = (data.get("label") or "").strip()
+            if lbl:
+                out[const] = lbl
+    return out
+
+
 class _RematchSettingsDialog(QDialog):
     """Dialog to edit VS Seeker tier count and gate flags.
 
@@ -669,6 +806,12 @@ class _RematchSettingsDialog(QDialog):
         self._raw_lines = raw_lines
         self._project_root = project_root
         self._tier_rows: list[QComboBox] = []
+        # Load any user-set flag labels from porysuite_labels.json. When
+        # a label is present the dropdown shows "Beat Misty  (FLAG_*)"
+        # instead of the bare constant. If no labels are saved to disk,
+        # the dropdown falls through to bare constants — that is the
+        # expected behaviour, not a bug.
+        self._flag_labels: dict[str, str] = _load_disk_flag_labels(project_root)
         self._build()
 
     def _build(self):
@@ -759,8 +902,17 @@ class _RematchSettingsDialog(QDialog):
                 cb = _NoScrollCombo()
                 cb.addItem("(none — always available)", "")
                 for flag in self._all_flags:
-                    cb.addItem(flag, flag)
-                # Set current value
+                    # Show the user's friendly label from the Label Manager
+                    # if one exists, e.g. "Beat Misty  (FLAG_BADGE02_GET)".
+                    # Bare constants remain for flags with no label set.
+                    lbl = self._flag_labels.get(flag, "")
+                    if lbl:
+                        cb.addItem(f"{lbl}  ({flag})", flag)
+                    else:
+                        cb.addItem(flag, flag)
+                # Set current value — match by data (the raw FLAG_ constant),
+                # never by text, so friendly-label formatting doesn't break
+                # round-tripping edits.
                 current = self._gate_flags[i] if i < len(self._gate_flags) else ""
                 if current:
                     idx = cb.findData(current)
@@ -840,6 +992,12 @@ class _TrainerListDelegate(QStyledItemDelegate):
     _SPR_W = 40
     _SPR_H = 52
     _PAD   = 6
+    # Shared dirty-role slot — matches MainWindow.DIRTY_FLAG_ROLE.
+    # The trainer list uses a custom delegate (sprite+name+const rendering)
+    # so the stock _DirtyDelegate from mainwindow can't be stacked on top.
+    # Instead this delegate bakes in the same amber-tint logic so dirty
+    # rows visually match other tabs (Moves, Items, Abilities).
+    _DIRTY_ROLE = Qt.ItemDataRole.UserRole + 500
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
         painter.save()
@@ -849,6 +1007,11 @@ class _TrainerListDelegate(QStyledItemDelegate):
             _sel = QStyle.State.State_Selected  # type: ignore[attr-defined]
         selected = bool(option.state & _sel)
         painter.fillRect(option.rect, QColor("#1565c0" if selected else "#191919"))
+        # Amber overlay for dirty (edited-but-unsaved) rows. Same 90-alpha
+        # tint the stock _DirtyDelegate uses in other tabs so visual style
+        # stays consistent across the app.
+        if index.data(self._DIRTY_ROLE):
+            painter.fillRect(option.rect, QColor(255, 183, 77, 90))
 
         r = option.rect
 
@@ -929,11 +1092,9 @@ class _PartySlotWidget(QWidget):
         self._sprite_lbl.setStyleSheet("background: #111; border-radius: 2px;")
         hdr.addWidget(self._sprite_lbl)
 
-        self._species_cb = _NoScrollCombo()
-        self._species_cb.setEditable(True)
+        self._species_cb = _SearchableConstCombo()
         self._species_cb.setMinimumWidth(140)
         self._species_cb.setMaximumWidth(220)
-        self._species_cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         for const, name in self._species_list:
             self._species_cb.addItem(name, const)
         self._species_cb.currentIndexChanged.connect(self._on_species_changed)
@@ -970,10 +1131,8 @@ class _PartySlotWidget(QWidget):
         item_row = QHBoxLayout()
         item_row.setSpacing(5)
         item_row.addWidget(QLabel("Held Item:"))
-        self._item_cb = _NoScrollCombo()
-        self._item_cb.setEditable(True)
+        self._item_cb = _SearchableConstCombo()
         self._item_cb.setMinimumWidth(180)
-        self._item_cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         for const, name in self._items_list:
             self._item_cb.addItem(name, const)
         self._item_cb.currentIndexChanged.connect(lambda: self.changed.emit())
@@ -994,10 +1153,8 @@ class _PartySlotWidget(QWidget):
             for col_i in range(2):
                 slot_num = row_i * 2 + col_i + 1
                 row_layout.addWidget(QLabel(f"Move {slot_num}:"))
-                cb = _NoScrollCombo()
-                cb.setEditable(True)
+                cb = _SearchableConstCombo()
                 cb.setMinimumWidth(160)
-                cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
                 for const, name in self._moves_list:
                     cb.addItem(name, const)
                 cb.currentIndexChanged.connect(lambda: self.changed.emit())
@@ -1020,14 +1177,11 @@ class _PartySlotWidget(QWidget):
         self._moves_row_w.setVisible(party_type in ("NO_ITEM_CUSTOM_MOVES", "ITEM_CUSTOM_MOVES"))
 
     def load(self, member: dict):
-        species = member.get("species", "SPECIES_NONE")
-        idx = self._species_cb.findData(species)
-        if idx >= 0:
-            self._species_cb.blockSignals(True)
-            self._species_cb.setCurrentIndex(idx)
-            self._species_cb.blockSignals(False)
-        else:
-            self._species_cb.setCurrentText(species)
+        # _SearchableConstCombo.set_const preserves unknown constants from
+        # disk by appending them as extra items — so currentData() always
+        # returns the selected constant, letting collect() skip the text
+        # fallback that previously let free-typed nonsense get saved.
+        self._species_cb.set_const(member.get("species", "SPECIES_NONE"))
         try:
             self._lvl_spin.setValue(int(member.get("lvl", 5)))
         except (ValueError, TypeError):
@@ -1036,44 +1190,35 @@ class _PartySlotWidget(QWidget):
             self._iv_spin.setValue(int(member.get("iv", 0)))
         except (ValueError, TypeError):
             self._iv_spin.setValue(0)
-        item = member.get("heldItem", "ITEM_NONE")
-        idx = self._item_cb.findData(item)
-        if idx >= 0:
-            self._item_cb.blockSignals(True)
-            self._item_cb.setCurrentIndex(idx)
-            self._item_cb.blockSignals(False)
-        else:
-            self._item_cb.setCurrentText(item)
+        self._item_cb.set_const(member.get("heldItem", "ITEM_NONE"))
         moves = member.get("moves", [])
         for i, cb in enumerate(self._move_cbs):
-            mv = moves[i] if i < len(moves) else "MOVE_NONE"
-            idx = cb.findData(mv)
-            cb.blockSignals(True)
-            if idx >= 0:
-                cb.setCurrentIndex(idx)
-            else:
-                cb.setCurrentText(mv)
-            cb.blockSignals(False)
+            cb.set_const(moves[i] if i < len(moves) else "MOVE_NONE")
         # Populate sprite now that species is set (signals were blocked above)
         self._on_species_changed()
 
     def collect(self) -> dict:
+        # currentData() is authoritative — the _SearchableConstCombo snap-back
+        # logic + set_const on load guarantee currentData() returns a real
+        # constant, never None. No text fallback means no nonsense strings
+        # ever reach the save pipeline.
+        species = self._species_cb.currentData() or "SPECIES_NONE"
         result: dict = {
-            "species": self._species_cb.currentData() or self._species_cb.currentText(),
+            "species": species,
             "lvl":     str(self._lvl_spin.value()),
             "iv":      str(self._iv_spin.value()),
         }
         if self._item_row_w.isVisible():
-            result["heldItem"] = self._item_cb.currentData() or self._item_cb.currentText() or "ITEM_NONE"
+            result["heldItem"] = self._item_cb.currentData() or "ITEM_NONE"
         if self._moves_row_w.isVisible():
             result["moves"] = [
-                (cb.currentData() or cb.currentText() or "MOVE_NONE")
+                (cb.currentData() or "MOVE_NONE")
                 for cb in self._move_cbs
             ]
         return result
 
     def _on_species_changed(self):
-        const = self._species_cb.currentData() or self._species_cb.currentText()
+        const = self._species_cb.currentData()
         if self._icon_fn and const:
             try:
                 icon = self._icon_fn(const)
@@ -1098,6 +1243,12 @@ class _TrainerDetailPanel(QWidget):
     setup_battle_requested = pyqtSignal()  # emitted when "Set up battle" button clicked
     edit_tier_gates_requested = pyqtSignal()  # open rematch settings dialog
     add_to_rematch_requested = pyqtSignal(str)  # emits trainer const to add
+    # Emitted when the user is about to switch away from a rematch-tier party
+    # view and we've just flushed that tier's slot-widget edits to the shared
+    # parties dict. Parent listens to queue a pending .c write for the
+    # affected sParty symbol so Save picks it up even if no trainer switch
+    # happens afterwards. Signature: (sParty_symbol, party_dict).
+    tier_party_modified = pyqtSignal(str, dict)
     _loading         = False  # True while populating fields — suppresses changed signal
 
     def __init__(
@@ -1209,17 +1360,13 @@ class _TrainerDetailPanel(QWidget):
         self._name_edit.textChanged.connect(self._refresh_header)
         form.addRow("Name:", self._name_edit)
 
-        self._class_cb = _NoScrollCombo()
-        self._class_cb.setEditable(True)
-        self._class_cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._class_cb = _SearchableConstCombo()
         self._class_cb.currentIndexChanged.connect(self._refresh_header)
         form.addRow("Class:", self._class_cb)
 
         # Trainer Pic — combo + inline thumbnail
         pic_row = QHBoxLayout()
-        self._pic_cb = _NoScrollCombo()
-        self._pic_cb.setEditable(True)
-        self._pic_cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._pic_cb = _SearchableConstCombo()
         self._pic_cb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self._pic_cb.currentIndexChanged.connect(self._on_pic_changed)
         pic_row.addWidget(self._pic_cb)
@@ -1278,10 +1425,8 @@ class _TrainerDetailPanel(QWidget):
         for i in range(4):
             row = QHBoxLayout()
             row.addWidget(QLabel(f"Slot {i + 1}:"))
-            cb = _NoScrollCombo()
-            cb.setEditable(True)
+            cb = _SearchableConstCombo()
             cb.setMinimumWidth(200)
-            cb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
             for const, name in self._items_list:
                 cb.addItem(name, const)
             cb.currentIndexChanged.connect(lambda: self.changed.emit())
@@ -1888,12 +2033,91 @@ class _TrainerDetailPanel(QWidget):
                 f"{const}  ·  Gate: {gate}"
                 + (f"  ({flag})" if flag else ""))
 
+    def _flush_viewing_tier_party(self) -> None:
+        """Push the currently-displayed tier's party from slot widgets into
+        the shared parties dict BEFORE we clear the slots to load a different
+        tier. Without this, switching tiers away and back silently discards
+        the user's edits — the slot widgets get deleted and nothing has yet
+        written their state to ``self._parties`` (which normally only happens
+        on trainer-list switch, via ``TrainersTabWidget._flush_current``).
+
+        Handles tier 0 (base party) and tiers >0 (rematch variants) the same
+        way — just computes a different sParty symbol. Does nothing during
+        initial load or when no tier is currently being viewed.
+        """
+        if self._loading:
+            return
+        if not self._rematch_tiers:
+            return
+        tier_idx = getattr(self, "_viewing_tier_idx", -1)
+        if tier_idx < 0 or tier_idx >= len(self._rematch_tiers):
+            return
+        tier_const = self._rematch_tiers[tier_idx]
+        if not tier_const or tier_const == _SKIP or tier_const == "":
+            return
+
+        # Tier 0 writes to the base trainer's sParty symbol; tier >0 writes
+        # to the variant's (e.g. sParty_BirdKeeperBennyR3). Both paths just
+        # use the tier const itself — _trainer_const_to_party_symbol converts
+        # TRAINER_X → X's camel form.
+        tier_sym = f"sParty_{_trainer_const_to_party_symbol(tier_const)}"
+        ptype = self._party_type_cb.currentData() or "NO_ITEM_DEFAULT_MOVES"
+        members = [slot.collect() for slot in self._party_slots]
+        party_update = {"type": ptype, "members": members}
+
+        # Short-circuit if nothing actually changed. Keeps save-path noise
+        # down and prevents flipping dirty flags on incidental tier switches.
+        old = self._all_parties_data.get(tier_sym)
+        if old == party_update:
+            return
+
+        # _all_parties_data is the SAME dict reference as the parent's
+        # self._parties — writing here updates both. Parent still needs to
+        # queue a pending .c write via the signal below.
+        self._all_parties_data[tier_sym] = party_update
+        self.tier_party_modified.emit(tier_sym, party_update)
+
+        # Refresh the dropdown's label for the tier we just flushed so the
+        # "Rematch 3 — Fearow L50" summary reflects the new mons. Without
+        # this, switching tiers away and back shows the new party in slots
+        # but the dropdown still advertises the OLD species.
+        self._refresh_tier_combo_item(tier_idx)
+
+    def _refresh_tier_combo_item(self, tier_idx: int) -> None:
+        """Rebuild the display text of a single tier combo entry so the
+        party summary shown in the dropdown matches the current party data.
+        Called after a flush writes edited slot widgets back to the shared
+        parties dict. blockSignals prevents re-entrancy into _on_tier_changed.
+        """
+        if tier_idx < 0 or tier_idx >= self._tier_combo.count():
+            return
+        if tier_idx >= len(self._rematch_tiers):
+            return
+        const = self._rematch_tiers[tier_idx]
+        tier_name = (self._tier_labels[tier_idx]
+                     if tier_idx < len(self._tier_labels)
+                     else f"Tier {tier_idx}")
+        if not const or const == _SKIP or const == "":
+            new_text = f"{tier_name}  —  (same as previous tier)"
+        else:
+            all_trainers = getattr(self, '_all_trainers_data', {})
+            all_parties = getattr(self, '_all_parties_data', {})
+            summary = self._tier_party_summary(const, all_trainers, all_parties)
+            new_text = f"{tier_name}  —  {summary}"
+        self._tier_combo.blockSignals(True)
+        self._tier_combo.setItemText(tier_idx, new_text)
+        self._tier_combo.blockSignals(False)
+
     def _on_tier_changed(self, index: int):
         """Switch the party display to show the selected rematch tier's party."""
         if self._loading:
             return
         if not self._rematch_tiers or index < 0 or index >= len(self._rematch_tiers):
             return
+
+        # Save the outgoing tier's party BEFORE we clear its slot widgets.
+        # _viewing_tier_idx still points to the tier the user is leaving.
+        self._flush_viewing_tier_party()
 
         self._update_tier_summary(index)
         const = self._rematch_tiers[index]
@@ -1977,15 +2201,24 @@ class _TrainerDetailPanel(QWidget):
                                    Qt.AspectRatioMode.KeepAspectRatio,
                                    Qt.TransformationMode.SmoothTransformation)
                     )
-                    # Also update the large header sprite
+                    # Also update the large header sprite. Scale target is
+                    # clamped to the label's actual fixed size (64x64) so the
+                    # pixmap can't overflow and get clipped — earlier code
+                    # scaled to 80x100 and the clipped result read as empty
+                    # space next to the header text for some trainers.
                     self._sprite_lbl.setPixmap(
-                        pix.scaled(80, 100,
+                        pix.scaled(64, 64,
                                    Qt.AspectRatioMode.KeepAspectRatio,
                                    Qt.TransformationMode.SmoothTransformation)
                     )
                     if not self._loading:
                         self.changed.emit()
                     return
+        # Fallback: clear BOTH the thumb and the header sprite. If only
+        # _sprite_lbl were cleared, the thumb would keep the previous
+        # trainer's sprite visible and users would think this trainer has
+        # the wrong pic assigned when really the pic-map lookup failed.
+        self._pic_thumb.clear()
         self._sprite_lbl.clear()
         self._sprite_lbl.setText("?")
         if not self._loading:
@@ -1997,8 +2230,11 @@ class _TrainerDetailPanel(QWidget):
             if os.path.isfile(path):
                 pix = QPixmap(path)
                 if not pix.isNull():
+                    # Match _sprite_lbl's 64x64 fixed size — scaling larger
+                    # (e.g. 80x100) overflows and gets clipped, which reads
+                    # as an empty black box to the user.
                     self._sprite_lbl.setPixmap(
-                        pix.scaled(80, 100,
+                        pix.scaled(64, 64,
                                    Qt.AspectRatioMode.KeepAspectRatio,
                                    Qt.TransformationMode.SmoothTransformation)
                     )
@@ -2073,24 +2309,14 @@ class _TrainerDetailPanel(QWidget):
 
         if not self._class_cb.count():
             self._populate_class_combo()
-        idx = self._class_cb.findData(cls_const)
-        self._class_cb.blockSignals(True)
-        if idx >= 0:
-            self._class_cb.setCurrentIndex(idx)
-        else:
-            self._class_cb.setCurrentText(cls_const)   # preserve unknown as text
-        self._class_cb.blockSignals(False)
+        # _SearchableConstCombo.set_const: unknown consts get appended as
+        # items so currentData() always returns the loaded value — no
+        # currentText() fallback needed in collect().
+        self._class_cb.set_const(cls_const)
 
         if not self._pic_cb.count():
             self._populate_pic_combo()
-        pic_const = trainer.get("trainerPic", "")
-        idx = self._pic_cb.findData(pic_const)
-        self._pic_cb.blockSignals(True)
-        if idx >= 0:
-            self._pic_cb.setCurrentIndex(idx)
-        else:
-            self._pic_cb.setCurrentText(pic_const)     # preserve unknown as text
-        self._pic_cb.blockSignals(False)
+        self._pic_cb.set_const(trainer.get("trainerPic", ""))
         self._on_pic_changed()
 
         music_raw = trainer.get("encounterMusic_gender", "")
@@ -2121,11 +2347,8 @@ class _TrainerDetailPanel(QWidget):
         raw_items = trainer.get("items", "{}").strip("{}")
         bag_items = [s.strip() for s in raw_items.split(",") if s.strip() and s.strip() not in ("", "0")]
         for i, cb in enumerate(self._bag_cbs):
-            cb.blockSignals(True)
             item_val = bag_items[i] if i < len(bag_items) else "ITEM_NONE"
-            idx = cb.findData(item_val)
-            cb.setCurrentIndex(idx if idx >= 0 else 0)
-            cb.blockSignals(False)
+            cb.set_const(item_val)
 
         # Party tab
         self._clear_party_slots()
@@ -2172,16 +2395,24 @@ class _TrainerDetailPanel(QWidget):
         self._party_slots.append(slot)
         self._slots_layout.insertWidget(self._slots_layout.count() - 1, slot)
 
-    def collect(self) -> tuple[dict, dict]:
-        """Return (trainer_dict_updates, party_dict)."""
+    def collect(self) -> tuple[dict, dict, Optional[str]]:
+        """Return (trainer_dict_updates, party_dict, tier_party_symbol_override).
+
+        * When the panel is viewing a rematch *tier* rather than the base
+          trainer, the party slots belong to the tier variant. In that case
+          the third return value is the tier's sParty symbol so the caller
+          can write the party dict under the correct symbol, and the "party"
+          field is OMITTED from trainer_updates (so the base trainer's party
+          pointer is not clobbered with the tier's symbol).
+        * When viewing the base trainer, the third return value is None.
+        """
         trainer: dict = {}
-        trainer["trainerName"]          = f'_("{self._name_edit.text()}")'
-        trainer["trainerClass"]         = (
-            self._class_cb.currentData() or self._class_cb.currentText()
-        )
-        trainer["trainerPic"]           = (
-            self._pic_cb.currentData() or self._pic_cb.currentText()
-        )
+        trainer["trainerName"] = f'_("{self._name_edit.text()}")'
+        # currentData() is authoritative — _SearchableConstCombo snap-back +
+        # set_const on load guarantee it returns a real constant, never None
+        # and never free-typed text.
+        trainer["trainerClass"] = self._class_cb.currentData() or ""
+        trainer["trainerPic"]   = self._pic_cb.currentData() or ""
         music_val = self._music_cb.currentData() or self._music_cb.currentText()
         if getattr(self, "_has_female_flag", False):
             music_val = music_val + " | F_TRAINER_FEMALE"
@@ -2193,18 +2424,46 @@ class _TrainerDetailPanel(QWidget):
 
         bag: list[str] = []
         for cb in self._bag_cbs:
-            v = cb.currentData() or cb.currentText() or ""
+            v = cb.currentData() or ""
             if v and v not in ("ITEM_NONE", "0", ""):
                 bag.append(v)
         trainer["items"] = "{" + ", ".join(bag) + "}" if bag else "{}"
 
         ptype = self._party_type_cb.currentData() or "NO_ITEM_DEFAULT_MOVES"
-        party_symbol = f"sParty_{_trainer_const_to_party_symbol(self._current_const or '')}"
-        trainer["party"] = f"{ptype}({party_symbol})"
+
+        # Rematch-tier aliasing: if the user opened the Party-tab tier dropdown
+        # and is now editing tier 2's party, the slots below belong to the
+        # TIER variant trainer — NOT the base. Writing the party to the base
+        # trainer's sParty symbol would corrupt the base party with the tier's
+        # team. Detect tier-view and route the party write to the tier.
+        tier_sym_override: Optional[str] = None
+        rematch_tiers = getattr(self, "_rematch_tiers", None) or []
+        viewing_tier = getattr(self, "_viewing_tier_idx", 0)
+        if rematch_tiers and 0 < viewing_tier < len(rematch_tiers):
+            tier_const = rematch_tiers[viewing_tier]
+            if tier_const and tier_const != _SKIP:
+                # Don't let trainer_updates overwrite the base trainer's
+                # "party" field — it must still point to the base sParty.
+                # The identity/AI/bag fields have not been re-loaded for the
+                # tier variant, so they don't apply either. Strip every field
+                # except the ones that belong to the base trainer, which is
+                # nothing meaningful while a tier is being viewed — return
+                # just an empty trainer update + the tier's party dict.
+                tier_sym_override = (
+                    f"sParty_{_trainer_const_to_party_symbol(tier_const)}"
+                )
+                # The tier view only re-renders the party slots, not identity/
+                # AI/bag — so we must NOT write those back to the base. Replace
+                # the trainer dict with just the already-loaded base values (a
+                # no-op update) plus leave "party" alone.
+                trainer = {}
+        else:
+            party_symbol = f"sParty_{_trainer_const_to_party_symbol(self._current_const or '')}"
+            trainer["party"] = f"{ptype}({party_symbol})"
 
         members = [slot.collect() for slot in self._party_slots]
         party   = {"type": ptype, "members": members}
-        return trainer, party
+        return trainer, party, tier_sym_override
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2355,6 +2614,11 @@ class TrainersTabWidget(QWidget):
         self._items_list: list     = [("ITEM_NONE", "None")]
         self._moves_list: list     = [("MOVE_NONE", "None")]
         self._detail_panel: Optional[_TrainerDetailPanel] = None
+        # Dirty-tracking set — survives _rebuild_list() (search filter), which
+        # wipes every QListWidgetItem and recreates them fresh. Without an
+        # external backing store, edited-but-unsaved amber tints would vanish
+        # the moment the user types into the search box. Keyed by TRAINER_*.
+        self._dirty_consts: set[str] = set()
         self._build()
 
     # ── build ─────────────────────────────────────────────────────────────────
@@ -2469,6 +2733,10 @@ class TrainersTabWidget(QWidget):
         # Reset current selection — the old panel is being replaced, so
         # _flush_current must not collect stale data from the new empty panel.
         self._current_const = None
+        # Reload wipes amber dirty tints — the incoming data is the new
+        # baseline, so any previous "edited but unsaved" markers no longer
+        # apply to the freshly-loaded rows.
+        self._dirty_consts.clear()
 
         # Build a fresh detail panel with the new lists
         self._detail_panel = _TrainerDetailPanel(
@@ -2492,6 +2760,11 @@ class TrainersTabWidget(QWidget):
         self._detail_panel.setup_battle_requested.connect(self._on_setup_battle)
         self._detail_panel.edit_tier_gates_requested.connect(self._on_edit_tier_gates)
         self._detail_panel.add_to_rematch_requested.connect(self._on_add_to_rematch)
+        # Tier-switch flushes need a pending .c write queued on the parent so
+        # Save picks them up even when the user never leaves this trainer.
+        # _parties is already updated by the panel; we just queue the
+        # write-string and mark the base-trainer row dirty.
+        self._detail_panel.tier_party_modified.connect(self._on_tier_party_modified)
         self._detail_scroll.setWidget(self._detail_panel)
 
         self._rebuild_list()
@@ -2507,8 +2780,54 @@ class TrainersTabWidget(QWidget):
         """Return {sParty_symbol: c_code} for parties that need writing to disk."""
         return dict(self._pending_party_writes)
 
+    # ── dirty-tracking API (called from MainWindow) ───────────────────────────
+    def current_const(self) -> Optional[str]:
+        """Which trainer constant is currently open in the detail panel."""
+        return self._current_const
+
+    def mark_dirty(self, const: str) -> None:
+        """Paint the given trainer's row amber (edited-but-unsaved).
+
+        Writes to the external `_dirty_consts` set AND to the current
+        QListWidgetItem's DIRTY role so the delegate repaints immediately.
+        The external set lets `_rebuild_list` re-assert the tint after a
+        search filter wipes all items.
+        """
+        if not const:
+            return
+        self._dirty_consts.add(const)
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item and item.data(Qt.ItemDataRole.UserRole) == const:
+                item.setData(_TrainerListDelegate._DIRTY_ROLE, True)
+                break
+
+    def clear_all_dirty(self) -> None:
+        """Remove amber tint from every trainer row (post-save)."""
+        self._dirty_consts.clear()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item is not None:
+                item.setData(_TrainerListDelegate._DIRTY_ROLE, None)
+
     def clear_pending_party_writes(self):
         self._pending_party_writes.clear()
+
+    def _on_tier_party_modified(self, party_sym: str, party_update: dict):
+        """Panel flushed a tier's party edits just before switching tiers.
+        Queue the .c write-string so Save picks it up, and mark the base
+        trainer's row dirty (the tier variant is keyed under the base in
+        the list UI, not its own row)."""
+        if not party_sym or not party_update:
+            return
+        self._pending_party_writes[party_sym] = _generate_party_c(
+            party_sym, party_update["type"], party_update["members"]
+        )
+        if self._current_const:
+            self.mark_dirty(self._current_const)
+        # Propagate so the mainwindow sidebar dot + title-bar asterisk light
+        # up for this edit just like every other edit.
+        self.changed.emit()
 
     def save_dialogue_edits(self) -> bool:
         """Write edited dialogue text back to the correct text.inc files.
@@ -2668,6 +2987,13 @@ class TrainersTabWidget(QWidget):
                     item.setIcon(QIcon(pix))
                 item.setToolTip(const)
                 item.setSizeHint(QSize(0, _TrainerListDelegate._ROW_H))
+                # Re-apply dirty tint if this trainer has unsaved edits.
+                # _rebuild_list wipes and recreates all items (search filter,
+                # rename, etc.), so amber must be re-asserted from the
+                # external _dirty_consts set — the QListWidgetItem itself
+                # doesn't persist across rebuilds.
+                if const in self._dirty_consts:
+                    item.setData(_TrainerListDelegate._DIRTY_ROLE, True)
                 self._list.addItem(item)
 
         self._list.blockSignals(False)
@@ -2691,27 +3017,39 @@ class TrainersTabWidget(QWidget):
         if not self._detail_panel or not self._current_const:
             return
         try:
-            trainer_updates, party_update = self._detail_panel.collect()
+            trainer_updates, party_update, tier_sym_override = (
+                self._detail_panel.collect()
+            )
         except Exception as exc:
             log.warning("_flush_current collect: %s", exc)
             return
 
-        # Guard: if the panel returned empty critical fields, it wasn't
-        # properly loaded (e.g. combos not populated yet).  Don't overwrite
-        # the real trainer data with blanks.
-        if not trainer_updates.get("trainerClass") and not trainer_updates.get("trainerPic"):
-            existing = self._trainers.get(self._current_const, {})
-            if existing.get("trainerClass") or existing.get("trainerPic"):
-                # The existing data has real values but collect gave us nothing
-                # — skip the update to avoid wiping the trainer.
-                return
-
         existing = self._trainers.get(self._current_const, {})
-        existing.update(trainer_updates)
-        self._trainers[self._current_const] = existing
+
+        if tier_sym_override:
+            # We're viewing a rematch tier — the identity/AI/bag have NOT
+            # been re-rendered for the tier, so trainer_updates is empty.
+            # Only the party slots belong to the tier variant. Route the
+            # party dict to the tier's sParty symbol so editing tier 2's
+            # team doesn't overwrite the base trainer's party.
+            party_sym = tier_sym_override
+        else:
+            # Guard: if collect() returned empty critical fields, the panel
+            # wasn't properly loaded (combos not populated yet). Don't
+            # overwrite real trainer data with blanks. Merge field-by-field
+            # instead of dropping the entire update — a single empty field
+            # must not erase others.
+            merged_updates: dict = {}
+            for k, v in trainer_updates.items():
+                if v in ("", None) and existing.get(k):
+                    # Skip blank overwrite — existing has a real value.
+                    continue
+                merged_updates[k] = v
+            existing.update(merged_updates)
+            self._trainers[self._current_const] = existing
+            party_sym = _extract_party_symbol(existing.get("party", ""))
 
         # Track party dirtiness
-        party_sym = _extract_party_symbol(existing.get("party", ""))
         if party_sym:
             old = self._parties.get(party_sym)
             if old != party_update:

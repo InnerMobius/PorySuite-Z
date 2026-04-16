@@ -343,20 +343,38 @@ class MainWindow(QMainWindow):
         self.ui.trainers_table.deleteLater()
 
         self.trainers_editor = TrainersTabWidgetUI()
-        self.trainers_editor.changed.connect(lambda: self.setWindowModified(True))
+        # Dirty-flag wiring: amber row on edited trainer + trainers sidebar
+        # dot + title-bar asterisk. All three trainer sub-tabs (Trainers /
+        # Trainer Classes / Graphics) share the single "trainers" section
+        # icon, which is mapped via `_section_to_page` in UnifiedMainWindow.
+        self.trainers_editor.changed.connect(self._on_trainer_edited)
         self.trainers_editor.rename_requested.connect(self._on_trainer_rename_from_panel)
 
         self.trainer_class_editor = TrainerClassEditor()
-        self.trainer_class_editor.changed.connect(lambda: self.setWindowModified(True))
+        self.trainer_class_editor.changed.connect(self._on_trainer_class_edited)
+        # Amber-tint delegate on the class list: unlike the Trainers tab
+        # which has its own custom delegate, this list uses the stock one
+        # so we can stack the shared _DirtyDelegate on top.
+        try:
+            _tcl = getattr(self.trainer_class_editor, "_list", None)
+            if _tcl is not None:
+                self._install_dirty_delegate(_tcl)
+        except Exception:
+            pass
         # Live-push pending class-name renames into the sibling Trainers
         # editor so the trainer list and detail panel reflect them without
         # requiring save.
         self.trainer_class_editor.class_name_edited.connect(
             self.trainers_editor.apply_class_name
         )
+        # Rename... button → open shared RenameDialog and drive the rename
+        # through refactor_service (cross-project source-file rename).
+        self.trainer_class_editor.rename_class_requested.connect(
+            self._on_trainer_class_rename
+        )
 
         self.trainer_graphics_tab = TrainerGraphicsTab()
-        self.trainer_graphics_tab.modified.connect(lambda: self.setWindowModified(True))
+        self.trainer_graphics_tab.modified.connect(self._on_trainer_graphics_edited)
 
         # Tab switcher: Trainers / Trainer Classes / Graphics
         _TRAINER_TAB_SS = """
@@ -448,7 +466,13 @@ QTabBar::tab:hover:!selected {
         # Add a global Abilities editor tab
         try:
             self.abilities_tab = AbilitiesTabWidget()
-            self.abilities_tab.data_changed.connect(lambda: self.setWindowModified(True))
+            # Dirty-flag wiring: amber row on edited ability + sidebar dot.
+            # The abilities list ships its own QSS like moves/items, so the
+            # delegate-based tint is required to see dirty rows.
+            self.abilities_tab.data_changed.connect(self._on_ability_edited)
+            _al = getattr(self.abilities_tab, "_list", None)
+            if _al is not None:
+                self._install_dirty_delegate(_al)
             self.abilities_tab.data_changed.connect(self._refresh_ability_combos)
             self.abilities_tab.rename_requested.connect(self._on_ability_rename)
             self.abilities_tab.species_jump_requested.connect(self._jump_to_species)
@@ -762,6 +786,25 @@ QTabBar::tab:hover:!selected {
         self.ui.list_pokedex_regional.itemSelectionChanged.connect(
             self.update_pokedex_entry
         )
+        # Drag-to-reorder on either dex list must trip the dirty flag.
+        # QListWidget uses its internal model's rowsMoved signal — there is
+        # no widget-level equivalent. Connecting the model signal catches
+        # every InternalMove completion. Lambda captures the list reference
+        # so the slot knows which list to paint amber on.
+        try:
+            _nat = self.ui.list_pokedex_national
+            _nat.model().rowsMoved.connect(
+                lambda p, s, e, d, r, lst=_nat: self._on_dex_reordered(lst, s, e, r)
+            )
+        except Exception:
+            pass
+        try:
+            _reg = self.ui.list_pokedex_regional
+            _reg.model().rowsMoved.connect(
+                lambda p, s, e, d, r, lst=_reg: self._on_dex_reordered(lst, s, e, r)
+            )
+        except Exception:
+            pass
         self.ui.tab_pokemon_data.currentChanged.connect(self.refresh_current_species)
         self.ui.evolutions.itemSelectionChanged.connect(self.update_evolutions)
         self.ui.pushButton_7.clicked.connect(self.add_evolution)
@@ -3439,6 +3482,36 @@ QTabBar::tab:hover:!selected {
             ie = getattr(self, "items_editor", None)
             if ie is not None:
                 lst = getattr(ie, "_list", None)
+                if lst is not None:
+                    self._mark_list_item_dirty(lst, False)
+        except Exception:
+            pass
+        # Abilities editor's QListWidget — same treatment.
+        try:
+            ab = getattr(self, "abilities_tab", None)
+            if ab is not None:
+                lst = getattr(ab, "_list", None)
+                if lst is not None:
+                    self._mark_list_item_dirty(lst, False)
+        except Exception:
+            pass
+        # Trainers editor has its own custom delegate, so it needs a
+        # widget-specific API to wipe amber (the stock _mark_list_item_dirty
+        # targets foreground/background brushes, which the custom delegate
+        # ignores). clear_all_dirty also resets the external _dirty_consts
+        # set that survives search-filter rebuilds.
+        try:
+            te = getattr(self, "trainers_editor", None)
+            if te is not None and hasattr(te, "clear_all_dirty"):
+                te.clear_all_dirty()
+        except Exception:
+            pass
+        # Trainer Classes uses the stock _DirtyDelegate, so the shared
+        # helper applies cleanly.
+        try:
+            tce = getattr(self, "trainer_class_editor", None)
+            if tce is not None:
+                lst = getattr(tce, "_list", None)
                 if lst is not None:
                     self._mark_list_item_dirty(lst, False)
         except Exception:
@@ -6199,6 +6272,57 @@ QTabBar::tab:hover:!selected {
                     match_role=Qt.ItemDataRole.UserRole, match_value=hoenn,
                 )
 
+    def _on_dex_reordered(self, lst, source_start: int,
+                          source_end: int, destination_row: int):
+        """Wired (via lambda) to both dex lists' `model().rowsMoved`.
+
+        Drag-to-reorder on either dex list fires this slot. The national
+        save block (line ~8874) and regional save block (added alongside
+        this fix) rebuild their respective dex lists from the UI order —
+        so reorders DO persist on Save.
+
+        Visual feedback:
+          - title bar asterisk via `setWindowModified(True)`
+          - Pokédex sidebar dot via `sectionDirtyChanged("pokedex", True)`
+          - amber tint on every row whose index changed as a result of the
+            move. That's the range `min(source_start, destination_row)` to
+            `max(source_end, destination_row)` inclusive — dragging row 3
+            to position 8 changes the effective dex_num for rows 3 through
+            8, not just the dragged row.
+
+        Short-circuits during `_loading_depth > 0` so programmatic
+        population (project load, Refresh) doesn't falsely dirty the list.
+        """
+        if self._loading_depth > 0:
+            return
+        try:
+            self.setWindowModified(True)
+        except Exception:
+            pass
+        try:
+            self.sectionDirtyChanged.emit("pokedex", True)
+        except Exception:
+            pass
+        # Paint the affected range amber, row by row, using the existing
+        # per-row helper so the QSS-overriding delegate picks it up.
+        try:
+            lo = max(0, min(source_start, destination_row))
+            hi = min(lst.count() - 1, max(source_end, destination_row))
+            for i in range(lo, hi + 1):
+                item = lst.item(i)
+                if item is None:
+                    continue
+                const = item.data(Qt.ItemDataRole.UserRole)
+                if not const:
+                    continue
+                self._mark_list_item_dirty(
+                    lst, True,
+                    match_role=Qt.ItemDataRole.UserRole,
+                    match_value=const,
+                )
+        except Exception:
+            pass
+
     def _on_species_field_edited(self):
         """Unified dirty handler for every editable field under the Pokemon
         Data tab (Stats, Evolutions, Learnsets, Graphics, Abilities sub-panel).
@@ -6274,6 +6398,95 @@ QTabBar::tab:hover:!selected {
             )
         except Exception:
             pass
+
+    def _on_ability_edited(self):
+        """Wired to `abilities_tab.data_changed`. Marks the project modified,
+        emits sectionDirtyChanged("abilities", True) so the Abilities sidebar
+        icon gets the amber dot, and colors the currently-selected ability's
+        row amber in the tab's list. Short-circuits during programmatic loads
+        so switching ability selection doesn't falsely mark rows dirty."""
+        if self._loading_depth > 0:
+            return
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("abilities", True)
+        try:
+            ab = getattr(self, "abilities_tab", None)
+            if ab is None:
+                return
+            const = getattr(ab, "_current_ability", None)
+            lst = getattr(ab, "_list", None)
+            if lst is None or not const:
+                return
+            self._mark_list_item_dirty(
+                lst, True,
+                match_role=Qt.ItemDataRole.UserRole, match_value=const,
+            )
+        except Exception:
+            pass
+
+    def _on_trainer_edited(self):
+        """Wired to `trainers_editor.changed`. Marks the project modified,
+        emits sectionDirtyChanged("trainers", True) so the Trainers sidebar
+        icon gets the amber dot, and paints the currently-selected trainer's
+        row amber via the widget's own mark_dirty() helper (the Trainers
+        list uses a custom delegate, so the stock _mark_list_item_dirty
+        path won't reach it — the widget's API bakes the DIRTY_ROLE logic
+        into its own delegate). Short-circuits during programmatic loads
+        so switching trainer selection doesn't falsely mark rows dirty.
+        """
+        if self._loading_depth > 0:
+            return
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("trainers", True)
+        try:
+            ed = getattr(self, "trainers_editor", None)
+            if ed is None:
+                return
+            const = ed.current_const()
+            if not const:
+                return
+            ed.mark_dirty(const)
+        except Exception:
+            pass
+
+    def _on_trainer_class_edited(self):
+        """Wired to `trainer_class_editor.changed`. Trainer Classes lives in
+        the same sidebar icon group as Trainers — both emit the "trainers"
+        section so a single dot represents any unsaved edit across the
+        Trainers / Classes / Graphics sub-tabs. Also amber-tints the
+        selected class row via the stock _DirtyDelegate (no custom
+        delegate on this list, so the shared helper applies cleanly)."""
+        if self._loading_depth > 0:
+            return
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("trainers", True)
+        try:
+            tce = getattr(self, "trainer_class_editor", None)
+            if tce is None:
+                return
+            const = getattr(tce, "_current_class", None)
+            lst = getattr(tce, "_list", None)
+            if lst is None or not const:
+                return
+            self._mark_list_item_dirty(
+                lst, True,
+                match_role=Qt.ItemDataRole.UserRole, match_value=const,
+            )
+        except Exception:
+            pass
+
+    def _on_trainer_graphics_edited(self):
+        """Wired to `trainer_graphics_tab.modified`. Trainer Graphics shares
+        the "trainers" sidebar icon, so a single amber dot covers palette
+        edits as well as identity/class edits. Per the user instruction
+        (palette widget has no per-row list to tint), the signal is used
+        purely for the title-bar asterisk + sidebar dot — the combo box
+        itself is not decorated. Short-circuits during programmatic loads.
+        """
+        if self._loading_depth > 0:
+            return
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("trainers", True)
 
     def _flush_pokedex_panel(self):
         """Write panel edits back into the in-memory pokedex data,
@@ -6445,41 +6658,49 @@ QTabBar::tab:hover:!selected {
     # ── Abilities editor load / save ────────────────────────────────────────
 
     def load_abilities_editor(self):
-        """Populate the abilities editor with ability data + species cross-refs."""
+        """Populate the abilities editor with ability data + species cross-refs.
+
+        Wrapped in `_loading_guard`: populating the list + panel triggers
+        the detail panel's edit signals, which escape its own `_loading`
+        flag for fields like DexDescriptionEdit (textChanged fires on every
+        setPlainText). The guard suppresses the resulting
+        `_on_ability_edited → sectionDirtyChanged` chain so a fresh open of
+        the Abilities tab doesn't amber-highlight the first ability."""
         if not self.source_data or not hasattr(self, "abilities_tab") or not self.abilities_tab:
             return
-        abilities = self.source_data.get_pokemon_abilities() or {}
+        with self._loading_guard():
+            abilities = self.source_data.get_pokemon_abilities() or {}
 
-        # The JSON cache only has {name, id} — read display names and
-        # descriptions directly from src/data/text/abilities.h (the same
-        # file the name decapitalizer reads/writes).
-        root = ""
-        try:
-            root = self.local_util.repo_root()
-        except Exception:
-            pass
-        if root:
-            self._enrich_abilities_from_text(root, abilities)
+            # The JSON cache only has {name, id} — read display names and
+            # descriptions directly from src/data/text/abilities.h (the same
+            # file the name decapitalizer reads/writes).
+            root = ""
+            try:
+                root = self.local_util.repo_root()
+            except Exception:
+                pass
+            if root:
+                self._enrich_abilities_from_text(root, abilities)
 
-        # Build species data dict for cross-reference.
-        # get_species_ability() resolves numeric IDs to ABILITY_* constants.
-        species_data = {}
-        pokemon = self.source_data.get_pokemon_data() or {}
-        for sp_const in pokemon:
-            resolved = []
-            for i in range(2):
-                try:
-                    ab = self.source_data.get_species_ability(sp_const, i)
-                except Exception:
-                    ab = "ABILITY_NONE"
-                resolved.append(ab or "ABILITY_NONE")
-            sp_name = self.source_data.get_species_data(sp_const, "name") or sp_const
-            species_data[sp_const] = {
-                "abilities": resolved,
-                "name": sp_name,
-            }
+            # Build species data dict for cross-reference.
+            # get_species_ability() resolves numeric IDs to ABILITY_* constants.
+            species_data = {}
+            pokemon = self.source_data.get_pokemon_data() or {}
+            for sp_const in pokemon:
+                resolved = []
+                for i in range(2):
+                    try:
+                        ab = self.source_data.get_species_ability(sp_const, i)
+                    except Exception:
+                        ab = "ABILITY_NONE"
+                    resolved.append(ab or "ABILITY_NONE")
+                sp_name = self.source_data.get_species_data(sp_const, "name") or sp_const
+                species_data[sp_const] = {
+                    "abilities": resolved,
+                    "name": sp_name,
+                }
 
-        self.abilities_tab.load_abilities(abilities, species_data, project_root=root)
+            self.abilities_tab.load_abilities(abilities, species_data, project_root=root)
 
     @staticmethod
     def _enrich_abilities_from_text(root: str, abilities: dict):
@@ -6802,6 +7023,146 @@ QTabBar::tab:hover:!selected {
             else:
                 maybe_exec(
                     key="rename_queued_ability",
+                    parent=self,
+                    title="Name Updated",
+                    text=f"Display name changed to \"{display_name}\".",
+                )
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _on_trainer_class_rename(self, old_const: str):
+        """Rename a TRAINER_CLASS_* constant across the whole project.
+
+        Mirrors _on_ability_rename / _on_move_rename: opens the shared
+        RenameDialog (display name + auto-derived constant), drives the
+        source-file pass through refactor_service.rename_trainer_class,
+        and calls into the Trainer Class editor to update its in-memory
+        caches so the list text + detail panel stay consistent without
+        a full reload.
+        """
+        if not self.source_data or not old_const:
+            return
+        try:
+            from ui.custom_widgets.rename_dialog import RenameDialog
+            dlg = RenameDialog(
+                self, prefix="TRAINER_CLASS_",
+                entity_type="Trainer Class", show_display=True,
+            )
+            dlg.set_old_constant(old_const)
+
+            tce = getattr(self, "trainer_class_editor", None)
+            # Pre-populate display name from the editor's current view of
+            # the class (picks up any in-progress _dirty_names edit).
+            cur_name = ""
+            if tce is not None:
+                try:
+                    cur_name = tce._dirty_names.get(
+                        old_const, tce._names.get(old_const, "")
+                    )
+                except Exception:
+                    cur_name = ""
+            if not cur_name:
+                base = old_const[len("TRAINER_CLASS_"):] if old_const.startswith("TRAINER_CLASS_") else old_const
+                cur_name = base.replace("_", " ").title()
+            dlg.set_display_name(cur_name)
+
+            # Live preview of source-file hits
+            def _preview():
+                _, new_const, display_name = dlg.get_values()
+                if new_const and new_const != old_const:
+                    try:
+                        svc = getattr(getattr(self, "source_data", None), "refactor_service", None)
+                        if svc:
+                            previews = svc.rename_trainer_class(
+                                old_const, new_const,
+                                display_name=display_name or "",
+                                preview=True,
+                            )
+                            dlg.set_preview(previews or [])
+                    except Exception:
+                        pass
+            dlg.suffix_edit.textChanged.connect(_preview)
+            try:
+                dlg.display_edit.textChanged.connect(_preview)
+            except Exception:
+                pass
+
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            _, new_const, display_name = dlg.get_values()
+            if not new_const:
+                return
+
+            const_changed = new_const != old_const
+            # Pull the ORIGINAL on-disk display name for comparison. Anything
+            # the user typed into the live-name field counts as a pending
+            # edit, not the "old" value.
+            original_display = ""
+            if tce is not None:
+                try:
+                    original_display = tce._names.get(old_const, "")
+                except Exception:
+                    original_display = ""
+            display_changed = display_name != original_display
+
+            if not const_changed and not display_changed:
+                return
+
+            previews = []
+            if const_changed:
+                svc = getattr(getattr(self, "source_data", None), "refactor_service", None)
+                if svc is None:
+                    QMessageBox.warning(self, "Rename", "Refactor service unavailable.")
+                    return
+                previews = svc.rename_trainer_class(
+                    old_const, new_const,
+                    display_name=display_name or "",
+                )
+
+            # Update the class editor's in-memory state in place so the list
+            # and detail panel immediately show the new name/constant.
+            if tce is not None:
+                try:
+                    tce.rename_class_key(old_const, new_const, display_name or "")
+                except Exception:
+                    import traceback; traceback.print_exc()
+                # Track display-name rename so Save writes the new string
+                # to trainer_class_names.h even if only the display changed.
+                if not const_changed and display_changed:
+                    try:
+                        tce._dirty_names[old_const] = display_name or ""
+                    except Exception:
+                        pass
+
+            # Also update the Trainers editor's cached class-name map so
+            # the "class" column / picker shows the new name without reload.
+            try:
+                if hasattr(self.trainers_editor, "apply_class_name"):
+                    target_const = new_const if const_changed else old_const
+                    self.trainers_editor.apply_class_name(
+                        target_const, display_name or ""
+                    )
+            except Exception:
+                pass
+
+            self.setWindowModified(True)
+
+            if const_changed:
+                n = len(previews)
+                maybe_exec(
+                    key="rename_queued_trainer_class",
+                    parent=self,
+                    title="Rename Queued",
+                    text=(
+                        f"Trainer class rename  {old_const}  \u2192  {new_const}  staged.\n"
+                        f"{n} reference(s) found in source files.\n\n"
+                        "Changes will be written to disk on File \u2192 Save."
+                    ),
+                )
+            else:
+                maybe_exec(
+                    key="rename_queued_trainer_class",
                     parent=self,
                     title="Name Updated",
                     text=f"Display name changed to \"{display_name}\".",
@@ -7931,69 +8292,92 @@ QTabBar::tab:hover:!selected {
     # ── New trainer editor (TrainersTabWidget) ────────────────────────────────
 
     def _load_trainers_editor(self):
-        """Load trainer data into the new TrainersTabWidget editor."""
+        """Load trainer data into the new TrainersTabWidget editor.
+
+        Wrapped in `_loading_guard`: populating combos + detail panel +
+        party slots fires `.changed` signals that would otherwise cascade
+        into `_on_trainer_edited` → sectionDirtyChanged so the Trainers
+        sidebar dot + title-bar asterisk light up on a fresh open even
+        though the user has made no edits. The guard suppresses the
+        dirty-mark chain for the duration of the load.
+        """
         if not self.source_data:
             return
-        try:
-            trainers = self.source_data.get_pokemon_trainers() or {}
-            root     = self.project_info.get("dir", "") if self.project_info else ""
-
-            # Build species list
-            species_list = [("SPECIES_NONE", "None")]
+        with self._loading_guard():
             try:
-                for k, v in self.source_data.get_pokemon_data().items():
-                    name = v.get("name") or k.replace("SPECIES_", "").replace("_", " ").title()
-                    species_list.append((k, name))
-            except Exception:
-                pass
+                trainers = self.source_data.get_pokemon_trainers() or {}
+                root     = self.project_info.get("dir", "") if self.project_info else ""
 
-            # Build items list
-            items_list = [("ITEM_NONE", "None")]
-            try:
-                for k, v in self.source_data.get_pokemon_items().items():
-                    name = v.get("english") or v.get("name") or k
-                    items_list.append((k, name))
-            except Exception:
-                pass
+                # Build species list
+                species_list = [("SPECIES_NONE", "None")]
+                try:
+                    for k, v in self.source_data.get_pokemon_data().items():
+                        name = v.get("name") or k.replace("SPECIES_", "").replace("_", " ").title()
+                        species_list.append((k, name))
+                except Exception:
+                    pass
 
-            # Build moves list
-            moves_list = [("MOVE_NONE", "None")]
-            try:
-                raw_moves = self.source_data.get_pokemon_moves() or {}
-                for k in sorted(raw_moves.keys(),
-                                 key=lambda x: (self.source_data.get_move_data(x, "id") or 0)):
-                    v    = raw_moves[k]
-                    name = v.get("name") or k.replace("MOVE_", "").replace("_", " ").title()
-                    moves_list.append((k, name))
-            except Exception:
-                pass
+                # Build items list
+                items_list = [("ITEM_NONE", "None")]
+                try:
+                    for k, v in self.source_data.get_pokemon_items().items():
+                        name = v.get("english") or v.get("name") or k
+                        items_list.append((k, name))
+                except Exception:
+                    pass
 
-            self.trainers_editor.load(
-                trainers, root, species_list, items_list, moves_list,
-                species_icon_fn=self._species_list_icon,
-            )
+                # Build moves list
+                moves_list = [("MOVE_NONE", "None")]
+                try:
+                    raw_moves = self.source_data.get_pokemon_moves() or {}
+                    for k in sorted(raw_moves.keys(),
+                                     key=lambda x: (self.source_data.get_move_data(x, "id") or 0)):
+                        v    = raw_moves[k]
+                        name = v.get("name") or k.replace("MOVE_", "").replace("_", " ").title()
+                        moves_list.append((k, name))
+                except Exception:
+                    pass
 
-            # Load the trainer graphics tab with the same pic map
-            try:
-                pic_map = getattr(self.trainers_editor, "_pic_map", {})
-                self.trainer_graphics_tab.load(root, pic_map)
-            except Exception:
-                pass
-
-            # Also load the trainer class editor, but ONLY if it has no
-            # unsaved edits — otherwise re-running load() would silently
-            # discard the user's dirty name/money/pic changes.
-            try:
-                tce = self.trainer_class_editor
-                if not (getattr(tce, "_loaded", False) and tce.has_edits()):
-                    tce.load(root, trainers)
-            except Exception as exc2:
-                logging.getLogger(__name__).warning(
-                    "_load_trainers_editor class editor: %s", exc2
+                self.trainers_editor.load(
+                    trainers, root, species_list, items_list, moves_list,
+                    species_icon_fn=self._species_list_icon,
                 )
-        except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("_load_trainers_editor: %s", exc)
+
+                # Load the trainer graphics tab with the same pic map
+                try:
+                    pic_map = getattr(self.trainers_editor, "_pic_map", {})
+                    self.trainer_graphics_tab.load(root, pic_map)
+                except Exception:
+                    pass
+
+                # Also load the trainer class editor. Normally we skip reload
+                # when there are unsaved edits (protecting against non-refresh
+                # reloads clobbering the user's in-progress work) — but the
+                # F5 refresh path is SUPPOSED to discard edits, so when
+                # _refresh_discarding is True we bypass the has_edits() guard
+                # and always reload from disk. Without this override, F5
+                # silently keeps stale in-memory class edits visible.
+                try:
+                    tce = self.trainer_class_editor
+                    discarding = getattr(self, "_refresh_discarding", False)
+                    if discarding or not (
+                        getattr(tce, "_loaded", False) and tce.has_edits()
+                    ):
+                        tce.load(root, trainers)
+                        if discarding:
+                            # Wipe amber + dirty flags in the class editor so
+                            # the UI matches the freshly-reloaded disk state.
+                            try:
+                                tce.clear_dirty()
+                            except Exception:
+                                pass
+                except Exception as exc2:
+                    logging.getLogger(__name__).warning(
+                        "_load_trainers_editor class editor: %s", exc2
+                    )
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("_load_trainers_editor: %s", exc)
 
     def _save_trainer_classes(self):
         """Flush TrainerClassEditor edits and write to C headers."""
@@ -8836,6 +9220,27 @@ QTabBar::tab:hover:!selected {
                                 sdata["dex_num"] = i + 1
                                 sdata["dex_constant"] = const
                     self.source_data.data["pokedex"].data["national_dex"] = dex_list
+
+                    # Same treatment for the regional dex list — it also
+                    # supports drag-reorder. Without this rebuild, regional
+                    # reorders were silently dropped at save time.
+                    try:
+                        reg_list = []
+                        current_reg = {
+                            d.get("dex_constant"): d
+                            for d in (self.source_data.get_regional_dex() or [])
+                        }
+                        for i in range(self.ui.list_pokedex_regional.count()):
+                            item = self.ui.list_pokedex_regional.item(i)
+                            const = item.data(Qt.ItemDataRole.UserRole)
+                            entry = current_reg.get(
+                                const, {"dex_constant": const}
+                            )
+                            entry["dex_num"] = i + 1
+                            reg_list.append(entry)
+                        self.source_data.data["pokedex"].data["regional_dex"] = reg_list
+                    except Exception:
+                        pass
 
                 # Consolidate global Moves table edits before save
                 dlg.step("Writing moves")

@@ -219,21 +219,32 @@ def _build_class_to_facility(fac_to_class: dict) -> dict[str, list[str]]:
 
 
 def _parse_trainer_pic_paths(root: str) -> dict[str, str]:
-    """Return {TRAINER_PIC_CONST: abs_png_path}."""
-    path_by_suffix: dict[str, str] = {}
+    """Return {TRAINER_PIC_CONST: abs_png_path}.
+
+    Bridging via the ``gTrainerFrontPic_<Symbol>`` C symbol, not the filename —
+    the filename uses its own snake_case convention that doesn't line up with
+    the constant for compound-word classes. Example:
+    ``TRAINER_PIC_COOLTRAINER_M`` → symbol ``CooltrainerM`` → file
+    ``cool_trainer_m_front_pic.png``. Matching the constant suffix against the
+    filename stem misses this pairing. Normalising both the constant suffix
+    and the symbol to ``lowercased-and-underscore-stripped`` collapses them to
+    the same key (``cooltrainerm``) and they line up reliably.
+    """
+    path_by_symbol: dict[str, str] = {}
     gfx = os.path.join(root, "src", "data", "graphics", "trainers.h")
     if os.path.isfile(gfx):
         pat = re.compile(
-            r'gTrainerFrontPic_\w+\[\]\s*=\s*INCBIN_U32\("([^"]+front_pic\.4bpp\.lz)"\)'
+            r'gTrainerFrontPic_(\w+)\[\]\s*=\s*INCBIN_U32\("([^"]+front_pic\.4bpp\.lz)"\)'
         )
         try:
             with open(gfx, encoding="utf-8", errors="replace") as f:
                 for line in f:
                     m = pat.search(line)
                     if m:
-                        rel = m.group(1)
-                        key = os.path.basename(rel).replace("_front_pic.4bpp.lz", "")
-                        path_by_suffix[key] = os.path.join(
+                        symbol = m.group(1)                    # CooltrainerM
+                        rel    = m.group(2)
+                        key    = symbol.replace("_", "").lower()   # cooltrainerm
+                        path_by_symbol[key] = os.path.join(
                             root, rel.replace(".4bpp.lz", ".png")
                         )
         except Exception as exc:
@@ -248,9 +259,11 @@ def _parse_trainer_pic_paths(root: str) -> dict[str, str]:
                 for line in f:
                     m = pat2.search(line)
                     if m:
-                        suffix = m.group(1)[len("TRAINER_PIC_"):].lower()
-                        if suffix in path_by_suffix:
-                            result[m.group(1)] = path_by_suffix[suffix]
+                        const  = m.group(1)
+                        suffix = const[len("TRAINER_PIC_"):]
+                        key    = suffix.replace("_", "").lower()
+                        if key in path_by_symbol:
+                            result[const] = path_by_symbol[key]
         except Exception as exc:
             log.warning("_parse_trainer_pic_paths consts: %s", exc)
     return result
@@ -327,9 +340,15 @@ def write_facility_pic_mapping(
     path = os.path.join(root, "src", "data", "pokemon", "trainer_class_lookups.h")
     if not os.path.isfile(path):
         return False
-    # Build {FACILITY_CLASS: new_PIC} from edits
+    # Build {FACILITY_CLASS: new_PIC} from edits.
+    # Skip entries whose new_pic is empty ("" from the "(none)" option in
+    # the combo) — otherwise the writer would emit "[FAC_X] = ," which is
+    # a C syntax error and breaks the build. Empty == "don't change this
+    # class's pic mapping".
     fac_edits: dict[str, str] = {}
     for tc, new_pic in edits.items():
+        if not new_pic:
+            continue
         for fac in class_to_fac.get(tc, []):
             fac_edits[fac] = new_pic
     if not fac_edits:
@@ -489,6 +508,10 @@ class TrainerClassEditor(QWidget):
     # Used to push pending name renames to the sibling Trainers editor live,
     # so the trainer list/detail reflect pending class name edits without save.
     class_name_edited = pyqtSignal(str, str)
+    # Emitted when the user clicks the Rename button — mainwindow opens
+    # the shared RenameDialog and routes the rename through refactor_service
+    # so the constant gets renamed across every source file at once.
+    rename_class_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -620,14 +643,37 @@ class TrainerClassEditor(QWidget):
         edit_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         edit_form.setSpacing(8)
 
-        # Display name
+        # Display name + Rename button
+        name_row = QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(6)
         self._name_edit = QLineEdit()
         self._name_edit.setMaxLength(12)
         self._name_edit.setStyleSheet(_input_ss)
+        self._name_edit.setToolTip(
+            "Updates only the in-game display string for this class.\n"
+            "Does NOT rename the TRAINER_CLASS_* constant — use the\n"
+            "Rename... button for that (updates all source files)."
+        )
         self._name_edit.textChanged.connect(self._on_name_changed)
+        name_row.addWidget(self._name_edit, 1)
+        self._rename_btn = QPushButton("Rename...")
+        self._rename_btn.setFixedWidth(80)
+        self._rename_btn.setToolTip(
+            "Rename the TRAINER_CLASS_* constant across every source file\n"
+            "(opponents.h, trainer_class_names.h, battle_main.c, trainers.json,\n"
+            "scripts, maps, etc.). Display name and constant suffix update\n"
+            "together, like the Pokémon / Item / Move / Ability rename flow."
+        )
+        self._rename_btn.setStyleSheet(
+            "background: #2a2a3a; color: #aac; border: 1px solid #3a3a4a; "
+            "padding: 3px 8px; border-radius: 3px; font-size: 10px;"
+        )
+        self._rename_btn.clicked.connect(self._on_rename_clicked)
+        name_row.addWidget(self._rename_btn)
         lbl = QLabel("Display Name:")
         lbl.setStyleSheet(_fs)
-        edit_form.addRow(lbl, self._name_edit)
+        edit_form.addRow(lbl, name_row)
 
         self._name_counter = QLabel("0/12")
         self._name_counter.setStyleSheet("color: #666; font-size: 9px;")
@@ -682,11 +728,14 @@ class TrainerClassEditor(QWidget):
         pic_form.addRow("", self._open_folder_btn)
 
         pic_note = QLabel(
-            "Changes the sprite for this class in Battle Tower,\n"
-            "Trainer Tower, and Union Room via facility class lookups."
+            "Class-level sprite used ONLY in Battle Tower, Trainer Tower,\n"
+            "and Union Room matches — where the opponent is generated from\n"
+            "a class, not a specific trainer. Regular trainer battles use\n"
+            "the per-trainer pic set on the Trainers tab, not this one.\n"
+            "Set to (none) if this class is never used in a facility."
         )
         pic_note.setStyleSheet(
-            "color: #555; font-size: 9px; font-style: italic;"
+            "color: #888; font-size: 10px; font-style: italic;"
         )
         pic_note.setWordWrap(True)
         pic_form.addRow("", pic_note)
@@ -837,7 +886,13 @@ class TrainerClassEditor(QWidget):
     # ── Pic combo ──────────────────────────────────────────────────────────
 
     def _populate_pic_combo(self):
-        """Fill the sprite picker dropdown with all TRAINER_PIC constants."""
+        """Fill the sprite picker dropdown with all TRAINER_PIC constants.
+
+        The leading "(none)" entry is kept so classes with no mapping yet
+        render something in the dropdown, but selecting it does NOT write
+        an empty pic to disk — ``write_facility_pic_mapping`` treats empty
+        values as "leave alone" to avoid emitting invalid C (``[FAC] = ,``).
+        """
         self._pic_cb.blockSignals(True)
         self._pic_cb.clear()
         self._pic_cb.addItem("(none)", "")
@@ -1049,6 +1104,75 @@ class TrainerClassEditor(QWidget):
 
         self.changed.emit()
 
+    def _on_rename_clicked(self):
+        """User clicked the Rename... button — delegate to mainwindow so it
+        can open the shared RenameDialog and drive the cross-project rename
+        through refactor_service. Mainwindow calls back via
+        ``rename_class_key`` to update this widget's in-memory data."""
+        if not self._current_class:
+            return
+        self.rename_class_requested.emit(self._current_class)
+
+    def rename_class_key(self, old_const: str, new_const: str, display_name: str) -> None:
+        """Re-key every in-memory dict from old_const to new_const and swap
+        the selected trainer-class constant. Called by mainwindow after the
+        refactor service has queued (or applied) the global rename, so the
+        editor's list + widgets stay in sync without a full reload.
+
+        display_name is written into self._names under the NEW key so the
+        list item text / summary reflect the combined rename+displayname.
+        """
+        if not old_const or not new_const or old_const == new_const:
+            # Display-only change — just update the name caches.
+            if old_const in self._names:
+                self._names[old_const] = display_name
+            if self._current_class == old_const:
+                self._name_edit.blockSignals(True)
+                self._name_edit.setText(display_name)
+                self._name_edit.blockSignals(False)
+                self._update_name_counter(display_name)
+            return
+
+        def _rekey(d: dict):
+            if old_const in d:
+                d[new_const] = d.pop(old_const)
+
+        _rekey(self._classes)
+        _rekey(self._names)
+        _rekey(self._money)
+        _rekey(self._class_to_pic)
+        _rekey(self._class_to_fac)
+        _rekey(self._dirty_names)
+        _rekey(self._dirty_money)
+        _rekey(self._dirty_pics)
+        # display_name overrides whatever was in _names — refactor_service
+        # has already queued the name write, keep caches consistent.
+        self._names[new_const] = display_name
+
+        # Swap the list item's stored const + visible text.
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if item and item.data(Qt.ItemDataRole.UserRole) == old_const:
+                item.setData(Qt.ItemDataRole.UserRole, new_const)
+                item.setText(display_name or new_const)
+                break
+
+        if self._current_class == old_const:
+            self._current_class = new_const
+            self._name_edit.blockSignals(True)
+            self._name_edit.setText(display_name)
+            self._name_edit.blockSignals(False)
+            self._update_name_counter(display_name)
+            # The identity label at the top of the detail panel also needs
+            # to refresh. Not all builds of this editor have _const_lbl, so
+            # guard the access.
+            const_lbl = getattr(self, "_const_lbl", None)
+            if const_lbl is not None:
+                try:
+                    const_lbl.setText(new_const)
+                except Exception:
+                    pass
+
     def _on_money_changed(self, value: int):
         if not self._current_class:
             return
@@ -1127,6 +1251,14 @@ class TrainerClassEditor(QWidget):
         const_edit = QLineEdit()
         const_edit.setPlaceholderText("e.g. TRAINER_CLASS_MY_CLASS")
         const_edit.setStyleSheet(_input_ss)
+        # Hard-restrict input to A-Z, 0-9, and underscore so the user
+        # physically cannot type lowercase, spaces, or punctuation.
+        from PyQt6.QtGui import QRegularExpressionValidator
+        from PyQt6.QtCore import QRegularExpression
+        const_edit.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression(r"^[A-Z][A-Z0-9_]*$"), const_edit)
+        )
         form.addRow("Constant:", const_edit)
 
         name_edit = QLineEdit()
@@ -1172,6 +1304,19 @@ class TrainerClassEditor(QWidget):
 
         if not const_name.startswith("TRAINER_CLASS_"):
             const_name = "TRAINER_CLASS_" + const_name
+
+        # Belt-and-suspenders regex check — the QLineEdit validator already
+        # prevents illegal characters, but if this code ever runs before the
+        # validator is attached (tests, future refactor), fail loudly.
+        if not re.fullmatch(r"TRAINER_CLASS_[A-Z][A-Z0-9_]*", const_name):
+            QMessageBox.warning(
+                self, "Invalid Constant",
+                "Trainer class constants must be ALL-CAPS with only\n"
+                "letters, digits, and underscores, starting with a letter\n"
+                "after the TRAINER_CLASS_ prefix.\n\n"
+                f"Got: {const_name}"
+            )
+            return
 
         if const_name in self._classes:
             QMessageBox.warning(self, "Already Exists", f"{const_name} already exists.")

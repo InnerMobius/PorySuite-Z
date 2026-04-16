@@ -827,7 +827,13 @@ class AbilityDetailPanel(QWidget):
             self.edit_desc.blockSignals(False)
 
             # ── Detect and load battle/field effects ───────────────────────
-            self._load_effect_editors(const, project_root)
+            # Pass the ability's own data dict in: if the user has edited this
+            # ability earlier in the session, `save_current` has already
+            # stashed the (template_id, params) tuple into `data` under
+            # `_battle_effect`/`_field_effect`. We must prefer those values
+            # over re-detecting from disk — otherwise navigating to another
+            # ability and coming back silently reverts the edit.
+            self._load_effect_editors(const, project_root, data)
 
             # Species usage table
             self.tbl_species.setRowCount(len(species_usage))
@@ -905,8 +911,16 @@ class AbilityDetailPanel(QWidget):
 
     # ── Effect editor methods ────────────────────────────────────────────────
 
-    def _load_effect_editors(self, const: str, project_root: str):
-        """Detect current effects and populate the template combos."""
+    def _load_effect_editors(self, const: str, project_root: str,
+                             data: dict | None = None):
+        """Detect current effects and populate the template combos.
+
+        If `data` contains session-edited `_battle_effect` / `_field_effect`
+        tuples (stashed by `AbilitiesTabWidget.save_current` when the user
+        navigated away from this ability), those take precedence over
+        re-detecting from the C source on disk. This is what makes a mid-
+        session edit survive a row switch-and-return.
+        """
         from core.ability_effect_templates import (
             detect_all_effects, BATTLE_TEMPLATE_MAP, FIELD_TEMPLATE_MAP,
         )
@@ -920,6 +934,19 @@ class AbilityDetailPanel(QWidget):
                 import logging
                 logging.getLogger(__name__).warning(
                     "Effect detection failed for %s: %s", const, e)
+
+        # Session-edited values override disk detection. The tuple shape
+        # matches what `detect_all_effects` returns: (template_id, params).
+        # Empty template_id ("" ) means the user cleared the effect — which
+        # still needs to override the on-disk "yes there is an effect"
+        # result, otherwise a clear-and-navigate-away is also lost.
+        if data is not None:
+            if "_battle_effect" in data:
+                btid, bparams = data["_battle_effect"]
+                battle_result = (btid, bparams) if btid else None
+            if "_field_effect" in data:
+                ftid, fparams = data["_field_effect"]
+                field_result = (ftid, fparams) if ftid else None
 
         # ── Battle effect ──
         self.cmb_battle_template.blockSignals(True)
@@ -1637,6 +1664,15 @@ class AbilitiesTabWidget(QWidget):
             key=lambda kv: kv[1].get("id", 0),
         )
         for const, data in sorted_abilities:
+            # ABILITY_NONE is the sentinel "no ability" slot used throughout
+            # the source and by the species editor's "empty" dropdown option.
+            # It must stay in `_abilities_data` (the save path writes it as
+            # #define ABILITY_NONE 0) but should NOT appear in the editable
+            # list — there's nothing for the user to edit on it and the
+            # species-usage pane for "NONE" would list every ability-less
+            # species in the game.
+            if const == "ABILITY_NONE" or data.get("id", 0) == 0:
+                continue
             display = data.get("display_name", data.get("name", const))
             aid = data.get("id", "?")
             item = QListWidgetItem(f"{aid:>3}  {display}")

@@ -651,6 +651,31 @@ class RefactorService:
 
         return previews
 
+    def rename_trainer_class(self, old_const: str, new_const: str, display_name: str, preview: bool = False) -> List[PreviewEntry]:
+        """Rename a TRAINER_CLASS_* constant across the whole repo.
+
+        Updates:
+        - The TRAINER_CLASS_* constant itself everywhere it appears (opponents.h
+          and trainers.h #define, trainer_class_names.h index, battle_main.c
+          gTrainerMoneyTable key, data/trainers.json trainerClass field, etc.).
+        - The display-name string in src/data/text/trainer_class_names.h.
+
+        Intentionally does NOT rename the FACILITY_CLASS_* constant — that is
+        a separate include/constants/trainer_types.h enum used by facility
+        battles, and renaming the trainer class does not imply the facility
+        class mapping should change.
+        """
+        previews: List[PreviewEntry] = []
+        previews.extend(self._search_and_replace(old_const, new_const, preview_only=True))
+        if not preview:
+            self.pending.append({
+                "op": "rename_trainer_class",
+                "old": old_const,
+                "new": new_const,
+                "display": display_name,
+            })
+        return previews
+
     def rename_trainer(self, old_const: str, new_const: str, preview: bool = False) -> List[PreviewEntry]:
         """Rename a trainer constant across the whole repo.
 
@@ -990,6 +1015,38 @@ class RefactorService:
                 if self._logger:
                     self._logger(f"Renamed ability {old} -> {new}")
                 self._record("abilities", old, new)
+                applied.append(op)
+            elif kind == "rename_trainer_class":
+                # Replace the TRAINER_CLASS_* constant everywhere. This also
+                # catches the [TRAINER_CLASS_X] key inside trainer_class_names.h
+                # — the key is renamed automatically, only the string literal
+                # needs a separate pass.
+                self._search_and_replace(old, new, preview_only=False)
+                if self._logger:
+                    self._logger(f"Renamed trainer class {old} -> {new}")
+                # Update the display-name string in trainer_class_names.h.
+                # The key was already renamed above, so match the NEW const.
+                tc_display = op.get("display")
+                if tc_display:
+                    names_h = os.path.join(root, "src", "data", "text", "trainer_class_names.h")
+                    if os.path.isfile(names_h):
+                        try:
+                            with open(names_h, "r", encoding="utf-8") as fh:
+                                text = fh.read()
+                            new_text = re.sub(
+                                r'(\[' + re.escape(new) + r'\]\s*=\s*_\(")[^"]*(")',
+                                lambda m: m.group(1) + tc_display + m.group(2),
+                                text,
+                            )
+                            if new_text != text:
+                                with open(names_h, "w", encoding="utf-8", newline="\n") as fh:
+                                    fh.write(new_text)
+                                self._changed_files.add(names_h)
+                                if self._logger:
+                                    self._logger(f"Updated class name in trainer_class_names.h: {tc_display}")
+                        except Exception:
+                            logging.exception("Failed updating trainer_class_names.h display name")
+                self._record("trainer_classes", old, new)
                 applied.append(op)
             elif kind == "rename_trainer":
                 old_party = op.get("old_party") or self._trainer_to_party_symbol(old)
