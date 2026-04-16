@@ -80,6 +80,7 @@ The VS Seeker tier-gate flag-picker dialog was supposed to display friendly labe
 
 ## Bug Fixes
 
+- **Ability field effect "Halve Egg Hatch Steps" no longer breaks the build.** The tool's template was injecting C code that referenced `i` before the host function's `u32 i` was declared (`src/daycare.c:1146: 'i' undeclared`). Template now declares its own local loop variables. The field-effect remover also got a new marker-block helper so "Clear Field Effect" leaves `daycare.c` fully clean instead of leaving orphan scaffolding behind.
 - Trainer Pic shows correctly for COOLTRAINER / POKEMANIAC / every other compound-word class (no more "?" placeholder).
 - Rematch-tier party edits survive tier switches.
 - Tier dropdown label refreshes in-place after editing the current tier's party.
