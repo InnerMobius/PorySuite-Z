@@ -30,6 +30,11 @@ from ui.dex_description_edit import DexDescriptionEdit
 ABILITY_NAME_LENGTH = 12   # GBA in-game max (ABILITY_NAME_LENGTH in battle_main.h)
 ABILITY_DESC_LENGTH = 51   # 52-byte buffer on summary screen minus null terminator
 
+# Matches mainwindow.MainWindow.DIRTY_FLAG_ROLE — the role the shared
+# _DirtyDelegate paints amber backgrounds from.  Duplicated here instead of
+# imported to avoid a circular import (mainwindow imports this module).
+DIRTY_FLAG_ROLE = Qt.ItemDataRole.UserRole + 500
+
 
 def _name_to_constant_suffix(display_name: str) -> str:
     """Derive an ALL_CAPS_UNDERSCORE constant suffix from a display name.
@@ -1182,16 +1187,43 @@ class AbilityDetailPanel(QWidget):
 # ── Add New Ability Dialog ───────────────────────────────────────────────────
 
 class AddAbilityDialog(QDialog):
-    """Dialog for creating a new ability with optional battle/field effect copying."""
+    """Dialog for creating a new ability.
+
+    Offers two parallel ways to give the new ability behavior:
+
+      1. Pick a **template** from the audited library (Stat Double, Type
+         Resist, Type Encounter, Nature Sync, etc.) with inline parameter
+         fields — fully covered by the test harness in
+         `C:\\tmp\\porysuite-audit\\`.  This is the clean, build-safe path
+         for a brand-new ability.
+      2. **Copy from an existing ability** — replicates that ability's
+         current C code under the new constant.  Useful for legacy / inline
+         references that don't map to any template.
+
+    A side with a template picked greys out the copy-from combo on that
+    side (and vice versa), so the choice is unambiguous.  Both paths are
+    optional — leave everything blank and you get a bare
+    constant + name + description entry that can be customized later via
+    the right-hand editor.
+
+    The dialog itself NEVER writes to disk.  Template choices are stashed
+    into `data["_battle_effect"]`/`data["_field_effect"]` so the normal
+    save-abilities pipeline can inject C on the user's Save action.
+    Copy-from still writes to disk immediately on OK (pre-existing
+    behavior, unchanged).
+    """
 
     def __init__(self, next_id: int, existing_constants: set[str],
                  abilities_data: dict | None = None, project_root: str = "",
                  parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add New Ability")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(540)
         self._existing = existing_constants
         self._project_root = project_root
+        self._battle_param_combos: dict[str, QComboBox] = {}
+        self._field_param_combos: dict[str, QComboBox] = {}
+        self._loading = True   # suppresses preview churn during __init__
 
         layout = QVBoxLayout(self)
 
@@ -1243,10 +1275,62 @@ class AddAbilityDialog(QDialog):
         self.lbl_id = QLabel(str(next_id))
         form.addRow("ID (auto):", self.lbl_id)
 
-        # ── Copy battle effect from ─────────────────────────────────────────
+        layout.addLayout(form)
+
+        # ── Battle Effect group (template OR copy-from) ──────────────────────
+        from core.ability_effect_templates import (
+            BATTLE_TEMPLATES, FIELD_TEMPLATES,
+        )
+
+        grp_battle = QGroupBox("Battle Effect (optional)")
+        b_v = QVBoxLayout(grp_battle)
+        b_v.setSpacing(4)
+
+        b_tmpl_row = QHBoxLayout()
+        b_tmpl_row.addWidget(QLabel("Template:"))
+        self.cmb_battle_template = QComboBox()
+        self.cmb_battle_template.wheelEvent = lambda e: e.ignore()
+        self.cmb_battle_template.addItem("(none)", "")
+        for tmpl in BATTLE_TEMPLATES:
+            self.cmb_battle_template.addItem(tmpl.name, tmpl.id)
+        self.cmb_battle_template.setToolTip(
+            "Pick a battle effect template.  Code is only written when "
+            "you Save the project — nothing touches disk right now."
+        )
+        self.cmb_battle_template.currentIndexChanged.connect(
+            self._on_battle_template_changed)
+        b_tmpl_row.addWidget(self.cmb_battle_template, 1)
+        b_v.addLayout(b_tmpl_row)
+
+        self._battle_params_widget = QWidget()
+        self._battle_params_layout = QFormLayout(self._battle_params_widget)
+        self._battle_params_layout.setContentsMargins(12, 0, 0, 0)
+        self._battle_params_layout.setSpacing(3)
+        self._battle_params_layout.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight)
+        b_v.addWidget(self._battle_params_widget)
+
+        self.lbl_battle_tmpl_preview = QLabel("")
+        self.lbl_battle_tmpl_preview.setWordWrap(True)
+        self.lbl_battle_tmpl_preview.setStyleSheet(
+            "color: #888888; font-size: 9px; font-family: 'Courier New';"
+            " padding: 2px 4px; background-color: #161616;"
+            " border: 1px solid #2a2a2a; border-radius: 3px;"
+        )
+        self.lbl_battle_tmpl_preview.setVisible(False)
+        b_v.addWidget(self.lbl_battle_tmpl_preview)
+
+        b_or = QLabel("— or —")
+        b_or.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        b_or.setStyleSheet("color: #666666; font-size: 10px; padding: 2px 0;")
+        b_v.addWidget(b_or)
+
+        b_copy_row = QHBoxLayout()
+        b_copy_row.addWidget(QLabel("Copy from:"))
         self.cmb_battle = QComboBox()
         self.cmb_battle.wheelEvent = lambda e: e.ignore()
         self.cmb_battle.addItem("(none — no battle effect)", "")
+        sorted_abs: list = []
         if abilities_data:
             sorted_abs = sorted(
                 abilities_data.items(),
@@ -1262,20 +1346,70 @@ class AddAbilityDialog(QDialog):
         self.cmb_battle.setToolTip(
             "Copy battle effect code (case blocks in battle_util.c, etc.)\n"
             "from an existing ability. Only abilities with known battle\n"
-            "effects are listed. You can customize the code after creation."
+            "effects are listed. Use this for legacy/custom abilities that\n"
+            "don't map to one of the templates above."
         )
-        form.addRow("Battle effect:", self.cmb_battle)
+        self.cmb_battle.currentIndexChanged.connect(self._update_battle_preview)
+        self.cmb_battle.currentIndexChanged.connect(
+            self._on_battle_copy_changed)
+        b_copy_row.addWidget(self.cmb_battle, 1)
+        b_v.addLayout(b_copy_row)
 
-        # Battle preview
         self.lbl_battle_preview = QLabel("")
         self.lbl_battle_preview.setWordWrap(True)
         self.lbl_battle_preview.setStyleSheet(
             "color: #888888; font-size: 10px; padding: 0 0 4px 0;"
         )
-        form.addRow("", self.lbl_battle_preview)
-        self.cmb_battle.currentIndexChanged.connect(self._update_battle_preview)
+        b_v.addWidget(self.lbl_battle_preview)
 
-        # ── Copy field effect from ─────────────────────────────────────────
+        layout.addWidget(grp_battle)
+
+        # ── Field Effect group (template OR copy-from) ───────────────────────
+        grp_field = QGroupBox("Field Effect (optional)")
+        f_v = QVBoxLayout(grp_field)
+        f_v.setSpacing(4)
+
+        f_tmpl_row = QHBoxLayout()
+        f_tmpl_row.addWidget(QLabel("Template:"))
+        self.cmb_field_template = QComboBox()
+        self.cmb_field_template.wheelEvent = lambda e: e.ignore()
+        self.cmb_field_template.addItem("(none)", "")
+        for tmpl in FIELD_TEMPLATES:
+            self.cmb_field_template.addItem(tmpl.name, tmpl.id)
+        self.cmb_field_template.setToolTip(
+            "Pick a field/overworld effect template.  Code is only written "
+            "when you Save the project — nothing touches disk right now."
+        )
+        self.cmb_field_template.currentIndexChanged.connect(
+            self._on_field_template_changed)
+        f_tmpl_row.addWidget(self.cmb_field_template, 1)
+        f_v.addLayout(f_tmpl_row)
+
+        self._field_params_widget = QWidget()
+        self._field_params_layout = QFormLayout(self._field_params_widget)
+        self._field_params_layout.setContentsMargins(12, 0, 0, 0)
+        self._field_params_layout.setSpacing(3)
+        self._field_params_layout.setLabelAlignment(
+            Qt.AlignmentFlag.AlignRight)
+        f_v.addWidget(self._field_params_widget)
+
+        self.lbl_field_tmpl_preview = QLabel("")
+        self.lbl_field_tmpl_preview.setWordWrap(True)
+        self.lbl_field_tmpl_preview.setStyleSheet(
+            "color: #888888; font-size: 9px; font-family: 'Courier New';"
+            " padding: 2px 4px; background-color: #161616;"
+            " border: 1px solid #2a2a2a; border-radius: 3px;"
+        )
+        self.lbl_field_tmpl_preview.setVisible(False)
+        f_v.addWidget(self.lbl_field_tmpl_preview)
+
+        f_or = QLabel("— or —")
+        f_or.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f_or.setStyleSheet("color: #666666; font-size: 10px; padding: 2px 0;")
+        f_v.addWidget(f_or)
+
+        f_copy_row = QHBoxLayout()
+        f_copy_row.addWidget(QLabel("Copy from:"))
         self.cmb_field = QComboBox()
         self.cmb_field.wheelEvent = lambda e: e.ignore()
         self.cmb_field.addItem("(none — no field effect)", "")
@@ -1289,29 +1423,35 @@ class AddAbilityDialog(QDialog):
                     )
         self.cmb_field.setToolTip(
             "Copy field/overworld effect code (encounter rate, egg hatching,\n"
-            "etc.) from an existing ability. Only abilities with known field\n"
-            "effects are listed. You can customize the code after creation."
+            "etc.) from an existing ability.  Use this for abilities whose\n"
+            "behavior isn't captured by one of the templates above."
         )
-        form.addRow("Field effect:", self.cmb_field)
+        self.cmb_field.currentIndexChanged.connect(self._update_field_preview)
+        self.cmb_field.currentIndexChanged.connect(
+            self._on_field_copy_changed)
+        f_copy_row.addWidget(self.cmb_field, 1)
+        f_v.addLayout(f_copy_row)
 
-        # Field preview
         self.lbl_field_preview = QLabel("")
         self.lbl_field_preview.setWordWrap(True)
         self.lbl_field_preview.setStyleSheet(
             "color: #888888; font-size: 10px; padding: 0 0 4px 0;"
         )
-        form.addRow("", self.lbl_field_preview)
-        self.cmb_field.currentIndexChanged.connect(self._update_field_preview)
+        f_v.addWidget(self.lbl_field_preview)
 
-        layout.addLayout(form)
+        layout.addWidget(grp_field)
 
         self.lbl_hint = QLabel(
-            "Pick a battle effect and/or field effect to copy, or leave both\n"
-            "as (none) and add behavior manually in the C source later."
+            "Template effects write C on Save (not now).  Copy-from writes\n"
+            "C immediately on OK.  Leave everything (none) for a bare\n"
+            "ability you'll customize later from the right-hand editor."
         )
         self.lbl_hint.setWordWrap(True)
         self.lbl_hint.setStyleSheet("color: #e8a838; font-size: 10px; padding: 6px 0;")
         layout.addWidget(self.lbl_hint)
+
+        # Finish loading — now live previews can run.
+        self._loading = False
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1422,6 +1562,148 @@ class AddAbilityDialog(QDialog):
             parts.append(f"{n_inline} inline check(s) in {', '.join(files)}")
         self.lbl_field_preview.setText("Will copy: " + "; ".join(parts) if parts else "No field code found")
 
+    # ── template-picker plumbing ─────────────────────────────────────────────
+
+    def _clear_param_combos(self, layout: QFormLayout,
+                            combos: dict[str, QComboBox]):
+        while layout.rowCount() > 0:
+            layout.removeRow(0)
+        combos.clear()
+
+    def _rebuild_battle_tmpl_params(self, template_id: str):
+        from core.ability_effect_templates import BATTLE_TEMPLATE_MAP
+        self._clear_param_combos(
+            self._battle_params_layout, self._battle_param_combos)
+        tmpl = BATTLE_TEMPLATE_MAP.get(template_id)
+        if not tmpl or not tmpl.params:
+            return
+        for param in tmpl.params:
+            cmb = QComboBox()
+            cmb.wheelEvent = lambda e: e.ignore()
+            for display, value in param.choices:
+                cmb.addItem(display, value)
+            cmb.currentIndexChanged.connect(self._update_battle_tmpl_preview)
+            self._battle_params_layout.addRow(param.label + ":", cmb)
+            self._battle_param_combos[param.id] = cmb
+
+    def _rebuild_field_tmpl_params(self, template_id: str):
+        from core.ability_effect_templates import FIELD_TEMPLATE_MAP
+        self._clear_param_combos(
+            self._field_params_layout, self._field_param_combos)
+        tmpl = FIELD_TEMPLATE_MAP.get(template_id)
+        if not tmpl or not tmpl.params:
+            return
+        for param in tmpl.params:
+            cmb = QComboBox()
+            cmb.wheelEvent = lambda e: e.ignore()
+            for display, value in param.choices:
+                cmb.addItem(display, value)
+            cmb.currentIndexChanged.connect(self._update_field_tmpl_preview)
+            self._field_params_layout.addRow(param.label + ":", cmb)
+            self._field_param_combos[param.id] = cmb
+
+    def _collect_battle_tmpl_params(self) -> dict:
+        return {pid: cmb.currentData()
+                for pid, cmb in self._battle_param_combos.items()}
+
+    def _collect_field_tmpl_params(self) -> dict:
+        return {pid: cmb.currentData()
+                for pid, cmb in self._field_param_combos.items()}
+
+    def _update_battle_tmpl_preview(self):
+        from core.ability_effect_templates import generate_battle_code
+        tid = self.cmb_battle_template.currentData()
+        if not tid:
+            self.lbl_battle_tmpl_preview.setVisible(False)
+            return
+        const = self.get_constant() or "ABILITY_NEW"
+        params = self._collect_battle_tmpl_params()
+        blocks = generate_battle_code(tid, const, params)
+        if blocks:
+            preview = blocks[0][1]
+            lines = preview.split("\n")
+            if len(lines) > 8:
+                preview = "\n".join(lines[:8]) + "\n  ..."
+            self.lbl_battle_tmpl_preview.setText(preview)
+            self.lbl_battle_tmpl_preview.setVisible(True)
+        else:
+            self.lbl_battle_tmpl_preview.setVisible(False)
+
+    def _update_field_tmpl_preview(self):
+        from core.ability_effect_templates import generate_field_code
+        tid = self.cmb_field_template.currentData()
+        if not tid:
+            self.lbl_field_tmpl_preview.setVisible(False)
+            return
+        const = self.get_constant() or "ABILITY_NEW"
+        params = self._collect_field_tmpl_params()
+        blocks = generate_field_code(tid, const, params)
+        if blocks:
+            preview = blocks[0][1]
+            lines = preview.split("\n")
+            if len(lines) > 8:
+                preview = "\n".join(lines[:8]) + "\n  ..."
+            self.lbl_field_tmpl_preview.setText(preview)
+            self.lbl_field_tmpl_preview.setVisible(True)
+        else:
+            self.lbl_field_tmpl_preview.setVisible(False)
+
+    def _on_battle_template_changed(self, _idx: int):
+        tid = self.cmb_battle_template.currentData() or ""
+        self._rebuild_battle_tmpl_params(tid)
+        self._update_battle_tmpl_preview()
+        # Mutual exclusion: if a template is picked, grey out the copy-from
+        # combo so the user can't accidentally double-up.
+        self._sync_battle_mutual_exclusion()
+
+    def _on_field_template_changed(self, _idx: int):
+        tid = self.cmb_field_template.currentData() or ""
+        self._rebuild_field_tmpl_params(tid)
+        self._update_field_tmpl_preview()
+        self._sync_field_mutual_exclusion()
+
+    def _on_battle_copy_changed(self, _idx: int):
+        self._sync_battle_mutual_exclusion()
+
+    def _on_field_copy_changed(self, _idx: int):
+        self._sync_field_mutual_exclusion()
+
+    def _sync_battle_mutual_exclusion(self):
+        """Enable/disable battle template vs copy-from based on which has a
+        non-empty selection.  The two paths are mutually exclusive."""
+        if self._loading:
+            return
+        tmpl_active = bool(self.cmb_battle_template.currentData())
+        copy_active = bool(self.cmb_battle.currentData())
+        self.cmb_battle.setEnabled(not tmpl_active)
+        self.cmb_battle_template.setEnabled(not copy_active)
+        self._battle_params_widget.setEnabled(tmpl_active and not copy_active)
+
+    def _sync_field_mutual_exclusion(self):
+        if self._loading:
+            return
+        tmpl_active = bool(self.cmb_field_template.currentData())
+        copy_active = bool(self.cmb_field.currentData())
+        self.cmb_field.setEnabled(not tmpl_active)
+        self.cmb_field_template.setEnabled(not copy_active)
+        self._field_params_widget.setEnabled(tmpl_active and not copy_active)
+
+    def get_battle_template(self) -> tuple[str, dict]:
+        """Return (template_id, params) for the battle-effect template the
+        user picked, or ('', {}) if they didn't.  Never writes to disk —
+        the caller stashes this into data["_battle_effect"] and the
+        save-abilities pipeline applies it on the user's Save action."""
+        tid = self.cmb_battle_template.currentData() or ""
+        if not tid:
+            return "", {}
+        return tid, self._collect_battle_tmpl_params()
+
+    def get_field_template(self) -> tuple[str, dict]:
+        tid = self.cmb_field_template.currentData() or ""
+        if not tid:
+            return "", {}
+        return tid, self._collect_field_tmpl_params()
+
 
 # ── AbilitiesTabWidget (main widget) ────────────────────────────────────────
 
@@ -1445,6 +1727,12 @@ class AbilitiesTabWidget(QWidget):
         self._loading = False
         self._new_abilities: set = set()
         self._deleted_abilities: set = set()
+        # Ability constants whose row should paint amber in the list.
+        # Survives `_rebuild_list`'s `self._list.clear()` — the rebuild
+        # copies each const's flag back onto the fresh QListWidgetItem so
+        # newly-added rows don't lose their amber tint after the add path
+        # triggers a rebuild.  Cleared on save via `clear_all_dirty`.
+        self._dirty_consts: set[str] = set()
         self._build_ui()
 
     def _build_ui(self):
@@ -1575,6 +1863,24 @@ class AbilitiesTabWidget(QWidget):
     def clear_deleted_abilities(self) -> None:
         self._deleted_abilities.clear()
 
+    def clear_all_dirty(self) -> None:
+        """Wipe every amber-row marker and the tracking set.
+
+        Called by the main window's `_clear_all_dirty_markers` after a
+        successful save.  The shared `_mark_list_item_dirty` helper also
+        clears the role on existing items, but we clear the tracking set
+        here too so a later `_rebuild_list` (e.g. after an add/delete)
+        doesn't re-tint rows that were just saved.
+        """
+        self._dirty_consts.clear()
+        try:
+            for i in range(self._list.count()):
+                item = self._list.item(i)
+                if item is not None:
+                    item.setData(DIRTY_FLAG_ROLE, None)
+        except Exception:
+            pass
+
     def apply_effect_changes(self) -> list[str]:
         """Write all pending effect changes to C source files.
 
@@ -1677,6 +1983,11 @@ class AbilitiesTabWidget(QWidget):
             aid = data.get("id", "?")
             item = QListWidgetItem(f"{aid:>3}  {display}")
             item.setData(Qt.ItemDataRole.UserRole, const)
+            # Re-apply the amber dirty role if this const was dirty before
+            # the rebuild — otherwise clear() would wipe the tint.  Matches
+            # the role the shared _DirtyDelegate in mainwindow paints.
+            if const in self._dirty_consts:
+                item.setData(DIRTY_FLAG_ROLE, True)
             self._list.addItem(item)
         self._count_lbl.setText(f"{self._list.count()} abilities")
         self._list.blockSignals(False)
@@ -1750,6 +2061,8 @@ class AbilitiesTabWidget(QWidget):
         aid = dlg.get_id()
         battle_src = dlg.get_battle_source()
         field_src = dlg.get_field_source()
+        btid, bparams = dlg.get_battle_template()
+        ftid, fparams = dlg.get_field_template()
 
         self._abilities_data[const] = {
             "name": const[len("ABILITY_"):] if const.startswith("ABILITY_") else const,
@@ -1757,10 +2070,33 @@ class AbilitiesTabWidget(QWidget):
             "display_name": name,
             "description": desc,
         }
+        # RAM-only stash for template-based effects.  Actual C injection
+        # happens on Save in `apply_effect_changes`; nothing touches disk
+        # now.  Only set the key if a template was picked — the absence of
+        # a key means "no pending change" to the save pipeline, which is
+        # the correct signal for a brand-new ability with no effect.
+        if btid:
+            self._abilities_data[const]["_battle_effect"] = (btid, bparams)
+        if ftid:
+            self._abilities_data[const]["_field_effect"] = (ftid, fparams)
         self._new_abilities.add(const)
+        # Mark the new ability's row dirty so the amber tint shows up.
+        # _dirty_consts survives `_rebuild_list` (which wipes items and
+        # their roles); the rebuild path re-reads it and sets the role on
+        # every fresh item whose const is in the set.
+        self._dirty_consts.add(const)
 
-        # Copy effects from source abilities if requested
-        self._apply_effect_copy(const, battle_src, field_src)
+        # Copy-from path (writes to disk immediately — pre-existing
+        # behavior).  For each side, template takes precedence over
+        # copy-from (mutual exclusion is enforced visually by the dialog
+        # greying out the other combo when one is picked, but we also
+        # enforce it here as a safety-net so a template+copy combo never
+        # ends up with double-applied code on the new ability).
+        effective_battle_src = "" if btid else battle_src
+        effective_field_src = "" if ftid else field_src
+        if effective_battle_src or effective_field_src:
+            self._apply_effect_copy(
+                const, effective_battle_src, effective_field_src)
 
         self._dirty = True
         self.data_changed.emit()
@@ -1812,6 +2148,8 @@ class AbilitiesTabWidget(QWidget):
         aid = dlg.get_id()
         battle_src = dlg.get_battle_source()
         field_src = dlg.get_field_source()
+        btid, bparams = dlg.get_battle_template()
+        ftid, fparams = dlg.get_field_template()
 
         self._abilities_data[const] = {
             "name": const[len("ABILITY_"):] if const.startswith("ABILITY_") else const,
@@ -1819,10 +2157,18 @@ class AbilitiesTabWidget(QWidget):
             "display_name": name,
             "description": desc,
         }
+        if btid:
+            self._abilities_data[const]["_battle_effect"] = (btid, bparams)
+        if ftid:
+            self._abilities_data[const]["_field_effect"] = (ftid, fparams)
         self._new_abilities.add(const)
+        self._dirty_consts.add(const)
 
-        # Copy effects from source abilities if requested
-        self._apply_effect_copy(const, battle_src, field_src)
+        effective_battle_src = "" if btid else battle_src
+        effective_field_src = "" if ftid else field_src
+        if effective_battle_src or effective_field_src:
+            self._apply_effect_copy(
+                const, effective_battle_src, effective_field_src)
 
         self._dirty = True
         self.data_changed.emit()
@@ -1917,6 +2263,7 @@ class AbilitiesTabWidget(QWidget):
         self._abilities_data.pop(const, None)
         self._deleted_abilities.add(const)
         self._new_abilities.discard(const)
+        self._dirty_consts.discard(const)
         self._current_ability = None
         self._dirty = True
         self.data_changed.emit()
@@ -1939,6 +2286,14 @@ class AbilitiesTabWidget(QWidget):
             self._abilities_data[new_const] = self._abilities_data.pop(old_const)
             if self._current_ability == old_const:
                 self._current_ability = new_const
+            # Keep the dirty set in sync with the rekey so rebuild still
+            # paints amber on a renamed-but-unsaved ability.
+            if old_const in self._dirty_consts:
+                self._dirty_consts.discard(old_const)
+                self._dirty_consts.add(new_const)
+            if old_const in self._new_abilities:
+                self._new_abilities.discard(old_const)
+                self._new_abilities.add(new_const)
             self._rebuild_list()
             # Re-select the renamed ability
             for i in range(self._list.count()):
@@ -1952,6 +2307,12 @@ class AbilitiesTabWidget(QWidget):
     def _on_detail_changed(self):
         if not self._loading:
             self._dirty = True
+            if self._current_ability:
+                # Keep the dirty set in sync with edits to existing
+                # abilities so any future `_rebuild_list` preserves the
+                # amber tint.  The shared `_mark_list_item_dirty` in
+                # mainwindow still handles the immediate paint.
+                self._dirty_consts.add(self._current_ability)
             self.data_changed.emit()
 
     def _on_species_dblclick(self, row: int, _col: int):

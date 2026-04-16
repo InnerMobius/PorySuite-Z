@@ -3486,13 +3486,20 @@ QTabBar::tab:hover:!selected {
                     self._mark_list_item_dirty(lst, False)
         except Exception:
             pass
-        # Abilities editor's QListWidget — same treatment.
+        # Abilities editor's QListWidget — same treatment, plus the
+        # widget's own `clear_all_dirty` helper which also resets the
+        # internal `_dirty_consts` set that survives rebuilds (used by
+        # the add/duplicate path so newly-added unsaved abilities show
+        # amber even after `_rebuild_list` destroys and recreates every
+        # QListWidgetItem).
         try:
             ab = getattr(self, "abilities_tab", None)
             if ab is not None:
                 lst = getattr(ab, "_list", None)
                 if lst is not None:
                     self._mark_list_item_dirty(lst, False)
+                if hasattr(ab, "clear_all_dirty"):
+                    ab.clear_all_dirty()
         except Exception:
             pass
         # Trainers editor has its own custom delegate, so it needs a
