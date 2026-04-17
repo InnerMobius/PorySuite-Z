@@ -342,3 +342,62 @@ def icon_palette_pal_path(project_root: str, idx: int) -> str:
         project_root, "graphics", "pokemon", "icon_palettes",
         f"icon_palette_{idx}.pal",
     )
+
+
+# ── Item icon path helpers ──────────────────────────────────────────────────
+
+def item_slug_from_const(item_const: str) -> str:
+    """ITEM_POTION → 'potion', ITEM_ACRO_BIKE → 'acro_bike'."""
+    if item_const.upper().startswith("ITEM_"):
+        return item_const[len("ITEM_"):].lower()
+    return item_const.lower()
+
+
+def item_icon_paths(project_root: str, item_slug: str) -> tuple[str, str]:
+    """Return (icon_png_path, icon_pal_path) for an item slug.
+
+    pokefirered layout:
+        graphics/items/icons/<slug>.png
+        graphics/items/icon_palettes/<slug>.pal
+
+    Every item has its own per-slug palette file (verified against the
+    vanilla tree — there is no shared fallback palette).
+    """
+    png = os.path.join(project_root, "graphics", "items", "icons",
+                       f"{item_slug}.png")
+    pal = os.path.join(project_root, "graphics", "items", "icon_palettes",
+                       f"{item_slug}.pal")
+    return png, pal
+
+
+def item_pal_path_from_png(png_path: str) -> str:
+    """Derive the .pal path from an item icon PNG path.
+
+    icons/potion.png → icon_palettes/potion.pal
+    """
+    folder = os.path.dirname(png_path)        # .../icons
+    parent = os.path.dirname(folder)          # .../items
+    base = os.path.basename(png_path)         # potion.png
+    slug = os.path.splitext(base)[0]          # potion
+    return os.path.join(parent, "icon_palettes", f"{slug}.pal")
+
+
+# ── Trainer pic path helpers (promoted from trainer_graphics_tab.py) ────────
+
+def trainer_pal_path_from_png(png_path: str) -> str:
+    """Derive the .pal path from a trainer front-pic PNG path.
+
+    front_pics/aqua_leader_archie_front_pic.png
+      → palettes/aqua_leader_archie.pal
+
+    Back pics follow the same convention in back_pics/, mapped to the
+    same palettes/ folder (pokefirered shares palettes between front
+    and back).
+    """
+    folder = os.path.dirname(png_path)                      # .../front_pics
+    parent = os.path.dirname(folder)                        # .../trainers
+    base = os.path.basename(png_path)                       # xxx_front_pic.png
+    # Strip either suffix so back_pics/ paths resolve too.
+    slug = base.replace("_front_pic.png", "").replace("_back_pic.png", "")
+    slug = os.path.splitext(slug)[0] if slug.endswith(".png") else slug
+    return os.path.join(parent, "palettes", f"{slug}.pal")

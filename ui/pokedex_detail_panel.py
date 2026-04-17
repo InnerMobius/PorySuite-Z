@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.dex_description_edit import DexDescriptionEdit
+from core.sprite_render import load_sprite_pixmap
+from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_POKEMON
 
 # ── shared card style (same palette as items / species panels) ───────────────
 
@@ -238,8 +240,16 @@ class PokedexDetailPanel(QWidget):
         self._loading   = False
         self._dex_const: str | None = None
         self._trainer_sprite_path: str | None = None
+        # Bus-aware sprite state. We remember the species const so a live
+        # palette edit on another tab (Graphics / Trainer Graphics) can
+        # re-render our header sprite without reloading the whole entry.
+        self._species_const: str | None = None
+        self._sprite_path: str | None = None
+        self._project_root: str = ""
         self.setStyleSheet(_FIELD_SS)
         self._build()
+        # Subscribe to palette edits — the bus emits (category, key).
+        _get_palette_bus().palette_changed.connect(self._on_palette_changed)
 
     # ── build ────────────────────────────────────────────────────────────────
 
@@ -458,23 +468,71 @@ class PokedexDetailPanel(QWidget):
 
     def set_project_root(self, root: str) -> None:
         """Set the pokefirered repo root so the trainer sprite can be found."""
+        self._project_root = root or ""
         trainer_path = os.path.join(
             root, "graphics", "trainers", "front_pics", "red_front_pic.png"
         )
         self._trainer_sprite_path = trainer_path
         self._size_preview.set_trainer(trainer_path)
 
-    def set_sprite(self, png_path: str | None):
-        if png_path and os.path.isfile(png_path):
-            pm = QPixmap(png_path)
-            self._sprite_lbl.setPixmap(pm)
-        else:
+    def set_sprite(self, png_path: str | None,
+                   species_const: str | None = None) -> None:
+        """Render the header sprite re-indexed through the live palette.
+
+        If *species_const* is supplied we resolve the palette through
+        :mod:`core.sprite_palette_bus` — RAM-first (unsaved edits),
+        disk-fallback. The palette may be mid-edit on the Graphics tab
+        and not yet on disk; the bus gives us that edit.
+
+        Without a species const we degrade to a flat :class:`QPixmap`
+        load so callers that don't know the species still see something.
+        """
+        self._sprite_path = png_path
+        self._species_const = species_const
+        if not png_path or not os.path.isfile(png_path):
             self._sprite_lbl.setPixmap(QPixmap())
+            self._size_preview.set_pokemon(png_path)
+            return
+        pal = None
+        if species_const and self._project_root:
+            pal = _get_palette_bus().ensure_pokemon_palette(
+                self._project_root, species_const, "normal",
+            )
+        pm = load_sprite_pixmap(png_path, pal)
+        self._sprite_lbl.setPixmap(pm or QPixmap())
         self._size_preview.set_pokemon(png_path)
 
+    # ── bus subscription ─────────────────────────────────────────────────────
+
+    def _on_palette_changed(self, category: str, key: str) -> None:
+        """Re-render the header sprite when OUR species' palette changes."""
+        if category != CAT_POKEMON:
+            return
+        if not self._species_const or not self._sprite_path:
+            return
+        # Key is "<SPECIES_CONST>:<kind>"; normal is what the dex shows.
+        if key != f"{self._species_const}:normal":
+            return
+        try:
+            pal = _get_palette_bus().get_pokemon_palette(
+                self._species_const, "normal",
+            )
+            if pal:
+                pm = load_sprite_pixmap(self._sprite_path, pal)
+                if pm is not None:
+                    self._sprite_lbl.setPixmap(pm)
+        except Exception:
+            pass
+
     def load_entry(self, entry: dict, species_name: str = "",
-                   sprite_path: str | None = None):
-        """Populate all fields from a pokedex.json entry dict."""
+                   sprite_path: str | None = None,
+                   species_const: str | None = None):
+        """Populate all fields from a pokedex.json entry dict.
+
+        *species_const* (SPECIES_*) is used to resolve the live palette
+        through the SpritePaletteBus so unsaved Graphics-tab edits show
+        up on the dex card immediately.
+        """
         self._loading = True
         try:
             self._dex_const = entry.get("dex_constant", "")
@@ -483,7 +541,7 @@ class PokedexDetailPanel(QWidget):
             dex_num = entry.get("dex_num", "")
             self._hdr_dex.setText(f"#{dex_num:0>4}" if isinstance(dex_num, int) else "")
             self._hdr_const.setText(self._dex_const or "")
-            self.set_sprite(sprite_path)
+            self.set_sprite(sprite_path, species_const=species_const)
 
             self.f_description.setPlainText(entry.get("descriptionText") or "")
             self.f_category.setText(entry.get("categoryName") or "")

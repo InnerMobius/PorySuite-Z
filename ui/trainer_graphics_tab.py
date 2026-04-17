@@ -43,24 +43,15 @@ from ui.draggable_palette_row import DraggablePaletteRow
 from core.gba_image_utils import (
     swap_palette_entries, export_indexed_png, export_palette,
 )
+# Shared PNG→.pal path helper (single source of truth in graphics_data).
+# Aliased to the previous local name so existing call sites don't churn.
+from ui.graphics_data import trainer_pal_path_from_png as _pal_path_from_png
+from core.sprite_palette_bus import get_bus as _get_palette_bus
 
 Color = Tuple[int, int, int]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
-
-def _pal_path_from_png(png_path: str) -> str:
-    """Derive the .pal path from a trainer front-pic PNG path.
-
-    front_pics/aqua_leader_archie_front_pic.png
-      → palettes/aqua_leader_archie.pal
-    """
-    folder = os.path.dirname(png_path)                     # .../front_pics
-    parent = os.path.dirname(folder)                       # .../trainers
-    base = os.path.basename(png_path)                      # xxx_front_pic.png
-    slug = base.replace("_front_pic.png", "")              # xxx
-    return os.path.join(parent, "palettes", f"{slug}.pal")
-
 
 def _friendly_pic_name(pic_const: str) -> str:
     """Turn TRAINER_PIC_COOLTRAINER_M → 'Cooltrainer M'."""
@@ -517,6 +508,21 @@ class TrainerGraphicsTab(QWidget):
         if pic_const in self._cards:
             self._select_card(pic_const)
 
+    def _broadcast_palette(self, pic_const: str,
+                           colors: List[Color]) -> None:
+        """Push a trainer palette to the cross-tab SpritePaletteBus.
+
+        Stores under BOTH the TRAINER_PIC_* constant and the PNG path
+        so viewer tabs can hit a cache entry whichever key they have
+        in hand (trainers-tab rows carry pic_const; the trainer class
+        editor sometimes has only the PNG path).
+        """
+        bus = _get_palette_bus()
+        bus.set_trainer_palette(pic_const, colors)
+        png_path = self._pic_map.get(pic_const, "")
+        if png_path:
+            bus.set_palette("trainer_pic", png_path, colors)
+
     def _select_card(self, pic_const: str) -> None:
         """Swap selection to the given card and load its palette into the
         right-hand editor."""
@@ -558,8 +564,10 @@ class TrainerGraphicsTab(QWidget):
     def _on_palette_edited(self) -> None:
         if self._loading or not self._current_pic:
             return
-        self._palettes[self._current_pic] = self._pal_row.colors()
+        colors = self._pal_row.colors()
+        self._palettes[self._current_pic] = colors
         self._palette_dirty.add(self._current_pic)
+        self._broadcast_palette(self._current_pic, colors)
         self._refresh_sprite()
         self._dirty_dot.show()
         # Reflect on the card too so the grid shows the amber border.
@@ -596,6 +604,7 @@ class TrainerGraphicsTab(QWidget):
         finally:
             self._loading = False
         self._palette_dirty.add(self._current_pic)
+        self._broadcast_palette(self._current_pic, pal)
         self._refresh_sprite()
         self._dirty_dot.show()
         card = self._cards.get(self._current_pic)
@@ -676,6 +685,7 @@ class TrainerGraphicsTab(QWidget):
             self._loading = False
 
         self._palette_dirty.add(sp)
+        self._broadcast_palette(sp, pal)
         self._refresh_sprite()
         self._dirty_dot.show()
         card = self._cards.get(sp)
@@ -837,6 +847,7 @@ class TrainerGraphicsTab(QWidget):
         self._palettes[sp] = colors
         self._sprite_png_dirty.add(sp)
         self._palette_dirty.add(sp)
+        self._broadcast_palette(sp, colors)
 
         self._loading = True
         try:
@@ -929,6 +940,7 @@ class TrainerGraphicsTab(QWidget):
         # Apply
         self._palettes[self._current_pic] = colors
         self._palette_dirty.add(self._current_pic)
+        self._broadcast_palette(self._current_pic, colors)
 
         self._loading = True
         try:
@@ -1002,6 +1014,7 @@ class TrainerGraphicsTab(QWidget):
 
         self._palettes[self._current_pic] = colors
         self._palette_dirty.add(self._current_pic)
+        self._broadcast_palette(self._current_pic, colors)
 
         self._loading = True
         try:

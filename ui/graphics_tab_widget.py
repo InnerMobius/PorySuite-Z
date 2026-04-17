@@ -38,6 +38,7 @@ from ui.graphics_data import (
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
 from ui.draggable_palette_row import DraggablePaletteRow
 from core.gba_image_utils import swap_palette_entries, export_indexed_png
+from core.sprite_palette_bus import get_bus as _get_palette_bus
 
 
 Color = Tuple[int, int, int]
@@ -1029,10 +1030,17 @@ class GraphicsTabWidget(QWidget):
     def _on_normal_changed(self) -> None:
         if self._loading or not self._current_species:
             return
+        colors = self._normal_row.colors()
         self._palettes.setdefault(
             self._current_species, {"normal": [], "shiny": []}
-        )["normal"] = self._normal_row.colors()
+        )["normal"] = colors
         self._palette_dirty.add(self._current_species)
+        # Broadcast the new palette so viewer tabs (Pokedex, Starters,
+        # Info panel, species tree, …) reskin immediately — even though
+        # no .pal file has been written yet.
+        _get_palette_bus().set_pokemon_palette(
+            self._current_species, "normal", colors,
+        )
         self._mark_modified()
         # Live recolour preview if currently showing normal
         if not self._preview_shiny:
@@ -1041,10 +1049,14 @@ class GraphicsTabWidget(QWidget):
     def _on_shiny_changed(self) -> None:
         if self._loading or not self._current_species:
             return
+        colors = self._shiny_row.colors()
         self._palettes.setdefault(
             self._current_species, {"normal": [], "shiny": []}
-        )["shiny"] = self._shiny_row.colors()
+        )["shiny"] = colors
         self._palette_dirty.add(self._current_species)
+        _get_palette_bus().set_pokemon_palette(
+            self._current_species, "shiny", colors,
+        )
         self._mark_modified()
         # Live recolour preview if currently showing shiny
         if self._preview_shiny:
@@ -1099,6 +1111,9 @@ class GraphicsTabWidget(QWidget):
             self._loading = False
 
         self._palette_dirty.add(sp)
+        # Push the swapped row to the bus — viewers filter on the kind
+        # they're showing.
+        _get_palette_bus().set_pokemon_palette(sp, key, pal)
         self._refresh_preview_sprites()
         self._mark_modified()
 
@@ -1214,6 +1229,13 @@ class GraphicsTabWidget(QWidget):
         # Mark everything dirty: both .pal files + both PNGs need saving.
         self._palette_dirty.add(sp)
         self._sprite_png_dirty.add(sp)
+        # Push both rows — the lockstep swap rewrote both .pal rows
+        # AND the PNG pixels in RAM. Viewer tabs have no access to the
+        # in-memory PNGs so they will still render off disk until Save,
+        # but at least the palette they render WITH matches this tab.
+        bus = _get_palette_bus()
+        bus.set_pokemon_palette(sp, "normal", normal)
+        bus.set_pokemon_palette(sp, "shiny", shiny)
         self._refresh_preview_sprites()
         self._mark_modified()
 
@@ -1230,8 +1252,12 @@ class GraphicsTabWidget(QWidget):
     def _on_icon_pal_changed(self, idx: int) -> None:
         if self._loading:
             return
-        self._icon_palettes[idx] = self._icon_rows[idx].colors()
+        colors = self._icon_rows[idx].colors()
+        self._icon_palettes[idx] = colors
         self._icon_pal_dirty.add(idx)
+        # Broadcast so every species-tree row and every animated-icon
+        # client (Info tab, dex card) reskins off the new shared palette.
+        _get_palette_bus().set_icon_palette(idx, colors)
         self._mark_modified()
         # If the user edited the palette this species is actually using,
         # re-render the preview live.

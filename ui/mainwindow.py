@@ -295,6 +295,22 @@ class MainWindow(QMainWindow):
         # Max characters per Pokédex line; updated from header after project load
         self.description_max_chars_per_line = 48
 
+        # Info-tab front-pic state (see _update_species_info_sprites).
+        # Remembered so _on_sprite_palette_changed can reskin in place
+        # when the Graphics tab edits our species' palette.
+        self._info_front_species: str = ""
+        self._info_front_path: str = ""
+        # Subscribe to the cross-tab palette bus so viewer labels that
+        # live directly on MainWindow (Info tab front pic, species tree,
+        # starter sprites, animated icons) pick up unsaved edits.
+        try:
+            from core.sprite_palette_bus import get_bus as _spbus
+            _spbus().palette_changed.connect(
+                self._on_sprite_palette_changed
+            )
+        except Exception:
+            pass
+
         # Reset buttons for discarding tab-specific edits still in memory
         self.reset_species_button = QPushButton("\u21bb Reset")
         self.reset_pokedex_button = QPushButton("\u21bb Reset to Vanilla")
@@ -1025,6 +1041,18 @@ QTabBar::tab:hover:!selected {
         # written PNGs are read rather than the stale QIcons.
         if hasattr(self, "_species_icon_cache"):
             self._species_icon_cache.clear()
+        # Drop the lazy graphics-data cache so the new project's icon
+        # palette indices + pic coords are re-parsed on next access.
+        if hasattr(self, "_graphics_cache_obj"):
+            self._graphics_cache_obj = None
+        # Drop the cross-tab palette cache — a new project has fresh
+        # .pal files on disk; unsaved RAM values from the old project
+        # would shadow them otherwise.
+        try:
+            from core.sprite_palette_bus import get_bus as _spbus
+            _spbus().clear()
+        except Exception:
+            pass
         try:
             self.items_editor._icon_cache.clear()
         except Exception:
@@ -4137,7 +4165,7 @@ QTabBar::tab:hover:!selected {
         except Exception:
             logging.exception("graphics_tab_widget.load_species failed")
         if hasattr(self, "_icon_timer"):
-            self._set_icon_animation(icon_pic)
+            self._set_icon_animation(icon_pic, species=species)
 
         # Update evolutions
         self.ui.evolutions.clear()
@@ -4973,6 +5001,7 @@ QTabBar::tab:hover:!selected {
                 pokedex_entry,
                 species_name=species_name,
                 sprite_path=sprite_path,
+                species_const=species,
             )
             # Wild encounters for this species
             enc_db = getattr(self, "_encounter_db", None)
@@ -5106,6 +5135,7 @@ QTabBar::tab:hover:!selected {
                     pokedex_entry,
                     species_name=species_name,
                     sprite_path=sprite_path,
+                    species_const=species,
                 )
                 # Wild encounters for this species
                 enc_db = getattr(self, "_encounter_db", None)
@@ -5813,11 +5843,17 @@ QTabBar::tab:hover:!selected {
 
     # ── Animated icon helpers ─────────────────────────────────────────────────
 
-    def _set_icon_animation(self, png_path: str | None):
-        """Start or stop the icon sprite animation for a new species."""
+    def _set_icon_animation(self, png_path: str | None,
+                            species: str = ""):
+        """Start or stop the icon sprite animation for a new species.
+
+        *species* (SPECIES_*) is remembered so the tick can resolve the
+        shared icon palette (0/1/2) through the SpritePaletteBus.
+        """
         self._icon_timer.stop()
-        self._icon_anim_path  = png_path
-        self._icon_anim_frame = 0
+        self._icon_anim_path   = png_path
+        self._icon_anim_species = species or ""
+        self._icon_anim_frame  = 0
         if png_path and os.path.isfile(png_path):
             self._tick_icon_animation()   # show frame 0 immediately
             self._icon_timer.start()
@@ -5830,13 +5866,35 @@ QTabBar::tab:hover:!selected {
 
     def _tick_icon_animation(self):
         """Advance one frame of the icon sprite animation.
+
         Updates both the Graphics-tab label and the Info-tab label.
+        The icon PNG is indexed and colored by one of three SHARED icon
+        palettes (``gMonIconPaletteIndices[species]`` → 0/1/2); we
+        reskin through the live palette so Icon Palette edits on the
+        Graphics tab show up across both labels immediately.
         """
         path = getattr(self, "_icon_anim_path", None)
         if not path or not os.path.isfile(path):
             self._icon_timer.stop()
             return
-        pm = QPixmap(path)
+        pm: QPixmap | None = None
+        species = getattr(self, "_icon_anim_species", "")
+        try:
+            idx = 0
+            gcache = self._graphics_cache()
+            if gcache is not None and species:
+                idx = max(0, min(2, gcache.get_icon_idx(species)))
+            root = self.project_info.get("dir", "")
+            pal = None
+            if root:
+                from core.sprite_palette_bus import get_bus as _spbus
+                pal = _spbus().ensure_icon_palette(root, idx)
+            from core.sprite_render import load_sprite_pixmap
+            pm = load_sprite_pixmap(path, pal)
+        except Exception:
+            pm = None
+        if pm is None or pm.isNull():
+            pm = QPixmap(path)
         if pm.isNull() or pm.height() < 32:
             self._icon_timer.stop()
             return
@@ -5936,15 +5994,24 @@ QTabBar::tab:hover:!selected {
         if not species:
             return
 
-        # Update sprite
+        # Update sprite — re-index through the live palette so unsaved
+        # Graphics-tab edits show up on the starter card immediately.
         try:
             sprite_lbl = self._starter_sprite_labels[starter_idx]
             front_pic = self.source_data.get_species_image_path(
                 species, "frontPic"
             )
             if front_pic:
-                pm = QPixmap(front_pic)
-                if not pm.isNull():
+                from core.sprite_palette_bus import get_bus as _spbus
+                from core.sprite_render import load_sprite_pixmap
+                root = self.project_info.get("dir", "")
+                pal = None
+                if root:
+                    pal = _spbus().ensure_pokemon_palette(
+                        root, species, "normal",
+                    )
+                pm = load_sprite_pixmap(front_pic, pal)
+                if pm is not None and not pm.isNull():
                     # Scale to 128×128 with smooth transform for crisp pixel art
                     scaled = pm.scaled(
                         128, 128,
@@ -5956,6 +6023,15 @@ QTabBar::tab:hover:!selected {
                     sprite_lbl.setPixmap(QPixmap())
             else:
                 sprite_lbl.setPixmap(QPixmap())
+        except Exception:
+            pass
+        # Remember this slot so the bus subscriber can refresh in place
+        # when the Graphics tab edits this starter's palette.
+        try:
+            if not hasattr(self, "_starter_sprite_species"):
+                self._starter_sprite_species = [""] * 3
+            if 0 <= starter_idx < len(self._starter_sprite_species):
+                self._starter_sprite_species[starter_idx] = species or ""
         except Exception:
             pass
 
@@ -5992,10 +6068,38 @@ QTabBar::tab:hover:!selected {
 
     # ── Species tree icon helpers ─────────────────────────────────────────────
 
-    def _species_list_icon(self, species: str, form: str | None = None) -> QIcon:
+    def _graphics_cache(self):
+        """Return a lazily-loaded :class:`GraphicsDataCache` for this project.
+
+        Used by viewer code (species tree, animated icon, Info tab) to
+        look up ``gMonIconPaletteIndices[species]`` without reaching
+        across into the Graphics tab's private state. Returns ``None``
+        if no project is open.
         """
-        Returns a QIcon showing frame 0 of the species icon sprite.
-        Results are cached so each PNG is only loaded once per session.
+        try:
+            if getattr(self, "_graphics_cache_obj", None) is None:
+                root = self.project_info.get("dir", "")
+                if not root:
+                    return None
+                from ui.graphics_data import GraphicsDataCache
+                cache = GraphicsDataCache(root)
+                cache.load()
+                self._graphics_cache_obj = cache
+            return self._graphics_cache_obj
+        except Exception:
+            return None
+
+    def _species_list_icon(self, species: str, form: str | None = None) -> QIcon:
+        """Return a QIcon showing frame 0 of the species icon sprite.
+
+        The icon PNG is indexed and rides on ONE of three shared icon
+        palettes (``gMonIconPaletteIndices[species]`` → 0/1/2).  We
+        re-index through the live palette from the SpritePaletteBus so
+        mid-edit changes on the Graphics tab show up across the whole
+        species tree without reloading the project.
+
+        Cache is invalidated by ``_on_sprite_palette_changed`` when an
+        icon palette (or pokemon palette for the form in use) moves.
         """
         cache_key = f"{species}:{form or ''}"
         cache = getattr(self, "_species_icon_cache", {})
@@ -6008,8 +6112,28 @@ QTabBar::tab:hover:!selected {
                     species, "iconSprite", form=form
                 )
                 if path and os.path.isfile(path):
-                    pm = QPixmap(path)
-                    if not pm.isNull() and pm.height() >= 32:
+                    pm: QPixmap | None = None
+                    # Resolve the shared icon palette via the bus so
+                    # unsaved edits show up live.
+                    try:
+                        from core.sprite_palette_bus import get_bus as _spbus
+                        from core.sprite_render import load_sprite_pixmap
+                        idx = 0
+                        gcache = self._graphics_cache()
+                        if gcache is not None:
+                            idx = max(0, min(2, gcache.get_icon_idx(species)))
+                        root = self.project_info.get("dir", "")
+                        pal = None
+                        if root:
+                            pal = _spbus().ensure_icon_palette(root, idx)
+                        pm = load_sprite_pixmap(path, pal)
+                    except Exception:
+                        pm = None
+                    if pm is None or pm.isNull():
+                        # Final fallback — flat load keeps the UI from
+                        # going blank if the palette pipeline fails.
+                        pm = QPixmap(path)
+                    if pm is not None and not pm.isNull() and pm.height() >= 32:
                         icon = QIcon(pm.copy(0, 0, 32, 32))
         except Exception:
             pass
@@ -6029,6 +6153,10 @@ QTabBar::tab:hover:!selected {
         """
         Update the sprite labels on the Info tab.
         Called from update_data() after graphics paths are resolved.
+
+        The front pic is rendered through the live Pokemon palette so
+        unsaved Graphics-tab edits show up immediately (pokefirered
+        sprites are indexed PNGs with a separate .pal file).
         """
         try:
             if hasattr(self, "_species_const_lbl"):
@@ -6036,15 +6164,107 @@ QTabBar::tab:hover:!selected {
 
             if hasattr(self, "_info_front_lbl"):
                 if front_pic:
-                    # Load at native 64×64 — no scaling, alpha channel composited
-                    # transparently over the tab background
-                    pm = QPixmap(front_pic)
-                    self._info_front_lbl.setPixmap(pm)
+                    # Re-index through the live palette so mid-edit
+                    # palette changes propagate to the Info tab header.
+                    pal = None
+                    if species:
+                        try:
+                            from core.sprite_palette_bus import get_bus
+                            root = self.project_info.get("dir", "")
+                            if root:
+                                pal = get_bus().ensure_pokemon_palette(
+                                    root, species, "normal",
+                                )
+                        except Exception:
+                            pal = None
+                    from core.sprite_render import load_sprite_pixmap
+                    pm = load_sprite_pixmap(front_pic, pal)
+                    self._info_front_lbl.setPixmap(pm or QPixmap())
+                    # Remember what we're displaying so a palette edit on
+                    # another tab can refresh it without a full reload.
+                    self._info_front_species = species or ""
+                    self._info_front_path = front_pic or ""
                 else:
                     self._info_front_lbl.setPixmap(QPixmap())
+                    self._info_front_species = ""
+                    self._info_front_path = ""
 
             # _info_icon_lbl is driven by _tick_icon_animation via the shared
             # timer — no static pixmap assignment needed here
+        except Exception:
+            pass
+
+    def _on_sprite_palette_changed(self, category: str, key: str) -> None:
+        """React to a live palette edit broadcast by the SpritePaletteBus.
+
+        Currently wired sinks:
+
+        * Info tab front pic — reskin on ``"pokemon"`` edits to the
+          currently-displayed species (normal variant only; the Info
+          tab does not show shiny).
+        * Starter sprites (up to three) — reskin the matching slot
+          whenever its species' normal palette moves.
+        * Icon palettes (shared 0/1/2) — species-tree rows are rebuilt
+          on the next selection change; no per-row re-render here as
+          the tree is bulk-refreshed elsewhere.
+        """
+        try:
+            # Shared icon palettes (0/1/2) — one edit can affect many
+            # species-tree rows.  Drop the icon cache and force the
+            # tree to repaint; each row's icon will be regenerated
+            # lazily through the bus on next paint.
+            if category == "icon_palette":
+                if hasattr(self, "_species_icon_cache"):
+                    self._species_icon_cache.clear()
+                try:
+                    tree = getattr(self.ui, "tree_pokemon", None)
+                    if tree is not None:
+                        tree.viewport().update()
+                except Exception:
+                    pass
+                # Animated icon preview on the Info tab also depends on
+                # the shared palette — refresh its current frame.
+                try:
+                    self._tick_icon_animation()
+                except Exception:
+                    pass
+                return
+
+            if category != "pokemon":
+                return
+
+            from core.sprite_render import load_sprite_pixmap
+            from core.sprite_palette_bus import get_bus
+
+            # Info tab front pic ------------------------------------------
+            want = f"{getattr(self, '_info_front_species', '')}:normal"
+            if key == want and want != ":normal":
+                path = getattr(self, "_info_front_path", "")
+                if path:
+                    pal = get_bus().get_pokemon_palette(
+                        self._info_front_species, "normal",
+                    )
+                    if pal and hasattr(self, "_info_front_lbl"):
+                        pm = load_sprite_pixmap(path, pal)
+                        if pm is not None:
+                            self._info_front_lbl.setPixmap(pm)
+
+            # Starter sprites ---------------------------------------------
+            species_list = getattr(self, "_starter_sprite_species", [])
+            for idx, sp in enumerate(species_list):
+                if not sp:
+                    continue
+                if key != f"{sp}:normal":
+                    continue
+                try:
+                    self._update_starter_sprite(idx)
+                except Exception:
+                    pass
+
+            # Species-tree row icon (uses the icon sprite, not the
+            # front pic — icon sprite is colored by the SHARED icon
+            # palette, not the per-species normal palette).  Nothing to
+            # invalidate here; pokemon-normal edits don't touch icons.
         except Exception:
             pass
 

@@ -19,6 +19,14 @@ from PyQt6.QtWidgets import (
     QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
+# Shared sprite-rendering + cross-tab palette propagation. Trainer pics
+# are indexed 4bpp PNGs with a separate .pal file — a flat QPixmap(path)
+# read shows stale colours the moment the user edits the palette.
+from core.sprite_render import load_sprite_pixmap
+from core.sprite_palette_bus import (
+    get_bus as _get_palette_bus, CAT_TRAINER_PIC,
+)
+
 log = logging.getLogger(__name__)
 
 # ── Dark-theme styles (match the rest of PorySuite-Z) ────────────────────────
@@ -530,6 +538,50 @@ class TrainerClassEditor(QWidget):
         self._dirty_pics: dict[str, str] = {}  # class → new TRAINER_PIC
         self._loaded = False
         self._build()
+        # Subscribe to the cross-tab palette bus so live Trainer Graphics
+        # edits show up on the list rows + the detail preview without a
+        # save.
+        try:
+            _get_palette_bus().palette_changed.connect(
+                self._on_trainer_palette_changed
+            )
+        except Exception:
+            pass
+
+    # ── Bus-aware sprite helper ─────────────────────────────────────────────
+
+    def _load_trainer_pixmap(self, png_path: str,
+                             pic_const: str = "") -> Optional[QPixmap]:
+        """Load a trainer-pic pixmap re-indexed through the live palette.
+
+        *pic_const* is optional but preferred — it lets the bus cache
+        keyed edits from the Trainer Graphics tab hit first. Falls
+        back to disk (or a flat load) on any failure.
+        """
+        if not png_path or not os.path.isfile(png_path):
+            return None
+        pal = _get_palette_bus().ensure_trainer_palette_from_png(
+            png_path, pic_const=pic_const,
+        )
+        return load_sprite_pixmap(png_path, pal)
+
+    def _on_trainer_palette_changed(self, category: str, key: str) -> None:
+        """Refresh visible trainer thumbnails on any trainer-pic edit."""
+        if category != CAT_TRAINER_PIC:
+            return
+        try:
+            # Rebuild both the list row icons and the detail preview by
+            # re-selecting the current class. Cheap enough — this runs
+            # at most every few keystrokes of a palette edit.
+            self._populate_list()
+            if self._current_class:
+                pic_const = self._dirty_pics.get(
+                    self._current_class,
+                    self._class_to_pic.get(self._current_class, ""),
+                )
+                self._update_sprite_preview(pic_const)
+        except Exception:
+            pass
 
     # ── UI construction ─────────────────────────────────────────────────────
 
@@ -906,8 +958,8 @@ class TrainerClassEditor(QWidget):
             png = self._pic_paths.get(pic_const, "")
             icon = QIcon()
             if png and os.path.isfile(png):
-                pix = QPixmap(png)
-                if not pix.isNull():
+                pix = self._load_trainer_pixmap(png, pic_const=pic_const)
+                if pix is not None and not pix.isNull():
                     pix = pix.scaled(
                         24, 32,
                         Qt.AspectRatioMode.KeepAspectRatio,
@@ -937,8 +989,8 @@ class TrainerClassEditor(QWidget):
             if pic_const and pic_const in self._pic_paths:
                 png = self._pic_paths[pic_const]
                 if os.path.isfile(png):
-                    pix = QPixmap(png)
-                    if not pix.isNull():
+                    pix = self._load_trainer_pixmap(png, pic_const=pic_const)
+                    if pix is not None and not pix.isNull():
                         pix = pix.scaled(
                             32, 40,
                             Qt.AspectRatioMode.KeepAspectRatio,
@@ -1050,8 +1102,10 @@ class TrainerClassEditor(QWidget):
         if pic_const and pic_const in self._pic_paths:
             png_path = self._pic_paths[pic_const]
             if os.path.isfile(png_path):
-                pix = QPixmap(png_path)
-                if not pix.isNull():
+                pix = self._load_trainer_pixmap(
+                    png_path, pic_const=pic_const,
+                )
+                if pix is not None and not pix.isNull():
                     pix = pix.scaled(
                         88, 112,
                         Qt.AspectRatioMode.KeepAspectRatio,
@@ -1202,8 +1256,8 @@ class TrainerClassEditor(QWidget):
             if item.data(Qt.ItemDataRole.UserRole) == self._current_class:
                 png = self._pic_paths.get(new_pic, "")
                 if png and os.path.isfile(png):
-                    pix = QPixmap(png)
-                    if not pix.isNull():
+                    pix = self._load_trainer_pixmap(png, pic_const=new_pic)
+                    if pix is not None and not pix.isNull():
                         pix = pix.scaled(
                             32, 40,
                             Qt.AspectRatioMode.KeepAspectRatio,

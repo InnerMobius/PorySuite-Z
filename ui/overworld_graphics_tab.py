@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
 from ui.graphics_tab_widget import PaletteSwatchRow
+from core.sprite_palette_bus import get_bus as _get_palette_bus
 
 Color = Tuple[int, int, int]
 
@@ -1374,8 +1375,13 @@ class OverworldGraphicsTab(QWidget):
         if self._loading or not self._current_sprite:
             return
         tag = self._current_sprite.palette_tag
-        self._palettes[tag] = self._pal_row.colors()
+        colors = self._pal_row.colors()
+        self._palettes[tag] = colors
         self._palette_dirty.add(tag)
+        # Broadcast so any future viewer of this palette tag sees the
+        # edit live.  Overworld viewers aren't migrated yet but the
+        # hook is in place.
+        _get_palette_bus().set_overworld_palette(tag, colors)
         self.modified.emit()
         # Refresh the selected sprite detail immediately
         self._show_sprite_detail(self._current_sprite)
@@ -1637,6 +1643,7 @@ class OverworldGraphicsTab(QWidget):
 
         self._palettes[tag] = colors
         self._palette_dirty.add(tag)
+        _get_palette_bus().set_overworld_palette(tag, colors)
 
         self._loading = True
         try:

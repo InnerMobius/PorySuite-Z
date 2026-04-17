@@ -33,6 +33,11 @@ from ui.constants import (
 # ── icon resolution ───────────────────────────────────────────────────────────
 
 from ui.open_folder_util import open_in_folder
+# Shared sprite + palette infrastructure — items are indexed 4bpp PNGs
+# with per-slug .pal files, so flat QPixmap(path) reads show stale
+# colours the moment the user edits the palette.
+from core.sprite_render import load_sprite_pixmap
+from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_ITEM_ICON
 
 
 def _parse_item_icon_map(project_path: str) -> dict[str, str]:
@@ -667,32 +672,49 @@ class ItemDetailPanel(QWidget):
             display = sym.replace("gItemIcon_", "")
             icon = QIcon()
             if png_path and os.path.isfile(png_path):
-                pm = QPixmap(png_path).scaled(
-                    24, 24,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.FastTransformation,
+                # Re-index through the live palette (bus-cached or
+                # disk-loaded) so mid-edit palette changes show up in
+                # the combo's icon thumbs.
+                pal = _get_palette_bus().ensure_item_palette_from_png(
+                    png_path,
                 )
-                icon = QIcon(pm)
+                pm = load_sprite_pixmap(png_path, pal)
+                if pm is not None and not pm.isNull():
+                    pm = pm.scaled(
+                        24, 24,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.FastTransformation,
+                    )
+                    icon = QIcon(pm)
             self.f_icon_combo.addItem(icon, display, sym)
         self.f_icon_combo.blockSignals(False)
 
     def set_icon(self, png_path: str | None):
-        """Display the item icon from a PNG path, or a placeholder if None."""
+        """Display the item icon from a PNG path, or a placeholder if None.
+
+        Re-indexes through the live .pal (RAM-cached edits first, then
+        disk) so Graphics-tab palette edits propagate to this detail
+        header immediately.
+        """
         if png_path and os.path.isfile(png_path):
-            pm = QPixmap(png_path).scaled(
-                self._ICON_SIZE, self._ICON_SIZE,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
-            self._icon_lbl.setPixmap(pm)
-            self._icon_lbl.setStyleSheet(
-                "QLabel { background: transparent; border: none; }"
-            )
-            self._icon_lbl.setText("")
-        else:
-            self._icon_lbl.setPixmap(QPixmap())
-            self._icon_lbl.setStyleSheet(_PLACEHOLDER_ICON_SS)
-            self._icon_lbl.setText("?")
+            pal = _get_palette_bus().ensure_item_palette_from_png(png_path)
+            pm = load_sprite_pixmap(png_path, pal)
+            if pm is not None and not pm.isNull():
+                pm = pm.scaled(
+                    self._ICON_SIZE, self._ICON_SIZE,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+                self._icon_lbl.setPixmap(pm)
+                self._icon_lbl.setStyleSheet(
+                    "QLabel { background: transparent; border: none; }"
+                )
+                self._icon_lbl.setText("")
+                return
+            # Fall through to placeholder if reskin failed.
+        self._icon_lbl.setPixmap(QPixmap())
+        self._icon_lbl.setStyleSheet(_PLACEHOLDER_ICON_SS)
+        self._icon_lbl.setText("?")
 
     def load_item(self, const: str, data: dict, icon_path: str | None = None,
                   icon_sym: str | None = None):
@@ -874,6 +896,41 @@ class ItemsTabWidget(QWidget):
             install_scroll_guard_recursive(self)
         except Exception:
             pass
+        # Subscribe to cross-tab palette edits so item thumbnails update
+        # the moment the Graphics → Items palette changes — even without
+        # a save.
+        try:
+            _get_palette_bus().palette_changed.connect(
+                self._on_item_palette_changed
+            )
+        except Exception:
+            pass
+
+    def _on_item_palette_changed(self, category: str, key: str) -> None:
+        """Drop stale thumbnail caches and re-render visible rows."""
+        if category != CAT_ITEM_ICON:
+            return
+        # Wipe the thumbnail cache unconditionally — an item's list-row
+        # cache-key is the ITEM_* const, but the bus key might be the
+        # PNG path (when pushed by ensure_* helpers) or the item slug
+        # (when pushed by the Graphics editor). Easier to nuke the
+        # whole cache than reverse-map.
+        self._icon_cache.clear()
+        try:
+            # Force visible rows to repaint with new icons.
+            vp = self._list.viewport() if hasattr(self, "_list") else None
+            if vp is not None:
+                vp.update()
+        except Exception:
+            pass
+        # Re-render the currently open detail header too.
+        try:
+            if self._current and self._detail is not None:
+                png = self._icons.get(self._current, "")
+                if png:
+                    self._detail.set_icon(png)
+        except Exception:
+            pass
 
     # ── build ────────────────────────────────────────────────────────────────
 
@@ -1034,16 +1091,28 @@ class ItemsTabWidget(QWidget):
     # ── internal ──────────────────────────────────────────────────────────────
 
     def _icon_for(self, const: str) -> QIcon:
+        """Resolve the list-row thumbnail for an ITEM_*.
+
+        Renders through the SpritePaletteBus so unsaved Graphics-tab
+        palette edits show up on the list rows immediately. The cache
+        is invalidated by ``_on_palette_changed`` when an item palette
+        moves.
+        """
         if const in self._icon_cache:
             return self._icon_cache[const]
         png = self._icons.get(const, "")
         if png and os.path.isfile(png):
-            pm = QPixmap(png).scaled(
-                self._LIST_ICON, self._LIST_ICON,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
-            icon = QIcon(pm)
+            pal = _get_palette_bus().ensure_item_palette_from_png(png)
+            pm = load_sprite_pixmap(png, pal)
+            if pm is not None and not pm.isNull():
+                pm = pm.scaled(
+                    self._LIST_ICON, self._LIST_ICON,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                )
+                icon = QIcon(pm)
+            else:
+                icon = QIcon()
         else:
             icon = QIcon()
         self._icon_cache[const] = icon

@@ -20,6 +20,13 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.game_text_edit import GameTextEdit, inc_to_display, display_to_inc
+# Shared sprite-rendering + cross-tab palette propagation. Trainer pics
+# are indexed 4bpp PNGs paired with a separate .pal file; flat QPixmap
+# reads go stale the moment a palette edit happens in Trainer Graphics.
+from core.sprite_render import load_sprite_pixmap
+from core.sprite_palette_bus import (
+    get_bus as _get_palette_bus, CAT_TRAINER_PIC,
+)
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +39,30 @@ from ui.constants import (
     STRUCT_FOR_PARTY_TYPE as _STRUCT_FOR_TYPE,
     PARTY_TYPE_FOR_STRUCT as _TYPE_FOR_STRUCT,
 )
+
+# ── Bus-aware trainer-pic loader ────────────────────────────────────────────
+
+def _load_trainer_pic(path: str, pic_const: str = "") -> QPixmap:
+    """Load a trainer-pic PNG re-indexed through the live palette.
+
+    Resolves the palette via :mod:`core.sprite_palette_bus` so any
+    unsaved Trainer Graphics edits show up on list rows and detail
+    sprites immediately. Falls back to a flat load if the re-index
+    path fails (bad PNG, missing .pal).
+    """
+    if not path or not os.path.isfile(path):
+        return QPixmap()
+    try:
+        pal = _get_palette_bus().ensure_trainer_palette_from_png(
+            path, pic_const=pic_const,
+        )
+        pm = load_sprite_pixmap(path, pal)
+        if pm is not None and not pm.isNull():
+            return pm
+    except Exception:
+        pass
+    return QPixmap(path)
+
 
 # ── No-scroll combo box ──────────────────────────────────────────────────────
 # Dropdown must never change value on mouse wheel unless the popup is open.
@@ -2194,7 +2225,7 @@ class _TrainerDetailPanel(QWidget):
         if const and const in self._pic_map:
             path = self._pic_map[const]
             if os.path.isfile(path):
-                pix = QPixmap(path)
+                pix = _load_trainer_pic(path, pic_const=const)
                 if not pix.isNull():
                     self._pic_thumb.setPixmap(
                         pix.scaled(32, 40,
@@ -2228,7 +2259,7 @@ class _TrainerDetailPanel(QWidget):
         if pic_const and pic_const in self._pic_map:
             path = self._pic_map[pic_const]
             if os.path.isfile(path):
-                pix = QPixmap(path)
+                pix = _load_trainer_pic(path, pic_const=pic_const)
                 if not pix.isNull():
                     # Match _sprite_lbl's 64x64 fixed size — scaling larger
                     # (e.g. 80x100) overflows and gets clipped, which reads
@@ -2620,6 +2651,36 @@ class TrainersTabWidget(QWidget):
         # the moment the user types into the search box. Keyed by TRAINER_*.
         self._dirty_consts: set[str] = set()
         self._build()
+        # Live cross-tab palette sync — when Trainer Graphics edits a
+        # pic's palette, every visible row + the detail preview should
+        # reskin without a save.
+        try:
+            _get_palette_bus().palette_changed.connect(
+                self._on_trainer_palette_changed
+            )
+        except Exception:
+            pass
+
+    def _on_trainer_palette_changed(self, category: str, key: str) -> None:
+        """Refresh trainer thumbnails on a trainer-pic palette edit."""
+        if category != CAT_TRAINER_PIC:
+            return
+        try:
+            # Rebuild the visible list so every row's thumbnail is
+            # regenerated through the (now-updated) bus cache.
+            self._rebuild_list(self._search.text() if hasattr(self, "_search") else "")
+        except Exception:
+            pass
+        # Refresh the detail panel's sprite for the selected trainer.
+        try:
+            if self._detail_panel is not None and self._current_const:
+                pic_const = self._trainers.get(
+                    self._current_const, {}
+                ).get("trainerPic", "")
+                if pic_const:
+                    self._detail_panel._load_sprite(pic_const)
+        except Exception:
+            pass
 
     # ── build ─────────────────────────────────────────────────────────────────
     def _build(self):
@@ -2947,7 +3008,7 @@ class TrainersTabWidget(QWidget):
         if pic_const and pic_const in self._pic_map:
             path = self._pic_map[pic_const]
             if os.path.isfile(path):
-                pix = QPixmap(path)
+                pix = _load_trainer_pic(path, pic_const=pic_const)
                 if not pix.isNull():
                     return pix
         return QPixmap()
