@@ -877,9 +877,16 @@ class GraphicsTabWidget(QWidget):
 
             # Normal/Shiny palette for this species
             self._load_species_palettes(species)
-            # If user has shiny preview on, re-skin sprites with shiny pal
-            if self._preview_shiny:
-                self._refresh_preview_sprites()
+
+            # Now reskin the front/back thumbs + battle preview using the
+            # freshly-loaded palette (normal or shiny per toggle).  Without
+            # this, the thumbnails and preview show the baked PNG palette
+            # which may differ from the authoritative .pal file.
+            normal_pal = (self._palettes.get(species) or {}).get("normal")
+            if normal_pal:
+                self._set_thumb(self._front_thumb[1], front_path, normal_pal)
+                self._set_thumb(self._back_thumb[1], back_path, normal_pal)
+            self._refresh_preview_sprites()
         finally:
             self._loading = False
 
@@ -927,7 +934,8 @@ class GraphicsTabWidget(QWidget):
 
     def _refresh_preview_sprites(self) -> None:
         """Apply normal or shiny palette to the stored source sprites
-        and push them into the BattleScenePreview widget.
+        and push them into the BattleScenePreview widget AND the left-
+        column front/back thumbnails.
 
         When an in-memory sprite image exists (populated by an Index-as-
         Background right-click), the preview uses its remapped pixel data
@@ -959,12 +967,15 @@ class GraphicsTabWidget(QWidget):
                 return _reskin_indexed_png(path, palette) or fallback
             return fallback
 
-        self._preview.set_front_pixmap(
-            _recolour("front", self._front_src_path, self._front_src)
-        )
-        self._preview.set_back_pixmap(
-            _recolour("back", self._back_src_path, self._back_src)
-        )
+        front_pix = _recolour("front", self._front_src_path, self._front_src)
+        back_pix = _recolour("back", self._back_src_path, self._back_src)
+
+        self._preview.set_front_pixmap(front_pix)
+        self._preview.set_back_pixmap(back_pix)
+
+        # Keep left-column thumbnails in sync with the palette too
+        self._set_thumb(self._front_thumb[1], self._front_src_path, palette)
+        self._set_thumb(self._back_thumb[1], self._back_src_path, palette)
 
     def _load_species_palettes(self, species: str) -> None:
         if not self._project_root:
@@ -979,11 +990,17 @@ class GraphicsTabWidget(QWidget):
         self._normal_row.set_colors(pal["normal"])
         self._shiny_row.set_colors(pal["shiny"])
 
-    def _set_thumb(self, lbl: QLabel, path: str) -> None:
+    def _set_thumb(self, lbl: QLabel, path: str,
+                   palette: Optional[List[Color]] = None) -> None:
         if not path or not os.path.exists(path):
             lbl.clear()
             return
-        pix = QPixmap(path)
+        if palette:
+            pix = _reskin_indexed_png(path, palette)
+            if pix is None:
+                pix = QPixmap(path)
+        else:
+            pix = QPixmap(path)
         if pix.isNull():
             lbl.clear()
             return
@@ -996,10 +1013,16 @@ class GraphicsTabWidget(QWidget):
         )
         lbl.setPixmap(scaled)
 
-    def _load_pix(self, path: str) -> Optional[QPixmap]:
+    def _load_pix(self, path: str,
+                  palette: Optional[List[Color]] = None) -> Optional[QPixmap]:
         if not path or not os.path.exists(path):
             return None
-        pix = QPixmap(path)
+        if palette:
+            pix = _reskin_indexed_png(path, palette)
+            if pix is None:
+                pix = QPixmap(path)
+        else:
+            pix = QPixmap(path)
         if pix.isNull():
             return None
         return pix

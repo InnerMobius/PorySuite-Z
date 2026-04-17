@@ -1610,8 +1610,13 @@ class PokemonStarters(pokemon_data.PokemonStarters):
                         battle_setup_lines.append(line)
                         continue
                     elif "u16 starterMon" in line:
-                        if any(starter["ability_num"] != -1 for starter in self.data):
-                            line += "\n    u16 abilityNum;\n"
+                        extra = ""
+                        if any((s.get("shiny_chance") or 0.0) > 0.0 for s in self.data):
+                            extra += "\n    u32 shinyPersonality;\n    u16 shinyOtId;\n    u16 shinySid;"
+                        if any(s.get("ball_item") for s in self.data):
+                            extra += "\n    u16 starterBall;"
+                        if extra:
+                            line = line.rstrip("\n") + extra + "\n"
                         battle_setup_lines.append(line)
                     elif "ScriptGiveMon(starterMon" in line:
                         line = self.__generate_switch_case_code()
@@ -1628,7 +1633,8 @@ class PokemonStarters(pokemon_data.PokemonStarters):
 
     def __generate_switch_case_code(self):
         """
-        Generates the switch case code for assigning starter Pokémon based on the value of gSpecialVar_Result.
+        Generates the switch case code for assigning starter Pokémon based on
+        the value of gSpecialVar_Result.
 
         Returns:
             str: The generated switch case code.
@@ -1639,13 +1645,56 @@ class PokemonStarters(pokemon_data.PokemonStarters):
                 f'        case {i}: // {starter["species"]}\n'
                 f'            ScriptGiveMon(starterMon, {starter["level"]}, {starter["item"]}, 0, 0, 0);\n'
             )
-            if starter["custom_move"] != "MOVE_NONE":
-                switch_case_code += f'            GiveMoveToMon(&gPlayerParty[0], {starter["custom_move"]});\n'
-            if starter["ability_num"] != -1:
+
+            # Custom move
+            if starter.get("custom_move", "MOVE_NONE") != "MOVE_NONE":
                 switch_case_code += (
-                    f'            abilityNum = {starter["ability_num"]};\n'
+                    f'            GiveMoveToMon(&gPlayerParty[0], {starter["custom_move"]});\n'
                 )
-                switch_case_code += f"            SetMonData(&gPlayerParty[0], MON_DATA_ABILITY_NUM, &abilityNum);\n"
+
+            # Shiny chance
+            shiny_chance = starter.get("shiny_chance") or 0.0
+            if shiny_chance > 0.0:
+                # Threshold out of 10000 so 0.01% = 1, 100% = 10000.
+                threshold = min(int(round(shiny_chance * 100)), 10000)
+                # Patch lower 16 bits of personality to satisfy the Gen 3 shiny
+                # XOR check: (OTID ^ SID ^ hi16 ^ lo16) < 8.
+                # Setting lo16 = OTID ^ SID ^ hi16 makes the value exactly 0.
+                # Upper 16 bits are preserved so nature (personality % 25) is
+                # unchanged.
+                shiny_block = (
+                    '            shinyOtId = (u16)(gSaveBlock2Ptr->playerTrainerId[0]'
+                    ' | (gSaveBlock2Ptr->playerTrainerId[1] << 8));\n'
+                    '            shinySid = (u16)(gSaveBlock2Ptr->playerTrainerId[2]'
+                    ' | (gSaveBlock2Ptr->playerTrainerId[3] << 8));\n'
+                    '            shinyPersonality = GetMonData(&gPlayerParty[0], MON_DATA_PERSONALITY, NULL);\n'
+                    '            shinyPersonality = (shinyPersonality & 0xFFFF0000)'
+                    ' | (u32)(u16)(shinyOtId ^ shinySid ^ (u16)(shinyPersonality >> 16));\n'
+                    '            SetMonData(&gPlayerParty[0], MON_DATA_PERSONALITY, &shinyPersonality);\n'
+                )
+                switch_case_code += (
+                    f'            // PORYSUITE_SHINY_CHANCE: {shiny_chance:.2f}\n'
+                )
+                if threshold >= 10000:
+                    # 100 % — always shiny, skip the Random() roll.
+                    switch_case_code += shiny_block
+                else:
+                    switch_case_code += (
+                        f'            if (Random() % 10000 < {threshold})\n'
+                        '            {\n'
+                        + "".join("    " + ln for ln in shiny_block.splitlines(keepends=True))
+                        + '            }\n'
+                    )
+
+            # Ball type
+            ball_item = starter.get("ball_item")
+            if ball_item:
+                switch_case_code += (
+                    f'            // PORYSUITE_BALL: {ball_item}\n'
+                    f'            starterBall = {ball_item};\n'
+                    f'            SetMonData(&gPlayerParty[0], MON_DATA_POKEBALL, &starterBall);\n'
+                )
+
             switch_case_code += f"            break;\n"
         switch_case_code += "    }\n"
         return switch_case_code

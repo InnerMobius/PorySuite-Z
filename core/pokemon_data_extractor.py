@@ -1441,7 +1441,8 @@ class StartersDataExtractor(PokemonDataExtractor):
                     "level": 5,
                     "item": "ITEM_NONE",
                     "custom_move": "MOVE_NONE",
-                    "ability_num": -1,
+                    "shiny_chance": 0.0,
+                    "ball_item": None,
                 }
             )
 
@@ -1461,19 +1462,27 @@ class StartersDataExtractor(PokemonDataExtractor):
                 if m:
                     starters[idx]["level"] = int(m.group(1))
                     starters[idx]["item"] = m.group(2)
-                m2 = re.search(r"abilityNum\s*=\s*([A-Za-z0-9_]+)", block)
-                if m2:
-                    try:
-                        starters[idx]["ability_num"] = int(m2.group(1))
-                    except ValueError:
-                        starters[idx]["ability_num"] = m2.group(1)
-
                 m3 = re.search(
                     r"GiveMoveToMon\s*\([^,]*,\s*([A-Za-z0-9_]+)\s*\)",
                     block,
                 )
                 if m3:
                     starters[idx]["custom_move"] = m3.group(1)
+
+                # Shiny chance — marker comment written by the codegen.
+                m_shiny = re.search(
+                    r"//\s*PORYSUITE_SHINY_CHANCE:\s*([\d.]+)", block)
+                if m_shiny:
+                    try:
+                        starters[idx]["shiny_chance"] = float(m_shiny.group(1))
+                    except ValueError:
+                        pass
+
+                # Ball item — marker comment written by the codegen.
+                m_ball = re.search(
+                    r"//\s*PORYSUITE_BALL:\s*(\w+)", block)
+                if m_ball:
+                    starters[idx]["ball_item"] = m_ball.group(1)
 
         if len(starters) < 3:
             msg = (

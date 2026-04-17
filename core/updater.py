@@ -52,10 +52,13 @@ PRESERVE = {
 # ── Version comparison ───────────────────────────────────────────────────────
 
 def parse_version(v: str) -> tuple:
-    """Parse a version string like '0.0.2b' into a comparable tuple.
+    """Parse a version string like '0.0.6b' into a comparable tuple.
 
-    Strips leading 'v' and trailing letter suffix.  Returns something
-    like (0, 0, 2, 'b') so that 0.0.2b > 0.0.1b.
+    The version scheme treats the third segment as a decimal fraction so
+    that 0.0.6 > 0.0.59 (just as 0.6 > 0.59 in decimal arithmetic).
+    This means '6' → 0.6, '59' → 0.59, '61' → 0.61, '611' → 0.611.
+    The first two segments (major, minor) are plain integers.
+    Strips leading 'v' and trailing alpha suffix before parsing.
     """
     v = v.strip().lstrip("v")
     # Split off trailing alpha suffix (e.g. 'b' for beta)
@@ -63,16 +66,22 @@ def parse_version(v: str) -> tuple:
     while v and v[-1].isalpha():
         suffix = v[-1] + suffix
         v = v[:-1]
-    parts = []
-    for p in v.split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            parts.append(0)
-    # Pad to at least 3 parts
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts) + (suffix,)
+    parts = v.split(".")
+    try:
+        major = int(parts[0]) if len(parts) > 0 else 0
+    except ValueError:
+        major = 0
+    try:
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        minor = 0
+    # Third segment is a decimal fraction: "6" → 0.6, "59" → 0.59
+    patch_str = parts[2] if len(parts) > 2 else "0"
+    try:
+        patch = float("0." + patch_str)
+    except ValueError:
+        patch = 0.0
+    return (major, minor, patch, suffix)
 
 
 def is_newer(remote: str, local: str = VERSION) -> bool:

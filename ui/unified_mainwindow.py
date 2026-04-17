@@ -1312,20 +1312,10 @@ class UnifiedMainWindow(QMainWindow):
             elif page_name == "trainers":
                 ps._save_trainers_editor()
             elif page_name == "starters":
-                # Flush starters — same as update_main_tabs for starters
-                for i, prefix in enumerate(["starter1", "starter2", "starter3"]):
-                    species_cb = getattr(ps.ui, f"{prefix}_species", None)
-                    level_sb = getattr(ps.ui, f"{prefix}_level", None)
-                    item_cb = getattr(ps.ui, f"{prefix}_item", None)
-                    move_cb = getattr(ps.ui, f"{prefix}_move", None)
-                    if species_cb:
-                        ps.source_data.set_starter_data(i, "species", species_cb.currentData())
-                    if level_sb:
-                        ps.source_data.set_starter_data(i, "level", level_sb.value())
-                    if item_cb:
-                        ps.source_data.set_starter_data(i, "item", item_cb.currentData())
-                    if move_cb:
-                        ps.source_data.set_starter_data(i, "custom_move", move_cb.currentData())
+                # Delegate to the single flush method so both save paths
+                # stay in sync — field additions only need to be in one place.
+                if hasattr(ps, "_flush_starter_widgets"):
+                    ps._flush_starter_widgets()
         except Exception as e:
             self.log_message(f"Warning: could not flush {page_name} data: {e}")
 

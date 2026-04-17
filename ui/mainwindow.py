@@ -769,9 +769,14 @@ QTabBar::tab:hover:!selected {
             except Exception:
                 pass
             self._on_species_field_edited()
+        # Starter widgets get their own handler so changes light up the
+        # Starters sidebar dot, not the Pokemon dot.
+        _STARTER_PREFIXES = ("starter1_", "starter2_", "starter3_")
         for attr_name in dir(self.ui):
             if attr_name.startswith('_'):
                 continue
+            if any(attr_name.startswith(p) for p in _STARTER_PREFIXES):
+                continue  # handled separately below
             w = getattr(self.ui, attr_name, None)
             if w is None:
                 continue
@@ -788,6 +793,32 @@ QTabBar::tab:hover:!selected {
                     w.textChanged.connect(_dirty)
             except Exception:
                 pass  # some attrs aren't real widgets
+
+        # ── Starter-specific dirty connections ───────────────────────────────
+        # Each starter combo/spinbox fires _on_starter_edited(idx) instead of
+        # _on_species_field_edited, so only the Starters sidebar dot lights up
+        # and only the edited starter's groupbox turns amber.
+        _STARTER_FIELDS = [
+            ("starter1_species", 0), ("starter1_level", 0),
+            ("starter1_item",    0), ("starter1_move",  0),
+            ("starter2_species", 1), ("starter2_level", 1),
+            ("starter2_item",    1), ("starter2_move",  1),
+            ("starter3_species", 2), ("starter3_level", 2),
+            ("starter3_item",    2), ("starter3_move",  2),
+        ]
+        for _sf, _si in _STARTER_FIELDS:
+            _sw = getattr(self.ui, _sf, None)
+            if _sw is None:
+                continue
+            try:
+                if isinstance(_sw, (QSpinBox, QDoubleSpinBox)):
+                    _sw.valueChanged.connect(
+                        lambda *_, i=_si: self._on_starter_edited(i))
+                elif isinstance(_sw, QComboBox):
+                    _sw.currentIndexChanged.connect(
+                        lambda *_, i=_si: self._on_starter_edited(i))
+            except Exception:
+                pass
 
         # Connect selection change signals
         self.ui.tree_pokemon.itemSelectionChanged.connect(self.update_tree_pokemon)
@@ -3135,46 +3166,41 @@ QTabBar::tab:hover:!selected {
         self._nat_order_cache: list[str] | None = None
         self._kanto_cutoff_const: str | None = None
 
-        # ── Populate and enable starter ability combo boxes ─────────────────
-        # The game's abilityNum selects which of the species' ability slots
-        # to use: -1 = default (random), 0 = slot 1, 1 = slot 2.
-        for ab_box in (self.ui.starter1_ability_num,
-                       self.ui.starter2_ability_num,
-                       self.ui.starter3_ability_num):
-            ab_box.setEnabled(True)
-            ab_box.clear()
-            ab_box.addItem("Default (random)", -1)
-            ab_box.addItem("Ability Slot 1", 0)
-            ab_box.addItem("Ability Slot 2", 1)
-            ab_box.currentIndexChanged.connect(
-                lambda *_a: self.setWindowModified(True))
+        # ── Remove the ability row entirely from each starter form layout ───
+        # The generated UI file put the ability combo + checkbox in row 4
+        # (0-indexed) of each groupbox QFormLayout. removeRow() deletes the
+        # label AND field widgets from the layout — no invisible ghost rows.
+        # We iterate in reverse index order so repeated removeRow(4) calls
+        # are safe even if one groupbox is missing.
+        _form_ability_row = 4
+        for _form_name in ("groupBox_starter1_form",
+                           "groupBox_starter2_form",
+                           "groupBox_starter3_form"):
+            _form = getattr(self.ui, _form_name, None)
+            if _form is not None and _form.rowCount() > _form_ability_row:
+                _form.removeRow(_form_ability_row)
+        # Tooltip for Custom Move fields.
+        for _n in ("starter1", "starter2", "starter3"):
+            mv = getattr(self.ui, f"{_n}_move", None)
+            if mv:
+                mv.setToolTip(
+                    "Optional extra move given to this starter at the start "
+                    "of the game, on top of whatever it normally learns at "
+                    "its starting level. Set to — None — to leave the "
+                    "learnset unchanged."
+                )
 
         # Set starter data without warnings if fewer than three
         starters = self.source_data.get_pokemon_starters()
-        widgets = [
-            (
-                self.ui.starter1_species,
-                self.ui.starter1_level,
-                self.ui.starter1_item,
-                self.ui.starter1_ability_num,
-            ),
-            (
-                self.ui.starter2_species,
-                self.ui.starter2_level,
-                self.ui.starter2_item,
-                self.ui.starter2_ability_num,
-            ),
-            (
-                self.ui.starter3_species,
-                self.ui.starter3_level,
-                self.ui.starter3_item,
-                self.ui.starter3_ability_num,
-            ),
-        ]
+        _sp_boxes  = [self.ui.starter1_species, self.ui.starter2_species, self.ui.starter3_species]
+        _lv_spins  = [self.ui.starter1_level,   self.ui.starter2_level,   self.ui.starter3_level]
+        _it_boxes  = [self.ui.starter1_item,     self.ui.starter2_item,    self.ui.starter3_item]
         for idx, starter in enumerate(starters):
-            if idx >= len(widgets):
+            if idx >= 3:
                 break
-            species_box, level_spin, item_box, ability_box = widgets[idx]
+            species_box = _sp_boxes[idx]
+            level_spin  = _lv_spins[idx]
+            item_box    = _it_boxes[idx]
             species_idx = species_box.findData(starter.get("species"))
             if species_idx == -1:
                 species_idx = 0
@@ -3184,12 +3210,6 @@ QTabBar::tab:hover:!selected {
             if item_idx == -1:
                 item_idx = 0
             item_box.setCurrentIndex(item_idx)
-            # Restore ability slot selection
-            ability_val = starter.get("ability_num", -1)
-            ab_idx = ability_box.findData(ability_val)
-            if ab_idx == -1:
-                ab_idx = 0  # Default
-            ability_box.setCurrentIndex(ab_idx)
 
         # Add moves to move combo boxes
         self.ui.starter1_move.clear()
@@ -3368,9 +3388,9 @@ QTabBar::tab:hover:!selected {
         species_item.setIcon(0, self._species_list_icon(species))
         self.ui.tree_pokemon.addTopLevelItem(species_item)
         self.ui.evo_species.addItem(species, species)
-        self.ui.starter1_species.addItem(species, species)
-        self.ui.starter2_species.addItem(species, species)
-        self.ui.starter3_species.addItem(species, species)
+        self.ui.starter1_species.addItem(species_name, species)
+        self.ui.starter2_species.addItem(species_name, species)
+        self.ui.starter3_species.addItem(species_name, species)
 
         # Add forms as child items and to the dropdown menus
         if len(forms) > 0:
@@ -3380,9 +3400,9 @@ QTabBar::tab:hover:!selected {
                 form_item.setIcon(0, self._species_list_icon(species, form))
                 species_item.addChild(form_item)
                 self.ui.evo_species.addItem("    " + form, form, species)
-                self.ui.starter1_species.addItem("    " + form, form, species)
-                self.ui.starter2_species.addItem("    " + form, form, species)
-                self.ui.starter3_species.addItem("    " + form, form, species)
+                self.ui.starter1_species.addItem("    " + form_name, form, species)
+                self.ui.starter2_species.addItem("    " + form_name, form, species)
+                self.ui.starter3_species.addItem("    " + form_name, form, species)
             species_item.setExpanded(False)
 
         return species_item
@@ -3551,6 +3571,14 @@ QTabBar::tab:hover:!selected {
                     self._mark_list_item_dirty(lst, False)
         except Exception:
             pass
+        # Clear starter groupbox amber tints.
+        for _gb_name in ("groupBox_starter1", "groupBox_starter2", "groupBox_starter3"):
+            try:
+                gb = getattr(self.ui, _gb_name, None)
+                if gb is not None:
+                    gb.setStyleSheet("")
+            except Exception:
+                pass
         # Clear every known section's dot indicator.
         for section in ("species", "pokedex", "items", "moves", "abilities",
                         "trainers", "starters", "encounters", "credits",
@@ -5571,54 +5599,7 @@ QTabBar::tab:hover:!selected {
                 self.save_items_table()
                 self.items_editor.save_icon_changes()
             elif self.previous_main_tab == 3:  # Starters
-                # Update starter data for each starter
-                self.source_data.set_starter_data(
-                    0, "species", self.ui.starter1_species.currentData()
-                )
-                self.source_data.set_starter_data(
-                    0, "level", self.ui.starter1_level.value()
-                )
-                self.source_data.set_starter_data(
-                    0, "item", self.ui.starter1_item.currentData()
-                )
-                self.source_data.set_starter_data(
-                    0, "custom_move", self.ui.starter1_move.currentData()
-                )
-                self.source_data.set_starter_data(
-                    0, "ability_num", self.ui.starter1_ability_num.currentData()
-                )
-
-                self.source_data.set_starter_data(
-                    1, "species", self.ui.starter2_species.currentData()
-                )
-                self.source_data.set_starter_data(
-                    1, "level", self.ui.starter2_level.value()
-                )
-                self.source_data.set_starter_data(
-                    1, "item", self.ui.starter2_item.currentData()
-                )
-                self.source_data.set_starter_data(
-                    1, "custom_move", self.ui.starter2_move.currentData()
-                )
-                self.source_data.set_starter_data(
-                    1, "ability_num", self.ui.starter2_ability_num.currentData()
-                )
-
-                self.source_data.set_starter_data(
-                    2, "species", self.ui.starter3_species.currentData()
-                )
-                self.source_data.set_starter_data(
-                    2, "level", self.ui.starter3_level.value()
-                )
-                self.source_data.set_starter_data(
-                    2, "item", self.ui.starter3_item.currentData()
-                )
-                self.source_data.set_starter_data(
-                    2, "custom_move", self.ui.starter3_move.currentData()
-                )
-                self.source_data.set_starter_data(
-                    2, "ability_num", self.ui.starter3_ability_num.currentData()
-                )
+                self._flush_starter_widgets()
             elif self.previous_main_tab == 4:  # Trainers
                 self._save_trainers_editor()
                 self._save_trainer_classes()
@@ -5968,13 +5949,137 @@ QTabBar::tab:hover:!selected {
             # Insert the sprite container at the top of the form layout
             form_layout.insertRow(0, sprite_container)
 
-            # Connect species change to update sprite
+            # Connect species change to update sprite.
             species_combo.currentIndexChanged.connect(
                 lambda *_a, idx=i: self._update_starter_sprite(idx)
             )
 
             # Initial update
             self._update_starter_sprite(i)
+
+        # After all three sprite containers are built, add Shiny Chance and
+        # Ball fields to each groupbox form layout.
+        self._setup_starter_extra_fields()
+
+    def _setup_starter_extra_fields(self):
+        """Add Shiny Chance (QDoubleSpinBox) and Ball (QComboBox) rows to
+        each starter groupbox. Called once from _setup_starter_sprites; on
+        re-entry (project reload) the widgets already exist so we just
+        restore saved values."""
+        from PyQt6.QtWidgets import QDoubleSpinBox, QComboBox, QLabel
+        from PyQt6.QtCore import Qt
+
+        _gb_names   = ["groupBox_starter1", "groupBox_starter2", "groupBox_starter3"]
+        _form_names = ["groupBox_starter1_form", "groupBox_starter2_form", "groupBox_starter3_form"]
+
+        # Build ball list from the project's item data, filtered to throw-able
+        # ball items only.  Falls back to a hardcoded list if no item data yet.
+        _KNOWN_BALLS = [
+            ("ITEM_POKE_BALL",    "Poké Ball"),
+            ("ITEM_GREAT_BALL",   "Great Ball"),
+            ("ITEM_ULTRA_BALL",   "Ultra Ball"),
+            ("ITEM_MASTER_BALL",  "Master Ball"),
+            ("ITEM_SAFARI_BALL",  "Safari Ball"),
+            ("ITEM_NET_BALL",     "Net Ball"),
+            ("ITEM_DIVE_BALL",    "Dive Ball"),
+            ("ITEM_NEST_BALL",    "Nest Ball"),
+            ("ITEM_REPEAT_BALL",  "Repeat Ball"),
+            ("ITEM_TIMER_BALL",   "Timer Ball"),
+            ("ITEM_LUXURY_BALL",  "Luxury Ball"),
+            ("ITEM_PREMIER_BALL", "Premier Ball"),
+        ]
+        # Try to get display names from the project's items data.
+        ball_entries = []  # list of (const, display_name)
+        try:
+            items_data = self.source_data.get_pokemon_items() if self.source_data else {}
+            for const, fallback_name in _KNOWN_BALLS:
+                name = None
+                if const in items_data:
+                    name = (self.source_data.get_item_data(const, "display_name")
+                            or self.source_data.get_item_data(const, "name"))
+                ball_entries.append((const, name or fallback_name))
+        except Exception:
+            ball_entries = list(_KNOWN_BALLS)
+
+        starters = self.source_data.get_pokemon_starters() if self.source_data else []
+
+        # If widgets already exist from a previous load, just restore values.
+        if hasattr(self, "_starter_shiny_spins") and self._starter_shiny_spins:
+            with self._loading_guard():
+                for i, spin in enumerate(self._starter_shiny_spins):
+                    val = starters[i].get("shiny_chance", 0.0) if i < len(starters) else 0.0
+                    spin.setValue(val)
+                for i, combo in enumerate(self._starter_ball_combos):
+                    saved = starters[i].get("ball_item") if i < len(starters) else None
+                    idx2 = combo.findData(saved) if saved else 0
+                    combo.setCurrentIndex(max(idx2, 0))
+            return
+
+        self._starter_shiny_spins  = []
+        self._starter_ball_combos  = []
+
+        for i, (gb_name, form_name) in enumerate(zip(_gb_names, _form_names)):
+            gb   = getattr(self.ui, gb_name, None)
+            form = getattr(self.ui, form_name, None)
+            if gb is None or form is None:
+                continue
+
+            # ── Shiny Chance row ─────────────────────────────────────────────
+            shiny_spin = QDoubleSpinBox(gb)
+            shiny_spin.setRange(0.0, 100.0)
+            shiny_spin.setDecimals(2)
+            shiny_spin.setSingleStep(1.0)
+            shiny_spin.setSuffix(" %")
+            # Special-value text replaces the entire display at minimum, so
+            # don't include a number — it previously read "0.00 % (Game Default)"
+            # which looked like the game's natural rate was 0%.
+            shiny_spin.setSpecialValueText("Off  (use natural rate)")
+            shiny_spin.setToolTip(
+                "Force this starter to have a set chance of being shiny.\n"
+                "Off = the game's normal shiny rate applies (very rare).\n"
+                "Any value above 0 overrides that rate for this starter only.\n"
+                "100 % = always shiny.\n\n"
+                "The shiny check still uses the player's own Trainer / Secret ID,\n"
+                "so the personality is legitimate — not a cheater flag."
+            )
+            saved_shiny = starters[i].get("shiny_chance", 0.0) if i < len(starters) else 0.0
+            with self._loading_guard():
+                shiny_spin.setValue(saved_shiny)
+            shiny_spin.valueChanged.connect(
+                lambda *_, idx=i: self._on_starter_edited(idx))
+            shiny_label = QLabel(
+                "<small><i>Overrides the natural shiny rate for this starter only.</i></small>",
+                gb,
+            )
+            shiny_label.setWordWrap(True)
+            form.addRow("Forced Shiny", shiny_spin)
+            form.addRow(shiny_label)
+            self._starter_shiny_spins.append(shiny_spin)
+
+            # ── Ball row ─────────────────────────────────────────────────────
+            ball_combo = QComboBox(gb)
+            ball_combo.addItem("— Game Default —", None)
+            for const, name in ball_entries:
+                ball_combo.addItem(name, const)
+            ball_combo.setToolTip(
+                "Which Poké Ball this starter is registered as caught in.\n"
+                "Shown on the summary screen and party screen.\n"
+                "Game Default leaves the field unset."
+            )
+            saved_ball = starters[i].get("ball_item") if i < len(starters) else None
+            with self._loading_guard():
+                bidx = ball_combo.findData(saved_ball) if saved_ball else 0
+                ball_combo.setCurrentIndex(max(bidx, 0))
+            ball_combo.currentIndexChanged.connect(
+                lambda *_, idx=i: self._on_starter_edited(idx))
+            ball_label = QLabel(
+                "<small><i>Ball shown on the party/summary screen for this starter.</i></small>",
+                gb,
+            )
+            ball_label.setWordWrap(True)
+            form.addRow("Starter Ball", ball_combo)
+            form.addRow(ball_label)
+            self._starter_ball_combos.append(ball_combo)
 
     def _update_starter_sprite(self, starter_idx: int):
         """Refresh the sprite and type labels for the given starter index."""
@@ -6579,6 +6684,67 @@ QTabBar::tab:hover:!selected {
                 )
         except Exception:
             pass
+
+    # Amber stylesheet applied to a starter groupbox when it has unsaved edits.
+    _STARTER_DIRTY_SS = (
+        "QGroupBox {"
+        "  background-color: rgba(255, 183, 77, 40);"
+        "  border: 1px solid rgba(255, 183, 77, 160);"
+        "  border-radius: 3px;"
+        "}"
+    )
+
+    def _on_starter_edited(self, starter_idx: int = -1):
+        """Wired to every starter combo/spinbox change. Marks the project
+        modified, lights up the Starters sidebar dot (not the Pokemon dot),
+        and applies an amber tint to the edited starter's groupbox.
+        Suppressed while _loading_depth > 0 so programmatic population on
+        project load doesn't falsely mark dirty."""
+        if self._loading_depth > 0:
+            return
+        try:
+            self.setWindowModified(True)
+        except Exception:
+            pass
+        try:
+            self.sectionDirtyChanged.emit("starters", True)
+        except Exception:
+            pass
+        # Amber the specific groupbox that owns the edited field.
+        _gb_names = ["groupBox_starter1", "groupBox_starter2", "groupBox_starter3"]
+        if 0 <= starter_idx < len(_gb_names):
+            gb = getattr(self.ui, _gb_names[starter_idx], None)
+            if gb is not None:
+                try:
+                    gb.setStyleSheet(self._STARTER_DIRTY_SS)
+                except Exception:
+                    pass
+
+    def _flush_starter_widgets(self):
+        """Write all starter widget values into source_data RAM. Called on
+        tab-leave and on Save. Handles the five core fields plus shiny_chance
+        and ball_item from the dynamically-created widgets."""
+        _prefixes = ["starter1", "starter2", "starter3"]
+        for i, pfx in enumerate(_prefixes):
+            sp = getattr(self.ui, f"{pfx}_species", None)
+            lv = getattr(self.ui, f"{pfx}_level", None)
+            it = getattr(self.ui, f"{pfx}_item", None)
+            mv = getattr(self.ui, f"{pfx}_move", None)
+            if sp:
+                self.source_data.set_starter_data(i, "species", sp.currentData())
+            if lv:
+                self.source_data.set_starter_data(i, "level", lv.value())
+            if it:
+                self.source_data.set_starter_data(i, "item", it.currentData())
+            if mv:
+                self.source_data.set_starter_data(i, "custom_move", mv.currentData())
+        # Dynamic widgets (shiny spinboxes and ball combos).
+        shiny_spins = getattr(self, "_starter_shiny_spins", [])
+        ball_combos = getattr(self, "_starter_ball_combos", [])
+        for i, spin in enumerate(shiny_spins):
+            self.source_data.set_starter_data(i, "shiny_chance", spin.value())
+        for i, combo in enumerate(ball_combos):
+            self.source_data.set_starter_data(i, "ball_item", combo.currentData())
 
     def _on_item_edited(self):
         """Wired to `items_editor.item_modified`. Marks the project modified,
