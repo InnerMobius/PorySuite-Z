@@ -30,8 +30,9 @@ from PyQt6.QtWidgets import (
 )
 
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
-from ui.graphics_tab_widget import PaletteSwatchRow
-from core.sprite_palette_bus import get_bus as _get_palette_bus
+from ui.draggable_palette_row import DraggablePaletteRow
+from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_OVERWORLD
+from core.gba_image_utils import swap_palette_entries, export_indexed_png
 
 Color = Tuple[int, int, int]
 
@@ -425,6 +426,23 @@ def build_overworld_data(root: str) -> Tuple[List[PalettePool], Dict[str, Sprite
 
 # ── Reskin helper (reuse from graphics_tab_widget) ──────────────────────────
 
+def _apply_palette_to_image(img: QImage, palette: List[Color]) -> Optional[QPixmap]:
+    """Apply a 16-colour palette to an already-loaded indexed QImage and return a QPixmap."""
+    try:
+        ct = list(img.colorTable())
+        for i, (r, g, b) in enumerate(palette[:16]):
+            if i >= len(ct):
+                ct.append((0xFF << 24) | (r << 16) | (g << 8) | b)
+            else:
+                alpha = ct[i] & 0xFF000000
+                ct[i] = alpha | (r << 16) | (g << 8) | b
+        img2 = img.copy()
+        img2.setColorTable(ct)
+        return QPixmap.fromImage(img2)
+    except Exception:
+        return None
+
+
 def _reskin_overworld(png_path: str, palette: List[Color]) -> Optional[QPixmap]:
     """Recolour an overworld sprite sheet using a 16-colour palette."""
     try:
@@ -433,17 +451,14 @@ def _reskin_overworld(png_path: str, palette: List[Color]) -> Optional[QPixmap]:
             return None
         if img.format() != QImage.Format.Format_Indexed8:
             img = img.convertToFormat(QImage.Format.Format_Indexed8)
-        ct = list(img.colorTable())
-        for i, (r, g, b) in enumerate(palette[:16]):
-            if i >= len(ct):
-                ct.append((0xFF << 24) | (r << 16) | (g << 8) | b)
-            else:
-                alpha = ct[i] & 0xFF000000
-                ct[i] = alpha | (r << 16) | (g << 8) | b
-        img.setColorTable(ct)
-        return QPixmap.fromImage(img)
+        return _apply_palette_to_image(img, palette)
     except Exception:
         return None
+
+
+def _reskin_overworld_img(img: QImage, palette: List[Color]) -> Optional[QPixmap]:
+    """Recolour an already-loaded indexed QImage (e.g. from Index-as-BG remap)."""
+    return _apply_palette_to_image(img, palette)
 
 
 # ── Animation widget — 4-direction walk preview ────────────────────────────
@@ -1104,6 +1119,13 @@ class OverworldGraphicsTab(QWidget):
     modified = pyqtSignal()
     gfx_constants_changed = pyqtSignal()
 
+    # Amber stylesheet applied to the Palette groupbox when the current palette
+    # has unsaved edits — matches the dirty-highlight pattern in other GFX tabs.
+    _DIRTY_SS = (
+        "QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; }"
+        "QGroupBox::title { color: #ffb74d; }"
+    )
+
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._project_root: str = ""
@@ -1116,6 +1138,10 @@ class OverworldGraphicsTab(QWidget):
         # In-memory palette cache: {tag_name: [16 Color tuples]}
         self._palettes: Dict[str, List[Color]] = {}
         self._palette_dirty: set[str] = set()
+        # In-memory remapped sprite images: {gfx_const: QImage}
+        # Populated only by the Index-as-Background path (pixel remaps).
+        self._sprite_imgs: Dict[str, QImage] = {}
+        self._sprite_png_dirty: set[str] = set()
         # Map tag → .pal file path for saving
         self._pal_paths: Dict[str, str] = {}
         # Reverse lookup: tag → PalettePool
@@ -1128,6 +1154,9 @@ class OverworldGraphicsTab(QWidget):
         self._list_refresh_timer.timeout.connect(self._refresh_visible_thumbnails)
 
         self._build_ui()
+
+        # Subscribe to bus so cross-tab palette edits invalidate our cache.
+        _get_palette_bus().palette_changed.connect(self._on_bus_palette_changed)
 
     def _build_ui(self) -> None:
         outer = QHBoxLayout(self)
@@ -1270,6 +1299,7 @@ class OverworldGraphicsTab(QWidget):
 
         # Palette section (bottom half)
         pal_frame = QGroupBox("Palette")
+        self._pal_frame = pal_frame  # held for amber dirty highlight
         pf = QVBoxLayout(pal_frame)
         pf.setContentsMargins(8, 14, 8, 8)
         pf.setSpacing(6)
@@ -1297,7 +1327,9 @@ class OverworldGraphicsTab(QWidget):
         pal_slot_row.addWidget(self._pal_assign_btn)
         pf.addLayout(pal_slot_row)
 
-        self._pal_row = PaletteSwatchRow()
+        # Drag-reorderable swatches with right-click Index-as-Background,
+        # matching the palette editing feel of the Trainer/Species GFX tabs.
+        self._pal_row = DraggablePaletteRow()
         pf.addWidget(self._pal_row)
 
         pal_btn_row = QHBoxLayout()
@@ -1308,9 +1340,15 @@ class OverworldGraphicsTab(QWidget):
             "this sprite's palette. If the palette is shared, all\n"
             "sprites using it will be affected."
         )
+        self._import_pal_btn = QPushButton("Import from .pal…")
+        self._import_pal_btn.setToolTip(
+            "Load a JASC .pal file (16 RGB colours) and apply it\n"
+            "to this sprite's palette."
+        )
         self._open_folder_btn = QPushButton("Open Palettes Folder")
         self._open_folder_btn.setToolTip("Open the overworld palettes directory.")
         pal_btn_row.addWidget(self._import_btn)
+        pal_btn_row.addWidget(self._import_pal_btn)
         pal_btn_row.addWidget(self._open_folder_btn)
         pal_btn_row.addStretch(1)
         pf.addLayout(pal_btn_row)
@@ -1323,7 +1361,10 @@ class OverworldGraphicsTab(QWidget):
 
         # ── Wire signals ────────────────────────────────────────────────
         self._pal_row.colors_changed.connect(self._on_palette_edited)
+        self._pal_row.palette_reordered.connect(self._on_palette_reordered)
+        self._pal_row.swatch_set_as_bg.connect(self._on_set_swatch_as_bg)
         self._import_btn.clicked.connect(self._import_palette_from_png)
+        self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
         self._open_folder_btn.clicked.connect(self._open_palettes_folder)
         self._open_sprite_folder_btn.clicked.connect(self._open_current_sprite_folder)
         self._cat_combo.currentIndexChanged.connect(self._rebuild_grid)
@@ -1332,13 +1373,46 @@ class OverworldGraphicsTab(QWidget):
     # ────────────────────────────────────────────────────────── loading ──
     def load(self, project_root: str) -> None:
         """Parse C headers and populate the sprite browser."""
+        # Kill any pending debounce refresh so a stale timer can't re-dirty
+        # the grid after we clear the dirty state below.
+        self._list_refresh_timer.stop()
+
+        # Unconditionally evict every existing thumbnail widget from the grid
+        # BEFORE anything that could throw.  Old amber-bordered widgets carry
+        # embedded CSS that Qt will keep rendering at their last position until
+        # the C++ object is actually destroyed.  setParent(None) is immediate —
+        # unlike deleteLater() it removes the widget from the screen right now,
+        # so even if the rebuild below fails the user sees an empty grid, not
+        # stale amber thumbnails.
+        while self._grid_layout.count():
+            item = self._grid_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+
         self._project_root = project_root
         self._pools, self._all_sprites = build_overworld_data(project_root)
         self._palettes.clear()
         self._palette_dirty.clear()
+        self._sprite_imgs.clear()
+        self._sprite_png_dirty.clear()
         self._pal_paths.clear()
         self._pools_by_tag.clear()
         self._current_sprite = None
+
+        # Reset ALL right-panel visual state to clean.  Without this the
+        # palette-frame amber highlight, stale swatch colours, and stale sprite
+        # info persist visually after F5 even though the in-memory dirty sets
+        # have been cleared.  Mirrors what TrainerGraphicsTab.load() does
+        # (clears _dirty_dot, resets _sel_lbl, clears _sprite_lbl).
+        self._pal_frame.setStyleSheet("")
+        self._pal_info_lbl.setText("Select a sprite to view its palette")
+        self._sheet_lbl.clear()
+        self._sheet_lbl.setText("Select a sprite")
+        self._sheet_info_lbl.setText("")
+        # Reset swatch row to all-black — safe because set_colors uses emit=False
+        # so colors_changed / _on_palette_edited never fires here.
+        self._pal_row.set_colors([(0, 0, 0)] * 16)
 
         # Check DOWP status
         self._update_dowp_status()
@@ -1353,21 +1427,36 @@ class OverworldGraphicsTab(QWidget):
             self._all_sprites.values(), key=lambda s: s.display_name
         )
 
-        # Build the grid
-        self._rebuild_grid()
+        # Build the grid under _loading guard so any signal that incidentally
+        # fires during thumbnail construction is treated as a load-time event
+        # and doesn't emit modified or mark anything dirty.
+        self._loading = True
+        try:
+            self._rebuild_grid()
+        finally:
+            self._loading = False
 
     def _get_palette_for_sprite(self, entry: SpriteEntry) -> Optional[List[Color]]:
-        """Get the palette for a sprite, loading from disk/cache as needed."""
+        """Get the palette for a sprite — RAM-first via the bus, then disk.
+
+        The bus holds any unsaved edits made in this tab or another tab.  We
+        must check it before hitting the .pal file so the viewer always shows
+        the current in-RAM state rather than a stale on-disk copy.
+        """
         tag = entry.palette_tag
         if tag not in self._palettes:
-            pal_path = self._pal_paths.get(tag, "")
-            if pal_path:
-                colors = read_jasc_pal(pal_path)
+            # 1) Check bus — another tab (or a previous edit in this tab) may
+            #    have already pushed a palette for this tag.
+            bus_colors = _get_palette_bus().get_overworld_palette(tag)
+            if bus_colors:
+                self._palettes[tag] = bus_colors
             else:
-                colors = []
-            if not colors:
-                colors = [(0, 0, 0)] * 16
-            self._palettes[tag] = colors
+                # 2) Fall back to the .pal file on disk.
+                pal_path = self._pal_paths.get(tag, "")
+                colors = read_jasc_pal(pal_path) if pal_path else []
+                if not colors:
+                    colors = [(0, 0, 0)] * 16
+                self._palettes[tag] = colors
         return self._palettes.get(tag)
 
     # ────────────────────────────────────────────────────────── handlers ──
@@ -1378,16 +1467,125 @@ class OverworldGraphicsTab(QWidget):
         colors = self._pal_row.colors()
         self._palettes[tag] = colors
         self._palette_dirty.add(tag)
-        # Broadcast so any future viewer of this palette tag sees the
-        # edit live.  Overworld viewers aren't migrated yet but the
-        # hook is in place.
         _get_palette_bus().set_overworld_palette(tag, colors)
+        self._pal_frame.setStyleSheet(self._DIRTY_SS)
         self.modified.emit()
         # Refresh the selected sprite detail immediately
         self._show_sprite_detail(self._current_sprite)
-        # Defer full grid refresh for shared palette updates
+        # Defer full grid refresh so shared-palette thumbnails update
         if not self._list_refresh_timer.isActive():
             self._list_refresh_timer.start(400)
+
+    def _on_palette_reordered(self, from_idx: int, to_idx: int) -> None:
+        """User dragged a swatch — swap slots in the palette.
+        Pixels keep their index values so only colour assignment changes."""
+        if self._loading or not self._current_sprite:
+            return
+        n = 16
+        if from_idx == to_idx or not (0 <= from_idx < n) or not (0 <= to_idx < n):
+            return
+        tag = self._current_sprite.palette_tag
+        pal = list(self._palettes.get(tag) or [(0, 0, 0)] * n)
+        while len(pal) < n:
+            pal.append((0, 0, 0))
+        pal[from_idx], pal[to_idx] = pal[to_idx], pal[from_idx]
+        self._palettes[tag] = pal
+        self._palette_dirty.add(tag)
+        _get_palette_bus().set_overworld_palette(tag, pal)
+        self._pal_frame.setStyleSheet(self._DIRTY_SS)
+        self._loading = True
+        try:
+            self._pal_row.set_colors(pal)
+        finally:
+            self._loading = False
+        self.modified.emit()
+        self._show_sprite_detail(self._current_sprite)
+        if not self._list_refresh_timer.isActive():
+            self._list_refresh_timer.start(400)
+
+    def _on_set_swatch_as_bg(self, slot: int) -> None:
+        """Right-click → Index as Background: make slot 0 the transparent slot.
+        Swaps pixel values slot↔0 in the sprite PNG and swaps palette entries
+        lockstep — the rendered image is unchanged but slot 0 is now transparent.
+        This is the only path that mutates PNG pixel data."""
+        if self._loading or not self._current_sprite:
+            return
+        if slot <= 0 or slot >= 16:
+            return
+        entry = self._current_sprite
+        tag = entry.palette_tag
+        n = 16
+        pal = list(self._palettes.get(tag) or [(0, 0, 0)] * n)
+        while len(pal) < n:
+            pal.append((0, 0, 0))
+
+        # Load the QImage for this sprite if we don't have it in RAM yet.
+        gfx_key = entry.gfx_const
+        if gfx_key not in self._sprite_imgs:
+            if entry.png_path and os.path.isfile(entry.png_path):
+                img = QImage(entry.png_path)
+                if not img.isNull():
+                    if img.format() != QImage.Format.Format_Indexed8:
+                        img = img.convertToFormat(QImage.Format.Format_Indexed8)
+                    self._sprite_imgs[gfx_key] = img
+
+        img = self._sprite_imgs.get(gfx_key)
+        if img is not None:
+            try:
+                new_img, _ = swap_palette_entries(img, pal, slot, 0)
+                self._sprite_imgs[gfx_key] = new_img
+                self._sprite_png_dirty.add(gfx_key)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Index as Background Error",
+                    f"Failed to remap sprite pixels:\n{exc}",
+                )
+                return
+        else:
+            QMessageBox.information(
+                self, "No Sprite PNG",
+                "This sprite has no on-disk PNG to remap.\n"
+                "The palette-only swap has still been applied.",
+            )
+
+        # Lockstep palette swap — slot 0 convention is transparency.
+        pal[0], pal[slot] = pal[slot], pal[0]
+        self._palettes[tag] = pal
+        self._loading = True
+        try:
+            self._pal_row.set_colors(pal)
+        finally:
+            self._loading = False
+        self._palette_dirty.add(tag)
+        _get_palette_bus().set_overworld_palette(tag, pal)
+        self._pal_frame.setStyleSheet(self._DIRTY_SS)
+        self.modified.emit()
+        self._show_sprite_detail(self._current_sprite)
+        if not self._list_refresh_timer.isActive():
+            self._list_refresh_timer.start(400)
+
+    def _on_bus_palette_changed(self, category: str, key: str) -> None:
+        """Another tab pushed a palette update to the bus.
+        If it's an overworld palette we have cached, evict the cache entry
+        so the next render call picks up the fresh value from the bus."""
+        if category != CAT_OVERWORLD:
+            return
+        # Evict local cache so _get_palette_for_sprite re-reads from bus.
+        self._palettes.pop(key, None)
+        # Debounce a thumbnail refresh — don't spam on rapid edits.
+        if not self._list_refresh_timer.isActive():
+            self._list_refresh_timer.start(400)
+        # If the currently-displayed sprite uses this tag, refresh detail too.
+        if (self._current_sprite and
+                self._current_sprite.palette_tag == key):
+            palette = self._get_palette_for_sprite(self._current_sprite)
+            self._loading = True
+            try:
+                if palette:
+                    self._pal_row.set_colors(palette)
+            finally:
+                self._loading = False
+            self._show_sprite_detail(self._current_sprite)
 
     def _rebuild_grid(self) -> None:
         """Rebuild the sprite thumbnail grid with current filters."""
@@ -1442,7 +1640,13 @@ class OverworldGraphicsTab(QWidget):
         container.setFixedSize(76, 80)
         is_selected = (self._current_sprite and
                        entry.gfx_const == self._current_sprite.gfx_const)
-        border_color = "#1565c0" if is_selected else "#333"
+        is_dirty = entry.palette_tag in self._palette_dirty
+        if is_selected:
+            border_color = "#1565c0"
+        elif is_dirty:
+            border_color = "#ffb74d"
+        else:
+            border_color = "#333"
         container.setStyleSheet(
             f"QWidget {{ background: #222; border: 1px solid {border_color}; border-radius: 3px; }}"
             "QWidget:hover { border-color: #1565c0; }"
@@ -1457,11 +1661,17 @@ class OverworldGraphicsTab(QWidget):
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setFixedSize(68, 56)
 
+        # Always render through the palette — never load the raw PNG directly,
+        # because the PNG's baked-in colour table may be stale relative to
+        # whatever the user (or another tab) has edited in RAM.
+        # If the gfx_const has a remapped QImage from an Index-as-BG op, use
+        # that as the source so unsaved pixel changes are visible immediately.
         pix = None
-        if palette and entry.png_path:
+        remapped_img = self._sprite_imgs.get(entry.gfx_const)
+        if palette and remapped_img:
+            pix = _reskin_overworld_img(remapped_img, palette)
+        elif palette and entry.png_path:
             pix = _reskin_overworld(entry.png_path, palette)
-        if pix is None and entry.png_path and os.path.isfile(entry.png_path):
-            pix = QPixmap(entry.png_path)
 
         if pix and not pix.isNull():
             fw = entry.width if isinstance(entry.width, int) else 16
@@ -1527,6 +1737,17 @@ class OverworldGraphicsTab(QWidget):
                 )
         self._pal_assign_combo.blockSignals(False)
 
+        # Reflect dirty state on the palette groupbox BEFORE populating
+        # swatches.  setStyleSheet() on a parent triggers a full CSS
+        # re-evaluation of all children; calling it after set_colors()
+        # would clear the freshly-set swatch backgrounds.  With the
+        # DragSwatch CSS-based _refresh() this is now a belt-and-braces
+        # guard rather than strictly necessary, but the order still matters.
+        if tag in self._palette_dirty:
+            self._pal_frame.setStyleSheet(self._DIRTY_SS)
+        else:
+            self._pal_frame.setStyleSheet("")
+
         self._loading = True
         try:
             if palette:
@@ -1538,12 +1759,15 @@ class OverworldGraphicsTab(QWidget):
         """Show large sprite sheet + animation for the selected sprite."""
         palette = self._get_palette_for_sprite(entry)
 
-        # Large sheet view
+        # Large sheet view — render through RAM palette, never raw QPixmap.
+        # Prefer the in-memory remapped image if this sprite had an
+        # Index-as-BG operation (pixel data different from on-disk PNG).
         pix = None
-        if palette and entry.png_path:
+        remapped_img = self._sprite_imgs.get(entry.gfx_const)
+        if palette and remapped_img:
+            pix = _reskin_overworld_img(remapped_img, palette)
+        elif palette and entry.png_path:
             pix = _reskin_overworld(entry.png_path, palette)
-        if pix is None and entry.png_path:
-            pix = QPixmap(entry.png_path)
 
         if pix and not pix.isNull():
             scale = max(1, min(3, self._sheet_lbl.width() // max(1, pix.width())))
@@ -1651,6 +1875,7 @@ class OverworldGraphicsTab(QWidget):
         finally:
             self._loading = False
 
+        self._pal_frame.setStyleSheet(self._DIRTY_SS)
         self._show_sprite_detail(self._current_sprite)
         self._rebuild_grid()
         self.modified.emit()
@@ -1659,6 +1884,78 @@ class OverworldGraphicsTab(QWidget):
         QMessageBox.information(
             self, "Palette Imported",
             f"Loaded {len(ct[:16])} colours from:\n"
+            f"{os.path.basename(path)}\n\n"
+            f"Applied to: {tag}\n"
+            f"({affected} sprite(s) affected)\n\n"
+            "Click File → Save to write the .pal file.",
+        )
+
+    def _import_palette_from_pal(self) -> None:
+        """Import a JASC .pal file and apply it to the selected sprite's palette."""
+        if not self._current_sprite:
+            QMessageBox.information(
+                self, "No Sprite Selected",
+                "Select a sprite first, then import a palette for it.",
+            )
+            return
+
+        tag = self._current_sprite.palette_tag
+        pool = self._pools_by_tag.get(tag)
+
+        if pool and len(pool.sprites) > 1:
+            ret = QMessageBox.question(
+                self, "Shared Palette",
+                f"This sprite's palette ({pool.display_name}) is shared by\n"
+                f"{len(pool.sprites)} sprites. Importing will change all of them.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ret != QMessageBox.StandardButton.Yes:
+                return
+
+        start_dir = os.path.join(
+            self._project_root, "graphics", "object_events", "palettes"
+        ) if self._project_root else ""
+        if not os.path.isdir(start_dir):
+            start_dir = self._project_root or ""
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select JASC Palette", start_dir, "Palette Files (*.pal);;All Files (*)",
+        )
+        if not path:
+            return
+
+        colors = read_jasc_pal(path)
+        if not colors:
+            QMessageBox.warning(
+                self, "Import Failed",
+                f"Could not read a valid 16-colour JASC palette from:\n{path}",
+            )
+            return
+
+        while len(colors) < 16:
+            colors.append((0, 0, 0))
+        colors = [clamp_to_gba(r, g, b) for r, g, b in colors[:16]]
+
+        self._palettes[tag] = colors
+        self._palette_dirty.add(tag)
+        _get_palette_bus().set_overworld_palette(tag, colors)
+
+        self._loading = True
+        try:
+            self._pal_row.set_colors(colors)
+        finally:
+            self._loading = False
+
+        self._pal_frame.setStyleSheet(self._DIRTY_SS)
+        self._show_sprite_detail(self._current_sprite)
+        self._rebuild_grid()
+        self.modified.emit()
+
+        affected = len(pool.sprites) if pool else 1
+        QMessageBox.information(
+            self, "Palette Imported",
+            f"Loaded 16 colours from:\n"
             f"{os.path.basename(path)}\n\n"
             f"Applied to: {tag}\n"
             f"({affected} sprite(s) affected)\n\n"
@@ -2008,12 +2305,14 @@ class OverworldGraphicsTab(QWidget):
         self.gfx_constants_changed.emit()
 
     def has_unsaved_changes(self) -> bool:
-        return bool(self._palette_dirty)
+        return bool(self._palette_dirty) or bool(self._sprite_png_dirty)
 
     def flush_to_disk(self) -> tuple[int, list[str]]:
-        """Write all dirty palettes to .pal files."""
+        """Write all dirty palettes to .pal files and remapped sprites to PNG."""
         ok = 0
         errors: list[str] = []
+
+        # Pass 1 — palette files
         for tag in list(self._palette_dirty):
             pal_path = self._pal_paths.get(tag, "")
             if not pal_path:
@@ -2021,8 +2320,30 @@ class OverworldGraphicsTab(QWidget):
                 continue
             colors = self._palettes.get(tag)
             if colors and write_jasc_pal(pal_path, colors):
+                self._palette_dirty.discard(tag)
                 ok += 1
             else:
                 errors.append(f"overworld-pal:{tag}")
-        self._palette_dirty.clear()
+
+        # Pass 2 — remapped PNG pixel data (Index-as-Background ops)
+        for gfx_key in list(self._sprite_png_dirty):
+            entry = self._all_sprites.get(gfx_key)
+            img = self._sprite_imgs.get(gfx_key)
+            if entry is None or img is None or not entry.png_path:
+                errors.append(f"overworld-png:{gfx_key} (no sprite data)")
+                continue
+            pal = self._palettes.get(entry.palette_tag, [(0, 0, 0)] * 16)
+            try:
+                export_indexed_png(img, pal, entry.png_path)
+                self._sprite_png_dirty.discard(gfx_key)
+                ok += 1
+            except Exception as exc:
+                errors.append(f"overworld-png:{gfx_key} ({exc})")
+
+        # Clear amber highlight if everything is clean now.
+        if not self._palette_dirty and not self._sprite_png_dirty:
+            self._pal_frame.setStyleSheet("")
+            # Rebuild grid to clear amber thumbnail borders.
+            self._rebuild_grid()
+
         return ok, errors

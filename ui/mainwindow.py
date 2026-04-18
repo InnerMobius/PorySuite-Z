@@ -500,7 +500,10 @@ QTabBar::tab:hover:!selected {
         try:
             self.overworld_graphics_tab = OverworldGraphicsTab()
             self.overworld_graphics_tab.modified.connect(
-                lambda: self.setWindowModified(True)
+                lambda: (
+                    self.setWindowModified(True),
+                    self.sectionDirtyChanged.emit("overworld", True),
+                )
             )
             self.ui.mainTabs.addTab(self.overworld_graphics_tab, "Overworld GFX")
             self.overworld_gfx_tab_index = self.ui.mainTabs.indexOf(
@@ -1114,7 +1117,13 @@ QTabBar::tab:hover:!selected {
             # load_data) to the existing rebuild_caches() method so there is
             # a single implementation of that logic.
             self.rebuild_caches()
-        finally:
+        except Exception:
+            # rebuild_caches() failed (e.g. a PyQt RuntimeError from a widget
+            # being deleted mid-refresh, or a JSON parse error).  Swallow it
+            # here so the cleanup phase below ALWAYS runs — in particular,
+            # _clear_all_dirty_markers() must fire even on a failed rebuild so
+            # the toolbar amber dots and section dirty counts are reset to match
+            # the clean on-disk state the user expects after pressing F5.
             # NOTE: keep _refresh_discarding True across the panel-reload
             # phase below — update_pokedex_entry() calls _flush_pokedex_panel
             # first, and we must suppress that flush so the still-stale
@@ -1133,6 +1142,17 @@ QTabBar::tab:hover:!selected {
             pass
         try:
             self.load_abilities_editor()
+        except Exception:
+            pass
+        # Overworld Graphics tab reads its own C headers independently of
+        # source_data, so it gets an explicit reload here — same pattern as
+        # _load_trainers_editor above.  This guarantees load() runs on every
+        # F5 even if rebuild_caches() failed before reaching load_data().
+        try:
+            if hasattr(self, "overworld_graphics_tab") and self.project_info:
+                _ow_dir = str(self.project_info.get("dir", "") or "")
+                if _ow_dir:
+                    self.overworld_graphics_tab.load(_ow_dir)
         except Exception:
             pass
 

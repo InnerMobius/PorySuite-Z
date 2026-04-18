@@ -55,7 +55,12 @@ class DragSwatch(QLabel):
         self._color: tuple[int, int, int] = (0, 0, 0)
         self.setFixedSize(SWATCH_SZ, SWATCH_SZ)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setAutoFillBackground(True)
+        # NOTE: do NOT call setAutoFillBackground(True) here.
+        # We control the background via setStyleSheet (CSS), not QPalette.
+        # QPalette-based backgrounds are silently overridden by Qt's CSS
+        # engine whenever any ancestor widget has a stylesheet engaged —
+        # even an empty one.  setStyleSheet on the widget itself always
+        # wins, so we own the background regardless of parent state.
         self.setAcceptDrops(True)
         self._drag_start: QPoint | None = None
         self._refresh_tooltip()
@@ -85,9 +90,9 @@ class DragSwatch(QLabel):
     # painting
     def _refresh(self):
         r, g, b = self._color
-        p = self.palette()
-        p.setColor(self.backgroundRole(), QColor(r, g, b))
-        self.setPalette(p)
+        # CSS background-color takes priority over QPalette and is immune to
+        # parent stylesheet re-evaluations.  Do NOT use setPalette() here.
+        self.setStyleSheet(f"background-color: rgb({r},{g},{b});")
 
     def _refresh_tooltip(self):
         r, g, b = self._color
