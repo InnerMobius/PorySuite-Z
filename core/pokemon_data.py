@@ -1061,11 +1061,33 @@ class PokemonItems(pokemon_data.PokemonItems):
                 if not os.path.isfile(file_path) or should_save:
                     if self.data:
                         json_str = json.dumps(self.data, indent=2, ensure_ascii=False)
-                        with open(file_path, 'w', encoding="utf-8", newline="\n") as json_file:
-                            json_file.write(json_str)
-                        self.original_data = json.loads(json_str)
-                        self.pending_changes = True
-                        print(f"Saved {self.DATA_FILE} file.")
+
+                        # ── Byte-match guard ─────────────────────────────
+                        # Tab-switch auto-flush (save_items_table on leaving
+                        # the Items tab) runs even when the user didn't edit
+                        # anything. If the serialized JSON would be exactly
+                        # what's already on disk, skip the write — a no-op
+                        # write still bumps the file's mtime AND can trip
+                        # git into reporting the file as modified due to
+                        # line-ending / trailing-newline drift. No write,
+                        # no diff, no phantom "you have uncommitted changes"
+                        # after a fresh upstream pull.
+                        current_bytes = None
+                        try:
+                            with open(file_path, "rb") as jf:
+                                current_bytes = jf.read()
+                        except OSError:
+                            current_bytes = None
+                        new_bytes = json_str.encode("utf-8")
+                        if current_bytes is not None and current_bytes == new_bytes:
+                            # Disk already matches; nothing to do.
+                            self.original_data = json.loads(json_str)
+                        else:
+                            with open(file_path, 'w', encoding="utf-8", newline="\n") as json_file:
+                                json_file.write(json_str)
+                            self.original_data = json.loads(json_str)
+                            self.pending_changes = True
+                            print(f"Saved {self.DATA_FILE} file.")
             finally:
                 self.data = mapping
                 try:

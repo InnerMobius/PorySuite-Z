@@ -328,44 +328,120 @@ def inject_bridge_script(project_dir: str):
 
 
 def ensure_bridge_gitignored(project_dir: str):
-    """Ensure PorySuite bridge files are in the project's .gitignore.
+    """Ensure PorySuite bridge files are ignored — LOCALLY ONLY.
 
     These files are ephemeral IPC artifacts that should never be committed:
     - porysuite_bridge.json  (Porymap → PorySuite messages)
     - porysuite_command.json (PorySuite → Porymap commands)
     - porymap.user.cfg       (per-project Porymap settings, user-specific)
+
+    ── Why .git/info/exclude and not the project's .gitignore ──────────
+    Writing to the tracked ``.gitignore`` shows up as "modified" on every
+    fresh upstream pull: upstream doesn't have these entries, we append
+    them on project open, and now every ``git status`` reports a dirty
+    working tree even though the user never touched anything.  Users
+    rightly complain that "Switch to Branch" refuses to run because their
+    unedited project looks dirty.
+
+    ``.git/info/exclude`` is git's dedicated file for *local-only* ignore
+    rules.  It's not tracked, not committed, never appears in diffs, and
+    is never overwritten by pull or checkout.  Any user who clones the
+    project gets the bridge entries fresh on their first project open
+    without ever seeing a phantom ``.gitignore`` modification.
+
+    If a tracked ``.gitignore`` entry was added by an earlier version of
+    PorySuite, we also scrub the auto-added block out now so upstream
+    pulls stop showing ``.gitignore`` as modified.  Only the exact
+    sentinel-wrapped block PorySuite wrote is removed — user-added lines
+    nearby are untouched.
     """
-    gitignore_path = os.path.join(project_dir, ".gitignore")
     entries_needed = [
         "porysuite_bridge.json",
         "porysuite_command.json",
         "porymap.user.cfg",
     ]
+    _SENTINEL_OPEN = "# PorySuite bridge files (auto-added, do not commit)"
 
-    # Read existing .gitignore
-    existing = ""
-    if os.path.isfile(gitignore_path):
+    # ── Step 1: scrub any legacy block from the tracked .gitignore ──
+    # Older builds appended to project/.gitignore with the sentinel above
+    # followed by one line per entry. Remove only that exact shape so we
+    # stop showing .gitignore as modified after every upstream pull.
+    tracked_gi = os.path.join(project_dir, ".gitignore")
+    if os.path.isfile(tracked_gi):
         try:
-            with open(gitignore_path, "r", encoding="utf-8") as f:
+            with open(tracked_gi, "r", encoding="utf-8") as f:
+                raw = f.read()
+            if _SENTINEL_OPEN in raw:
+                lines = raw.splitlines(keepends=True)
+                cleaned: list[str] = []
+                skipping = False
+                for line in lines:
+                    stripped = line.strip()
+                    if not skipping and stripped == _SENTINEL_OPEN:
+                        skipping = True
+                        # Also drop one preceding blank line we added
+                        if cleaned and cleaned[-1].strip() == "":
+                            cleaned.pop()
+                        continue
+                    if skipping:
+                        # Remove each bridge entry line immediately after
+                        # the sentinel; stop once we hit a blank line or
+                        # anything that isn't one of our entries.
+                        if stripped in entries_needed:
+                            continue
+                        if stripped == "":
+                            skipping = False
+                            continue
+                        # First non-entry line ends our block
+                        skipping = False
+                    cleaned.append(line)
+                new_raw = "".join(cleaned)
+                if new_raw != raw:
+                    with open(tracked_gi, "w", encoding="utf-8", newline="") as f:
+                        f.write(new_raw)
+                    log.info(
+                        f"Removed legacy PorySuite bridge block from {tracked_gi}"
+                    )
+        except OSError:
+            pass
+
+    # ── Step 2: make sure .git/info/exclude has the entries ──
+    git_dir = os.path.join(project_dir, ".git")
+    if not os.path.isdir(git_dir):
+        # Not a git repo (or submodule weirdness) — nothing we can do,
+        # bridge files will just appear as untracked, which is fine.
+        return
+    info_dir = os.path.join(git_dir, "info")
+    try:
+        os.makedirs(info_dir, exist_ok=True)
+    except OSError:
+        return
+    exclude_path = os.path.join(info_dir, "exclude")
+
+    existing = ""
+    if os.path.isfile(exclude_path):
+        try:
+            with open(exclude_path, "r", encoding="utf-8") as f:
                 existing = f.read()
         except OSError:
             return
 
-    # Check which entries are missing
-    lines = existing.splitlines()
-    missing = [e for e in entries_needed if e not in lines]
+    existing_lines = existing.splitlines()
+    missing = [e for e in entries_needed if e not in existing_lines]
     if not missing:
         return
 
-    # Append missing entries
     try:
-        with open(gitignore_path, "a", encoding="utf-8") as f:
+        with open(exclude_path, "a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
-            f.write("\n# PorySuite bridge files (auto-added, do not commit)\n")
+            f.write(f"\n{_SENTINEL_OPEN}\n")
             for entry in missing:
                 f.write(f"{entry}\n")
-        log.info(f"Added {len(missing)} entries to {gitignore_path}")
+        log.info(
+            f"Added {len(missing)} bridge entries to local-only "
+            f"{exclude_path} (not tracked by git)"
+        )
     except OSError:
         pass
 

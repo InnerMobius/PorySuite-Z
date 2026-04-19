@@ -74,9 +74,13 @@ class GitPanel(QDialog):
         super().__init__(mw)
         self._mw = mw
         self.setWindowTitle("Git")
-        self.setMinimumWidth(620)
+        # Wide enough that section descriptions (Push / Commit / Branches)
+        # don't clip their left margin off-screen.  Prior 620 min left the
+        # first few characters of each paragraph hidden behind the
+        # scrollbar; 880 clears every long line in the panel.
+        self.setMinimumWidth(880)
         self.setMinimumHeight(600)
-        self.resize(660, 800)
+        self.resize(960, 820)
         self.setWindowFlags(
             Qt.WindowType.Window |
             Qt.WindowType.WindowCloseButtonHint |
