@@ -347,10 +347,12 @@ class SongStructurePanel(QWidget):
             if ok:
                 item.target = target
 
-        # All items: edit tick position
+        # All items: edit tick position.
+        # Max is 65535 (16-bit GBA tick ceiling), not _total_ticks — commands
+        # like GOTO legitimately sit at or beyond the last note in the song.
         tick, ok = QInputDialog.getInt(
             self, "Edit Position",
-            "Tick position:", item.tick, 0, self._total_ticks)
+            "Tick position:", item.tick, 0, 65535)
         if ok:
             item.tick = tick
 
@@ -368,7 +370,7 @@ class SongStructurePanel(QWidget):
 
         tick, ok = QInputDialog.getInt(
             self, "Section Position",
-            "Place at tick:", self._cursor_tick, 0, max(1, self._total_ticks))
+            "Place at tick:", self._cursor_tick, 0, 65535)
         if not ok:
             return
 
@@ -400,7 +402,7 @@ class SongStructurePanel(QWidget):
         tick, ok = QInputDialog.getInt(
             self, "Loop Back Position",
             "Place Loop Back at tick:", self._cursor_tick,
-            0, max(1, self._total_ticks))
+            0, 65535)
         if not ok:
             return
 
@@ -428,7 +430,7 @@ class SongStructurePanel(QWidget):
         tick, ok = QInputDialog.getInt(
             self, "Pattern Call Position",
             "Insert Pattern Call at tick:", self._cursor_tick,
-            0, max(1, self._total_ticks))
+            0, 65535)
         if not ok:
             return
 
@@ -441,7 +443,7 @@ class SongStructurePanel(QWidget):
         tick, ok = QInputDialog.getInt(
             self, "End Song Position",
             "End the song at tick:", self._cursor_tick,
-            0, max(1, self._total_ticks))
+            0, 65535)
         if not ok:
             return
 

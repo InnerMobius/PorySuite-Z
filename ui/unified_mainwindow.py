@@ -640,6 +640,18 @@ class UnifiedMainWindow(QMainWindow):
             self._credits_editor = CreditsEditorWidget()
             idx = self.stack.addWidget(self._credits_editor)
             self._page_indices["credits"] = idx
+            # Wire dirty signals to the unified dirty system.
+            ps = self._porysuite_window
+            if ps is not None:
+                self._credits_editor.modified.connect(
+                    lambda: (
+                        ps.setWindowModified(True),
+                        ps.sectionDirtyChanged.emit("credits", True),
+                    )
+                )
+                self._credits_editor.saved.connect(
+                    lambda: ps.sectionDirtyChanged.emit("credits", False)
+                )
         except Exception as e:
             print(f"[CreditsEditor] Failed to load: {e}")
             import traceback; traceback.print_exc()

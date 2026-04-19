@@ -47,6 +47,7 @@ from core.gba_image_utils import (
 # Aliased to the previous local name so existing call sites don't churn.
 from ui.graphics_data import trainer_pal_path_from_png as _pal_path_from_png
 from core.sprite_palette_bus import get_bus as _get_palette_bus
+from core.sprite_render import load_sprite_pixmap as _load_sprite_pixmap
 
 Color = Tuple[int, int, int]
 
@@ -477,10 +478,19 @@ class TrainerGraphicsTab(QWidget):
         for i, key in enumerate(filtered):
             card = _PicCard(key)
             card.clicked.connect(lambda _=False, k=key: self._select_card(k))
-            # Populate thumbnail from the base PNG (no palette reskin yet —
-            # reskin on demand would blow past the cache footprint).
+            # Render thumbnail through the palette bus so the correct .pal
+            # colours are shown (RAM-first, disk-fallback) rather than
+            # whatever the PNG happens to have baked in.
             png_path = self._pic_map.get(key, "")
-            pix = QPixmap(png_path) if png_path and os.path.isfile(png_path) else None
+            pix = None
+            if png_path and os.path.isfile(png_path):
+                try:
+                    palette = _get_palette_bus().ensure_trainer_palette_from_png(
+                        png_path, pic_const=key
+                    )
+                    pix = _load_sprite_pixmap(png_path, palette)
+                except Exception:
+                    pix = QPixmap(png_path)
             card.set_thumbnail(pix)
             card.set_dirty(key in self._palette_dirty)
             card.set_selected(key == self._current_pic)

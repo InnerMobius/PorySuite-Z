@@ -186,6 +186,102 @@ class RefactorService:
             if self._logger:
                 self._logger(f"Updated {rel}")
 
+    def _multi_search_and_replace(self, pairs: "List[Tuple[str, str]]", preview_only: bool) -> List[PreviewEntry]:
+        """Scan the source tree once, applying ALL (old, new) pairs atomically per line.
+
+        This is the cascade-safe alternative to calling :meth:`_search_and_replace`
+        repeatedly in a loop.  The old behaviour was:
+
+            for a, b in tokens:
+                self._search_and_replace(a, b, preview_only=False)
+
+        which re-reads every file per token and, critically, re-scans the
+        PREVIOUS pass's output.  When a new name contains the old name as a
+        substring (e.g. renaming ``Octo`` → ``Octorock``), a later token like
+        ``OCTO → OCTOROCK`` finds its own pattern inside ``SPECIES_OCTOROCK``
+        that the first pass just wrote, and cascades to ``SPECIES_OCTOROCKROCK``.
+
+        This method builds a single combined regex from all token keys
+        (``re.escape`` + ``|`` alternation), sorted longest-first so overlapping
+        prefixes resolve to the longer match (``SPECIES_OCTO`` beats ``OCTO`` at
+        the same position).  ``re.sub`` advances past each replacement, so a
+        newly-written substring can never be re-matched by a later token in the
+        SAME sweep.  That is the exact property needed to kill the cascade.
+
+        Word-boundary matching is NOT applied here — the existing substring
+        semantics are preserved for compatibility with identifiers that embed
+        the base name (e.g. ``gMonFrontPic_Octo``).  The fix is strictly about
+        stopping self-cascade, not about tightening which matches occur.
+        """
+        # Deduplicate identity and empty pairs; preserve first occurrence.
+        seen: set = set()
+        clean: "List[Tuple[str, str]]" = []
+        for a, b in pairs:
+            if not a or a == b or a in seen:
+                continue
+            seen.add(a)
+            clean.append((a, b))
+        if not clean:
+            return []
+        # Longest old-key first so longer patterns win over shorter prefixes.
+        clean.sort(key=lambda p: len(p[0]), reverse=True)
+        mapping = {a: b for a, b in clean}
+        combined = re.compile("|".join(re.escape(a) for a, _ in clean))
+
+        root = self.util.repo_root()
+        preview: List[PreviewEntry] = []
+        scan_spec = [
+            ("src",     {".c", ".h"}),
+            ("include", {".c", ".h"}),
+            ("data",    {".inc", ".s", ".json", ".pory"}),
+            ("sound",   {".inc", ".s"}),
+            (".",       {".mk"}),
+        ]
+        try:
+            from PyQt6.QtWidgets import QApplication
+            _app = QApplication.instance()
+        except Exception:
+            _app = None
+        _file_count = 0
+        for folder, exts in scan_spec:
+            base = os.path.join(root, folder)
+            if not os.path.isdir(base):
+                continue
+            for dirpath, _, filenames in os.walk(base):
+                for name in filenames:
+                    if not any(name.endswith(ext) for ext in exts):
+                        continue
+                    file_path = os.path.join(dirpath, name)
+                    try:
+                        with open(file_path, "r", encoding="utf-8", errors="surrogateescape") as f:
+                            lines = f.readlines()
+                    except OSError:
+                        continue
+                    changed = False
+                    new_lines = list(lines)
+                    for idx, ln in enumerate(lines):
+                        if not combined.search(ln):
+                            continue
+                        new_ln = combined.sub(lambda m: mapping[m.group(0)], ln)
+                        if new_ln != ln:
+                            preview.append((os.path.relpath(file_path, root), idx + 1, ln.rstrip(), new_ln.rstrip()))
+                            new_lines[idx] = new_ln
+                            changed = True
+                    if changed and not preview_only:
+                        try:
+                            with open(file_path, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
+                                f.writelines(new_lines)
+                            rel = os.path.relpath(file_path, root)
+                            self._changed_files.add(rel)
+                            if self._logger:
+                                self._logger(f"Updated {rel}")
+                        except OSError:
+                            pass
+                    _file_count += 1
+                    if _app is not None and _file_count % 50 == 0:
+                        _app.processEvents()
+        return preview
+
     def _search_and_replace(self, old: str, new: str, preview_only: bool) -> List[PreviewEntry]:
         root = self.util.repo_root()
         preview: List[PreviewEntry] = []
@@ -326,7 +422,16 @@ class RefactorService:
         return True
 
     def _rename_in_species_graphics_json(self, path: str, old_camel: str, new_camel: str, old_slug: str, new_slug: str) -> bool:
-        """Rename graphic symbol keys and path values in species_graphics.json."""
+        """Rename graphic symbol keys and path values in species_graphics.json.
+
+        Keys use the form ``<prefix>_<CamelBase>`` (e.g. ``gMonFrontPic_Pika``).
+        Values use the form ``graphics/pokemon/<slug>/<file>.<ext>``.
+
+        Matching is anchored — NOT substring — to avoid the cascade bug where
+        renaming ``Pika → Pikachu`` while an unrelated ``Pikachu`` species
+        already exists would mangle ``gMonFrontPic_Pikachu`` into
+        ``gMonFrontPic_Pikachuchu`` via a naive ``str.replace``.
+        """
         if not os.path.isfile(path):
             return False
         try:
@@ -336,17 +441,41 @@ class RefactorService:
             return False
         if not isinstance(data, dict):
             return False
+
+        # Anchored key rewrite: only swap the suffix ``_<old_camel>`` at the end
+        # of a symbol key.  ``Pika`` inside ``Pikachu`` is safe because the
+        # check requires a leading underscore AND end-of-string.
+        camel_suffix = "_" + old_camel
+
+        def _rewrite_key(k: str) -> str:
+            if k.endswith(camel_suffix):
+                return k[: -len(old_camel)] + new_camel
+            return k
+
+        # Anchored path rewrite: split on ``/`` and only swap segments that
+        # EXACTLY equal ``old_slug``.  ``pika`` inside ``pikachu`` is safe.
+        def _rewrite_path(p: str) -> str:
+            if "/" not in p and p != old_slug:
+                return p
+            segs = p.split("/")
+            return "/".join(new_slug if s == old_slug else s for s in segs)
+
         updated = {}
         changed = False
         for k, v in data.items():
-            new_k = k.replace(old_camel, new_camel) if old_camel in k else k
+            new_k = _rewrite_key(k)
             if new_k != k:
                 changed = True
             new_v = {}
             if isinstance(v, dict):
                 for vk, vv in v.items():
                     if isinstance(vv, str):
-                        new_vv = vv.replace(old_camel, new_camel).replace(old_slug, new_slug)
+                        # Symbol-style values (rare but possible) get the same
+                        # anchored key rewrite; otherwise treat as a path.
+                        if vv.endswith(camel_suffix) or vv == old_camel:
+                            new_vv = vv[: -len(old_camel)] + new_camel if vv.endswith(camel_suffix) else new_camel
+                        else:
+                            new_vv = _rewrite_path(vv)
                         if new_vv != vv:
                             changed = True
                         new_v[vk] = new_vv
@@ -796,8 +925,13 @@ class RefactorService:
                     (old_base.upper(), new_base.upper()),
                     (old_slug, new_slug),
                 ]
-                for a, b in tokens:
-                    self._search_and_replace(a, b, preview_only=False)
+                # Atomic multi-token sweep.  Each file is scanned once with a
+                # combined regex; longer tokens win at overlap; no pass can
+                # re-match the output of an earlier pass.  This kills the
+                # cascade bug where renaming e.g. Octo → Octorock produced
+                # SPECIES_OCTOROCKROCK because the later OCTO→OCTOROCK token
+                # was finding OCTO inside the just-written OCTOROCK.
+                self._multi_search_and_replace(tokens, preview_only=False)
 
                 # names file covered by plan
 

@@ -12,7 +12,7 @@ The script sequence controls the order, timing, and map backgrounds.
 import os
 import re
 
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QIcon
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -103,6 +103,11 @@ class ScriptCommand:
 class CreditsEditorWidget(QWidget):
     """Credits editor — edit the game's ending credits text and sequence."""
 
+    # Emitted whenever the tab transitions from clean → dirty.
+    modified = pyqtSignal()
+    # Emitted after a successful save (internal Save button OR global Ctrl+S).
+    saved = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._project_dir = ""
@@ -110,6 +115,9 @@ class CreditsEditorWidget(QWidget):
         self._entries: list[CreditsEntry] = []   # parsed text pairs
         self._script: list[ScriptCommand] = []   # parsed script sequence
         self._dirty = False
+        # Set of title_symbol strings for entries with unsaved edits.
+        # Survives _populate_list() rebuilds so amber tinting is re-applied.
+        self._dirty_symbols: set[str] = set()
         # mtime snapshot taken on load; checked at save to detect external
         # edits (external-tool modifications to strings.c / credits.c).
         self._loaded_mtimes: dict[str, float] = {}
@@ -382,9 +390,11 @@ class CreditsEditorWidget(QWidget):
                     self._script.append(ScriptCommand("WAITBUTTON", "", int(m.group(1)), line))
                     continue
 
+        self._dirty_symbols.clear()
         self._populate_list()
         self._set_editor_enabled(True)
         self._status_label.setText(f"{len(self._entries)} entries loaded")
+        self._status_label.setStyleSheet("color: #888; font-size: 11px;")
         self._dirty = False
         self._save_btn.setEnabled(False)
 
@@ -401,6 +411,9 @@ class CreditsEditorWidget(QWidget):
                 display += f"  —  {names_clean}"
             item = QListWidgetItem(display)
             item.setData(Qt.ItemDataRole.UserRole, i)
+            # Re-apply amber tint if this entry had unsaved edits before the rebuild.
+            if entry.title_symbol in self._dirty_symbols:
+                item.setBackground(QColor("#3d2e00"))
             self._entry_list.addItem(item)
 
         if self._entries:
@@ -544,11 +557,36 @@ class CreditsEditorWidget(QWidget):
 
         self._preview.setText("".join(html_parts))
 
-    def _mark_dirty(self):
+    def _mark_dirty(self, tint_all: bool = False):
+        """Mark the tab dirty.
+
+        If *tint_all* is True (used after drag-reorder or bulk operations),
+        every list item is tinted amber because the entire ordering changed.
+        Otherwise only the currently selected item is tinted.
+        """
         self._dirty = True
         self._save_btn.setEnabled(True)
         self._status_label.setText("Unsaved changes")
         self._status_label.setStyleSheet("color: #e8a44a; font-size: 11px;")
+
+        if tint_all:
+            # Mark every entry dirty and tint every row.
+            for entry in self._entries:
+                self._dirty_symbols.add(entry.title_symbol)
+            for i in range(self._entry_list.count()):
+                item = self._entry_list.item(i)
+                if item:
+                    item.setBackground(QColor("#3d2e00"))
+        else:
+            # Mark only the selected entry dirty and tint its row.
+            row = self._entry_list.currentRow()
+            if 0 <= row < len(self._entries):
+                self._dirty_symbols.add(self._entries[row].title_symbol)
+                item = self._entry_list.item(row)
+                if item:
+                    item.setBackground(QColor("#3d2e00"))
+
+        self.modified.emit()
 
     def _on_rows_moved(self):
         """Rebuild entries list to match new visual order after drag-drop."""
@@ -559,7 +597,8 @@ class CreditsEditorWidget(QWidget):
             new_entries.append(self._entries[old_idx])
             item.setData(Qt.ItemDataRole.UserRole, i)
         self._entries = new_entries
-        self._mark_dirty()
+        # Reorder affects every entry — tint all rows amber.
+        self._mark_dirty(tint_all=True)
 
     # ═════════════════════════════════════════════════════════════════════════
     # Add / Remove Entries
@@ -612,6 +651,7 @@ class CreditsEditorWidget(QWidget):
         if ret != QMessageBox.StandardButton.Yes:
             return
 
+        removed_symbol = entry.title_symbol
         self._entries.pop(row)
 
         # Remove corresponding PRINT from script
@@ -626,10 +666,20 @@ class CreditsEditorWidget(QWidget):
                     break
                 print_idx += 1
 
+        # The entry is gone — remove from dirty tracking.
+        self._dirty_symbols.discard(removed_symbol)
+
         self._populate_list()
         if self._entries:
             self._entry_list.setCurrentRow(min(row, len(self._entries) - 1))
-        self._mark_dirty()
+
+        # Mark section dirty (the deletion itself is the change) without
+        # tinting any specific remaining row — those weren't edited.
+        self._dirty = True
+        self._save_btn.setEnabled(True)
+        self._status_label.setText("Unsaved changes")
+        self._status_label.setStyleSheet("color: #e8a44a; font-size: 11px;")
+        self.modified.emit()
 
     # ═════════════════════════════════════════════════════════════════════════
     # Saving
@@ -675,15 +725,22 @@ class CreditsEditorWidget(QWidget):
             self._write_strings()
             self._write_credits_c()
             self._dirty = False
+            self._dirty_symbols.clear()
             self._save_btn.setEnabled(False)
             self._status_label.setText("Saved successfully")
             self._status_label.setStyleSheet("color: #7cbb5e; font-size: 11px;")
+            # Clear amber tinting on all list items.
+            for i in range(self._entry_list.count()):
+                item = self._entry_list.item(i)
+                if item:
+                    item.setBackground(QColor(0, 0, 0, 0))
             # Refresh mtime snapshot after successful save
             for path in list(self._loaded_mtimes.keys()):
                 try:
                     self._loaded_mtimes[path] = os.path.getmtime(path)
                 except OSError:
                     pass
+            self.saved.emit()
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Failed to save credits:\n{e}")
 
