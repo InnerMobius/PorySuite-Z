@@ -1,10 +1,10 @@
-# PorySuite-Z v0.0.63bai
+# PorySuite-Z v0.0.62b
 
 > pokefirered projects only.
 
 A piano-roll and workflow release. Sound editor replacements now land atomically and survive cold restarts. The piano roll's Copy/Paste carries a note's volume and pan along with it instead of losing them on paste. A new per-track Max Volume action fixes SFX that stayed too quiet even with the track slider maxed. The Git tab's Switch to Branch now handles "local changes would be overwritten" in-app with plain-English Stash / Discard / Cancel buttons instead of forcing the user to a terminal. Oak's Parcel no longer jumps to `CCF0CCF0` because the items-header writer pads dense array gaps again. Stale `.s` files from removed songs no longer break upstream pulls — the build sweeps them automatically before every build.
 
-## What's New in 0.0.63bai
+## What's New in 0.0.62b
 
 ### Git Tab — Switch Branch Handles Conflicts In-App
 
@@ -94,7 +94,7 @@ No terminal invocation, no `make clean-assets` required. Upstream pulls build cl
 - Updated: `ui/mainwindow.py` — `_git_checkout_branch` detects "would be overwritten" and opens `_show_switch_branch_conflict_dialog` with Stash / Discard / Cancel; `_prune_stale_song_s_files` added and invoked from `_run_make`; items-header writer pads `gItems[]` with `ITEM_NONE` placeholders across every constant's index.
 - Updated: `eventide/mainwindow.py` — same branch-conflict recovery dialog mirrored for EVENTide.
 - Updated: `ui/dialogs/git_panel.py` — Switch-to-Branch tooltip updated to mention the in-app Stash/Discard dialog.
-- Updated: `core/app_info.py` — VERSION bump to `0.0.63bai`.
+- Updated: `core/app_info.py` — VERSION bump to `0.0.62b`.
 - Regenerated: `pokefirered/src/data/items.h` — 376 dense entries (308 real + 68 `ITEM_NONE`).
 - Deleted: `pokefirered/sound/songs/midi/*.s` referencing `voicegroup013` — eight stale files swept.
 
