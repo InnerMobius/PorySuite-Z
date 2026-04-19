@@ -838,50 +838,118 @@ class SoundEditorTab(QWidget):
             midi_dir = os.path.join(
                 self._project_root, "sound", "songs", "midi")
             dest_path = os.path.join(midi_dir, f"{entry.label}.s")
+            mid_path = os.path.join(midi_dir, f"{entry.label}.mid")
+            cfg_path = os.path.join(midi_dir, "midi.cfg")
 
-            # Read the source file
+            # ── Step 1: close any open piano roll window for this song.
+            # The piano roll caches the SongData it was constructed with.
+            # If it's open and dirty (even if user thought they closed it
+            # earlier — it may still be alive in memory), the main-window
+            # Save pipeline will call its save_to_disk() and overwrite our
+            # replacement with the OLD parse. Close + forget it.
+            prw = getattr(self, "_piano_roll_window", None)
+            if prw is not None:
+                try:
+                    # Force not-dirty so closing doesn't prompt, then close.
+                    if hasattr(prw, "_is_dirty"):
+                        prw._is_dirty = False
+                    prw.close()
+                except Exception:
+                    pass
+                self._piano_roll_window = None
+                _log.info("Closed piano roll window before replacing %s", entry.label)
+
+            # ── Step 2: read the source file
             with open(source, encoding="utf-8") as f:
                 content = f.read()
 
-            # Detect the source file's original label
+            # Detect the source file's original label and rename all
+            # occurrences to match our target label.
             m = re.search(r'\.global\s+(\w+)\s*$', content, re.MULTILINE)
             if m:
                 original_label = m.group(1)
                 if original_label != entry.label:
                     content = content.replace(original_label, entry.label)
 
-            # Write the replaced file
-            with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
+            # ── Step 3: write via atomic replace so a partially written
+            # .s can never be seen by the build or by re-parse.
+            tmp_path = dest_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(content)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp_path, dest_path)
 
-            # Ensure a .mid placeholder exists so the Makefile picks up
-            # this song (MID_OBJS is derived from *.mid wildcard).
-            mid_path = os.path.join(midi_dir, f"{entry.label}.mid")
+            # ── Step 4: ensure a .mid placeholder exists (Makefile's
+            # MID_OBJS wildcard is `sound/songs/midi/*.mid`).
             if not os.path.isfile(mid_path):
                 from ui.dialogs.s_file_import_dialog import _SImportWorker
                 with open(mid_path, "wb") as mf:
                     mf.write(_SImportWorker._make_placeholder_mid())
                 _log.info("Created placeholder .mid for %s", entry.label)
 
-            # Ensure .s is newer than .mid — make's %.s:%.mid rule runs
-            # mid2agb when .mid is newer, which would overwrite our .s.
-            # Touch .s to now AND backdate the .mid by 2 seconds.
-            os.utime(dest_path)
+            # ── Step 5: lock mtimes so mid2agb CANNOT re-run on build.
+            # pokefirered's audio_rules.mk declares:
+            #     $(MID_ASM_DIR)/%.s: $(MID_SUBDIR)/%.mid $(MID_CFG_PATH)
+            # make re-runs mid2agb (which overwrites our .s) if EITHER
+            # the .mid OR midi.cfg is newer than .s. A tiny 2-second
+            # backdate on .mid is not enough — any later edit that touches
+            # midi.cfg, or filesystem clock skew, or a make -j race, can
+            # flip the ordering.  Push both dependencies 1 HOUR into the
+            # past relative to .s and touch .s to "now".  midi.cfg only
+            # has its mtime moved (contents untouched), so other songs are
+            # unaffected — make only cares about the timestamp.
+            import time as _time
+            now = _time.time()
+            os.utime(dest_path, (now, now))
+            far_past = now - 3600  # 1 hour back
             if os.path.isfile(mid_path):
-                s_mtime = os.stat(dest_path).st_mtime
-                os.utime(mid_path, (s_mtime - 2, s_mtime - 2))
+                os.utime(mid_path, (far_past, far_past))
+            if os.path.isfile(cfg_path):
+                cfg_mtime = os.stat(cfg_path).st_mtime
+                if cfg_mtime >= now:
+                    # Only push it back if it's currently at/after our .s;
+                    # if it's already in the past we leave it alone.
+                    os.utime(cfg_path, (far_past, far_past))
 
-            # Clear cached parse so it re-reads from disk
+            # ── Step 6: verify the bytes we meant to write are on disk.
+            with open(dest_path, encoding="utf-8") as f:
+                disk_content = f.read()
+            if disk_content != content:
+                raise RuntimeError(
+                    f"Replace verify failed: disk content for {entry.label} "
+                    f"does not match what we wrote "
+                    f"(wrote {len(content)} bytes, disk has {len(disk_content)})")
+            _log.info(
+                "Replaced %s (%d bytes) — .s mtime=%s, .mid backdated",
+                entry.label, len(content),
+                _time.strftime("%H:%M:%S", _time.localtime(now)))
+
+            # ── Step 7: re-parse the new .s and install it in the cache.
+            # The old code popped _all_songs[label] and relied on the next
+            # access to re-parse. That left a window where any consumer
+            # holding a prior reference to the parsed SongData (e.g. a
+            # piano roll that was reopened, a preview worker) could use
+            # the stale object. Pop AND immediately reparse from the
+            # just-written file so subsequent consumers get the new one.
             self._all_songs.pop(entry.label, None)
+            try:
+                self._parse_song(entry)
+            except Exception as pe:
+                _log.warning("Re-parse after replace failed for %s: %s",
+                             entry.label, pe)
 
-            # Re-select to refresh the details panel
+            # Refresh the details panel so the user sees the new song.
             self._on_song_selected(self._song_tree.currentItem(), None)
             self.modified.emit()
 
-            _log.info("Replaced song %s with %s", entry.label, source)
+            _log.info("Replace complete: %s ← %s", entry.label, source)
         except Exception as e:
             QMessageBox.critical(self, "Replace Failed", str(e))
-            _log.error("Replace failed: %s", e)
+            _log.error("Replace failed: %s", e, exc_info=True)
 
     def _parse_song(self, entry):
         """Parse a song's .s file on demand."""

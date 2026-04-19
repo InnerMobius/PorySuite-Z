@@ -695,11 +695,161 @@ class EventideMainWindow(QMainWindow):
             return
 
         ok, msg = self._git_run("checkout", branch, timeout=20)
-        if not ok:
+        if ok:
+            self.statusBar().showMessage(
+                f"Switched to branch '{branch}' — refreshing...", 4000
+            )
+            QTimer.singleShot(50, self._refresh_project)
+            return
+
+        # In-app recovery for "local changes would be overwritten"
+        msg_lower = (msg or "").lower()
+        is_overwrite_conflict = (
+            "would be overwritten" in msg_lower
+            or "please commit your changes or stash them" in msg_lower
+        )
+        if not is_overwrite_conflict:
             QMessageBox.warning(self, "Switch Branch", f"git checkout failed:\n{msg}")
             return
 
-        self.statusBar().showMessage(f"Switched to branch '{branch}' — refreshing...", 4000)
+        conflict_files: list[str] = []
+        for line in (msg or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.lower().startswith(("error:", "please commit", "aborting")):
+                continue
+            if line.startswith(("\t", "        ", "    ")) and " " not in s.split()[0]:
+                conflict_files.append(s)
+        seen = set()
+        conflict_files = [p for p in conflict_files if not (p in seen or seen.add(p))]
+        self._show_switch_branch_conflict_dialog(branch, conflict_files, msg)
+
+    def _show_switch_branch_conflict_dialog(
+        self, branch: str, conflict_files: list[str], raw_msg: str
+    ) -> None:
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit,
+            QPushButton,
+        )
+        from PyQt6.QtGui import QFont
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Switch Branch — Unsaved Changes")
+        dlg.setMinimumWidth(620)
+        lay = QVBoxLayout(dlg)
+
+        header = QLabel(
+            f"<b>Can't switch to '{branch}' yet — some files on your "
+            f"computer are different from what's saved in git.</b>"
+        )
+        header.setWordWrap(True)
+        lay.addWidget(header)
+
+        explain = QLabel(
+            "This usually happens because the app (or a failed build) wrote "
+            "to these files as part of normal operation, even though you "
+            "didn't manually edit them. Git is protecting you from losing "
+            "those differences during the switch.<br><br>"
+            "Pick one of the options below — you don't need a terminal:"
+            "<ul>"
+            "<li><b>Stash &amp; Switch</b> (safe) — tucks the differences "
+            "aside, switches branches, and you can restore them later.</li>"
+            "<li><b>Discard &amp; Switch</b> (destructive) — throws away the "
+            "differences in the listed files and switches.</li>"
+            "<li><b>Cancel</b> — do nothing, stay on the current branch.</li>"
+            "</ul>"
+        )
+        explain.setWordWrap(True)
+        explain.setStyleSheet("color: #bbb; font-size: 11px;")
+        lay.addWidget(explain)
+
+        lay.addWidget(QLabel(f"<b>Affected files ({len(conflict_files)}):</b>"))
+        txt = QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setFont(QFont("Courier New", 9))
+        txt.setMaximumHeight(140)
+        txt.setPlainText(
+            "\n".join(conflict_files)
+            if conflict_files
+            else (raw_msg or "(git did not list specific files)")
+        )
+        lay.addWidget(txt)
+
+        btn_row = QHBoxLayout()
+        stash_btn   = QPushButton("📦  Stash && Switch")
+        discard_btn = QPushButton("🗑  Discard && Switch")
+        cancel_btn  = QPushButton("Cancel")
+        btn_row.addWidget(stash_btn)
+        btn_row.addWidget(discard_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        result = {"action": None}
+        stash_btn.clicked.connect(lambda: (result.update(action="stash"), dlg.accept()))
+        discard_btn.clicked.connect(lambda: (result.update(action="discard"), dlg.accept()))
+        cancel_btn.clicked.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted or not result["action"]:
+            return
+
+        if result["action"] == "stash":
+            ok, out = self._git_run(
+                "stash", "push", "-u",
+                "-m", f"Auto-stash before switching to {branch}",
+                timeout=30,
+            )
+            if not ok:
+                QMessageBox.warning(
+                    self, "Stash Failed",
+                    "Couldn't stash the changes, so the switch was "
+                    "cancelled. Git said:\n\n" + (out or "")
+                )
+                return
+        else:
+            confirm = QMessageBox.question(
+                self, "Discard Changes",
+                "This will permanently throw away your local edits to "
+                f"{len(conflict_files)} file(s). This cannot be undone.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            if conflict_files:
+                for i in range(0, len(conflict_files), 40):
+                    chunk = conflict_files[i:i + 40]
+                    ok, out = self._git_run("checkout", "--", *chunk, timeout=30)
+                    if not ok:
+                        QMessageBox.warning(
+                            self, "Discard Failed",
+                            "Couldn't discard the local changes, so the "
+                            "switch was cancelled. Git said:\n\n" + (out or "")
+                        )
+                        return
+            else:
+                ok, out = self._git_run("checkout", "--", ".", timeout=60)
+                if not ok:
+                    QMessageBox.warning(
+                        self, "Discard Failed",
+                        "Couldn't discard the local changes, so the switch "
+                        "was cancelled. Git said:\n\n" + (out or "")
+                    )
+                    return
+
+        ok, msg2 = self._git_run("checkout", branch, timeout=20)
+        if not ok:
+            QMessageBox.warning(
+                self, "Switch Branch",
+                "Even after cleaning up, git still wouldn't switch. "
+                "Git said:\n\n" + (msg2 or "")
+            )
+            return
+
+        self.statusBar().showMessage(
+            f"Switched to branch '{branch}' — refreshing...", 4000
+        )
         QTimer.singleShot(50, self._refresh_project)
 
     def _git_show_status(self) -> None:

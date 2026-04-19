@@ -303,6 +303,7 @@ class PianoRollCanvas(QWidget):
         # Selection
         self._selected: set[int] = set()  # indices into self._notes
         self._clipboard: list[dict] = []
+        self._clipboard_ctrl: list[dict] = []
         self._visible_tracks: Optional[set[int]] = None  # None = all visible
 
         # Undo stack — stores snapshots of (notes, control_events)
@@ -424,14 +425,37 @@ class PianoRollCanvas(QWidget):
         self.update()
 
     def copy_selected(self):
+        """Copy the currently-selected notes AND the track control events
+        (VOL, PAN, BEND, BENDR) that fall inside their tick range on the
+        same track.  Without this, pasted notes would lose the per-note
+        volume / pan / pitch-bend the original note inherited from its
+        track state, and the paste would sound much quieter / flatter
+        than the original.
+        """
         if not self._selected:
             return
         sel = [self._notes[i] for i in sorted(self._selected)]
         min_tick = min(n['tick'] for n in sel)
+        max_tick = max(n['tick'] + n.get('duration', 0) for n in sel)
+        tracks_in_sel = {n.get('track', 0) for n in sel}
+
         self._clipboard = [
             {**n, 'tick': n['tick'] - min_tick} for n in sel
         ]
-        self.status_message.emit(f"Copied {len(self._clipboard)} notes")
+
+        # Also clip control events that live in the selected tick/track
+        # range so volume/pan/bend travel with the notes.
+        self._clipboard_ctrl = [
+            {**e, 'tick': e['tick'] - min_tick}
+            for e in self._control_events
+            if e.get('track', 0) in tracks_in_sel
+            and min_tick <= e['tick'] <= max_tick
+        ]
+
+        self.status_message.emit(
+            f"Copied {len(self._clipboard)} notes "
+            f"(+{len(self._clipboard_ctrl)} volume/pan events)"
+        )
 
     def paste(self, at_tick: int = 0):
         if not self._clipboard:
@@ -444,6 +468,16 @@ class PianoRollCanvas(QWidget):
             self._notes.append(new)
             self._selected.add(base)
             base += 1
+
+        # Re-insert control events at the paste location on the active
+        # track so the pasted notes inherit their original volume/pan/bend.
+        for e in getattr(self, '_clipboard_ctrl', []) or []:
+            self._control_events.append({
+                **e,
+                'tick': e['tick'] + at_tick,
+                'track': self._active_track,
+            })
+
         self.notes_changed.emit()
         self.update()
 

@@ -2028,7 +2028,13 @@ QTabBar::tab:hover:!selected {
             menu.addAction(act)
 
     def _git_checkout_branch(self, branch: str) -> None:
-        """Switch to a local branch and refresh the project."""
+        """Switch to a local branch and refresh the project.
+
+        If git refuses because local files would be overwritten, show an
+        in-app dialog listing the conflicting files and offering three
+        plain-English options: Stash & Switch, Discard & Switch, Cancel.
+        The user never needs to open a terminal to resolve this.
+        """
         if not self.project_info:
             return
         project_dir = self.project_info.get("dir", "")
@@ -2046,11 +2052,203 @@ QTabBar::tab:hover:!selected {
             return
 
         ok, msg = self._git_run("checkout", branch, timeout=20)
-        if not ok:
+        if ok:
+            self.statusBar().showMessage(
+                f"Switched to branch '{branch}' — refreshing…", 4000
+            )
+            QTimer.singleShot(50, self._refresh_project)
+            return
+
+        # ── Error path: try to recover in-app ────────────────────────────
+        msg_lower = (msg or "").lower()
+        is_overwrite_conflict = (
+            "would be overwritten" in msg_lower
+            or "please commit your changes or stash them" in msg_lower
+        )
+
+        if not is_overwrite_conflict:
             _MB.warning(self, "Switch Branch", f"git checkout failed:\n{msg}")
             return
 
-        self.statusBar().showMessage(f"Switched to branch '{branch}' — refreshing…", 4000)
+        # Parse the list of conflicting files out of git's error text.
+        # Git formats them as indented lines between the error header
+        # and the "Please commit..." / "Aborting" trailer.
+        import re
+        conflict_files: list[str] = []
+        for line in (msg or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # Skip header / footer lines
+            if s.lower().startswith(("error:", "please commit", "aborting")):
+                continue
+            # A file path line in git's output looks like "\tpath/to/file"
+            # or simply "  path/to/file" — just a path, no spaces at start
+            # of a sentence like "Your local changes...".
+            if line.startswith(("\t", "        ", "    ")) and " " not in s.split()[0]:
+                conflict_files.append(s)
+        # Dedupe while preserving order
+        seen = set()
+        conflict_files = [p for p in conflict_files if not (p in seen or seen.add(p))]
+
+        self._show_switch_branch_conflict_dialog(branch, conflict_files, msg)
+
+    def _show_switch_branch_conflict_dialog(
+        self, branch: str, conflict_files: list[str], raw_msg: str
+    ) -> None:
+        """In-app recovery dialog for 'local changes would be overwritten'.
+
+        Three buttons:
+          * Stash & Switch  — git stash push -u, then retry checkout.
+          * Discard & Switch — git checkout -- <files>, then retry checkout.
+          * Cancel          — do nothing.
+        Everything happens inside the app; no terminal needed.
+        """
+        from PyQt6.QtWidgets import (
+            QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPlainTextEdit,
+            QPushButton, QMessageBox,
+        )
+        from PyQt6.QtGui import QFont
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Switch Branch — Unsaved Changes")
+        dlg.setMinimumWidth(620)
+        lay = QVBoxLayout(dlg)
+
+        header = QLabel(
+            f"<b>Can't switch to '{branch}' yet — some files on your "
+            f"computer are different from what's saved in git.</b>"
+        )
+        header.setWordWrap(True)
+        lay.addWidget(header)
+
+        explain = QLabel(
+            "This usually happens because PorySuite (or a failed build) wrote "
+            "to these files as part of normal operation, even though you didn't "
+            "manually edit them. Git is protecting you from losing those "
+            "differences during the switch.<br><br>"
+            "Pick one of the options below — you don't need a terminal:"
+            "<ul>"
+            "<li><b>Stash &amp; Switch</b> (safe) — tucks the differences "
+            "aside into git's stash area, switches branches, and you can "
+            "restore them later from the Stash section if you need them.</li>"
+            "<li><b>Discard &amp; Switch</b> (destructive) — throws away the "
+            "differences in the listed files and switches. Use this if the "
+            "files are just auto-generated output you don't care about "
+            "(items.json, .gitignore tweaks from setup, etc.).</li>"
+            "<li><b>Cancel</b> — do nothing, stay on the current branch.</li>"
+            "</ul>"
+        )
+        explain.setWordWrap(True)
+        explain.setStyleSheet("color: #bbb; font-size: 11px;")
+        lay.addWidget(explain)
+
+        lay.addWidget(QLabel(f"<b>Affected files ({len(conflict_files)}):</b>"))
+        txt = QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setFont(QFont("Courier New", 9))
+        txt.setMaximumHeight(140)
+        if conflict_files:
+            txt.setPlainText("\n".join(conflict_files))
+        else:
+            # Fall back to raw git output if we couldn't parse the list
+            txt.setPlainText(raw_msg or "(git did not list specific files)")
+        lay.addWidget(txt)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        stash_btn   = QPushButton("📦  Stash && Switch")
+        stash_btn.setToolTip(
+            "Tuck the changes aside safely with  git stash push -u ,\n"
+            "then switch to the selected branch. You can restore the\n"
+            "stashed changes later from the Stash section."
+        )
+        discard_btn = QPushButton("🗑  Discard && Switch")
+        discard_btn.setToolTip(
+            "Throw away the local differences in the listed files\n"
+            "( git checkout -- <files> ), then switch. Cannot be undone."
+        )
+        cancel_btn  = QPushButton("Cancel")
+
+        btn_row.addWidget(stash_btn)
+        btn_row.addWidget(discard_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        lay.addLayout(btn_row)
+
+        result = {"action": None}
+        stash_btn.clicked.connect(lambda: (result.update(action="stash"), dlg.accept()))
+        discard_btn.clicked.connect(lambda: (result.update(action="discard"), dlg.accept()))
+        cancel_btn.clicked.connect(dlg.reject)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted or not result["action"]:
+            return
+
+        from PyQt6.QtWidgets import QMessageBox as _MB
+
+        if result["action"] == "stash":
+            # Include untracked so items.json etc. are captured even if new.
+            ok, out = self._git_run(
+                "stash", "push", "-u",
+                "-m", f"PorySuite auto-stash before switching to {branch}",
+                timeout=30,
+            )
+            if not ok:
+                _MB.warning(
+                    self, "Stash Failed",
+                    "Couldn't stash the changes, so the switch was "
+                    "cancelled. Git said:\n\n" + (out or "")
+                )
+                return
+        else:  # discard
+            confirm = _MB.question(
+                self, "Discard Changes",
+                "This will permanently throw away your local edits to "
+                f"{len(conflict_files)} file(s). This cannot be undone.\n\n"
+                "Continue?",
+                _MB.StandardButton.Yes | _MB.StandardButton.Cancel,
+            )
+            if confirm != _MB.StandardButton.Yes:
+                return
+            if conflict_files:
+                # Discard only the specific files git named.
+                # Batch in small chunks to stay under Windows arg limits.
+                for i in range(0, len(conflict_files), 40):
+                    chunk = conflict_files[i:i + 40]
+                    ok, out = self._git_run(
+                        "checkout", "--", *chunk, timeout=30
+                    )
+                    if not ok:
+                        _MB.warning(
+                            self, "Discard Failed",
+                            "Couldn't discard the local changes, so the "
+                            "switch was cancelled. Git said:\n\n" + (out or "")
+                        )
+                        return
+            else:
+                # Nothing parsed — fall back to a broader reset of tracked files.
+                ok, out = self._git_run("checkout", "--", ".", timeout=60)
+                if not ok:
+                    _MB.warning(
+                        self, "Discard Failed",
+                        "Couldn't discard the local changes, so the switch "
+                        "was cancelled. Git said:\n\n" + (out or "")
+                    )
+                    return
+
+        # Retry the checkout now that the working tree is clean.
+        ok, msg2 = self._git_run("checkout", branch, timeout=20)
+        if not ok:
+            _MB.warning(
+                self, "Switch Branch",
+                "Even after cleaning up, git still wouldn't switch. "
+                "Git said:\n\n" + (msg2 or "")
+            )
+            return
+
+        self.statusBar().showMessage(
+            f"Switched to branch '{branch}' — refreshing…", 4000
+        )
         QTimer.singleShot(50, self._refresh_project)
 
     def _git_show_status(self) -> None:
@@ -2553,6 +2751,70 @@ QTabBar::tab:hover:!selected {
 
     # ── Make ──────────────────────────────────────────────────────────────────
 
+    def _prune_stale_song_s_files(self, project_dir: str) -> None:
+        """Delete sound/songs/midi/*.s files whose voicegroup no longer exists.
+
+        Runs before every build. Gitignored .s files from earlier PorySuite
+        sessions survive `git pull`, and if upstream removed a voicegroup the
+        stale .s breaks linking with `undefined reference to voicegroupXXX`.
+        Deleting the stale .s lets mid2agb regenerate it from the tracked
+        .mid + midi.cfg during the build — no user intervention needed.
+
+        A .s is only deleted if we can unambiguously identify a missing
+        voicegroup reference. When in doubt we leave the file alone.
+        """
+        vg_inc = os.path.join(project_dir, "sound", "voice_groups.inc")
+        midi_dir = os.path.join(project_dir, "sound", "songs", "midi")
+        if not os.path.isfile(vg_inc) or not os.path.isdir(midi_dir):
+            return
+
+        # Build the set of valid voicegroup labels from voice_groups.inc.
+        # Labels appear as `voicegroupNNN::` at column 0.
+        valid_vgs: set = set()
+        with open(vg_inc, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.match(r'^(voicegroup\w+)::', line)
+                if m:
+                    valid_vgs.add(m.group(1))
+        if not valid_vgs:
+            return  # Unexpected — don't prune if we can't verify.
+
+        grp_re = re.compile(
+            r'^\s*\.equ\s+\w+_grp\s*,\s*(voicegroup\w+)', re.MULTILINE)
+
+        removed: list[tuple[str, str]] = []
+        for name in os.listdir(midi_dir):
+            if not name.endswith(".s"):
+                continue
+            s_path = os.path.join(midi_dir, name)
+            try:
+                with open(s_path, "r", encoding="utf-8", errors="replace") as f:
+                    head = f.read(4096)  # voicegroup line is always near the top
+            except OSError:
+                continue
+            m = grp_re.search(head)
+            if not m:
+                continue  # No detectable vg reference — leave it alone.
+            vg = m.group(1)
+            if vg in valid_vgs:
+                continue  # Valid reference — keep the .s.
+            # Stale — delete it. mid2agb will regenerate from .mid on build.
+            try:
+                os.remove(s_path)
+                removed.append((name, vg))
+            except OSError:
+                pass
+
+        if removed:
+            self.log(
+                f"Pre-build cleanup: removed {len(removed)} stale song .s "
+                f"file(s) referencing voicegroups no longer in "
+                f"sound/voice_groups.inc. They will be regenerated from their "
+                f".mid files during the build."
+            )
+            for name, vg in removed:
+                self.log(f"  - sound/songs/midi/{name} (→ {vg})")
+
     def _run_make(self, extra_args: list) -> None:
         """Open an MSYS2 MINGW64 terminal and run make in the pokefirered project directory."""
         if not self.project_info:
@@ -2626,6 +2888,25 @@ QTabBar::tab:hover:!selected {
         msys_path = _win_path_to_msys(project_dir)
         make_args = ' '.join(extra_args)
         make_cmd  = f'make {make_args}'.strip()
+
+        # ── Pre-build sweep: drop stale .s files that reference dead voicegroups ─
+        # The Makefile's song wildcard (`$(wildcard sound/songs/midi/*.s)`) picks
+        # up EVERY .s file in that directory, including ones left over from
+        # earlier PorySuite sessions or git pulls. Those .s files are gitignored
+        # — `git pull` does not clean them — so if upstream drops a voicegroup
+        # the stale .s still tries to link against it, and the build dies with
+        # `undefined reference to voicegroupXXX`.
+        #
+        # Scan each .s before building. If it references a voicegroup that no
+        # longer exists in sound/voice_groups.inc, delete the .s — mid2agb will
+        # regenerate it fresh from the tracked .mid + midi.cfg during the build.
+        # Log every removal so the user sees exactly what was cleaned up.
+        try:
+            self._prune_stale_song_s_files(project_dir)
+        except Exception as _prune_err:
+            # Non-fatal: log and proceed. We'd rather try to build than refuse
+            # outright if the sweep hits an unexpected file layout.
+            self.log(f"Pre-build song sweep failed (continuing): {_prune_err}")
 
         # Build the GBA host tools if ANY critical one is missing or invalid.
         # Check all tools that are required for a full build — not just one.
@@ -10762,6 +11043,43 @@ QTabBar::tab:hover:!selected {
         if not items:
             return -1
 
+        # ── Gap-slot padding ────────────────────────────────────────────
+        # The engine indexes gItems[] by the ITEM_* constant value. Vanilla
+        # pokefirered has 376 constants (0..375) but only ~309 are real
+        # items — the rest are unused gap slots (ITEM_034, ITEM_035, …,
+        # ITEM_058, etc.) that in vanilla are filled with ITEM_NONE
+        # placeholder entries so the array stays dense.
+        #
+        # items.json only stores the REAL items, so we must pad the gaps
+        # ourselves when writing gItems[]. Without this, gItems[349]
+        # (ITEM_OAKS_PARCEL) reads past the end of the array, gets a
+        # garbage fieldUseFunc pointer, and the game jumps to 0xCCF0CCF0
+        # when Oak's Parcel is used — crash.
+        #
+        # Read include/constants/items.h to build {ITEM_*: index}, then
+        # emit entries in index order, inserting ITEM_NONE placeholders
+        # wherever items.json lacks an entry for a given index.
+        const_path = os.path.join(proj_dir, "include", "constants", "items.h")
+        index_by_const: dict[str, int] = {}
+        max_index = -1
+        try:
+            with open(const_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r'\s*#define\s+(ITEM_\w+)\s+(\d+)', line)
+                    if m:
+                        idx = int(m.group(2))
+                        index_by_const[m.group(1)] = idx
+                        if idx > max_index:
+                            max_index = idx
+        except Exception:
+            # If we can't read constants, fall back to no padding — this
+            # preserves the old (buggy) behaviour rather than breaking
+            # projects that for some reason lack the header.
+            index_by_const = {}
+            max_index = -1
+
+        items_by_const = {it.get("itemId"): it for it in items if it.get("itemId")}
+
         # Build description lines and gItems[] body following the Inja template
         desc_parts: list[str] = []
         body_parts: list[str] = []
@@ -10784,18 +11102,36 @@ QTabBar::tab:hover:!selected {
         # ITEM_NONE sentinel description at the end
         desc_parts.append('const u8 gItemDescription_ITEM_NONE[] = _("?????");')
 
-        for item in items:
+        def _placeholder_block() -> str:
+            """Vanilla-style ITEM_NONE placeholder for an unused slot."""
+            return (
+                "    {\n"
+                '        .name = _("????????"),\n'
+                "        .itemId = ITEM_NONE,\n"
+                "        .price = 0,\n"
+                "        .holdEffect = HOLD_EFFECT_NONE,\n"
+                "        .holdEffectParam = 0,\n"
+                "        .description = gItemDescription_ITEM_NONE,\n"
+                "        .importance = 0,\n"
+                "        .registrability = 0,\n"
+                "        .pocket = POCKET_ITEMS,\n"
+                "        .type = ITEM_TYPE_BAG_MENU,\n"
+                "        .fieldUseFunc = NULL,\n"
+                "        .battleUsage = 0,\n"
+                "        .battleUseFunc = NULL,\n"
+                "        .secondaryId = 0\n"
+                "    }"
+            )
+
+        def _real_block(item: dict) -> str:
             item_id = item.get("itemId", "ITEM_NONE")
             pocket = item.get("pocket", "")
             move_id = item.get("moveId", "")
-
-            # --- description reference for gItems[] ---
             if pocket == "POCKET_TM_CASE" and move_id:
                 desc_ref = f"gMoveDescription_{move_id}"
             else:
                 desc_ref = f"gItemDescription_{item_id}"
-
-            block = (
+            return (
                 f"    {{\n"
                 f'        .name = _("{item.get("english", "????????")}"),\n'
                 f"        .itemId = {item_id},\n"
@@ -10813,7 +11149,27 @@ QTabBar::tab:hover:!selected {
                 f"        .secondaryId = {item.get('secondaryId', 0)}\n"
                 f"    }}"
             )
-            body_parts.append(block)
+
+        if max_index >= 0:
+            # Emit one entry per index 0..max_index.  A placeholder fills
+            # any slot where items.json has no matching itemId.
+            const_by_index: dict[int, str] = {}
+            for k, v in index_by_const.items():
+                # If two constants share an index, prefer the non-NONE one;
+                # otherwise keep the first we see.
+                if v not in const_by_index or const_by_index[v] == "ITEM_NONE":
+                    const_by_index[v] = k
+            for idx in range(max_index + 1):
+                const = const_by_index.get(idx)
+                item = items_by_const.get(const) if const else None
+                if item and const and const != "ITEM_NONE":
+                    body_parts.append(_real_block(item))
+                else:
+                    body_parts.append(_placeholder_block())
+        else:
+            # Fallback: old behaviour (one entry per items.json row)
+            for item in items:
+                body_parts.append(_real_block(item))
 
         header_comment = (
             "//\n"

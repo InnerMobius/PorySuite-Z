@@ -581,7 +581,8 @@ class GitPanel(QDialog):
         self._branch_switch_btn.setEnabled(False)
         self._branch_switch_btn.setToolTip(
             "Check out the selected branch.\n"
-            "Your current changes will remain (git checkout)."
+            "If local files conflict, a dialog will offer to\n"
+            "Stash or Discard them — no terminal needed."
         )
         self._branch_switch_btn.clicked.connect(self._do_switch_branch)
 

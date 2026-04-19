@@ -162,17 +162,36 @@ class PianoRollWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        toolbar.addWidget(QLabel(" Vol:"))
+        toolbar.addWidget(QLabel(" Preview Vol:"))
         self._vol_slider = QSlider(Qt.Orientation.Horizontal)
         install_scroll_guard(self._vol_slider)
         self._vol_slider.setRange(0, 100)
         self._vol_slider.setValue(80)
         self._vol_slider.setFixedWidth(60)
-        self._vol_slider.setToolTip("Playback volume.")
+        self._vol_slider.setToolTip(
+            "Editor preview gain only — does NOT affect the saved song.\n"
+            "To change the song's volume on the ROM, use the per-track VOL\n"
+            "sliders in the track sidebar on the left."
+        )
         self._vol_slider.valueChanged.connect(self._on_volume)
         toolbar.addWidget(self._vol_slider)
 
         toolbar.addSeparator()
+
+        self._btn_boost = QPushButton("🔊 Max Volume")
+        self._btn_boost.setFixedWidth(130)
+        self._btn_boost.setToolTip(
+            "Boost the ACTIVE track's volume to the ceiling:\n"
+            "  • every VOL event on the track → 127\n"
+            "  • every note's velocity on the track → 127\n"
+            "  • master volume → 127 (so track VOL=127 can round-trip)\n\n"
+            "Use on SFX that stay quiet even with the track slider maxed —\n"
+            "imported MIDIs often carry soft per-note velocities that keep\n"
+            "output under the ceiling.  Other tracks are left alone.\n\n"
+            "Select the track you want boosted in the sidebar first."
+        )
+        self._btn_boost.clicked.connect(self._on_boost_all)
+        toolbar.addWidget(self._btn_boost)
 
         self._btn_save = QPushButton("Save")
         self._btn_save.setFixedWidth(60)
@@ -524,9 +543,20 @@ class PianoRollWindow(QMainWindow):
         """Update the song's tempo when the user changes the BPM spinbox."""
         self._bpm = value
 
-        # Update the TEMPO command in track 1 (where tempo lives)
+        # ── Ceiling fix ─────────────────────────────────────────────────
+        # TEMPO in the .s is stored as `raw*tbs/2` in a single byte (0-255).
+        # The writer reverses: raw = round(value * 2 / tbs). With tbs=1 the
+        # ceiling is BPM ≈ 127 (raw 255 → 255/2). Anything above that
+        # overflows the byte and reloads wrong. Hoist tempo_base to 2 (max
+        # BPM 255) whenever the user exceeds what the current tbs can
+        # represent, so the new BPM round-trips losslessly on cold load.
         if self._song and self._song.tracks:
             tbs = self._song.tempo_base if self._song.tempo_base else 1
+            # Max representable BPM at the current tbs is floor(255*tbs/2).
+            max_bpm_for_tbs = (255 * tbs) // 2
+            if value > max_bpm_for_tbs and tbs < 2:
+                self._song.tempo_base = 2
+                tbs = 2
             for cmd in self._song.tracks[0].commands:
                 if cmd.cmd == 'TEMPO':
                     cmd.value = value
@@ -580,6 +610,91 @@ class PianoRollWindow(QMainWindow):
         if self._sequencer is not None and loop_s is not None and loop_e is not None:
             self._sequencer.set_loop(loop_s, loop_e)
         self._status.showMessage("Song structure updated", 3000)
+
+    def _on_boost_all(self):
+        """🔊 Max Volume — boost the ACTIVE track only.
+
+        Three multipliers govern M4A output level:
+          output = (master_volume/127) × (track_volume/127) × (note_velocity/127) × envelope
+
+        The track-volume slider only controls the middle term. Imported
+        MIDIs usually carry per-note velocities in the 60-100 range, so
+        even with the slider maxed a note tops out at ~55-80% of full
+        output — quieter than music with multiple tracks summing in the
+        mixer.
+
+        This action maxes the SELECTED track's VOL events + every note's
+        velocity ON THAT TRACK, and raises master_volume to 127 so the
+        track's new VOL=127 round-trips losslessly through save/reload.
+        Other tracks are left alone.
+        """
+        # Which track is currently active?
+        track_idx = getattr(self._piano_roll.canvas, '_active_track', 0) or 0
+        if not (0 <= track_idx < len(self._song.tracks)):
+            QMessageBox.warning(
+                self, "Max Volume",
+                "No active track — click a track in the sidebar first."
+            )
+            return
+
+        ans = QMessageBox.question(
+            self, "Max Volume",
+            f"Boost every note and every VOL event on <b>Track {track_idx + 1}</b> "
+            f"to 127, and raise the master volume to 127 so the track plays "
+            f"at its loudest?<br><br>"
+            f"Other tracks will be left untouched. This is useful when an "
+            f"SFX is too quiet even with the track slider maxed — imported "
+            f"MIDIs often have soft per-note velocities that stay under the "
+            f"ceiling.<br><br>"
+            f"You can still undo note changes on the piano roll canvas "
+            f"(Ctrl+Z) if you don't like the result.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+
+        # 1) Master volume → 127 so track VOL=127 survives save/reload
+        self._song.master_volume = 127
+
+        # 2) Every VOL event on THIS track → 127 (and add one if missing);
+        #    also every note-command velocity on THIS track → 127.
+        from core.sound.song_parser import TrackCommand
+        track = self._song.tracks[track_idx]
+        found = False
+        for cmd in track.commands:
+            if cmd.cmd == 'VOL':
+                cmd.value = 127
+                found = True
+        if not found:
+            track.commands.insert(0, TrackCommand(
+                cmd='VOL', tick=0, value=127, raw_line=''))
+        for cmd in track.commands:
+            if getattr(cmd, 'velocity', None) is not None:
+                cmd.velocity = 127
+
+        # 3) Canvas notes on THIS track only
+        canvas = self._piano_roll.canvas
+        canvas.push_undo()
+        for n in canvas._notes:
+            if n.get('track', 0) == track_idx:
+                n['velocity'] = 127
+        # Any VOL control events the canvas is using for playback on this track
+        for e in canvas._control_events:
+            if e.get('track', 0) == track_idx and e.get('type') == 'VOL':
+                e['value'] = 127
+        canvas.notes_changed.emit()
+        canvas.update()
+
+        # 4) Live sequencer update for THIS track
+        if self._sequencer is not None:
+            self._sequencer.set_track_volume(track_idx, 127)
+
+        self._mark_dirty()
+        self._status.showMessage(
+            f"Maxed Track {track_idx + 1} — VOL events and note velocities "
+            f"set to 127. Save and rebuild to hear the result.",
+            6000,
+        )
 
     def _on_save(self):
         """Save button / Ctrl+S — writes the song to disk directly."""
@@ -651,13 +766,41 @@ class PianoRollWindow(QMainWindow):
         """User changed a track's volume slider."""
         if self._sequencer is not None:
             self._sequencer.set_track_volume(track_index, volume)
-        # Also persist in song data so save captures it
+        # Also persist in song data so save captures it.
+        #
+        # ── Bump EVERY VOL event, not just the first ──────────────────
+        # mid2agb often emits multiple VOL events throughout a track
+        # (automation/fades). If we only bumped the first one, the track
+        # would ramp back down to the imported low value a few ticks in,
+        # leaving the SFX quieter than the user expected. Bump them all
+        # to match the slider so the whole track plays at the requested
+        # level. (If the user wants a fade, they can set per-note
+        # velocity or edit individual VOL events via Note Properties.)
         if 0 <= track_index < len(self._song.tracks):
             track = self._song.tracks[track_index]
+            found_any = False
             for cmd in track.commands:
                 if cmd.cmd == 'VOL':
                     cmd.value = volume
-                    break
+                    found_any = True
+            if not found_any:
+                # Track had no VOL event at all — insert one at tick 0
+                from core.sound.song_parser import TrackCommand
+                track.commands.insert(0, TrackCommand(
+                    cmd='VOL', tick=0, value=volume, raw_line=''))
+            # ── Ceiling fix ───────────────────────────────────────────
+            # The .s file writes VOL as `raw*mvl/mxv`, and the writer's
+            # _raw_vol() reverse-computes raw = round(value * 127 / mvl),
+            # then clamps to 127. If `volume` exceeds the current
+            # `master_volume` (`_mvl` in the .s), the write clamps and
+            # the next cold-load parse evaluates back to the ceiling
+            # (e.g. user slides to 120 with mvl=90 → file says 127*mvl/mxv
+            # → reload reads 90). Hoist master_volume up to 127 so the
+            # full 0-127 VOL range can round-trip losslessly. A 127 mvl
+            # means _raw_vol(v, 127) == v exactly — every track's VOL is
+            # written faithfully and re-parses to the same number.
+            if volume > getattr(self._song, 'master_volume', 127):
+                self._song.master_volume = 127
             self._mark_dirty()
 
     def _on_track_pan(self, track_index: int, pan: int):
