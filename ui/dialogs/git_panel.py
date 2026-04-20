@@ -643,20 +643,44 @@ class GitPanel(QDialog):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Batch in chunks of 40 to stay under the Windows command-line length cap.
-        failed: list[str] = []
-        for i in range(0, len(paths), 40):
-            batch = paths[i:i + 40]
-            ok, _ = self._mw._git_run("checkout", "--", *batch, timeout=30)
-            if not ok:
-                failed.extend(batch)
+        # Run one file at a time so we get a real per-file result and a real
+        # error message when something fails.  Batching was hiding which file
+        # broke and what git actually said about it.  On Windows the file may
+        # also be briefly locked by a reader in another process — retry twice
+        # with a short delay before giving up.
+        import time
+        failed: list[tuple[str, str]] = []  # (path, error_message)
+        for p in paths:
+            last_err = ""
+            for attempt in range(3):
+                ok, out = self._mw._git_run("checkout", "--", p, timeout=30)
+                if ok:
+                    last_err = ""
+                    break
+                last_err = (out or "").strip() or "git exited non-zero with no output"
+                time.sleep(0.25)  # short backoff for a transient lock
+            if last_err:
+                failed.append((p, last_err))
 
         if failed:
-            preview_f = "\n".join(f"  • {p}" for p in failed[:20])
+            # Show the real git error for each file so we can diagnose the
+            # failure instead of guessing.
+            preview_f = "\n\n".join(
+                f"  • {p}\n      → {err.splitlines()[0] if err else '(no output)'}"
+                + (("\n        " + "\n        ".join(err.splitlines()[1:6])) if len(err.splitlines()) > 1 else "")
+                for p, err in failed[:10]
+            )
+            if len(failed) > 10:
+                preview_f += f"\n\n  … and {len(failed) - 10} more"
             QMessageBox.warning(
                 self,
-                "Discard Changes",
-                f"{len(failed)} file(s) could not be reverted:\n\n{preview_f}",
+                "Discard Changes — Errors",
+                f"{len(failed)} of {len(paths)} file(s) could not be reverted.\n\n"
+                f"Git reported:\n\n{preview_f}\n\n"
+                f"If the error mentions a lock or 'unable to unlink', another\n"
+                f"program (often PorySuite itself, or Windows Search) is holding\n"
+                f"the file open.  Close the item in any open editor, wait a\n"
+                f"moment, then try again.",
             )
         else:
             self._commit_status_lbl.setText(
