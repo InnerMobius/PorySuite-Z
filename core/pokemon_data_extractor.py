@@ -103,8 +103,34 @@ def _write_json(path: str, data: dict | list, min_entries: int = 1) -> bool:
         return False
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+
+    # Byte-match guard: if the serialized payload is identical to what is
+    # already on disk, do NOT rewrite the file.  Rewriting would bump the
+    # file's mtime and surface as a phantom "modified" entry in git status
+    # even though the content is unchanged.  This commonly happens after a
+    # `git pull` from upstream: the source header (e.g. items.h) gets a
+    # fresh mtime, _load_json's staleness check fails, the extractor
+    # re-parses the header, and we land here with content identical to the
+    # existing JSON.  In that case we only bump the JSON's mtime forward so
+    # the staleness check stays quiet on the next load.  Git does not track
+    # mtime, so this is invisible to `git status`.
+    new_bytes = json.dumps(data, indent=4).encode("utf-8")
+    try:
+        with open(path, "rb") as jf:
+            current_bytes = jf.read()
+    except OSError:
+        current_bytes = None
+
+    if current_bytes is not None and current_bytes == new_bytes:
+        try:
+            os.utime(path, None)  # touch mtime; content unchanged
+        except OSError:
+            pass
+        print(f"Skipped rewrite (identical): {os.path.abspath(path)}")
+        return True
+
+    with open(path, "wb") as f:
+        f.write(new_bytes)
     print(f"Wrote {os.path.abspath(path)}")
     return True
 
