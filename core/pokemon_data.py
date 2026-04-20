@@ -943,9 +943,14 @@ class PokemonItems(pokemon_data.PokemonItems):
         # so the save function doesn't think data changed when it didn't.
         self.original_data = json.loads(json.dumps(self.data))
 
-    def _ensure_map(self):
-        """Convert list-based data into a dictionary keyed by item constant."""
-        items = self.data
+    @staticmethod
+    def _normalize_items(items):
+        """Return ``items`` transformed into a dict keyed by ITEM_* constant.
+
+        Accepts either the upstream wrapped form (``{"items": [...]}``), a
+        bare list, or an already-normalized dict.  Returns ``None`` if the
+        input is not recognized.
+        """
         if isinstance(items, dict) and "items" in items:
             items = items.get("items")
         if isinstance(items, list):
@@ -956,9 +961,30 @@ class PokemonItems(pokemon_data.PokemonItems):
                     mapping[const] = {
                         k: v for k, v in entry.items() if k != "itemId"
                     }
-            self.data = mapping
-        elif isinstance(items, dict) and items is not self.data:
-            self.data = items
+            return mapping
+        if isinstance(items, dict):
+            return items
+        return None
+
+    def _ensure_map(self):
+        """Convert list-based data into a dictionary keyed by item constant.
+
+        Also normalizes ``self.original_data`` if it was handed to this
+        object in the upstream wrapped form (e.g. by
+        ``PokemonDataManager.rebuild_caches`` on F5).  Without this second
+        normalization, ``save()``'s diff check compares a dict-keyed
+        ``self.data`` against a wrapped ``self.original_data``, they are
+        never equal, and ``items.json`` is rewritten on every refresh —
+        producing a phantom ``modified:`` entry in ``git status``.
+        """
+        normalized = self._normalize_items(self.data)
+        if normalized is not None:
+            self.data = normalized
+        orig = getattr(self, "original_data", None)
+        if orig is not None:
+            orig_normalized = self._normalize_items(orig)
+            if orig_normalized is not None and orig_normalized is not orig:
+                self.original_data = orig_normalized
 
     def _set_items_header_path(self, rel_path: str):
         rel_norm = os.path.normpath(rel_path)

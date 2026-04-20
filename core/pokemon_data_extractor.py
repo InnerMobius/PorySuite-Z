@@ -63,22 +63,14 @@ def _clean_line(line: str) -> str:
     return line.strip()
 
 
-def _load_json(path: str, source_headers: list[str] | None = None) -> dict | list | None:
-    """Return JSON data if file exists and is valid.
+def _load_json(path: str) -> dict | list | None:
+    """Return parsed JSON data if the file exists and is valid, else None.
 
-    ``source_headers`` is accepted for API compatibility but is intentionally
-    IGNORED.  The previous behaviour treated the JSON as "stale" whenever any
-    of the source headers had a newer mtime than the JSON — but mtimes get
-    bumped by every ``git pull`` even on unchanged content, so every pull
-    forced a re-extraction + rewrite and produced a phantom "modified" entry
-    in git status for files the user had not touched.
-
-    The JSON files in ``src/data/`` ARE the source of truth for the tool's
-    editable data model.  If one exists and parses, trust it.  Re-extraction
-    from the C header should only happen when the JSON is missing or
-    corrupt.  Users who want to force a re-extraction can delete the JSON
-    file manually (via the Git panel's Discard button for tracked files, or
-    via an OS file delete for untracked).
+    The JSON files in ``src/data/`` are the source of truth for the tool's
+    editable data model.  If one exists and parses, it is trusted.  Re-
+    extraction from the C header only runs when the JSON is missing or
+    corrupt.  Users who want to force re-extraction can delete the JSON
+    file manually (Git panel → Discard for tracked files, or OS delete).
     """
     abs_path = os.path.abspath(path)
     print(f"Reading {abs_path}")
@@ -95,10 +87,16 @@ def _load_json(path: str, source_headers: list[str] | None = None) -> dict | lis
 def _write_json(path: str, data: dict | list, min_entries: int = 1) -> bool:
     """Write JSON data and return ``True`` on success.
 
-    ``min_entries`` defines the smallest acceptable number of entries. If
-    ``data`` is empty or contains fewer than this amount, a warning is logged
-    and ``False`` is returned so callers can abort loading when parsing
-    produced no results.
+    ``min_entries`` defines the smallest acceptable number of entries.  If
+    ``data`` is empty or contains fewer than this amount, a warning is
+    logged and ``False`` is returned so callers can abort loading when
+    parsing produced no results.
+
+    Format matches upstream's ``src/data/*.json`` exactly:
+      - ``indent=2`` (every upstream JSON uses 2-space indent).
+      - ``ensure_ascii=True`` (upstream ships ASCII-escaped unicode, e.g.
+        ``"POK\\u00e9 BALL"``).  Writing literal UTF-8 would produce a
+        phantom diff against every upstream checkout.
     """
 
     if not data or len(data) < min_entries:
@@ -108,41 +106,8 @@ def _write_json(path: str, data: dict | list, min_entries: int = 1) -> bool:
         return False
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    # Byte-match guard: if the serialized payload is identical to what is
-    # already on disk, do NOT rewrite the file.  Rewriting would bump the
-    # file's mtime and surface as a phantom "modified" entry in git status
-    # even though the content is unchanged.  This commonly happens after a
-    # `git pull` from upstream: the source header (e.g. items.h) gets a
-    # fresh mtime, _load_json's staleness check fails, the extractor
-    # re-parses the header, and we land here with content identical to the
-    # existing JSON.  In that case we only bump the JSON's mtime forward so
-    # the staleness check stays quiet on the next load.  Git does not track
-    # mtime, so this is invisible to `git status`.
-    # Match upstream's JSON formatting exactly so that if a re-extraction DOES
-    # happen (because the JSON was missing or corrupt), the result does not
-    # surface as a phantom diff against upstream:
-    #   - indent=2 is the format every JSON file in src/data/ uses upstream.
-    #   - ensure_ascii=True escapes non-ASCII (e.g. "POK\u00e9 BALL") which
-    #     is what upstream ships.  Writing literal UTF-8 produces a diff
-    #     against every upstream checkout.
-    new_bytes = json.dumps(data, indent=2, ensure_ascii=True).encode("utf-8")
-    try:
-        with open(path, "rb") as jf:
-            current_bytes = jf.read()
-    except OSError:
-        current_bytes = None
-
-    if current_bytes is not None and current_bytes == new_bytes:
-        try:
-            os.utime(path, None)  # touch mtime; content unchanged
-        except OSError:
-            pass
-        print(f"Skipped rewrite (identical): {os.path.abspath(path)}")
-        return True
-
-    with open(path, "wb") as f:
-        f.write(new_bytes)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(data, f, indent=2, ensure_ascii=True)
     print(f"Wrote {os.path.abspath(path)}")
     return True
 
@@ -824,12 +789,7 @@ class SpeciesDataExtractor(PokemonDataExtractor):
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
 
-        root = self.local_util.repo_root()
-        source_headers = [
-            os.path.join(root, self.HEADER_FILE),
-            os.path.join(root, "src", "data", "pokemon", "evolution.h"),
-        ]
-        data = _load_json(json_path, source_headers=source_headers)
+        data = _load_json(json_path)
         if data is not None:
             header = self._parse_header_data()
             fixed_ratios = 0
@@ -923,7 +883,7 @@ class SpeciesGraphicsDataExtractor(PokemonDataExtractor):
         header = os.path.join(
             self.local_util.repo_root(), "src", "data", "graphics", "pokemon.h"
         )
-        data = _load_json(json_path, source_headers=[header])
+        data = _load_json(json_path)
         if data is not None:
             print(f"Loaded {len(data)} species graphics [OK]")
             return data
@@ -979,8 +939,7 @@ class AbilitiesDataExtractor(PokemonDataExtractor):
 
         # Search for a header defining abilities
         header = _find_abilities_header(self.local_util.repo_root())
-        source_headers = [header] if header else []
-        data = _load_json(json_path, source_headers=source_headers)
+        data = _load_json(json_path)
         if data is not None:
             # Enrich with display names + descriptions from text file
             self._enrich_abilities(data)
@@ -1079,11 +1038,7 @@ class ItemsDataExtractor(PokemonDataExtractor):
         self.items_order = []
 
         json_path = self.get_data_file_path()
-        root = self.local_util.repo_root()
-        source_headers = [
-            os.path.join(root, c) for c in self._candidate_headers()
-        ]
-        data = _load_json(json_path, source_headers=source_headers)
+        data = _load_json(json_path)
         if isinstance(data, dict) and data:
             print(f"Loaded {len(data)} items [OK]")
             self.items_order = list(data.keys())
@@ -1269,7 +1224,7 @@ class TrainersDataExtractor(PokemonDataExtractor):
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
         header_abs = os.path.join(root, self.HEADER_FILE)
-        data = _load_json(json_path, source_headers=[header_abs])
+        data = _load_json(json_path)
         if data is not None:
             return data
 
@@ -1367,7 +1322,7 @@ class PokemonConstantsExtractor(PokemonDataExtractor):
         header = os.path.join(
             self.local_util.repo_root(), "include", "constants", "pokemon.h"
         )
-        data = _load_json(path, source_headers=[header]) or {}
+        data = _load_json(path) or {}
         if data.get("types") and data.get("evolution_types"):
             print(f"Loaded {len(data['types'])} types [OK]")
             print(
@@ -1448,12 +1403,7 @@ class StartersDataExtractor(PokemonDataExtractor):
         )
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
-        root = self.local_util.repo_root()
-        source_headers = [
-            os.path.join(root, self.HEADER_FILE),
-            os.path.join(root, "src", "battle_setup.c"),
-        ]
-        data = _load_json(json_path, source_headers=source_headers)
+        data = _load_json(json_path)
         if data is not None:
             print(f"Loaded {len(data)} starters [OK]")
             return data
@@ -1592,12 +1542,7 @@ class MovesDataExtractor(PokemonDataExtractor):
         json_path = os.path.join(root, "src", "data", self.DATA_FILE)
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
-        source_headers = [
-            os.path.join(root, self.HEADER_MOVES),
-            os.path.join(root, self.HEADER_DESCS),
-            os.path.join(root, self.HEADER_NAMES),
-        ]
-        data = _load_json(json_path, source_headers=source_headers)
+        data = _load_json(json_path)
         if data is not None:
             # Normalize numeric fields to ints when loaded from JSON caches
             try:
@@ -1813,7 +1758,7 @@ class PokedexDataExtractor(PokemonDataExtractor):
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
         header_abs = os.path.join(self.local_util.repo_root(), self.HEADER_FILE)
-        data = _load_json(json_path, source_headers=[header_abs])
+        data = _load_json(json_path)
         if data is not None:
             print(f"Loaded {len(data['national_dex'])} pokedex entries [OK]")
             return data
@@ -1921,7 +1866,7 @@ class PokemonEvolutionsExtractor(PokemonDataExtractor):
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
         header_abs = os.path.join(self.local_util.repo_root(), self.HEADER_FILE)
-        data = _load_json(json_path, source_headers=[header_abs])
+        data = _load_json(json_path)
         if data is not None:
             print(f"Loaded {len(data)} evolution lists [OK]")
             return data

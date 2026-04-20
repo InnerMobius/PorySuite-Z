@@ -34,59 +34,39 @@ Result: bridge is 5 callbacks, 5 signals, 2 user actions, 1 command — every li
 
 ---
 
-## Phase 1 — Dirty-Flag Audit (Every Editor)
+## Phase 1 — Dirty-Flag Audit (Every Editor) ✅ MOSTLY COMPLETE
 
 **Problem:** The auto-connected `_dirty` lambda in `mainwindow.py:__init__` fires
 `setWindowModified(True)` on every widget change signal, including programmatic
 loads. This means just viewing data marks the project modified.
 
-**Fix pattern (already installed):**
+**Fix pattern (installed and documented in CLAUDE.md):**
 - `self._loading_depth` counter on `MainWindow`
 - `_loading_guard()` context manager
 - `_dirty` lambda no-ops while `_loading_depth > 0`
 - Every load/refresh/populate method wraps its widget-setting block in the guard.
+- Per-item amber row/card tinting (Pattern A/B/C — see CLAUDE.md "Tab load() / F5 Refresh Contract")
+- F5/Refresh contract: `load()` must stop timers, clear in-memory dirty state, reset ALL visual dirty state (amber groupboxes, amber rows, status labels), and guard `_rebuild_grid()` with `_loading = True/False`.
 
-### Step 1.1 — Species tab ✅ PARTIALLY DONE (pending user test)
-Wrapped: `update_data`, `update_tree_pokemon`, `update_pokedex_entry`, `_refresh_pokedex_display`.
+### Step 1.1 — Species tab ✅ COMPLETE
+### Step 1.2 — Pokémon Data sub-tabs ✅ COMPLETE
+### Step 1.3 — Items editor ✅ COMPLETE
+### Step 1.4 — Moves editor ✅ COMPLETE
+### Step 1.5 — Abilities editor ✅ COMPLETE
+Amber row tinting on unsaved entries, `_dirty_consts` set survives rebuilds, `clear_all_dirty()` on save. Add Ability dialog template support. Dirty row on newly added abilities fixed.
 
-### Step 1.2 — Pokémon Data sub-tabs
-Inside the Pokemon Data tab, each sub-tab has its own load path:
-- [ ] Learnsets (`load_species_learnset_table`) — populates the level-up move table
-- [ ] Evolutions (`update_evolutions`) — populates evo list and param combos
-- [ ] Egg moves / tutor / TM-HM — check which methods populate those tables
-- [ ] Sprites / cries / footprints — graphics_tab_widget.py `load_species`
-- [ ] Abilities sub-panel — `_refresh_ability_combos`
+### Step 1.6 — Trainers editor ✅ COMPLETE
+Includes VS Seeker tier persistence, trainer class pic lookup, flag label loader, F5 discard, validation fixes, dirty-flag wiring for all sub-tabs (Trainers / Classes / Graphics).
 
-For each: confirm the load method populates widgets, wrap it in the guard, verify no dirty mark fires on view.
-
-### Step 1.3 — Items editor
-- [ ] `load_items_table` + any per-item detail panel load
-- [ ] Verify item selection change doesn't fire `_dirty`
-
-### Step 1.4 — Moves editor
-- [ ] `load_moves_defs_table`, `load_moves_table`
-- [ ] Move detail panel load
-
-### Step 1.5 — Abilities editor
-- [ ] `load_abilities_editor` (`abilities_tab_widget.py`)
-- [ ] Double-click species handler already there — verify it doesn't dirty on view
-
-### Step 1.6 — Trainers editor
-- [ ] `_load_trainers_editor`, `load_trainers_table`
-- [ ] Per-trainer selection → party load must not dirty
-- [ ] Trainer class editor (`trainer_class_editor`) — has its own `clear_dirty()` — verify pattern
-
-### Step 1.7 — Starters editor
-- [ ] Starter species/item combo load at project load must not dirty
-- [ ] Sprite preview update (already added in 0.0.55b) — confirm no dirty
+### Step 1.7 — Starters editor ✅ COMPLETE
+Dirty dot now fires `sectionDirtyChanged("starters", True)` (was incorrectly firing "species"). Amber groupbox per starter. Species display names. Dead Ability row removed. Shiny Chance + Pokéball fields added and wired.
 
 ### Step 1.8 — Wild Encounters editor
 - [ ] Encounter group selection → table load
 - [ ] Probability widget population
 
-### Step 1.9 — Credits editor
-- [ ] Credits list load
-- [ ] Per-line text widget population
+### Step 1.9 — Credits editor ✅ COMPLETE (2026-04-18)
+Pattern A amber rows. `modified`/`saved` signals wired to `sectionDirtyChanged("credits", True/False)`. `_dirty_symbols` set survives `_populate_list()` rebuilds. F5 clears all amber. Save clears all amber.
 
 ### Step 1.10 — Title Screen editor
 - [ ] Image/palette preview loads
@@ -99,11 +79,11 @@ For each: confirm the load method populates widgets, wrap it in the guard, verif
 - [ ] Instrument editor load
 - [ ] Voicegroup editor load
 
-### Step 1.12 — Overworld Graphics tab
-- [ ] Already uses `has_unsaved_changes()` — verify dirty only set on real edits
+### Step 1.12 — Overworld Graphics tab ✅ COMPLETE (v0.0.6b, 2026-04-18)
+Pattern B card amber borders + Pattern C groupbox frame. `_palette_dirty` / `_sprite_png_dirty` sets. Two-pass save. F5 structural fix (explicit `load()` call in `_refresh_project()`).
 
-### Step 1.13 — Trainer Graphics tab
-- [ ] Same as overworld — verify dirty pattern
+### Step 1.13 — Trainer Graphics tab ✅ COMPLETE (v0.0.57b)
+Pattern B card amber borders + Pattern C groupbox frame. Card grid with `_PicCard.set_dirty()`. QSplitter layout. Import PNG as Sprite. `_broadcast_palette` pushes to bus under both keys.
 
 ### Step 1.14 — EVENTide tabs (separate QMainWindow)
 EVENTide has its own dirty tracking via `data_changed` signals. Audit:
@@ -114,9 +94,23 @@ EVENTide has its own dirty tracking via `data_changed` signals. Audit:
 Confirm each tab's `data_changed` only fires on real user input, never during load.
 
 ### Step 1.15 — Verification (end of Phase 1)
-- [ ] Open project, click through every editor, confirm no `*` in title
-- [ ] Make one edit in each tab, confirm `*` appears
-- [ ] Close without saving, confirm one prompt for the edits only
+- [x] Species, Pokédex, Moves, Items, Trainers, Abilities, Starters, Credits, Overworld GFX, Trainer GFX — all user-verified
+- [ ] Wild Encounters, Title Screen, Sound Editor, EVENTide — pending
+- [ ] Final clean-project smoke test: open project, click all tabs, confirm zero `*`
+
+---
+
+## Phase 1B — Sprite Rendering Pipeline ✅ COMPLETE (v0.0.6b, 2026-04-16)
+
+Not in the original plan, but addressed as part of the correctness audit.
+
+**Problem:** All sprite viewer sites used `QPixmap(path)` directly, ignoring the authoritative `.pal` file and any unsaved RAM edits. Editing a palette in any graphics tab had no effect on the rest of the app.
+
+**Fix:** Two new shared modules enforce a single rendering path:
+- `core/sprite_palette_bus.py` — process-wide palette bus, RAM-first, disk-fallback, emits `palette_changed(category, key)`.
+- `core/sprite_render.py` — `load_sprite_pixmap(path, palette)` is the only sanctioned way to render a sprite PNG.
+
+All viewer tabs (Pokédex, Items, Trainers, Trainer Classes, species tree, Info panel, Starters) migrated. All editor tabs (Species Graphics, Trainer Graphics, Overworld Graphics) push to the bus on every mutation. Rules documented in CLAUDE.md → "Sprite Rendering Pipeline."
 
 ---
 
@@ -143,6 +137,13 @@ edit survived.
 ### Step 2.4 — No-op save
 With no edits: save, confirm no JSON files get rewritten (mtime check). This
 proves the `should_save = data != original_data` gate works for every editor.
+
+**items.json update (v0.0.63b):** The "no-op save rewrites items.json" regression went through four rounds of root-cause hunting before the real culprit was found — `PokemonData._ensure_map` was normalizing only `self.data`, leaving `self.original_data` in its wrapped `{"items": [...]}` shape, so the diff always mismatched. Fix normalizes both sides via `_normalize_items`. Items no longer re-save after F5 / upstream pull / rebuild.
+
+### Step 2.5 — Build-pipeline side effects (v0.0.63b)
+- [x] `_prune_stale_song_s_files` also deletes stale `.o` files in `build/*/sound/songs/midi/` so upstream pulls that drop voicegroups (e.g. `voicegroup013`) don't leave ghost object files that fail the link.
+- [x] `logOutput` QTextEdit excluded from the species auto-wire loop — build log output no longer flags Bulbasaur (or any species row) dirty on Make.
+- [x] Dead `source_headers=` argument removed from all 8 `_load_json` callers in `core/pokemon_data_extractor.py`.
 
 ### Step 2.5 — Partial failure recovery
 If header write fails mid-save, confirm no JSON gets corrupted and the UI
@@ -328,9 +329,18 @@ Sound editor has its own known gotchas (see `sound_engine_fixes.md` memory).
 
 ## Tracking
 
-- **Phase 0**: COMPLETE
-- **Phase 1**: Step 1.1 partial (awaiting user test)
-- **Phase 2–10**: NOT STARTED
+- **Phase 0**: ✅ COMPLETE
+- **Phase 1**: ✅ MOSTLY COMPLETE — Species, Pokédex, Moves, Items, Abilities, Trainers, Starters, Credits, Overworld GFX, Trainer GFX all done. Remaining: Wild Encounters, Title Screen, Sound Editor, EVENTide.
+- **Phase 1B (Sprite Rendering Pipeline)**: ✅ COMPLETE
+- **Phase 2**: NOT STARTED
+- **Phase 3**: NOT STARTED
+- **Phase 4**: NOT STARTED
+- **Phase 5**: NOT STARTED
+- **Phase 6**: Partially ongoing (CLAUDE.md, CLAUDECONTEXT.md, UNIFIED_EDITOR_PLAN.md kept current)
+- **Phase 7**: NOT STARTED
+- **Phase 8**: NOT STARTED
+- **Phase 9**: NOT STARTED
+- **Phase 10**: NOT STARTED
 
 When a step completes, mark it `✅`. When a bug is found inside a step, log it
 to `BUGS.md` and link from here.

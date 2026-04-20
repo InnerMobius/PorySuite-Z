@@ -775,11 +775,19 @@ QTabBar::tab:hover:!selected {
         # Starter widgets get their own handler so changes light up the
         # Starters sidebar dot, not the Pokemon dot.
         _STARTER_PREFIXES = ("starter1_", "starter2_", "starter3_")
+        # Display-only widgets that accept programmatic text from the app
+        # but are NOT user-editable species fields.  Connecting their
+        # textChanged to _dirty causes every self.log() call to mark the
+        # current species dirty — e.g. pre-build log output during a Make
+        # would light up Bulbasaur amber even though nothing was edited.
+        _NON_FIELD_TEXT_WIDGETS = {"logOutput"}
         for attr_name in dir(self.ui):
             if attr_name.startswith('_'):
                 continue
             if any(attr_name.startswith(p) for p in _STARTER_PREFIXES):
                 continue  # handled separately below
+            if attr_name in _NON_FIELD_TEXT_WIDGETS:
+                continue  # display-only log / console widgets
             w = getattr(self.ui, attr_name, None)
             if w is None:
                 continue
@@ -2758,7 +2766,7 @@ QTabBar::tab:hover:!selected {
     # ── Make ──────────────────────────────────────────────────────────────────
 
     def _prune_stale_song_s_files(self, project_dir: str) -> None:
-        """Delete sound/songs/midi/*.s files whose voicegroup no longer exists.
+        """Delete song .s/.o files whose voicegroup no longer exists.
 
         Runs before every build. Gitignored .s files from earlier PorySuite
         sessions survive `git pull`, and if upstream removed a voicegroup the
@@ -2766,8 +2774,22 @@ QTabBar::tab:hover:!selected {
         Deleting the stale .s lets mid2agb regenerate it from the tracked
         .mid + midi.cfg during the build — no user intervention needed.
 
-        A .s is only deleted if we can unambiguously identify a missing
-        voicegroup reference. When in doubt we leave the file alone.
+        Two kinds of leftovers have to go:
+
+        * The stale ``sound/songs/midi/*.s`` file (if still present on disk).
+          Identified by scanning its ``.equ NAME_grp, voicegroupNNN`` line
+          and checking that voicegroup exists in ``sound/voice_groups.inc``.
+        * The stale ``build/*/sound/songs/midi/*.o`` file in every build
+          sub-tree. If left in place, Make sees an ``.o`` newer than the
+          ``.mid`` source and decides nothing needs to rebuild — the
+          linker then pulls the stale ``.o`` with its baked-in reference
+          to the missing voicegroup and fails at link time even though
+          the ``.s`` was correctly removed.
+
+        A file is only deleted if we can unambiguously identify a missing
+        voicegroup reference — either from the ``.s`` itself (preferred)
+        or, when the ``.s`` is already gone, by symbol-dumping the ``.o``
+        in the build dir. When in doubt, everything is left alone.
         """
         vg_inc = os.path.join(project_dir, "sound", "voice_groups.inc")
         midi_dir = os.path.join(project_dir, "sound", "songs", "midi")
@@ -2788,7 +2810,58 @@ QTabBar::tab:hover:!selected {
         grp_re = re.compile(
             r'^\s*\.equ\s+\w+_grp\s*,\s*(voicegroup\w+)', re.MULTILINE)
 
-        removed: list[tuple[str, str]] = []
+        # Locate every build subdirectory that might hold a compiled .o
+        # for a midi song (firered, firered_modern, firered_rev10, …).
+        build_root = os.path.join(project_dir, "build")
+        build_midi_dirs: list[str] = []
+        if os.path.isdir(build_root):
+            for child in os.listdir(build_root):
+                cand = os.path.join(
+                    build_root, child, "sound", "songs", "midi"
+                )
+                if os.path.isdir(cand):
+                    build_midi_dirs.append(cand)
+
+        def _delete_matching_o(stem: str) -> list[str]:
+            """Delete ``build/*/sound/songs/midi/STEM.o`` in every subtree.
+
+            Returns the list of repo-relative paths that were removed so
+            the caller can log them.
+            """
+            deleted: list[str] = []
+            for bdir in build_midi_dirs:
+                o_path = os.path.join(bdir, stem + ".o")
+                if os.path.isfile(o_path):
+                    try:
+                        os.remove(o_path)
+                        deleted.append(
+                            os.path.relpath(o_path, project_dir).replace(
+                                "\\", "/"
+                            )
+                        )
+                    except OSError:
+                        pass
+            return deleted
+
+        def _vg_from_object(o_path: str) -> str | None:
+            """Return the voicegroup symbol referenced by a compiled .o,
+            or ``None`` if no voicegroup relocation is present."""
+            try:
+                with open(o_path, "rb") as f:
+                    blob = f.read()
+            except OSError:
+                return None
+            # Symbol names live in the ELF string tables as NUL-terminated
+            # ASCII.  A crude scan finds every ``voicegroupNNN`` token.
+            for m in re.finditer(rb"voicegroup\w+", blob):
+                return m.group(0).decode("ascii", errors="replace")
+            return None
+
+        removed_s: list[tuple[str, str, list[str]]] = []
+        removed_o_only: list[tuple[str, str, list[str]]] = []
+        handled_stems: set[str] = set()
+
+        # 1) Pass over every .s still on disk — the pre-2026-04-20 path.
         for name in os.listdir(midi_dir):
             if not name.endswith(".s"):
                 continue
@@ -2802,24 +2875,65 @@ QTabBar::tab:hover:!selected {
             if not m:
                 continue  # No detectable vg reference — leave it alone.
             vg = m.group(1)
+            stem = name[:-2]
+            handled_stems.add(stem)
             if vg in valid_vgs:
-                continue  # Valid reference — keep the .s.
-            # Stale — delete it. mid2agb will regenerate from .mid on build.
+                continue  # Valid reference — keep the .s and the .o.
+            # Stale — delete the .s AND any matching .o under build/.
+            # The .mid is kept: mid2agb + midi.cfg will regenerate a
+            # correct .s on the next build (midi.cfg maps each .mid to a
+            # valid voicegroup; the stale references only lived in the
+            # previously compiled .s/.o pair).
             try:
                 os.remove(s_path)
-                removed.append((name, vg))
             except OSError:
                 pass
+            dead_os = _delete_matching_o(stem)
+            removed_s.append((name, vg, dead_os))
 
-        if removed:
+        # 2) Pass over every .o in the build tree whose .s is already
+        #    gone — catches the case where a previous PorySuite session
+        #    pruned the .s but left the baked-in stale .o behind.
+        for bdir in build_midi_dirs:
+            for oname in os.listdir(bdir):
+                if not oname.endswith(".o"):
+                    continue
+                stem = oname[:-2]
+                if stem in handled_stems:
+                    continue
+                # Only consider .o where the matching .s no longer exists —
+                # a fresh .s-on-disk would already have been handled above.
+                if os.path.isfile(os.path.join(midi_dir, stem + ".s")):
+                    continue
+                o_path = os.path.join(bdir, oname)
+                vg = _vg_from_object(o_path)
+                if not vg or vg in valid_vgs:
+                    continue
+                dead_os = _delete_matching_o(stem)
+                removed_o_only.append((stem + ".o", vg, dead_os))
+                handled_stems.add(stem)
+
+        if removed_s:
             self.log(
-                f"Pre-build cleanup: removed {len(removed)} stale song .s "
+                f"Pre-build cleanup: removed {len(removed_s)} stale song .s "
                 f"file(s) referencing voicegroups no longer in "
-                f"sound/voice_groups.inc. They will be regenerated from their "
-                f".mid files during the build."
+                f"sound/voice_groups.inc. They will be regenerated from "
+                f"their .mid files during the build."
             )
-            for name, vg in removed:
-                self.log(f"  - sound/songs/midi/{name} (→ {vg})")
+            for name, vg, dead_os in removed_s:
+                suffix = f" + {len(dead_os)} stale .o" if dead_os else ""
+                self.log(f"  - sound/songs/midi/{name} (→ {vg}){suffix}")
+
+        if removed_o_only:
+            self.log(
+                f"Pre-build cleanup: removed {len(removed_o_only)} stale "
+                f"compiled song .o file(s) whose voicegroup is no longer "
+                f"in sound/voice_groups.inc. Make will re-compile from "
+                f"the .mid on this build."
+            )
+            for name, vg, dead_os in removed_o_only:
+                for rel in dead_os:
+                    self.log(f"  - {rel} (→ {vg})")
 
     def _run_make(self, extra_args: list) -> None:
         """Open an MSYS2 MINGW64 terminal and run make in the pokefirered project directory."""

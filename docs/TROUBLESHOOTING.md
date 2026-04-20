@@ -2,6 +2,19 @@
 
 This guide covers common setup issues and how to reset the application if something goes wrong. Written in plain English.
 
+## v0.0.63b — recently fixed
+
+### `src/data/items.json` keeps showing as "modified" in Git after a pull (even without editing anything)
+Fixed in v0.0.63b (2026-04-20). The fourth and final root cause was an internal diff bug: on F5 / cache rebuild, the "original" copy of the items data was left in a different shape than the working copy, so the save path always thought something had changed and rewrote the file. Both copies are now normalized through the same helper. If you still see `items.json` drift on a clean tree, report it with a screenshot of the Git panel.
+
+### Build fails with `undefined reference to voicegroup013` (or similar) after upstream pull
+Fixed in v0.0.63b. The previous sweep (v0.0.62b) removed stale `.s` song files but left the compiled `.o` objects in `build/…/sound/songs/midi/`, and Make skipped rebuilding because the `.o` was newer than the `.mid`. The sweep now runs in two passes: stale `.s` AND any `.o` that references a voicegroup no longer in `voice_groups.inc` are deleted before every build. Nothing to do — it runs automatically.
+
+### Bulbasaur (or whatever species is selected first) lights up amber dirty on every build
+Fixed in v0.0.63b. The build log was auto-wired into the species tab's dirty detector, so every log line marked the first species row edited. Excluded the log widget from the wire-up.
+
+---
+
 ## Unified Editor (Phase 1+2) Known Issues
 
 ### The toolbar icons are colored squares
