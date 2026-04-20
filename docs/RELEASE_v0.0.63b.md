@@ -22,6 +22,16 @@ A second write path had the same symptom from a different angle. On project open
 
 The shared `_write_json` helper in `core/pokemon_data_extractor.py` now performs the same byte-match guard: serialize the payload, read the current file bytes, and if they match, skip the write entirely and just call `os.utime()` to bump the JSON's mtime forward. Git does not track mtime, so the file stays clean in `git status`, and the next load's staleness check is satisfied because the JSON is now newer than the header again. The guard lives in the shared writer, so every extractor that routes through `_write_json` (items, abilities, moves, and others) benefits automatically — not just items.
 
+### Git Panel — In-App Discard & Delete Buttons
+
+The Commit section now has two new buttons so users never need to drop to a terminal to clean up their working tree.
+
+**🗑 Discard Checked Changes** sits directly under the "Modified files" list. Tick any number of tracked files, click the button, confirm, and each one is reverted to its last committed state via `git checkout --`. Batched 40 paths at a time to stay under the Windows command-line length cap. Failed files (permissions, locked by another process) are reported back in a dialog with the full list. This is the button path for wiping a phantom `items.json` or `.gitignore` modification that PorySuite's own auto-maintenance paths may have left behind in older builds.
+
+**🗑 Delete Checked Untracked** sits directly under the "New untracked files" list. Tick any stray build artifacts, stale test exports, or accidental drops, click the button, confirm, and each one is removed from disk with `os.remove` (or `shutil.rmtree` for directories). Again, failures are reported back with the full list.
+
+Both buttons show a confirmation dialog with the full list of affected paths (up to 20 shown inline; the rest summarized as `… and N more`). There is no undo — the confirmation is the last checkpoint.
+
 ### Git Panel — Width
 
 Minimum width bumped from 620 to 880 pixels; default size from 660×800 to 960×820. Section descriptions (Push / Commit / Branches / Stash) were clipping their left margin behind the scrollbar, hiding the first few characters of every long line. The new width keeps the full paragraph visible without a horizontal scroll. Users who want the panel narrower can still resize below 880 — it just won't fit every explanation cleanly at that point.
@@ -40,7 +50,7 @@ Minimum width bumped from 620 to 880 pixels; default size from 660×800 to 960×
 - Updated: `porymap_bridge/porymap_launcher.py` — `ensure_bridge_gitignored` rewritten to target `.git/info/exclude`; legacy-block scrubbing on the tracked `.gitignore` for users migrating from prior builds.
 - Updated: `core/pokemon_data.py` — items save path now byte-compares against disk and skips the write when the content is identical.
 - Updated: `core/pokemon_data_extractor.py` — shared `_write_json` helper now byte-compares against disk before writing, skips the rewrite on a match, and bumps mtime via `os.utime()` so the staleness check stays quiet without producing a phantom git diff. Fixes items.json (and any other extractor JSON routed through the helper) appearing as modified on project open after an upstream pull.
-- Updated: `ui/dialogs/git_panel.py` — minimum width 620 → 880; default size 660×800 → 960×820.
+- Updated: `ui/dialogs/git_panel.py` — minimum width 620 → 880; default size 660×800 → 960×820. Added `🗑 Discard Checked Changes` button (tracked modifications) and `🗑 Delete Checked Untracked` button (stray files) to the Commit section, each with a confirmation dialog. No terminal needed for working-tree cleanup.
 - Updated: `core/app_info.py` — VERSION bump to `0.0.63b` *(pending — bumped on release)*.
 
 ## Known Limitations

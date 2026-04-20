@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QListWidget, QListWidgetItem,
     QRadioButton, QButtonGroup, QSizePolicy,
-    QFrame, QSplitter,
+    QFrame, QSplitter, QMessageBox,
 )
 
 if TYPE_CHECKING:
@@ -409,6 +409,21 @@ class GitPanel(QDialog):
         )
         lay.addWidget(self._commit_file_list)
 
+        # ── Discard-checked button for tracked modifications ──────────────────
+        discard_row = QHBoxLayout()
+        self._discard_tracked_btn = QPushButton("🗑  Discard Checked Changes")
+        self._discard_tracked_btn.setToolTip(
+            "Reverts the CHECKED tracked files back to their committed state\n"
+            "(runs  git checkout --  on each one).\n\n"
+            "Use this to wipe a phantom 'modified' line that PorySuite auto-\n"
+            "touched, or to throw away real edits you don't want to keep.\n"
+            "There is no undo — a confirmation dialog will show the file list."
+        )
+        self._discard_tracked_btn.clicked.connect(self._do_discard_tracked)
+        discard_row.addWidget(self._discard_tracked_btn)
+        discard_row.addStretch()
+        lay.addLayout(discard_row)
+
         self._commit_none_lbl = QLabel("<i>No tracked changes — working tree is clean.</i>")
         self._commit_none_lbl.setStyleSheet("color: #888;")
         self._commit_none_lbl.hide()
@@ -441,6 +456,22 @@ class GitPanel(QDialog):
         )
         self._commit_untracked_list.hide()
         lay.addWidget(self._commit_untracked_list)
+
+        # ── Delete-checked button for untracked files ─────────────────────────
+        delete_untracked_row = QHBoxLayout()
+        self._delete_untracked_btn = QPushButton("🗑  Delete Checked Untracked")
+        self._delete_untracked_btn.setToolTip(
+            "Permanently DELETES the CHECKED untracked files from disk.\n\n"
+            "Use this for stray files you never want — build artifacts, stale\n"
+            "test exports, accidental drops.  There is no undo — the files are\n"
+            "removed from disk outright.  A confirmation dialog will show the list."
+        )
+        self._delete_untracked_btn.clicked.connect(self._do_delete_untracked)
+        self._delete_untracked_btn.hide()
+        delete_untracked_row.addWidget(self._delete_untracked_btn)
+        delete_untracked_row.addStretch()
+        lay.addLayout(delete_untracked_row)
+        self._delete_untracked_row_lay = delete_untracked_row
 
         # ── Commit message ────────────────────────────────────────────────────
         lay.addWidget(QLabel("<b>Commit message</b>  — briefly describe what changed:"))
@@ -508,6 +539,7 @@ class GitPanel(QDialog):
             self._commit_untracked_header.show()
             self._commit_untracked_note.show()
             self._commit_untracked_list.show()
+            self._delete_untracked_btn.show()
             for raw in untracked:
                 path = raw[3:].strip()
                 item = QListWidgetItem(f"  ??   {path}")
@@ -518,6 +550,10 @@ class GitPanel(QDialog):
             self._commit_untracked_header.hide()
             self._commit_untracked_note.hide()
             self._commit_untracked_list.hide()
+            self._delete_untracked_btn.hide()
+
+        # Also update the tracked Discard button's enabled state
+        self._discard_tracked_btn.setEnabled(bool(tracked))
 
     def _do_commit(self):
         msg = self._commit_msg.toPlainText().strip()
@@ -555,6 +591,140 @@ class GitPanel(QDialog):
         else:
             self._commit_status_lbl.setText(f"✗  {out}")
             self._commit_status_lbl.setStyleSheet("color: #e06c75; font-size: 11px;")
+
+    # ── Discard / delete handlers ─────────────────────────────────────────────
+
+    def _do_discard_tracked(self):
+        """Run `git checkout -- <file>` on every checked tracked file.
+
+        Used to wipe phantom 'modified' entries left behind by PorySuite auto-
+        maintenance (items.json, .gitignore) or to throw away real edits the
+        user does not want to keep.
+        """
+        paths: list[str] = []
+        for i in range(self._commit_file_list.count()):
+            item = self._commit_file_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                paths.append(item.data(256))
+
+        if not paths:
+            QMessageBox.information(
+                self,
+                "Discard Changes",
+                "No files are checked.  Tick the ones you want to discard first.",
+            )
+            return
+
+        preview = "\n".join(f"  • {p}" for p in paths[:20])
+        if len(paths) > 20:
+            preview += f"\n  … and {len(paths) - 20} more"
+
+        reply = QMessageBox.warning(
+            self,
+            "Discard Changes?",
+            f"This will revert {len(paths)} file(s) back to their last committed "
+            f"state.  Any edits you made to these files will be lost — there is "
+            f"no undo.\n\n{preview}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Batch in chunks of 40 to stay under the Windows command-line length cap.
+        failed: list[str] = []
+        for i in range(0, len(paths), 40):
+            batch = paths[i:i + 40]
+            ok, _ = self._mw._git_run("checkout", "--", *batch, timeout=30)
+            if not ok:
+                failed.extend(batch)
+
+        if failed:
+            preview_f = "\n".join(f"  • {p}" for p in failed[:20])
+            QMessageBox.warning(
+                self,
+                "Discard Changes",
+                f"{len(failed)} file(s) could not be reverted:\n\n{preview_f}",
+            )
+        else:
+            self._commit_status_lbl.setText(
+                f"✓  Discarded changes in {len(paths)} file(s)."
+            )
+            self._commit_status_lbl.setStyleSheet("color: #7cbb5e; font-size: 11px;")
+
+        self._mw._git_refresh_status_bar()
+        self.refresh()
+
+    def _do_delete_untracked(self):
+        """Delete every checked untracked file from disk.
+
+        Used for stray build artifacts, stale test exports, or accidental
+        drops.  No git operation is needed — untracked files are not in git,
+        so we just remove them from the filesystem.
+        """
+        import os
+
+        paths: list[str] = []
+        for i in range(self._commit_untracked_list.count()):
+            item = self._commit_untracked_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                paths.append(item.data(256))
+
+        if not paths:
+            QMessageBox.information(
+                self,
+                "Delete Untracked",
+                "No untracked files are checked.  Tick the ones you want "
+                "to delete first.",
+            )
+            return
+
+        preview = "\n".join(f"  • {p}" for p in paths[:20])
+        if len(paths) > 20:
+            preview += f"\n  … and {len(paths) - 20} more"
+
+        reply = QMessageBox.warning(
+            self,
+            "Delete Untracked Files?",
+            f"This will permanently DELETE {len(paths)} untracked file(s) "
+            f"from disk.  There is no recycle bin step — the files are "
+            f"removed outright.\n\n{preview}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        _, root_out = self._mw._git_run("rev-parse", "--show-toplevel", timeout=5)
+        repo_root = (root_out or "").strip()
+
+        failed: list[str] = []
+        for rel in paths:
+            abs_path = os.path.join(repo_root, rel) if repo_root else rel
+            try:
+                if os.path.isdir(abs_path):
+                    import shutil
+                    shutil.rmtree(abs_path)
+                else:
+                    os.remove(abs_path)
+            except OSError:
+                failed.append(rel)
+
+        if failed:
+            preview_f = "\n".join(f"  • {p}" for p in failed[:20])
+            QMessageBox.warning(
+                self,
+                "Delete Untracked",
+                f"{len(failed)} file(s) could not be deleted:\n\n{preview_f}",
+            )
+        else:
+            self._commit_status_lbl.setText(
+                f"✓  Deleted {len(paths)} untracked file(s)."
+            )
+            self._commit_status_lbl.setStyleSheet("color: #7cbb5e; font-size: 11px;")
+
+        self._mw._git_refresh_status_bar()
+        self.refresh()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Section 5 — Branches
