@@ -1060,7 +1060,14 @@ class PokemonItems(pokemon_data.PokemonItems):
                 should_save = self.original_data is not None and mapping != self.original_data
                 if not os.path.isfile(file_path) or should_save:
                     if self.data:
-                        json_str = json.dumps(self.data, indent=2, ensure_ascii=False)
+                        # ensure_ascii=True is REQUIRED to match upstream's
+                        # items.json format.  Upstream escapes non-ASCII
+                        # characters (e.g. "POK\u00e9 BALL").  Writing with
+                        # ensure_ascii=False produces the literal "POKé BALL"
+                        # and turns every save into a phantom diff against
+                        # upstream.  See BUGS.md — items.json phantom dirty
+                        # after upstream pull.
+                        json_str = json.dumps(self.data, indent=2, ensure_ascii=True)
 
                         # ── Byte-match guard ─────────────────────────────
                         # Tab-switch auto-flush (save_items_table on leaving

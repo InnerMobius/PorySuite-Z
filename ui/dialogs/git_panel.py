@@ -142,6 +142,18 @@ class GitPanel(QDialog):
         super().showEvent(event)
         self.refresh()
         self._timer.start()
+        # Force the scroll area back to the top.  Without this, Qt sometimes
+        # restores the scroll position from a previous show or scrolls to
+        # whichever widget most recently received focus, so the user opens
+        # the panel and sees it already scrolled past the Status / Pull /
+        # Push sections.  QTimer.singleShot(0, ...) runs after layout so the
+        # scrollbar exists and its range is known.
+        scroll = self.findChild(QScrollArea)
+        if scroll is not None:
+            QTimer.singleShot(0, lambda: (
+                scroll.verticalScrollBar().setValue(0),
+                scroll.horizontalScrollBar().setValue(0),
+            ))
 
     def hideEvent(self, event):
         super().hideEvent(event)

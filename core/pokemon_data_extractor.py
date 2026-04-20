@@ -64,20 +64,25 @@ def _clean_line(line: str) -> str:
 
 
 def _load_json(path: str, source_headers: list[str] | None = None) -> dict | list | None:
-    """Return JSON data if file exists, is valid, and is not stale.
+    """Return JSON data if file exists and is valid.
 
-    If *source_headers* is given, the cache is considered stale when any
-    of those files has a modification time newer than the JSON file.
+    ``source_headers`` is accepted for API compatibility but is intentionally
+    IGNORED.  The previous behaviour treated the JSON as "stale" whenever any
+    of the source headers had a newer mtime than the JSON — but mtimes get
+    bumped by every ``git pull`` even on unchanged content, so every pull
+    forced a re-extraction + rewrite and produced a phantom "modified" entry
+    in git status for files the user had not touched.
+
+    The JSON files in ``src/data/`` ARE the source of truth for the tool's
+    editable data model.  If one exists and parses, trust it.  Re-extraction
+    from the C header should only happen when the JSON is missing or
+    corrupt.  Users who want to force a re-extraction can delete the JSON
+    file manually (via the Git panel's Discard button for tracked files, or
+    via an OS file delete for untracked).
     """
     abs_path = os.path.abspath(path)
     print(f"Reading {abs_path}")
     try:
-        if source_headers:
-            json_mtime = os.path.getmtime(path)
-            for hdr in source_headers:
-                if os.path.isfile(hdr) and os.path.getmtime(hdr) > json_mtime:
-                    print(f"Cache stale: {os.path.basename(hdr)} is newer than {os.path.basename(path)}, re-extracting")
-                    return None
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
             if data:
@@ -114,7 +119,14 @@ def _write_json(path: str, data: dict | list, min_entries: int = 1) -> bool:
     # existing JSON.  In that case we only bump the JSON's mtime forward so
     # the staleness check stays quiet on the next load.  Git does not track
     # mtime, so this is invisible to `git status`.
-    new_bytes = json.dumps(data, indent=4).encode("utf-8")
+    # Match upstream's JSON formatting exactly so that if a re-extraction DOES
+    # happen (because the JSON was missing or corrupt), the result does not
+    # surface as a phantom diff against upstream:
+    #   - indent=2 is the format every JSON file in src/data/ uses upstream.
+    #   - ensure_ascii=True escapes non-ASCII (e.g. "POK\u00e9 BALL") which
+    #     is what upstream ships.  Writing literal UTF-8 produces a diff
+    #     against every upstream checkout.
+    new_bytes = json.dumps(data, indent=2, ensure_ascii=True).encode("utf-8")
     try:
         with open(path, "rb") as jf:
             current_bytes = jf.read()
