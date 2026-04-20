@@ -2337,8 +2337,14 @@ QTabBar::tab:hover:!selected {
         file_list.setMaximumHeight(180)
 
         for raw in lines:
-            xy   = raw[:2]
-            path = raw[3:].strip()
+            # _git_run .strip()s the full output which can eat the leading
+            # space of the first line's XY column.  split(None, 1) handles
+            # every porcelain format (" M path", "M  path", "MM path",
+            # "?? path") without position-based fragility.
+            parts = raw.split(None, 1)
+            if len(parts) != 2:
+                continue
+            xy, path = parts[0], parts[1]
             item = QListWidgetItem(f"{xy}  {path}")
             item.setData(256, path)
             item.setCheckState(_Qt.CheckState.Checked)

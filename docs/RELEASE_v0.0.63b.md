@@ -26,6 +26,12 @@ A third round uncovered the actual root cause — the first two rounds were trea
 
 `_write_json` still carries a byte-match guard (serialize, compare, skip write on match, `os.utime()` to bump mtime) as a belt-and-suspenders measure. With the staleness check removed, the re-extraction path is rarely reached in normal use — but if anything does route through it, the guard prevents unnecessary writes.
 
+### Git Panel — Porcelain-Path Parsing Bug
+
+Fixed a parsing bug that mangled the first file's path whenever `git status --porcelain` was used to populate a file list. The `_git_run` helper calls `.strip()` on the full command output, which eats the leading space of the first line's XY status column. `git status --porcelain` outputs ` M src/data/items.json` (leading space is significant — it represents the empty "staged" column). After the outer `.strip()` the line became `M src/data/items.json`, and the fixed-position parser `raw[3:]` sliced off the first character of the path, producing `rc/data/items.json` instead of `src/data/items.json`. Any attempt to act on that file through the panel's Discard button — or to stage it through the Commit dialogs in the main window and the EVENTide commit pipeline, which both used the same parse — routed to a non-existent path and failed with `pathspec 'rc/...' did not match any file(s) known to git`.
+
+All three sites now use `str.split(None, 1)`, which is tolerant of leading whitespace and handles every porcelain format (`" M path"`, `"M  path"`, `"MM path"`, `"?? path"`) consistently.
+
 ### Git Panel — In-App Discard & Delete Buttons
 
 The Commit section now has two new buttons so users never need to drop to a terminal to clean up their working tree.

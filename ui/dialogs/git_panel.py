@@ -516,11 +516,31 @@ class GitPanel(QDialog):
 
     def _refresh_commit_files(self):
         _, status_out = self._mw._git_run("status", "--short", timeout=10)
-        all_lines = [l for l in (status_out or "").splitlines() if l.strip()]
 
-        # Split into tracked changes (M/A/D/R/etc.) vs untracked (??)
-        tracked   = [l for l in all_lines if not l.startswith("??")]
-        untracked = [l for l in all_lines if l.startswith("??")]
+        # IMPORTANT: _git_run calls .strip() on the full output, which EATS
+        # the leading space of the first line's XY column.  `git status
+        # --porcelain` outputs ` M path` (space + M + space + path) for
+        # unstaged modifications — after .strip() the first line becomes
+        # `M path`, and a fixed-position parse (`raw[3:]`) would produce
+        # `rc/data/items.json` instead of `src/data/items.json`.  Use
+        # str.split(None, 1) which handles every porcelain format
+        # regardless of leading whitespace:
+        #   " M path", "M  path", "MM path", "?? path"  →  (code, path)
+        def _parse_status_line(raw: str) -> tuple[str, str] | None:
+            parts = raw.split(None, 1)
+            if len(parts) != 2:
+                return None
+            return parts[0], parts[1]
+
+        all_lines = [l for l in (status_out or "").splitlines() if l.strip()]
+        parsed: list[tuple[str, str]] = []
+        for raw in all_lines:
+            p = _parse_status_line(raw)
+            if p is not None:
+                parsed.append(p)
+
+        tracked   = [(c, p) for (c, p) in parsed if c != "??"]
+        untracked = [(c, p) for (c, p) in parsed if c == "??"]
 
         # ── Tracked list ──────────────────────────────────────────────────────
         self._commit_file_list.clear()
@@ -528,10 +548,8 @@ class GitPanel(QDialog):
             self._commit_tracked_header.show()
             self._commit_file_list.show()
             self._commit_none_lbl.hide()
-            for raw in tracked:
-                xy   = raw[:2].strip()
-                path = raw[3:].strip()
-                item = QListWidgetItem(f"  {xy}   {path}")
+            for code, path in tracked:
+                item = QListWidgetItem(f"  {code}   {path}")
                 item.setData(256, path)
                 item.setCheckState(Qt.CheckState.Checked)
                 self._commit_file_list.addItem(item)
@@ -552,8 +570,7 @@ class GitPanel(QDialog):
             self._commit_untracked_note.show()
             self._commit_untracked_list.show()
             self._delete_untracked_btn.show()
-            for raw in untracked:
-                path = raw[3:].strip()
+            for _, path in untracked:
                 item = QListWidgetItem(f"  ??   {path}")
                 item.setData(256, path)
                 item.setCheckState(Qt.CheckState.Unchecked)  # opt-in, not opt-out
