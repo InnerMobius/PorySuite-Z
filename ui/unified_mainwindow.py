@@ -662,6 +662,9 @@ class UnifiedMainWindow(QMainWindow):
             self._sound_editor = SoundEditorTab()
             idx = self.stack.addWidget(self._sound_editor)
             self._page_indices["sound"] = idx
+            self._sound_editor.modified.connect(
+                lambda: (self.set_page_dirty("sound", True),
+                         self.setWindowModified(True)))
         except Exception as e:
             print(f"[SoundEditor] Failed to load: {e}")
             import traceback
@@ -1058,6 +1061,9 @@ class UnifiedMainWindow(QMainWindow):
                 try:
                     vg_tab.save_to_disk()
                     saved_sound = True
+                    inst_tab = getattr(se, '_instruments_tab', None)
+                    if inst_tab:
+                        inst_tab.clear_dirty()
                 except Exception as e:
                     self.log_message(f"Error saving voicegroups: {e}")
             # Piano roll edits (song .s files)
@@ -1084,6 +1090,9 @@ class UnifiedMainWindow(QMainWindow):
                     self.log_message("Saved song table, songs.h, and midi.cfg")
                 except Exception as e:
                     self.log_message(f"Error saving song table: {e}")
+
+            if saved_sound:
+                self.set_page_dirty("sound", False)
 
         # Save Tilemap Editor (.bin file) and Tile Animation Editor (C source)
         saved_tilemap = False

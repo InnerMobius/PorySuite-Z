@@ -2122,19 +2122,68 @@ class PokemonMoves(pokemon_data.PokemonMoves):
 
         rel_path, file_exists = self._header_for_key("BATTLE_MOVES_H")
         if file_exists:
+            # Build a map of MOVE_* constant → numeric index from the constants
+            # header so we can pad gaps with MOVE_NONE placeholders. Without
+            # this, any MOVE_* constant whose numeric value is past the last
+            # written entry causes gBattleMoves[] to be accessed out-of-bounds
+            # — same crash pattern as Oak's Parcel (items gap bug).
+            moves_const_path = os.path.join(
+                self._repo_root, "include", "constants", "moves.h"
+            )
+            index_by_move: dict[str, int] = {}
+            max_move_index = -1
+            try:
+                import re as _re
+                with open(moves_const_path, "r", encoding="utf-8") as _f:
+                    for _line in _f:
+                        _m = _re.match(r'\s*#define\s+(MOVE_\w+)\s+(\d+)', _line)
+                        if _m:
+                            _idx = int(_m.group(2))
+                            index_by_move[_m.group(1)] = _idx
+                            if _idx > max_move_index:
+                                max_move_index = _idx
+            except Exception:
+                index_by_move = {}
+                max_move_index = -1
+
+            moves_by_const = dict(self.data.get("moves", {}).items())
+
             with WriteSourceFile(self.project_info, rel_path) as f:
                 f.write("const struct BattleMove gBattleMoves[MOVES_COUNT] =\n{\n")
-                move_items = list(self.data.get("moves", {}).items())
-                for idx, (move, info) in enumerate(move_items):
-                    f.write(f"    [{move}] =\n    {{\n")
-                    for key, val in info.items():
-                        if key in ("id", "description", "name", "animation"):
-                            continue
-                        f.write(f"        .{key} = {val},\n")
-                    f.write("    },\n")
-                    # Blank line between entries, but not after the last one
-                    if idx < len(move_items) - 1:
-                        f.write("\n")
+                if max_move_index >= 0:
+                    # Emit one entry per index 0..max_move_index, padding gaps
+                    # with MOVE_NONE placeholders so the array is always dense.
+                    const_by_index: dict[int, str] = {}
+                    for k, v in index_by_move.items():
+                        if v not in const_by_index or const_by_index[v] == "MOVE_NONE":
+                            const_by_index[v] = k
+                    all_indices = list(range(max_move_index + 1))
+                    for loop_idx, slot in enumerate(all_indices):
+                        move_const = const_by_index.get(slot)
+                        if move_const and move_const != "MOVE_NONE" and move_const in moves_by_const:
+                            info = moves_by_const[move_const]
+                            f.write(f"    [{move_const}] =\n    {{\n")
+                            for key, val in info.items():
+                                if key in ("id", "description", "name", "animation"):
+                                    continue
+                                f.write(f"        .{key} = {val},\n")
+                            f.write("    },\n")
+                        else:
+                            f.write(f"    [MOVE_NONE] = {{0}},\n")
+                        if loop_idx < len(all_indices) - 1:
+                            f.write("\n")
+                else:
+                    # Fallback: no constants file — write densely as before
+                    move_items = list(moves_by_const.items())
+                    for idx, (move, info) in enumerate(move_items):
+                        f.write(f"    [{move}] =\n    {{\n")
+                        for key, val in info.items():
+                            if key in ("id", "description", "name", "animation"):
+                                continue
+                            f.write(f"        .{key} = {val},\n")
+                        f.write("    },\n")
+                        if idx < len(move_items) - 1:
+                            f.write("\n")
                 f.write("};\n")
         else:
             self._log_missing_header(rel_path)

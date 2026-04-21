@@ -425,12 +425,15 @@ class PianoRollCanvas(QWidget):
         self.update()
 
     def copy_selected(self):
-        """Copy the currently-selected notes AND the track control events
-        (VOL, PAN, BEND, BENDR) that fall inside their tick range on the
-        same track.  Without this, pasted notes would lose the per-note
-        volume / pan / pitch-bend the original note inherited from its
-        track state, and the paste would sound much quieter / flatter
-        than the original.
+        """Copy the currently-selected notes AND their volume/pan/bend context.
+
+        Captures two sets of control events:
+        1. State snapshot — the last VOL/PAN/BEND/BENDR value on each track
+           *before* the selection start.  These become header events at tick 0
+           so pasted notes inherit the same volume/pan state as the originals,
+           even when the controlling event lives earlier in the track.
+        2. In-range events — events that fall within the selection's tick span,
+           preserving any mid-selection automation.
         """
         if not self._selected:
             return
@@ -443,14 +446,46 @@ class PianoRollCanvas(QWidget):
             {**n, 'tick': n['tick'] - min_tick} for n in sel
         ]
 
-        # Also clip control events that live in the selected tick/track
-        # range so volume/pan/bend travel with the notes.
-        self._clipboard_ctrl = [
+        # Events that fall within the selection span (relative to min_tick)
+        in_range = [
             {**e, 'tick': e['tick'] - min_tick}
             for e in self._control_events
             if e.get('track', 0) in tracks_in_sel
             and min_tick <= e['tick'] <= max_tick
         ]
+
+        # State snapshot: for each track+type, find the last event BEFORE
+        # min_tick and include it at tick 0 so the pasted notes start with
+        # the same volume/pan/bend as the original context.
+        state_events = []
+        for track in tracks_in_sel:
+            for ctrl_type in ('VOL', 'PAN', 'BEND', 'BENDR'):
+                last = None
+                for e in self._control_events:
+                    if (e.get('track', 0) == track
+                            and e.get('type') == ctrl_type
+                            and e['tick'] < min_tick):
+                        if last is None or e['tick'] > last['tick']:
+                            last = e
+                if last is None:
+                    continue
+                # Skip if in_range already has an event at tick 0 for this type
+                already_at_zero = any(
+                    r['track'] == track
+                    and r.get('type') == ctrl_type
+                    and r['tick'] == 0
+                    for r in in_range
+                )
+                if not already_at_zero:
+                    state_events.append({
+                        'tick': 0,
+                        'type': ctrl_type,
+                        'value': last['value'],
+                        'track': track,
+                    })
+
+        # State events first (tick 0), then in-range events sorted by tick
+        self._clipboard_ctrl = state_events + in_range
 
         self.status_message.emit(
             f"Copied {len(self._clipboard)} notes "

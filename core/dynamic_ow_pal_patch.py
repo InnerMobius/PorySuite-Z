@@ -104,7 +104,442 @@ def _replace_all(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
-def apply_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
+def scan_dowp_risks(project_root: str) -> List[str]:
+    """Scan the project for known DOWP compatibility issues.
+    Returns a list of plain-English warning strings (empty list = no known risks).
+    """
+    warnings: List[str] = []
+
+    gfx_candidates = [
+        os.path.join(project_root, "src", "data", "object_events", "object_event_graphics_info.h"),
+        os.path.join(project_root, "src", "data", "graphics", "object_events", "graphics_info.h"),
+    ]
+    none_tag_structs: List[str] = []
+    all_tags: set = set()
+
+    for gfx_path in gfx_candidates:
+        if not os.path.isfile(gfx_path):
+            continue
+        try:
+            with open(gfx_path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            for m in re.finditer(
+                r'const struct ObjectEventGraphicsInfo\s+(\w+)\s*=\s*\{([^}]*)\}',
+                text, re.DOTALL
+            ):
+                struct_name = m.group(1)
+                body = m.group(2)
+                tag_m = re.search(r'\.paletteTag\s*=\s*(\w+)', body)
+                if tag_m:
+                    tag = tag_m.group(1)
+                    if tag == "OBJ_EVENT_PAL_TAG_NONE":
+                        none_tag_structs.append(struct_name)
+                    else:
+                        all_tags.add(tag)
+        except Exception:
+            pass
+
+    if none_tag_structs:
+        count = len(none_tag_structs)
+        names = ", ".join(none_tag_structs[:4])
+        if count > 4:
+            names += f" (+{count - 4} more)"
+        warnings.append(
+            f"{count} sprite definition(s) use OBJ_EVENT_PAL_TAG_NONE as their palette tag. "
+            f"Under DOWP these sprites won't load a palette and will display the wrong colours.\n"
+            f"Affected: {names}\n"
+            f"Fix: assign each a unique OBJ_EVENT_PAL_TAG_* constant in object_event_graphics_info.h."
+        )
+
+    if len(all_tags) > 12:
+        warnings.append(
+            f"Your project uses {len(all_tags)} unique sprite palette tags. "
+            f"The GBA only supports 16 OBJ palette slots at once. "
+            f"The player sprite and its reflection use ~2–3 slots, and any custom HUD "
+            f"overlay takes another. If more unique NPC sprites appear on screen "
+            f"simultaneously than available slots, extra sprites will display wrong colours."
+        )
+
+    return warnings
+
+
+def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
+    """Reverse the Dynamic Overworld Palettes patch.
+
+    Restores each modified source file to its pre-DOWP state by applying each
+    patch in reverse.  Returns (success, reverted_descriptions, failed_descriptions).
+    """
+    reverted: List[str] = []
+    failed: List[str] = []
+
+    # ── field_effect_helpers.c ────────────────────────────────────────────────
+    feh_c_path = os.path.join(project_root, "src", "field_effect_helpers.c")
+    if os.path.isfile(feh_c_path):
+        fehc = _read(feh_c_path)
+
+        old_refl_map = (
+            "    reflectionSprite->oam.paletteNum = "
+            "gReflectionEffectPaletteMap[reflectionSprite->oam.paletteNum];"
+        )
+        tint_block = re.compile(
+            r"    // DOWP: generate tinted reflection palette dynamically\n"
+            r"    \{.*?\n    \}",
+            re.DOTALL,
+        )
+        if tint_block.search(fehc):
+            fehc = tint_block.sub(old_refl_map, fehc, count=1)
+            reverted.append("SetUpReflection: reflection map lookup restored")
+        elif old_refl_map in fehc:
+            reverted.append("SetUpReflection: already restored")
+        else:
+            failed.append("Could not restore SetUpReflection")
+
+        old_regular_refl = (
+            "static void LoadObjectRegularReflectionPalette(struct ObjectEvent * objectEvent, u8 paletteIndex)\n"
+            "{\n"
+            "    const struct ObjectEventGraphicsInfo * graphicsInfo;\n"
+            "\n"
+            "    graphicsInfo = GetObjectEventGraphicsInfo(objectEvent->graphicsId);\n"
+            "    if (graphicsInfo->reflectionPaletteTag != OBJ_EVENT_PAL_TAG_NONE)\n"
+            "    {\n"
+            "        if (graphicsInfo->paletteSlot == PALSLOT_PLAYER)\n"
+            "            LoadPlayerObjectReflectionPalette(graphicsInfo->paletteTag, paletteIndex);\n"
+            "        else if (graphicsInfo->paletteSlot == PALSLOT_NPC_SPECIAL)\n"
+            "            LoadSpecialObjectReflectionPalette(graphicsInfo->paletteTag, paletteIndex);\n"
+            "        else\n"
+            "            PatchObjectPalette(GetObjectPaletteTag(paletteIndex), paletteIndex);\n"
+            "        UpdateSpritePaletteWithWeather(paletteIndex);\n"
+            "    }\n"
+            "}"
+        )
+        new_regular_refl = (
+            "static void LoadObjectRegularReflectionPalette(struct ObjectEvent * objectEvent, u8 paletteIndex)\n"
+            "{\n"
+            "    // DOWP: reflection palettes are now generated dynamically in SetUpReflection.\n"
+            "    // This function just ensures weather tinting is applied.\n"
+            "    const struct ObjectEventGraphicsInfo * graphicsInfo;\n"
+            "\n"
+            "    graphicsInfo = GetObjectEventGraphicsInfo(objectEvent->graphicsId);\n"
+            "    if (graphicsInfo->reflectionPaletteTag != OBJ_EVENT_PAL_TAG_NONE)\n"
+            "    {\n"
+            "        UpdateSpritePaletteWithWeather(paletteIndex);\n"
+            "    }\n"
+            "}"
+        )
+        fehc, ok = _replace_once(fehc, new_regular_refl, old_regular_refl, "")
+        if ok:
+            reverted.append("LoadObjectRegularReflectionPalette: restored")
+        elif old_regular_refl in fehc:
+            reverted.append("LoadObjectRegularReflectionPalette: already restored")
+        else:
+            failed.append("Could not restore LoadObjectRegularReflectionPalette")
+
+        _write(feh_c_path, fehc)
+    else:
+        failed.append("field_effect_helpers.c not found")
+
+    # ── event_object_movement.h ───────────────────────────────────────────────
+    eomh_path = os.path.join(project_root, "include", "event_object_movement.h")
+    if os.path.isfile(eomh_path):
+        eomh = _read(eomh_path)
+        decl = "// DOWP: dynamic palette loading\nvoid LoadObjectEventPalette(u16 paletteTag);\n"
+        if decl in eomh:
+            eomh = eomh.replace("\n\n" + decl, "").replace(decl, "")
+            _write(eomh_path, eomh)
+            reverted.append("event_object_movement.h: LoadObjectEventPalette decl removed")
+        elif "void LoadObjectEventPalette" not in eomh:
+            reverted.append("event_object_movement.h: already clean")
+        else:
+            failed.append("event_object_movement.h: declaration in unexpected form — remove manually")
+    else:
+        failed.append("event_object_movement.h not found")
+
+    # ── field_effect.h ────────────────────────────────────────────────────────
+    feh_path = os.path.join(project_root, "include", "field_effect.h")
+    if os.path.isfile(feh_path):
+        feh = _read(feh_path)
+        decl = "// DOWP: exported for dynamic palette freeing\nvoid FieldEffectFreePaletteIfUnused(u8 paletteNum);\n"
+        if decl in feh:
+            feh = feh.replace("\n\n" + decl, "").replace(decl, "")
+            _write(feh_path, feh)
+            reverted.append("field_effect.h: FieldEffectFreePaletteIfUnused decl removed")
+        elif "FieldEffectFreePaletteIfUnused" not in feh:
+            reverted.append("field_effect.h: already clean")
+        else:
+            failed.append("field_effect.h: declaration in unexpected form — remove manually")
+    else:
+        failed.append("field_effect.h not found")
+
+    # ── field_effect.c ────────────────────────────────────────────────────────
+    fe_path = os.path.join(project_root, "src", "field_effect.c")
+    if os.path.isfile(fe_path):
+        fe = _read(fe_path)
+        fe, ok = _replace_once(fe,
+            "void FieldEffectFreePaletteIfUnused(u8 paletteNum);",
+            "static void FieldEffectFreePaletteIfUnused(u8 paletteNum);", "")
+        if ok:
+            reverted.append("FieldEffectFreePaletteIfUnused: decl restored to static")
+        elif "static void FieldEffectFreePaletteIfUnused(u8 paletteNum);" in fe:
+            reverted.append("FieldEffectFreePaletteIfUnused: decl already static")
+        else:
+            failed.append("Could not restore FieldEffectFreePaletteIfUnused decl")
+
+        fe, ok = _replace_once(fe,
+            "void FieldEffectFreePaletteIfUnused(u8 paletteNum)\n{",
+            "static void FieldEffectFreePaletteIfUnused(u8 paletteNum)\n{", "")
+        if ok:
+            reverted.append("FieldEffectFreePaletteIfUnused: def restored to static")
+        elif "static void FieldEffectFreePaletteIfUnused(u8 paletteNum)\n{" in fe:
+            reverted.append("FieldEffectFreePaletteIfUnused: def already static")
+        else:
+            failed.append("Could not restore FieldEffectFreePaletteIfUnused def")
+        _write(fe_path, fe)
+    else:
+        failed.append("field_effect.c not found")
+
+    # ── event_object_movement.c ───────────────────────────────────────────────
+    eom_path = os.path.join(project_root, "src", "event_object_movement.c")
+    if not os.path.isfile(eom_path):
+        return False, reverted, failed + ["event_object_movement.c not found"]
+
+    eom = _read(eom_path)
+
+    # Site 5 paletteNum
+    eom, ok = _replace_once(eom,
+        "    sprite->subspriteTables = graphicsInfo->subspriteTables;\n"
+        "    sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
+        "    if (!sprite->usingSheet)",
+        "    sprite->subspriteTables = graphicsInfo->subspriteTables;\n"
+        "    sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
+        "    if (!sprite->usingSheet)", "")
+    if ok:
+        reverted.append("ObjectEventSetGraphicsId paletteNum: restored")
+    else:
+        if "sprite->oam.paletteNum = graphicsInfo->paletteSlot;" in eom:
+            reverted.append("ObjectEventSetGraphicsId paletteNum: already restored")
+        else:
+            failed.append("Could not restore ObjectEventSetGraphicsId paletteNum")
+
+    # Site 5 palette swap block
+    eom, ok = _replace_once(eom,
+        "    // DOWP: free old palette, load new one dynamically\n"
+        "    {\n"
+        "        u8 oldPalNum = sprite->oam.paletteNum;\n"
+        "        LoadObjectEventPalette(graphicsInfo->paletteTag);\n"
+        "        FieldEffectFreePaletteIfUnused(oldPalNum);\n"
+        "    }\n"
+        "    \n"
+        "    var = sprite->images->size / TILE_SIZE_4BPP;",
+        "    if (graphicsInfo->paletteSlot == PALSLOT_PLAYER)\n"
+        "        PatchObjectPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);\n"
+        "\n"
+        "    if (graphicsInfo->paletteSlot == PALSLOT_NPC_SPECIAL)\n"
+        "        LoadSpecialObjectReflectionPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);\n"
+        "    \n"
+        "    var = sprite->images->size / TILE_SIZE_4BPP;", "")
+    if ok:
+        reverted.append("ObjectEventSetGraphicsId: restored")
+    else:
+        failed.append("Could not restore ObjectEventSetGraphicsId")
+
+    # Site 4 paletteNum
+    eom, ok = _replace_once(eom,
+        "        sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
+        "        sprite->coordOffsetEnabled = TRUE;\n"
+        "        sprite->data[0] = objectEventId;\n"
+        "        objectEvent->spriteId = spriteId;\n"
+        "        // DEBUG — log return-to-field spawn",
+        "        sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
+        "        sprite->coordOffsetEnabled = TRUE;\n"
+        "        sprite->data[0] = objectEventId;\n"
+        "        objectEvent->spriteId = spriteId;\n"
+        "        // DEBUG — log return-to-field spawn", "")
+    if ok:
+        reverted.append("SpawnObjectEventOnReturnToField paletteNum: restored")
+    else:
+        failed.append("Could not restore SpawnObjectEventOnReturnToField paletteNum")
+
+    # Site 4 reflection block
+    eom, ok = _replace_once(eom,
+        "    *(u16 *)&spriteTemplate.paletteTag = TAG_NONE;\n"
+        "    // DOWP: load palette on demand\n"
+        "    LoadObjectEventPalette(graphicsInfo->paletteTag);\n"
+        "\n"
+        "    *(u16 *)&spriteTemplate.paletteTag = TAG_NONE;",
+        "    *(u16 *)&spriteTemplate.paletteTag = TAG_NONE;\n"
+        "    if (graphicsInfo->paletteSlot == PALSLOT_PLAYER)\n"
+        "        LoadPlayerObjectReflectionPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);\n"
+        "\n"
+        "    if (graphicsInfo->paletteSlot >= PALSLOT_NPC_SPECIAL)\n"
+        "        LoadSpecialObjectReflectionPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);\n"
+        "\n"
+        "    *(u16 *)&spriteTemplate.paletteTag = TAG_NONE;", "")
+    if ok:
+        reverted.append("SpawnObjectEventOnReturnToField reflection: restored")
+    else:
+        failed.append("Could not restore SpawnObjectEventOnReturnToField reflection")
+
+    # Site 3
+    eom, ok = _replace_once(eom,
+        "        LoadObjectEventPalette(graphicsInfo->paletteTag);\n"
+        "        sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
+        "        sprite->data[0] = localId;",
+        "        sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
+        "        sprite->data[0] = localId;\n"
+        "        if (graphicsInfo->paletteSlot == PALSLOT_NPC_SPECIAL)\n"
+        "            LoadSpecialObjectReflectionPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);", "")
+    if ok:
+        reverted.append("CreateFameCheckerObject: restored")
+    else:
+        failed.append("Could not restore CreateFameCheckerObject")
+
+    # Site 2
+    eom, ok = _replace_once(eom,
+        "        LoadObjectEventPalette(graphicsInfo->paletteTag);\n"
+        "        sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
+        "        sprite->coordOffsetEnabled = TRUE;\n"
+        "        sprite->sVirtualObjId = virtualObjId;\n"
+        "        sprite->sVirtualObjElev = elevation;",
+        "        sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
+        "        sprite->coordOffsetEnabled = TRUE;\n"
+        "        sprite->sVirtualObjId = virtualObjId;\n"
+        "        sprite->sVirtualObjElev = elevation;\n"
+        "        if (graphicsInfo->paletteSlot == PALSLOT_NPC_SPECIAL)\n"
+        "            LoadSpecialObjectReflectionPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);", "")
+    if ok:
+        reverted.append("CreateVirtualObject: restored")
+    else:
+        failed.append("Could not restore CreateVirtualObject")
+
+    # Site 1
+    eom, ok = _replace_once(eom,
+        "    sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
+        "    sprite->coordOffsetEnabled = TRUE;\n"
+        "    sprite->data[0] = objectEventId;\n"
+        "    objectEvent->spriteId = spriteId;\n"
+        "    // DEBUG — log object spawn position",
+        "    sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
+        "    sprite->coordOffsetEnabled = TRUE;\n"
+        "    sprite->data[0] = objectEventId;\n"
+        "    objectEvent->spriteId = spriteId;\n"
+        "    // DEBUG — log object spawn position", "")
+    if ok:
+        reverted.append("TrySetupObjectEventSprite paletteNum: restored")
+    else:
+        failed.append("Could not restore TrySetupObjectEventSprite paletteNum")
+
+    # TrySetupObjectEventSprite reflection block
+    eom, ok = _replace_once(eom,
+        "    // DOWP: load palette on demand (replaces static slot pre-loading)\n"
+        "    LoadObjectEventPalette(graphicsInfo->paletteTag);\n"
+        "\n"
+        "    if (objectEvent->movementType == MOVEMENT_TYPE_INVISIBLE)",
+        "    if (graphicsInfo->paletteSlot == PALSLOT_PLAYER)\n"
+        "        LoadPlayerObjectReflectionPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);\n"
+        "    else if (graphicsInfo->paletteSlot == PALSLOT_NPC_SPECIAL)\n"
+        "        LoadSpecialObjectReflectionPalette(graphicsInfo->paletteTag, graphicsInfo->paletteSlot);\n"
+        "\n"
+        "\n"
+        "    if (objectEvent->movementType == MOVEMENT_TYPE_INVISIBLE)", "")
+    if ok:
+        reverted.append("TrySetupObjectEventSprite: reflection pre-loading restored")
+    else:
+        failed.append("Could not restore TrySetupObjectEventSprite reflection block")
+
+    # InitObjectEventPalettes
+    eom, ok = _replace_once(eom,
+        "void InitObjectEventPalettes(u8 palSlot)\n"
+        "{\n"
+        "    // DOWP: palettes load on demand — no bulk pre-loading.\n"
+        "    FreeAndReserveObjectSpritePalettes();\n"
+        "    gReservedSpritePaletteCount = 0; // All 16 OBJ slots available for dynamic use\n"
+        "    sCurrentSpecialObjectPaletteTag = OBJ_EVENT_PAL_TAG_NONE;\n"
+        "    sCurrentReflectionType = palSlot;\n"
+        "}",
+        "void InitObjectEventPalettes(u8 palSlot)\n"
+        "{\n"
+        "    FreeAndReserveObjectSpritePalettes();\n"
+        "    sCurrentSpecialObjectPaletteTag = OBJ_EVENT_PAL_TAG_NONE;\n"
+        "    sCurrentReflectionType = palSlot;\n"
+        "    if (palSlot == 1)\n"
+        "    {\n"
+        "        PatchObjectPaletteRange(gObjectPaletteTagSets[sCurrentReflectionType], 0, 6);\n"
+        "        gReservedSpritePaletteCount = 8;\n"
+        "    }\n"
+        "    else\n"
+        "    {\n"
+        "        PatchObjectPaletteRange(gObjectPaletteTagSets[sCurrentReflectionType], 0, 10);\n"
+        "    }\n"
+        "}", "")
+    if ok:
+        reverted.append("InitObjectEventPalettes: bulk loading restored")
+    else:
+        failed.append("Could not restore InitObjectEventPalettes")
+
+    # RemoveObjectEventInternal
+    eom, ok = _replace_once(eom,
+        "static void RemoveObjectEventInternal(struct ObjectEvent *objectEvent)\n"
+        "{\n"
+        "    u8 paletteNum;\n"
+        "    struct SpriteFrameImage image;\n"
+        "    image.size = GetObjectEventGraphicsInfo(objectEvent->graphicsId)->size;\n"
+        "    gSprites[objectEvent->spriteId].images = &image;\n"
+        "    paletteNum = gSprites[objectEvent->spriteId].oam.paletteNum;\n"
+        "    DestroySprite(&gSprites[objectEvent->spriteId]);\n"
+        "    FieldEffectFreePaletteIfUnused(paletteNum);\n"
+        "}",
+        "static void RemoveObjectEventInternal(struct ObjectEvent *objectEvent)\n"
+        "{\n"
+        "    struct SpriteFrameImage image;\n"
+        "    image.size = GetObjectEventGraphicsInfo(objectEvent->graphicsId)->size;\n"
+        "    gSprites[objectEvent->spriteId].images = &image;\n"
+        "    DestroySprite(&gSprites[objectEvent->spriteId]);\n"
+        "}", "")
+    if ok:
+        reverted.append("RemoveObjectEventInternal: palette freeing removed")
+    else:
+        failed.append("Could not restore RemoveObjectEventInternal")
+
+    # LoadObjectEventPalette def → static
+    eom, ok = _replace_once(eom,
+        "void LoadObjectEventPalette(u16 paletteTag)\n{",
+        "static void LoadObjectEventPalette(u16 paletteTag)\n{", "")
+    if ok:
+        reverted.append("LoadObjectEventPalette: def restored to static")
+    elif "static void LoadObjectEventPalette(u16 paletteTag)\n{" in eom:
+        reverted.append("LoadObjectEventPalette: def already static")
+    else:
+        failed.append("Could not restore LoadObjectEventPalette def")
+
+    # LoadObjectEventPalette decl → static
+    eom, ok = _replace_once(eom,
+        "void LoadObjectEventPalette(u16);",
+        "static void LoadObjectEventPalette(u16);", "")
+    if ok:
+        reverted.append("LoadObjectEventPalette: decl restored to static")
+    elif "static void LoadObjectEventPalette(u16);" in eom:
+        reverted.append("LoadObjectEventPalette: decl already static")
+    else:
+        failed.append("Could not restore LoadObjectEventPalette decl")
+
+    _write(eom_path, eom)
+
+    # ── Remove marker file ────────────────────────────────────────────────────
+    marker_path = os.path.join(project_root, MARKER_FILE)
+    if os.path.isfile(marker_path):
+        try:
+            os.remove(marker_path)
+            reverted.append("Marker file removed")
+        except OSError as e:
+            failed.append(f"Could not remove marker file: {e}")
+
+    return len(failed) == 0, reverted, failed
+
+
+def apply_dowp_patch(project_root: str,
+                     tint_r: int = 5,
+                     tint_g: int = 5,
+                     tint_b: int = 10) -> Tuple[bool, List[str], List[str]]:
     """Apply the Dynamic Overworld Palettes patch.
 
     Returns:
@@ -489,9 +924,9 @@ def apply_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
             "            for (i = 0; i < 16; i++)\n"
             "            {\n"
             "                u16 c = tintBuf[i];\n"
-            "                u32 r = (c & 0x1F) + 5;\n"
-            "                u32 g = ((c >> 5) & 0x1F) + 5;\n"
-            "                u32 b = ((c >> 10) & 0x1F) + 10;\n"
+            f"                u32 r = (c & 0x1F) + {tint_r};\n"
+            f"                u32 g = ((c >> 5) & 0x1F) + {tint_g};\n"
+            f"                u32 b = ((c >> 10) & 0x1F) + {tint_b};\n"
             "                if (r > 31) r = 31;\n"
             "                if (g > 31) g = 31;\n"
             "                if (b > 31) b = 31;\n"

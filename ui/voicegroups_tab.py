@@ -36,6 +36,13 @@ _ROLE_VG_NAME = Qt.ItemDataRole.UserRole + 20
 _ROLE_SLOT_IDX = Qt.ItemDataRole.UserRole + 21
 
 # ---------------------------------------------------------------------------
+# Dirty-flag colours / styles
+# ---------------------------------------------------------------------------
+_DIRTY_BG = QColor("#3d2e00")
+_DIRTY_SS = ("QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; }"
+             "QGroupBox::title { color: #ffb74d; }")
+
+# ---------------------------------------------------------------------------
 # Voice type display info
 # ---------------------------------------------------------------------------
 
@@ -137,8 +144,9 @@ class VoicegroupsTab(QWidget):
         self._current_slot_item = None  # selected slot QTreeWidgetItem
         self._current_inst = None       # selected Instrument
         self._updating_ui = False       # suppress change handlers during load
-        self._dirty_voicegroups: set[str] = set()  # names of modified VGs
-        self._vg_labels: dict[str, str] = {}       # friendly display labels
+        self._dirty_voicegroups: set[str] = set()          # names of modified VGs
+        self._dirty_slots: dict[str, set[int]] = {}       # vg_name -> dirty slot indices
+        self._vg_labels: dict[str, str] = {}              # friendly display labels
 
         self._build_ui()
 
@@ -264,12 +272,12 @@ class VoicegroupsTab(QWidget):
         # ── Slot list ─────────────────────────────────────────────────────
         right_splitter = QSplitter(Qt.Orientation.Vertical)
 
-        slots_group = QGroupBox("Instrument Slots (0–127)")
-        slots_group.setToolTip(
+        self._slots_group = QGroupBox("Instrument Slots (0–127)")
+        self._slots_group.setToolTip(
             "All 128 instrument slots in this voicegroup.\n"
             "Click a slot to edit it below.\n"
             "Filler slots (default empty square waves) are shown in grey.")
-        slots_layout = QVBoxLayout(slots_group)
+        slots_layout = QVBoxLayout(self._slots_group)
 
         # Filter bar for slots
         slot_filter_row = QHBoxLayout()
@@ -317,7 +325,7 @@ class VoicegroupsTab(QWidget):
             self._on_slot_context_menu)
         slots_layout.addWidget(self._slot_tree)
 
-        right_splitter.addWidget(slots_group)
+        right_splitter.addWidget(self._slots_group)
 
         # ── Slot editor ───────────────────────────────────────────────────
         editor_area = QScrollArea()
@@ -585,6 +593,8 @@ class VoicegroupsTab(QWidget):
         self._voicegroup_data = voicegroup_data
         self._song_table = song_table
         self._dirty_voicegroups.clear()
+        self._dirty_slots.clear()
+        self._slots_group.setStyleSheet("")
 
         # Use shared labels dict from sound editor tab (same object
         # reference, so edits here are visible to the piano roll)
@@ -650,6 +660,9 @@ class VoicegroupsTab(QWidget):
                 item.setToolTip(2, '\n'.join(songs[:20])
                                 + (f'\n... and {len(songs)-20} more'
                                    if len(songs) > 20 else ''))
+            if vg_name in self._dirty_voicegroups:
+                for col in range(self._vg_tree.columnCount()):
+                    item.setBackground(col, _DIRTY_BG)
             self._vg_tree.addTopLevelItem(item)
 
         self._vg_tree.setSortingEnabled(True)
@@ -709,6 +722,12 @@ class VoicegroupsTab(QWidget):
         num_str = vg_name.replace('voicegroup', '')
         self._vg_title.setText(f"Voicegroup {num_str}")
 
+        # Reflect per-VG dirty state in the slots panel frame
+        if vg_name in self._dirty_voicegroups:
+            self._slots_group.setStyleSheet(_DIRTY_SS)
+        else:
+            self._slots_group.setStyleSheet("")
+
         # Summary line
         type_counts = {}
         filler_count = 0
@@ -760,9 +779,21 @@ class VoicegroupsTab(QWidget):
                 item.setText(3, details)
                 item.setForeground(1, _type_color(inst.voice_type))
 
+            # Re-apply amber if this slot was edited but not yet saved
+            if inst.slot_index in self._dirty_slots.get(vg.name, set()):
+                for col in range(self._slot_tree.columnCount()):
+                    item.setBackground(col, _DIRTY_BG)
+
             self._slot_tree.addTopLevelItem(item)
 
         self._apply_slot_filter()
+
+        # Auto-select the first non-filler slot so ADSR/edit controls are live
+        for i in range(self._slot_tree.topLevelItemCount()):
+            item = self._slot_tree.topLevelItem(i)
+            if item.text(2) != "(filler)":
+                self._slot_tree.setCurrentItem(item)
+                break
 
     def _slot_detail_string(self, inst) -> str:
         """Build a short detail string for a slot."""
@@ -1193,10 +1224,30 @@ class VoicegroupsTab(QWidget):
     # Dirty tracking / slot refresh
     # ═══════════════════════════════════════════════════════════════════════
 
+    def _tint_vg_row(self, name: str, dirty: bool) -> None:
+        """Set or clear the amber background on a voicegroup list row."""
+        bg = _DIRTY_BG if dirty else QColor(0, 0, 0, 0)
+        for i in range(self._vg_tree.topLevelItemCount()):
+            item = self._vg_tree.topLevelItem(i)
+            if item.data(0, _ROLE_VG_NAME) == name:
+                for col in range(self._vg_tree.columnCount()):
+                    item.setBackground(col, bg)
+                break
+
     def _mark_dirty(self):
-        """Mark the current voicegroup as modified."""
+        """Mark the current voicegroup and current slot as modified."""
         if self._current_vg:
-            self._dirty_voicegroups.add(self._current_vg.name)
+            name = self._current_vg.name
+            self._dirty_voicegroups.add(name)
+            self._tint_vg_row(name, True)
+            # Also track and tint the specific slot that was edited
+            if self._current_slot_item is not None:
+                slot_idx = self._current_slot_item.data(0, _ROLE_SLOT_IDX)
+                if slot_idx is not None:
+                    self._dirty_slots.setdefault(name, set()).add(slot_idx)
+                    for col in range(self._slot_tree.columnCount()):
+                        self._current_slot_item.setBackground(col, _DIRTY_BG)
+        self._slots_group.setStyleSheet(_DIRTY_SS)
         self.modified.emit()
 
     def _refresh_slot_item(self, inst):
@@ -1652,6 +1703,7 @@ class VoicegroupsTab(QWidget):
         (e.g. Instruments tab editing shared instrument objects)."""
         for name in names:
             self._dirty_voicegroups.add(name)
+            self._tint_vg_row(name, True)
 
     def has_unsaved_changes(self) -> bool:
         """Check if any voicegroups have been modified."""
@@ -1717,6 +1769,16 @@ class VoicegroupsTab(QWidget):
             f.write('\n')
 
         self._dirty_voicegroups.clear()
+        self._dirty_slots.clear()
+        for i in range(self._vg_tree.topLevelItemCount()):
+            item = self._vg_tree.topLevelItem(i)
+            for col in range(self._vg_tree.columnCount()):
+                item.setBackground(col, QColor(0, 0, 0, 0))
+        for i in range(self._slot_tree.topLevelItemCount()):
+            item = self._slot_tree.topLevelItem(i)
+            for col in range(self._slot_tree.columnCount()):
+                item.setBackground(col, QColor(0, 0, 0, 0))
+        self._slots_group.setStyleSheet("")
         _log.info("Wrote voice_groups.inc (%d voicegroups)",
                   len(self._voicegroup_data.voicegroups))
 

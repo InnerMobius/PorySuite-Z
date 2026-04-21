@@ -151,10 +151,14 @@ class RenameDialog(QDialog):
             def _update_disp(text, _lbl=disp_counter, _max=_DISP_MAX):
                 used = len(text)
                 _lbl.setText("{0}/{1}".format(used, _max))
+                if used >= _max:
+                    color = "#cc3333"   # red — at limit
+                elif used >= max(1, int(_max * 0.85)):
+                    color = "#cc8800"   # amber — 85 % warning
+                else:
+                    color = "#888888"   # grey — fine
                 _lbl.setStyleSheet(
-                    "color: #cc3333; font-size: 10px; font-family: 'Courier New';"
-                    if used >= _max
-                    else "color: #888888; font-size: 10px; font-family: 'Courier New';"
+                    f"color: {color}; font-size: 10px; font-family: 'Courier New';"
                 )
 
             self.display_edit.textChanged.connect(_update_disp)

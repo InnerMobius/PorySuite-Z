@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QSlider, QGroupBox,
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QComboBox, QFrame, QProgressBar, QSizePolicy,
-    QToolButton, QTabWidget, QMenu,
+    QSpinBox, QToolButton, QTabWidget, QMenu,
 )
 
 from ui.custom_widgets.scroll_guard import install_scroll_guard
@@ -47,6 +47,8 @@ _ROLE_SONG_TYPE = Qt.ItemDataRole.UserRole + 2
 _ROLE_TRACK_VG = Qt.ItemDataRole.UserRole + 3
 _ROLE_TRACK_SLOT = Qt.ItemDataRole.UserRole + 4
 
+_DIRTY_BG = QColor("#3d2e00")
+
 
 class SoundEditorTab(QWidget):
     """Main Sound Editor widget — hosts Songs and Instruments sub-tabs."""
@@ -71,6 +73,8 @@ class SoundEditorTab(QWidget):
         self._rendered_audio = None
         self._render_thread = None
         self._is_rendering = False
+        self._dirty_songs: set[str] = set()
+        self._loading_song = False
 
         self._build_ui()
         self._playback_timer = QTimer(self)
@@ -210,18 +214,56 @@ class SoundEditorTab(QWidget):
         vg_row.addWidget(self._btn_goto_vg)
         vg_row.addStretch()
         self._detail_tracks = QLabel("Tracks: —")
-        self._detail_tempo = QLabel("Tempo: —")
+
+        tempo_row = QHBoxLayout()
+        tempo_row.setContentsMargins(0, 0, 0, 0)
+        tempo_row.addWidget(QLabel("Tempo:"))
+        self._spin_tempo = QSpinBox()
+        self._spin_tempo.setRange(1, 510)
+        self._spin_tempo.setValue(120)
+        self._spin_tempo.setEnabled(False)
+        self._spin_tempo.setToolTip("Song tempo in BPM. Edits save immediately to the .s file.")
+        install_scroll_guard(self._spin_tempo)
+        tempo_row.addWidget(self._spin_tempo)
+        tempo_row.addWidget(QLabel("BPM"))
+        tempo_row.addStretch()
+
         props_left.addLayout(vg_row)
         props_left.addWidget(self._detail_tracks)
-        props_left.addWidget(self._detail_tempo)
+        props_left.addLayout(tempo_row)
 
         # Right column
         props_right = QVBoxLayout()
-        self._detail_reverb = QLabel("Reverb: —")
-        self._detail_volume = QLabel("Volume: —")
+
+        reverb_row = QHBoxLayout()
+        reverb_row.setContentsMargins(0, 0, 0, 0)
+        reverb_row.addWidget(QLabel("Reverb:"))
+        self._spin_reverb = QSpinBox()
+        self._spin_reverb.setRange(0, 127)
+        self._spin_reverb.setValue(0)
+        self._spin_reverb.setEnabled(False)
+        self._spin_reverb.setToolTip("Song reverb level (0–127, 0 = off). Edits save immediately.")
+        install_scroll_guard(self._spin_reverb)
+        reverb_row.addWidget(self._spin_reverb)
+        reverb_row.addStretch()
+
+        volume_row = QHBoxLayout()
+        volume_row.setContentsMargins(0, 0, 0, 0)
+        volume_row.addWidget(QLabel("Volume:"))
+        self._spin_volume = QSpinBox()
+        self._spin_volume.setRange(0, 127)
+        self._spin_volume.setValue(127)
+        self._spin_volume.setEnabled(False)
+        self._spin_volume.setToolTip(
+            "Song master volume (0–127). Scales all track volumes.\n"
+            "Edits save immediately to the .s file.")
+        install_scroll_guard(self._spin_volume)
+        volume_row.addWidget(self._spin_volume)
+        volume_row.addStretch()
+
         self._detail_loop = QLabel("Loop: —")
-        props_right.addWidget(self._detail_reverb)
-        props_right.addWidget(self._detail_volume)
+        props_right.addLayout(reverb_row)
+        props_right.addLayout(volume_row)
         props_right.addWidget(self._detail_loop)
 
         props_layout.addLayout(props_left)
@@ -342,6 +384,11 @@ class SoundEditorTab(QWidget):
         # Load samples automatically when switching to Instruments/Voicegroups
         self._tab_widget.currentChanged.connect(self._on_tab_changed)
 
+        # Inline song property editors
+        self._spin_tempo.valueChanged.connect(self._on_song_tempo_changed)
+        self._spin_reverb.valueChanged.connect(self._on_song_reverb_changed)
+        self._spin_volume.valueChanged.connect(self._on_song_volume_changed)
+
     def _on_tab_changed(self, index: int):
         """Load sample data when switching to tabs that need it."""
         widget = self._tab_widget.widget(index)
@@ -358,6 +405,7 @@ class SoundEditorTab(QWidget):
         self._song_tree.clear()
         self._track_tree.clear()
         self._samples_loaded = False
+        self._dirty_songs.clear()
 
         try:
             from core.sound.song_table_manager import load_song_table
@@ -461,6 +509,9 @@ class SoundEditorTab(QWidget):
             item.setData(0, _ROLE_SONG_KEY, entry.label)
             item.setData(0, _ROLE_SONG_TYPE, song_type)
             item.setToolTip(0, f"{entry.constant} (#{entry.index})")
+            if entry.label in self._dirty_songs:
+                for col in range(self._song_tree.columnCount()):
+                    item.setBackground(col, _DIRTY_BG)
             self._song_tree.addTopLevelItem(item)
 
         self._song_tree.setSortingEnabled(True)
@@ -571,9 +622,9 @@ class SoundEditorTab(QWidget):
             self._detail_tracks.setText(
                 "Build required — the .s assembly file for this song "
                 "does not exist yet. Run Project > Make (Ctrl+M) first.")
-            self._detail_tempo.setText("")
-            self._detail_reverb.setText("")
-            self._detail_volume.setText("")
+            self._spin_tempo.setEnabled(False)
+            self._spin_reverb.setEnabled(False)
+            self._spin_volume.setEnabled(False)
             self._detail_loop.setText("")
             self._btn_play.setEnabled(False)
             self._btn_piano_roll.setEnabled(False)
@@ -585,9 +636,14 @@ class SoundEditorTab(QWidget):
             self._detail_voicegroup.setText(f"Voicegroup: {song.voicegroup}")
             self._btn_goto_vg.setVisible(bool(song.voicegroup))
             self._detail_tracks.setText(f"Tracks: {len(song.tracks)}")
-            self._detail_tempo.setText(f"Tempo: {bpm} BPM")
-            self._detail_reverb.setText(f"Reverb: {song.reverb}")
-            self._detail_volume.setText(f"Volume: {song.master_volume}")
+            self._loading_song = True
+            self._spin_tempo.setValue(bpm)
+            self._spin_tempo.setEnabled(True)
+            self._spin_reverb.setValue(song.reverb)
+            self._spin_reverb.setEnabled(True)
+            self._spin_volume.setValue(song.master_volume)
+            self._spin_volume.setEnabled(True)
+            self._loading_song = False
 
             if loop_start is not None:
                 self._detail_loop.setText(f"Loop: tick {loop_start} -> {loop_end}")
@@ -605,9 +661,9 @@ class SoundEditorTab(QWidget):
             self._detail_voicegroup.setText(f"Voicegroup: VG{entry.voicegroup_index}")
             self._btn_goto_vg.setVisible(False)
             self._detail_tracks.setText("Tracks: (not parsed)")
-            self._detail_tempo.setText("Tempo: —")
-            self._detail_reverb.setText("Reverb: —")
-            self._detail_volume.setText("Volume: —")
+            self._spin_tempo.setEnabled(False)
+            self._spin_reverb.setEnabled(False)
+            self._spin_volume.setEnabled(False)
             self._detail_loop.setText("Loop: —")
             self._btn_play.setEnabled(False)
             self._btn_piano_roll.setEnabled(False)
@@ -1015,13 +1071,69 @@ class SoundEditorTab(QWidget):
         self._detail_voicegroup.setText("Voicegroup: —")
         self._btn_goto_vg.setVisible(False)
         self._detail_tracks.setText("Tracks: —")
-        self._detail_tempo.setText("Tempo: —")
-        self._detail_reverb.setText("Reverb: —")
-        self._detail_volume.setText("Volume: —")
+        self._spin_tempo.setEnabled(False)
+        self._spin_tempo.blockSignals(True)
+        self._spin_tempo.setValue(120)
+        self._spin_tempo.blockSignals(False)
+        self._spin_reverb.setEnabled(False)
+        self._spin_reverb.blockSignals(True)
+        self._spin_reverb.setValue(0)
+        self._spin_reverb.blockSignals(False)
+        self._spin_volume.setEnabled(False)
+        self._spin_volume.blockSignals(True)
+        self._spin_volume.setValue(127)
+        self._spin_volume.blockSignals(False)
         self._detail_loop.setText("Loop: —")
         self._track_tree.clear()
         self._btn_play.setEnabled(False)
         self._btn_piano_roll.setEnabled(False)
+
+    def _on_song_tempo_changed(self, value: int):
+        if self._loading_song:
+            return
+        song = self._all_songs.get(self._current_song_key)
+        if not song or not hasattr(song, 'tracks') or not song.tracks:
+            return
+        tbs = song.tempo_base if song.tempo_base else 1
+        max_bpm_for_tbs = (255 * tbs) // 2
+        if value > max_bpm_for_tbs and tbs < 2:
+            song.tempo_base = 2
+        for cmd in song.tracks[0].commands:
+            if cmd.cmd == 'TEMPO':
+                cmd.value = value
+                break
+        self._save_song_inline(song)
+
+    def _on_song_reverb_changed(self, value: int):
+        if self._loading_song:
+            return
+        song = self._all_songs.get(self._current_song_key)
+        if not song or not hasattr(song, 'reverb'):
+            return
+        song.reverb = value
+        self._save_song_inline(song)
+
+    def _on_song_volume_changed(self, value: int):
+        if self._loading_song:
+            return
+        song = self._all_songs.get(self._current_song_key)
+        if not song or not hasattr(song, 'master_volume'):
+            return
+        song.master_volume = value
+        self._save_song_inline(song)
+
+    def _save_song_inline(self, song):
+        """Write song header changes (tempo/reverb/volume) directly to the .s file."""
+        try:
+            from core.sound.song_writer import save_song_file
+            save_song_file(song)
+            key = self._current_song_key
+            self._dirty_songs.add(key)
+            self._tint_song_row(key, True)
+            self.modified.emit()
+            _log.info("Inline save: %s", song.label)
+        except Exception as e:
+            _log.error("Inline song save failed for %s: %s", song.label, e)
 
     def _on_goto_voicegroup(self):
         """Click the 'Open' button next to the voicegroup label."""
@@ -1060,9 +1172,29 @@ class SoundEditorTab(QWidget):
             song_table=self._song_table,
         )
         win.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        win.modified.connect(self.modified.emit)
+        song_key = self._current_song_key
+        win.modified.connect(lambda: self._on_piano_roll_modified(song_key))
+        win.saved.connect(lambda: self._on_piano_roll_saved(song_key))
         self._piano_roll_window = win
         win.show()
+
+    def _tint_song_row(self, key: str, dirty: bool) -> None:
+        bg = _DIRTY_BG if dirty else QColor(0, 0, 0, 0)
+        for i in range(self._song_tree.topLevelItemCount()):
+            item = self._song_tree.topLevelItem(i)
+            if item.data(0, _ROLE_SONG_KEY) == key:
+                for col in range(self._song_tree.columnCount()):
+                    item.setBackground(col, bg)
+                break
+
+    def _on_piano_roll_modified(self, key: str) -> None:
+        self._dirty_songs.add(key)
+        self._tint_song_row(key, True)
+        self.modified.emit()
+
+    def _on_piano_roll_saved(self, key: str) -> None:
+        self._dirty_songs.discard(key)
+        self._tint_song_row(key, False)
 
     # ═════════════════════════════════════════════════════════════════════════
     # Track context menu

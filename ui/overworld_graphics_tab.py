@@ -21,12 +21,12 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QImage, QPixmap, QColor
+from PyQt6.QtGui import QImage, QPixmap, QColor, QIcon
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QGroupBox,
     QPushButton, QFileDialog, QMessageBox, QListWidget, QListWidgetItem,
     QScrollArea, QGridLayout, QFrame, QSplitter, QSizePolicy, QLineEdit,
-    QDialog, QFormLayout, QSpinBox, QDialogButtonBox,
+    QDialog, QFormLayout, QSpinBox, QDialogButtonBox, QTabWidget,
 )
 
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
@@ -1097,12 +1097,800 @@ class NewSpriteDialog(QDialog):
         return self._palette_colors
 
 
+# ── Field Effect Sprites ─────────────────────────────────────────────────────
+
+class FieldEffectEntry:
+    """One field effect or misc sprite."""
+    __slots__ = ("name", "png_path", "pal_path", "category")
+
+    def __init__(self, name: str, png_path: str,
+                 pal_path: Optional[str], category: str) -> None:
+        self.name = name
+        self.png_path = png_path
+        self.pal_path = pal_path  # None if no .pal file exists
+        self.category = category
+
+
+def _scan_field_effect_sprites(root: str) -> List[FieldEffectEntry]:
+    """Scan graphics/field_effects/pics/ and graphics/misc/ for PNG sprites."""
+    entries: List[FieldEffectEntry] = []
+    dirs = [
+        (os.path.join(root, "graphics", "field_effects", "pics"), "Field Effects"),
+        (os.path.join(root, "graphics", "misc"), "Misc"),
+    ]
+    for dirpath, category in dirs:
+        if not os.path.isdir(dirpath):
+            continue
+        for fname in sorted(os.listdir(dirpath)):
+            if not fname.lower().endswith(".png"):
+                continue
+            png = os.path.join(dirpath, fname)
+            pal = png[:-4] + ".pal"
+            entries.append(FieldEffectEntry(
+                name=fname[:-4],
+                png_path=png,
+                pal_path=pal if os.path.isfile(pal) else None,
+                category=category,
+            ))
+    return sorted(entries, key=lambda e: (e.category, e.name.lower()))
+
+
+class FieldEffectSpritesTab(QWidget):
+    """Editor for field effect sprites — exclamation marks, music notes, emoticons, etc.
+
+    These live in graphics/field_effects/pics/ and graphics/misc/.  Most have
+    no separate .pal file; their palette is baked into the PNG.  When a .pal
+    file does exist, edits are written there.  When there is no .pal file,
+    saving bakes the new palette back into the PNG via export_indexed_png.
+    """
+
+    modified = pyqtSignal()
+
+    _DIRTY_SS = (
+        "QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; }"
+        "QGroupBox::title { color: #ffb74d; }"
+    )
+    _BUS_PREFIX = "fe:"
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._project_root = ""
+        self._entries: List[FieldEffectEntry] = []
+        self._current: Optional[FieldEffectEntry] = None
+        self._loading = False
+
+        self._palettes: Dict[str, List[Color]] = {}       # key = _bus_key(entry)
+        self._palette_dirty: set[str] = set()
+        self._sprite_imgs: Dict[str, QImage] = {}          # key = png_path
+        self._sprite_png_dirty: set[str] = set()
+
+        self._build_ui()
+        _get_palette_bus().palette_changed.connect(self._on_bus_palette_changed)
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _bus_key(self, entry: FieldEffectEntry) -> str:
+        return self._BUS_PREFIX + entry.png_path
+
+    def _get_palette(self, entry: FieldEffectEntry) -> List[Color]:
+        """Return palette from bus, RAM, .pal file, or baked PNG colour table."""
+        key = self._bus_key(entry)
+        if key in self._palettes:
+            return self._palettes[key]
+
+        bus_colors = _get_palette_bus().get_overworld_palette(key)
+        if bus_colors:
+            self._palettes[key] = bus_colors
+            return bus_colors
+
+        if entry.pal_path and os.path.isfile(entry.pal_path):
+            colors = read_jasc_pal(entry.pal_path)
+            if colors:
+                while len(colors) < 16:
+                    colors.append((0, 0, 0))
+                self._palettes[key] = colors[:16]
+                return self._palettes[key]
+
+        if entry.png_path and os.path.isfile(entry.png_path):
+            img = QImage(entry.png_path)
+            if not img.isNull():
+                if img.format() != QImage.Format.Format_Indexed8:
+                    img = img.convertToFormat(QImage.Format.Format_Indexed8)
+                ct = img.colorTable()
+                colors: List[Color] = []
+                for c in ct[:16]:
+                    colors.append(clamp_to_gba((c >> 16) & 0xFF,
+                                               (c >> 8) & 0xFF,
+                                               c & 0xFF))
+                while len(colors) < 16:
+                    colors.append((0, 0, 0))
+                self._palettes[key] = colors
+                return self._palettes[key]
+
+        self._palettes[key] = [(0, 0, 0)] * 16
+        return self._palettes[key]
+
+    def _filtered_entries(self) -> List[FieldEffectEntry]:
+        cat = self._fe_cat_combo.currentData() or "all"
+        search = self._fe_search.text().strip().lower()
+        result = self._entries
+        if cat != "all":
+            result = [e for e in result if e.category == cat]
+        if search:
+            result = [e for e in result if search in e.name.lower()]
+        return result
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(0)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(2)
+        splitter.setStyleSheet("QSplitter::handle { background: #2e2e2e; }")
+
+        # ── LEFT: sprite list ─────────────────────────────────────────────────
+        left = QWidget()
+        left.setMinimumWidth(220)
+        left.setMaximumWidth(380)
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(8, 8, 8, 8)
+        lv.setSpacing(6)
+
+        cat_row = QHBoxLayout()
+        cat_row.setSpacing(6)
+        cat_row.addWidget(QLabel("Category:"))
+        self._fe_cat_combo = QComboBox()
+        self._fe_cat_combo.wheelEvent = lambda e: e.ignore()
+        self._fe_cat_combo.addItem("All", "all")
+        self._fe_cat_combo.addItem("Field Effects", "Field Effects")
+        self._fe_cat_combo.addItem("Misc", "Misc")
+        cat_row.addWidget(self._fe_cat_combo, 1)
+        lv.addLayout(cat_row)
+
+        self._fe_search = QLineEdit()
+        self._fe_search.setPlaceholderText("Search sprites…")
+        lv.addWidget(self._fe_search)
+
+        self._fe_count_lbl = QLabel("")
+        self._fe_count_lbl.setStyleSheet("color: #888; font-size: 10px;")
+        lv.addWidget(self._fe_count_lbl)
+
+        self._fe_list = QListWidget()
+        self._fe_list.setIconSize(QSize(40, 40))
+        self._fe_list.setSpacing(2)
+        lv.addWidget(self._fe_list, 1)
+
+        splitter.addWidget(left)
+
+        # ── RIGHT: detail + palette ───────────────────────────────────────────
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(8, 8, 8, 8)
+        rv.setSpacing(8)
+
+        sheet_group = QGroupBox("Sprite Sheet")
+        sg = QVBoxLayout(sheet_group)
+        sg.setContentsMargins(8, 14, 8, 8)
+        self._fe_sheet_lbl = QLabel("Select a sprite")
+        self._fe_sheet_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._fe_sheet_lbl.setMinimumHeight(100)
+        self._fe_sheet_lbl.setStyleSheet("background: #111; border: 1px solid #333;")
+        sg.addWidget(self._fe_sheet_lbl)
+
+        self._fe_sheet_info = QLabel("")
+        self._fe_sheet_info.setStyleSheet("color: #888; font-size: 11px;")
+        self._fe_sheet_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._fe_sheet_info.setWordWrap(True)
+        sg.addWidget(self._fe_sheet_info)
+
+        fe_btn_row = QHBoxLayout()
+        self._fe_open_folder_btn = QPushButton("Show in Folder")
+        self._fe_open_folder_btn.setToolTip(
+            "Open the folder containing this sprite and select it.")
+        fe_btn_row.addWidget(self._fe_open_folder_btn)
+        fe_btn_row.addStretch(1)
+        sg.addLayout(fe_btn_row)
+        rv.addWidget(sheet_group, 1)
+
+        pal_frame = QGroupBox("Palette")
+        self._fe_pal_frame = pal_frame
+        pf = QVBoxLayout(pal_frame)
+        pf.setContentsMargins(8, 14, 8, 8)
+        pf.setSpacing(6)
+
+        self._fe_pal_info = QLabel("Select a sprite to view its palette")
+        self._fe_pal_info.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._fe_pal_info.setWordWrap(True)
+        pf.addWidget(self._fe_pal_info)
+
+        self._fe_pal_row = DraggablePaletteRow()
+        pf.addWidget(self._fe_pal_row)
+
+        fe_pal_btns = QHBoxLayout()
+        self._fe_import_png_btn = QPushButton("Import Palette from PNG…")
+        self._fe_import_png_btn.setToolTip(
+            "Extract palette from an indexed PNG and apply it to this sprite.")
+        self._fe_import_pal_btn = QPushButton("Import from .pal…")
+        self._fe_import_pal_btn.setToolTip(
+            "Load a JASC .pal file and apply it to this sprite.")
+        self._fe_browse_folder_btn = QPushButton("Open Folder")
+        self._fe_browse_folder_btn.setToolTip(
+            "Open the field_effects/pics folder.")
+        fe_pal_btns.addWidget(self._fe_import_png_btn)
+        fe_pal_btns.addWidget(self._fe_import_pal_btn)
+        fe_pal_btns.addWidget(self._fe_browse_folder_btn)
+        fe_pal_btns.addStretch(1)
+        pf.addLayout(fe_pal_btns)
+
+        rv.addWidget(pal_frame, 0)
+
+        splitter.addWidget(right)
+        splitter.setSizes([280, 620])
+        outer.addWidget(splitter)
+
+        # ── Wire signals ──────────────────────────────────────────────────────
+        self._fe_pal_row.colors_changed.connect(self._on_palette_edited)
+        self._fe_pal_row.palette_reordered.connect(self._on_palette_reordered)
+        self._fe_pal_row.swatch_set_as_bg.connect(self._on_set_swatch_as_bg)
+        self._fe_list.currentRowChanged.connect(self._on_list_selection_changed)
+        self._fe_cat_combo.currentIndexChanged.connect(self._rebuild_list)
+        self._fe_search.textChanged.connect(self._rebuild_list)
+        self._fe_import_png_btn.clicked.connect(self._import_palette_from_png)
+        self._fe_import_pal_btn.clicked.connect(self._import_palette_from_pal)
+        self._fe_browse_folder_btn.clicked.connect(self._open_sprite_folder)
+        self._fe_open_folder_btn.clicked.connect(self._open_current_sprite_folder)
+
+    # ── loading ───────────────────────────────────────────────────────────────
+
+    def load(self, project_root: str) -> None:
+        """Scan field effect sprite folders and populate the list."""
+        self._project_root = project_root
+        self._palettes.clear()
+        self._palette_dirty.clear()
+        self._sprite_imgs.clear()
+        self._sprite_png_dirty.clear()
+        self._current = None
+
+        self._fe_pal_frame.setStyleSheet("")
+        self._fe_pal_info.setText("Select a sprite to view its palette")
+        self._fe_sheet_lbl.clear()
+        self._fe_sheet_lbl.setText("Select a sprite")
+        self._fe_sheet_info.setText("")
+        self._fe_pal_row.set_colors([(0, 0, 0)] * 16)
+
+        self._entries = _scan_field_effect_sprites(project_root)
+
+        self._loading = True
+        try:
+            self._rebuild_list()
+        finally:
+            self._loading = False
+
+    # ── list management ───────────────────────────────────────────────────────
+
+    def _rebuild_list(self) -> None:
+        self._fe_list.blockSignals(True)
+        self._fe_list.clear()
+
+        entries = self._filtered_entries()
+        self._fe_count_lbl.setText(f"{len(entries)} sprites")
+
+        for entry in entries:
+            key = self._bus_key(entry)
+            palette = self._get_palette(entry)
+
+            icon = QIcon()
+            if entry.png_path and os.path.isfile(entry.png_path):
+                pix = _reskin_overworld(entry.png_path, palette)
+                if pix and not pix.isNull():
+                    h = pix.height()
+                    w = min(h, pix.width())
+                    if pix.width() > w:
+                        pix = pix.copy(0, 0, w, h)
+                    scaled = pix.scaled(
+                        40, 40,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.FastTransformation,
+                    )
+                    icon = QIcon(scaled)
+
+            item = QListWidgetItem(icon, entry.name)
+            item.setData(Qt.ItemDataRole.UserRole, entry.png_path)
+            if key in self._palette_dirty:
+                item.setBackground(QColor("#3d2e00"))
+            self._fe_list.addItem(item)
+
+        # Restore selection
+        if self._current:
+            for i, e in enumerate(entries):
+                if e.png_path == self._current.png_path:
+                    self._fe_list.setCurrentRow(i)
+                    break
+
+        self._fe_list.blockSignals(False)
+
+    # ── detail view ───────────────────────────────────────────────────────────
+
+    def _on_list_selection_changed(self, row: int) -> None:
+        entries = self._filtered_entries()
+        if row < 0 or row >= len(entries):
+            return
+        entry = entries[row]
+        self._current = entry
+        self._show_detail(entry)
+        self._load_palette_panel(entry)
+
+    def _load_palette_panel(self, entry: FieldEffectEntry) -> None:
+        key = self._bus_key(entry)
+        palette = self._get_palette(entry)
+
+        if entry.pal_path:
+            pal_info = f"Palette file: {os.path.basename(entry.pal_path)}  (saves to .pal)"
+        else:
+            pal_info = "No .pal file — palette baked into PNG on save"
+        self._fe_pal_info.setText(pal_info)
+
+        if key in self._palette_dirty:
+            self._fe_pal_frame.setStyleSheet(self._DIRTY_SS)
+        else:
+            self._fe_pal_frame.setStyleSheet("")
+
+        self._loading = True
+        try:
+            self._fe_pal_row.set_colors(palette)
+        finally:
+            self._loading = False
+
+    def _show_detail(self, entry: FieldEffectEntry) -> None:
+        palette = self._get_palette(entry)
+
+        pix = None
+        remapped = self._sprite_imgs.get(entry.png_path)
+        if palette and remapped:
+            pix = _reskin_overworld_img(remapped, palette)
+        elif palette and entry.png_path:
+            pix = _reskin_overworld(entry.png_path, palette)
+
+        if pix and not pix.isNull():
+            scale = max(1, min(4, self._fe_sheet_lbl.width() // max(1, pix.width())))
+            scaled = pix.scaled(
+                pix.width() * scale, pix.height() * scale,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self._fe_sheet_lbl.setPixmap(scaled)
+        else:
+            self._fe_sheet_lbl.clear()
+            self._fe_sheet_lbl.setText("No sprite")
+
+        if entry.png_path and os.path.isfile(entry.png_path):
+            img = QImage(entry.png_path)
+            size_str = f"{img.width()}×{img.height()}px" if not img.isNull() else "?"
+        else:
+            size_str = "?"
+        self._fe_sheet_info.setText(
+            f"{entry.name}  |  {entry.category}  |  {size_str}"
+        )
+
+    # ── palette editing ───────────────────────────────────────────────────────
+
+    def _on_palette_edited(self) -> None:
+        if self._loading or not self._current:
+            return
+        key = self._bus_key(self._current)
+        colors = self._fe_pal_row.colors()
+        self._palettes[key] = colors
+        self._palette_dirty.add(key)
+        _get_palette_bus().set_overworld_palette(key, colors)
+        self._fe_pal_frame.setStyleSheet(self._DIRTY_SS)
+        self.modified.emit()
+        self._show_detail(self._current)
+        self._rebuild_list()
+
+    def _on_palette_reordered(self, from_idx: int, to_idx: int) -> None:
+        if self._loading or not self._current:
+            return
+        n = 16
+        if from_idx == to_idx or not (0 <= from_idx < n) or not (0 <= to_idx < n):
+            return
+        key = self._bus_key(self._current)
+        pal = list(self._palettes.get(key) or [(0, 0, 0)] * n)
+        while len(pal) < n:
+            pal.append((0, 0, 0))
+        pal[from_idx], pal[to_idx] = pal[to_idx], pal[from_idx]
+        self._palettes[key] = pal
+        self._palette_dirty.add(key)
+        _get_palette_bus().set_overworld_palette(key, pal)
+        self._fe_pal_frame.setStyleSheet(self._DIRTY_SS)
+        self._loading = True
+        try:
+            self._fe_pal_row.set_colors(pal)
+        finally:
+            self._loading = False
+        self.modified.emit()
+        self._show_detail(self._current)
+        self._rebuild_list()
+
+    def _on_set_swatch_as_bg(self, slot: int) -> None:
+        if self._loading or not self._current:
+            return
+        if slot <= 0 or slot >= 16:
+            return
+        entry = self._current
+        key = self._bus_key(entry)
+        pal = list(self._palettes.get(key) or [(0, 0, 0)] * 16)
+        while len(pal) < 16:
+            pal.append((0, 0, 0))
+
+        png_key = entry.png_path
+        if png_key not in self._sprite_imgs:
+            if entry.png_path and os.path.isfile(entry.png_path):
+                img = QImage(entry.png_path)
+                if not img.isNull():
+                    if img.format() != QImage.Format.Format_Indexed8:
+                        img = img.convertToFormat(QImage.Format.Format_Indexed8)
+                    self._sprite_imgs[png_key] = img
+
+        img = self._sprite_imgs.get(png_key)
+        if img is not None:
+            try:
+                new_img, _ = swap_palette_entries(img, pal, slot, 0)
+                self._sprite_imgs[png_key] = new_img
+                self._sprite_png_dirty.add(png_key)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Index as Background Error",
+                    f"Failed to remap sprite pixels:\n{exc}",
+                )
+                return
+        else:
+            QMessageBox.information(
+                self, "No Sprite PNG",
+                "This sprite has no on-disk PNG to remap.\n"
+                "The palette-only swap has still been applied.",
+            )
+
+        pal[0], pal[slot] = pal[slot], pal[0]
+        self._palettes[key] = pal
+        self._loading = True
+        try:
+            self._fe_pal_row.set_colors(pal)
+        finally:
+            self._loading = False
+        self._palette_dirty.add(key)
+        _get_palette_bus().set_overworld_palette(key, pal)
+        self._fe_pal_frame.setStyleSheet(self._DIRTY_SS)
+        self.modified.emit()
+        self._show_detail(self._current)
+        self._rebuild_list()
+
+    def _on_bus_palette_changed(self, category: str, key: str) -> None:
+        if category != CAT_OVERWORLD or not key.startswith(self._BUS_PREFIX):
+            return
+        self._palettes.pop(key, None)
+        self._rebuild_list()
+        if self._current and self._bus_key(self._current) == key:
+            pal = self._get_palette(self._current)
+            self._loading = True
+            try:
+                self._fe_pal_row.set_colors(pal)
+            finally:
+                self._loading = False
+            self._show_detail(self._current)
+
+    # ── import ────────────────────────────────────────────────────────────────
+
+    def _import_palette_from_png(self) -> None:
+        if not self._current:
+            QMessageBox.information(self, "No Sprite", "Select a sprite first.")
+            return
+        start = os.path.dirname(self._current.png_path) if self._current.png_path else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Indexed PNG", start, "PNG Images (*.png)",
+        )
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(self, "Import Failed", f"Could not load:\n{path}")
+            return
+        if img.format() != QImage.Format.Format_Indexed8:
+            QMessageBox.warning(
+                self, "Not an Indexed PNG",
+                "Convert to indexed-colour PNG (8-bit, 16 colours) in your image editor first.",
+            )
+            return
+        ct = img.colorTable()
+        colors: List[Color] = []
+        for c in ct[:16]:
+            colors.append(clamp_to_gba((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF))
+        while len(colors) < 16:
+            colors.append((0, 0, 0))
+
+        key = self._bus_key(self._current)
+        self._palettes[key] = colors
+        self._palette_dirty.add(key)
+        _get_palette_bus().set_overworld_palette(key, colors)
+        self._loading = True
+        try:
+            self._fe_pal_row.set_colors(colors)
+        finally:
+            self._loading = False
+        self._fe_pal_frame.setStyleSheet(self._DIRTY_SS)
+        self._show_detail(self._current)
+        self._rebuild_list()
+        self.modified.emit()
+        QMessageBox.information(
+            self, "Palette Imported",
+            f"Loaded {min(len(ct), 16)} colours from {os.path.basename(path)}.\n"
+            "Click File → Save to write the changes.",
+        )
+
+    def _import_palette_from_pal(self) -> None:
+        if not self._current:
+            QMessageBox.information(self, "No Sprite", "Select a sprite first.")
+            return
+        start = os.path.dirname(self._current.png_path) if self._current.png_path else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select JASC Palette", start,
+            "Palette Files (*.pal);;All Files (*)",
+        )
+        if not path:
+            return
+        colors = read_jasc_pal(path)
+        if not colors:
+            QMessageBox.warning(
+                self, "Import Failed",
+                f"Could not read a valid JASC palette from:\n{path}",
+            )
+            return
+        while len(colors) < 16:
+            colors.append((0, 0, 0))
+        colors = [clamp_to_gba(r, g, b) for r, g, b in colors[:16]]
+
+        key = self._bus_key(self._current)
+        self._palettes[key] = colors
+        self._palette_dirty.add(key)
+        _get_palette_bus().set_overworld_palette(key, colors)
+        self._loading = True
+        try:
+            self._fe_pal_row.set_colors(colors)
+        finally:
+            self._loading = False
+        self._fe_pal_frame.setStyleSheet(self._DIRTY_SS)
+        self._show_detail(self._current)
+        self._rebuild_list()
+        self.modified.emit()
+        QMessageBox.information(
+            self, "Palette Imported",
+            f"Loaded 16 colours from {os.path.basename(path)}.\n"
+            "Click File → Save to write the changes.",
+        )
+
+    # ── folder helpers ────────────────────────────────────────────────────────
+
+    def _open_current_sprite_folder(self) -> None:
+        if self._current and self._current.png_path:
+            fp = self._current.png_path
+            if os.path.isfile(fp):
+                try:
+                    import subprocess
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(fp)])
+                except Exception:
+                    self._open_folder(os.path.dirname(fp))
+            else:
+                self._open_folder(os.path.dirname(fp))
+
+    def _open_sprite_folder(self) -> None:
+        folder = os.path.join(self._project_root, "graphics", "field_effects", "pics")
+        if not os.path.isdir(folder):
+            folder = os.path.join(self._project_root, "graphics")
+        self._open_folder(folder)
+
+    def _open_folder(self, folder: str) -> None:
+        if os.path.isdir(folder):
+            try:
+                from ui.open_folder_util import open_folder
+                open_folder(folder)
+            except Exception:
+                try:
+                    os.startfile(folder)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+    # ── save ──────────────────────────────────────────────────────────────────
+
+    def has_unsaved_changes(self) -> bool:
+        return bool(self._palette_dirty) or bool(self._sprite_png_dirty)
+
+    def flush_to_disk(self) -> tuple[int, list[str]]:
+        """Write dirty palettes to .pal files or bake them into PNGs."""
+        ok = 0
+        errors: list[str] = []
+
+        # Build key→entry lookup
+        key_to_entry: Dict[str, FieldEffectEntry] = {
+            self._bus_key(e): e for e in self._entries
+        }
+
+        # Pass 1 — palette changes (write .pal or bake into PNG)
+        for key in list(self._palette_dirty):
+            entry = key_to_entry.get(key)
+            if not entry:
+                errors.append(f"fe-pal:{key} (no entry)")
+                continue
+            colors = self._palettes.get(key)
+            if not colors:
+                errors.append(f"fe-pal:{entry.name} (no palette in RAM)")
+                continue
+
+            if entry.pal_path:
+                if write_jasc_pal(entry.pal_path, colors):
+                    self._palette_dirty.discard(key)
+                    ok += 1
+                else:
+                    errors.append(f"fe-pal:{entry.name}")
+            else:
+                # No .pal file — bake palette into PNG
+                img = self._sprite_imgs.get(entry.png_path)
+                if img is None and entry.png_path and os.path.isfile(entry.png_path):
+                    img = QImage(entry.png_path)
+                    if not img.isNull() and img.format() != QImage.Format.Format_Indexed8:
+                        img = img.convertToFormat(QImage.Format.Format_Indexed8)
+                if img is None or img.isNull():
+                    errors.append(f"fe-png:{entry.name} (cannot load image)")
+                    continue
+                try:
+                    export_indexed_png(img, colors, entry.png_path)
+                    self._palette_dirty.discard(key)
+                    self._sprite_png_dirty.discard(entry.png_path)
+                    ok += 1
+                except Exception as exc:
+                    errors.append(f"fe-png:{entry.name} ({exc})")
+
+        # Pass 2 — Index-as-BG pixel remaps not already written above
+        png_to_entry: Dict[str, FieldEffectEntry] = {e.png_path: e for e in self._entries}
+        for png_path in list(self._sprite_png_dirty):
+            entry = png_to_entry.get(png_path)
+            img = self._sprite_imgs.get(png_path)
+            if not entry or img is None:
+                errors.append(f"fe-png:{png_path} (no data)")
+                continue
+            key = self._bus_key(entry)
+            pal = self._palettes.get(key, [(0, 0, 0)] * 16)
+            try:
+                export_indexed_png(img, pal, png_path)
+                self._sprite_png_dirty.discard(png_path)
+                ok += 1
+            except Exception as exc:
+                errors.append(f"fe-png:{entry.name} ({exc})")
+
+        if not self._palette_dirty and not self._sprite_png_dirty:
+            self._fe_pal_frame.setStyleSheet("")
+            self._rebuild_list()
+
+        return ok, errors
+
+
+# ── NPC sprite category filters ───────────────────────────────────────────────
+
 CATEGORY_FILTERS = [
     ("all", "All"),
     ("people", "Players & NPCs"),
     ("pokemon", "Pokemon"),
     ("misc", "Objects & Items"),
 ]
+
+
+class _DOWPApplyDialog(QDialog):
+    """Confirmation dialog for enabling DOWP with tint sliders and risk warnings."""
+
+    def __init__(self, risks: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Enable Dynamic Overworld Palettes")
+        self.setMinimumWidth(520)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        # Risk warnings
+        if risks:
+            warn_box = QGroupBox("⚠  Compatibility warnings")
+            warn_box.setStyleSheet(
+                "QGroupBox { border: 1px solid #cc8800; border-radius: 4px; "
+                "color: #ffb74d; font-weight: bold; padding-top: 8px; }"
+            )
+            wl = QVBoxLayout(warn_box)
+            for r in risks:
+                lbl = QLabel(r)
+                lbl.setWordWrap(True)
+                lbl.setStyleSheet("color: #ffb74d; font-size: 10px;")
+                wl.addWidget(lbl)
+            layout.addWidget(warn_box)
+
+        # What this does
+        info = QLabel(
+            "Enables dynamic palette loading for all overworld sprites:\n"
+            "  • Each sprite loads its palette on demand when it appears on screen\n"
+            "  • Sprites are no longer locked to the 4 shared NPC palette slots\n"
+            "  • Up to 16 unique palettes can be active simultaneously\n"
+            "  • Water reflections are tinted automatically using the values below\n\n"
+            "Files modified:  src/event_object_movement.c  •  src/field_effect.c\n"
+            "  src/field_effect_helpers.c  •  include/event_object_movement.h\n"
+            "  include/field_effect.h"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; font-size: 10px;")
+        layout.addWidget(info)
+
+        # Tint sliders
+        tint_box = QGroupBox("Water reflection tint  (added to each colour channel, 0–15)")
+        tl = QFormLayout(tint_box)
+        self._spin_r = QSpinBox(); self._spin_r.setRange(0, 15); self._spin_r.setValue(5)
+        self._spin_g = QSpinBox(); self._spin_g.setRange(0, 15); self._spin_g.setValue(5)
+        self._spin_b = QSpinBox(); self._spin_b.setRange(0, 15); self._spin_b.setValue(10)
+        for spin in (self._spin_r, self._spin_g, self._spin_b):
+            spin.wheelEvent = lambda e: e.ignore()
+        self._preview = QLabel()
+        self._preview.setFixedSize(48, 24)
+        self._preview.setToolTip("Sample mid-grey colour before (left) and after (right) tinting")
+
+        tl.addRow("Red offset:",   self._spin_r)
+        tl.addRow("Green offset:", self._spin_g)
+        tl.addRow("Blue offset:",  self._spin_b)
+        tl.addRow("Preview:", self._preview)
+        layout.addWidget(tint_box)
+
+        for spin in (self._spin_r, self._spin_g, self._spin_b):
+            spin.valueChanged.connect(self._refresh_preview)
+        self._refresh_preview()
+
+        # Backup confirmation
+        self._confirm_chk = QPushButton("☐  I have a git commit or backup of my project")
+        self._confirm_chk.setCheckable(True)
+        self._confirm_chk.setStyleSheet(
+            "QPushButton { text-align:left; background:#222; border:1px solid #555; "
+            "padding:6px; border-radius:3px; color:#aaa; }"
+            "QPushButton:checked { border-color:#6a6; color:#8f8; }"
+        )
+        self._confirm_chk.toggled.connect(self._on_confirm_toggled)
+        layout.addWidget(self._confirm_chk)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(False)
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Apply Patch")
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+    def _refresh_preview(self):
+        r0, g0, b0 = 16, 16, 16   # sample mid-grey (GBA 5-bit space)
+        r1 = min(31, r0 + self._spin_r.value())
+        g1 = min(31, g0 + self._spin_g.value())
+        b1 = min(31, b0 + self._spin_b.value())
+        # Scale to 8-bit for display
+        def s(v): return (v << 3) | (v >> 2)
+        from PyQt6.QtGui import QPixmap as _QP, QPainter as _QPA, QColor as _QC
+        pm = _QP(48, 24)
+        p = _QPA(pm)
+        p.fillRect(0, 0, 24, 24, _QC(s(r0), s(g0), s(b0)))
+        p.fillRect(24, 0, 24, 24, _QC(s(r1), s(g1), s(b1)))
+        p.end()
+        self._preview.setPixmap(pm)
+
+    def _on_confirm_toggled(self, checked: bool):
+        self._confirm_chk.setText(
+            "☑  I have a git commit or backup of my project" if checked
+            else "☐  I have a git commit or backup of my project"
+        )
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(checked)
+
+    def tint_values(self) -> tuple:
+        return self._spin_r.value(), self._spin_g.value(), self._spin_b.value()
 
 
 class OverworldGraphicsTab(QWidget):
@@ -1222,13 +2010,13 @@ class OverworldGraphicsTab(QWidget):
         self._add_sprite_btn.clicked.connect(self._add_new_sprite)
         lv.addWidget(self._add_sprite_btn)
 
-        # Dynamic Overworld Palettes button
+        # Dynamic Overworld Palettes buttons
         self._dowp_btn = QPushButton("Enable Dynamic Palettes…")
         self._dowp_btn.setToolTip(
             "Apply the Dynamic Overworld Palettes patch to this project.\n"
             "Allows every overworld sprite to have its own unique palette\n"
             "instead of being locked to 4 shared NPC palette slots.\n\n"
-            "This is a ONE-WAY change — it modifies C source files."
+            "This is a reversible change — the Disable button restores the originals."
         )
         self._dowp_btn.setStyleSheet(
             "QPushButton { background: #2a4d2a; color: #8f8; border: 1px solid #4a8a4a; "
@@ -1238,6 +2026,20 @@ class OverworldGraphicsTab(QWidget):
         )
         self._dowp_btn.clicked.connect(self._enable_dynamic_palettes)
         lv.addWidget(self._dowp_btn)
+
+        self._dowp_disable_btn = QPushButton("Disable Dynamic Palettes…")
+        self._dowp_disable_btn.setToolTip(
+            "Reverse the Dynamic Overworld Palettes patch and restore the\n"
+            "original source files. Requires a clean build afterwards."
+        )
+        self._dowp_disable_btn.setStyleSheet(
+            "QPushButton { background: #4d2a2a; color: #f88; border: 1px solid #8a4a4a; "
+            "padding: 6px; border-radius: 3px; font-weight: bold; }"
+            "QPushButton:hover { background: #6d3a3a; }"
+        )
+        self._dowp_disable_btn.setVisible(False)
+        self._dowp_disable_btn.clicked.connect(self._disable_dynamic_palettes)
+        lv.addWidget(self._dowp_disable_btn)
 
         self._dowp_status = QLabel("")
         self._dowp_status.setStyleSheet("color: #888; font-size: 10px;")
@@ -1357,7 +2159,21 @@ class OverworldGraphicsTab(QWidget):
 
         splitter.addWidget(right)
         splitter.setSizes([340, 660])
-        outer.addWidget(splitter)
+
+        # Wrap the NPC sprite content and field effect tab in a QTabWidget
+        npc_container = QWidget()
+        npc_layout = QVBoxLayout(npc_container)
+        npc_layout.setContentsMargins(0, 0, 0, 0)
+        npc_layout.addWidget(splitter)
+
+        self._ow_tabs = QTabWidget()
+        self._ow_tabs.addTab(npc_container, "NPC Sprites")
+
+        self._fe_tab = FieldEffectSpritesTab()
+        self._fe_tab.modified.connect(self.modified)
+        self._ow_tabs.addTab(self._fe_tab, "Field Effect Sprites")
+
+        outer.addWidget(self._ow_tabs)
 
         # ── Wire signals ────────────────────────────────────────────────
         self._pal_row.colors_changed.connect(self._on_palette_edited)
@@ -1435,6 +2251,9 @@ class OverworldGraphicsTab(QWidget):
             self._rebuild_grid()
         finally:
             self._loading = False
+
+        # Load field effect sprites tab
+        self._fe_tab.load(project_root)
 
     def _get_palette_for_sprite(self, entry: SpriteEntry) -> Optional[List[Color]]:
         """Get the palette for a sprite — RAM-first via the bus, then disk.
@@ -2182,25 +3001,26 @@ class OverworldGraphicsTab(QWidget):
 
     # ──────────────────────────────────────────────── dynamic palettes ──
     def _update_dowp_status(self) -> None:
-        """Update the DOWP button and status label based on patch state."""
+        """Update the DOWP buttons and status label based on patch state."""
         try:
-            from dynamic_ow_pal_patch import is_dowp_enabled
+            from core.dynamic_ow_pal_patch import is_dowp_enabled
         except ImportError:
             self._dowp_btn.setVisible(False)
+            self._dowp_disable_btn.setVisible(False)
             self._dowp_status.setText("")
             return
 
         if is_dowp_enabled(self._project_root):
-            self._dowp_btn.setEnabled(False)
-            self._dowp_btn.setText("Dynamic Palettes Active")
+            self._dowp_btn.setVisible(False)
+            self._dowp_disable_btn.setVisible(True)
             self._dowp_status.setText(
-                "✓ Dynamic OW palettes enabled. Each sprite can use its own "
-                "unique palette — no longer limited to the 4 shared NPC slots."
+                "✓ Dynamic OW palettes enabled. Each sprite uses its own palette. "
+                "Up to 16 unique palettes on screen at once."
             )
             self._dowp_status.setStyleSheet("color: #6a6; font-size: 10px;")
         else:
-            self._dowp_btn.setEnabled(True)
-            self._dowp_btn.setText("Enable Dynamic Palettes…")
+            self._dowp_btn.setVisible(True)
+            self._dowp_disable_btn.setVisible(False)
             self._dowp_status.setText(
                 "Standard mode: sprites share 4 NPC palette slots.\n"
                 "Enable dynamic palettes to use custom per-sprite palettes."
@@ -2213,52 +3033,27 @@ class OverworldGraphicsTab(QWidget):
             return
 
         try:
-            from dynamic_ow_pal_patch import is_dowp_enabled, apply_dowp_patch
+            from core.dynamic_ow_pal_patch import is_dowp_enabled, apply_dowp_patch, scan_dowp_risks
         except ImportError:
-            QMessageBox.critical(
-                self, "Error",
-                "Could not load the dynamic palette patch module.\n"
-                "Please ensure dynamic_ow_pal_patch.py is in the core/ folder.",
-            )
+            QMessageBox.critical(self, "Error",
+                "Could not load the dynamic palette patch module.")
             return
 
         if is_dowp_enabled(self._project_root):
-            QMessageBox.information(
-                self, "Already Enabled",
-                "Dynamic Overworld Palettes are already active in this project.",
-            )
+            QMessageBox.information(self, "Already Enabled",
+                "Dynamic Overworld Palettes are already active in this project.")
             return
 
-        # Confirmation dialog with warning
-        ret = QMessageBox.warning(
-            self,
-            "Enable Dynamic Overworld Palettes?",
-            "This will modify several C source files in your project to enable\n"
-            "the Dynamic Overworld Palettes system.\n\n"
-            "What it does:\n"
-            "  • Sprites load their palette on demand when spawning\n"
-            "  • Each sprite can have its own unique palette\n"
-            "  • No longer limited to the 4 shared NPC palette slots\n"
-            "  • Reflection palettes are generated automatically\n"
-            "  • Up to 16 unique palettes can be on screen at once\n\n"
-            "⚠ This is a ONE-WAY change.\n"
-            "The patch modifies C source files and cannot be automatically\n"
-            "reversed. Make sure you have a backup or git commit first.\n\n"
-            "Files that will be modified:\n"
-            "  • src/event_object_movement.c\n"
-            "  • src/field_effect.c\n"
-            "  • src/field_effect_helpers.c\n"
-            "  • include/event_object_movement.h\n"
-            "  • include/field_effect.h\n\n"
-            "Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        risks = scan_dowp_risks(self._project_root)
+
+        dlg = _DOWPApplyDialog(risks, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        tint_r, tint_g, tint_b = dlg.tint_values()
+        success, applied_list, failed_list = apply_dowp_patch(
+            self._project_root, tint_r=tint_r, tint_g=tint_g, tint_b=tint_b
         )
-        if ret != QMessageBox.StandardButton.Yes:
-            return
-
-        # Apply the patch
-        success, applied_list, failed_list = apply_dowp_patch(self._project_root)
 
         if success:
             self._update_dowp_status()
@@ -2288,6 +3083,56 @@ class OverworldGraphicsTab(QWidget):
             # Still update status — partial patches are tracked by the marker file
             self._update_dowp_status()
 
+    def _disable_dynamic_palettes(self) -> None:
+        """Reverse the DOWP patch after user confirmation."""
+        if not self._project_root:
+            return
+
+        try:
+            from core.dynamic_ow_pal_patch import remove_dowp_patch
+        except ImportError:
+            QMessageBox.critical(self, "Error",
+                "Could not load the dynamic palette patch module.")
+            return
+
+        ret = QMessageBox.warning(
+            self,
+            "Disable Dynamic Overworld Palettes?",
+            "This will reverse the Dynamic Overworld Palettes patch and restore\n"
+            "the original source files.\n\n"
+            "Files that will be restored:\n"
+            "  • src/event_object_movement.c\n"
+            "  • src/field_effect.c\n"
+            "  • src/field_effect_helpers.c\n"
+            "  • include/event_object_movement.h\n"
+            "  • include/field_effect.h\n\n"
+            "After disabling, do a full clean rebuild (make clean && make modern).\n\n"
+            "Make sure you have a git commit or backup first.\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        success, reverted_list, failed_list = remove_dowp_patch(self._project_root)
+        self._update_dowp_status()
+
+        if success:
+            detail = "\n".join(f"  ✓ {r}" for r in reverted_list)
+            QMessageBox.information(self, "Dynamic Palettes Disabled",
+                f"Patch successfully reversed.\n\n{detail}\n\n"
+                f"Run a full clean rebuild to complete the removal.")
+        else:
+            applied_str = "\n".join(f"  ✓ {r}" for r in reverted_list) if reverted_list else "  (none)"
+            failed_str = "\n".join(f"  ✗ {f}" for f in failed_list)
+            QMessageBox.warning(self, "Partial Reversal",
+                f"Some parts could not be automatically reversed.\n"
+                f"Your source files may have been modified after the patch was applied.\n\n"
+                f"Reverted:\n{applied_str}\n\n"
+                f"Failed:\n{failed_str}\n\n"
+                f"Search for '// DOWP' in the listed files to find and remove remaining changes.")
+
     # ────────────────────────────────────────────────────────── save ──
     def _notify_new_gfx_constant(self, gfx_const: str, png_path: str) -> None:
         """Push a new OBJ_EVENT_GFX constant into ConstantsManager and
@@ -2305,14 +3150,15 @@ class OverworldGraphicsTab(QWidget):
         self.gfx_constants_changed.emit()
 
     def has_unsaved_changes(self) -> bool:
-        return bool(self._palette_dirty) or bool(self._sprite_png_dirty)
+        return (bool(self._palette_dirty) or bool(self._sprite_png_dirty)
+                or self._fe_tab.has_unsaved_changes())
 
     def flush_to_disk(self) -> tuple[int, list[str]]:
         """Write all dirty palettes to .pal files and remapped sprites to PNG."""
         ok = 0
         errors: list[str] = []
 
-        # Pass 1 — palette files
+        # Pass 1 — NPC palette files
         for tag in list(self._palette_dirty):
             pal_path = self._pal_paths.get(tag, "")
             if not pal_path:
@@ -2345,5 +3191,10 @@ class OverworldGraphicsTab(QWidget):
             self._pal_frame.setStyleSheet("")
             # Rebuild grid to clear amber thumbnail borders.
             self._rebuild_grid()
+
+        # Pass 3 — field effect sprites
+        fe_ok, fe_errors = self._fe_tab.flush_to_disk()
+        ok += fe_ok
+        errors.extend(fe_errors)
 
         return ok, errors

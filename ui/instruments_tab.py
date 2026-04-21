@@ -36,6 +36,11 @@ _log = logging.getLogger("SoundEditor.Instruments")
 _ROLE_VG_NAME = Qt.ItemDataRole.UserRole + 10
 _ROLE_SLOT_IDX = Qt.ItemDataRole.UserRole + 11
 _ROLE_INST_TYPE = Qt.ItemDataRole.UserRole + 12
+_ROLE_INST_KEY = Qt.ItemDataRole.UserRole + 13
+
+_DIRTY_BG = QColor("#3d2e00")
+_DIRTY_SS = ("QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; }"
+             "QGroupBox::title { color: #ffb74d; }")
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +474,7 @@ class InstrumentsTab(QWidget):
         self._current_instrument = None
         self._current_vg_name = ""
         self._editing = False  # guard against feedback loops
+        self._dirty_inst_keys: set[str] = set()
 
         self._build_ui()
 
@@ -563,12 +569,12 @@ class InstrumentsTab(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 0)
 
         # -- Instrument info --
-        info_group = QGroupBox("Instrument Details")
-        info_group.setToolTip(
+        self._info_group = QGroupBox("Instrument Details")
+        self._info_group.setToolTip(
             "Properties of the selected instrument.\n"
             "Changes are applied to every copy of this instrument\n"
             "across all voicegroups — they're the same sound, shared.")
-        info_layout = QVBoxLayout(info_group)
+        info_layout = QVBoxLayout(self._info_group)
 
         self._inst_name_label = QLabel("No instrument selected")
         self._inst_name_label.setFont(QFont("", 14, QFont.Weight.Bold))
@@ -790,7 +796,7 @@ class InstrumentsTab(QWidget):
         edit_grid.addWidget(self._sample_frame)
 
         info_layout.addWidget(edit_frame)
-        right_layout.addWidget(info_group)
+        right_layout.addWidget(self._info_group)
 
         # -- Export instrument preset (needs a selected instrument) --
         preset_row = QHBoxLayout()
@@ -958,6 +964,7 @@ class InstrumentsTab(QWidget):
         self._project_root = project_root
         self._voicegroup_data = voicegroup_data
         self._unique_instruments: dict = {}  # key -> (inst, vg_names)
+        self.clear_dirty()
         self._populate_instrument_list()
         self._btn_import_sample.setEnabled(bool(project_root))
         self._btn_import_inst.setEnabled(bool(project_root))
@@ -1087,8 +1094,13 @@ class InstrumentsTab(QWidget):
             item.setData(0, _ROLE_VG_NAME, info['first_vg'])
             item.setData(0, _ROLE_SLOT_IDX, info['first_slot'])
             item.setData(0, _ROLE_INST_TYPE, type_str)
+            item.setData(0, _ROLE_INST_KEY, key)
             item.setToolTip(0, f"{inst.voice_type} (0x{inst.type_byte:02X})")
             item.setToolTip(1, ', '.join(sorted(info['vg_set'])))
+
+            if key in self._dirty_inst_keys:
+                for col in range(self._inst_tree.columnCount()):
+                    item.setBackground(col, _DIRTY_BG)
 
         # Expand all groups
         self._inst_tree.expandAll()
@@ -1171,7 +1183,13 @@ class InstrumentsTab(QWidget):
 
     def _show_instrument_details(self, inst, vg):
         """Populate the right panel with instrument info and editable controls."""
-        self._editing = True  # suppress change handlers while loading
+        self._editing = True
+        try:
+            self._show_instrument_details_inner(inst, vg)
+        finally:
+            self._editing = False
+
+    def _show_instrument_details_inner(self, inst, vg):
 
         self._inst_name_label.setText(inst.friendly_name)
         self._inst_type_label.setText(
@@ -1325,8 +1343,6 @@ class InstrumentsTab(QWidget):
         # Instrument export
         self._btn_export_inst.setEnabled(inst.is_directsound and bool(inst.sample_label))
 
-        self._editing = False
-
     def _update_usage_info(self, inst):
         """Show which voicegroups contain this instrument."""
         key = self._inst_identity_key(inst)
@@ -1381,33 +1397,66 @@ class InstrumentsTab(QWidget):
     # Editing — change handlers
     # ═══════════════════════════════════════════════════════════════════════
 
+    def _tint_inst_row(self, key: str, dirty: bool) -> None:
+        bg = _DIRTY_BG if dirty else QColor(0, 0, 0, 0)
+        for gi in range(self._inst_tree.topLevelItemCount()):
+            group = self._inst_tree.topLevelItem(gi)
+            for ci in range(group.childCount()):
+                child = group.child(ci)
+                if child.data(0, _ROLE_INST_KEY) == key:
+                    for col in range(self._inst_tree.columnCount()):
+                        child.setBackground(col, bg)
+                    return
+
+    def _mark_inst_dirty(self, key: str) -> None:
+        self._dirty_inst_keys.add(key)
+        self.modified.emit()
+        try:
+            self._tint_inst_row(key, True)
+            self._info_group.setStyleSheet(_DIRTY_SS)
+        except Exception as e:
+            _log.error("Dirty visual update failed: %s", e)
+
+    def clear_dirty(self) -> None:
+        self._dirty_inst_keys.clear()
+        self._info_group.setStyleSheet("")
+        for gi in range(self._inst_tree.topLevelItemCount()):
+            group = self._inst_tree.topLevelItem(gi)
+            for ci in range(group.childCount()):
+                child = group.child(ci)
+                for col in range(self._inst_tree.columnCount()):
+                    child.setBackground(col, QColor(0, 0, 0, 0))
+
     def _apply_to_all_copies(self, attr: str, value):
         """Apply a property change to every copy of this instrument
         across all voicegroups (they're the same sound, just shared)."""
         inst = self._current_instrument
-        if not inst or not self._voicegroup_data:
+        if not inst:
             return
 
         key = self._inst_identity_key(inst)
-        info = self._unique_instruments.get(key)
-        if not info:
+        self._mark_inst_dirty(key)
+
+        if not self._voicegroup_data:
+            setattr(inst, attr, value)
             return
 
+        info = self._unique_instruments.get(key)
         changed_vgs = []
-        for vg_name in info['vg_set']:
-            vg = self._voicegroup_data.get_voicegroup(vg_name)
-            if not vg:
-                continue
-            for other in vg.instruments:
-                if self._inst_identity_key(other) == key:
-                    setattr(other, attr, value)
-            changed_vgs.append(vg_name)
+        if info:
+            for vg_name in info['vg_set']:
+                vg = self._voicegroup_data.get_voicegroup(vg_name)
+                if not vg:
+                    continue
+                for other in vg.instruments:
+                    if self._inst_identity_key(other) == key:
+                        setattr(other, attr, value)
+                changed_vgs.append(vg_name)
+        else:
+            setattr(inst, attr, value)
 
-        # Tell the voicegroups tab which voicegroups need saving
         if changed_vgs and self._voicegroups_tab_ref:
             self._voicegroups_tab_ref.mark_voicegroups_dirty(changed_vgs)
-
-        self.modified.emit()
 
     def _update_pan_desc(self, pan: int):
         """Update the pan description label."""
@@ -1545,14 +1594,17 @@ class InstrumentsTab(QWidget):
         try:
             self._write_loop_to_bin(sample, loop_on, loop_start)
             self._update_loop_ui(sample, loop_on, loop_start)
-            self._mark_loop_dirty()
-            self.modified.emit()
             _log.info("Loop %s for %s", "enabled" if loop_on else "disabled",
                        self._current_instrument.sample_label)
         except Exception as e:
             _log.error("Failed to update loop setting: %s", e)
             QMessageBox.warning(self, "Loop Error",
                                 f"Failed to update sample loop:\n{e}")
+            return
+        self._mark_loop_dirty()
+        inst = self._current_instrument
+        if inst:
+            self._mark_inst_dirty(self._inst_identity_key(inst))
 
     def _on_loop_seconds_changed(self, seconds: float):
         """User typed a time in seconds — convert to bytes and save."""
@@ -1568,12 +1620,15 @@ class InstrumentsTab(QWidget):
         try:
             self._write_loop_to_bin(sample, True, loop_bytes)
             self._update_loop_ui(sample, True, loop_bytes)
-            self._mark_loop_dirty()
-            self.modified.emit()
         except Exception as e:
             _log.error("Failed to update loop start: %s", e)
             QMessageBox.warning(self, "Loop Error",
                                 f"Failed to update loop point:\n{e}")
+            return
+        self._mark_loop_dirty()
+        inst = self._current_instrument
+        if inst:
+            self._mark_inst_dirty(self._inst_identity_key(inst))
 
     def _on_loop_waveform_dragged(self, frac: float):
         """User dragged the loop marker on the waveform."""
@@ -1597,14 +1652,13 @@ class InstrumentsTab(QWidget):
                 pct = loop_bytes * 100 / size
                 self._loop_detail_label.setText(
                     f"(byte {loop_bytes:,} — {pct:.0f}%)")
-            self._mark_loop_dirty()
-            self.modified.emit()
         except Exception as e:
             _log.error("Failed to update loop start: %s", e)
-
-    def _on_loop_start_changed(self, value: int):
-        """Internal byte-level handler (kept for compatibility)."""
-        pass  # All loop changes go through seconds or waveform now
+            return
+        self._mark_loop_dirty()
+        inst = self._current_instrument
+        if inst:
+            self._mark_inst_dirty(self._inst_identity_key(inst))
 
     # ═══════════════════════════════════════════════════════════════════════
     # Preview playback

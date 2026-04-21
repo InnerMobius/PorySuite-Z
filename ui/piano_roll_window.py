@@ -34,6 +34,7 @@ class PianoRollWindow(QMainWindow):
 
     closed = pyqtSignal()
     modified = pyqtSignal()  # propagates to parent → main window dirty flag
+    saved = pyqtSignal()     # emitted after save_to_disk() clears _is_dirty
 
     def __init__(self, song_data, voicegroup_data=None, sample_data=None,
                  vg_labels=None, project_root='', song_table=None,
@@ -974,6 +975,7 @@ class PianoRollWindow(QMainWindow):
         path = save_song_file(self._song)
 
         self._is_dirty = False
+        self.saved.emit()
         self.setWindowTitle(
             f"Piano Roll  --  {self._song.label}  "
             f"({self._bpm} BPM, {len(self._song.tracks)} tracks)")
