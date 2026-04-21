@@ -1597,6 +1597,9 @@ class UnifiedMainWindow(QMainWindow):
         if self._eventide_window:
             self._eventide_window.setWindowModified(False)
         self.setWindowModified(False)
+        # Clear ALL toolbar dots — every section, not just PorySuite ones.
+        for section in list(self._section_to_page):
+            self.set_page_dirty(section, False)
         from PyQt6.QtCore import QTimer
         def _clear_refresh_dirty():
             if self._porysuite_window:
@@ -1604,6 +1607,8 @@ class UnifiedMainWindow(QMainWindow):
             if self._eventide_window:
                 self._eventide_window.setWindowModified(False)
             self.setWindowModified(False)
+            for section in list(self._section_to_page):
+                self.set_page_dirty(section, False)
         QTimer.singleShot(200, _clear_refresh_dirty)
         self.statusBar().showMessage("Everything refreshed from disk.", 4000)
         self.log_message("Full refresh complete — all data reloaded from disk.")

@@ -6405,7 +6405,17 @@ class EventEditorTab(QWidget):
         self._refresh_gfx_combo()
 
         self.btn_open.setEnabled(True)
-        self.map_label.setText('No map loaded — click Open Map')
+
+        # If a map was already open, reload it from disk to pick up any
+        # on-disk changes and discard unsaved in-memory edits.
+        if self._map_dir and self._map_dir.is_dir():
+            try:
+                self._load_map(self._map_dir)
+            except Exception as e:
+                self._mw.log_message(f'Event Editor: map reload error: {e}')
+                self.map_label.setText('No map loaded — click Open Map')
+        else:
+            self.map_label.setText('No map loaded — click Open Map')
 
         # Build project-wide script label index
         from eventide.backend.script_index import ScriptIndex
