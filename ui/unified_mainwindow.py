@@ -1093,13 +1093,18 @@ class UnifiedMainWindow(QMainWindow):
         saved_sound = False
         if hasattr(self, '_sound_editor'):
             se = self._sound_editor
-            # Voicegroups
+            # Voicegroups — also triggered when instruments-only edits are pending.
+            # Instruments are embedded in voice_groups.inc; saving voicegroups
+            # always writes the current in-memory instrument data, so any
+            # instruments-tab edit is persisted by a voicegroup save regardless
+            # of whether the voicegroup list itself was touched.
             vg_tab = getattr(se, '_voicegroups_tab', None)
-            if vg_tab and vg_tab.has_unsaved_changes():
+            inst_tab = getattr(se, '_instruments_tab', None)
+            inst_dirty = bool(inst_tab and inst_tab._dirty_inst_keys)
+            if vg_tab and (vg_tab.has_unsaved_changes() or inst_dirty):
                 try:
                     vg_tab.save_to_disk()
                     saved_sound = True
-                    inst_tab = getattr(se, '_instruments_tab', None)
                     if inst_tab:
                         inst_tab.clear_dirty()
                 except Exception as e:

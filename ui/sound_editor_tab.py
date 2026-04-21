@@ -1127,10 +1127,11 @@ class SoundEditorTab(QWidget):
         try:
             from core.sound.song_writer import save_song_file
             save_song_file(song)
+            # Data is on disk — clear any existing dirty tint for this song.
+            # Do NOT add to _dirty_songs; inline saves don't leave pending changes.
             key = self._current_song_key
-            self._dirty_songs.add(key)
-            self._tint_song_row(key, True)
-            self.modified.emit()
+            self._dirty_songs.discard(key)
+            self._tint_song_row(key, False)
             _log.info("Inline save: %s", song.label)
         except Exception as e:
             _log.error("Inline song save failed for %s: %s", song.label, e)
