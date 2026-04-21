@@ -149,6 +149,13 @@ class UnifiedMainWindow(QMainWindow):
             "sound": "sound",
             "overworld": "overworld",
             "trainer_graphics": "trainers",
+            "events":    "events",
+            "maps":      "maps",
+            "regionmap": "regionmap",
+            "tilesets":  "tilesets",
+            "ui":        "ui",
+            "config":    "config",
+            "labels":    "labels",
         }
 
         # ── Build toolbar and menus ──────────────────────────────────────────
@@ -681,12 +688,25 @@ class UnifiedMainWindow(QMainWindow):
             idx = self.stack.addWidget(widget)
             self._page_indices[name] = idx
 
+        # Wire EVENTide tab dirty dots.
+        eventide_main.event_editor_tab.data_changed.connect(
+            lambda: self.set_page_dirty("events", True))
+        eventide_main.maps_tab.data_changed.connect(
+            lambda: self.set_page_dirty("maps", True))
+        eventide_main.region_map_tab.data_changed.connect(
+            lambda: self.set_page_dirty("regionmap", True))
+
         # ── Label Manager (standalone page) ─────────────────────────────────
         try:
             from label_manager import LabelManagerWidget
             self._label_manager = LabelManagerWidget()
             idx = self.stack.addWidget(self._label_manager)
             self._page_indices["labels"] = idx
+            self._label_manager.modified.connect(
+                lambda: (self.set_page_dirty("labels", True),
+                         self.setWindowModified(True)))
+            self._label_manager.labels_changed.connect(
+                lambda: self.set_page_dirty("labels", False))
         except Exception as e:
             print(f"[LabelManager] Failed to load: {e}")
             import traceback; traceback.print_exc()
@@ -708,10 +728,14 @@ class UnifiedMainWindow(QMainWindow):
             idx = self.stack.addWidget(self._tilemap_editor)
             self._page_indices["tilesets"] = idx
             # Connect tilemap + tile animation editor modified signals to window dirty
-            self._tilemap_editor.modified.connect(lambda: self.setWindowModified(True))
+            self._tilemap_editor.modified.connect(
+                lambda: (self.set_page_dirty("tilesets", True),
+                         self.setWindowModified(True)))
             anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
             if anim_ed and hasattr(anim_ed, 'modified'):
-                anim_ed.modified.connect(lambda: self.setWindowModified(True))
+                anim_ed.modified.connect(
+                    lambda: (self.set_page_dirty("tilesets", True),
+                             self.setWindowModified(True)))
         except Exception as e:
             print(f"[TilemapEditor] Failed to load: {e}")
             import traceback; traceback.print_exc()
@@ -893,6 +917,15 @@ class UnifiedMainWindow(QMainWindow):
         if hasattr(porysuite_main, "sectionDirtyChanged"):
             porysuite_main.sectionDirtyChanged.connect(self.set_page_dirty)
 
+        # Text editor and config dirty dots — those tabs fire setWindowModified
+        # via mainwindow.py but don't emit sectionDirtyChanged.  Wire directly.
+        if hasattr(porysuite_main, "ui_tab"):
+            porysuite_main.ui_tab.modified.connect(
+                lambda: self.set_page_dirty("ui", True))
+        if hasattr(porysuite_main, "config_tab"):
+            porysuite_main.config_tab.modified.connect(
+                lambda: self.set_page_dirty("config", True))
+
     # ═════════════════════════════════════════════════════════════════════════
     # Project loading
     # ═════════════════════════════════════════════════════════════════════════
@@ -1004,6 +1037,8 @@ class UnifiedMainWindow(QMainWindow):
                 self._porysuite_window.update_save()
                 self._porysuite_window.setWindowModified(False)
                 saved_porysuite = True
+                self.set_page_dirty("ui", False)
+                self.set_page_dirty("config", False)
             except Exception as e:
                 self.log_message(f"Error saving PorySuite data: {e}")
 
@@ -1021,6 +1056,9 @@ class UnifiedMainWindow(QMainWindow):
             # currentIndexChanged → _mark_dirty, leaving EVENTide dirty
             # with nothing actually needing saving.
             self._eventide_window.setWindowModified(False)
+            self.set_page_dirty("events", False)
+            self.set_page_dirty("maps", False)
+            self.set_page_dirty("regionmap", False)
 
         # Emit change signals so the other side picks up changes
         if saved_porysuite and hasattr(self, 'project_data'):
@@ -1121,6 +1159,12 @@ class UnifiedMainWindow(QMainWindow):
                         self.log_message(f"Tile animation save errors: {', '.join(errs)}")
                 except Exception as e:
                     self.log_message(f"Error saving tile animation properties: {e}")
+
+        if saved_tilemap or saved_tile_anim:
+            self.set_page_dirty("tilesets", False)
+
+        if saved_labels:
+            self.set_page_dirty("labels", False)
 
         # Always clear the dirty flag after save — even if no sub-component
         # reported changes.  The Sound Editor (and others) can emit modified()

@@ -47,6 +47,7 @@ class LabelManagerWidget(QWidget):
     """Standalone page for managing friendly labels on flags and vars."""
 
     labels_changed = pyqtSignal()
+    modified = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -394,6 +395,8 @@ class LabelManagerWidget(QWidget):
         self._mark_dirty()
 
     def _mark_dirty(self):
+        if not self._dirty:
+            self.modified.emit()
         self._dirty = True
         self._save_btn.setEnabled(True)
 
