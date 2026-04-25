@@ -1,16 +1,100 @@
 """
 Layouts & Tilesets tab — Layout Manager + Tileset Manager
 
-Layout operations: rename, delete, clean orphans, apply tilesets.
-Tileset operations: rename secondary tilesets.
+Every action in this sub-tab writes to disk immediately via the layout/
+tileset renamer backends. There is no staging layer here — these ops do
+filesystem renames and repo-wide source rewrites that are not safely
+deferrable. Each dialog warns the user explicitly and the tooltips are
+labelled IMMEDIATE WRITE.
+
+The sub-tab participates in the Maps page dirty-flag system through its
+data_changed signal: the parent MapsTab forwards it up to the toolbar
+dot + title-bar asterisk wiring.
 """
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout,
-    QComboBox, QPushButton, QGroupBox, QLabel, QFormLayout,
-    QInputDialog, QMessageBox, QMenu,
+    QComboBox, QPushButton, QGroupBox, QLabel, QFormLayout, QLineEdit,
+    QDialog, QDialogButtonBox, QInputDialog, QMessageBox, QMenu,
 )
+
+
+_WARN_IMMEDIATE_LAYOUT = (
+    "\n\n⚠  WRITES TO DISK IMMEDIATELY when you confirm. Renames or "
+    "deletes here update layouts.json and rewrite every reference to the "
+    "old name across the project source. Cannot be undone from within "
+    "the app.\nMake a backup or commit to Git before proceeding."
+)
+
+
+# Engine / convention limits for identifiers.
+# Layout ids and tileset labels are C symbols — keep them under 60 to stay
+# readable in headers and avoid generated-symbol overflow.
+LAYOUT_ID_MAX = 60
+TILESET_LABEL_MAX = 60
+TILESET_FOLDER_MAX = 48
+
+
+def _attach_char_counter(line_edit: QLineEdit, counter_lbl: QLabel,
+                         max_chars: int) -> None:
+    """Wire a max-length cap + live grey/amber/red counter to a QLineEdit.
+
+    Mirrors the items / abilities pattern so every text input across the
+    app uses the same grammar.
+    """
+    line_edit.setMaxLength(max_chars)
+    base_ss = "font-size: 10px; font-family: 'Courier New';"
+
+    def _refresh(_text=None):
+        used = len(line_edit.text())
+        counter_lbl.setText(f"{used}/{max_chars}")
+        if used >= max_chars:
+            color = "#cc3333"
+        elif used >= int(max_chars * 0.85):
+            color = "#ffb74d"
+        else:
+            color = "#888888"
+        counter_lbl.setStyleSheet(f"color: {color}; {base_ss}")
+
+    counter_lbl.setStyleSheet(f"color: #888888; {base_ss}")
+    line_edit.textChanged.connect(_refresh)
+    _refresh()
+
+
+def _prompt_text(parent, title: str, label: str, current: str,
+                 max_chars: int, helper: str = "") -> tuple[str, bool]:
+    """Modal text-entry dialog with a live character counter.
+
+    Returns (text, ok). Replaces QInputDialog.getText where we need a
+    character cap + visual counter for consistency with the rest of the
+    app.
+    """
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    layout = QVBoxLayout(dlg)
+    if helper:
+        h = QLabel(helper)
+        h.setWordWrap(True)
+        h.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(h)
+    layout.addWidget(QLabel(label))
+    edit = QLineEdit(current)
+    layout.addWidget(edit)
+    counter = QLabel("")
+    counter.setAlignment(Qt.AlignmentFlag.AlignRight)
+    layout.addWidget(counter)
+    _attach_char_counter(edit, counter, max_chars)
+    bb = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    bb.accepted.connect(dlg.accept)
+    bb.rejected.connect(dlg.reject)
+    layout.addWidget(bb)
+    edit.setFocus()
+    edit.selectAll()
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return "", False
+    return edit.text().strip(), True
 
 
 class LayoutsTab(QWidget):
@@ -28,6 +112,27 @@ class LayoutsTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
+        # ── Header banner — explains save model + intent of this sub-tab ─────
+        banner = QLabel(
+            "<small>"
+            "<b>Layouts</b> are the tilemaps + dimensions a map references "
+            "from <code>data/layouts/layouts.json</code>. <b>Tilesets</b> "
+            "are the graphics + metatiles a layout uses. Use this sub-tab "
+            "to rename either, swap which tilesets a layout uses, or "
+            "remove orphaned data."
+            "<br><br>"
+            "<b>Save model:</b> "
+            "<span style='color:#f99'>Every action in this sub-tab "
+            "writes to disk immediately</span> when you confirm — there "
+            "is no Save / F5 staging here. Renames rewrite every "
+            "reference across the project source. Back up or commit to "
+            "Git before using these."
+            "</small>"
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet("padding: 4px; color: #ccc;")
+        layout.addWidget(banner)
+
         # ── Layout Manager ───────────────────────────────────────────────────
         layout_group = QGroupBox("Layout Manager")
         layout_inner = QVBoxLayout(layout_group)
@@ -36,15 +141,43 @@ class LayoutsTab(QWidget):
         self.layout_combo = QComboBox()
         self.layout_combo.wheelEvent = lambda e: e.ignore()
         self.layout_combo.setPlaceholderText("Select a layout...")
+        self.layout_combo.setToolTip(
+            "Pick the layout to rename, delete, or open in Porymap. "
+            "Selection is required for the buttons below.")
         form.addRow("Layout:", self.layout_combo)
         layout_inner.addLayout(form)
 
         btn_row = QHBoxLayout()
         self.btn_rename_layout = QPushButton("Rename Layout")
+        self.btn_rename_layout.setToolTip(
+            "IMMEDIATE WRITE.\n\n"
+            "Renames the layout id (e.g. LAYOUT_PALLET_TOWN), renames "
+            "the matching folder under data/layouts/, updates "
+            "layouts.json, and rewrites every reference to the old id "
+            "across the project source.\n\n"
+            "Not staged — confirms write directly to disk. Cannot be "
+            "undone from within the app.")
         self.btn_delete_layout = QPushButton("Delete Layout")
+        self.btn_delete_layout.setToolTip(
+            "IMMEDIATE WRITE — DESTRUCTIVE.\n\n"
+            "Removes the layout from layouts.json, deletes its folder "
+            "under data/layouts/, and rewrites every reference across "
+            "the project source. Refuses to run if any map still uses "
+            "this layout — reassign those maps first.\n\n"
+            "Not staged. Cannot be undone from within the app.")
         self.btn_clean_layouts = QPushButton("Clean Orphaned Layouts")
+        self.btn_clean_layouts.setToolTip(
+            "IMMEDIATE WRITE.\n\n"
+            "Scans layouts.json for entries whose folders are missing "
+            "and that no map references, and removes them.\n\n"
+            "Not staged. Cannot be undone from within the app.")
         self.btn_open_porymap = QPushButton("Open in Porymap")
-        self.btn_open_porymap.setToolTip("Open the selected layout's map in Porymap")
+        self.btn_open_porymap.setToolTip(
+            "READ-ONLY.\n\n"
+            "Launches Porymap with the project loaded, opening the "
+            "first map that uses the selected layout (if any). "
+            "Porymap is a separate program — you'll need to install it "
+            "via Tools → Install Porymap if you haven't.")
         for btn in (self.btn_rename_layout, self.btn_delete_layout,
                     self.btn_clean_layouts, self.btn_open_porymap):
             btn.setEnabled(False)
@@ -56,14 +189,28 @@ class LayoutsTab(QWidget):
         self.primary_combo = QComboBox()
         self.primary_combo.wheelEvent = lambda e: e.ignore()
         self.primary_combo.setPlaceholderText("Select primary tileset...")
+        self.primary_combo.setToolTip(
+            "The primary tileset (usually shared between many maps) the "
+            "selected layout will use. Picked from the project's "
+            "layouts.json.")
         tileset_form.addRow("Primary Tileset:", self.primary_combo)
         self.secondary_combo = QComboBox()
         self.secondary_combo.wheelEvent = lambda e: e.ignore()
         self.secondary_combo.setPlaceholderText("Select secondary tileset...")
+        self.secondary_combo.setToolTip(
+            "The secondary tileset (typically the per-area look) the "
+            "selected layout will use. Picked from the parsed tileset "
+            "headers under data/tilesets/secondary/.")
         tileset_form.addRow("Secondary Tileset:", self.secondary_combo)
         layout_inner.addLayout(tileset_form)
 
         self.btn_apply_tilesets = QPushButton("Apply Tilesets to Layout")
+        self.btn_apply_tilesets.setToolTip(
+            "IMMEDIATE WRITE.\n\n"
+            "Sets the primary and secondary tileset fields in "
+            "layouts.json for the selected layout. The map will use "
+            "those tilesets the next time it's opened or built.\n\n"
+            "Not staged.")
         self.btn_apply_tilesets.setEnabled(False)
         layout_inner.addWidget(self.btn_apply_tilesets)
 
@@ -77,10 +224,20 @@ class LayoutsTab(QWidget):
         self.tileset_combo = QComboBox()
         self.tileset_combo.wheelEvent = lambda e: e.ignore()
         self.tileset_combo.setPlaceholderText("Select a secondary tileset...")
+        self.tileset_combo.setToolTip(
+            "Pick the secondary tileset to rename. Format is "
+            "label (folder).")
         ts_form.addRow("Secondary Tileset:", self.tileset_combo)
         tileset_inner.addLayout(ts_form)
 
         self.btn_rename_tileset = QPushButton("Rename Tileset")
+        self.btn_rename_tileset.setToolTip(
+            "IMMEDIATE WRITE.\n\n"
+            "Renames the tileset's gTileset_* label (the C symbol used "
+            "by layouts) and optionally the folder name under "
+            "data/tilesets/secondary/. Rewrites every reference across "
+            "the project source.\n\n"
+            "Not staged. Cannot be undone from within the app.")
         self.btn_rename_tileset.setEnabled(False)
         tileset_inner.addWidget(self.btn_rename_tileset)
 
@@ -174,13 +331,26 @@ class LayoutsTab(QWidget):
             QMessageBox.information(self, "Rename Layout", "Select a layout first.")
             return
         old_id = layout['id']
-        new_id, ok = QInputDialog.getText(
-            self, "Rename Layout", f"New ID for '{old_id}':", text=old_id)
-        if not ok or not new_id.strip() or new_id == old_id:
+        new_id, ok = _prompt_text(
+            self, "Rename Layout",
+            f"New ID for '{old_id}':", old_id, LAYOUT_ID_MAX,
+            helper="Layout id is a C symbol used across the project source "
+                   "(e.g. LAYOUT_PALLET_TOWN). Confirming this dialog "
+                   "WRITES TO DISK IMMEDIATELY.")
+        if not ok or not new_id or new_id == old_id:
+            return
+        confirm = QMessageBox.warning(
+            self, "Rename Layout — Confirm",
+            f"Rename layout '{old_id}' → '{new_id}'?\n\n"
+            f"This renames the layout folder, updates layouts.json, and "
+            f"rewrites every reference to the old id across the project."
+            f"{_WARN_IMMEDIATE_LAYOUT}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if confirm != QMessageBox.StandardButton.Ok:
             return
         try:
-            self._layout_renamer.rename_layout(old_id, new_id.strip())
-            self._mw.log_message(f"Renamed layout {old_id} -> {new_id.strip()}")
+            self._layout_renamer.rename_layout(old_id, new_id)
+            self._mw.log_message(f"Renamed layout {old_id} -> {new_id}")
             self._populate_combos()
             self.data_changed.emit()
         except Exception as e:
@@ -198,11 +368,15 @@ class LayoutsTab(QWidget):
                 self, "Delete Layout",
                 f"Layout '{lid}' is used by {len(refs)} map(s). Remove those references first.")
             return
-        reply = QMessageBox.question(
-            self, "Delete Layout",
-            f"Delete layout '{lid}'? This removes files and updates all references.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
+        reply = QMessageBox.warning(
+            self, "Delete Layout — Confirm",
+            f"Delete layout '{lid}'?\n\n"
+            f"This deletes the layout's folder under data/layouts/, removes "
+            f"its entry from layouts.json, and rewrites every reference "
+            f"across the project source."
+            f"{_WARN_IMMEDIATE_LAYOUT}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if reply != QMessageBox.StandardButton.Ok:
             return
         try:
             self._layout_renamer.delete_layout(lid)
@@ -213,11 +387,13 @@ class LayoutsTab(QWidget):
             QMessageBox.critical(self, "Delete Layout", str(e))
 
     def _on_clean_layouts(self):
-        reply = QMessageBox.question(
-            self, "Clean Orphaned Layouts",
-            "Remove layouts whose folders are missing and have no map references?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
+        reply = QMessageBox.warning(
+            self, "Clean Orphaned Layouts — Confirm",
+            "Scan layouts.json for entries whose folders are missing AND "
+            "that no map references, and remove them?"
+            f"{_WARN_IMMEDIATE_LAYOUT}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if reply != QMessageBox.StandardButton.Ok:
             return
         try:
             count = self._layout_renamer.clean_orphaned_layouts()
@@ -241,6 +417,14 @@ class LayoutsTab(QWidget):
         if not primary and not secondary:
             QMessageBox.information(self, "Apply Tilesets", "Select at least one tileset to apply.")
             return
+        confirm = QMessageBox.warning(
+            self, "Apply Tilesets — Confirm",
+            f"Set primary='{primary or '(unchanged)'}' and "
+            f"secondary='{secondary or '(unchanged)'}' on layout '{lid}'?"
+            f"{_WARN_IMMEDIATE_LAYOUT}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if confirm != QMessageBox.StandardButton.Ok:
+            return
         try:
             self._layout_renamer.rename_layout(
                 lid, lid,
@@ -262,19 +446,33 @@ class LayoutsTab(QWidget):
             QMessageBox.information(self, "Rename Tileset", "Select a tileset first.")
             return
         old_label, old_folder = data
-        new_label, ok = QInputDialog.getText(
+        new_label, ok = _prompt_text(
             self, "Rename Tileset",
-            f"New label for '{old_label}' (folder: {old_folder}):", text=old_label)
-        if not ok or not new_label.strip() or new_label == old_label:
+            f"New label for '{old_label}' (folder: {old_folder}):",
+            old_label, TILESET_LABEL_MAX,
+            helper="Tileset label is the gTileset_* C symbol layouts "
+                   "reference. The 'gTileset_' prefix is added "
+                   "automatically by the build — type just the suffix "
+                   "(e.g. 'PalletTown'). Confirming WRITES TO DISK "
+                   "IMMEDIATELY.")
+        if not ok or not new_label or new_label == old_label:
             return
-        new_label = new_label.strip()
-        new_folder, ok2 = QInputDialog.getText(
+        new_folder, ok2 = _prompt_text(
             self, "Rename Tileset",
-            f"New folder name (currently '{old_folder}'):", text=old_folder)
-        if not ok2 or not new_folder.strip():
+            f"New folder name (currently '{old_folder}'):",
+            old_folder, TILESET_FOLDER_MAX,
+            helper="Folder name under data/tilesets/secondary/. Leave as-is "
+                   "to keep the existing folder.")
+        if not ok2 or not new_folder:
             new_folder = old_folder
-        else:
-            new_folder = new_folder.strip()
+        confirm = QMessageBox.warning(
+            self, "Rename Tileset — Confirm",
+            f"Rename tileset label '{old_label}' → '{new_label}' "
+            f"(folder '{old_folder}' → '{new_folder}')?"
+            f"{_WARN_IMMEDIATE_LAYOUT}",
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        if confirm != QMessageBox.StandardButton.Ok:
+            return
         try:
             self._tileset_renamer.rename_tileset(old_label, old_folder, new_label, new_folder)
             self._mw.log_message(f"Renamed tileset {old_label} -> {new_label}")

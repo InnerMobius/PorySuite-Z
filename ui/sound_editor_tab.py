@@ -152,6 +152,14 @@ class SoundEditorTab(QWidget):
         self._btn_import_s.setEnabled(False)
         self._btn_import_s.clicked.connect(self._open_s_import)
         count_row.addWidget(self._btn_import_s)
+
+        self._btn_cleanup = QPushButton("Clean Up Files...")
+        self._btn_cleanup.setToolTip(
+            "Scan for orphaned samples, song files, and voicegroups that\n"
+            "are no longer used but still compiled into every ROM build.")
+        self._btn_cleanup.setEnabled(False)
+        self._btn_cleanup.clicked.connect(self._on_cleanup)
+        count_row.addWidget(self._btn_cleanup)
         left_layout.addLayout(count_row)
 
         # Song tree
@@ -431,6 +439,7 @@ class SoundEditorTab(QWidget):
 
             self._btn_import_midi.setEnabled(True)
             self._btn_import_s.setEnabled(True)
+            self._btn_cleanup.setEnabled(True)
 
             # Pass data to sub-tabs
             if hasattr(self, '_instruments_tab'):
@@ -1095,12 +1104,13 @@ class SoundEditorTab(QWidget):
         if not song or not hasattr(song, 'tracks') or not song.tracks:
             return
         tbs = song.tempo_base if song.tempo_base else 1
-        max_bpm_for_tbs = (255 * tbs) // 2
-        if value > max_bpm_for_tbs and tbs < 2:
-            song.tempo_base = 2
+        # cmd.value must store the evaluated expression BPM * tbs / 2,
+        # NOT the raw BPM — _raw_tempo() reverses that to recover the
+        # integer X for "TEMPO , X*tbs/2".  Storing raw BPM here makes
+        # _raw_tempo double the byte value every time the song is saved.
         for cmd in song.tracks[0].commands:
             if cmd.cmd == 'TEMPO':
-                cmd.value = value
+                cmd.value = int(value * tbs / 2)
                 break
         self._save_song_inline(song)
 
@@ -1645,3 +1655,9 @@ class SoundEditorTab(QWidget):
             self.modified.emit()
         except Exception as e:
             _log.error("Failed to reload after .s import: %s", e)
+
+    def _on_cleanup(self):
+        """Open the Sound Cleanup dialog to find and delete orphaned audio data."""
+        from ui.dialogs.sound_cleanup_dialog import SoundCleanupDialog
+        dlg = SoundCleanupDialog(self._project_root, self._sample_data, parent=self)
+        dlg.exec()

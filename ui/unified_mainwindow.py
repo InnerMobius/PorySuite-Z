@@ -465,6 +465,13 @@ class UnifiedMainWindow(QMainWindow):
         expand_rom_action.triggered.connect(self._on_expand_rom)
         tools_menu.addAction(expand_rom_action)
 
+        cleanup_sound_action = QAction("Clean Up Sound Files...", self)
+        cleanup_sound_action.setToolTip(
+            "Scan for orphaned samples, song files, and voicegroups that\n"
+            "are no longer used but still compiled into every ROM build.")
+        cleanup_sound_action.triggered.connect(self._on_cleanup_sound)
+        tools_menu.addAction(cleanup_sound_action)
+
         tools_menu.addSeparator()
 
         open_terminal_action = QAction("Open Terminal", self)
@@ -690,11 +697,14 @@ class UnifiedMainWindow(QMainWindow):
 
         # Wire EVENTide tab dirty dots.
         eventide_main.event_editor_tab.data_changed.connect(
-            lambda: self.set_page_dirty("events", True))
+            lambda: (self.set_page_dirty("events", True),
+                     self.setWindowModified(True)))
         eventide_main.maps_tab.data_changed.connect(
-            lambda: self.set_page_dirty("maps", True))
+            lambda: (self.set_page_dirty("maps", True),
+                     self.setWindowModified(True)))
         eventide_main.region_map_tab.data_changed.connect(
-            lambda: self.set_page_dirty("regionmap", True))
+            lambda: (self.set_page_dirty("regionmap", True),
+                     self.setWindowModified(True)))
 
         # ── Label Manager (standalone page) ─────────────────────────────────
         try:
@@ -867,6 +877,7 @@ class UnifiedMainWindow(QMainWindow):
                 _eet_mod._preview_song_cb = self._sound_preview_song
                 _eet_mod._open_in_sound_editor_cb = self._sound_open_song
                 _eet_mod._stop_preview_cb = self._sound_stop_preview
+            _eet_mod._open_ow_sprite_cb = self._open_ow_sprite
         except Exception:
             pass
 
@@ -1056,9 +1067,26 @@ class UnifiedMainWindow(QMainWindow):
             # currentIndexChanged → _mark_dirty, leaving EVENTide dirty
             # with nothing actually needing saving.
             self._eventide_window.setWindowModified(False)
+
+        # Maps tab: flush staged section/in-game-name edits to disk first.
+        # save() also clears dirty markers internally on success. On failure
+        # it keeps pending edits so the user can retry — don't wipe markers.
+        if self._eventide_window:
+            maps_tab = getattr(self._eventide_window, 'maps_tab', None)
+            maps_save_ok = True
+            if maps_tab:
+                try:
+                    maps_save_ok = maps_tab.save()
+                except Exception as e:
+                    maps_save_ok = False
+                    self.log_message(f"Error saving Maps tab: {e}")
+
             self.set_page_dirty("events", False)
-            self.set_page_dirty("maps", False)
             self.set_page_dirty("regionmap", False)
+            if maps_save_ok:
+                self.set_page_dirty("maps", False)
+                if maps_tab:
+                    maps_tab.clear_dirty_markers()
 
         # Emit change signals so the other side picks up changes
         if saved_porysuite and hasattr(self, 'project_data'):
@@ -1272,6 +1300,19 @@ class UnifiedMainWindow(QMainWindow):
             self, 'ROM Expanded',
             'Done! The Makefile now pads the ROM to 32 MB.\n\n'
             'Rebuild with Make Modern to create the larger ROM.')
+
+    def _on_cleanup_sound(self):
+        """Open the Sound Cleanup dialog to find and delete orphaned audio data."""
+        if not self.project_info:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        sample_data = None
+        if hasattr(self, '_sound_editor') and self._sound_editor:
+            sample_data = getattr(self._sound_editor, '_sample_data', None)
+        project_dir = self.project_info.get('dir', '')
+        from ui.dialogs.sound_cleanup_dialog import SoundCleanupDialog
+        dlg = SoundCleanupDialog(project_dir, sample_data, parent=self)
+        dlg.exec()
 
     def _on_play(self):
         """Launch the compiled .gba file using the configured emulator or Windows default."""
@@ -1533,6 +1574,17 @@ class UnifiedMainWindow(QMainWindow):
         """Called from EVENTide Stop button — stops audio without switching pages."""
         if hasattr(self, '_sound_editor'):
             self._sound_editor.stop_preview()
+
+    def _open_ow_sprite(self, gfx_const: str):
+        """Called from EVENTide 'Open in OW Graphics' — switch to OW tab and select sprite."""
+        self._switch_page("overworld")
+        ps = getattr(self, '_porysuite_window', None)
+        if ps is None:
+            return
+        ow_tab = getattr(ps, 'overworld_graphics_tab', None)
+        if ow_tab is None:
+            return
+        ow_tab.select_sprite_by_gfx_const(gfx_const)
 
     def _toggle_log_panel(self):
         """Show or hide the log panel.  Saves preference to settings."""

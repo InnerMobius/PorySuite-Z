@@ -9,12 +9,13 @@ sound at any pitch via a clickable piano keyboard.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import threading
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
-from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QMouseEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
+from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QPen, QMouseEvent, QDoubleValidator
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QLineEdit, QPushButton, QGroupBox,
@@ -719,23 +720,32 @@ class InstrumentsTab(QWidget):
 
         loop_row.addWidget(QLabel("at"))
 
-        # Time-based spinner (seconds with 3 decimal places = milliseconds)
-        from PyQt6.QtWidgets import QDoubleSpinBox
-        self._spin_loop_seconds = QDoubleSpinBox()
-        self._spin_loop_seconds.setRange(0.0, 999.999)
-        self._spin_loop_seconds.setDecimals(3)
-        self._spin_loop_seconds.setSuffix(" s")
-        self._spin_loop_seconds.setSingleStep(0.001)
+        # Loop point text field — plain QLineEdit so typing, paste, and
+        # backspace all work normally.  QDoubleSpinBox with 4 decimal places
+        # has intractable Qt validation bugs that prevent editing small values.
+        self._spin_loop_seconds = QLineEdit()
         self._spin_loop_seconds.setFixedWidth(100)
+        self._loop_validator = QDoubleValidator(0.0, 999.9999, 4)
+        self._loop_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self._spin_loop_seconds.setValidator(self._loop_validator)
         self._spin_loop_seconds.setToolTip(
-            "Loop start time in seconds.\n"
+            "Loop start time in seconds (4 decimal places).\n"
             "Matches Audacity's timeline — set this to the\n"
             "exact timestamp where you want the loop to begin.\n"
             "The GBA plays the full sample once, then jumps\n"
-            "back to this point and repeats.")
-        install_scroll_guard(self._spin_loop_seconds)
-        self._spin_loop_seconds.valueChanged.connect(self._on_loop_seconds_changed)
+            "back to this point and repeats.\n\n"
+            "Type the value and press Enter to apply.")
+        # returnPressed fires unconditionally on Enter regardless of validator state.
+        # textEdited fires on every keystroke; debounce timer applies 400 ms after
+        # the user stops typing so the loop updates without needing to press Enter.
+        self._spin_loop_seconds.returnPressed.connect(self._on_loop_seconds_changed)
+        self._loop_debounce = QTimer(self)
+        self._loop_debounce.setInterval(400)
+        self._loop_debounce.setSingleShot(True)
+        self._loop_debounce.timeout.connect(self._on_loop_seconds_changed)
+        self._spin_loop_seconds.textEdited.connect(self._loop_debounce.start)
         loop_row.addWidget(self._spin_loop_seconds)
+        loop_row.addWidget(QLabel("s"))
 
         self._loop_detail_label = QLabel("")
         self._loop_detail_label.setStyleSheet("color: grey; font-size: 10px;")
@@ -747,10 +757,6 @@ class InstrumentsTab(QWidget):
         loop_row.addStretch()
         samp_layout.addLayout(loop_row)
 
-        # Hidden byte-level spinner (used internally, not shown)
-        self._spin_loop_start = QSpinBox()
-        self._spin_loop_start.setRange(0, 999999)
-        self._spin_loop_start.setVisible(False)
 
         # Waveform mini-view with loop marker
         self._loop_waveform = _LoopWaveformWidget()
@@ -1179,6 +1185,9 @@ class InstrumentsTab(QWidget):
 
         self._current_instrument = inst
         self._current_vg_name = vg_name
+        key = self._inst_identity_key(inst)
+        self._info_group.setStyleSheet(
+            _DIRTY_SS if key in self._dirty_inst_keys else "")
         self._show_instrument_details(inst, vg)
 
     def _show_instrument_details(self, inst, vg):
@@ -1240,16 +1249,15 @@ class InstrumentsTab(QWidget):
                     loop_sec = loop_bytes / rate if rate > 0 else 0.0
 
                     # Block signals to avoid feedback loops
+                    self._loop_debounce.stop()
                     self._chk_loop.blockSignals(True)
                     self._spin_loop_seconds.blockSignals(True)
 
                     self._chk_loop.setChecked(sample.has_loop)
-                    self._spin_loop_seconds.setMaximum(
-                        size / rate if rate > 0 else 999.999)
-                    self._spin_loop_seconds.setValue(loop_sec)
+                    max_sec = size / rate if rate > 0 else 999.9999
+                    self._loop_validator.setTop(max_sec)
+                    self._spin_loop_seconds.setText(f"{loop_sec:.4f}")
                     self._spin_loop_seconds.setEnabled(sample.has_loop)
-                    self._spin_loop_start.setValue(loop_bytes)
-                    self._spin_loop_start.setMaximum(max(size - 1, 0))
 
                     # Detail label: byte offset + percentage
                     if size > 0:
@@ -1363,6 +1371,8 @@ class InstrumentsTab(QWidget):
 
     def _clear_details(self):
         """Reset the detail panel."""
+        self._loop_debounce.stop()
+        self._info_group.setStyleSheet("")
         self._editing = True
         self._current_instrument = None
         self._inst_name_label.setText("No instrument selected")
@@ -1545,9 +1555,10 @@ class InstrumentsTab(QWidget):
         rate = sample.header.sample_rate or 1
         size = sample.header.size
 
-        # Time spinner
+        # Time field
+        self._loop_debounce.stop()
         self._spin_loop_seconds.blockSignals(True)
-        self._spin_loop_seconds.setValue(loop_bytes / rate)
+        self._spin_loop_seconds.setText(f"{loop_bytes / rate:.4f}")
         self._spin_loop_seconds.setEnabled(loop_on)
         self._spin_loop_seconds.blockSignals(False)
 
@@ -1606,16 +1617,21 @@ class InstrumentsTab(QWidget):
         if inst:
             self._mark_inst_dirty(self._inst_identity_key(inst))
 
-    def _on_loop_seconds_changed(self, seconds: float):
-        """User typed a time in seconds — convert to bytes and save."""
+    def _on_loop_seconds_changed(self):
+        """User entered a loop time in seconds — convert to bytes and save."""
         if self._editing:
             return
         sample = self._get_current_sample()
         if not sample or not self._chk_loop.isChecked():
             return
 
+        try:
+            seconds = float(self._spin_loop_seconds.text())
+        except (ValueError, AttributeError):
+            return
+
         rate = sample.header.sample_rate or 1
-        loop_bytes = max(0, min(int(seconds * rate), sample.header.size - 1))
+        loop_bytes = max(0, min(round(seconds * rate), sample.header.size - 1))
 
         try:
             self._write_loop_to_bin(sample, True, loop_bytes)
@@ -1645,8 +1661,9 @@ class InstrumentsTab(QWidget):
             self._write_loop_to_bin(sample, True, loop_bytes)
             # Update time spinner and detail label (waveform already updated by drag)
             rate = sample.header.sample_rate or 1
+            self._loop_debounce.stop()
             self._spin_loop_seconds.blockSignals(True)
-            self._spin_loop_seconds.setValue(loop_bytes / rate)
+            self._spin_loop_seconds.setText(f"{loop_bytes / rate:.4f}")
             self._spin_loop_seconds.blockSignals(False)
             if size > 0:
                 pct = loop_bytes * 100 / size
@@ -1859,7 +1876,6 @@ class InstrumentsTab(QWidget):
         if not path:
             return
 
-        import os
         from core.sound.sample_loader import peek_wav_info
 
         try:
@@ -1928,7 +1944,7 @@ class InstrumentsTab(QWidget):
             replace_sample_from_wav(path, sample, target_rate=target_rate)
             # Refresh the detail display
             self._show_instrument_details(inst, None)
-            self.modified.emit()
+            self._mark_inst_dirty(self._inst_identity_key(inst))
             QMessageBox.information(
                 self, "Replaced",
                 f"Sample '{sample.friendly_name}' audio replaced.\n\n"
@@ -1990,18 +2006,23 @@ class InstrumentsTab(QWidget):
             QMessageBox.critical(
                 self, "Delete Failed", str(e))
 
-    def _assign_sample_to_slot(self, sample_label: str):
+    def _assign_sample_to_slot(self, sample_label: str, new_instrument: bool = False):
         """Assign a sample to an instrument slot.
 
-        If a DirectSound instrument is currently selected, assigns to that.
+        If a DirectSound instrument is currently selected AND new_instrument is
+        False, reassigns that slot's sample to sample_label.
         Otherwise, asks the user which voicegroup to add it to and finds
         a filler slot to replace.
 
+        new_instrument=True is used when importing a brand-new sample — it must
+        always find a fresh filler slot instead of clobbering the selected one.
+
         Returns the target Instrument or None.
         """
-        # If a DirectSound instrument is selected, use that slot
+        # If a DirectSound instrument is selected, use that slot — but only
+        # when reassigning, not when creating a new instrument (import path).
         inst = self._current_instrument
-        if inst and inst.is_directsound:
+        if inst and inst.is_directsound and not new_instrument:
             self._apply_to_all_copies('sample_label', sample_label)
             return inst
 
@@ -2072,8 +2093,121 @@ class InstrumentsTab(QWidget):
         if not path:
             return
 
+        from core.sound.sample_loader import peek_wav_info
+
+        # ── Peek at the WAV early so we have rate/size for both paths ────
+        try:
+            info = peek_wav_info(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Bad WAV", str(e))
+            return
+
+        wav_rate = info['rate']
+        wav_dur = info['duration']
+        raw_size = info['mono_8bit_size'] + 16  # +16 for header
+
+        # ── If a DS instrument is selected, offer to replace it in-place ──
+        inst = self._current_instrument
+        has_ds_slot = (inst is not None
+                       and inst.is_directsound
+                       and bool(inst.sample_label)
+                       and self._sample_data is not None
+                       and inst.sample_label in self._sample_data.direct_sound)
+
+        if has_ds_slot:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Replace or Add New?")
+            msg.setText(
+                f"A DirectSound instrument is already selected:\n"
+                f"{inst.friendly_name}\n\n"
+                f"Do you want to replace its audio with the new WAV, "
+                f"or add it as a completely new instrument?")
+            btn_replace = msg.addButton("Replace Selected",
+                                        QMessageBox.ButtonRole.AcceptRole)
+            btn_add = msg.addButton("Add as New Instrument",
+                                    QMessageBox.ButtonRole.RejectRole)
+            msg.exec()
+            clicked = msg.clickedButton()
+            if clicked is None:
+                return
+
+            if clicked is btn_replace:
+                # ── Replace in-place path ─────────────────────────────────
+                existing = self._sample_data.direct_sound[inst.sample_label]
+                orig_rate = existing.header.sample_rate
+                orig_size = len(existing.pcm_data) + 16
+
+                # Build rate options for the replace dialog
+                replace_options = []
+                if wav_rate != orig_rate:
+                    match_size = int(wav_dur * orig_rate) + 16
+                    replace_options.append(
+                        f"Match original ({orig_rate} Hz) — "
+                        f"{match_size / 1024:.1f} KB")
+                replace_options.append(
+                    f"Keep WAV rate ({wav_rate} Hz) — "
+                    f"{raw_size / 1024:.1f} KB")
+                for tier_rate, tier_desc in [
+                    (22050, "good quality"),
+                    (13379, "typical GBA"),
+                    (8000,  "small / lo-fi"),
+                ]:
+                    if wav_rate > tier_rate and tier_rate != orig_rate:
+                        tier_size = int(wav_dur * tier_rate) + 16
+                        replace_options.append(
+                            f"Downsample to {tier_rate} Hz ({tier_desc}) — "
+                            f"{tier_size / 1024:.1f} KB")
+
+                size_warn = ""
+                if orig_size > 10 * 1024:
+                    size_warn = (
+                        f"\n⚠ Original sample is {orig_size / 1024:.1f} KB — "
+                        f"large for a GBA instrument.\n")
+
+                choice, ok = QInputDialog.getItem(
+                    self, "Replace Sample — Rate & Size",
+                    f"Replacing '{existing.friendly_name}' audio.\n"
+                    f"Original rate: {orig_rate} Hz\n"
+                    f"New WAV: {wav_rate} Hz, {wav_dur:.2f}s\n"
+                    f"{size_warn}\n"
+                    f"Loop settings will be preserved (scaled to new length).\n\n"
+                    f"Choose a sample rate:",
+                    replace_options, 0, False)
+                if not ok:
+                    return
+
+                target_rate = orig_rate  # default: match original
+                if "Match original" in choice:
+                    target_rate = orig_rate
+                elif "Keep WAV rate" in choice:
+                    target_rate = wav_rate
+                elif "22050" in choice:
+                    target_rate = 22050
+                elif "13379" in choice:
+                    target_rate = 13379
+                elif "8000" in choice:
+                    target_rate = 8000
+
+                try:
+                    from core.sound.sample_loader import replace_sample_from_wav
+                    replace_sample_from_wav(path, existing,
+                                            target_rate=target_rate)
+                    self._show_instrument_details(inst, None)
+                    self._mark_inst_dirty(self._inst_identity_key(inst))
+                    final_rate = existing.header.sample_rate
+                    final_size = os.path.getsize(existing.file_path)
+                    QMessageBox.information(
+                        self, "Replaced",
+                        f"Sample '{existing.friendly_name}' audio replaced.\n\n"
+                        f"Rate: {final_rate} Hz\n"
+                        f"Size: {final_size / 1024:.1f} KB")
+                except Exception as e:
+                    QMessageBox.critical(self, "Replace Failed", str(e))
+                return
+            # else: user chose "Add as New Instrument" — fall through below
+
+        # ── Add as new instrument path ─────────────────────────────────────
         # Ask for a name
-        import os
         suggested = os.path.splitext(os.path.basename(path))[0]
         # Clean up the name for GBA label safety
         suggested = re.sub(r'[^a-zA-Z0-9_]', '_', suggested).strip('_')
@@ -2094,19 +2228,7 @@ class InstrumentsTab(QWidget):
                                 "The name must contain at least one letter.")
             return
 
-        from core.sound.sample_loader import (
-            import_wav_as_sample, peek_wav_info, _resample_linear)
-
-        # ── Peek at the WAV to show size/rate info ────────────────────────
-        try:
-            info = peek_wav_info(path)
-        except Exception as e:
-            QMessageBox.critical(self, "Bad WAV", str(e))
-            return
-
-        wav_rate = info['rate']
-        wav_dur = info['duration']
-        raw_size = info['mono_8bit_size'] + 16  # +16 for header
+        from core.sound.sample_loader import import_wav_as_sample
 
         # Always show rate/size options — even "GBA-friendly" rates
         # can be wasteful for long samples.  Let the user decide.
@@ -2183,14 +2305,18 @@ class InstrumentsTab(QWidget):
             final_size = os.path.getsize(new_sample.file_path)
             final_rate = new_sample.header.sample_rate
 
-            # Assign the new sample to an instrument slot
-            target_inst = self._assign_sample_to_slot(new_sample.label)
+            # Assign the new sample to an instrument slot — new_instrument=True
+            # so a fresh filler slot is found rather than clobbering the
+            # currently selected instrument.
+            target_inst = self._assign_sample_to_slot(new_sample.label,
+                                                       new_instrument=True)
 
             self._populate_instrument_list()
-            self.modified.emit()
-
             if target_inst:
                 self._show_instrument_details(target_inst, None)
+                self._mark_inst_dirty(self._inst_identity_key(target_inst))
+            else:
+                self.modified.emit()
 
             QMessageBox.information(
                 self, "Imported",
@@ -2238,7 +2364,6 @@ class InstrumentsTab(QWidget):
 
         import json
         import zipfile
-        import os
 
         try:
             # Build the manifest
@@ -2305,7 +2430,6 @@ class InstrumentsTab(QWidget):
 
         import json
         import zipfile
-        import os
         from core.sound.sample_loader import (
             read_bin_sample, DirectSoundSample)
 
@@ -2405,8 +2529,10 @@ class InstrumentsTab(QWidget):
                     self._sample_data.direct_sound[label] = new_sample
                     self._sample_data._ds_label_to_path[label] = bin_rel
 
-            # Assign the sample to an instrument slot
-            target_inst = self._assign_sample_to_slot(label)
+            # Assign the sample to an instrument slot — new_instrument=True
+            # so a fresh filler slot is found rather than clobbering the
+            # currently selected instrument.
+            target_inst = self._assign_sample_to_slot(label, new_instrument=True)
             if not target_inst:
                 # User cancelled voicegroup selection — sample is still
                 # imported, they can assign it later
@@ -2434,7 +2560,7 @@ class InstrumentsTab(QWidget):
             # Refresh the display to show the new instrument
             self._populate_instrument_list()
             self._show_instrument_details(target_inst, None)
-            self.modified.emit()
+            self._mark_inst_dirty(self._inst_identity_key(target_inst))
 
             QMessageBox.information(
                 self, "Imported",

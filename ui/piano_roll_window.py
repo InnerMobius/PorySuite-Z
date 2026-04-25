@@ -544,23 +544,17 @@ class PianoRollWindow(QMainWindow):
         """Update the song's tempo when the user changes the BPM spinbox."""
         self._bpm = value
 
-        # ── Ceiling fix ─────────────────────────────────────────────────
-        # TEMPO in the .s is stored as `raw*tbs/2` in a single byte (0-255).
-        # The writer reverses: raw = round(value * 2 / tbs). With tbs=1 the
-        # ceiling is BPM ≈ 127 (raw 255 → 255/2). Anything above that
-        # overflows the byte and reloads wrong. Hoist tempo_base to 2 (max
-        # BPM 255) whenever the user exceeds what the current tbs can
-        # represent, so the new BPM round-trips losslessly on cold load.
         if self._song and self._song.tracks:
             tbs = self._song.tempo_base if self._song.tempo_base else 1
-            # Max representable BPM at the current tbs is floor(255*tbs/2).
-            max_bpm_for_tbs = (255 * tbs) // 2
-            if value > max_bpm_for_tbs and tbs < 2:
-                self._song.tempo_base = 2
-                tbs = 2
+            # cmd.value must store the evaluated expression BPM * tbs / 2.
+            # Storing raw BPM caused _raw_tempo() to double the byte every
+            # save, and the old tbs-upgrade logic further corrupted speed
+            # by changing the scale factor without adjusting the display BPM.
+            # The spinbox range (20-510) means BPM * tbs / 2 ≤ 255 for tbs=1
+            # (510 / 2 = 255), so no byte overflow is possible without upgrading.
             for cmd in self._song.tracks[0].commands:
                 if cmd.cmd == 'TEMPO':
-                    cmd.value = value
+                    cmd.value = int(value * tbs / 2)
                     break
 
         # Update sequencer playback speed if playing

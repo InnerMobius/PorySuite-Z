@@ -49,6 +49,7 @@ from ui.custom_widgets.scroll_guard import install_scroll_guard_recursive
 _preview_song_cb = None      # Callable[[str], bool] — constant -> play it
 _open_in_sound_editor_cb = None  # Callable[[str], None] — constant -> switch page
 _stop_preview_cb = None      # Callable[[], None] — stop any playing preview
+_open_ow_sprite_cb = None    # Callable[[str], None] — gfx_const -> select in OW Graphics tab
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -6246,6 +6247,15 @@ class EventEditorTab(QWidget):
         self._open_sprite_btn.clicked.connect(self._open_sprite_folder)
         ll.addWidget(self._open_sprite_btn)
 
+        self._open_ow_graphics_btn = QPushButton("Open in OW Graphics")
+        self._open_ow_graphics_btn.setToolTip(_tt('Select this sprite in the Overworld Graphics editor tab'))
+        self._open_ow_graphics_btn.setStyleSheet(
+            "background: #2a2a3a; color: #aac; border: 1px solid #3a3a4a; "
+            "padding: 4px 12px; border-radius: 3px; font-size: 10px;"
+        )
+        self._open_ow_graphics_btn.clicked.connect(self._open_sprite_in_ow_tab)
+        ll.addWidget(self._open_ow_graphics_btn)
+
         ll.addStretch()
         splitter.addWidget(left)
 
@@ -7464,6 +7474,11 @@ class EventEditorTab(QWidget):
         if path:
             open_in_folder(path)
 
+    def _open_sprite_in_ow_tab(self):
+        gfx_const = self.gfx_combo.currentText()
+        if gfx_const and _open_ow_sprite_cb:
+            _open_ow_sprite_cb(gfx_const)
+
     def _update_xref(self, obj: dict):
         """Scan all scripts for commands that modify this object's position.
 
@@ -8038,8 +8053,9 @@ class EventEditorTab(QWidget):
         trainer_const = self._extract_trainer_const(idx) if has_cmd else ''
         item_const = self._extract_item_const(idx) if has_cmd else ''
         flag_var_const = self._extract_flag_var_const(idx) if has_cmd else ''
-        act_edit_trainer = act_edit_item = act_edit_label = None
-        if trainer_const or item_const or flag_var_const:
+        sound_const = self._extract_sound_const(idx) if has_cmd else ''
+        act_edit_trainer = act_edit_item = act_edit_label = act_open_sound = None
+        if trainer_const or item_const or flag_var_const or sound_const:
             menu.addSeparator()
         if trainer_const:
             trainer_name = _resolve_name(trainer_const)
@@ -8053,6 +8069,9 @@ class EventEditorTab(QWidget):
             label_name = _resolve_name(flag_var_const)
             act_edit_label = menu.addAction(
                 f'Edit Label ({label_name})')
+        if sound_const and _open_in_sound_editor_cb:
+            act_open_sound = menu.addAction(
+                f'Open in Sound Editor ({sound_const})')
 
         action = menu.exec(self._cmd_list.mapToGlobal(pos))
         if action == act_edit and has_cmd:
@@ -8081,6 +8100,8 @@ class EventEditorTab(QWidget):
             self.jump_to_item.emit(item_const)
         elif action and action == act_edit_label and flag_var_const:
             self.jump_to_label.emit(flag_var_const)
+        elif action and action == act_open_sound and sound_const:
+            _open_in_sound_editor_cb(sound_const)
 
     def _extract_trainer_const(self, idx: int) -> str:
         """Return TRAINER_* constant from the command at idx, or ''."""
@@ -8132,6 +8153,18 @@ class EventEditorTab(QWidget):
             arg = str(cmd_tuple[1])
             if arg.startswith(('FLAG_', 'VAR_')):
                 return arg
+        return ''
+
+    def _extract_sound_const(self, idx: int) -> str:
+        """Return the sound constant from a playbgm/playse/playfanfare command, or ''."""
+        if idx < 0 or idx >= len(self._cmd_tuples):
+            return ''
+        cmd_tuple = self._cmd_tuples[idx]
+        if not cmd_tuple or len(cmd_tuple) < 2:
+            return ''
+        cmd = cmd_tuple[0]
+        if cmd in ('playbgm', 'playse', 'playfanfare'):
+            return str(cmd_tuple[1])
         return ''
 
     def _on_edit_command(self, item: QListWidgetItem):

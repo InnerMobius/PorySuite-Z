@@ -7,6 +7,7 @@ song_table.inc, songs.h, and midi.cfg.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 
 import mido
+
+_log = logging.getLogger("SoundEditor.MidiImport")
 
 
 # ── General MIDI instrument names (0-127) ──────────────────────────────────
@@ -253,6 +256,81 @@ def _abs_to_delta(msgs: list) -> None:
         prev = abs_t
 
 
+def _deduplicate_simultaneous_notes(mid: mido.MidiFile) -> mido.MidiFile:
+    """Remove duplicate simultaneous note_on events per channel per tick.
+
+    When multiple note_on events fire on the same channel at the same absolute
+    tick (e.g. kick+hihat+snare all on beat 1 of a drum track), mid2agb emits
+    a separate NOTE command for every one. This bloats the per-track event
+    count and causes mid2agb to truncate the track before the song ends.
+
+    For each (channel, absolute_tick) group with more than one note_on, we keep
+    only the highest-velocity note and drop the rest (plus their matching
+    note_offs). No audible impact on GBA playback: M4A is monophonic per
+    channel, so only one note plays at a time anyway.
+    """
+    out = mido.MidiFile(type=mid.type, ticks_per_beat=mid.ticks_per_beat)
+
+    for track in mid.tracks:
+        # Convert to absolute times (works for both Message and MetaMessage)
+        abs_msgs = []
+        t = 0
+        for msg in track:
+            t += msg.time
+            abs_msgs.append(msg.copy(time=t))
+
+        # Group note_ons by (channel, absolute_tick) — only real note_on events
+        simultaneous: dict[tuple, list] = {}
+        for i, msg in enumerate(abs_msgs):
+            if msg.type == 'note_on' and msg.velocity > 0:
+                key = (msg.channel, msg.time)
+                simultaneous.setdefault(key, []).append((i, msg.note, msg.velocity))
+
+        # For each group with >1 note_on, keep highest velocity, drop the rest
+        drop_indices: set[int] = set()
+        # bag of (channel, note) → remaining note_offs to drop for each dropped note_on
+        drop_note_off_bag: dict[tuple, int] = {}
+        for group in simultaneous.values():
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda x: x[2], reverse=True)  # sort by velocity desc
+            for idx, note, _vel in group[1:]:
+                drop_indices.add(idx)
+                key = (abs_msgs[idx].channel, note)
+                drop_note_off_bag[key] = drop_note_off_bag.get(key, 0) + 1
+
+        # Drop matching note_offs for each dropped note_on (one-for-one).
+        # IMPORTANT: check msg.type BEFORE accessing .channel — MetaMessage
+        # objects (end_of_track, set_tempo, etc.) have no .channel attribute.
+        for i, msg in enumerate(abs_msgs):
+            if i in drop_indices:
+                continue
+            if msg.type not in ('note_off', 'note_on'):
+                continue
+            if msg.type == 'note_off' or msg.velocity == 0:
+                key = (msg.channel, msg.note)
+                if drop_note_off_bag.get(key, 0) > 0:
+                    drop_indices.add(i)
+                    drop_note_off_bag[key] -= 1
+                    if drop_note_off_bag[key] == 0:
+                        del drop_note_off_bag[key]
+
+        dropped = len(drop_indices)
+        if dropped:
+            _log.debug(
+                "dedup track: dropped %d simultaneous note_on(s) "
+                "(was %d events, now %d)",
+                dropped, len(abs_msgs), len(abs_msgs) - dropped,
+            )
+
+        # Rebuild track with delta times
+        clean = [msg for i, msg in enumerate(abs_msgs) if i not in drop_indices]
+        _abs_to_delta(clean)
+        out.tracks.append(mido.MidiTrack(clean))
+
+    return out
+
+
 def run_mid2agb(
     project_root: str,
     midi_path: str,
@@ -302,6 +380,11 @@ def run_mid2agb(
         # Convert Type 0 → Type 1: split single track into per-channel tracks
         if mid.type == 0 and len(mid.tracks) == 1:
             mid = _split_type0_to_type1(mid)
+
+        # Remove simultaneous note_ons on the same channel at the same tick.
+        # Drum tracks especially can have kick+snare+cymbal all at beat 1,
+        # which bloats mid2agb's per-track event buffer and causes truncation.
+        mid = _deduplicate_simultaneous_notes(mid)
 
         mid.save(midi_dest)
     except Exception:

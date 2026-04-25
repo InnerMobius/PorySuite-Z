@@ -72,16 +72,21 @@ class WarpValidator:
                     issues.append(WarpIssue(path, i, target))
         return issues
 
-    def clean_invalid_warps(self) -> int:
+    def clean_invalid_warps(self) -> tuple[int, list[str]]:
+        """Remove invalid warp events from all map.json files.
+
+        Returns (removed_count, affected_map_folders).
+        """
         issues = self.find_invalid_warps()
         if not issues:
-            return 0
+            return 0, []
 
         by_map: dict[str, list[int]] = {}
         for issue in issues:
             by_map.setdefault(issue.map_path, []).append(issue.index)
 
         removed = 0
+        affected_folders: list[str] = []
         for path, indices in by_map.items():
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -94,5 +99,7 @@ class WarpValidator:
             with open(path, 'w', encoding='utf-8', newline='\n') as f:
                 json.dump(data, f, indent=2)
                 f.write('\n')
+            # Extract folder name (parent dir of map.json)
+            affected_folders.append(os.path.basename(os.path.dirname(path)))
 
-        return removed
+        return removed, affected_folders

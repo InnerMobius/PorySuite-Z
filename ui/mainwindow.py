@@ -3557,7 +3557,6 @@ QTabBar::tab:hover:!selected {
             ("UNBREEDABLE", "Egg Group: Undiscovered"),
             ("GENDERLESS", "Genderless"),
             ("NO_FLIP", "No Flip"),
-            ("STARTER", "Starter"),
             ("IN_NATDEX", "In National Dex"),
             ("IN_REGDEX", "In Regional Dex"),
         ]
@@ -3565,7 +3564,6 @@ QTabBar::tab:hover:!selected {
             "UNBREEDABLE": "Species cannot breed (egg group: UNDISCOVERED).",
             "GENDERLESS": "Species is genderless in-game (genderRatio = 255).",
             "NO_FLIP": "Rendering hint: do not flip sprites.",
-            "STARTER": "Mark as a starter (writes src/data/starters.json).",
             "IN_NATDEX": "Managed by NATIONAL_DEX enum in include/constants/pokedex.h.",
             "IN_REGDEX": "Managed by KANTO_DEX_COUNT in include/constants/pokedex.h.",
         }
@@ -4452,10 +4450,6 @@ QTabBar::tab:hover:!selected {
         if hasattr(self.ui, "species_flags"):
             try:
                 # Read concrete fields and set checkbox states for every species
-                try:
-                    starters_list = self.source_data.get_pokemon_starters() if hasattr(self.source_data, 'get_pokemon_starters') else []
-                except Exception:
-                    starters_list = []
                 # Build quick membership sets for dex lists
                 natdex_species = set()
                 for d in self.source_data.get_national_dex() or []:
@@ -4495,9 +4489,6 @@ QTabBar::tab:hover:!selected {
                         orig = self.source_data.get_species_info(species, "eggGroups", form) or []
                         item.setData(1000, orig)
                         item.setCheckState(Qt.CheckState.Checked if isinstance(orig, list) and "EGG_GROUP_UNDISCOVERED" in orig else Qt.CheckState.Unchecked)
-                    elif key == "STARTER":
-                        item.setData(1000, starters_list)
-                        item.setCheckState(Qt.CheckState.Checked if species in starters_list else Qt.CheckState.Unchecked)
                     elif key == "IN_NATDEX":
                         item.setData(1000, None)
                         item.setCheckState(Qt.CheckState.Checked if species in natdex_species else Qt.CheckState.Unchecked)
@@ -4951,10 +4942,6 @@ QTabBar::tab:hover:!selected {
         if hasattr(self.ui, "species_flags"):
             try:
                 # Update concrete fields from flag checkboxes
-                try:
-                    starters_list = self.source_data.get_pokemon_starters() if hasattr(self.source_data, 'get_pokemon_starters') else []
-                except Exception:
-                    starters_list = []
                 for i in range(self.ui.species_flags.count()):
                     item = self.ui.species_flags.item(i)
                     try:
@@ -4978,22 +4965,6 @@ QTabBar::tab:hover:!selected {
                                 orig = item.data(1000)
                                 if isinstance(orig, list):
                                     update_if_needed("eggGroups", orig)
-                        elif key == "STARTER":
-                            sd = getattr(self, 'source_data', None)
-                            if sd and isinstance(getattr(sd, 'data', None), dict):
-                                sl = sd.data.get('starters') or []
-                                if checked and species not in sl:
-                                    sl.append(species)
-                                    sd.data['starters'] = sl
-                                    sd.pending_changes = True
-                                    updated = True
-                                if (not checked) and species in sl:
-                                    sl = [s for s in sl if s != species]
-                                    sd.data['starters'] = sl
-                                    sd.pending_changes = True
-                                    updated = True
-                            else:
-                                item.setData(1001, checked)
                         elif key in ("IN_NATDEX", "IN_REGDEX"):
                             pd = getattr(self.source_data, 'data', {}).get('pokedex')
                             pdata = getattr(pd, 'data', {}) if pd else {}

@@ -3198,3 +3198,35 @@ class OverworldGraphicsTab(QWidget):
         errors.extend(fe_errors)
 
         return ok, errors
+
+    # ── Public navigation API ────────────────────────────────────────────────
+
+    def select_sprite_by_gfx_const(self, gfx_const: str) -> bool:
+        """Switch to the NPC Sprites sub-tab and select the sprite for gfx_const.
+
+        Returns True if the sprite was found and selected, False if not found.
+        """
+        entry = self._all_sprites.get(gfx_const)
+        if not entry:
+            return False
+
+        # Switch to NPC Sprites sub-tab (index 0)
+        self._ow_tabs.setCurrentIndex(0)
+
+        # Set category filter to match the sprite's category so it's visible
+        for i in range(self._cat_combo.count()):
+            if self._cat_combo.itemData(i) == entry.category:
+                self._cat_combo.blockSignals(True)
+                self._cat_combo.setCurrentIndex(i)
+                self._cat_combo.blockSignals(False)
+                break
+
+        # Clear any search text so the sprite isn't hidden by a filter
+        self._search.blockSignals(True)
+        self._search.clear()
+        self._search.blockSignals(False)
+
+        # Rebuild grid now that filters are updated, then select the sprite
+        self._rebuild_grid()
+        self._on_sprite_clicked(entry)
+        return True

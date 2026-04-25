@@ -83,6 +83,8 @@ class MapRenamer:
         new_folder = new_folder or map_folder
         old_id = f"MAP_{map_folder.upper()}"
         new_id = new_id or old_id
+        # map.json 'name' is always kept in sync with the folder name.
+        # External tools (Porymap, mapjson) rely on this convention.
 
         if map_folder != new_folder:
             old_path = os.path.join(self.maps_dir, map_folder)
@@ -362,5 +364,4 @@ class MapRenamer:
                             return sec
                     except Exception:
                         pass
-        sec_guess = 'MAPSEC_' + re.sub(r'(?<=[a-z0-9])(?=[A-Z0-9])', '_', base).upper()
         return None
