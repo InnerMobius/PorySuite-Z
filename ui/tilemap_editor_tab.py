@@ -345,8 +345,10 @@ class PaletteEditorWidget(QWidget):
 class TilemapCanvas(QWidget):
     """Renders and allows editing of a tilemap."""
 
-    tile_clicked = pyqtSignal(int, int)  # col, row
-    tile_hovered = pyqtSignal(int, int)  # col, row
+    tile_clicked = pyqtSignal(int, int)    # col, row — left button
+    tile_hovered = pyqtSignal(int, int)    # col, row
+    tile_eyedrop = pyqtSignal(int, int)    # col, row — right button
+    stroke_finished = pyqtSignal()         # left-button release — commit to undo
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -400,7 +402,8 @@ class TilemapCanvas(QWidget):
         if not self._tilemap or not self._sheet or not self._rendered:
             return
         from core.tilemap_data import (
-            _recolor_tile, _recolor_tile_8bpp, build_flat_color_table,
+            _recolor_tile, _recolor_tile_8bpp, _recolor_tile_8bpp_attr,
+            build_flat_color_table,
         )
         entry = self._tilemap.get(col, row)
 
@@ -419,8 +422,18 @@ class TilemapCanvas(QWidget):
         )
         if use_palettes and tile_img.format() == QImage.Format.Format_Indexed8:
             if self._sheet.is_8bpp:
-                flat_ct = build_flat_color_table(self._palettes)
-                tile_img = _recolor_tile_8bpp(tile_img, flat_ct)
+                # Region-map style: 8bpp PNG holds multiple sub-palettes
+                # baked side-by-side, but the GBA actually renders this
+                # as 4bpp with the .bin entry's attr-palette selecting
+                # which sub-palette to use. Render to MATCH the GBA so
+                # the editor canvas is WYSIWYG. If only one palette is
+                # loaded, fall through to flat 8bpp (true 256-color BG mode).
+                if self._palettes.palette_count() > 1:
+                    tile_img = _recolor_tile_8bpp_attr(
+                        tile_img, entry.palette, self._palettes)
+                else:
+                    flat_ct = build_flat_color_table(self._palettes)
+                    tile_img = _recolor_tile_8bpp(tile_img, flat_ct)
             else:
                 tile_img = _recolor_tile(tile_img, entry.palette, self._palettes)
 
@@ -482,6 +495,11 @@ class TilemapCanvas(QWidget):
                 self.tile_clicked.emit(col, row)
                 if self._paint_callback:
                     self._paint_callback(col, row)
+        elif event.button() == Qt.MouseButton.RightButton:
+            # Right-click is always eyedrop, regardless of current tool mode.
+            col, row = self._tile_at(event.pos())
+            if col >= 0:
+                self.tile_eyedrop.emit(col, row)
 
     def mouseMoveEvent(self, event):
         col, row = self._tile_at(event.pos())
@@ -493,7 +511,11 @@ class TilemapCanvas(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._painting = False
+            if self._painting:
+                self._painting = False
+                # Tell the tab the drag is over so it can commit the stroke
+                # to the undo stack as ONE entry (not one per cell painted).
+                self.stroke_finished.emit()
 
     def wheelEvent(self, event: QWheelEvent):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -626,6 +648,7 @@ class TilemapEditorTab(QWidget):
     """Full tilemap editor page for the unified toolbar."""
 
     modified = pyqtSignal()
+    tilemap_saved = pyqtSignal(str)   # absolute path of the saved .bin
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -641,7 +664,20 @@ class TilemapEditorTab(QWidget):
         self._tool = "paint"  # "paint" or "pick"
         self._tile_offset = 0  # VRAM tile offset for current sheet
         self._last_open_dir = ""  # remembers last Open dialog folder
+
+        # ── Undo/redo (Ctrl+Z / Ctrl+Y) ─────────────────────────────────────
+        # A drag-paint stroke is a single undo step. _current_stroke
+        # captures the OLD entry of every cell touched during the active
+        # drag — committed to _undo_stack on mouse release. Cells already
+        # in _current_stroke aren't re-recorded (so dragging back over
+        # the same cell doesn't lose the original-original entry).
+        self._undo_stack: list[dict] = []  # list[{(col,row): old_TileEntry}]
+        self._redo_stack: list[dict] = []
+        self._current_stroke: dict = {}
+        self._undo_limit = 100             # cap to bound memory
+
         self._build_ui()
+        self._install_undo_shortcuts()
 
     def set_project(self, project_dir: str):
         self._project_dir = project_dir
@@ -696,6 +732,27 @@ class TilemapEditorTab(QWidget):
         self._btn_save.clicked.connect(self._save_file)
         tb.addWidget(self._btn_save)
 
+        self._btn_reveal = QPushButton("Open in Folder")
+        self._btn_reveal.setToolTip(
+            "Reveal the current tilemap, tile sheet, and palette files in "
+            "your OS file manager. Useful for editing the .png in an "
+            "external image editor.")
+        self._btn_reveal.setEnabled(False)
+        self._btn_reveal.clicked.connect(self._on_reveal_in_folder)
+        tb.addWidget(self._btn_reveal)
+
+        self._btn_autofix = QPushButton("Auto-Fix Palettes")
+        self._btn_autofix.setToolTip(
+            "Scan every tile in this tilemap and set its sub-palette bits "
+            "to match the dominant 16-color range in the tile's pixel "
+            "data. Use this after upgrading PorySuite-Z if a tilemap was "
+            "saved before the multi-palette fix and now renders with "
+            "wrong colors. One undo step. No-op for true 4bpp / "
+            "single-palette 8bpp sheets.")
+        self._btn_autofix.setEnabled(False)
+        self._btn_autofix.clicked.connect(self._on_autofix_palettes)
+        tb.addWidget(self._btn_autofix)
+
         tb.addSeparator()
 
         # Tile sheet selector
@@ -704,6 +761,17 @@ class TilemapEditorTab(QWidget):
         self._sheet_combo.setMinimumWidth(200)
         self._sheet_combo.currentIndexChanged.connect(self._on_sheet_changed)
         tb.addWidget(self._sheet_combo)
+
+        self._btn_reveal_sheet = QPushButton("Open Sheet")
+        self._btn_reveal_sheet.setToolTip(
+            "Reveal the currently-selected tile sheet (.png) in your OS "
+            "file manager. Use this to open the sheet in an external "
+            "image editor (GIMP, Aseprite, etc.). When you save the "
+            ".png and return to PorySuite, the editor reloads it next "
+            "time you change sheets or reload the tilemap.")
+        self._btn_reveal_sheet.setEnabled(False)
+        self._btn_reveal_sheet.clicked.connect(self._on_reveal_sheet_in_folder)
+        tb.addWidget(self._btn_reveal_sheet)
 
         tb.addSeparator()
 
@@ -762,6 +830,8 @@ class TilemapEditorTab(QWidget):
         self._canvas = TilemapCanvas()
         self._canvas.tile_clicked.connect(self._on_canvas_click)
         self._canvas.tile_hovered.connect(self._on_canvas_hover)
+        self._canvas.tile_eyedrop.connect(self._on_canvas_eyedrop)
+        self._canvas.stroke_finished.connect(self._on_stroke_finished)
         self._canvas.set_paint_callback(self._paint_tile)
 
         canvas_scroll = QScrollArea()
@@ -927,7 +997,14 @@ class TilemapEditorTab(QWidget):
         self._last_open_dir = os.path.dirname(path)
         self._load_tilemap(path)
 
-    def _load_tilemap(self, bin_path: str):
+    def _load_tilemap(self, bin_path: str,
+                      sheet_override: str = "",
+                      palette_override: str = ""):
+        """Open a .bin tilemap. Auto-discovers .png + .pal/.gbapal in the
+        same directory unless explicit overrides are passed (used by
+        cross-tab nav from Region Map, which knows the exact sheet/palette
+        to use even when name-matching auto-discovery wouldn't pick them).
+        """
         from core.tilemap_data import (
             Tilemap, TileSheet, PaletteSet, discover_assets,
         )
@@ -948,8 +1025,16 @@ class TilemapEditorTab(QWidget):
         self._width_spin.blockSignals(False)
         self._height_spin.blockSignals(False)
 
-        # Auto-discover assets
+        # Auto-discover assets, then apply explicit overrides on top.
         assets = discover_assets(bin_path)
+        if sheet_override:
+            assets.best_sheet = sheet_override
+            if sheet_override not in assets.tile_sheets:
+                assets.tile_sheets.insert(0, sheet_override)
+        if palette_override:
+            assets.best_pals = [palette_override]
+            if palette_override not in assets.pal_files:
+                assets.pal_files.insert(0, palette_override)
 
         # Populate sheet combo
         self._sheet_combo.blockSignals(True)
@@ -1006,20 +1091,49 @@ class TilemapEditorTab(QWidget):
         self._canvas.set_data(self._tilemap, self._sheet, self._palettes)
         self._picker.set_sheet(self._sheet, self._palettes)
 
-        # In 8bpp mode, palette bits are ignored by hardware — disable the
-        # per-tile palette spinner and show a tooltip explaining why
+        # 8bpp + single palette = true 256-color BG mode (palette bits
+        # ignored by hardware). 8bpp + multi-palette = region-map style
+        # (.png holds multiple sub-palettes baked, but the GBA renders
+        # 4bpp with attr-palette selection — the spinner DOES matter).
+        # 4bpp = always relevant.
         is_8bpp = self._sheet and self._sheet.is_8bpp
-        self._pal_spin.setEnabled(not is_8bpp)
-        if is_8bpp:
+        multi_pal = (
+            self._palettes is not None
+            and self._palettes.palette_count() > 1
+        )
+        spinner_meaningful = (not is_8bpp) or multi_pal
+        self._pal_spin.setEnabled(spinner_meaningful)
+        if is_8bpp and not multi_pal:
             self._pal_spin.setToolTip(
-                "Palette slot is ignored in 8bpp mode.\n"
+                "Palette slot is ignored in true 256-color BG mode.\n"
                 "All 256 colors are used directly from the full palette."
+            )
+        elif is_8bpp and multi_pal:
+            self._pal_spin.setToolTip(
+                "Sub-palette index for this tile (region-map style).\n"
+                "The .png stores multiple 16-color sub-palettes; the GBA\n"
+                "selects which one via the .bin entry's attr-palette bits.\n"
+                "Picking a tile from the picker auto-detects the right slot."
             )
         else:
             self._pal_spin.setToolTip("")
 
         self._btn_save.setEnabled(True)
+        self._btn_reveal.setEnabled(True)
+        # Sheet-reveal only enabled when there's actually a sheet path to show.
+        self._btn_reveal_sheet.setEnabled(bool(assets.best_sheet))
+        # Auto-Fix only does useful work for 8bpp + multi-palette sheets.
+        autofix_useful = bool(
+            self._sheet and self._sheet.is_8bpp
+            and self._palettes and self._palettes.palette_count() > 1
+        )
+        self._btn_autofix.setEnabled(autofix_useful)
         self._dirty = False
+        # Loading a different file invalidates the undo/redo history —
+        # those steps reference cells in the previous tilemap.
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._current_stroke.clear()
 
         fname = os.path.basename(bin_path)
         parent = os.path.basename(os.path.dirname(bin_path))
@@ -1061,8 +1175,123 @@ class TilemapEditorTab(QWidget):
             self._dirty = False
             self._status.setText(
                 self._status.text().split(" — Saved")[0] + " — Saved!")
+            self.tilemap_saved.emit(self._tilemap.source_path)
         except Exception as e:
             QMessageBox.warning(self, "Save Error", str(e))
+
+    def _on_reveal_in_folder(self):
+        """Open the OS file manager with the current tilemap selected."""
+        if not self._tilemap or not self._tilemap.source_path:
+            return
+        from ui.open_folder_util import open_in_folder
+        if not open_in_folder(self._tilemap.source_path):
+            QMessageBox.warning(
+                self, "Open in Folder",
+                f"Could not open folder for:\n{self._tilemap.source_path}")
+
+    def _on_reveal_sheet_in_folder(self):
+        """Open the OS file manager with the currently-selected tile
+        sheet (.png) selected — so the user can edit it externally."""
+        idx = self._sheet_combo.currentIndex()
+        sheet_path = self._sheet_combo.itemData(idx) if idx >= 0 else ""
+        if not sheet_path:
+            return
+        from ui.open_folder_util import open_in_folder
+        if not open_in_folder(sheet_path):
+            QMessageBox.warning(
+                self, "Open Sheet in Folder",
+                f"Could not open folder for:\n{sheet_path}")
+
+    def _on_autofix_palettes(self):
+        """Bulk-repair tile palette bits from the tile artwork.
+
+        For each tilemap entry, run detect_tile_palette on the tile's
+        pixel data and rewrite the entry's palette bits to match. Useful
+        when a tilemap was saved before the multi-palette renderer landed
+        — those entries have palette=0 stored regardless of which
+        sub-palette the artwork was actually drawn with.
+
+        Wrapped as one undo step so the user can revert with Ctrl+Z if
+        the result isn't what they wanted.
+        """
+        if not self._tilemap or not self._sheet or not self._palettes:
+            return
+        if not self._sheet.is_8bpp or self._palettes.palette_count() <= 1:
+            QMessageBox.information(
+                self, "Auto-Fix Palettes",
+                "This tilemap doesn't need a fix — it's not an 8bpp + "
+                "multi-palette sheet (the only case where stored palette "
+                "bits can drift from the artwork).")
+            return
+
+        from core.tilemap_data import detect_tile_palette
+        from PyQt6.QtWidgets import QMessageBox as _MB
+
+        # Pre-flight count so the user knows what they're committing to.
+        # Build a stroke dict of OLD entries for cells that will change
+        # — single undo step covers the whole pass.
+        proposed: dict = {}  # (col,row) -> new palette index
+        old_entries: dict = {}
+        cache: dict = {}     # tile_index -> detected palette (memoize)
+        for row in range(self._tilemap.height):
+            for col in range(self._tilemap.width):
+                entry = self._tilemap.get(col, row)
+                idx = entry.tile_index
+                if idx in cache:
+                    detected = cache[idx]
+                else:
+                    try:
+                        local_idx = idx - self._tile_offset
+                        if local_idx < 0 or local_idx >= self._sheet.tile_count:
+                            cache[idx] = entry.palette
+                            continue
+                        tile_img = self._sheet.get_tile_image(local_idx, False, False)
+                        detected = detect_tile_palette(tile_img)
+                    except Exception:
+                        cache[idx] = entry.palette
+                        continue
+                    cache[idx] = detected
+                if detected != entry.palette:
+                    proposed[(col, row)] = detected
+                    old_entries[(col, row)] = self._copy_entry(entry)
+
+        if not proposed:
+            _MB.information(
+                self, "Auto-Fix Palettes",
+                "No changes needed — every tile's stored palette already "
+                "matches its dominant artwork range.")
+            return
+
+        reply = _MB.question(
+            self, "Auto-Fix Palettes",
+            f"{len(proposed)} tile cell(s) have a stored palette that "
+            f"doesn't match the artwork's dominant sub-palette range.\n\n"
+            f"Auto-fix all of them in one undo step?")
+        if reply != _MB.StandardButton.Yes:
+            return
+
+        from core.tilemap_data import TileEntry
+        for (col, row), new_pal in proposed.items():
+            entry = self._tilemap.get(col, row)
+            new_entry = TileEntry(
+                tile_index=entry.tile_index,
+                hflip=entry.hflip,
+                vflip=entry.vflip,
+                palette=new_pal,
+            )
+            self._tilemap.set(col, row, new_entry)
+            self._canvas.refresh_tile(col, row)
+
+        # Commit as one undo entry.
+        self._undo_stack.append(old_entries)
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._dirty = True
+        self.modified.emit()
+        self._status.setText(
+            self._status.text().split(" — ")[0]
+            + f" — Auto-fixed {len(proposed)} tile palette(s)")
 
     def has_unsaved_changes(self) -> bool:
         return self._dirty
@@ -1074,6 +1303,7 @@ class TilemapEditorTab(QWidget):
         try:
             self._tilemap.save()
             self._dirty = False
+            self.tilemap_saved.emit(self._tilemap.source_path)
             return (1, [])
         except Exception as e:
             return (0, [str(e)])
@@ -1122,24 +1352,36 @@ class TilemapEditorTab(QWidget):
         self._btn_paint.setChecked(tool == "paint")
         self._btn_pick.setChecked(tool == "pick")
 
+    def _eyedrop_tile(self, col: int, row: int):
+        """Pick the tile at (col, row) and load it as the current paint
+        tile — sets tile index, palette, hflip, vflip, and refreshes the
+        picker selection + preview."""
+        if not self._tilemap:
+            return
+        entry = self._tilemap.get(col, row)
+        self._current_tile = entry.tile_index
+        self._current_pal = entry.palette
+        self._hflip = entry.hflip
+        self._vflip = entry.vflip
+        self._update_tile_info()
+        self._picker._selected = entry.tile_index
+        self._picker.update()
+
+    def _on_canvas_eyedrop(self, col: int, row: int):
+        """Right-click handler — eyedrop regardless of current tool mode."""
+        self._eyedrop_tile(col, row)
+
     def _paint_tile(self, col: int, row: int):
         """Called when canvas is clicked/dragged in paint mode."""
         if not self._tilemap:
             return
 
         if self._tool == "pick":
-            # Eyedropper: pick tile from tilemap
-            entry = self._tilemap.get(col, row)
-            self._current_tile = entry.tile_index
-            self._current_pal = entry.palette
-            self._hflip = entry.hflip
-            self._vflip = entry.vflip
-            self._update_tile_info()
-            self._picker._selected = entry.tile_index
-            self._picker.update()
+            # Pick-tool mode (left-click eyedrop) — same as right-click eyedrop.
+            self._eyedrop_tile(col, row)
             return
 
-        # Paint mode: place current tile
+        # Paint mode: place current tile.
         from core.tilemap_data import TileEntry
         entry = TileEntry(
             tile_index=self._current_tile,
@@ -1147,10 +1389,116 @@ class TilemapEditorTab(QWidget):
             vflip=self._vflip,
             palette=self._current_pal,
         )
+        # Record the OLD entry once per cell per stroke (a drag may revisit
+        # the same cell; we only want the entry that was there before the
+        # whole stroke started). copy() to detach from any future mutation.
+        if (col, row) not in self._current_stroke:
+            old = self._tilemap.get(col, row)
+            self._current_stroke[(col, row)] = self._copy_entry(old)
+        # No-op if the new entry is identical to what's already there —
+        # avoids dirtying the file for redundant clicks.
+        existing = self._tilemap.get(col, row)
+        if self._entries_equal(existing, entry):
+            return
         self._tilemap.set(col, row, entry)
         self._canvas.refresh_tile(col, row)
         self._dirty = True
         self.modified.emit()
+
+    # ── Undo / redo ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _copy_entry(entry):
+        from core.tilemap_data import TileEntry
+        return TileEntry(
+            tile_index=entry.tile_index,
+            hflip=entry.hflip,
+            vflip=entry.vflip,
+            palette=entry.palette,
+        )
+
+    @staticmethod
+    def _entries_equal(a, b) -> bool:
+        return (a.tile_index == b.tile_index and a.hflip == b.hflip
+                and a.vflip == b.vflip and a.palette == b.palette)
+
+    def _install_undo_shortcuts(self):
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        from PyQt6.QtCore import Qt as _Qt
+        # Ctrl+Z = undo, Ctrl+Y AND Ctrl+Shift+Z = redo.
+        QShortcut(QKeySequence.StandardKey.Undo, self,
+                  activated=self._undo,
+                  context=_Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        QShortcut(QKeySequence.StandardKey.Redo, self,
+                  activated=self._redo,
+                  context=_Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        # QKeySequence.Redo on Windows is Ctrl+Y; on Mac/Linux it's
+        # Ctrl+Shift+Z. Add an explicit Ctrl+Y too so it works everywhere.
+        QShortcut(QKeySequence("Ctrl+Y"), self,
+                  activated=self._redo,
+                  context=_Qt.ShortcutContext.WidgetWithChildrenShortcut)
+
+    def _on_stroke_finished(self):
+        """Called after the user releases the mouse from a paint drag.
+        Commit the stroke (old entries for every modified cell) to the
+        undo stack as ONE step. Clear the redo stack — new edits
+        invalidate the redo history."""
+        if not self._current_stroke:
+            return
+        # Filter out cells where the stroke didn't actually change anything
+        # (e.g. user clicked a cell and the new entry matched the old).
+        actual = {}
+        for (col, row), old_entry in self._current_stroke.items():
+            current = self._tilemap.get(col, row)
+            if not self._entries_equal(current, old_entry):
+                actual[(col, row)] = old_entry
+        self._current_stroke = {}
+        if not actual:
+            return
+        self._undo_stack.append(actual)
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _apply_step(self, step: dict) -> dict:
+        """Apply a step (dict of {(col,row): TileEntry}) to the tilemap and
+        return the inverse (entries that WERE there before this step ran).
+        Used by both undo and redo."""
+        inverse = {}
+        for (col, row), entry in step.items():
+            current = self._tilemap.get(col, row)
+            inverse[(col, row)] = self._copy_entry(current)
+            self._tilemap.set(col, row, entry)
+            self._canvas.refresh_tile(col, row)
+        return inverse
+
+    def _undo(self):
+        if not self._undo_stack:
+            self._status.setText(
+                self._status.text().split(" — ")[0] + " — Nothing to undo")
+            return
+        step = self._undo_stack.pop()
+        inverse = self._apply_step(step)
+        self._redo_stack.append(inverse)
+        self._dirty = True
+        self.modified.emit()
+        self._status.setText(
+            self._status.text().split(" — ")[0]
+            + f" — Undo ({len(step)} cell(s))")
+
+    def _redo(self):
+        if not self._redo_stack:
+            self._status.setText(
+                self._status.text().split(" — ")[0] + " — Nothing to redo")
+            return
+        step = self._redo_stack.pop()
+        inverse = self._apply_step(step)
+        self._undo_stack.append(inverse)
+        self._dirty = True
+        self.modified.emit()
+        self._status.setText(
+            self._status.text().split(" — ")[0]
+            + f" — Redo ({len(step)} cell(s))")
 
     def _on_canvas_click(self, col: int, row: int):
         """Show info for clicked tile."""
@@ -1170,6 +1518,26 @@ class TilemapEditorTab(QWidget):
 
     def _on_tile_picked(self, idx: int):
         self._current_tile = idx
+        # When the sheet is 8bpp + multi-palette (region-map style), the
+        # picker tile's pixel values directly encode which sub-palette it
+        # was baked from. Auto-detect that sub-palette so painting carries
+        # the right attr-palette over to the tilemap entry — no manual
+        # spinner-twiddling per tile.
+        if (self._sheet and self._sheet.is_8bpp
+                and self._palettes is not None
+                and self._palettes.palette_count() > 1):
+            try:
+                from core.tilemap_data import detect_tile_palette
+                tile_img = self._sheet.get_tile_image(idx, False, False)
+                detected = detect_tile_palette(tile_img)
+                if detected != self._current_pal:
+                    self._current_pal = detected
+                    self._pal_spin.blockSignals(True)
+                    self._pal_spin.setValue(detected)
+                    self._pal_spin.blockSignals(False)
+                    self._picker.set_palette_index(detected)
+            except Exception:
+                pass
         self._update_tile_info()
 
     def _on_pal_changed(self, val: int):

@@ -180,7 +180,20 @@ Map and layout management with two sub-tabs:
 
 ### Region Map
 
-Visual region map editor with actual tileset graphics as background. Section assignment, region clone/rename/delete. Supports all 4 FireRed regions (Kanto + 3 Sevii). Dual layer (Map + Dungeon).
+Visual region map editor with actual tileset graphics as background. Click a cell, pick a MAPSEC from the strict dropdown, and the assignment stages immediately (cell turns amber until you save). Hover line under the map shows `(x, y)  MAPSEC_NAME` live as the cursor moves.
+
+**Region management — staged in memory, flushed on Ctrl+S:**
+
+- **Create New Region** — fresh blank region (empty MAPSEC grid, blank tilemap). Best for "I want a new dungeon / area to paint from scratch."
+- **Clone Region** — copies the source region's tilemap **artwork** under a new name. The MAPSEC grid starts blank — you paint which MAPSECs the new region should own. Two regions can't both claim the same MAPSEC (the engine routes to whichever slot comes later in the enum), so the clone deliberately avoids duplicating the grid.
+- **Rename Region** — renames the folder, files, and engine constant. Scans the project for external references to the old `REGIONMAP_<NAME>` constant and warns if the build will fail (so you can update them first).
+- **Delete Region** — removes the region everywhere. Same external-reference scan as rename. Refuses to delete the last remaining region. Lists in plain English exactly what'll be removed (layout file, .bin, enum entry, lookup entries, visibility gates) before you confirm.
+
+**Engine codegen** — `src/region_map.c` is rewritten between `// PORYSUITE-REGIONS-START / END` markers on every save with region changes. Eight blocks managed: enum, INCBINs, includes, decompress dispatch, player-region lookup table, player-region detect, get_section dispatch, story-flag visibility gates. First-time edit warning fires before the first staging op so you can back up to git first. Atomic write via temp + rename — no `.bak` files.
+
+**Live name sanitizer** — typing `Hyrule Overworld` becomes `hyrule_overworld` as you type. Reserved C keywords, name collisions, and invalid characters are blocked.
+
+**Open in Tilemap Editor** button jumps to the Tilemap Editor with the current region's `.bin`, `.png`, and `.gbapal` pre-loaded.
 
 ![Region Map](regionmap%20editor.png)
 
@@ -196,16 +209,20 @@ GBA `.bin` tilemap viewer and editor with three sub-tabs:
 
 **Tilemap Editor:**
 
-- **Open any tilemap** from `graphics/` -- auto-discovers matching tile sheet (`.png`) and palettes (`.pal` files). File dialog remembers the last folder you opened from within a session.
+- **Open any tilemap** from `graphics/` -- auto-discovers matching tile sheet (`.png`) and palettes (`.pal` AND `.gbapal` files). File dialog remembers the last folder you opened from within a session.
 - **4bpp and 8bpp support** -- auto-detects color depth from PNG color table size. Title screen logos and other 256-color tilemaps render correctly.
+- **Multi-palette 8bpp support (region-map style)** -- when an 8bpp PNG ships alongside a multi-palette `.gbapal` (multiple sub-palettes baked into one 256-color image — like `region_map.gbapal`), the canvas renders in GBA-accurate mode using the per-tile attr palette so what you see matches what the GBA draws. Picking a tile from the picker auto-detects which sub-palette it was baked from and sets the Pal spinner accordingly.
+- **Auto-Fix Palettes button** -- bulk-repair pass that scans every tile in the current tilemap and rewrites stored palette bits to match the dominant 16-color range in the tile artwork. Useful after upgrading PorySuite-Z if a tilemap was saved before the multi-palette fix and now renders with wrong colors. One undo step.
 - **Rendered preview** with correct palettes, tile flips, and zoom (1-8x) with grid overlay
 - **Paint tool** -- click/drag tiles from the tile picker onto the tilemap
-- **Eyedropper tool** -- pick tiles from the tilemap
+- **Eyedropper tool** -- right-click any tile on the canvas to instantly pick it (sets tile index, palette, hflip, vflip). Left-click pick-tool mode also works.
+- **Undo/Redo** -- Ctrl+Z / Ctrl+Y (also Ctrl+Shift+Z). A drag-paint counts as ONE undo step regardless of how many cells you swept across. 100-step history.
 - **Per-tile controls** -- palette slot, horizontal/vertical flip
 - **Tile offset** -- VRAM base address spinner (0-1023) for games that load tile sheets at non-zero offsets
 - **Dimension re-wrap** -- changing width auto-recalculates height to keep all tilemap entries (never truncates)
 - **Visual palette editor** -- 16 palette slots shown as color swatch rows. **Double-click any color swatch to edit it** with a color picker (GBA 15-bit clamped). Right-click for Import .pal (JASC format), Export .pal, Extract from PNG, Export All. Color-coded slot labels: white = loaded & used, red = needed & missing, grey = loaded & unused
-- **Smart palette loading** -- only name-matching .pal files are auto-loaded (e.g. `solarbeam.bin` -> `solarbeam.pal`). Non-matching .pal files in the same directory are excluded so PNG colors (almost always correct) are used by default when no dedicated .pal exists.
+- **Smart palette loading** -- name-matching `.pal` / `.gbapal` files auto-load (e.g. `solarbeam.bin` → `solarbeam.pal`). Falls back to a single multi-palette file in the same dir when no name match exists (the canonical "shared palette across many tilemaps" case, like `region_map.gbapal` for every `<region>.bin`).
+- **Open in Folder** (next to Save) reveals the current `.bin` tilemap in your OS file manager. **Open Sheet** (next to the Tile Sheet combo) reveals the currently-selected tile sheet `.png` so you can edit it in an external image editor (GIMP, Aseprite, etc.). When you save the tilemap, the editor broadcasts a `file_saved` signal app-wide, so dependent views (like the Region Map tab) refresh automatically.
 - **Palette source toggle** -- "Auto .pal files" (loads from project's palette directory) or "PNG colors" (uses tile sheet's own color table)
 - **Save** -- integrated with the app's File > Save pipeline. Tile changes mark the window dirty; saving writes the `.bin` file alongside all other editors.
 

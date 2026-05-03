@@ -8,7 +8,7 @@ The map/world management and event editing side of PorySuite-Z. EVENTide's edito
 |------|---------|
 | **EVENTide** | RMXP-style visual script editor — the main editing surface |
 | **Maps** | Two sub-tabs: **Map Manager** (map renaming, group management, section renaming, move/delete maps, warp validation) and **Layouts & Tilesets** (layout renaming/deletion, orphan cleanup, tileset reassignment) |
-| **Region Map** | Visual region map editor — section assignment, region clone/rename/delete, dual layer (map + dungeon) |
+| **Region Map** | Visual region map editor — staged MAPSEC assignment, region create/clone/rename/delete with engine codegen (`src/region_map.c` rewritten between marker comments), external-reference scan, "Open in Tilemap Editor" cross-tab nav |
 
 ## Event Editor
 

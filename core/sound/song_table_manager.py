@@ -427,6 +427,37 @@ def rename_song(
         if old_s != new_s and os.path.isfile(old_s):
             os.remove(old_s)
 
+    # Rename the companion .mid file if it exists.
+    # CRITICAL: Make's audio rule infers the .s target from the .mid filename.
+    # If the .mid keeps its old name, every build will try to assemble a .s
+    # that no longer exists at that path, producing:
+    #   "can't open sound/songs/midi/<old_label>.s for reading"
+    # Also clean up any stale compiled .o under build/*/sound/songs/midi/
+    # baked from the old .mid name so the linker doesn't pull a dead object.
+    old_mid = os.path.join(midi_dir, old_midi)
+    new_mid = os.path.join(midi_dir, entry.midi_filename)
+    if os.path.isfile(old_mid) and old_mid != new_mid:
+        try:
+            if os.path.isfile(new_mid):
+                os.remove(new_mid)
+            os.rename(old_mid, new_mid)
+        except OSError:
+            # Non-fatal: the rename will surface as a build error and the
+            # user can retry. Better than crashing the rename action.
+            pass
+
+    # Sweep stale .o objects compiled from the old name out of build/.
+    build_root = os.path.join(project_root, 'build')
+    if os.path.isdir(build_root):
+        old_o_name = f'{old_label}.o'
+        for sub in os.listdir(build_root):
+            stale_o = os.path.join(build_root, sub, 'sound', 'songs', 'midi', old_o_name)
+            if os.path.isfile(stale_o):
+                try:
+                    os.remove(stale_o)
+                except OSError:
+                    pass
+
     return new_label
 
 

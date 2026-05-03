@@ -301,6 +301,13 @@ def inject_bridge_script(project_dir: str):
 
     This is the 'parasite' — every project the user opens automatically gets
     our bridge script injected into Porymap's custom scripts list.
+
+    CRITICAL: This function MUST prune stale `porysuite_bridge.mjs` entries
+    that point at a previous install location (e.g. an older versioned folder
+    like `PorySuite-Z-0.0.4b/`). Porymap loads every script in `custom_scripts`
+    and shows a "Failed to find script file" popup for any missing path. If a
+    user upgrades by installing into a new folder, the stale entry must be
+    replaced — not appended next to.
     """
     cfg_path = porymap_user_config_path(project_dir)
     data = _read_cfg(cfg_path)
@@ -308,23 +315,39 @@ def inject_bridge_script(project_dir: str):
     script_path = bridge_script_path().replace("\\", "/")
     existing_scripts = data.get("custom_scripts", "")
 
-    # Porymap stores custom_scripts as: "path1:1,path2:1" where :1=enabled, :0=disabled
-    if script_path in existing_scripts:
-        # Clean up any old wrong-format entries (1:path instead of path:1)
-        if f"1:{script_path}" in existing_scripts:
-            existing_scripts = existing_scripts.replace(f"1:{script_path}", f"{script_path}")
-            data["custom_scripts"] = existing_scripts
-            _write_cfg(cfg_path, data)
-        return  # Already registered
+    # Porymap stores custom_scripts as: "path1:1,path2:1" where :1=enabled, :0=disabled.
+    # Split, drop any entry whose path basename is porysuite_bridge.mjs (regardless
+    # of where the parent folder is — that's the whole point), then re-append the
+    # current install's path. Keep all third-party custom scripts untouched.
+    BRIDGE_BASENAME = "porysuite_bridge.mjs"
+    cleaned: list[str] = []
+    pruned_any = False
+    for raw in existing_scripts.split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        # Each entry is "<path>:<0|1>" — but tolerate the legacy "1:<path>" form
+        # this code used to emit.
+        if entry.startswith("1:") or entry.startswith("0:"):
+            path_part = entry[2:]
+        elif entry.endswith(":1") or entry.endswith(":0"):
+            path_part = entry[:-2]
+        else:
+            path_part = entry
+        path_norm = path_part.replace("\\", "/")
+        if path_norm.rsplit("/", 1)[-1].lower() == BRIDGE_BASENAME:
+            # Drop every porysuite_bridge.mjs registration regardless of folder.
+            # We re-add the canonical one below.
+            pruned_any = True
+            continue
+        cleaned.append(entry)
 
-    # Append our script (enabled)
-    entry = f"{script_path}:1"
-    if existing_scripts:
-        data["custom_scripts"] = f"{existing_scripts},{entry}"
-    else:
-        data["custom_scripts"] = entry
+    cleaned.append(f"{script_path}:1")
+    new_value = ",".join(cleaned)
 
-    _write_cfg(cfg_path, data)
+    if new_value != existing_scripts or pruned_any:
+        data["custom_scripts"] = new_value
+        _write_cfg(cfg_path, data)
 
 
 def ensure_bridge_gitignored(project_dir: str):

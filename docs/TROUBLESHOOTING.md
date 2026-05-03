@@ -2,6 +2,31 @@
 
 This guide covers common setup issues and how to reset the application if something goes wrong. Written in plain English.
 
+## Region Map editor
+
+### I cloned a region and now the new region's tilemap shows up in-game when the player is in the source region's territory
+The clone shipped at first as a true duplicate, copying both the artwork AND the MAPSEC grid. The engine's player-region lookup matches the first region in enum order that owns the player's MAPSEC — so the clone (added later) silently shadowed the source for every shared MAPSEC.
+
+Fixed: Clone now copies the **artwork only**. The new region's MAPSEC grid starts blank — you paint which MAPSECs the new region should own. To recover an existing broken state, **delete the clone** (Delete Region → Save), then re-clone after the fix is in. The new clone will have the source's artwork as a starting point and a blank grid.
+
+If you wanted a truly empty region from the start, use **Create New Region**, not Clone.
+
+### A tilemap I edited looks fine in the Tilemap Editor but renders with wrong colors in-game
+Region-map style sheets are 8bpp PNGs that bake multiple sub-palettes side-by-side, but the GBA renders them as 4bpp tiles with per-entry attr-palette selection. Older builds of PorySuite-Z saved tilemap entries with `palette=0` regardless of which sub-palette the artwork was drawn for, so the GBA rendered with the wrong colors.
+
+Fixed in two parts:
+1. The canvas now renders in GBA-accurate mode, so what you see in the editor matches the GBA.
+2. Picking a tile from the picker auto-detects the right sub-palette and sets the spinner.
+
+For tilemaps already saved with wrong palette bits: open the affected `.bin` in the Tilemap Editor and click **Auto-Fix Palettes** in the toolbar. It scans every tile and rewrites the stored palette bits to match the dominant 16-color range in the artwork. One undo step.
+
+### Region rename / delete left my custom code referencing the old enum constant
+Both Rename Region and Delete Region now scan the project for external references to the affected `REGIONMAP_<NAME>` constant before applying. If references are found in `src/`, `include/`, or `data/`, the dialog lists them with `path:line` snippets and warns the build will fail until you update them manually. Cancel the op, fix the references, then retry.
+
+In vanilla pokefirered no code outside `region_map.c` references the region constants by name, so deletion is build-safe out of the box. Custom hacks vary.
+
+---
+
 ## v0.0.63b — recently fixed
 
 ### `src/data/items.json` keeps showing as "modified" in Git after a pull (even without editing anything)

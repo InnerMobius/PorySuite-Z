@@ -207,6 +207,30 @@ class TileSheet:
 Color = Tuple[int, int, int]  # (r, g, b) 0-255
 
 
+def _read_gbapal_file(path: str) -> List[Color]:
+    """Read a raw binary .gbapal file and return its colors as 8-bit RGB.
+
+    GBA palette format: each color is 2 bytes little-endian, encoding
+    a 15-bit BGR555 value: 0bBBBBBGGGGGRRRRR. Each 5-bit channel scales
+    to 8-bit by left-shift 3.
+    Total file size: 32 bytes per 16-color palette, up to 512 bytes for
+    a full 256-color (16-palette) file.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return []
+    colors: List[Color] = []
+    for i in range(0, len(data) - 1, 2):
+        val = data[i] | (data[i + 1] << 8)
+        r = (val & 0x1F) << 3
+        g = ((val >> 5) & 0x1F) << 3
+        b = ((val >> 10) & 0x1F) << 3
+        colors.append((r, g, b))
+    return colors
+
+
 @dataclass
 class PaletteSet:
     """Up to 16 palettes of 16 colors each."""
@@ -271,21 +295,28 @@ class PaletteSet:
 
     @staticmethod
     def from_pal_files(paths: List[str]) -> "PaletteSet":
-        """Load palettes from a list of .pal files.
+        """Load palettes from a list of .pal or .gbapal files.
 
-        Handles both 16-color .pal files (one file = one palette slot) and
-        256-color .pal files (one file = 16 palette slots, split into groups
-        of 16 colors).
+        Routes by extension: `.gbapal` is raw binary GBA palette format
+        (each color = 2 bytes little-endian, 5-bit RGB), `.pal` is JASC
+        text format. Both 16-color and 256-color files are handled — 256
+        colors split into 16 sub-palettes.
         """
-        from ui.palette_utils import read_jasc_pal
         palettes = []
         loaded = set()
         for p in paths:
-            colors = read_jasc_pal(p)
+            ext = os.path.splitext(p)[1].lower()
+            if ext == ".gbapal":
+                colors = _read_gbapal_file(p)
+            else:
+                from ui.palette_utils import read_jasc_pal
+                colors = read_jasc_pal(p)
             if not colors:
                 continue
             if len(colors) > 16:
-                # 256-color palette file — split into 16-color sub-palettes
+                # Multi-palette file — split into 16-color sub-palettes.
+                # region_map.gbapal is the canonical example: 256 colors
+                # = 16 palettes of 16, each tile picks one via attr bits.
                 for i in range(0, len(colors), 16):
                     chunk = colors[i:i + 16]
                     while len(chunk) < 16:
@@ -469,6 +500,74 @@ def _recolor_tile_8bpp(
     return recolored
 
 
+def _recolor_tile_8bpp_attr(
+    tile: QImage,
+    attr_pal: int,
+    palette_set: PaletteSet,
+) -> QImage:
+    """Render an 8bpp-stored tile as if it were a 4bpp GBA tile with
+    per-entry palette selection (the region-map case).
+
+    Region-map graphics on FireRed are 4bpp on the GBA but the .png is
+    stored as 8bpp because multiple sub-palettes' worth of baked colors
+    are needed for editing. The .bin tilemap entry's palette bits ARE
+    used by hardware — the engine selects sub-palette `attr_pal` and
+    renders pixels by their LOW 4 BITS only.
+
+    This function builds a 256-entry color table where index P maps to
+    sub-palette `attr_pal` color `(P % 16)`. Result: the displayed tile
+    matches what the GBA actually draws for any given attr_pal.
+
+    If `attr_pal` isn't loaded, falls back to palette 0.
+    """
+    effective_pal = attr_pal
+    if not palette_set.is_slot_loaded(effective_pal):
+        effective_pal = 0
+    pal: List[Color]
+    if effective_pal < palette_set.palette_count():
+        pal = list(palette_set.palettes[effective_pal])
+    else:
+        pal = []
+    while len(pal) < 16:
+        pal.append((0, 0, 0))
+    ct: List[int] = []
+    for p in range(256):
+        r, g, b = pal[p % 16]
+        # Color index 0 of any sub-palette is transparent on GBA.
+        if (p % 16) == 0:
+            ct.append(qRgba(r, g, b, 0))
+        else:
+            ct.append(qRgb(r, g, b))
+    recolored = QImage(tile)
+    recolored.setColorTable(ct)
+    return recolored
+
+
+def detect_tile_palette(tile: QImage) -> int:
+    """Inspect an 8bpp tile's pixel values and guess which 16-color
+    sub-palette its colors were baked from. Returns the palette index
+    (0-15) corresponding to the sub-palette range that contains the
+    most non-zero pixels.
+
+    Used by the Tilemap Editor to auto-set the attr_pal when the user
+    picks a tile from a multi-palette 8bpp sheet — so painting feels
+    natural (pick a purple tile, paint, GBA renders it purple).
+    """
+    if tile.format() != QImage.Format.Format_Indexed8:
+        return 0
+    counts = [0] * 16
+    w, h = tile.width(), tile.height()
+    for y in range(h):
+        for x in range(w):
+            p = tile.pixelIndex(x, y)
+            if p == 0:
+                continue  # transparent in every sub-palette
+            counts[(p // 16) & 0x0F] += 1
+    if not any(counts):
+        return 0
+    return counts.index(max(counts))
+
+
 # ─── Auto-discovery ───────────────────────────────────────────────────────────
 
 
@@ -592,11 +691,16 @@ def discover_assets(bin_path: str) -> TilemapAssets:
 
     # -- Palettes --
 
-    # Same dir .pal files
+    def _is_pal_file(fname: str) -> bool:
+        # Accept JASC .pal and raw GBA .gbapal both.
+        f = fname.lower()
+        return f.endswith(".pal") or f.endswith(".gbapal")
+
+    # Same dir
     try:
         for f in sorted(os.listdir(dir_path)):
             fp = os.path.join(dir_path, f)
-            if f.lower().endswith(".pal") and os.path.isfile(fp):
+            if _is_pal_file(f) and os.path.isfile(fp):
                 pals.append(fp)
     except OSError:
         pass
@@ -607,17 +711,17 @@ def discover_assets(bin_path: str) -> TilemapAssets:
         try:
             for f in sorted(os.listdir(pal_subdir)):
                 fp = os.path.join(pal_subdir, f)
-                if f.lower().endswith(".pal") and os.path.isfile(fp) and fp not in pals:
+                if _is_pal_file(f) and os.path.isfile(fp) and fp not in pals:
                     pals.append(fp)
         except OSError:
             pass
 
-    # Parent dir .pal files
+    # Parent dir
     if parent_dir and parent_dir != dir_path:
         try:
             for f in sorted(os.listdir(parent_dir)):
                 fp = os.path.join(parent_dir, f)
-                if f.lower().endswith(".pal") and os.path.isfile(fp) and fp not in pals:
+                if _is_pal_file(f) and os.path.isfile(fp) and fp not in pals:
                     pals.append(fp)
         except OSError:
             pass
@@ -634,14 +738,35 @@ def discover_assets(bin_path: str) -> TilemapAssets:
         if pname == base_name or pname.startswith(base_name):
             matching_pals.append(p)
 
-    # If a name-matching .pal has 256 colors, it covers all 16 palette slots
-    # on its own — don't load any others.
+    # If a name-matching palette has more than 16 colors, it covers
+    # multiple palette slots on its own — don't load any others.
+    def _read_colors(p: str) -> list:
+        if p.lower().endswith(".gbapal"):
+            try:
+                return _read_gbapal_file(p)
+            except Exception:
+                return []
+        from ui.palette_utils import read_jasc_pal
+        return read_jasc_pal(p)
+
     best_pals = matching_pals
     if matching_pals:
-        from ui.palette_utils import read_jasc_pal
-        first_colors = read_jasc_pal(matching_pals[0])
+        first_colors = _read_colors(matching_pals[0])
         if len(first_colors) > 16:
             best_pals = matching_pals[:1]
+    else:
+        # No name-matching palette. Auto-pick a multi-palette file in the
+        # same directory if there's exactly one — this is the canonical
+        # "shared palette across many tilemaps" case (region_map.gbapal
+        # for every <region>.bin in graphics/region_map/).
+        multi_pal_candidates = []
+        for p in pals:
+            if os.path.dirname(p) != dir_path:
+                continue  # only consider same-dir files
+            if len(_read_colors(p)) > 16:
+                multi_pal_candidates.append(p)
+        if len(multi_pal_candidates) == 1:
+            best_pals = multi_pal_candidates
 
     return TilemapAssets(
         bin_path=bin_path,

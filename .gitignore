@@ -68,6 +68,10 @@ docs/SOUND_EDITOR_PLAN.md
 docs/SOUND_ENGINE_DEBUG_LOG.md
 docs/UNIFIED_EDITOR_PLAN.md
 docs/POST_RELEASE_AUDIT_PLAN.md
+docs/REGION_MAP_ROADMAP.md
 docs/RELEASING.md
 eventide/docs/CLAUDECONTEXT.md
 eventide/docs/eventide_whitelist.md
+
+# Stray local artifacts that don't belong in the repo
+/titlescreen.pal

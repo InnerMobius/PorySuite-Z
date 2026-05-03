@@ -76,6 +76,14 @@ class UnifiedMainWindow(QMainWindow):
     open_in_eventide_signal = pyqtSignal(dict)
     open_in_porysuite_signal = pyqtSignal(dict)
 
+    # App-wide signal: a file was just written to disk by some tab. Any
+    # tab whose visuals depend on files written by other tabs should
+    # subscribe and refresh its caches if the saved path matches something
+    # it displays. Emitted with the absolute path of the saved file.
+    # Subscribers must be cheap — this fires on every save, including
+    # fast/unrelated ones.
+    file_saved = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         from core.app_info import VERSION
@@ -335,10 +343,20 @@ class UnifiedMainWindow(QMainWindow):
         btn.setIcon(self._icon_with_dirty_dot(base) if any_dirty else base)
 
     def _switch_page(self, name: str):
-        """Switch the stacked widget to the page identified by name."""
+        """Switch the stacked widget to the page identified by name. Also
+        syncs the sidebar button check-state — without this, programmatic
+        page switches (cross-tab nav like Open in Tilemap Editor / Open
+        in Sound Editor / Open in Overworld Graphics) leave the sidebar
+        highlighting the previous page."""
         idx = self._page_indices.get(name, -1)
         if idx >= 0:
             self.stack.setCurrentIndex(idx)
+            btn = self._page_buttons.get(name)
+            if btn is not None and not btn.isChecked():
+                # blockSignals so we don't re-fire the clicked handler
+                btn.blockSignals(True)
+                btn.setChecked(True)
+                btn.blockSignals(False)
             # Lazy loading is handled by _on_stack_page_changed
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -702,6 +720,11 @@ class UnifiedMainWindow(QMainWindow):
         eventide_main.maps_tab.data_changed.connect(
             lambda: (self.set_page_dirty("maps", True),
                      self.setWindowModified(True)))
+        # Region Map subscribes to app-wide file_saved so it refreshes its
+        # background when (e.g.) the Tilemap Editor writes a new .bin.
+        rm_tab = eventide_main.region_map_tab
+        if hasattr(rm_tab, 'on_file_saved'):
+            self.file_saved.connect(rm_tab.on_file_saved)
         eventide_main.region_map_tab.data_changed.connect(
             lambda: (self.set_page_dirty("regionmap", True),
                      self.setWindowModified(True)))
@@ -741,6 +764,10 @@ class UnifiedMainWindow(QMainWindow):
             self._tilemap_editor.modified.connect(
                 lambda: (self.set_page_dirty("tilesets", True),
                          self.setWindowModified(True)))
+            # Fan-out save events through the app-wide file_saved signal.
+            # Any tab whose visuals depend on a file the Tilemap Editor
+            # writes can subscribe to file_saved and refresh.
+            self._tilemap_editor.tilemap_saved.connect(self.file_saved.emit)
             anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
             if anim_ed and hasattr(anim_ed, 'modified'):
                 anim_ed.modified.connect(
@@ -878,6 +905,13 @@ class UnifiedMainWindow(QMainWindow):
                 _eet_mod._open_in_sound_editor_cb = self._sound_open_song
                 _eet_mod._stop_preview_cb = self._sound_stop_preview
             _eet_mod._open_ow_sprite_cb = self._open_ow_sprite
+        except Exception:
+            pass
+
+        # ── Region Map → Tilemap Editor nav ────────────────────────────────
+        try:
+            import eventide.ui.region_map_tab as _rmt_mod
+            _rmt_mod._open_tilemap_cb = self._open_tilemap_for_region
         except Exception:
             pass
 
@@ -1069,20 +1103,30 @@ class UnifiedMainWindow(QMainWindow):
             self._eventide_window.setWindowModified(False)
 
         # Maps tab: flush staged section/in-game-name edits to disk first.
-        # save() also clears dirty markers internally on success. On failure
-        # it keeps pending edits so the user can retry — don't wipe markers.
+        # Region Map tab: flush staged cell paints. Both have save() that
+        # returns False on failure and preserves pending state so the user
+        # can retry — don't wipe markers in that case.
         if self._eventide_window:
             maps_tab = getattr(self._eventide_window, 'maps_tab', None)
+            region_tab = getattr(self._eventide_window, 'region_map_tab', None)
             maps_save_ok = True
+            region_save_ok = True
             if maps_tab:
                 try:
                     maps_save_ok = maps_tab.save()
                 except Exception as e:
                     maps_save_ok = False
                     self.log_message(f"Error saving Maps tab: {e}")
+            if region_tab and hasattr(region_tab, 'save'):
+                try:
+                    region_save_ok = region_tab.save()
+                except Exception as e:
+                    region_save_ok = False
+                    self.log_message(f"Error saving Region Map tab: {e}")
 
             self.set_page_dirty("events", False)
-            self.set_page_dirty("regionmap", False)
+            if region_save_ok:
+                self.set_page_dirty("regionmap", False)
             if maps_save_ok:
                 self.set_page_dirty("maps", False)
                 if maps_tab:
@@ -1585,6 +1629,36 @@ class UnifiedMainWindow(QMainWindow):
         if ow_tab is None:
             return
         ow_tab.select_sprite_by_gfx_const(gfx_const)
+
+    def _open_tilemap_for_region(self, bin_path: str):
+        """Called from EVENTide Region Map 'Open in Tilemap Editor' button.
+
+        Switches to the Tilemap Editor page and pre-loads the given .bin
+        with the shared region-map sheet (`region_map.png`) and palette
+        (`region_map.gbapal`, multi-palette) explicitly overridden — the
+        editor's name-matching auto-discovery would skip both since
+        neither matches the region's .bin basename.
+        """
+        if not bin_path:
+            return
+        import os
+        gfx_dir = os.path.dirname(bin_path)
+        sheet_path = os.path.join(gfx_dir, "region_map.png")
+        pal_path = os.path.join(gfx_dir, "region_map.gbapal")
+        if not os.path.exists(sheet_path):
+            sheet_path = ""
+        if not os.path.exists(pal_path):
+            pal_path = ""
+        self._switch_page("tilesets")
+        if hasattr(self, '_tilemap_editor'):
+            try:
+                self._tilemap_editor._load_tilemap(
+                    bin_path,
+                    sheet_override=sheet_path,
+                    palette_override=pal_path,
+                )
+            except Exception as e:
+                self.log_message(f"Tilemap Editor: failed to load {bin_path}: {e}")
 
     def _toggle_log_panel(self):
         """Show or hide the log panel.  Saves preference to settings."""
