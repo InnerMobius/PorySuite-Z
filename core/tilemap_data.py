@@ -143,6 +143,94 @@ def _guess_width(entry_count: int) -> int:
     return 32
 
 
+# ── Per-project tilemap dimension preferences ────────────────────────────────
+#
+# .bin files are headerless — dimensions are inferred from file size. That
+# loses the user's chosen W/H across a save+reload (e.g. user sets 24×8 =
+# 192 tiles, saves, reopens, _guess_width(192) returns 32 → file reloads as
+# 32×6 with the row stride scrambled). To preserve the user's choice we
+# store a tiny JSON map keyed by .bin path → (w, h) inside PorySuite's
+# project-cache dir. No project tree pollution; the cache is portable
+# per-project (separate caches for separate projects via path hash).
+
+def _dim_cache_path(project_dir: str) -> str:
+    """Absolute path to the dimension-pref JSON for this project."""
+    if not project_dir:
+        return ""
+    try:
+        from core.app_info import get_cache_dir
+    except ImportError:
+        return ""
+    return os.path.join(get_cache_dir(project_dir), "tilemap_dimensions.json")
+
+
+def _normalize_bin_key(project_dir: str, bin_path: str) -> str:
+    """Project-relative path if possible (so the cache survives moving the
+    project folder), else the absolute path as a fallback."""
+    if project_dir and bin_path:
+        try:
+            return os.path.relpath(bin_path, project_dir).replace("\\", "/")
+        except ValueError:
+            pass
+    return bin_path
+
+
+def get_tilemap_dim_pref(project_dir: str, bin_path: str
+                         ) -> Optional[Tuple[int, int]]:
+    """Return cached (w, h) for this .bin, or None if no preference is
+    stored. Failures (missing file, malformed JSON) return None silently."""
+    cache_path = _dim_cache_path(project_dir)
+    if not cache_path or not os.path.isfile(cache_path):
+        return None
+    try:
+        import json as _json
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    key = _normalize_bin_key(project_dir, bin_path)
+    rec = data.get(key) or data.get(bin_path)
+    if not isinstance(rec, dict):
+        return None
+    try:
+        w = int(rec.get("w", 0))
+        h = int(rec.get("h", 0))
+    except (TypeError, ValueError):
+        return None
+    if w > 0 and h > 0:
+        return (w, h)
+    return None
+
+
+def set_tilemap_dim_pref(project_dir: str, bin_path: str,
+                          w: int, h: int) -> None:
+    """Record (w, h) for this .bin in the project's PorySuite cache."""
+    cache_path = _dim_cache_path(project_dir)
+    if not cache_path:
+        return
+    import json as _json
+    data: dict = {}
+    if os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                loaded = _json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            pass
+    key = _normalize_bin_key(project_dir, bin_path)
+    data[key] = {"w": int(w), "h": int(h)}
+    try:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8", newline="\n") as f:
+            _json.dump(data, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+
 # ─── Tile sheet (PNG indexed image) ──────────────────────────────────────────
 
 
@@ -229,6 +317,32 @@ def _read_gbapal_file(path: str) -> List[Color]:
         b = ((val >> 10) & 0x1F) << 3
         colors.append((r, g, b))
     return colors
+
+
+def _write_gbapal_file(path: str, colors: List[Color]) -> bool:
+    """Write a list of 8-bit RGB colors as a raw GBA palette (BGR555).
+
+    Mirror of `_read_gbapal_file`. The file size matches the number of
+    colors passed in: 2 bytes per colour, no header, no trailing data.
+    Channels are clamped to 5 bits via right-shift-3.
+    Returns True on success.
+    """
+    import os as _os
+    try:
+        _os.makedirs(_os.path.dirname(path) or ".", exist_ok=True)
+        buf = bytearray()
+        for (r, g, b) in colors:
+            r5 = max(0, min(31, int(r) >> 3))
+            g5 = max(0, min(31, int(g) >> 3))
+            b5 = max(0, min(31, int(b) >> 3))
+            val = r5 | (g5 << 5) | (b5 << 10)
+            buf.append(val & 0xFF)
+            buf.append((val >> 8) & 0xFF)
+        with open(path, "wb") as f:
+            f.write(bytes(buf))
+        return True
+    except Exception:
+        return False
 
 
 @dataclass

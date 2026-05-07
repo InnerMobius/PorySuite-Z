@@ -279,11 +279,18 @@ def quantize_image(
     flat = rgb.reshape(-1, 3)
     unique = np.unique(flat, axis=0)
 
-    if len(unique) <= max_colors:
-        # Already within limit — no quantization needed
-        palette = [tuple(c) for c in unique.tolist()]
-    elif mode == QMODE_MANUAL and manual_palette:
+    # MANUAL mode wins unconditionally — the user explicitly ordered the
+    # palette and may have added colours that aren't in the image at all
+    # (e.g. extra entries needed by other sprites sharing the palette).
+    # The earlier code bypassed manual_palette whenever the image's
+    # unique-colour count fit in `max_colors`, silently replacing the
+    # user's ordering with np.unique's sorted RGB and dropping any
+    # custom colours the user added that aren't in the source.
+    if mode == QMODE_MANUAL and manual_palette:
         palette = list(manual_palette[:max_colors])
+    elif len(unique) <= max_colors:
+        # No quantization needed — image fits.
+        palette = [tuple(c) for c in unique.tolist()]
     elif mode == QMODE_SMOOTH:
         # Pixel-weighted median-cut — subtle gradients preserved
         palette = _median_cut(flat, max_colors)
@@ -307,33 +314,58 @@ def quantize_image(
             deduped.append(c)
     palette = deduped
 
-    # Pad to target
+    # CRITICAL: remap pixels against the LIVE palette (just the unique
+    # entries) — NOT against a padded version that has 200+ duplicate
+    # `(0, 0, 0)` slots. With duplicate-black padding, _remap_pixels'
+    # nearest-color search would map any pixel that's closer to black
+    # than to its true colour into one of the padding slots, silently
+    # turning dark-but-non-black artwork into solid black blocks.
+    indices = _remap_pixels(rgb, palette, dither)
+
+    # Handle transparency — force transparent pixels to index 0.
+    # In MANUAL mode the user explicitly placed something in slot 0 and
+    # called it the BG colour; we trust that and just route alpha pixels
+    # there as-is (they'll render with whatever colour the user picked,
+    # but slot 0 is still the transparent index for sprite-engine code
+    # downstream because _indexed_array_to_qimage uses transparent_index=0).
+    # In automatic modes (BALANCED / SMOOTH / etc.) we still force black
+    # to slot 0 — the existing behaviour for when the caller hasn't
+    # told us what should be transparent.
+    if alpha is not None:
+        if mode != QMODE_MANUAL:
+            if palette[0] != (0, 0, 0):
+                try:
+                    black_idx = palette.index((0, 0, 0))
+                except ValueError:
+                    # Black isn't in the palette — append it as a new slot.
+                    # Don't overwrite an existing entry.
+                    palette.append((0, 0, 0))
+                    black_idx = len(palette) - 1
+                # Swap in index array
+                mask_0 = indices == 0
+                mask_b = indices == black_idx
+                indices[mask_0] = black_idx
+                indices[mask_b] = 0
+                palette[0], palette[black_idx] = palette[black_idx], palette[0]
+        indices[alpha == 0] = 0
+
+    # Pad palette to target length AFTER remap so the indexed image's
+    # color table reaches the expected size, but the padding entries
+    # exist only as visual placeholders — no pixel references them.
     while len(palette) < max_colors:
         palette.append((0, 0, 0))
     palette = palette[:max_colors]
 
-    # Map each pixel to nearest palette entry
-    indices = _remap_pixels(rgb, palette, dither)
-
-    # Handle transparency — force transparent pixels to index 0
-    if alpha is not None:
-        # Make sure index 0 is the BG colour (0,0,0)
-        if palette[0] != (0, 0, 0):
-            # Find black or insert it
-            try:
-                black_idx = palette.index((0, 0, 0))
-            except ValueError:
-                black_idx = len(palette) - 1
-                palette[black_idx] = (0, 0, 0)
-            # Swap in index array
-            mask_0 = indices == 0
-            mask_b = indices == black_idx
-            indices[mask_0] = black_idx
-            indices[mask_b] = 0
-            palette[0], palette[black_idx] = palette[black_idx], palette[0]
-        indices[alpha == 0] = 0
-
-    result = _indexed_array_to_qimage(indices, palette, transparent_index=0)
+    # transparent_index=0 only when the source actually had alpha pixels.
+    # For fully-opaque sources (BG tilemaps, region maps), the slot-0-
+    # transparent convention silently turns whatever colour ended up at
+    # slot 0 into a hole — every pixel that maps to that colour renders
+    # as the preview widget's dark background, looking like it got
+    # "cut to black" on import.
+    transparent_idx = 0 if alpha is not None else -1
+    result = _indexed_array_to_qimage(
+        indices, palette, transparent_index=transparent_idx,
+    )
     return result, palette
 
 
@@ -341,8 +373,19 @@ def _remap_pixels(
     rgb: np.ndarray,
     palette: list[Color],
     dither: bool,
+    clean_orphans: bool = False,
 ) -> np.ndarray:
-    """Map each pixel to the nearest palette index. Returns uint8 index array."""
+    """Map each pixel to the nearest palette index. Returns uint8 index array.
+
+    `clean_orphans` runs a 3×3 majority filter to suppress scattered
+    single-pixel noise from nearest-colour rounding. **Default OFF** —
+    the filter destroys intentional 1-pixel features (single-pixel
+    lines, dotted patterns, anti-aliased edges), which for pixel-art
+    sources is everything you actually drew. It used to default ON for
+    "noise cleanup" but in practice it was silently mangling user
+    artwork. Callers can opt back in for photographic / continuous-tone
+    sources where the noise it cleans up is real.
+    """
     h, w = rgb.shape[:2]
     pal_arr = np.array(palette, dtype=np.int32)
 
@@ -370,12 +413,8 @@ def _remap_pixels(
         dists = np.sum(diffs ** 2, axis=2)
         out = np.argmin(dists, axis=1).astype(np.uint8).reshape(h, w)
 
-        # Clean up orphan pixels — without dithering, subtle source
-        # variations cause scattered single-pixel noise that looks like
-        # accidental dithering.  A 3×3 majority filter replaces each pixel
-        # with the most common index in its neighbourhood when the pixel
-        # disagrees with the majority.
-        out = _majority_filter(out)
+        if clean_orphans:
+            out = _majority_filter(out)
 
     return out
 
@@ -471,9 +510,15 @@ def remap_to_palette(
     if not target_palette:
         # Empty palette — return a black indexed image
         target_palette = [(0, 0, 0)]
-    rgb, _alpha = _qimage_to_rgb_array(img)
+    rgb, alpha = _qimage_to_rgb_array(img)
     indices = _remap_pixels(rgb, target_palette, dither)
-    return _indexed_array_to_qimage(indices, target_palette, transparent_index=0)
+    # See quantize_image — only mark slot 0 transparent when the source
+    # actually had alpha. For fully-opaque BG sources, the slot-0-
+    # transparent convention is wrong and bakes a "hole" into the result.
+    transparent_idx = 0 if alpha is not None else -1
+    return _indexed_array_to_qimage(
+        indices, target_palette, transparent_index=transparent_idx,
+    )
 
 
 # ── Palette reordering ───────────────────────────────────────────────────────
@@ -557,11 +602,29 @@ def export_indexed_png(
     output_path: str,
     transparent_index: int = 0,
 ) -> bool:
-    """Save an indexed QImage as PNG. Returns True on success."""
+    """Save an indexed QImage as PNG. Returns True on success.
+
+    HARD REQUIREMENT: input MUST be Format_Indexed8. If it isn't, this
+    function refuses to save (returns False) rather than producing an
+    RGB PNG that would break gbagfx with "unsupported color type"
+    during the project build. Callers that load images from disk for
+    palette-baking MUST `convertToFormat(Format_Indexed8)` first.
+    """
     try:
-        # Rebuild the colour table to make sure it matches our palette
+        if indexed_img is None or indexed_img.isNull():
+            return False
+        if indexed_img.format() != QImage.Format.Format_Indexed8:
+            # Caller passed a non-indexed image. Refuse — silently writing
+            # an RGB PNG here is what causes gbagfx to fail with
+            # "red_normal.png: unsupported color type" during the build.
+            return False
+        # Rebuild the colour table to make sure it matches our palette.
         img = _rebuild_color_table(indexed_img, palette, transparent_index)
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        # Final safety net: if _rebuild_color_table somehow returned a
+        # non-indexed image, refuse the save.
+        if img.format() != QImage.Format.Format_Indexed8:
+            return False
         return img.save(output_path, "PNG")
     except Exception:
         return False

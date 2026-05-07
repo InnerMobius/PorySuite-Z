@@ -937,16 +937,27 @@ class SoundEditorTab(QWidget):
                     content = content.replace(original_label, entry.label)
 
             # ── Step 3: write via atomic replace so a partially written
-            # .s can never be seen by the build or by re-parse.
+            # .s can never be seen by the build or by re-parse. try/except
+            # cleanup so a failure between the .tmp open and os.replace
+            # doesn't leave a stray .tmp in the user's sound/songs/ tree
+            # (would otherwise pollute git status).
             tmp_path = dest_path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(content)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp_path, dest_path)
+            try:
+                with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(content)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp_path, dest_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                raise
 
             # ── Step 4: ensure a .mid placeholder exists (Makefile's
             # MID_OBJS wildcard is `sound/songs/midi/*.mid`).

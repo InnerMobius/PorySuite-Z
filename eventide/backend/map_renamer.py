@@ -38,16 +38,27 @@ class MapRenamer:
             raise RuntimeError(f"Invalid map_groups.json: {e}") from e
 
     def save_map_groups(self):
+        # Atomic write via temp + os.replace — wrapped in try so a failure
+        # at ANY point (write, validation, replace) cleans up the .tmp file
+        # rather than leaving it polluting the user's project tree.
         tmp = self.map_groups_json + '.tmp'
-        with open(tmp, 'w', newline='\n') as f:
-            json.dump(self.groups, f, indent=2)
-            f.write('\n')
         try:
-            with open(tmp) as chk:
-                json.load(chk)
-        except Exception as e:
-            raise RuntimeError(f'Failed to write valid JSON: {e}') from e
-        os.replace(tmp, self.map_groups_json)
+            with open(tmp, 'w', newline='\n') as f:
+                json.dump(self.groups, f, indent=2)
+                f.write('\n')
+            try:
+                with open(tmp) as chk:
+                    json.load(chk)
+            except Exception as e:
+                raise RuntimeError(f'Failed to write valid JSON: {e}') from e
+            os.replace(tmp, self.map_groups_json)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            raise
 
     def create_group(self, group_name: str):
         if group_name in self.groups:

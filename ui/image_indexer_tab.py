@@ -55,86 +55,172 @@ QGroupBox::title {
 
 # ── Manual colour pick dialog ────────────────────────────────────────────────
 
+class _CandidateSwatch(QLabel):
+    """Click-to-toggle candidate colour. Emits a signal when clicked."""
+    clicked = pyqtSignal(int)
+
+    def __init__(self, index: int, color: tuple[int, int, int], parent=None):
+        super().__init__(parent)
+        self._index = index
+        self._color = color
+        self._selected = False
+        self.setFixedSize(36, 36)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        r, g, b = color
+        self.setToolTip(f"({r}, {g}, {b}) — click to add/remove")
+        self._refresh_style()
+
+    def set_selected(self, selected: bool):
+        self._selected = selected
+        self._refresh_style()
+
+    def _refresh_style(self):
+        r, g, b = self._color
+        if self._selected:
+            border = "3px solid #ffb74d"
+        else:
+            border = "1px solid #555"
+        self.setStyleSheet(
+            f"background-color: rgb({r},{g},{b}); border: {border};"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._index)
+        super().mousePressEvent(event)
+
+
 class _ManualPickDialog(QDialog):
-    """Shows ~24 candidate colours as clickable swatches.  User checks/unchecks
-    to choose which ones to keep.  Live count label and small preview."""
+    """Pick + ORDER candidate colours.
+
+    Top: pool of all candidate colours (click to add/remove).
+    Middle: the result palette row — drag-reorder the slots, right-click
+            any slot for "Set as Background" which moves it to slot 0.
+    Bottom: live preview of how the source maps onto the chosen palette.
+
+    Result is `selected_colors()` returning the colours in slot order, so
+    slot 0 IS the transparent/background colour for sprite use cases.
+    """
 
     def __init__(self, candidates: list[tuple[int, int, int]],
                  target: int, source_img: QImage, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Pick {target} colours from {len(candidates)} candidates")
-        self.setMinimumWidth(500)
+        self.setWindowTitle(f"Pick & order {target} colours from {len(candidates)} candidates")
+        self.setMinimumWidth(560)
         self._target = target
         self._candidates = candidates
         self._source_img = source_img
-        self._checks: list[QCheckBox] = []
+        # Result palette as actual colours (NOT candidate indices). Length
+        # always equals _target. Slots beyond _filled_count are placeholder
+        # blacks. We track colours rather than indices so the user can
+        # double-click any slot to drop in a custom RGB that ISN'T one
+        # of the auto-detected candidates — e.g. a red the sprite doesn't
+        # use but other sprites sharing the palette need.
+        self._result_colors: list[tuple[int, int, int]] = []
+        self._filled_count: int = 0
+        # Suppress _on_result_colors_changed during programmatic set_colors.
+        self._suppress_row_signal: bool = False
+        self._candidate_swatches: list[_CandidateSwatch] = []
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
         info = QLabel(
-            f"The image was analysed and {len(self._candidates)} distinct colour "
-            f"groups were found.  Check the {self._target} you want to keep.  "
-            f"Unchecked colours will be mapped to the nearest checked colour."
+            f"The image was analysed and {len(self._candidates)} distinct "
+            f"colour groups were found. Click a swatch up top to add or "
+            f"remove it from the {self._target}-colour result palette below. "
+            f"Drag the result swatches to reorder — <b>slot 0 is the BG / "
+            f"transparent colour</b>. Right-click any result slot for "
+            f"'Set as Background' to send it to slot 0."
         )
         info.setWordWrap(True)
+        info.setStyleSheet("color: #ccc; font-size: 11px;")
         layout.addWidget(info)
 
         self._count_label = QLabel("")
         self._count_label.setStyleSheet("font-weight: bold; font-size: 12px;")
         layout.addWidget(self._count_label)
 
-        # Grid of swatches + checkboxes
+        # ── Candidate pool (click to toggle into the result row) ──────────
+        pool_label = QLabel("<b>Candidates</b> — click to add to result palette:")
+        pool_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        layout.addWidget(pool_label)
+
         grid_widget = QWidget()
         grid = QGridLayout(grid_widget)
         grid.setSpacing(4)
-
-        cols = 8
-        for i, (r, g, b) in enumerate(self._candidates):
-            row = i // cols
-            col = i % cols
-
-            cell = QVBoxLayout()
-            cell.setSpacing(1)
-
-            swatch = QLabel()
-            swatch.setFixedSize(32, 32)
-            swatch.setStyleSheet(
-                f"background-color: rgb({r},{g},{b}); border: 1px solid #555;"
-            )
-            swatch.setToolTip(f"({r}, {g}, {b})")
-            cell.addWidget(swatch, alignment=Qt.AlignmentFlag.AlignCenter)
-
-            cb = QCheckBox()
-            cb.setChecked(i < self._target)  # Pre-check the first N
-            cb.toggled.connect(self._update_count)
-            self._checks.append(cb)
-            cell.addWidget(cb, alignment=Qt.AlignmentFlag.AlignCenter)
-
-            grid.addLayout(cell, row, col)
+        cols = 10
+        for i, color in enumerate(self._candidates):
+            sw = _CandidateSwatch(i, color)
+            sw.clicked.connect(self._on_candidate_clicked)
+            row, col = divmod(i, cols)
+            grid.addWidget(sw, row, col)
+            self._candidate_swatches.append(sw)
 
         scroll = QScrollArea()
         scroll.setWidget(grid_widget)
         scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(300)
+        scroll.setMaximumHeight(180)
         layout.addWidget(scroll)
 
-        # Preview
+        # ── Result palette row (drag to reorder, slot 0 = BG) ─────────────
+        result_label = QLabel(
+            "<b>Result palette</b> — drag to reorder. "
+            "Slot 0 is BG/transparent (yellow border)."
+        )
+        result_label.setStyleSheet("color: #aaa; font-size: 11px; margin-top: 6px;")
+        layout.addWidget(result_label)
+
+        self._result_row = _SharedDraggablePaletteRow(n=self._target)
+        self._result_row.palette_reordered.connect(self._on_result_reorder)
+        self._result_row.swatch_set_as_bg.connect(self._on_set_as_bg)
+        # Listen for in-row color edits (user double-clicks a slot to pick
+        # a custom RGB that isn't in the candidate pool — e.g. a colour
+        # other sprites sharing this palette need).
+        self._result_row.colors_changed.connect(self._on_row_colors_changed)
+        layout.addWidget(self._result_row)
+
+        hint = QLabel(
+            "<small>Tip: <b>double-click</b> any result slot to set a "
+            "custom RGB colour that isn't in the candidate pool — useful "
+            "when the saved palette needs to include colours that don't "
+            "appear in this particular sprite (e.g. a red used by other "
+            "sprites sharing this palette).</small>"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        # ── Preview ───────────────────────────────────────────────────────
         self._preview = QLabel()
         self._preview.setFixedHeight(120)
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setStyleSheet("background: #1a1a1a; border: 1px solid #333;")
         layout.addWidget(self._preview)
 
-        # Buttons
+        # ── Buttons ───────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        select_all = QPushButton("Select All")
-        select_all.clicked.connect(lambda: self._set_all(True))
+        select_all = QPushButton("Auto-fill")
+        select_all.setToolTip(
+            "Fill the result palette with the first N candidates in their "
+            "discovery order (overwrites the current result)."
+        )
+        select_all.clicked.connect(self._auto_fill)
         btn_row.addWidget(select_all)
-        select_none = QPushButton("Select None")
-        select_none.clicked.connect(lambda: self._set_all(False))
-        btn_row.addWidget(select_none)
+        add_custom = QPushButton("+ Custom colour…")
+        add_custom.setToolTip(
+            "Add a colour that isn't in the candidate pool — opens a "
+            "colour picker. The colour is appended to the next empty "
+            "result slot. Useful when the palette needs entries for "
+            "other sprites that share it."
+        )
+        add_custom.clicked.connect(self._add_custom_color)
+        btn_row.addWidget(add_custom)
+        clear_btn = QPushButton("Clear")
+        clear_btn.setToolTip("Empty the result palette.")
+        clear_btn.clicked.connect(self._clear_result)
+        btn_row.addWidget(clear_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
 
@@ -146,22 +232,191 @@ class _ManualPickDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        self._update_count()
+        # Pre-fill with the first N candidates as a sensible starting point.
+        self._auto_fill()
 
-    def _set_all(self, checked: bool):
-        for cb in self._checks:
-            cb.setChecked(checked)
+    # ── State management ──────────────────────────────────────────────────
+
+    def _normalize_result_list(self):
+        """Ensure _result_colors has length == target, padded with blacks
+        beyond _filled_count. Trims if it grew somehow."""
+        while len(self._result_colors) < self._target:
+            self._result_colors.append((0, 0, 0))
+        del self._result_colors[self._target:]
+        if self._filled_count > self._target:
+            self._filled_count = self._target
+        if self._filled_count < 0:
+            self._filled_count = 0
+
+    def _refresh(self):
+        """Sync candidate-swatch highlights, push colours into the result
+        row, update count + preview."""
+        self._normalize_result_list()
+        # Highlight candidates whose colour appears anywhere in the
+        # filled portion of the result palette.
+        filled_set = set(self._result_colors[:self._filled_count])
+        for sw in self._candidate_swatches:
+            sw.set_selected(sw._color in filled_set)
+        # Push to the row (suppress the row's own colors_changed signal
+        # so we don't recurse).
+        self._suppress_row_signal = True
+        try:
+            self._result_row.set_colors(self._result_colors)
+        finally:
+            self._suppress_row_signal = False
+        # Slot tooltips for clarity.
+        for i, sw in enumerate(self._result_row._swatches):
+            if i == 0 and self._filled_count > 0:
+                sw.setToolTip(
+                    "Slot 0 — BG / transparent colour. "
+                    "Drag any other slot here, or right-click another "
+                    "slot → Set as Background."
+                )
+            elif i < self._filled_count:
+                sw.setToolTip(
+                    f"Slot {i}. Double-click to change to a custom colour."
+                )
+            else:
+                sw.setToolTip(
+                    f"Slot {i} — empty. Double-click to fill with a "
+                    f"custom colour, or click a candidate above to add."
+                )
+        self._update_count()
+        self._update_preview()
+
+    def _on_candidate_clicked(self, idx: int):
+        """Click a candidate to add it to (or remove it from) the result."""
+        if idx >= len(self._candidates):
+            return
+        color = self._candidates[idx]
+        # If this candidate's colour is already in the result, remove it.
+        for i in range(self._filled_count):
+            if self._result_colors[i] == color:
+                # Remove and shift the trailing filled colours down.
+                self._result_colors.pop(i)
+                self._result_colors.append((0, 0, 0))
+                self._filled_count -= 1
+                self._refresh()
+                return
+        # Otherwise add to the next empty slot.
+        if self._filled_count >= self._target:
+            self._count_label.setText(
+                f'<span style="color:#ff6666">'
+                f'Result palette is full ({self._target} slots). '
+                f'Remove a result colour first or double-click a slot '
+                f'to overwrite.</span>'
+            )
+            return
+        self._result_colors[self._filled_count] = color
+        self._filled_count += 1
+        self._refresh()
+
+    def _on_result_reorder(self, src: int, dst: int):
+        """User dragged a result swatch from src → dst."""
+        if src == dst:
+            return
+        n = self._filled_count
+        if src >= n:
+            # Dragging an empty slot — ignore.
+            self._refresh()
+            return
+        if dst >= n:
+            # Dropping onto empty area — clamp to the last filled slot.
+            dst = n - 1
+        item = self._result_colors[src]
+        # Remove from src then insert at dst — keeps the rest's order.
+        self._result_colors.pop(src)
+        self._result_colors.insert(dst, item)
+        # Pad and trim to target length.
+        self._normalize_result_list()
+        self._refresh()
+
+    def _on_set_as_bg(self, slot: int):
+        """Right-click → Set as Background. Move slot's colour to position 0."""
+        if slot == 0 or slot >= self._filled_count:
+            return
+        item = self._result_colors.pop(slot)
+        self._result_colors.insert(0, item)
+        self._normalize_result_list()
+        self._refresh()
+
+    def _on_row_colors_changed(self):
+        """User double-clicked a result slot and picked a custom colour
+        via QColorDialog. Sync our model to the row's new colour list."""
+        if self._suppress_row_signal:
+            return
+        new_colors = self._result_row.colors()
+        # Determine new filled_count: count slots that aren't pure black
+        # OR are still inside the previous filled range (so editing slot
+        # 3 to (0,0,0) doesn't accidentally truncate). Conservative rule:
+        # filled_count is at least max(previous_filled, last non-black + 1).
+        last_non_black = -1
+        for i, c in enumerate(new_colors):
+            if c != (0, 0, 0):
+                last_non_black = i
+        new_filled = max(self._filled_count, last_non_black + 1)
+        if new_filled > self._target:
+            new_filled = self._target
+        self._result_colors = list(new_colors)
+        self._filled_count = new_filled
+        self._normalize_result_list()
+        self._refresh()
+
+    def _add_custom_color(self):
+        """+ Custom colour button — pick a colour and append to the
+        next empty slot."""
+        from PyQt6.QtWidgets import QColorDialog
+        if self._filled_count >= self._target:
+            self._count_label.setText(
+                f'<span style="color:#ff6666">'
+                f'Result palette is full ({self._target} slots). '
+                f'Remove a colour or double-click an existing slot to '
+                f'replace it.</span>'
+            )
+            return
+        c = QColorDialog.getColor(parent=self)
+        if not c.isValid():
+            return
+        # Clamp to GBA 15-bit so what the user sees is what the GBA stores.
+        rgb = clamp_to_gba(c.red(), c.green(), c.blue())
+        self._result_colors[self._filled_count] = rgb
+        self._filled_count += 1
+        self._refresh()
+
+    def _auto_fill(self):
+        """Fill result with the first N candidates in discovery order."""
+        n = min(self._target, len(self._candidates))
+        self._result_colors = list(self._candidates[:n])
+        while len(self._result_colors) < self._target:
+            self._result_colors.append((0, 0, 0))
+        self._filled_count = n
+        self._refresh()
+
+    def _clear_result(self):
+        self._result_colors = [(0, 0, 0)] * self._target
+        self._filled_count = 0
+        self._refresh()
 
     def _update_count(self):
-        n = sum(1 for cb in self._checks if cb.isChecked())
-        color = "#66ff66" if n == self._target else (
-            "#ffaa00" if n > self._target else "#ff6666"
-        )
+        n = self._filled_count
+        if n == self._target:
+            color = "#66ff66"
+        elif n > self._target:
+            color = "#ffaa00"
+        else:
+            color = "#ff6666"
+        # When n < target, palette pads with placeholder slots — let the
+        # user know what'll happen.
+        suffix = ""
+        if 0 < n < self._target:
+            suffix = (
+                f'<span style="color:#888"> &nbsp; (the remaining '
+                f'{self._target - n} slot(s) will be saved as black)</span>'
+            )
         self._count_label.setText(
-            f'<span style="color:{color}">{n} / {self._target} selected</span>'
+            f'<span style="color:{color}">{n} / {self._target} filled</span>'
+            + suffix
         )
-        # Update preview
-        self._update_preview()
 
     def _update_preview(self):
         selected = self.selected_colors()
@@ -181,10 +436,14 @@ class _ManualPickDialog(QDialog):
             pass
 
     def selected_colors(self) -> list[tuple[int, int, int]]:
-        return [
-            self._candidates[i]
-            for i, cb in enumerate(self._checks) if cb.isChecked()
-        ]
+        """Result colours in slot order, padded to `target` length.
+        Slot 0 is the BG/transparent colour for sprite use cases. Slots
+        beyond `_filled_count` are saved as black placeholders so the
+        result palette is always exactly `target` long (otherwise the
+        downstream remap would have fewer indices than the caller
+        expects)."""
+        self._normalize_result_list()
+        return list(self._result_colors)
 
 
 # ── Draggable palette swatch ────────────────────────────────────────────────
@@ -1088,18 +1347,38 @@ class ImageIndexerWidget(QWidget):
     def _convert_to_tilemap(self):
         """Split indexed image into 8×8 tiles, deduplicate (with H/V flips),
         and export a .bin tilemap + tile sheet PNG."""
-        if self._indexed_img is None or not self._palette:
+        # Surface the early-return cases so the user knows WHY the button
+        # appeared to do nothing. Previous version silently returned when
+        # _indexed_img was None — looked like a broken button.
+        if self._indexed_img is None:
+            QMessageBox.warning(
+                self, "Convert to Tilemap",
+                "No indexed image loaded.\n\n"
+                "Load a PNG and (if it's not already indexed) press "
+                "Quantize first.")
+            return
+        if not self._palette:
+            QMessageBox.warning(
+                self, "Convert to Tilemap",
+                "No palette is loaded for this image. Try Quantize, or "
+                "Load .pal first.")
             return
         if self._indexed_img.format() != QImage.Format.Format_Indexed8:
             QMessageBox.warning(
-                self, "Not Indexed",
-                "Quantize the image first so it has an indexed palette.",
-            )
+                self, "Convert to Tilemap",
+                "The current image isn't in an indexed format.\n\n"
+                "Press Quantize first so the image has an indexed palette.")
             return
 
         from core.gba_image_utils import _qimage_index_array
 
-        arr = _qimage_index_array(self._indexed_img)
+        try:
+            arr = _qimage_index_array(self._indexed_img)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Convert to Tilemap",
+                f"Couldn't read pixel data from the indexed image:\n{e}")
+            return
         h, w = arr.shape
         if w % 8 != 0 or h % 8 != 0:
             QMessageBox.warning(
@@ -1112,69 +1391,96 @@ class ImageIndexerWidget(QWidget):
         cols = w // 8
         rows = h // 8
 
-        # Extract all 8×8 tiles
-        tiles: list[np.ndarray] = []
-        for ty in range(rows):
-            for tx in range(cols):
-                tile = arr[ty * 8:(ty + 1) * 8, tx * 8:(tx + 1) * 8].copy()
-                tiles.append(tile)
-
-        # Build unique tile set, checking normal + H + V + HV flips
-        unique_tiles: list[np.ndarray] = []
-        tile_hash: dict[bytes, tuple[int, bool, bool]] = {}  # hash -> (idx, hflip, vflip)
-        tilemap_entries: list[tuple[int, bool, bool]] = []  # (tile_idx, hflip, vflip)
-
-        for tile in tiles:
-            found = False
-            # Check all four flip variants
-            for hf in (False, True):
-                for vf in (False, True):
-                    variant = tile.copy()
-                    if hf:
-                        variant = np.fliplr(variant)
-                    if vf:
-                        variant = np.flipud(variant)
-                    key = variant.tobytes()
-                    if key in tile_hash:
-                        ref_idx, ref_hf, ref_vf = tile_hash[key]
-                        # Compose flips: if the stored tile was found via
-                        # (ref_hf, ref_vf), and our current variant used
-                        # (hf, vf), then the entry needs (hf ^ ref_hf, vf ^ ref_vf)
-                        tilemap_entries.append((
-                            ref_idx,
-                            bool(hf ^ ref_hf),
-                            bool(vf ^ ref_vf),
-                        ))
-                        found = True
-                        break
-                if found:
-                    break
-
-            if not found:
-                idx = len(unique_tiles)
-                unique_tiles.append(tile)
-                key = tile.tobytes()
-                tile_hash[key] = (idx, False, False)
-                tilemap_entries.append((idx, False, False))
-
-        # Ask user where to save
+        # Save-file dialog for the .bin so the user can name the output set
+        # explicitly. The .png and .pal are written alongside with the SAME
+        # base name as the .bin so the Tilemap Editor's name-match auto-
+        # discovery pairs them correctly. Defaulting to <source>_tilemap
+        # avoids overwriting the user's source PNG.
         default_dir = os.path.dirname(self._source_path) if self._source_path else ""
-        dir_path = QFileDialog.getExistingDirectory(
-            self, "Save Tilemap + Tile Sheet to Folder", default_dir,
-        )
-        if not dir_path:
-            return
-
-        base = "tilemap"
+        default_base = "tilemap"
         if self._source_path:
-            base = os.path.splitext(os.path.basename(self._source_path))[0]
+            default_base = (
+                os.path.splitext(os.path.basename(self._source_path))[0]
+                + "_tilemap"
+            )
+        default_path = os.path.join(default_dir, f"{default_base}.bin") if default_dir else f"{default_base}.bin"
+        bin_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Tilemap (.bin) — Sheet & Palette will share its base name",
+            default_path,
+            "Tilemap files (*.bin);;All files (*)",
+        )
+        if not bin_path:
+            return
+        if not bin_path.lower().endswith(".bin"):
+            bin_path += ".bin"
 
-        bin_path = os.path.join(dir_path, f"{base}.bin")
-        sheet_path = os.path.join(dir_path, f"{base}_tiles.png")
-        pal_path = os.path.join(dir_path, f"{base}.pal")
+        # Sheet + palette share the .bin's base name so the Tilemap Editor
+        # auto-discovery pairs them as one set.
+        out_dir = os.path.dirname(bin_path)
+        base = os.path.splitext(os.path.basename(bin_path))[0]
+        sheet_path = os.path.join(out_dir, f"{base}.png")
+        pal_path = os.path.join(out_dir, f"{base}.pal")
+
+        # Refuse to silently overwrite the source PNG (would happen if the
+        # user accepted a base name that matches the source's filename).
+        if (self._source_path and
+                os.path.normcase(os.path.abspath(sheet_path)) ==
+                os.path.normcase(os.path.abspath(self._source_path))):
+            QMessageBox.warning(
+                self, "Convert to Tilemap",
+                f"Output sheet would overwrite your source image:\n"
+                f"  {sheet_path}\n\n"
+                f"Pick a different .bin name (e.g. add a suffix like "
+                f"_tilemap) so the deduplicated sheet doesn't clobber "
+                f"the original.")
+            return
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
+            # Extract all 8×8 tiles
+            tiles: list[np.ndarray] = []
+            for ty in range(rows):
+                for tx in range(cols):
+                    tile = arr[ty * 8:(ty + 1) * 8, tx * 8:(tx + 1) * 8].copy()
+                    tiles.append(tile)
+
+            # Build unique tile set, checking normal + H + V + HV flips
+            unique_tiles: list[np.ndarray] = []
+            tile_hash: dict[bytes, tuple[int, bool, bool]] = {}  # hash -> (idx, hflip, vflip)
+            tilemap_entries: list[tuple[int, bool, bool]] = []  # (tile_idx, hflip, vflip)
+
+            for tile in tiles:
+                found = False
+                # Check all four flip variants
+                for hf in (False, True):
+                    for vf in (False, True):
+                        variant = tile.copy()
+                        if hf:
+                            variant = np.fliplr(variant)
+                        if vf:
+                            variant = np.flipud(variant)
+                        key = variant.tobytes()
+                        if key in tile_hash:
+                            ref_idx, ref_hf, ref_vf = tile_hash[key]
+                            # Compose flips: if the stored tile was found via
+                            # (ref_hf, ref_vf), and our current variant used
+                            # (hf, vf), then the entry needs (hf ^ ref_hf, vf ^ ref_vf)
+                            tilemap_entries.append((
+                                ref_idx,
+                                bool(hf ^ ref_hf),
+                                bool(vf ^ ref_vf),
+                            ))
+                            found = True
+                            break
+                    if found:
+                        break
+
+                if not found:
+                    idx = len(unique_tiles)
+                    unique_tiles.append(tile)
+                    key = tile.tobytes()
+                    tile_hash[key] = (idx, False, False)
+                    tilemap_entries.append((idx, False, False))
             # Write .bin tilemap — each entry is a 16-bit GBA tilemap word
             # Bits: [9:0] tile index, [10] hflip, [11] vflip, [15:12] palette
             bin_data = bytearray()
@@ -1209,15 +1515,33 @@ class ImageIndexerWidget(QWidget):
             # Also save the palette
             export_palette(self._palette, pal_path)
 
-            self._pal_status.setText(
+            summary = (
                 f"Tilemap: {len(unique_tiles)} unique tiles from "
                 f"{len(tiles)} total ({cols}×{rows}). "
                 f"Saved .bin + tiles PNG + .pal"
             )
+            self._pal_status.setText(summary)
         except Exception as e:
             QMessageBox.warning(self, "Tilemap Error", str(e))
+            return
         finally:
             QApplication.restoreOverrideCursor()
+        # Surface a success popup with the file paths so the user can see
+        # exactly what was written and where (the status-line message at
+        # the bottom of the tab is easy to miss).
+        QMessageBox.information(
+            self, "Convert to Tilemap",
+            f"Wrote three files sharing base name "
+            f"<b><code>{base}</code></b>:<br>"
+            f"&nbsp;&nbsp;• <code>{os.path.basename(bin_path)}</code> "
+            f"({len(tilemap_entries)} entries)<br>"
+            f"&nbsp;&nbsp;• <code>{os.path.basename(sheet_path)}</code> "
+            f"({len(unique_tiles)} unique tiles, deduplicated)<br>"
+            f"&nbsp;&nbsp;• <code>{os.path.basename(pal_path)}</code><br><br>"
+            f"In folder:<br><code>{out_dir}</code><br><br>"
+            f"Open the <code>.bin</code> in the Tilemap Editor — the "
+            f"matching sheet and palette are auto-discovered by base "
+            f"name.")
 
     # ── Export ───────────────────────────────────────────────────────────
 

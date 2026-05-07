@@ -1521,12 +1521,16 @@ class GraphicsTabWidget(QWidget):
             ok, errs = self._data.save_all()
             total_ok += ok
             all_errors.extend(errs)
-        # Species palettes
+        # Species palettes — write .pal files AND bake the NORMAL palette
+        # into front/back PNGs so opening the .png in GIMP shows current
+        # colours instead of stale ones from the original PNG. (Front and
+        # back are indexed PNGs sharing the normal palette by convention.)
         if self._project_root:
             for sp in list(self._palette_dirty):
                 npath, spath = species_pal_paths(self._project_root, sp)
                 pal = self._palettes.get(sp, {})
-                if pal.get("normal") and write_jasc_pal(npath, pal["normal"]):
+                normal_colors = pal.get("normal")
+                if normal_colors and write_jasc_pal(npath, normal_colors):
                     total_ok += 1
                 else:
                     all_errors.append(f"pal-normal:{sp}")
@@ -1534,6 +1538,49 @@ class GraphicsTabWidget(QWidget):
                     total_ok += 1
                 else:
                     all_errors.append(f"pal-shiny:{sp}")
+
+                # Bake normal palette into front/back PNGs.
+                # export_indexed_png refuses non-Indexed8 input (would
+                # otherwise produce an RGB PNG that breaks gbagfx during
+                # the build), so guarantee Indexed8 by loading from disk
+                # and converting if the in-memory copy isn't indexed.
+                if not normal_colors:
+                    continue
+                paths = self._sprite_paths.get(sp, {})
+                imgs = self._sprite_imgs.get(sp, {})
+                for key in ("front", "back"):
+                    path = paths.get(key, "")
+                    if not path:
+                        continue
+                    img = imgs.get(key)
+                    if img is None or img.format() != QImage.Format.Format_Indexed8:
+                        if not os.path.isfile(path):
+                            continue
+                        disk_img = QImage(path)
+                        if disk_img.isNull():
+                            continue
+                        if disk_img.format() != QImage.Format.Format_Indexed8:
+                            disk_img = disk_img.convertToFormat(
+                                QImage.Format.Format_Indexed8)
+                        img = disk_img
+                    try:
+                        if export_indexed_png(img, normal_colors, path,
+                                              transparent_index=0):
+                            # Disk PNG now in sync — drop any pending
+                            # remap-only flag for this species.
+                            pass
+                        else:
+                            all_errors.append(
+                                f"sprite-png-bake-{key}:{sp} "
+                                f"(refused — not indexed)")
+                    except Exception as exc:
+                        all_errors.append(
+                            f"sprite-png-bake-{key}:{sp} ({exc})")
+                # Pixel-remap flag (Index-as-Background) is handled by
+                # Pass 2 below — but if we just baked the new color
+                # table, the disk PNG matches our in-memory state, so
+                # we can drop the flag preemptively.
+                self._sprite_png_dirty.discard(sp)
             self._palette_dirty.clear()
             # Icon palettes
             for idx in list(self._icon_pal_dirty):

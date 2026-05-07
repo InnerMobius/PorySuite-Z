@@ -1178,6 +1178,11 @@ class TrainerGraphicsTab(QWidget):
         errors: list[str] = []
 
         # ── Pass 1: palettes ────────────────────────────────────────────
+        # For every dirty pic:
+        #   a) write the .pal (game runtime)
+        #   b) bake the same palette into the PNG's embedded color table
+        #      so opening the PNG in GIMP shows current colours instead
+        #      of stale ones from the original PNG.
         pal_wrote: list[str] = []
         for pic_const in list(self._palette_dirty):
             png_path = self._pic_map.get(pic_const, "")
@@ -1186,11 +1191,41 @@ class TrainerGraphicsTab(QWidget):
                 continue
             pal_path = _pal_path_from_png(png_path)
             colors = self._palettes.get(pic_const)
-            if colors and write_jasc_pal(pal_path, colors):
-                ok += 1
-                pal_wrote.append(pic_const)
-            else:
+            if not (colors and write_jasc_pal(pal_path, colors)):
                 errors.append(f"trainer-pal:{pic_const}")
+                continue
+            ok += 1
+            pal_wrote.append(pic_const)
+
+            # Bake the new palette into the PNG. Pixel indices stay the
+            # same — only the color table is rewritten. export_indexed_png
+            # refuses non-Indexed8 input (would otherwise produce an RGB
+            # PNG that breaks gbagfx during the build), so we guarantee
+            # Indexed8 by loading from disk + converting if needed.
+            img = self._sprite_imgs.get(pic_const)
+            if img is None or img.format() != QImage.Format.Format_Indexed8:
+                if os.path.isfile(png_path):
+                    disk_img = QImage(png_path)
+                    if not disk_img.isNull():
+                        if disk_img.format() != QImage.Format.Format_Indexed8:
+                            disk_img = disk_img.convertToFormat(
+                                QImage.Format.Format_Indexed8)
+                        img = disk_img
+            if img is not None and not img.isNull() \
+                    and img.format() == QImage.Format.Format_Indexed8:
+                try:
+                    if export_indexed_png(img, colors, png_path,
+                                          transparent_index=0):
+                        # PNG now in sync with the .pal — drop any
+                        # leftover remap-dirty flag.
+                        self._sprite_png_dirty.discard(pic_const)
+                    else:
+                        errors.append(
+                            f"trainer-png-bake:{pic_const} "
+                            f"(refused — not indexed)"
+                        )
+                except Exception as exc:
+                    errors.append(f"trainer-png-bake:{pic_const} ({exc})")
         for pic_const in pal_wrote:
             self._palette_dirty.discard(pic_const)
 

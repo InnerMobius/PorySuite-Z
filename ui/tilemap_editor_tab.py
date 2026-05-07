@@ -661,6 +661,12 @@ class TilemapEditorTab(QWidget):
         self._hflip = False
         self._vflip = False
         self._dirty = False
+        # Palette edits go through the right-side editor and live in
+        # `self._palettes`. Mark this true when ANY slot changes so save
+        # writes the palette back to its source file(s) AND bakes the
+        # new colours into the tile sheet PNG (so opening the .png in
+        # GIMP shows the colours that the editor / game render with).
+        self._palette_dirty = False
         self._tool = "paint"  # "paint" or "pick"
         self._tile_offset = 0  # VRAM tile offset for current sheet
         self._last_open_dir = ""  # remembers last Open dialog folder
@@ -753,6 +759,21 @@ class TilemapEditorTab(QWidget):
         self._btn_autofix.clicked.connect(self._on_autofix_palettes)
         tb.addWidget(self._btn_autofix)
 
+        self._btn_apply_pal = QPushButton("Apply Palette to PNG…")
+        self._btn_apply_pal.setToolTip(
+            "Take an external PNG (e.g. the original artwork you made "
+            "this tilemap from) and bake the editor's current palette "
+            "into its color table. If the PNG is already indexed, "
+            "pixel indices are kept exactly — only the color table "
+            "changes, so your art stays pixel-perfect. If it's RGB, "
+            "pixels are remapped to the nearest colour in the current "
+            "palette (lossy). Resulting PNG opens in GIMP with the "
+            "right colours."
+        )
+        self._btn_apply_pal.setEnabled(False)
+        self._btn_apply_pal.clicked.connect(self._on_apply_palette_to_png)
+        tb.addWidget(self._btn_apply_pal)
+
         tb.addSeparator()
 
         # Tile sheet selector
@@ -791,11 +812,21 @@ class TilemapEditorTab(QWidget):
 
         tb.addSeparator()
 
-        # Tilemap dimensions
+        # Tilemap dimensions — live visual REWRAP. Scrubbing W or H
+        # re-flows the existing entries across a different row stride
+        # in real time so you can see what the data looks like at
+        # different widths. Total entry count is preserved; the OTHER
+        # axis auto-recalculates to fit. To actually change the tile
+        # count (truncate/pad) use the Resize… button.
         tb.addWidget(QLabel(" W: "))
         self._width_spin = QSpinBox()
         self._width_spin.setRange(1, 128)
         self._width_spin.setValue(32)
+        self._width_spin.setToolTip(
+            "Tilemap width — live visual re-wrap. Scrub to see the "
+            "same entries at a different row stride; height auto-"
+            "recalculates to fit. No data is lost. To actually "
+            "change the tile COUNT (truncate or pad), use Resize…")
         self._width_spin.valueChanged.connect(self._on_dimensions_changed)
         tb.addWidget(self._width_spin)
 
@@ -803,8 +834,25 @@ class TilemapEditorTab(QWidget):
         self._height_spin = QSpinBox()
         self._height_spin.setRange(1, 128)
         self._height_spin.setValue(20)
+        self._height_spin.setToolTip(
+            "Tilemap height — live visual re-wrap. Scrub to see the "
+            "same entries at a different row count; width auto-"
+            "recalculates to fit. No data is lost. To actually "
+            "change the tile COUNT (truncate or pad), use Resize…")
         self._height_spin.valueChanged.connect(self._on_dimensions_changed)
         tb.addWidget(self._height_spin)
+
+        self._btn_resize = QPushButton("Resize…")
+        self._btn_resize.setToolTip(
+            "Change the tilemap's tile COUNT — pick new width and "
+            "height, the result is exactly W*H tiles. Shrinking "
+            "truncates entries past the new bounds (with a confirm "
+            "if any are painted); growing pads with blank tiles. "
+            "Use this for partial-screen UIs that need a specific "
+            "tilemap size.")
+        self._btn_resize.setEnabled(False)
+        self._btn_resize.clicked.connect(self._on_resize)
+        tb.addWidget(self._btn_resize)
 
         tb.addSeparator()
 
@@ -1007,13 +1055,32 @@ class TilemapEditorTab(QWidget):
         """
         from core.tilemap_data import (
             Tilemap, TileSheet, PaletteSet, discover_assets,
+            get_tilemap_dim_pref,
         )
 
+        # Look up the user's last-saved (W, H) for this .bin in PorySuite's
+        # per-project cache. Without this, Tilemap.from_file falls back to
+        # _guess_width which picks 32 for any 32-divisible count — losing
+        # custom widths the user set with the Resize dialog.
+        pref_w = 0
+        pref = get_tilemap_dim_pref(self._project_dir, bin_path)
+        if pref is not None:
+            pref_w = pref[0]
+
         try:
-            tilemap = Tilemap.from_file(bin_path)
+            tilemap = Tilemap.from_file(bin_path, width=pref_w)
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Cannot load tilemap:\n{e}")
             return
+
+        # If the cache had a height pref AND it doesn't match what
+        # from_file inferred, prefer the cached height — but only if the
+        # entry count actually fits it. Avoids accidentally truncating
+        # if the file shrank under our cache.
+        if pref is not None:
+            pref_h = pref[1]
+            if pref_h > 0 and pref_w * pref_h == len(tilemap.entries):
+                tilemap.height = pref_h
 
         self._tilemap = tilemap
 
@@ -1128,7 +1195,15 @@ class TilemapEditorTab(QWidget):
             and self._palettes and self._palettes.palette_count() > 1
         )
         self._btn_autofix.setEnabled(autofix_useful)
+        # Apply-palette-to-PNG only useful when there's a palette loaded.
+        self._btn_apply_pal.setEnabled(
+            self._palettes is not None
+            and self._palettes.palette_count() > 0
+        )
+        # Resize requires a loaded tilemap.
+        self._btn_resize.setEnabled(self._tilemap is not None)
         self._dirty = False
+        self._palette_dirty = False
         # Loading a different file invalidates the undo/redo history —
         # those steps reference cells in the previous tilemap.
         self._undo_stack.clear()
@@ -1172,12 +1247,145 @@ class TilemapEditorTab(QWidget):
             return
         try:
             self._tilemap.save()
+            # Persist W/H to the project's PorySuite cache so the next
+            # load doesn't fall back to _guess_width (which would lose
+            # any user-set custom width). The .bin format itself has no
+            # header; this is the only way to remember the choice.
+            try:
+                from core.tilemap_data import set_tilemap_dim_pref
+                set_tilemap_dim_pref(
+                    self._project_dir, self._tilemap.source_path,
+                    self._tilemap.width, self._tilemap.height,
+                )
+            except Exception:
+                pass
+            # Flush palette edits too — write back to .pal/.gbapal sources
+            # AND bake into the tile sheet PNG so GIMP shows current colors.
+            pal_msg = ""
+            if self._palette_dirty:
+                wrote_to, errs = self._flush_palette_edits()
+                if wrote_to:
+                    pal_msg = f" + palette ({', '.join(wrote_to)})"
+                if errs:
+                    QMessageBox.warning(
+                        self, "Palette Save",
+                        "Some palette files couldn't be written:\n"
+                        + "\n".join(errs))
             self._dirty = False
+            self._palette_dirty = False
             self._status.setText(
-                self._status.text().split(" — Saved")[0] + " — Saved!")
+                self._status.text().split(" — Saved")[0]
+                + f" — Saved!{pal_msg}")
             self.tilemap_saved.emit(self._tilemap.source_path)
         except Exception as e:
             QMessageBox.warning(self, "Save Error", str(e))
+
+    def _flush_palette_edits(self) -> tuple[list[str], list[str]]:
+        """Write the in-memory palette back to its source file(s) AND
+        bake the colors into the current tile sheet PNG.
+
+        Sources written:
+          - Every path in `self._palettes.source_paths` — `.pal` files get
+            JASC text format, `.gbapal` files get raw BGR555 binary.
+            Multi-palette files (>1 sub-palette loaded) are written as a
+            flat 256-color sequence; single-palette files get just 16.
+          - The current tile sheet PNG (if Format_Indexed8 on disk) gets
+            its color table rewritten so the file opens in GIMP with the
+            colors the user sees in the editor.
+
+        Returns (paths_written_basenames, error_messages).
+        """
+        import os as _os
+        from core.tilemap_data import _write_gbapal_file
+        from ui.palette_utils import write_jasc_pal
+
+        wrote: list[str] = []
+        errors: list[str] = []
+        if not self._palettes:
+            return wrote, errors
+
+        # Build the flat color list. Multi-palette PaletteSet returns 16
+        # sub-palettes of 16 each; for single-palette sources we collapse
+        # to just the one populated slot.
+        n_loaded = self._palettes.loaded_slot_count() if hasattr(
+            self._palettes, 'loaded_slot_count') else self._palettes.palette_count()
+        # Flat color list spanning every loaded slot, padded internally.
+        flat_colors = self._palettes.get_flat_colors() if hasattr(
+            self._palettes, 'get_flat_colors') else []
+        if not flat_colors and self._palettes.palette_count() > 0:
+            # Fallback — build flat manually
+            flat_colors = []
+            for i in range(self._palettes.palette_count()):
+                pal = self._palettes.palettes[i]
+                flat_colors.extend(pal[:16])
+                while len(flat_colors) % 16 != 0:
+                    flat_colors.append((0, 0, 0))
+
+        # Decide how many colors to write based on how many sub-palettes
+        # were loaded. Multi-palette source -> write all loaded slots.
+        # Single-palette source -> write 16.
+        if n_loaded > 1:
+            write_count = min(n_loaded * 16, len(flat_colors))
+        else:
+            write_count = min(16, len(flat_colors))
+        out_colors = flat_colors[:write_count]
+
+        # Write each source palette file.
+        for path in self._palettes.source_paths or []:
+            if not path:
+                continue
+            try:
+                ext = _os.path.splitext(path)[1].lower()
+                if ext == ".gbapal":
+                    if _write_gbapal_file(path, out_colors):
+                        wrote.append(_os.path.basename(path))
+                    else:
+                        errors.append(f"{_os.path.basename(path)}: write failed")
+                else:
+                    if write_jasc_pal(path, out_colors):
+                        wrote.append(_os.path.basename(path))
+                    else:
+                        errors.append(f"{_os.path.basename(path)}: write failed")
+            except Exception as exc:
+                errors.append(f"{_os.path.basename(path)}: {exc}")
+
+        # Bake into the tile sheet PNG. Pixel indices are untouched —
+        # only the color table is rewritten so opening the file in GIMP
+        # shows the new colors. Refuses non-Indexed8 PNGs (would otherwise
+        # produce an RGB PNG that breaks gbagfx during the build).
+        sheet_path = ""
+        if self._sheet and getattr(self._sheet, 'source_path', ""):
+            sheet_path = self._sheet.source_path
+        else:
+            idx = self._sheet_combo.currentIndex()
+            sheet_path = self._sheet_combo.itemData(idx) if idx >= 0 else ""
+        if sheet_path and _os.path.isfile(sheet_path):
+            try:
+                from PyQt6.QtGui import QImage
+                from core.gba_image_utils import export_indexed_png
+                disk_img = QImage(sheet_path)
+                if not disk_img.isNull():
+                    if disk_img.format() != QImage.Format.Format_Indexed8:
+                        disk_img = disk_img.convertToFormat(
+                            QImage.Format.Format_Indexed8)
+                    if disk_img.format() == QImage.Format.Format_Indexed8:
+                        # For multi-palette sheets, bake the flat 256-color
+                        # table. For single-palette sheets, just the 16.
+                        ct_colors = (out_colors
+                                     if len(out_colors) > 16 or n_loaded > 1
+                                     else out_colors[:16])
+                        if export_indexed_png(disk_img, ct_colors, sheet_path,
+                                              transparent_index=-1):
+                            wrote.append(_os.path.basename(sheet_path))
+                        else:
+                            errors.append(
+                                f"{_os.path.basename(sheet_path)}: "
+                                f"refused (not indexed)"
+                            )
+            except Exception as exc:
+                errors.append(f"{_os.path.basename(sheet_path)}: {exc}")
+
+        return wrote, errors
 
     def _on_reveal_in_folder(self):
         """Open the OS file manager with the current tilemap selected."""
@@ -1188,6 +1396,119 @@ class TilemapEditorTab(QWidget):
             QMessageBox.warning(
                 self, "Open in Folder",
                 f"Could not open folder for:\n{self._tilemap.source_path}")
+
+    def _on_apply_palette_to_png(self):
+        """Bake the editor's current palette into an external PNG.
+
+        Two paths depending on the source PNG:
+          - Already Indexed8: keep pixel indices exactly, just replace
+            the color table (lossless — pixel-art stays pixel-art).
+          - RGB: remap pixels to nearest colour in the current palette
+            (lossy — produces noise on continuous-tone sources, but
+            preserves intent for indexed-style art that happened to be
+            saved as RGB).
+
+        Result PNG opens in GIMP with the editor's colours as its swatches.
+        """
+        if not self._palettes or self._palettes.palette_count() == 0:
+            QMessageBox.warning(
+                self, "Apply Palette to PNG",
+                "No palette loaded — open a tilemap first or import a "
+                ".pal so there's a palette to apply.")
+            return
+
+        # Build the flat color list from the current palette set.
+        if hasattr(self._palettes, 'get_flat_colors'):
+            flat = self._palettes.get_flat_colors()
+        else:
+            flat = []
+            for i in range(self._palettes.palette_count()):
+                pal = self._palettes.palettes[i]
+                flat.extend(pal[:16])
+                while len(flat) % 16 != 0:
+                    flat.append((0, 0, 0))
+        n_loaded = (
+            self._palettes.loaded_slot_count()
+            if hasattr(self._palettes, 'loaded_slot_count')
+            else self._palettes.palette_count()
+        )
+        n_colors = max(16, n_loaded * 16)
+        n_colors = min(n_colors, len(flat))
+        out_pal = list(flat[:n_colors])
+
+        # Pick source PNG.
+        start_dir = self._last_open_dir or self._project_dir or ""
+        src_path, _ = QFileDialog.getOpenFileName(
+            self, "Apply palette to which PNG?",
+            start_dir,
+            "PNG Images (*.png);;All files (*)",
+        )
+        if not src_path:
+            return
+
+        from PyQt6.QtGui import QImage
+        src = QImage(src_path)
+        if src.isNull():
+            QMessageBox.warning(
+                self, "Apply Palette to PNG",
+                f"Couldn't read the PNG:\n{src_path}")
+            return
+
+        # Choose path: if source is indexed, keep pixel values; else remap.
+        if src.format() == QImage.Format.Format_Indexed8:
+            # Bake-only — pixel indices unchanged, color table replaced.
+            from core.gba_image_utils import export_indexed_png
+            indexed = src
+            mode_label = "color table replaced (pixel indices preserved)"
+        else:
+            # RGB or RGBA → remap to nearest colour in the palette.
+            from core.gba_image_utils import remap_to_palette, export_indexed_png
+            try:
+                indexed = remap_to_palette(src, out_pal, dither=False)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Apply Palette to PNG",
+                    f"Remap failed:\n{exc}")
+                return
+            mode_label = "pixels remapped to nearest palette colour"
+
+        # Pick destination — default to suggesting `<source>_palette.png`
+        # so we don't surprise the user by overwriting their original.
+        import os as _os
+        base, ext = _os.path.splitext(src_path)
+        suggest = f"{base}_palette.png"
+        dst_path, _ = QFileDialog.getSaveFileName(
+            self, "Save with current palette as…",
+            suggest,
+            "PNG Images (*.png);;All files (*)",
+        )
+        if not dst_path:
+            return
+        if not dst_path.lower().endswith(".png"):
+            dst_path += ".png"
+
+        try:
+            ok = export_indexed_png(indexed, out_pal, dst_path,
+                                    transparent_index=-1)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Apply Palette to PNG", f"Save failed:\n{exc}")
+            return
+        if not ok:
+            QMessageBox.warning(
+                self, "Apply Palette to PNG",
+                "Save refused — the resulting image wasn't indexed. "
+                "This is a safety check (RGB PNGs break the gbagfx "
+                "build step).")
+            return
+
+        QMessageBox.information(
+            self, "Apply Palette to PNG",
+            f"Wrote <code>{_os.path.basename(dst_path)}</code> "
+            f"with {len(out_pal)} colour entries.<br>"
+            f"<small>{mode_label}</small><br><br>"
+            f"Open it in GIMP and you'll see the editor's current "
+            f"palette as the file's swatches.")
 
     def _on_reveal_sheet_in_folder(self):
         """Open the OS file manager with the currently-selected tile
@@ -1294,19 +1615,45 @@ class TilemapEditorTab(QWidget):
             + f" — Auto-fixed {len(proposed)} tile palette(s)")
 
     def has_unsaved_changes(self) -> bool:
-        return self._dirty
+        return self._dirty or self._palette_dirty
 
     def flush_to_disk(self) -> tuple:
-        """Save the tilemap .bin file. Follows the flush_to_disk convention."""
-        if not self._tilemap or not self._tilemap.source_path or not self._dirty:
+        """Save the tilemap .bin file AND any palette edits.
+
+        Palette flush writes back to every source `.pal`/`.gbapal` the
+        palette was loaded from AND bakes the new colors into the tile
+        sheet PNG's color table so opening the .png in GIMP shows the
+        colors the editor / game render with.
+        """
+        if not self._tilemap or not self._tilemap.source_path:
             return (0, [])
+        if not self._dirty and not self._palette_dirty:
+            return (0, [])
+        ok = 0
+        errors: list[str] = []
         try:
             self._tilemap.save()
-            self._dirty = False
+            # Persist W/H so the next load doesn't lose the user's
+            # chosen layout (see _save_file for full reasoning).
+            try:
+                from core.tilemap_data import set_tilemap_dim_pref
+                set_tilemap_dim_pref(
+                    self._project_dir, self._tilemap.source_path,
+                    self._tilemap.width, self._tilemap.height,
+                )
+            except Exception:
+                pass
+            ok += 1
             self.tilemap_saved.emit(self._tilemap.source_path)
-            return (1, [])
         except Exception as e:
-            return (0, [str(e)])
+            errors.append(f"tilemap: {e}")
+        if self._palette_dirty:
+            wrote, perrs = self._flush_palette_edits()
+            ok += len(wrote)
+            errors.extend(f"palette {e}" for e in perrs)
+        self._dirty = False
+        self._palette_dirty = False
+        return (ok, errors)
 
     def _on_sheet_changed(self, idx: int):
         if idx < 0:
@@ -1582,6 +1929,12 @@ class TilemapEditorTab(QWidget):
         """Called when the palette editor widget changes a palette slot."""
         self._refresh_canvas()
         self._picker.set_sheet(self._sheet, self._palettes)
+        # Mark palette dirty so save() will write the palette back to
+        # disk AND bake into the sheet PNG. Also set the file-dirty flag
+        # so the toolbar dot lights up + Save All picks this up.
+        self._palette_dirty = True
+        self._dirty = True
+        self.modified.emit()
 
     def _on_import_pal_clicked(self):
         """Import a .pal file — choose 16-color (to a slot) or 256-color (all slots)."""
@@ -1622,9 +1975,26 @@ class TilemapEditorTab(QWidget):
                 return
             self._palettes.set_palette_at(slot, colors[:16])
 
+        # Track the imported file as a palette source so the next Save
+        # writes the user's edits back to THIS file (instead of skipping
+        # the palette flush silently — which is what happened when the
+        # tilemap's palette came from the sheet PNG's color table and
+        # the user expected their imported .pal to become the new source).
+        if self._palettes.source_paths is None:
+            self._palettes.source_paths = []
+        if path not in self._palettes.source_paths:
+            self._palettes.source_paths.append(path)
+
         self._refresh_canvas()
         self._picker.set_sheet(self._sheet, self._palettes)
         self._update_pal_editor()
+
+        # Mark dirty so Ctrl+S persists this. Without these three lines
+        # the palette only lives in RAM — restart the app and the imported
+        # palette is gone, replaced by whatever was baked into the PNG.
+        self._palette_dirty = True
+        self._dirty = True
+        self.modified.emit()
 
     def _ask_palette_slot(self):
         """Ask the user which palette slot (0-15) to import into."""
@@ -1706,11 +2076,16 @@ class TilemapEditorTab(QWidget):
             self._pal_header_label.setText("Palettes (16-color)")
 
     def _on_dimensions_changed(self):
-        """Re-interpret the tilemap with new width/height.
+        """Live visual REWRAP — scrubbing W or H reflows the same entries
+        across a new row stride, with the OTHER axis auto-recalculating
+        to fit. Total entry count is preserved. No data is lost.
 
-        Changing W or H re-wraps the same flat entry data — the total
-        entry count stays the same, only the row stride changes. When W
-        changes, H is auto-recalculated to fit all entries (and vice versa).
+        Use case: an opened .bin came in with the wrong auto-detected
+        width and the visual is jumbled. Drag W and watch the canvas
+        re-flow until it looks right.
+
+        For changing the tile COUNT (truncate or pad to a specific size),
+        the Resize… button is the explicit operation.
         """
         if not self._tilemap:
             return
@@ -1721,25 +2096,23 @@ class TilemapEditorTab(QWidget):
 
         from core.tilemap_data import TileEntry
 
-        # Total entry count from the original file — never changes
+        # Total entry count from the source — never changes.
         total = len(self._tilemap.entries)
 
-        # Determine which spinner the user actually changed by comparing
-        # to the current tilemap dimensions
+        # Whichever spinner the user moved drives; the other recalculates.
         if new_w != self._tilemap.width:
-            # Width changed → recalculate height to fit all entries
             new_h = max(1, (total + new_w - 1) // new_w)
             self._height_spin.blockSignals(True)
             self._height_spin.setValue(new_h)
             self._height_spin.blockSignals(False)
         elif new_h != self._tilemap.height:
-            # Height changed → recalculate width to fit all entries
             new_w = max(1, (total + new_h - 1) // new_h)
             self._width_spin.blockSignals(True)
             self._width_spin.setValue(new_w)
             self._width_spin.blockSignals(False)
 
-        # Pad with empty tiles if new grid is larger than entry count
+        # Pad with blank tiles only when the recalc'd grid is slightly
+        # bigger than the entry count (last row not fully filled).
         new_count = new_w * new_h
         entries = list(self._tilemap.entries)
         while len(entries) < new_count:
@@ -1749,6 +2122,152 @@ class TilemapEditorTab(QWidget):
         self._tilemap.height = new_h
         self._tilemap.entries = entries[:new_count]
         self._refresh_canvas()
+
+    def _on_resize(self):
+        """Explicit RESIZE — change the tilemap's actual tile count.
+
+        Pops a small dialog with W and H inputs (defaulting to current
+        dimensions). Result is exactly W*H entries:
+          - Shrink → truncate entries past the new bounds. If any of
+            the dropped tiles aren't blank, confirm before committing.
+          - Grow → pad with blank tiles at the end (top-left content
+            preserved).
+
+        Driving use case: partial-screen UIs (smaller dialogue boxes,
+        custom HUD strips) that need the .bin saved at a specific size
+        the engine reads. Different operation from the live rewrap on
+        the toolbar W/H spinners — that one preserves entry count.
+        """
+        if not self._tilemap:
+            return
+        from PyQt6.QtWidgets import (
+            QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QLabel,
+        )
+
+        old_w = self._tilemap.width
+        old_h = self._tilemap.height
+        old_count = len(self._tilemap.entries)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Resize Tilemap")
+        form = QFormLayout(dlg)
+        info = QLabel(
+            f"Currently <b>{old_w}×{old_h}</b> = {old_count} tiles.<br>"
+            f"Pick the new dimensions. Shrinking truncates; growing "
+            f"pads with blank tiles. Top-left content is preserved."
+        )
+        info.setWordWrap(True)
+        form.addRow(info)
+        w_spin = QSpinBox()
+        w_spin.setRange(1, 1024)
+        w_spin.setValue(old_w)
+        h_spin = QSpinBox()
+        h_spin.setRange(1, 1024)
+        h_spin.setValue(old_h)
+        live = QLabel("")
+        live.setStyleSheet("color: #aaa;")
+
+        def _refresh_live():
+            new_total = w_spin.value() * h_spin.value()
+            delta = new_total - old_count
+            if delta == 0:
+                live.setText(f"Result: {new_total} tiles (same total)")
+            elif delta > 0:
+                live.setText(
+                    f"Result: {new_total} tiles "
+                    f"(+{delta} blank tiles padded)"
+                )
+            else:
+                live.setText(
+                    f"<span style='color:#e88;'>Result: {new_total} "
+                    f"tiles ({-delta} dropped — will confirm if any "
+                    f"are painted)</span>"
+                )
+        w_spin.valueChanged.connect(_refresh_live)
+        h_spin.valueChanged.connect(_refresh_live)
+        _refresh_live()
+
+        form.addRow("Width (tiles):", w_spin)
+        form.addRow("Height (tiles):", h_spin)
+        form.addRow(live)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_w = w_spin.value()
+        new_h = h_spin.value()
+        if new_w == old_w and new_h == old_h:
+            return
+
+        from core.tilemap_data import TileEntry
+
+        old_entries = list(self._tilemap.entries)
+        new_count = new_w * new_h
+
+        # Build new grid: copy overlapping top-left rectangle, pad rest.
+        new_entries: list = [TileEntry() for _ in range(new_count)]
+        copy_w = min(new_w, old_w)
+        copy_h = min(new_h, old_h)
+        for r in range(copy_h):
+            for c in range(copy_w):
+                src = r * old_w + c
+                dst = r * new_w + c
+                if src < old_count:
+                    new_entries[dst] = old_entries[src]
+
+        # Confirm if shrinking would drop painted tiles.
+        if new_count < old_count:
+            default = TileEntry()
+            def _is_default(e):
+                return (e.tile_index == default.tile_index
+                        and e.hflip == default.hflip
+                        and e.vflip == default.vflip
+                        and e.palette == default.palette)
+            dropped_painted = False
+            for idx in range(old_count):
+                old_r, old_c = divmod(idx, old_w)
+                if old_r < copy_h and old_c < copy_w:
+                    continue
+                if not _is_default(old_entries[idx]):
+                    dropped_painted = True
+                    break
+            if dropped_painted:
+                reply = QMessageBox.warning(
+                    self, "Resize Tilemap",
+                    f"Shrinking {old_w}×{old_h} → {new_w}×{new_h} will "
+                    f"discard painted tiles outside the new bounds.\n\n"
+                    f"Continue?",
+                    QMessageBox.StandardButton.Ok
+                    | QMessageBox.StandardButton.Cancel,
+                )
+                if reply != QMessageBox.StandardButton.Ok:
+                    return
+
+        self._tilemap.width = new_w
+        self._tilemap.height = new_h
+        self._tilemap.entries = new_entries
+
+        # Sync toolbar spinners to the new dimensions, suppressing their
+        # rewrap handler (we just resized — no rewrap needed).
+        self._width_spin.blockSignals(True)
+        self._height_spin.blockSignals(True)
+        self._width_spin.setValue(new_w)
+        self._height_spin.setValue(new_h)
+        self._width_spin.blockSignals(False)
+        self._height_spin.blockSignals(False)
+
+        self._dirty = True
+        self.modified.emit()
+        self._refresh_canvas()
+        self._status.setText(
+            self._status.text().split(" — ")[0]
+            + f" — Resized to {new_w}×{new_h} ({new_count} tiles)"
+        )
 
     def _update_tile_info(self):
         self._tile_idx_label.setText(str(self._current_tile))

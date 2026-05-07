@@ -1727,29 +1727,44 @@ class FieldEffectSpritesTab(QWidget):
                 errors.append(f"fe-pal:{entry.name} (no palette in RAM)")
                 continue
 
+            wrote_pal = False
             if entry.pal_path:
                 if write_jasc_pal(entry.pal_path, colors):
-                    self._palette_dirty.discard(key)
+                    wrote_pal = True
                     ok += 1
                 else:
                     errors.append(f"fe-pal:{entry.name}")
-            else:
-                # No .pal file — bake palette into PNG
-                img = self._sprite_imgs.get(entry.png_path)
-                if img is None and entry.png_path and os.path.isfile(entry.png_path):
-                    img = QImage(entry.png_path)
-                    if not img.isNull() and img.format() != QImage.Format.Format_Indexed8:
-                        img = img.convertToFormat(QImage.Format.Format_Indexed8)
-                if img is None or img.isNull():
-                    errors.append(f"fe-png:{entry.name} (cannot load image)")
                     continue
-                try:
-                    export_indexed_png(img, colors, entry.png_path)
-                    self._palette_dirty.discard(key)
-                    self._sprite_png_dirty.discard(entry.png_path)
+
+            # Always bake into the PNG — whether or not there's a separate
+            # .pal file. This way opening the PNG in GIMP shows the
+            # current colours, matching what the game renders.
+            # export_indexed_png refuses non-indexed input (RGB PNGs
+            # break the gbagfx build step), so we MUST guarantee
+            # Format_Indexed8 here.
+            img = self._sprite_imgs.get(entry.png_path)
+            if (img is None or img.format() != QImage.Format.Format_Indexed8) \
+                    and entry.png_path and os.path.isfile(entry.png_path):
+                disk_img = QImage(entry.png_path)
+                if not disk_img.isNull():
+                    if disk_img.format() != QImage.Format.Format_Indexed8:
+                        disk_img = disk_img.convertToFormat(
+                            QImage.Format.Format_Indexed8)
+                    img = disk_img
+            if img is None or img.isNull() \
+                    or img.format() != QImage.Format.Format_Indexed8:
+                errors.append(f"fe-png:{entry.name} (cannot load as indexed)")
+                continue
+            try:
+                export_indexed_png(img, colors, entry.png_path)
+                self._palette_dirty.discard(key)
+                self._sprite_png_dirty.discard(entry.png_path)
+                if not wrote_pal:
+                    # Counted as a save only when there's no .pal sibling
+                    # (the .pal write already incremented ok above).
                     ok += 1
-                except Exception as exc:
-                    errors.append(f"fe-png:{entry.name} ({exc})")
+            except Exception as exc:
+                errors.append(f"fe-png:{entry.name} ({exc})")
 
         # Pass 2 — Index-as-BG pixel remaps not already written above
         png_to_entry: Dict[str, FieldEffectEntry] = {e.png_path: e for e in self._entries}
@@ -3158,20 +3173,67 @@ class OverworldGraphicsTab(QWidget):
         ok = 0
         errors: list[str] = []
 
-        # Pass 1 — NPC palette files
+        # Pass 1 — NPC palette files. Each dirty palette tag gets:
+        #   a) .pal rewritten from in-memory colors (game-side runtime)
+        #   b) NEW: every sprite PNG that USES this palette tag has its
+        #      embedded color table rebuilt to match. Without this step
+        #      the PNG keeps whatever colors were originally baked into
+        #      it and opening the .png in GIMP shows stale colors that
+        #      don't match what the game now renders. The PNG's pixel
+        #      INDICES are untouched — only the color table changes.
+        baked_pngs: set[str] = set()
         for tag in list(self._palette_dirty):
             pal_path = self._pal_paths.get(tag, "")
             if not pal_path:
                 errors.append(f"overworld-pal:{tag} (no path)")
                 continue
             colors = self._palettes.get(tag)
-            if colors and write_jasc_pal(pal_path, colors):
-                self._palette_dirty.discard(tag)
-                ok += 1
-            else:
+            if not (colors and write_jasc_pal(pal_path, colors)):
                 errors.append(f"overworld-pal:{tag}")
+                continue
+            self._palette_dirty.discard(tag)
+            ok += 1
 
-        # Pass 2 — remapped PNG pixel data (Index-as-Background ops)
+            # Bake into every sprite PNG that references this palette tag.
+            for gfx_key, entry in self._all_sprites.items():
+                if entry.palette_tag != tag or not entry.png_path:
+                    continue
+                if entry.png_path in baked_pngs:
+                    continue
+                img = self._sprite_imgs.get(gfx_key)
+                # If the in-memory copy isn't Indexed8, fall back to a
+                # fresh load-and-convert from disk. export_indexed_png
+                # refuses non-indexed input (would otherwise produce an
+                # RGB PNG that breaks the gbagfx build step), so we MUST
+                # guarantee indexed format before passing it through.
+                if img is None or img.format() != QImage.Format.Format_Indexed8:
+                    if not os.path.isfile(entry.png_path):
+                        continue
+                    disk_img = QImage(entry.png_path)
+                    if disk_img.isNull():
+                        continue
+                    if disk_img.format() != QImage.Format.Format_Indexed8:
+                        disk_img = disk_img.convertToFormat(
+                            QImage.Format.Format_Indexed8)
+                    img = disk_img
+                try:
+                    if export_indexed_png(img, colors, entry.png_path):
+                        baked_pngs.add(entry.png_path)
+                        # PNG just got the matching color table — clear
+                        # any remap-dirty flag on it too; the disk file
+                        # is now in sync with our in-memory state.
+                        self._sprite_png_dirty.discard(gfx_key)
+                    else:
+                        errors.append(
+                            f"overworld-png-bake:{gfx_key} "
+                            f"(refused — image not indexed)"
+                        )
+                except Exception as exc:
+                    errors.append(f"overworld-png-bake:{gfx_key} ({exc})")
+
+        # Pass 2 — remapped PNG pixel data (Index-as-Background ops).
+        # Anything still in _sprite_png_dirty had pixel-INDEX changes
+        # that Pass 1's color-table-only bake didn't cover.
         for gfx_key in list(self._sprite_png_dirty):
             entry = self._all_sprites.get(gfx_key)
             img = self._sprite_imgs.get(gfx_key)

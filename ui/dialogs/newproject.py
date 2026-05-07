@@ -32,6 +32,52 @@ SETUP_STEPS = [
 ]
 
 
+def _ensure_gitignore_entry(project_dir: str, entry: str,
+                             comment: str = "") -> None:
+    """Add `entry` to `project_dir/.gitignore` if not already present.
+
+    Conservative: never overwrites; never reorders existing entries; only
+    appends with a one-line comment so the user can see who/why. Skips
+    silently if the .gitignore can't be read or written. Safe to call
+    every project open — idempotent.
+
+    Match is whitespace-trimmed exact-line; doesn't match wildcards or
+    re-handle entries like ``/project.json`` vs ``project.json`` — those
+    intentional variations should be left as the user wrote them.
+    """
+    if not project_dir or not entry:
+        return
+    gi_path = os.path.join(project_dir, ".gitignore")
+    try:
+        existing = ""
+        if os.path.isfile(gi_path):
+            with open(gi_path, "r", encoding="utf-8", errors="replace") as f:
+                existing = f.read()
+        # Already present?
+        for raw in existing.splitlines():
+            if raw.strip() == entry:
+                return
+        # Append. Preserve trailing newline + add a leading blank line
+        # if the file doesn't already end in one (so our addition stands
+        # apart visually).
+        addition_lines = []
+        if existing and not existing.endswith("\n"):
+            addition_lines.append("")
+        if existing.strip() and not existing.rstrip("\n").endswith("\n"):
+            addition_lines.append("")
+        if comment:
+            addition_lines.append(comment)
+        addition_lines.append(entry)
+        addition_lines.append("")  # trailing newline
+        with open(gi_path, "a", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(addition_lines))
+    except Exception:
+        # Don't let a .gitignore problem block project creation. The user
+        # can manually add the entry; the worst case is the file shows
+        # up in their `git status`.
+        pass
+
+
 def format_project_name(name):
     keep_characters = (' ', '.', '_')
     name = "".join(c for c in name if c.isalnum() or c in keep_characters).strip().lower().replace(" ", "_")
@@ -375,6 +421,15 @@ class NewProject(QDialog):
         os.makedirs(os.path.join(self.project_dir, "data"), exist_ok=True)
         with open(os.path.join(self.project_dir, "project.json"), "w") as f:
             json.dump(self.project_info, f)
+        # Ensure project.json is gitignored — it's PorySuite metadata, not
+        # part of the decomp project. Without this entry it'd show up in
+        # the user's `git status` as an untracked file every time they
+        # open a fresh clone of an upstream decomp.
+        _ensure_gitignore_entry(
+            self.project_dir,
+            "project.json",
+            comment="# PorySuite project metadata (auto-added)",
+        )
         self.project_info = data_dir_project_info | self.project_info
 
     def remove_project_info(self):

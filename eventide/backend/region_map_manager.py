@@ -284,10 +284,21 @@ class RegionMapManager:
         if new_content == original:
             return  # nothing to write
         # Atomic write via temp + os.replace — never leaves a partial file.
+        # try/finally clean-up: if anything raises between opening the .tmp
+        # and the rename, remove the .tmp so it doesn't pollute the user's
+        # project tree (would otherwise show up in git status).
         tmp_path = self.region_map_c_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(new_content)
-        os.replace(tmp_path, self.region_map_c_path)
+        try:
+            with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(new_content)
+            os.replace(tmp_path, self.region_map_c_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
 
     def load_sections(self) -> dict:
         if not os.path.exists(self.sections_path):
