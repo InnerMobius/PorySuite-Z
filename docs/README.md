@@ -39,13 +39,15 @@ You can also use `LaunchPorySuite.bat` on Windows.
 
 On first run, the **Project Selector** window appears. Use **Open Existing Project** to point PorySuite at your pokefirered project directory. If build tools aren't detected, the Setup Wizard will walk you through installing everything.
 
+The Project Selector keeps a recent-projects list — hover any entry for a path tooltip and click the small **×** on the right to remove it from the list (the project on disk is left alone). Once a project is open, **File → Quit to Launcher** returns to the Project Selector without restarting the app, so switching between projects is one click.
+
 ![Launcher](launcher.png)
 
 ---
 
 ## Editor Pages
 
-PorySuite-Z has 17 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
+PorySuite-Z has 18 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
 
 ### Pokemon
 
@@ -97,7 +99,7 @@ Three sub-tabs:
 
 - **Trainers** -- Searchable trainer list grouped by trainer class. Detail editor includes: class, name, trainer pic (with visual preview), encounter music, AI flags, party type, and a full party editor with per-member level, species, held item, moves, and ability. VS Seeker rematch tier support with dynamic tier labels that refresh in-place when you edit a rematch party.
 - **Trainer Classes** -- Searchable class list with sprite thumbnails. Edit class display name (12-character limit), prize money multiplier, and default sprite (dropdown with thumbnails of all trainer pics). **Rename...** button writes the new `TRAINER_CLASS_*` constant across source files (opponents.h, trainers.h, battle_main.c, trainer_class_names.h, data/trainers.json, scripts, maps). Create new classes with a button that writes to three files. View battle info, encounter music, facility class mappings, and usage counts. Inline note under the class-level Trainer Pic explains it's scoped to Battle Tower / Trainer Tower / Union Room facility battles only.
-- **Graphics** -- Scrollable card grid of every trainer pic (thumbnail + name + `TRAINER_PIC_*` constant) with a live search filter, amber border on unsaved cards, and blue border on the selected card. Right panel has a 192x192 sprite preview, the same drag-to-reorder 16-swatch palette row used on Pokemon Graphics (drop on the leftmost slot to pick the transparent index — the sprite PNG is reindexed automatically on save), **Import PNG as Sprite...** (replaces pixels AND palette), **Import Palette from PNG**, **Import .pal File**, **Save Sprite as PNG**, **Save Palette as .pal**, and **Open Palettes Folder**. The body uses a draggable splitter so the grid and editor can be rebalanced, and both panels stay visible when the window isn't maximized.
+- **Graphics** -- Scrollable card grid of every trainer pic (thumbnail + name + `TRAINER_PIC_*` constant) with a live search filter, amber border on unsaved cards, and blue border on the selected card. Right panel has a 192x192 sprite preview, the same drag-to-reorder 16-swatch palette row used on Pokemon Graphics (drop on the leftmost slot to pick the transparent index — the sprite PNG is reindexed automatically on save), **Import PNG as Sprite...** (replaces pixels AND palette), **Import Palette from PNG**, **Import .pal File**, **Save Sprite as PNG**, **Save Palette as .pal**, and **Open Palettes Folder**. The **Add Trainer Pic** button takes a name and a PNG and registers a brand-new trainer pic across all four engine source files in one operation — the new constant is immediately available in the trainer detail panel and the trainer-class default-sprite dropdown without a restart. The body uses a draggable splitter so the grid and editor can be rebalanced, and both panels stay visible when the window isn't maximized.
 
 ![Trainers](trainers.png)
 
@@ -118,7 +120,7 @@ Sprite-first overworld editor with two sub-tabs:
 - **DOWP** -- Enable per-sprite palettes (patches 5 C source files). A risk scanner checks for null-palette sprites and warns if the project is near the 16-slot hardware limit before applying. R/G/B tint sliders control the water-reflection palette with a live preview. A red "Disable" button appears when DOWP is active and fully reverses the patch.
 
 **Field Effect Sprites:**
-Browse and edit the engine's in-world feedback sprites (exclamation marks, music notes, emoticons, egg hatch, confetti, etc.) from `graphics/field_effects/` and `graphics/misc/`. Same palette-editing toolkit as NPC sprites — drag-to-reorder swatches, Index as Background, import/export. Saving writes a `.pal` file when one exists, or bakes directly into the PNG when it doesn't.
+Browse and edit the engine's in-world feedback sprites (exclamation marks, music notes, emoticons, egg hatch, confetti, etc.) from `graphics/field_effects/` and `graphics/misc/`. Same palette-editing toolkit as NPC sprites — drag-to-reorder swatches, Index as Background, import/export. Saving writes a `.pal` file when one exists, or bakes directly into the PNG when it doesn't. **Re-bake from Palette Tag** scans the project for the active Pokemon's or NPC's palette and rebakes the field effect's PNG against it — useful when an effect should inherit the colors of whatever sprite it's overlaying instead of carrying its own palette.
 
 ![Overworld GFX](overworld.png)
 
@@ -275,6 +277,8 @@ Project-wide text browser, editor, and search & replace for all game-visible str
 - **Search bar** at the top with match case, whole word, and regex options. Results grouped by category with counts
 - **Replace bar** (toggled) -- Replace Selected or Replace All in Results
 - **Editor panel** -- GameTextEdit with context-appropriate character limits, file/label header, script cross-references
+- **Formatting toolbar** sits above every text field. Two rows: colour buttons (Red / Blue / Green plus a More… picker for the full named-colour set) apply to the selected text without leaving visible `{COLOR}` markup in the editor; the symbol row inserts PK / PKMN / LV / ¥ / ♂ / ♀ / arrows; submenus cover GBA button glyphs (A, B, L, R, Start, Select, D-Pad), the engine's emoji set (Heart, Fire, Note, faces, etc. — shown as real Unicode glyphs), variables (`{PLAYER}`, `{RIVAL}`, `{STR_VAR_*}`), and pacing tokens (`{PAUSE}`, `{PAUSE_UNTIL_PRESS}`, music pause/resume). Same toolbar appears wherever text is edited — item / move / ability / dex descriptions, trainer dialogue, EVENTide messages, credits.
+- **Braille render mode** -- EVENTide message dialogs gain a render-mode dropdown next to the text field. Picking *Braille* switches the editor to a sepia background and disables every non-Braille toolbar button, then writes the message via the `.braille` directive and `braillemessage` script command. Round-trips cleanly with the existing `.string` / `msgbox` form.
 - **"Open in EVENTide"** button for map dialogue and common script entries -- switches to EVENTide, loads the map, and selects the exact NPC whose script contains that text (searches the full command tree, works regardless of script chain depth)
 - **Saved searches** persist across sessions in `porysuite_text_bookmarks.json`. Right-click to rename/delete groups and manage entries
 - All parsers are dynamic -- whatever maps, scripts, and text files exist in your project are shown
@@ -290,6 +294,11 @@ ROM build diagnostics dashboard. Shows ROM size (progress bars for 16MB and 32MB
 ### Config
 
 Edit build configuration (`config.mk`) and game defines (`include/config.h`). Makefile variables and C preprocessor `#define` values are organized into collapsible section cards with toggle support.
+
+Beyond the standard build flags, the Config tab also exposes a few engine-level tunables that are otherwise buried in source:
+
+- **Trainer Prize Base Multiplier** -- changes the base scalar used for trainer prize money. Custom-economy projects no longer need to hand-edit `battle_main.c` (and don't risk a regression from a `git pull` resetting it).
+- **Gender-Tinted NPC Dialogue** -- vanilla pokefirered auto-tints NPC dialogue based on the talked-to NPC's overworld graphic (male sprites speak in blue, female sprites in red, neutral / object / Pokemon sprites stay dark gray). Toggle this off in projects that don't want the tint. The patch is idempotent and reversible — flipping it back on restores the canonical vanilla function.
 
 ![Config](config.png)
 
@@ -405,6 +414,7 @@ PorySuite-Z reads from and writes back to the original pokefirered source files:
 - File > Save shows a confirmation dialog before writing
 - Edits modify only the relevant fields in existing file structures (`.field = value` blocks, enum entries, etc.)
 - Whitespace, comments, field order, and formatting are preserved
+- **No phantom git diffs.** Every writer in the save pipeline is guarded by a byte-equality check — a file is only rewritten when its actual bytes would differ from what's already on disk. Combined with per-section snapshot guards that skip writers when their domain wasn't edited, a sound-only edit produces a sound-only diff. Earlier versions could dirty up to 19 unrelated files (species headers, learnsets, palettes, sprite PNGs) on a save that should have touched two assembly files.
 - If a required source file is missing or the layout is ambiguous, the save aborts with an error and no files are changed
 - Piano roll saves write the .s assembly file directly (not deferred to File > Save)
 - Sound editor changes (voicegroups, song table) are written through the File > Save pipeline
