@@ -164,8 +164,25 @@ class App:
 
         # Unified window is the only launch mode now
 
-        # Load project information
-        p_info = projects["projects"][self.project_selector.selected_index]
+        # Load project information.  Prefer path-based lookup so the
+        # index from the selector doesn't go stale when entries are
+        # added or removed (e.g. via the launcher's "remove from recent"
+        # button) before app.py reloads projects.json from disk.
+        sel_path = getattr(self.project_selector, "selected_path", "") or ""
+        p_info = None
+        if sel_path:
+            p_info = next(
+                (p for p in projects["projects"] if p.get("dir") == sel_path),
+                None,
+            )
+        if p_info is None:
+            try:
+                p_info = projects["projects"][self.project_selector.selected_index]
+            except (IndexError, KeyError):
+                QMessageBox.critical(
+                    None, "Error",
+                    "Selected project no longer in projects.json.")
+                sys.exit(1)
         local_info_path = os.path.join(p_info["dir"], "project.json")
         if not os.path.exists(local_info_path):
             local_info_path = os.path.join(p_info["dir"], "config.json")
@@ -207,8 +224,11 @@ class App:
         # Update last opened timestamp
         p_info["last_opened"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Update projects.json
-        projects["projects"][self.project_selector.selected_index] = p_info
+        # Update projects.json — find by path (robust against index drift).
+        for idx, entry in enumerate(projects["projects"]):
+            if entry.get("dir") == p_info.get("dir"):
+                projects["projects"][idx] = p_info
+                break
         with open(os.path.join(data_dir, "projects.json"), "w") as file_projects:
             json.dump(projects, file_projects)
 

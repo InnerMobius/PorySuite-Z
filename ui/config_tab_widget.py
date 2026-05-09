@@ -15,7 +15,7 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox,
     QVBoxLayout, QWidget,
 )
 
@@ -295,6 +295,75 @@ class ConfigTabWidget(QWidget):
 
         inner_layout.addWidget(h_group)
 
+        # ── Battle Economy (engine source patch) ──────────────────────────────
+        # Trainer prize formula: vanilla pokefirered hardcodes the
+        # multiplier as `4` in src/battle_script_commands.c. Different
+        # economies (e.g. small-number rupee currencies where 200 is a
+        # lot) need to scale this base multiplier without hand-editing
+        # the engine on every commit. The widget below saves to a
+        # project-defined macro, with a one-time idempotent rewrite of
+        # the engine source line so it reads from the macro.
+        eco_group = QGroupBox(
+            "Battle Economy  (include/config.h + engine patch)")
+        eco_group.setStyleSheet(_CARD_SS + _FIELD_SS)
+        eco_form = QFormLayout(eco_group)
+        eco_form.setContentsMargins(12, 16, 12, 12)
+        eco_form.setSpacing(4)
+
+        self._prize_multiplier = QSpinBox()
+        self._prize_multiplier.setRange(0, 65535)
+        self._prize_multiplier.setValue(4)  # vanilla default
+        eco_form.addRow("Trainer Prize Base Multiplier:",
+                        self._prize_multiplier)
+        eco_form.addRow("", _desc(
+            "The constant in the trainer prize formula:\n"
+            "    prize = base × level × class_multiplier × bonuses\n\n"
+            "Vanilla pokefirered uses 4. Lower it (e.g. 1) for "
+            "small-currency economies; raise it for inflation-heavy "
+            "settings. The change writes to a TRAINER_PRIZE_BASE_MULTIPLIER "
+            "macro in include/config.h and patches the engine line "
+            "once — re-saving with the same value writes nothing."
+        ))
+
+        inner_layout.addWidget(eco_group)
+
+        # ── Text & Dialogue (engine source patch) ─────────────────────────────
+        # Vanilla pokefirered auto-tints NPC dialogue based on the
+        # talked-to NPC's overworld graphic — male sprites get blue
+        # text, female sprites get red. The mapping lives in
+        # `sTextColorTable` and is applied at runtime by
+        # `AddTextPrinterDiffStyle`. Some projects don't want this
+        # behavior (uniform dialogue style, custom theming, etc.); the
+        # checkbox below patches the renderer to always use DARK_GRAY,
+        # disabling the gender tinting project-wide. Explicit {COLOR}
+        # tokens in text content still apply regardless.
+        text_group = QGroupBox(
+            "Text & Dialogue  (engine patch)")
+        text_group.setStyleSheet(_CARD_SS + _FIELD_SS)
+        text_form = QFormLayout(text_group)
+        text_form.setContentsMargins(12, 16, 12, 12)
+        text_form.setSpacing(4)
+
+        self._gender_dialogue_cb = QCheckBox("Enable")
+        text_form.addRow(
+            "Gender-Tinted NPC Dialogue:", self._gender_dialogue_cb)
+        text_form.addRow("", _desc(
+            "When enabled (vanilla), an NPC's overworld graphic ID "
+            "decides the dialogue tint at runtime — male sprites speak "
+            "in blue, female sprites in red, neutral / object / Pokemon "
+            "sprites stay dark gray.\n\n"
+            "When disabled, all dialogue renders dark gray regardless "
+            "of NPC graphic. Explicit {COLOR} tokens in text still apply.\n\n"
+            "Patches AddTextPrinterDiffStyle in src/new_menu_helpers.c "
+            "(idempotent — re-saving with the same value writes nothing).\n\n"
+            "The PorySuite-Z text editor uses this setting to preview "
+            "what dialogue will look like for the NPC you're editing: "
+            "with the toggle on, talking to a female NPC shows the "
+            "default text in red; with it off, in dark gray."
+        ))
+
+        inner_layout.addWidget(text_group)
+
         inner_layout.addStretch(1)
         scroll.setWidget(inner)
         root.addWidget(scroll, 1)
@@ -321,6 +390,9 @@ class ConfigTabWidget(QWidget):
 
         for cb in (self._modern_cb, self._compare_cb, self._keep_temps_cb, self._ndebug_cb):
             cb.toggled.connect(self._mark_dirty)
+
+        self._prize_multiplier.valueChanged.connect(self._mark_dirty)
+        self._gender_dialogue_cb.toggled.connect(self._mark_dirty)
 
     # ── internal slots ────────────────────────────────────────────────────────
 
@@ -357,6 +429,7 @@ class ConfigTabWidget(QWidget):
             self._game_version, self._game_revision, self._game_language,
             self._log_handler, self._pretty_print,
             self._modern_cb, self._compare_cb, self._keep_temps_cb, self._ndebug_cb,
+            self._prize_multiplier, self._gender_dialogue_cb,
         ):
             widget.blockSignals(True)
 
@@ -390,11 +463,33 @@ class ConfigTabWidget(QWidget):
             if pp_val is not None:
                 _set_combo(self._pretty_print, pp_val)
 
+            # Battle economy: read the current TRAINER_PRIZE_BASE_MULTIPLIER
+            # macro value (defaults to 4 — the vanilla literal — when the
+            # macro hasn't been added yet).
+            try:
+                from core.battle_economy_patch import read_prize_multiplier
+                self._prize_multiplier.setValue(
+                    read_prize_multiplier(project_dir))
+            except Exception:
+                self._prize_multiplier.setValue(4)
+
+            # Gender-tinted NPC dialogue: read whether the engine still
+            # has the vanilla AddTextPrinterDiffStyle (enabled) or
+            # PorySuite-Z's patched form (disabled).
+            try:
+                from core.text_coloring_patch import (
+                    read_gender_dialogue_enabled)
+                self._gender_dialogue_cb.setChecked(
+                    read_gender_dialogue_enabled(project_dir))
+            except Exception:
+                self._gender_dialogue_cb.setChecked(True)
+
         finally:
             for widget in (
                 self._game_version, self._game_revision, self._game_language,
                 self._log_handler, self._pretty_print,
                 self._modern_cb, self._compare_cb, self._keep_temps_cb, self._ndebug_cb,
+                self._prize_multiplier, self._gender_dialogue_cb,
             ):
                 widget.blockSignals(False)
 
@@ -440,6 +535,33 @@ class ConfigTabWidget(QWidget):
         h_text = _set_define_value(h_text, "LOG_HANDLER", self._log_handler.currentText())
         h_text = _set_define_value(h_text, "PRETTY_PRINT_HANDLER", self._pretty_print.currentText())
         _write_file(h_path, h_text)
+
+        # ── Battle economy macro + engine source patch ───────────────────
+        # Has its own writer that uses byte-equality guards and is
+        # idempotent — re-saving with the same value writes nothing.
+        try:
+            from core.battle_economy_patch import write_prize_multiplier
+            ok, msg = write_prize_multiplier(
+                self._project_dir, self._prize_multiplier.value())
+            if not ok:
+                QMessageBox.warning(self, "Battle Economy Patch", msg)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Battle Economy Patch",
+                f"Failed to apply prize-multiplier patch:\n{exc}")
+
+        # ── Gender-tinted NPC dialogue patch ────────────────────────────
+        try:
+            from core.text_coloring_patch import (
+                write_gender_dialogue_enabled)
+            ok, msg = write_gender_dialogue_enabled(
+                self._project_dir, self._gender_dialogue_cb.isChecked())
+            if not ok:
+                QMessageBox.warning(self, "Text & Dialogue Patch", msg)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Text & Dialogue Patch",
+                f"Failed to apply NPC dialogue color patch:\n{exc}")
 
         self._dirty = False
         self._save_btn.setEnabled(False)

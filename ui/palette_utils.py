@@ -87,8 +87,11 @@ def write_jasc_pal(path: str, colors: List[Color]) -> bool:
             lines.append(f"{r} {g} {b}")
         # pokefirered .pal files end with CRLF on Windows typically.  Use
         # Unix newlines + trailing newline — matches the existing files.
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(lines) + "\n")
+        # Byte-equality guard prevents phantom git diffs when the same
+        # palette gets re-flushed (e.g. graphics tab erroneously dirty
+        # without a real edit).
+        from core.file_io import write_text_if_changed
+        write_text_if_changed(path, "\n".join(lines) + "\n")
         return True
     except Exception:
         return False

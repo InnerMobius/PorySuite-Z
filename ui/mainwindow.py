@@ -206,6 +206,7 @@ import app_util
 from local_env import LocalUtil
 from app_info import APP_NAME, AUTHOR, get_data_dir
 import core as _core
+from core.file_io import write_text_if_changed
 from suppress_dialog import maybe_exec
 try:
     from newproject import NewProject
@@ -3736,9 +3737,132 @@ QTabBar::tab:hover:!selected {
             self._pull_menu.setEnabled(True)
         self._git_refresh_status_bar()
 
+        # ── Capture per-plugin data signatures for the save pipeline ──
+        # The C-header writers (`_write_moves_headers`, `_write_species_info_header`,
+        # `_write_pokedex_text_header`, `_write_items_header`, abilities saver)
+        # are ALL run on every Save All by design. They produce output formatted
+        # by PorySuite's own conventions, which doesn't match upstream's exact
+        # byte layout for some files (e.g. upstream's `level_up_learnsets.h`
+        # contains `#if defined(FIRERED) ... #elif defined(LEAFGREEN) ... #endif`
+        # blocks that PorySuite's parser strips and the writer doesn't restore).
+        # Result: any Save All — even with no edits in those domains — would
+        # rewrite the file with semantically-equivalent but byte-different
+        # content, dirtying it in git.
+        #
+        # Fix: snapshot each plugin's `data` dict at the end of load. Each
+        # writer checks whether the live data still matches its snapshot;
+        # if it does (no user edit since load), the writer returns early
+        # without touching disk. Combined with the byte-equality guards in
+        # `core/file_io.py::write_text_if_changed`, this gives two layers of
+        # phantom-dirty defence — the snapshot guard catches lossy round-trip
+        # writers, and the byte-equality guard catches everything else.
+        self._capture_plugin_signatures()
+
         # Clear the modified flag — UI population fires signals that incorrectly
         # mark the window as dirty before the user touches anything.
         self.setWindowModified(False)
+
+    @staticmethod
+    def _stable_default(value):
+        """Stable JSON fallback for non-serialisable values.
+
+        Uses the type name only — never ``str(value)`` directly, because
+        the default ``str`` of a generic object returns
+        ``"<TypeName object at 0x7fab1234>"`` and the address is
+        non-deterministic, making the signature drift between identical
+        in-memory states. Returning just the type name keeps the
+        signature stable.
+        """
+        return f"__nonjson_{type(value).__name__}__"
+
+    def _capture_plugin_signatures(self):
+        """Snapshot each writeback-relevant plugin's `data` so save-time
+        writers can skip when no user edit happened since load.
+
+        Uses a stable JSON serialisation (sort_keys + non-address-based
+        fallback) so the snapshot survives across save cycles when no
+        user edit happened. Any failure to snapshot is non-fatal — the
+        writer just falls through to the unconditional write path,
+        preserving previous behaviour.
+        """
+        if not getattr(self, "source_data", None):
+            return
+        keys = (
+            "pokemon_moves", "species_data", "pokedex",
+            "pokemon_items", "pokemon_evolutions", "pokemon_abilities",
+        )
+        for key in keys:
+            plugin = self.source_data.data.get(key)
+            if plugin is None or not hasattr(plugin, "data"):
+                continue
+            try:
+                plugin._load_signature = json.dumps(
+                    plugin.data, sort_keys=True,
+                    default=self._stable_default)
+            except Exception:
+                plugin._load_signature = None
+
+    def _plugin_data_unchanged(self, key: str) -> bool:
+        """Return True if the plugin's `data` is unchanged since load.
+
+        Falls back to ``False`` (i.e. proceed with save) on any error
+        or when no snapshot was taken — preserves the unconditional-write
+        behaviour for plugins we haven't wired up snapshotting for.
+
+        On mismatch, logs the first byte position where the current
+        serialisation diverges from the baseline so the user can see
+        WHY a writer fired (which mutation produced the drift). Goes
+        to ``porysuite/save_diag.log`` in the app folder.
+        """
+        if not getattr(self, "source_data", None):
+            return False
+        plugin = self.source_data.data.get(key)
+        if plugin is None:
+            return False
+        baseline = getattr(plugin, "_load_signature", None)
+        if baseline is None:
+            self._log_save_diag(
+                f"_plugin_data_unchanged({key}): no baseline snapshot")
+            return False
+        try:
+            current = json.dumps(
+                plugin.data, sort_keys=True,
+                default=self._stable_default)
+        except Exception as exc:
+            self._log_save_diag(
+                f"_plugin_data_unchanged({key}): "
+                f"current serialisation failed: {exc}")
+            return False
+        if current == baseline:
+            return True
+        # Diff: find the first position where they differ and dump a
+        # small window of context so we can see the mutation.
+        for i, (a, b) in enumerate(zip(baseline, current)):
+            if a != b:
+                start = max(0, i - 30)
+                end = min(max(len(baseline), len(current)), i + 60)
+                self._log_save_diag(
+                    f"_plugin_data_unchanged({key}): MISMATCH at byte {i}\n"
+                    f"  baseline: ...{baseline[start:end]!r}...\n"
+                    f"  current : ...{current[start:end]!r}...")
+                return False
+        # Length differs without a per-char diff (one is prefix of other)
+        self._log_save_diag(
+            f"_plugin_data_unchanged({key}): length differs "
+            f"baseline={len(baseline)} current={len(current)}")
+        return False
+
+    def _log_save_diag(self, msg: str):
+        """Append a diagnostic line to porysuite/save_diag.log."""
+        try:
+            import time
+            log_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "save_diag.log")
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
 
     def _load_national_order_from_header(self) -> list[str]:
         if self._nat_order_cache is not None:
@@ -7411,10 +7535,19 @@ QTabBar::tab:hover:!selected {
         """Flush the moves widget edits back to the data manager."""
         if not self.source_data or not hasattr(self.ui, "moves_widget"):
             return
+        # Skip the entire writeback when the user hasn't touched the
+        # Moves tab since load. Without this, every Save All re-wrote
+        # every move back into the plugin (via set_move_data) — which
+        # mutates the in-memory data with normalised types, making the
+        # snapshot signature drift and dirtying battle_moves.h on the
+        # next save.
+        mw = self.ui.moves_widget
+        if hasattr(mw, "has_unsaved_changes") and not mw.has_unsaved_changes():
+            return
         # Save the currently-displayed move before reading data
-        self.ui.moves_widget.save_current()
-        moves_data = self.ui.moves_widget.get_moves_data()
-        descriptions = self.ui.moves_widget.get_descriptions()
+        mw.save_current()
+        moves_data = mw.get_moves_data()
+        descriptions = mw.get_descriptions()
 
         # If the moves widget was never loaded (user never visited the tab),
         # moves_data will be empty — skip to avoid wiping data.
@@ -7535,6 +7668,11 @@ QTabBar::tab:hover:!selected {
         """Flush abilities editor edits back to source data and write files."""
         if not self.source_data or not hasattr(self, "abilities_tab") or not self.abilities_tab:
             return
+        # Skip the entire writeback if no edits happened in the abilities
+        # tab since load. Prevents `include/constants/abilities.h` and
+        # `src/data/text/abilities.h` from being rewritten on every Save All.
+        if not self.abilities_tab.has_unsaved_changes():
+            return
         self.abilities_tab.save_current()
         abilities = self.abilities_tab.get_abilities_data()
         if not abilities:
@@ -7608,8 +7746,7 @@ QTabBar::tab:hover:!selected {
         lines.append("\n#endif  // GUARD_CONSTANTS_ABILITIES_H\n")
 
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
+            write_text_if_changed(path, "".join(lines))
         except OSError as e:
             print(f"[Abilities] Failed to write {path}: {e}")
 
@@ -7654,8 +7791,7 @@ QTabBar::tab:hover:!selected {
         lines.append("};\n")
 
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
+            write_text_if_changed(path, "".join(lines))
         except OSError as e:
             print(f"[Abilities] Failed to write {path}: {e}")
 
@@ -9208,8 +9344,7 @@ QTabBar::tab:hover:!selected {
                             text = f.read()
                         for symbol, new_code in pending.items():
                             text = _replace_party_declaration(text, symbol, new_code)
-                        with open(parties_path, "w", encoding="utf-8", newline="\n") as f:
-                            f.write(text)
+                        write_text_if_changed(parties_path, text)
                         self.trainers_editor.clear_pending_party_writes()
                     except Exception as exc:
                         import logging
@@ -10239,6 +10374,24 @@ QTabBar::tab:hover:!selected {
         # Clear amber dirty markers from every tracked list/tree.
         self._clear_all_dirty_markers()
 
+        # Re-baseline the snapshot guards — the just-written disk state is
+        # the new "clean" reference for any future Save All. Without this,
+        # the snapshot would keep comparing against the load-time data and
+        # treat every legitimate save as "still clean", or worse, mis-detect
+        # later edits relative to a stale baseline.
+        try:
+            self._capture_plugin_signatures()
+        except Exception:
+            pass
+        # Clear per-tab dirty trackers so the next Save All correctly
+        # detects "no edits" and skips their writebacks.
+        try:
+            mw = getattr(self.ui, "moves_widget", None)
+            if mw is not None and hasattr(mw, "clear_unsaved_changes"):
+                mw.clear_unsaved_changes()
+        except Exception:
+            pass
+
         # Brief status bar confirmation
         self.statusBar().showMessage("Saved ✓", 3000)
 
@@ -10270,8 +10423,7 @@ QTabBar::tab:hover:!selected {
             path = os.path.join(
                 self.project_info["dir"], "src", "data", f"{data_file}.json"
             )
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
+            write_text_if_changed(path, text)
         except Exception as e:
             qm.critical(self, "Write Failed", str(e))
             return
@@ -10288,6 +10440,14 @@ QTabBar::tab:hover:!selected {
 
         Returns the number of species blocks updated, or -1 on error.
         """
+        # Skip the unconditional write entirely if no edit happened in
+        # species_data since the project loaded. Prevents phantom git
+        # diffs when Save All runs but no Pokemon stats were touched.
+        if self._plugin_data_unchanged("species_data"):
+            return 0
+        self._log_save_diag(
+            "_write_species_info_header FIRED — species_data drifted")
+
         root = self.project_info.get("dir", "")
         path = os.path.join(root, "src", "data", "pokemon", "species_info.h")
         if not os.path.isfile(path):
@@ -10458,8 +10618,7 @@ QTabBar::tab:hover:!selected {
 
         # Write
         try:
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.writelines(out)
+            write_text_if_changed(path, "".join(out))
         except Exception:
             return -1
 
@@ -10478,6 +10637,9 @@ QTabBar::tab:hover:!selected {
 
         Returns number of entries updated, or -1 on error.
         """
+        # Skip if no edit in species_data since load.
+        if self._plugin_data_unchanged("species_data"):
+            return 0
         import re
         root = self.project_info.get("dir", "")
         path = os.path.join(root, "src", "data", "pokemon", "pokedex_entries.h")
@@ -10525,8 +10687,7 @@ QTabBar::tab:hover:!selected {
                 total += 1
 
         try:
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
+            write_text_if_changed(path, text)
         except Exception:
             return -1
 
@@ -10537,6 +10698,12 @@ QTabBar::tab:hover:!selected {
 
         Returns number of entries updated, or -1 on error.
         """
+        # Description text lives on the species_data plugin (it's stored
+        # under each species' species_info.description). Skip if neither
+        # species_data nor pokedex was edited since load.
+        if (self._plugin_data_unchanged("species_data")
+                and self._plugin_data_unchanged("pokedex")):
+            return 0
         import re
         root = self.project_info.get("dir", "")
         path = os.path.join(root, "src", "data", "pokemon", "pokedex_text_fr.h")
@@ -10595,8 +10762,7 @@ QTabBar::tab:hover:!selected {
                     total += 1
 
         try:
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
+            write_text_if_changed(path, text)
         except Exception:
             return -1
 
@@ -10713,8 +10879,7 @@ QTabBar::tab:hover:!selected {
             new_count = max_c_id + 1
             text = text.replace(f"#define MOVES_COUNT {old_count}", f"#define MOVES_COUNT {new_count}")
 
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
+            write_text_if_changed(path, text)
             return len(new_moves)
         except Exception:
             return -1
@@ -10755,8 +10920,7 @@ QTabBar::tab:hover:!selected {
             insert = "\n".join(new_entries) + "\n"
             text = before + insert + text[close_idx:]
 
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
+            write_text_if_changed(path, text)
             return len(new_moves)
         except Exception:
             return -1
@@ -10821,8 +10985,7 @@ QTabBar::tab:hover:!selected {
             ptr_block = "\n".join(ptr_entries) + "\n"
             text = before + ptr_block + text[close_idx:]
 
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text)
+            write_text_if_changed(path, text)
             return len(new_moves)
         except Exception:
             return -1
@@ -10882,8 +11045,7 @@ QTabBar::tab:hover:!selected {
             for entry in reversed(new_entries):
                 lines.insert(insert_idx, entry)
 
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.writelines(lines)
+            write_text_if_changed(path, "".join(lines))
             return len(new_moves)
         except Exception:
             return -1
@@ -10898,6 +11060,16 @@ QTabBar::tab:hover:!selected {
 
         Returns total number of species updated across all files, or -1 on error.
         """
+        # Skip if pokemon_moves data wasn't edited since project load.
+        # The writers strip upstream's `#if defined(FIRERED) ... #endif`
+        # conditional blocks (the parser doesn't preserve them), so any
+        # round-trip without this guard produces a phantom diff in
+        # level_up_learnsets.h, tmhm_learnsets.h, tutor_learnsets.h, and
+        # egg_moves.h.
+        if self._plugin_data_unchanged("pokemon_moves"):
+            return 0
+        self._log_save_diag(
+            "_write_moves_headers FIRED — pokemon_moves data drifted")
         import re
 
         root = self.project_info.get("dir", "")
@@ -10975,10 +11147,8 @@ QTabBar::tab:hover:!selected {
                         lvl_text = lvl_text.rstrip() + "\n\n" + new_block + "\n"
                         total += 1
 
-                with open(lvl_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(lvl_text)
-                with open(ptr_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(ptr_text)
+                write_text_if_changed(lvl_path, lvl_text)
+                write_text_if_changed(ptr_path, ptr_text)
             except Exception:
                 pass
 
@@ -11018,8 +11188,7 @@ QTabBar::tab:hover:!selected {
                     _tm_sub,
                     tm_text,
                 )
-                with open(tm_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(tm_text)
+                write_text_if_changed(tm_path, tm_text)
             except Exception:
                 pass
 
@@ -11062,8 +11231,7 @@ QTabBar::tab:hover:!selected {
                     )
                     tut_text = tut_header + tut_body
 
-                with open(tut_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(tut_text)
+                write_text_if_changed(tut_path, tut_text)
             except Exception:
                 pass
 
@@ -11103,8 +11271,7 @@ QTabBar::tab:hover:!selected {
                             egg_text = egg_text.rstrip() + "\n" + new_block + ",\n"
                         total += 1
 
-                with open(egg_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(egg_text)
+                write_text_if_changed(egg_path, egg_text)
             except Exception:
                 pass
 
@@ -11115,6 +11282,9 @@ QTabBar::tab:hover:!selected {
 
         Returns the number of items written, or -1 on error.
         """
+        # Skip if no item edits since load.
+        if self._plugin_data_unchanged("pokemon_items"):
+            return 0
         import json as _json
 
         proj_dir = self.source_data.project_info.get("dir", "")
@@ -11280,8 +11450,7 @@ QTabBar::tab:hover:!selected {
         )
 
         try:
-            with open(header_path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(out)
+            write_text_if_changed(header_path, out)
         except Exception:
             return -1
 

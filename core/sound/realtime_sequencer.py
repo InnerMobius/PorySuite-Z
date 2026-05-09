@@ -524,6 +524,26 @@ class RealtimeSequencer:
                         if ts:
                             ts.pan = max(0, min(127, note.get('value', 64)))
                         continue
+                    if evt_type == 'TEMPO':
+                        # M4A bytecode: TEMPO value = bpm * tbs / 2.
+                        # Convert back to BPM and recompute samples-per-tick
+                        # so the rest of the callback uses the new tempo.
+                        # Note: spt / tick_inc are cached locals above the
+                        # while-loop, so we MUST refresh them here too —
+                        # otherwise the next chunk_len calculation keeps
+                        # using the old tempo until the callback returns.
+                        raw = note.get('value', 0)
+                        tbs_local = max(self._tbs, 1)
+                        new_bpm = (raw * 2) // tbs_local
+                        if new_bpm > 0:
+                            self._bpm = new_bpm
+                            ticks_per_frame = new_bpm * tbs_local / 150.0
+                            ticks_per_second = ticks_per_frame * 59.7275
+                            self._samples_per_tick = (
+                                OUTPUT_SAMPLE_RATE / ticks_per_second)
+                            spt = self._samples_per_tick
+                            tick_inc = 1.0 / spt
+                        continue
                     if evt_type:
                         continue  # unknown control event
 

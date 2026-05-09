@@ -250,24 +250,45 @@ def load_command_categories(root_dir: str) -> dict[str, list[tuple[str, str]]]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def parse_text_inc(path: Path) -> OrderedDict:
-    """Return an OrderedDict mapping labels to message strings."""
+    """Return an OrderedDict mapping labels to message strings.
+
+    Recognises both ``.string "..."`` (regular dialogue) and
+    ``.braille "..."`` (braille). Braille labels are stored with a
+    private ``__BRAILLE__`` prefix on the value so consumers can tell
+    them apart without a parallel data structure. The prefix is
+    stripped by ``write_text_inc`` before emitting the corresponding
+    directive — it never appears in the output bytes.
+    """
     texts = OrderedDict()
     if not path or not path.exists():
         return texts
     label_re = re.compile(r"^([A-Za-z0-9_]+)::")
     string_re = re.compile(r"\.string\s+\"((?:\\.|[^\"])*)\"")
+    braille_re = re.compile(r"\.braille\s+\"((?:\\.|[^\"])*)\"")
     current = None
     buf: list[str] = []
+    is_braille = False
     with path.open(encoding="utf-8") as fh:
         for line in fh:
             m = label_re.match(line.strip())
             if m:
                 if current is not None:
-                    texts[current] = "".join(buf)
+                    val = "".join(buf)
+                    if is_braille:
+                        val = _BRAILLE_PREFIX + val
+                    texts[current] = val
                 current = m.group(1)
                 buf = []
+                is_braille = False
                 continue
             if current is None:
+                continue
+            m = braille_re.search(line)
+            if m:
+                segment = m.group(1)
+                segment = segment.replace("\\n", "\n").replace("\\p", "\n\n")
+                buf.append(segment)
+                is_braille = True
                 continue
             m = string_re.search(line)
             if m:
@@ -275,7 +296,10 @@ def parse_text_inc(path: Path) -> OrderedDict:
                 segment = segment.replace("\\n", "\n").replace("\\p", "\n\n")
                 buf.append(segment)
     if current is not None:
-        texts[current] = "".join(buf)
+        val = "".join(buf)
+        if is_braille:
+            val = _BRAILLE_PREFIX + val
+        texts[current] = val
     return texts
 
 
@@ -299,14 +323,37 @@ def parse_all_texts(map_dir: Path, root_dir: Path) -> OrderedDict:
     return texts
 
 
+_BRAILLE_PREFIX = '__BRAILLE__'
+
+
+def _strip_braille_prefix(text: str) -> str:
+    """Remove the private braille marker before exposing the value to UI."""
+    if text.startswith(_BRAILLE_PREFIX):
+        return text[len(_BRAILLE_PREFIX):]
+    return text
+
+
 def write_text_inc(texts: dict, path: Path):
-    """Write the label->text mapping back to text.inc."""
+    """Write the label->text mapping back to text.inc.
+
+    Texts whose value carries the private ``__BRAILLE__`` prefix are
+    emitted with the ``.braille`` directive instead of ``.string``.
+    The prefix is stripped before writing so it doesn't end up in the
+    compiled bytes.
+    """
     lines = []
     for label, text in texts.items():
-        escaped = text.replace("\n\n", "\\p").replace("\n", "\\n")
-        escaped = escaped.replace('"', '\\"')
-        lines.append(f"{label}::\n")
-        lines.append(f"    .string \"{escaped}\"\n\n")
+        if text.startswith(_BRAILLE_PREFIX):
+            actual = text[len(_BRAILLE_PREFIX):]
+            escaped = actual.replace("\n\n", "\\p").replace("\n", "\\n")
+            escaped = escaped.replace('"', '\\"')
+            lines.append(f"{label}::\n")
+            lines.append(f"    .braille \"{escaped}\"\n\n")
+        else:
+            escaped = text.replace("\n\n", "\\p").replace("\n", "\\n")
+            escaped = escaped.replace('"', '\\"')
+            lines.append(f"{label}::\n")
+            lines.append(f"    .string \"{escaped}\"\n\n")
     with path.open('w', encoding='utf-8', newline='\n') as fh:
         fh.writelines(lines)
 
@@ -412,7 +459,28 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
             if m:
                 label = m.group(1).rstrip(',')
                 msg_type = m.group(2)
-                cmds.append(('message', label, texts.get(label, ''), msg_type))
+                cmds.append((
+                    'message', label,
+                    _strip_braille_prefix(texts.get(label, '')),
+                    msg_type))
+                i += 1
+                continue
+
+        # ── Braille messages — same tuple shape, render='braille' ────
+        # `braillemessage <label>` doesn't take a MSGBOX_TYPE; the
+        # window style is fixed by the engine. The text value here has
+        # the private __BRAILLE__ prefix stripped — that prefix is only
+        # used between parse_text_inc and write_text_inc to remember
+        # which directive to emit, and shouldn't leak into the command
+        # tuple the dialog reads.
+        if stripped.startswith('braillemessage'):
+            m = re.match(r'braillemessage\s+([^,\s]+)', stripped)
+            if m:
+                label = m.group(1).rstrip(',')
+                cmds.append((
+                    'message', label,
+                    _strip_braille_prefix(texts.get(label, '')),
+                    '', 'braille'))
                 i += 1
                 continue
 
@@ -1108,6 +1176,27 @@ def lines_from_commands(
             label_name = data[1] if len(data) > 1 else None
             text = data[2] if len(data) > 2 else ''
             msg_type = data[3] if len(data) > 3 else ''
+            # 5th element (optional) selects render mode. 'braille'
+            # means emit `braillemessage <label>` and tell the text
+            # writer to use `.braille` instead of `.string`.
+            render = data[4] if len(data) > 4 else 'normal'
+
+            if render == 'braille':
+                # Braille MUST use a label — `braillemessage` doesn't
+                # support an inline string form. If we got here without
+                # a label we synthesise one from a hash so the data
+                # round-trips, but UI should generally enforce a label.
+                if not label_name:
+                    label_name = f'BrailleText_{abs(hash(text)) & 0xFFFFFF:06X}'
+                visible.append(f'braillemessage {label_name}\n')
+                # Stash the text PLUS a render-type marker that the
+                # text.inc writer reads to pick `.braille` vs `.string`.
+                # The marker is a private prefix the writer strips
+                # before emitting; it never leaks into the actual
+                # output bytes.
+                texts[label_name] = '__BRAILLE__' + text
+                continue
+
             if label_name:
                 line = f'msgbox {label_name}'
                 if msg_type:

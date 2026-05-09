@@ -75,6 +75,23 @@ class SoundCleanupDialog(QDialog):
         self._btn_scan = QPushButton("Scan Again")
         self._btn_scan.clicked.connect(self._run_scan)
         btn_row.addWidget(self._btn_scan)
+
+        # Backfill missing source WAVs — generates a .wav alongside any
+        # imported .bin that doesn't already have one. Necessary for
+        # samples added BEFORE the WAV-source-saving feature landed:
+        # without a tracked WAV next to them, the imported sample is
+        # gitignored (sound/**/*.bin) and won't survive a fresh clone
+        # for collaborators.
+        self._btn_backfill = QPushButton("Backfill Missing .wav Sources")
+        self._btn_backfill.setToolTip(
+            "Generate a source .wav for every imported .bin that doesn't\n"
+            "have one. The .wav becomes the tracked source; the build\n"
+            "regenerates the .bin from it. Required for collaborators to\n"
+            "be able to clone and build the project after you've imported\n"
+            "samples.")
+        self._btn_backfill.clicked.connect(self._on_backfill)
+        btn_row.addWidget(self._btn_backfill)
+
         btn_row.addStretch()
         self._btn_delete = QPushButton("Delete Selected")
         self._btn_delete.setStyleSheet(
@@ -89,6 +106,35 @@ class SoundCleanupDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
+
+    def _on_backfill(self):
+        """Generate source .wav files for any .bin that lacks one."""
+        from core.sound.sample_loader import backfill_missing_source_wavs
+        try:
+            count, errors = backfill_missing_source_wavs(self._project_root)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Backfill Failed",
+                f"Could not run the backfill scan:\n{exc}")
+            return
+        if count == 0 and not errors:
+            QMessageBox.information(
+                self, "Nothing To Do",
+                "Every .bin in sound/direct_sound_samples/ already has a "
+                ".wav alongside it.")
+            return
+        msg = f"Created {count} new .wav source file(s)."
+        if errors:
+            msg += (
+                f"\n\n{len(errors)} file(s) could not be processed:\n"
+                + "\n".join(errors[:10])
+                + ("\n…" if len(errors) > 10 else ""))
+        msg += (
+            "\n\nThe new .wav files are tracked sources for previously "
+            "imported samples. Commit them so collaborators can build "
+            "the project. The .bin files stay gitignored as build "
+            "artifacts — `make` regenerates them from the .wav.")
+        QMessageBox.information(self, "Backfill Complete", msg)
 
     def _run_scan(self):
         from core.sound.sound_cleanup import (

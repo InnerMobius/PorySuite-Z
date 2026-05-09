@@ -90,6 +90,9 @@ class UnifiedMainWindow(QMainWindow):
         self.setWindowTitle(f"PorySuite-Z {VERSION}[*]")
         self.setMinimumSize(1024, 768)
         self.project_info = None
+        # Set to True by the "Quit to Launcher" menu action so closeEvent
+        # spawns a fresh app process after the dirty-save prompt clears.
+        self._return_to_launcher = False
 
         # ── Internal references to child windows ─────────────────────────────
         self._porysuite_window = None   # The original MainWindow (used as a widget)
@@ -391,6 +394,17 @@ class UnifiedMainWindow(QMainWindow):
         file_menu.addAction(open_folder_action)
 
         file_menu.addSeparator()
+
+        # Quit to Launcher — closes this window, prompts to save unsaved
+        # changes, then restarts the app from the project selector.
+        # Useful for jumping between two projects (e.g. two different
+        # pokefirered checkouts in different folders) without having to
+        # exit and click the shortcut again.
+        quit_to_launcher_action = QAction("Quit to Launcher", self)
+        quit_to_launcher_action.setToolTip(
+            "Close this project and return to the project selector")
+        quit_to_launcher_action.triggered.connect(self._quit_to_launcher)
+        file_menu.addAction(quit_to_launcher_action)
 
         quit_action = QAction("Quit", self)
         quit_action.setShortcut("Ctrl+Q")
@@ -1969,6 +1983,7 @@ class UnifiedMainWindow(QMainWindow):
         """Prompt to save unsaved changes before closing."""
         if not self._has_unsaved_changes():
             event.accept()
+            self._maybe_relaunch_to_launcher()
             return
 
         from app_util import create_unsaved_changes_dialog
@@ -1978,10 +1993,60 @@ class UnifiedMainWindow(QMainWindow):
         if ret == QMessageBox.StandardButton.Save:
             self._on_save_all()
             event.accept()
+            self._maybe_relaunch_to_launcher()
         elif ret == QMessageBox.StandardButton.Discard:
             event.accept()
+            self._maybe_relaunch_to_launcher()
         else:
             event.ignore()
+            # User cancelled — keep the window open and clear the
+            # relaunch flag so a follow-up plain Quit doesn't relaunch.
+            self._return_to_launcher = False
+
+    def _quit_to_launcher(self):
+        """Close the window and re-show the project selector.
+
+        Saves unsaved changes via the standard close-prompt path, then
+        spawns a fresh app process so all per-project state (sprite
+        palette bus, voicegroup caches, song table, etc.) is guaranteed
+        clean. Cleaner than trying to surgically reset every singleton
+        in the live process.
+        """
+        self._return_to_launcher = True
+        self.close()
+
+    def _maybe_relaunch_to_launcher(self):
+        """If the user picked Quit to Launcher, spawn a new app process.
+
+        Called from closeEvent after the close has been accepted. Uses
+        a child Python process so module-level state, GPU resources,
+        Qt cached objects, etc. all start fresh — same effect as
+        quitting and double-clicking the shortcut again.
+        """
+        if not getattr(self, "_return_to_launcher", False):
+            return
+        try:
+            import subprocess
+            import sys as _sys
+            # Re-execute the same script with the same interpreter.
+            # Detached so this process can fully terminate without the
+            # child being a zombie of it.
+            creationflags = 0
+            if hasattr(subprocess, "DETACHED_PROCESS"):
+                creationflags = subprocess.DETACHED_PROCESS
+            subprocess.Popen(
+                [_sys.executable] + _sys.argv,
+                close_fds=True,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            # If we can't spawn the child, fall back to staying open
+            # and warn the user — better than silently quitting and
+            # leaving them with no window.
+            QMessageBox.warning(
+                self, "Couldn't Relaunch",
+                f"Failed to start a new launcher window:\n{exc}\n\n"
+                "Please reopen PorySuite-Z manually.")
 
     # ═════════════════════════════════════════════════════════════════════════
     # Logging

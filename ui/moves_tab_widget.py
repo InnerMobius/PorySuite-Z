@@ -810,8 +810,31 @@ class MovesTabWidget(QWidget):
         self._move_descriptions: dict = {}   # const → description string
         self._new_moves: set = set()         # constants added this session
         self._current_move: str | None = None
+        # ``_dirty`` tracks the detail panel — set on field edit, cleared by
+        # ``save_current``. ``_any_edit_since_load`` is the broader "should
+        # the save pipeline run?" flag — set on any edit that mutates
+        # ``_moves_data`` (add / duplicate / rename / detail-panel save)
+        # and only cleared by ``load_moves`` (project reload) or
+        # ``clear_unsaved_changes`` after a successful save flush.
         self._dirty = False
+        self._any_edit_since_load = False
         self._build_ui()
+
+    def has_unsaved_changes(self) -> bool:
+        """True iff the user edited any move since the last load/save.
+
+        Used by the save pipeline to skip the entire moves writeback when
+        the user never touched the Moves tab — without this, even just
+        viewing the tab caused ``save_moves_defs_table`` to rewrite every
+        move back into the plugin, normalising types in ways that produced
+        phantom git diffs in ``battle_moves.h`` etc.
+        """
+        return self._any_edit_since_load or self._dirty
+
+    def clear_unsaved_changes(self) -> None:
+        """Mark the widget clean. Call after a successful save flush."""
+        self._dirty = False
+        self._any_edit_since_load = False
 
     # ── build ─────────────────────────────────────────────────────────────────
 
@@ -901,6 +924,10 @@ class MovesTabWidget(QWidget):
         """
         self._moves_data = moves
         self._move_descriptions = descriptions
+        # Fresh load — clear edit tracking so phantom signal-fires during
+        # populate don't leave the widget marked dirty.
+        self._dirty = False
+        self._any_edit_since_load = False
 
         # Collect extra effect constants from data and merge with hardcoded list
         extra_effects = list({v.get("effect", "") for v in moves.values() if v.get("effect")})
@@ -987,6 +1014,7 @@ class MovesTabWidget(QWidget):
         self._rebuild_list()
         self._select_move(const)
         self._dirty = False
+        self._any_edit_since_load = True
         self.data_changed.emit()
 
     def _on_duplicate_move(self) -> None:
@@ -1020,6 +1048,7 @@ class MovesTabWidget(QWidget):
         self._rebuild_list()
         self._select_move(const)
         self._dirty = False
+        self._any_edit_since_load = True
         self.data_changed.emit()
 
     def f_animation_count(self) -> int:
@@ -1145,10 +1174,12 @@ class MovesTabWidget(QWidget):
             self._new_moves.add(new_const)
         if self._current_move == old_const:
             self._current_move = new_const
+        self._any_edit_since_load = True
         self._rebuild_list()
         # Re-select the renamed move
         self._select_move(new_const)
 
     def _on_detail_changed(self) -> None:
         self._dirty = True
+        self._any_edit_since_load = True
         self.data_changed.emit()

@@ -36,6 +36,10 @@ class ProjectSelector(QMainWindow):
                             Qt.WindowType.WindowTitleHint)
         self.projects = projects or []
         self.selected_index = -1
+        # Path-based lookup is robust against index drift (e.g. when the
+        # user removes a recent-project entry, the surviving rows keep
+        # working without re-binding their indices).
+        self.selected_path = ""
         self.selected_app = "unified"
         gif_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "res", "images", "PorySuite.gif")
         movie = QMovie(gif_path)
@@ -67,28 +71,32 @@ class ProjectSelector(QMainWindow):
             self.add_project(name, path, i)
 
     def add_project(self, name: str, path: str, p_info_index: int):
-        from PyQt6.QtWidgets import QFrame, QHBoxLayout
+        from PyQt6.QtWidgets import QFrame, QHBoxLayout, QPushButton
 
         row = QFrame(self)
         row.setStyleSheet(
             "QFrame { border-bottom: 1px solid #333; padding: 4px 0; }"
             "QPushButton { padding: 4px 12px; }"
         )
+        # Full absolute path on hover — lets the user disambiguate two
+        # entries with the same display name (e.g. "pokefirered" at two
+        # different folder paths).
+        row.setToolTip(path)
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(6, 4, 6, 4)
 
         # Project name + path
         name_label = QLabel(f"<b>{name}</b>")
         name_label.setMinimumWidth(120)
+        name_label.setToolTip(path)
         row_layout.addWidget(name_label)
 
         path_label = QLabel(condense_path(path))
         path_label.setStyleSheet("color: #999; font-size: 11px;")
+        path_label.setToolTip(path)
         row_layout.addWidget(path_label, 1)
 
-        # Single Open button — unified window handles both editors
-        from PyQt6.QtWidgets import QPushButton
-
+        # Open button — unified window handles both editors
         btn_open = QPushButton("Open")
         btn_open.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_open.setToolTip("Open project in PorySuite-Z")
@@ -97,10 +105,81 @@ class ProjectSelector(QMainWindow):
         )
         row_layout.addWidget(btn_open)
 
+        # Small "remove from list" button — does NOT delete the project
+        # files on disk. Just drops the entry from the recent list so
+        # duplicates and old paths can be cleared out.
+        btn_remove = QPushButton("✕")
+        btn_remove.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_remove.setToolTip(
+            "Remove from recent projects (does not delete the project)")
+        btn_remove.setFixedSize(24, 24)
+        btn_remove.setStyleSheet(
+            "QPushButton { padding: 0; border: 1px solid #444; "
+            "border-radius: 3px; color: #888; background: transparent; }"
+            "QPushButton:hover { color: #fff; background: #663333; "
+            "border-color: #aa4444; }"
+        )
+        btn_remove.clicked.connect(
+            lambda _, p=path, r=row: self._remove_recent(p, r)
+        )
+        row_layout.addWidget(btn_remove)
+
         self.ui.verticalLayout_projects.addWidget(row)
+
+    def _remove_recent(self, project_path: str, row_widget):
+        """Drop a project from the recent-projects list.
+
+        Only removes the entry from projects.json — the project folder
+        on disk is untouched. After removal the row is hidden in the UI;
+        the next launch will not show it.
+        """
+        ret = QMessageBox.question(
+            self,
+            "Remove from Recent Projects",
+            f"Remove this entry from the recent list?\n\n{project_path}\n\n"
+            "The project files on disk will NOT be deleted — "
+            "you can re-add it later via 'Open Existing Project'.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        # Update projects.json — match by directory path (canonical key).
+        projects_file = os.path.join(get_data_dir(), "projects.json")
+        try:
+            with open(projects_file, "r") as f:
+                data = json.load(f)
+        except Exception:
+            data = {"projects": []}
+
+        data["projects"] = [
+            p for p in data.get("projects", [])
+            if p.get("dir") != project_path
+        ]
+
+        try:
+            with open(projects_file, "w") as f:
+                json.dump(data, f)
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Couldn't Save",
+                f"Failed to update projects.json:\n{exc}")
+            return
+
+        # Hide the row and disable any of its buttons so further clicks
+        # don't try to open / remove a stale entry.
+        row_widget.setEnabled(False)
+        row_widget.hide()
 
     def select_project(self, index: int, app: str = "unified"):
         self.selected_index = index
+        # Capture the absolute project path so app.py can look up the
+        # entry without depending on list indices that may have shifted.
+        try:
+            self.selected_path = self.projects[index].get("dir", "")
+        except (IndexError, AttributeError):
+            self.selected_path = ""
         self.close()
 
     def handle_project_click(self, event, index: int):
@@ -207,6 +286,7 @@ class ProjectSelector(QMainWindow):
                 json.dump(projects, f)
 
             self.selected_index = 0
+            self.selected_path = project_dir
             self.close()
 
     def change_project_plugin(self, index: int):

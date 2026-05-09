@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox,
     QPushButton, QFileDialog, QMessageBox,
     QSizePolicy, QScrollArea, QGridLayout, QLineEdit, QSplitter,
+    QDialog, QDialogButtonBox, QFormLayout, QSpinBox,
 )
 
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
@@ -174,6 +175,163 @@ class _PicCard(QPushButton):
 # Main widget
 # ═════════════════════════════════════════════════════════════════════════════
 
+class _AddTrainerPicDialog(QDialog):
+    """Pick a PNG + name a new trainer pic.
+
+    The dialog auto-derives the constant, the C symbol, and the snake_case
+    base filename from the PNG's basename so the user typically only has
+    to pick a file and click OK. All three derived names remain editable
+    in case the auto-derivation isn't what they want.
+    """
+
+    def __init__(self, project_root: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Trainer Pic")
+        self.setMinimumWidth(520)
+        self._project_root = project_root
+        self._png_path = ""
+
+        outer = QVBoxLayout(self)
+        outer.setSpacing(10)
+
+        intro = QLabel(
+            "Register a new trainer pic by picking an indexed PNG. The\n"
+            "PNG, palette, INCBIN entries, table rows, and constant define\n"
+            "are all wired up automatically — no hand-editing of C source.")
+        intro.setStyleSheet("color: #aaa; font-size: 11px;")
+        intro.setWordWrap(True)
+        outer.addWidget(intro)
+
+        # PNG picker row
+        png_row = QHBoxLayout()
+        self._png_edit = QLineEdit()
+        self._png_edit.setReadOnly(True)
+        self._png_edit.setPlaceholderText("Click Browse… to pick an indexed PNG")
+        png_row.addWidget(self._png_edit, 1)
+        self._browse_btn = QPushButton("Browse…")
+        self._browse_btn.clicked.connect(self._on_browse)
+        png_row.addWidget(self._browse_btn)
+        outer.addLayout(png_row)
+
+        # Auto-derived name fields
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._const_edit = QLineEdit()
+        self._const_edit.setPlaceholderText(
+            "Auto-filled from the PNG filename")
+        form.addRow("Constant:", self._const_edit)
+
+        self._symbol_edit = QLineEdit()
+        self._symbol_edit.setPlaceholderText(
+            "Auto-filled from the PNG filename")
+        form.addRow("C symbol:", self._symbol_edit)
+
+        self._base_edit = QLineEdit()
+        self._base_edit.setPlaceholderText(
+            "Auto-filled from the PNG filename")
+        form.addRow("Base filename:", self._base_edit)
+
+        # Battle-screen positioning. Underlying struct is `MonCoords`
+        # (vanilla pokefirered shares this 2-field struct between mon and
+        # trainer pics — the engine names it "Mon" but it works for both).
+        # The user just sees "Sprite size" and "Y offset" — much clearer
+        # than the struct name for someone who's never read the engine.
+        coord_row = QHBoxLayout()
+        self._size_spin = QSpinBox()
+        self._size_spin.setRange(1, 16)
+        self._size_spin.setValue(8)
+        self._size_spin.setToolTip(
+            "Power-of-2 sprite dimension code. 8 = 64×64 pixels, which\n"
+            "is what virtually every vanilla trainer pic uses. Only\n"
+            "change this if the sprite is a non-standard size.")
+        self._yoff_spin = QSpinBox()
+        self._yoff_spin.setRange(-32, 32)
+        self._yoff_spin.setValue(1)
+        self._yoff_spin.setToolTip(
+            "Vertical pixel nudge applied during the battle intro\n"
+            "animation. 1 matches almost every vanilla pic. Increase\n"
+            "to push the sprite up; decrease to push it down.")
+        coord_row.addWidget(QLabel("Sprite size:"))
+        coord_row.addWidget(self._size_spin)
+        coord_row.addSpacing(16)
+        coord_row.addWidget(QLabel("Y offset:"))
+        coord_row.addWidget(self._yoff_spin)
+        coord_row.addStretch(1)
+        form.addRow("Position:", coord_row)
+        outer.addLayout(form)
+
+        hint = QLabel(
+            "Defaults of size 8, Y offset 1 match almost every vanilla\n"
+            "pic. Tweak only if the sprite is a non-standard size or\n"
+            "needs a different on-screen position during battle intro.")
+        hint.setStyleSheet("color: #666; font-size: 10px;")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        # OK / Cancel
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Add")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        outer.addWidget(btns)
+
+    def _on_browse(self) -> None:
+        # Default to graphics/trainers/front_pics so the user lands in
+        # the right folder if their PNG is already there.
+        start = ""
+        if self._project_root:
+            start = os.path.join(
+                self._project_root, "graphics", "trainers", "front_pics")
+            if not os.path.isdir(start):
+                start = self._project_root
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Trainer Pic PNG", start, "PNG Images (*.png)")
+        if not path:
+            return
+
+        # Validate it's indexed before accepting.
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(
+                self, "Invalid PNG", f"Could not load:\n{path}")
+            return
+        if img.format() != QImage.Format.Format_Indexed8:
+            QMessageBox.warning(
+                self, "Not Indexed",
+                "The PNG must be 8-bit indexed (palette mode) with up to "
+                "16 colours.\nOpen it in GIMP → Image → Mode → Indexed "
+                "with 16 colours, then export and try again.")
+            return
+
+        self._png_path = path
+        self._png_edit.setText(path)
+
+        # Auto-derive the three names. Only fill fields the user hasn't
+        # already typed into so manual edits aren't clobbered.
+        from core.trainer_pic_registry import derive_names_from_filename
+        const, sym, base = derive_names_from_filename(path)
+        if not self._const_edit.text():
+            self._const_edit.setText(const)
+        if not self._symbol_edit.text():
+            self._symbol_edit.setText(sym)
+        if not self._base_edit.text():
+            self._base_edit.setText(base)
+
+    def values(self) -> dict:
+        return {
+            "png_path": self._png_path,
+            "constant": self._const_edit.text().strip(),
+            "symbol": self._symbol_edit.text().strip(),
+            "base_name": self._base_edit.text().strip(),
+            "coord_size": self._size_spin.value(),
+            "coord_y_offset": self._yoff_spin.value(),
+        }
+
+
 class TrainerGraphicsTab(QWidget):
     """Trainer sprite palette viewer / editor / importer."""
 
@@ -240,6 +398,19 @@ class TrainerGraphicsTab(QWidget):
         )
         self._search_edit.textChanged.connect(self._on_search_changed)
         header.addWidget(self._search_edit)
+
+        # "+ Add Trainer Pic" sits next to the search box — it's a
+        # global action (creates a NEW pic) so it belongs at the top
+        # alongside list-level controls, not in the right-hand editor
+        # panel where the per-pic Import/Export buttons live.
+        self._add_pic_btn = QPushButton("+ Add Trainer Pic…")
+        self._add_pic_btn.setToolTip(
+            "Register a new trainer pic in the project from an indexed\n"
+            "PNG. Wires up the four C source files (constants, INCBIN\n"
+            "decls, coords table, sprite table, palette table) plus a\n"
+            ".pal sibling — atomically, with byte-equality guards."
+        )
+        header.addWidget(self._add_pic_btn)
         header.addStretch(1)
 
         self._count_lbl = QLabel("")
@@ -418,6 +589,7 @@ class TrainerGraphicsTab(QWidget):
         self._pal_row.palette_reordered.connect(self._on_palette_reordered)
         self._pal_row.swatch_set_as_bg.connect(self._on_set_swatch_as_bg)
         self._open_folder_btn.clicked.connect(self._open_palettes_folder)
+        self._add_pic_btn.clicked.connect(self._on_add_trainer_pic)
         self._import_sprite_btn.clicked.connect(self._import_sprite_from_png)
         self._import_png_btn.clicked.connect(self._import_palette_from_png)
         self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
@@ -772,6 +944,90 @@ class TrainerGraphicsTab(QWidget):
                     os.startfile(folder)  # type: ignore[attr-defined]
                 except Exception:
                     pass
+
+    def _on_add_trainer_pic(self) -> None:
+        """Open the Add Trainer Pic dialog and run the registry patch on Apply.
+
+        Cross-cutting effect: this is the only PorySuite-Z action that
+        modifies the PROJECT'S TRAINER REGISTRY (constants + table files
+        + INCBIN list), so on success we have to refresh both the trainer
+        graphics grid (to show the new card) and propagate the new pic_map
+        to other tabs that depend on it (Trainers tab uses the same map
+        for its pic-picker).
+        """
+        if not self._project_root:
+            QMessageBox.information(
+                self, "No Project",
+                "Open a project first.")
+            return
+
+        dlg = _AddTrainerPicDialog(self._project_root, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        v = dlg.values()
+        if not v["png_path"]:
+            QMessageBox.warning(self, "Missing PNG", "Pick an indexed PNG first.")
+            return
+        if not v["constant"].startswith("TRAINER_PIC_"):
+            QMessageBox.warning(
+                self, "Bad Constant",
+                "Constant must start with TRAINER_PIC_.")
+            return
+        if not v["symbol"]:
+            QMessageBox.warning(
+                self, "Bad Symbol",
+                "C symbol cannot be empty.")
+            return
+        if not v["base_name"]:
+            QMessageBox.warning(
+                self, "Bad Base Name",
+                "Base filename cannot be empty.")
+            return
+
+        from core.trainer_pic_registry import add_trainer_pic
+        result = add_trainer_pic(
+            project_root=self._project_root,
+            source_png_path=v["png_path"],
+            constant=v["constant"],
+            symbol=v["symbol"],
+            base_name=v["base_name"],
+            coord_size=v["coord_size"],
+            coord_y_offset=v["coord_y_offset"],
+        )
+        if not result.success:
+            QMessageBox.critical(
+                self, "Add Trainer Pic Failed", result.error)
+            return
+
+        # Refresh the pic_map and grid. The map is owned by the Trainers
+        # tab, so re-run its parser to pick up the new entry, then push
+        # the refreshed map into our load() to rebuild the grid.
+        try:
+            from ui.trainers_tab_widget import _parse_trainer_pic_map
+            new_map = _parse_trainer_pic_map(self._project_root)
+            self.load(self._project_root, new_map)
+            # Auto-select the just-added card so the user lands on it.
+            if v["constant"] in self._pic_map:
+                self._select_card(v["constant"])
+        except Exception:
+            # Best-effort refresh — even if the in-tab refresh fails,
+            # the on-disk patch was successful.
+            pass
+
+        QMessageBox.information(
+            self, "Trainer Pic Added",
+            f"{v['constant']} (id {result.pic_id}) registered.\n\n"
+            f"Files modified:\n"
+            f"  • graphics/trainers/front_pics/{v['base_name']}_front_pic.png\n"
+            f"  • graphics/trainers/palettes/{v['base_name']}.pal\n"
+            f"  • src/data/graphics/trainers.h\n"
+            f"  • src/data/trainer_graphics/front_pic_tables.h\n"
+            f"  • include/constants/trainers.h\n\n"
+            f"Build the project to compile the new INCBIN entries — the "
+            f"PorySuite-Z preview already shows them, but the game ROM "
+            f"won't include them until you `make modern` (or your build "
+            f"target of choice).")
 
     def _import_sprite_from_png(self) -> None:
         """Replace the current trainer's sprite image (pixels + palette)

@@ -1135,6 +1135,89 @@ def _scan_field_effect_sprites(root: str) -> List[FieldEffectEntry]:
     return sorted(entries, key=lambda e: (e.category, e.name.lower()))
 
 
+class _RebakeFromTagDialog(QDialog):
+    """Pick an OBJ_EVENT_PAL_TAG_* to bake into a Field Effect sprite.
+
+    Each tag is shown as a list row with a 16-swatch palette preview as
+    the row icon. The icon is rendered to a small QPixmap on the fly
+    rather than persisted, so this dialog has no caching / lifecycle
+    concerns — it's a one-shot picker.
+    """
+
+    def __init__(self, sprite_name: str,
+                 tag_palettes: List[Tuple[str, List[Color]]],
+                 parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Re-bake from Palette Tag")
+        self.setMinimumSize(520, 420)
+
+        self._tag_palettes = tag_palettes
+        self._chosen_tag: Optional[str] = None
+        self._chosen_colors: Optional[List[Color]] = None
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            f"Pick a palette tag to bake into <b>{sprite_name}</b>.\n"
+            "Live colours from the Pokemon / NPC tab take priority over\n"
+            "the on-disk .pal / .gbapal — so unsaved palette edits in that\n"
+            "tab are honoured here too.")
+        info.setStyleSheet("color: #aaa; font-size: 11px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self._list = QListWidget()
+        self._list.setIconSize(QSize(192, 16))
+        self._list.setSpacing(2)
+        layout.addWidget(self._list, 1)
+
+        for tag, colors in tag_palettes:
+            icon = self._build_swatch_icon(colors)
+            item = QListWidgetItem(icon, tag)
+            self._list.addItem(item)
+
+        # Double-click accepts; single-click just selects.
+        self._list.itemDoubleClicked.connect(
+            lambda *_: self.accept())
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            parent=self)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Apply")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    @staticmethod
+    def _build_swatch_icon(colors: List[Color]) -> QIcon:
+        """Render a 16-color palette as a 192×16 pixmap (12 px per swatch)."""
+        from PyQt6.QtGui import QPainter
+        pix = QPixmap(192, 16)
+        pix.fill(QColor(0, 0, 0))
+        painter = QPainter(pix)
+        try:
+            for i, (r, g, b) in enumerate(colors[:16]):
+                painter.fillRect(i * 12, 0, 12, 16, QColor(r, g, b))
+        finally:
+            painter.end()
+        return QIcon(pix)
+
+    def accept(self) -> None:
+        row = self._list.currentRow()
+        if 0 <= row < len(self._tag_palettes):
+            tag, colors = self._tag_palettes[row]
+            self._chosen_tag = tag
+            self._chosen_colors = list(colors)
+        super().accept()
+
+    def chosen_tag(self) -> Optional[str]:
+        return self._chosen_tag
+
+    def chosen_colors(self) -> Optional[List[Color]]:
+        return self._chosen_colors
+
+
 class FieldEffectSpritesTab(QWidget):
     """Editor for field effect sprites — exclamation marks, music notes, emoticons, etc.
 
@@ -1171,6 +1254,53 @@ class FieldEffectSpritesTab(QWidget):
 
     def _bus_key(self, entry: FieldEffectEntry) -> str:
         return self._BUS_PREFIX + entry.png_path
+
+    def _collect_overworld_tag_palettes(self) -> List[Tuple[str, List[Color]]]:
+        """Return [(OBJ_EVENT_PAL_TAG_*, 16-color list), ...] sorted by tag.
+
+        Source priority for each tag's colors:
+          1. Live bus state (in-memory edits from the Pokemon/NPC tab,
+             possibly unsaved) — `_get_palette_bus().get_overworld_palette(tag)`.
+          2. The .pal sibling of the .gbapal file referenced by the tag's
+             palette symbol in object_event_graphics.h. Easier to read than
+             the binary .gbapal and PorySuite-Z keeps the two in sync.
+          3. The .gbapal binary itself via `_read_gbapal_file`.
+
+        Tags whose palette can't be resolved at all are dropped from the
+        list so the user doesn't see an empty / black entry.
+        """
+        if not self._project_root:
+            return []
+        tag_to_symbol = _parse_palette_table(self._project_root)
+        sym_to_path = _parse_pal_symbol_to_path(self._project_root)
+        bus = _get_palette_bus()
+
+        result: List[Tuple[str, List[Color]]] = []
+        for tag in sorted(tag_to_symbol.keys()):
+            colors = bus.get_overworld_palette(tag)
+            if not colors:
+                sym = tag_to_symbol.get(tag, "")
+                rel = sym_to_path.get(sym, "")
+                if rel:
+                    abs_pal = os.path.join(
+                        self._project_root, rel[:-len(".gbapal")] + ".pal")
+                    abs_gbapal = os.path.join(self._project_root, rel)
+                    if os.path.isfile(abs_pal):
+                        loaded = read_jasc_pal(abs_pal)
+                        if loaded:
+                            colors = list(loaded)
+                    if not colors and os.path.isfile(abs_gbapal):
+                        from core.tilemap_data import _read_gbapal_file
+                        loaded = _read_gbapal_file(abs_gbapal)
+                        if loaded:
+                            colors = list(loaded)
+            if not colors:
+                continue
+            # Pad / clamp to 16 entries so the swatch row renders cleanly.
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+            result.append((tag, colors[:16]))
+        return result
 
     def _get_palette(self, entry: FieldEffectEntry) -> List[Color]:
         """Return palette from bus, RAM, .pal file, or baked PNG colour table."""
@@ -1316,11 +1446,19 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_import_pal_btn = QPushButton("Import from .pal…")
         self._fe_import_pal_btn.setToolTip(
             "Load a JASC .pal file and apply it to this sprite.")
+        self._fe_rebake_tag_btn = QPushButton("Re-bake from Palette Tag…")
+        self._fe_rebake_tag_btn.setToolTip(
+            "Replace this sprite's palette with the live colours of an\n"
+            "OBJ_EVENT_PAL_TAG_* (Pokemon / NPC tab). Use this after editing\n"
+            "the player or NPC palette to update field-effect sprites that\n"
+            "share that palette tag at runtime, so GIMP shows the same\n"
+            "colours the game will render with.")
         self._fe_browse_folder_btn = QPushButton("Open Folder")
         self._fe_browse_folder_btn.setToolTip(
             "Open the field_effects/pics folder.")
         fe_pal_btns.addWidget(self._fe_import_png_btn)
         fe_pal_btns.addWidget(self._fe_import_pal_btn)
+        fe_pal_btns.addWidget(self._fe_rebake_tag_btn)
         fe_pal_btns.addWidget(self._fe_browse_folder_btn)
         fe_pal_btns.addStretch(1)
         pf.addLayout(fe_pal_btns)
@@ -1340,6 +1478,7 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_search.textChanged.connect(self._rebuild_list)
         self._fe_import_png_btn.clicked.connect(self._import_palette_from_png)
         self._fe_import_pal_btn.clicked.connect(self._import_palette_from_pal)
+        self._fe_rebake_tag_btn.clicked.connect(self._rebake_from_palette_tag)
         self._fe_browse_folder_btn.clicked.connect(self._open_sprite_folder)
         self._fe_open_folder_btn.clicked.connect(self._open_current_sprite_folder)
 
@@ -1683,6 +1822,69 @@ class FieldEffectSpritesTab(QWidget):
                     self._open_folder(os.path.dirname(fp))
             else:
                 self._open_folder(os.path.dirname(fp))
+
+    def _rebake_from_palette_tag(self) -> None:
+        """Bake an OBJ_EVENT_PAL_TAG_* palette into the current FE sprite.
+
+        Solves the cross-tab editing gap: changing the player palette in
+        the Pokemon/NPC tab updates the player's PNGs, but field-effect
+        PNGs that share that palette tag at runtime keep their old baked
+        colours. Their PNG indices are still correct (the game renders
+        fine), but GIMP shows stale colours, making them hard to edit.
+
+        This action lets the user pick a tag, fetches that tag's current
+        live palette (preferring in-memory bus state over disk so even
+        unsaved Overworld edits propagate), and bakes it into the FE
+        sprite's PNG color table. Pixel indices are untouched.
+        """
+        if not self._current:
+            QMessageBox.information(
+                self, "No Sprite Selected",
+                "Select a Field Effect sprite in the list first.")
+            return
+        if not self._project_root:
+            return
+
+        tag_palettes = self._collect_overworld_tag_palettes()
+        if not tag_palettes:
+            QMessageBox.information(
+                self, "No Palette Tags",
+                "Couldn't find any OBJ_EVENT_PAL_TAG_* palettes.\n\n"
+                "Open the Pokemon / NPC sub-tab first so Overworld\n"
+                "palettes are loaded into the shared bus, then try again.")
+            return
+
+        dlg = _RebakeFromTagDialog(
+            self._current.name, tag_palettes, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen_tag = dlg.chosen_tag()
+        chosen_colors = dlg.chosen_colors()
+        if not chosen_tag or not chosen_colors:
+            return
+
+        # Apply: update RAM palette, push to bus, mark dirty, refresh
+        # swatch row, bake into PNG via the existing flush-on-save path.
+        # Pushing to the bus matches the pattern used by `_on_palette_edited`
+        # so any other subscriber reading this FE entry's palette via the
+        # bus picks up the new colours immediately.
+        entry = self._current
+        key = self._bus_key(entry)
+        self._palettes[key] = list(chosen_colors)
+        self._palette_dirty.add(key)
+        _get_palette_bus().set_overworld_palette(key, list(chosen_colors))
+        self._fe_pal_frame.setStyleSheet(self._DIRTY_SS)
+        self._fe_pal_row.set_colors(list(chosen_colors), emit=False)
+        # Trigger sheet-view repaint with the new palette so the user
+        # sees the change immediately, before saving.
+        self._show_detail(entry)
+        self.modified.emit()
+        QMessageBox.information(
+            self, "Palette Applied",
+            f"Loaded '{chosen_tag}' into {entry.name}.\n\n"
+            "Save (Ctrl+S) to bake the new palette into the PNG\n"
+            "and write the .pal file. The pixel indices stay as-is —\n"
+            "only the colour table changes.")
 
     def _open_sprite_folder(self) -> None:
         folder = os.path.join(self._project_root, "graphics", "field_effects", "pics")

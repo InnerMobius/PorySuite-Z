@@ -625,7 +625,27 @@ def export_indexed_png(
         # non-indexed image, refuse the save.
         if img.format() != QImage.Format.Format_Indexed8:
             return False
-        return img.save(output_path, "PNG")
+        # Byte-equality guard: render the PNG to a buffer first, then
+        # only write to disk if the bytes differ. Prevents phantom git
+        # diffs when the graphics tab re-flushes a sprite whose palette
+        # already matches what's on disk (a common case after F5 /
+        # cross-tab edits trip the dirty flag without changing pixels).
+        from PyQt6.QtCore import QBuffer, QIODevice
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not img.save(buf, "PNG"):
+            return False
+        new_bytes = bytes(buf.data())
+        if os.path.isfile(output_path):
+            try:
+                with open(output_path, "rb") as f:
+                    if f.read() == new_bytes:
+                        return True  # already in sync — no write needed
+            except Exception:
+                pass
+        with open(output_path, "wb") as f:
+            f.write(new_bytes)
+        return True
     except Exception:
         return False
 
@@ -669,8 +689,10 @@ def export_palette(palette: list[Color], output_path: str) -> bool:
         lines = ["JASC-PAL", "0100", str(target_count)]
         for (r, g, b) in padded:
             lines.append(f"{r} {g} {b}")
-        with open(output_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(lines) + "\n")
+        # Byte-equality guard prevents phantom git diffs when the same
+        # palette is re-flushed.
+        from core.file_io import write_text_if_changed
+        write_text_if_changed(output_path, "\n".join(lines) + "\n")
         return True
     except Exception:
         return False

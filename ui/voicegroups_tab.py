@@ -597,12 +597,24 @@ class VoicegroupsTab(QWidget):
         self._slots_group.setStyleSheet("")
 
         # Use shared labels dict from sound editor tab (same object
-        # reference, so edits here are visible to the piano roll)
+        # reference, so edits here are visible to the piano roll).
+        # Fallback: if loaded standalone with no labels file yet, auto-
+        # generate from song usage so the list isn't blank on first open.
         if vg_labels is not None:
             self._vg_labels = vg_labels
         else:
-            from core.sound.voicegroup_labels import load_labels
+            from core.sound.voicegroup_labels import (
+                load_labels, save_labels, generate_labels_from_song_table,
+            )
             self._vg_labels = load_labels(project_root)
+            if not self._vg_labels and self._song_table is not None:
+                try:
+                    generated = generate_labels_from_song_table(self._song_table)
+                    if generated:
+                        self._vg_labels = generated
+                        save_labels(project_root, self._vg_labels)
+                except Exception:
+                    pass
 
         self._populate_vg_list()
 

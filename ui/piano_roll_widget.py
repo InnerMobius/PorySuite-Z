@@ -1410,7 +1410,7 @@ class PianoRollWidget(QWidget):
             # subroutine has 10 PAN commands and is called 7 times, we get
             # 70 PAN events instead of 10.  Deduplicate by (tick, type, value)
             # so only unique events at each tick position survive.
-            _CONTROL_EVENT_CMDS = {'BEND', 'BENDR', 'VOL', 'PAN'}
+            _CONTROL_EVENT_CMDS = {'BEND', 'BENDR', 'VOL', 'PAN', 'TEMPO'}
             _seen_ctrl: set[tuple[int, str, int]] = set()
             for cmd in flat_cmds:
                 if cmd.cmd in _CONTROL_EVENT_CMDS and cmd.value is not None:

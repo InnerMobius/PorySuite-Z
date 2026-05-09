@@ -673,19 +673,25 @@ def _stringize(cmd_tuple: tuple) -> str:
     if cmd == 'message':
         label = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         text = cmd_tuple[2] if len(cmd_tuple) > 2 else ''
+        # 5th element selects render mode (Normal vs Braille). The
+        # command-list shows a "Braille:" prefix on braille messages
+        # so the user can spot them at a glance — they compile through
+        # a different path and have different in-game appearance.
+        render = cmd_tuple[4] if len(cmd_tuple) > 4 else 'normal'
+        prefix = 'Braille' if render == 'braille' else 'Text'
         if text:
             # Strip trailing $ (end-of-string marker in pokefirered)
             display = text.rstrip('$')
             # Show full text with RMXP-style continuation lines
             lines = display.split('\n')
-            first = f'@>Text: {lines[0]}'
+            first = f'@>{prefix}: {lines[0]}'
             if len(lines) > 1:
                 continuation = '\n'.join(f' :        : {ln}' for ln in lines[1:] if ln)
                 return f'{first}\n{continuation}' if continuation else first
             return first
         if label:
-            return f'@>Text: {label}'
-        return '@>Text: (empty)'
+            return f'@>{prefix}: {label}'
+        return f'@>{prefix}: (empty)'
 
     # ── Flags ───────────────────────────────────────────────────────────
     if cmd in ('setflag', 'clearflag', 'checkflag'):
@@ -1159,9 +1165,26 @@ class _CommandWidget(QWidget):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class _MessageWidget(_CommandWidget):
-    """Show Message / msgbox — text editor with character limit enforcement."""
+    """Show Message / msgbox — text editor with character limit enforcement.
 
-    def __init__(self, label_name=None, text='', msg_type='', parent=None):
+    The optional ``render`` parameter selects between Normal (``.string``
+    + ``msgbox``) and Braille (``.braille`` + ``braillemessage``)
+    output. Defaults to Normal. The render-type dropdown is always
+    visible; switching to Braille greys out the type combo (because
+    ``braillemessage`` doesn't take a MSGBOX type) and disables
+    formatting buttons.
+
+    On construction, reads ``_DIALOG_CONTEXT`` (populated by the event
+    editor when the user picks an event / changes its NPC graphic) to
+    pick the *implicit* foreground color for the editor preview. Lets
+    the user see the runtime color of NPC dialogue (red for FEMALE
+    sprites, blue for MALE) without inserting any color tokens — the
+    in-engine ``AddTextPrinterDiffStyle`` does that at runtime, so the
+    editor preview mirrors it for an accurate WYSIWYG.
+    """
+
+    def __init__(self, label_name=None, text='', msg_type='', parent=None,
+                 render='normal'):
         from ui.game_text_edit import GameTextEdit
 
         super().__init__(parent)
@@ -1198,20 +1221,65 @@ class _MessageWidget(_CommandWidget):
             self.type_combo.setCurrentIndex(0)
         self.type_combo.setMaximumWidth(200)
         top.addWidget(self.type_combo)
+
+        # Render-type dropdown — Normal vs Braille. Braille messages
+        # compile through the .braille preprocessor directive and are
+        # invoked with `braillemessage` instead of `msgbox`. Letters get
+        # remapped to braille glyph indices at preprocess time, so they
+        # render as actual dot patterns in the game window.
+        top.addWidget(QLabel('Render:'))
+        self.render_combo = QComboBox()
+        self.render_combo.addItems(['Normal', 'Braille'])
+        if str(render).lower() == 'braille':
+            self.render_combo.setCurrentIndex(1)
+        self.render_combo.setMaximumWidth(110)
+        self.render_combo.setToolTip(_tt(
+            'Normal — regular dialogue (.string + msgbox).\n'
+            'Braille — compiles via .braille + braillemessage. Plain '
+            'letters only; colors and tokens are disabled because the '
+            'braille font has its own glyph table that doesn\'t share '
+            'character codes with normal text.'))
+        top.addWidget(self.render_combo)
+
         layout.addLayout(top)
 
         # GameTextEdit handles escape codes, $ stripping, char limits,
-        # {COMMAND} blue highlighting, and right-click insert menu
+        # the formatting toolbar, color preview, and right-click insert menu
         self.text_edit = GameTextEdit(max_chars_per_line=36, max_lines=20)
-        self.text_edit.setMaximumHeight(80)
+        self.text_edit.setMaximumHeight(120)
         self.text_edit.setPlaceholderText('Message text...')
         self.text_edit.set_eventide_text(text or '')
+        # Apply the implicit color preview based on this NPC's graphic
+        # ID (FEMALE → red, MALE → blue, else dark gray) to match what
+        # the in-game runtime will render. _refresh_dialog_context()
+        # is called by the event editor on event-load and gfx-change.
+        try:
+            self.text_edit.set_implicit_color(_implicit_color_from_context())
+        except Exception:
+            pass
         layout.addWidget(self.text_edit)
+
+        # Wire braille mode toggle → editor visual treatment + toolbar
+        # button enable/disable. Type combo is greyed out in braille
+        # because braillemessage doesn't accept a MSGBOX_TYPE arg.
+        def _on_render_changed(idx: int) -> None:
+            is_braille = (idx == 1)
+            self.text_edit.set_braille_mode(is_braille)
+            self.type_combo.setEnabled(not is_braille)
+        self.render_combo.currentIndexChanged.connect(_on_render_changed)
+        # Apply the initial state once.
+        _on_render_changed(self.render_combo.currentIndex())
 
     def to_tuple(self):
         label = self.label_combo.currentText().strip() or None
         text = self.text_edit.get_eventide_text()
         msg_type = self.type_combo.currentText().strip()
+        render = ('braille' if self.render_combo.currentIndex() == 1
+                  else 'normal')
+        # Tuple stays 4-element for normal messages so existing readers
+        # don't change. Braille messages add a 5th render token.
+        if render == 'braille':
+            return ('message', label, text, msg_type, 'braille')
         return ('message', label, text, msg_type)
 
     def friendly_name(self):
@@ -4828,6 +4896,82 @@ def _split_args(args_str: str) -> list[str]:
     return [a.strip() for a in str(args_str).split(',')]
 
 
+# ── Implicit-color context for message dialogs ───────────────────────────
+#
+# Populated by the event editor whenever an event is loaded or its
+# graphic changes. The message widget reads it on construction so the
+# editor preview matches what the runtime would render for this NPC's
+# dialogue (vanilla pokefirered tints text by NPC sprite gender via
+# ``sTextColorTable``; PorySuite's text editor mirrors that to give a
+# truthful preview without authors having to insert manual {COLOR} tokens).
+#
+# The context is a single shared dict because message dialogs are
+# spawned from many code paths and threading a parameter through all
+# of them would be invasive for a value that only changes when the
+# user picks a different event (rare relative to dialog opens).
+_DIALOG_CONTEXT: dict = {
+    'npc_graphic_id': None,        # OBJ_EVENT_GFX_* the event is using
+    'project_root': None,          # absolute path to pokefirered root
+    'npc_color_table': {},         # gfx_id -> 'MALE'/'FEMALE'/'NEUTRAL'/'MON'
+    'gender_dialogue_enabled': True,  # the Config tab toggle
+}
+
+
+def _refresh_dialog_context(npc_graphic_id: str | None,
+                            project_root: str | None) -> None:
+    """Update ``_DIALOG_CONTEXT`` when the active event / gfx changes.
+
+    Re-parses the ``sTextColorTable`` and re-reads the gender-dialogue
+    Config flag every time, so a Config tab toggle change between
+    saves takes effect on the next dialog open without reloading the
+    whole project.
+    """
+    _DIALOG_CONTEXT['npc_graphic_id'] = npc_graphic_id
+    _DIALOG_CONTEXT['project_root'] = project_root
+    if not project_root:
+        _DIALOG_CONTEXT['npc_color_table'] = {}
+        _DIALOG_CONTEXT['gender_dialogue_enabled'] = True
+        return
+    try:
+        from core.text_coloring_patch import (
+            parse_npc_text_color_table, read_gender_dialogue_enabled)
+        _DIALOG_CONTEXT['npc_color_table'] = (
+            parse_npc_text_color_table(project_root))
+        _DIALOG_CONTEXT['gender_dialogue_enabled'] = (
+            read_gender_dialogue_enabled(project_root))
+    except Exception:
+        _DIALOG_CONTEXT['npc_color_table'] = {}
+        _DIALOG_CONTEXT['gender_dialogue_enabled'] = True
+
+
+def _implicit_color_from_context() -> str:
+    """Return the editor's implicit-color name based on ``_DIALOG_CONTEXT``.
+
+    Maps the NPC gfx → 'MALE'/'FEMALE'/'NEUTRAL'/'MON' table entry
+    to a color name compatible with ``GameTextEdit.set_implicit_color``:
+
+      * MALE   → ``"BLUE"``  (vanilla AddTextPrinterDiffStyle path)
+      * FEMALE → ``"RED"``
+      * any other / missing → ``"DARK_GRAY"``
+
+    When the gender-dialogue toggle is off (Config tab patch applied),
+    always returns ``"DARK_GRAY"`` regardless of the NPC graphic — the
+    editor preview matches the runtime, which now always renders dark.
+    """
+    if not _DIALOG_CONTEXT.get('gender_dialogue_enabled', True):
+        return "DARK_GRAY"
+    gfx = _DIALOG_CONTEXT.get('npc_graphic_id') or ""
+    if not gfx:
+        return "DARK_GRAY"
+    table = _DIALOG_CONTEXT.get('npc_color_table', {})
+    kind = table.get(gfx, "NEUTRAL")
+    if kind == "MALE":
+        return "BLUE"
+    if kind == "FEMALE":
+        return "RED"
+    return "DARK_GRAY"
+
+
 def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
     """Create the appropriate widget for a command tuple."""
     if not cmd_tuple:
@@ -4840,7 +4984,10 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         label = cmd_tuple[1] if len(cmd_tuple) > 1 else None
         text = cmd_tuple[2] if len(cmd_tuple) > 2 else ''
         msg_type = cmd_tuple[3] if len(cmd_tuple) > 3 else ''
-        return _MessageWidget(label, text, msg_type)
+        # 5th element is the optional render type ('normal' | 'braille').
+        # Defaults to 'normal' so old 4-tuples continue to work unchanged.
+        render = cmd_tuple[4] if len(cmd_tuple) > 4 else 'normal'
+        return _MessageWidget(label, text, msg_type, render=render)
 
     if cmd == 'yesnobox':
         parts = _split_args(args)
@@ -7462,11 +7609,37 @@ class EventEditorTab(QWidget):
 
     def _on_gfx_changed(self, text):
         self._update_sprite(text)
+        # Refresh the dialog context so the next-opened message editor
+        # previews this NPC's implicit text color.
+        self._refresh_message_dialog_context()
 
     def _update_sprite(self, gfx_const):
         path = ConstantsManager.OBJECT_GFX_PATHS.get(gfx_const)
         self.sprite_preview.set_sprite(path)
         self._current_sprite_path = str(path) if path else ""
+
+    def _refresh_message_dialog_context(self) -> None:
+        """Push the current NPC graphic + project root into the
+        module-level dialog context so message editors opened after
+        this preview the right implicit text color.
+
+        Called when the user picks an event (gfx_combo populated) and
+        whenever the gfx changes thereafter.
+        """
+        try:
+            gfx = self.gfx_combo.currentText() if self.gfx_combo else ''
+        except Exception:
+            gfx = ''
+        # Project root: derive from map_dir which is always
+        # <root>/data/maps/<MapName>/. Walk up two levels.
+        root = None
+        try:
+            md = getattr(self, '_map_dir', None)
+            if md is not None:
+                root = str(md.parent.parent.parent)
+        except Exception:
+            root = None
+        _refresh_dialog_context(gfx or None, root)
 
     def _open_sprite_folder(self):
         from ui.open_folder_util import open_in_folder

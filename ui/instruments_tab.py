@@ -2034,13 +2034,41 @@ class InstrumentsTab(QWidget):
         if not vg_names:
             return None
 
-        vg_name, ok = QInputDialog.getItem(
+        # Build display labels matching the Voicegroups list ("VG NNN — Friendly")
+        # so the user can pick by purpose, not by number alone.
+        # Pull live in-memory labels from the voicegroups tab when available
+        # (catches unsaved renames); fall back to the on-disk JSON cache.
+        vg_labels: dict = {}
+        ref = getattr(self, "_voicegroups_tab_ref", None)
+        if ref is not None and getattr(ref, "_vg_labels", None):
+            vg_labels = ref._vg_labels
+        elif self._project_root:
+            try:
+                from core.sound.voicegroup_labels import load_labels
+                vg_labels = load_labels(self._project_root)
+            except Exception:
+                vg_labels = {}
+
+        display_items: list[str] = []
+        display_to_name: dict[str, str] = {}
+        for vg_name in vg_names:
+            num_str = vg_name.replace('voicegroup', '')
+            friendly = vg_labels.get(vg_name, '') if vg_labels else ''
+            if friendly:
+                display = f"VG {num_str} — {friendly}"
+            else:
+                display = f"VG {num_str}"
+            display_items.append(display)
+            display_to_name[display] = vg_name
+
+        chosen, ok = QInputDialog.getItem(
             self, "Add to Voicegroup",
             "Which voicegroup should this new instrument be added to?",
-            vg_names, 0, False)
+            display_items, 0, False)
         if not ok:
             return None
 
+        vg_name = display_to_name.get(chosen, chosen)
         vg = self._voicegroup_data.get_voicegroup(vg_name)
         if not vg:
             return None
@@ -2298,6 +2326,39 @@ class InstrumentsTab(QWidget):
                     else existing.header.sample_rate)
                 new_sample = existing
             else:
+                # Orphan-bin handling: a .bin file from a previous import
+                # may still be on disk even though direct_sound_data.inc
+                # was rolled back by `git pull` (the .inc is tracked, the
+                # .bin usually isn't, so the registry entry vanishes but
+                # the binary stays). When that happens, importer raises
+                # "File already exists" and the user is dead in the water.
+                # Detect the case and offer to overwrite — this is the
+                # only sensible interpretation when the .bin is on disk
+                # but no live sample references it.
+                orphan_path = os.path.join(
+                    self._project_root, 'sound',
+                    'direct_sound_samples', f"{name}.bin")
+                if os.path.exists(orphan_path):
+                    reply = QMessageBox.question(
+                        self, "Sample File Already Exists",
+                        f"'{name}.bin' is on disk but no instrument is "
+                        f"using it — most often left over from a "
+                        f"`git pull` that rolled back "
+                        f"direct_sound_data.inc.\n\n"
+                        f"Overwrite the orphan file with this new "
+                        f"sample?",
+                        QMessageBox.StandardButton.Yes
+                        | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes)
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                    try:
+                        os.remove(orphan_path)
+                    except OSError as exc:
+                        QMessageBox.critical(
+                            self, "Couldn't Delete",
+                            f"Failed to delete orphan file:\n{exc}")
+                        return
                 new_sample = import_wav_as_sample(
                     self._project_root, path, name, self._sample_data,
                     target_rate=target_rate)
@@ -2500,10 +2561,32 @@ class InstrumentsTab(QWidget):
                         self._project_root, 'sound',
                         'direct_sound_samples', bin_name)
 
+                    # Orphan-bin handling — see _on_import_wav for the
+                    # full rationale. After a `git pull` rolls back
+                    # direct_sound_data.inc, the previous import's
+                    # untracked .bin remains on disk, blocking the
+                    # next import attempt with the same name.
                     if os.path.exists(bin_abs):
-                        raise ValueError(
-                            f"File already exists: {bin_abs}\n"
-                            f"Choose a different name.")
+                        reply = QMessageBox.question(
+                            self, "Sample File Already Exists",
+                            f"'{bin_name}' is on disk but no instrument "
+                            f"is using it — most often left over from "
+                            f"a `git pull` that rolled back "
+                            f"direct_sound_data.inc.\n\n"
+                            f"Overwrite the orphan file with this "
+                            f"preset's sample?",
+                            QMessageBox.StandardButton.Yes
+                            | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.Yes)
+                        if reply != QMessageBox.StandardButton.Yes:
+                            return
+                        try:
+                            os.remove(bin_abs)
+                        except OSError as exc:
+                            QMessageBox.critical(
+                                self, "Couldn't Delete",
+                                f"Failed to delete orphan file:\n{exc}")
+                            return
 
                     bin_data = zf.read(bin_archive_name)
                     with open(bin_abs, 'wb') as f:
@@ -2528,6 +2611,28 @@ class InstrumentsTab(QWidget):
                     )
                     self._sample_data.direct_sound[label] = new_sample
                     self._sample_data._ds_label_to_path[label] = bin_rel
+
+                    # Save a source WAV alongside the BIN so the imported
+                    # preset survives the `sound/**/*.bin` gitignore. The
+                    # build's audio_rules.mk regenerates the BIN from the
+                    # WAV byte-identically. Same approach as the raw-WAV
+                    # import path in `import_wav_as_sample`.
+                    try:
+                        from core.sound.sample_loader import _write_pcm_as_wav
+                        wav_dest = os.path.join(
+                            self._project_root, 'sound',
+                            'direct_sound_samples', f"{name}.wav")
+                        _write_pcm_as_wav(
+                            wav_dest, header.sample_rate, pcm_loaded)
+                    except Exception as exc:
+                        QMessageBox.warning(
+                            self, "Source WAV Not Saved",
+                            f"The instrument was imported, but the source "
+                            f"WAV alongside the .bin couldn't be saved:\n"
+                            f"{exc}\n\n"
+                            f"This means the imported sample won't survive "
+                            f"a `git pull` for collaborators. The local "
+                            f"build is fine.")
 
             # Assign the sample to an instrument slot — new_instrument=True
             # so a fresh filler slot is found rather than clobbering the

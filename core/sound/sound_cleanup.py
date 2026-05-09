@@ -112,35 +112,44 @@ def scan_broken_inc_entries(project_root: str) -> list[OrphanEntry]:
 # ── Scanner 3: orphaned song files ─────────────────────────────────────────
 
 def scan_orphaned_songs(project_root: str) -> list[OrphanEntry]:
-    """Find .s/.mid files in sound/songs/midi/ with no matching MUS_* constant."""
+    """Find .s/.mid files in sound/songs/midi/ with no matching constant in songs.h.
+
+    File naming convention in pokefirered is the constant name lowercased —
+    `MUS_BERRY_PICK` → `mus_berry_pick.{s,mid}`, `SE_BALL` → `se_ball.{s,mid}`,
+    and so on. The previous implementation only matched `MUS_*` and reported
+    every `SE_*` SFX file as orphaned even though they're properly registered
+    as `SE_*` constants in the SAME header file. The fix is to take every
+    `#define`'d constant in songs.h as a known stem, regardless of prefix,
+    and not strip any prefix from the file stem either — match full names.
+    """
     songs_dir = Path(project_root) / "sound" / "songs" / "midi"
     songs_h = Path(project_root) / "include" / "constants" / "songs.h"
 
     if not songs_dir.exists():
         return []
 
-    # Build set of known song stems from songs.h
-    known_stems: set[str] = set()
+    # Every `#define <NAME>` constant in songs.h, lowercased. Covers MUS_*,
+    # SE_*, and anything else a hack might add (FANFARE_*, CRY_*, custom).
+    known: set[str] = set()
     if songs_h.exists():
         text = songs_h.read_text(encoding="utf-8", errors="replace")
-        for m in re.finditer(r'#define\s+(MUS_\w+)', text):
-            # MUS_RACE -> race
-            known_stems.add(m.group(1).lower()[4:])  # strip "MUS_" prefix
+        for m in re.finditer(r'#define\s+(\w+)', text):
+            known.add(m.group(1).lower())
 
-    # Group files by stem
+    # Group files by lowercased stem (no prefix stripping — the file stem
+    # IS the constant name lowercased, so we use it directly as the join
+    # key against `known`).
     stems: dict[str, dict] = {}
     for f in songs_dir.iterdir():
         if f.suffix in ('.s', '.mid'):
             stem = f.stem.lower()
-            # Normalize: strip "mus_" prefix if present
-            norm = stem[4:] if stem.startswith('mus_') else stem
-            if norm not in stems:
-                stems[norm] = {'stem': norm, 'paths': []}
-            stems[norm]['paths'].append(f)
+            if stem not in stems:
+                stems[stem] = {'stem': stem, 'paths': []}
+            stems[stem]['paths'].append(f)
 
     orphans = []
-    for norm, info in sorted(stems.items()):
-        if norm not in known_stems:
+    for stem_key, info in sorted(stems.items()):
+        if stem_key not in known:
             total_size = sum(
                 p.stat().st_size for p in info['paths']
                 if p.exists()
@@ -160,19 +169,59 @@ def scan_orphaned_songs(project_root: str) -> list[OrphanEntry]:
 # ── Scanner 4: orphaned voicegroups ────────────────────────────────────────
 
 def scan_orphaned_voicegroups(project_root: str) -> list[OrphanEntry]:
-    """Find voicegroupNNN blocks in voice_groups.inc not referenced by any .s file."""
-    vg_inc = Path(project_root) / "sound" / "voice_groups.inc"
-    songs_dir = Path(project_root) / "sound" / "songs" / "midi"
+    """Find voicegroupNNN blocks in voice_groups.inc not transitively reachable.
+
+    Reachability sources:
+      1. Direct reference from a song .s file via `.equ <song>_grp, voicegroupNNN`.
+      2. Direct reference from C/H source via the bare `voicegroupNNN` token
+         (e.g. `m4a_tables.c` references voicegroup000 for the cry table).
+      3. Transitive `voice_keysplit` / `voice_keysplit_all` reference from
+         a voicegroup that is itself reachable. The GBA M4A engine uses
+         keysplit voicegroups to dispatch to child voicegroups (Pokemon cries
+         are the canonical example: voicegroup000 keysplits into 001-007 by
+         species index). The previous implementation didn't follow these
+         child references and therefore reported every cry-child voicegroup
+         as "orphaned" — clicking Delete would have wiped Pokemon cries.
+    """
+    project = Path(project_root)
+    vg_inc = project / "sound" / "voice_groups.inc"
+    songs_dir = project / "sound" / "songs" / "midi"
 
     if not vg_inc.exists():
         return []
 
     text = vg_inc.read_text(encoding="utf-8", errors="replace")
 
-    # Find all defined voicegroup names
-    defined: list[str] = re.findall(r'^(\w*voicegroup\w*):', text, re.MULTILINE | re.IGNORECASE)
+    # Defined voicegroups (declared with `voicegroupNNN::` at the start of
+    # a line). Tracked in declaration order so the orphan list stays stable.
+    defined: list[str] = re.findall(
+        r'^(\w*voicegroup\w*):', text,
+        re.MULTILINE | re.IGNORECASE)
+    defined_set = set(defined)
 
-    # Find all referenced voicegroup names in .s files
+    # Build the keysplit graph: parent -> set of children. Walk the file
+    # line by line; track the current parent block; collect every
+    # `voice_keysplit <child>, ...` and `voice_keysplit_all <child>` ref.
+    children_of: dict[str, set[str]] = {name: set() for name in defined}
+    current = None
+    head_re = re.compile(r'^(\w*voicegroup\w*):', re.IGNORECASE)
+    keysplit_re = re.compile(
+        r'^\s*voice_keysplit(?:_all)?\s+(\w+)',
+        re.IGNORECASE)
+    for line in text.splitlines():
+        m = head_re.match(line)
+        if m:
+            current = m.group(1)
+            continue
+        if current is None:
+            continue
+        m = keysplit_re.match(line)
+        if m:
+            child = m.group(1)
+            if child in defined_set:
+                children_of[current].add(child)
+
+    # Roots: directly referenced from .s files via `.equ ..._grp, voicegroupNNN`.
     referenced: set[str] = set()
     if songs_dir.exists():
         for s_file in songs_dir.glob("*.s"):
@@ -183,15 +232,46 @@ def scan_orphaned_voicegroups(project_root: str) -> list[OrphanEntry]:
             except Exception:
                 pass
 
-    # Estimate block size per voicegroup (128 slots * 12 bytes each = 1536 bytes typical)
+    # Roots: bare `voicegroupNNN` token mentioned in any C / H source. The
+    # M4A engine in C code holds a typed reference to voicegroup000 (cry
+    # table), so even if no song uses it the C side keeps it alive.
+    src_dirs = [project / "src", project / "include"]
+    c_token_re = re.compile(r'\bvoicegroup\d+\b')
+    for src_dir in src_dirs:
+        if not src_dir.exists():
+            continue
+        for ext in ("*.c", "*.h"):
+            for src_file in src_dir.rglob(ext):
+                try:
+                    s_text = src_file.read_text(
+                        encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                for tok in c_token_re.findall(s_text):
+                    if tok in defined_set:
+                        referenced.add(tok)
+
+    # Transitive reachability: BFS from referenced through children.
+    live: set[str] = set()
+    frontier = list(referenced & defined_set)
+    while frontier:
+        nxt = frontier.pop()
+        if nxt in live:
+            continue
+        live.add(nxt)
+        for child in children_of.get(nxt, ()):
+            if child not in live:
+                frontier.append(child)
+
+    # Orphans = defined - live (preserve declaration order for the UI).
     orphans = []
     for name in defined:
-        if name not in referenced:
+        if name not in live:
             orphans.append(OrphanEntry(
                 category="voicegroup",
                 label=name,
                 file_path=vg_inc,
-                size_bytes=1536,  # estimate
+                size_bytes=1536,  # estimate — 128 slots × 12 bytes typical
             ))
     return orphans
 

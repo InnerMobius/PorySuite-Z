@@ -106,9 +106,12 @@ def _write_json(path: str, data: dict | list, min_entries: int = 1) -> bool:
         return False
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2, ensure_ascii=True)
-    print(f"Wrote {os.path.abspath(path)}")
+    # Render to string first, then byte-equality-guard the write so a
+    # save that produces identical content doesn't dirty the file in git.
+    text = json.dumps(data, indent=2, ensure_ascii=True)
+    from core.file_io import write_text_if_changed
+    if write_text_if_changed(path, text):
+        print(f"Wrote {os.path.abspath(path)}")
     return True
 
 
@@ -1578,6 +1581,20 @@ class MovesDataExtractor(PokemonDataExtractor):
         awaiting_brace = False
         i = 0
         skipped = 0
+        # Single-line placeholder pattern: `[MOVE_FOO] = {0}` or
+        # `[MOVE_FOO] = {0},`. PorySuite's writer emits this form for
+        # any slot whose data is missing from the in-memory cache so
+        # the array stays well-formed C99. The parser MUST recognise
+        # this as a closed entry on a single line — otherwise `current`
+        # stays set and the next `[MOVE_BAR] = { .field = ... }`
+        # block's fields get silently re-attributed to MOVE_FOO. (This
+        # was the cascading-data-loss bug: a corrupt file with several
+        # `[MOVE_NONE] = {0}` placeholder rows would, on the NEXT
+        # save, overwrite even more slots with `[MOVE_NONE] = {0}`
+        # because the parser had eaten their fields into MOVE_NONE.)
+        placeholder_pat = re.compile(
+            r"^\[(MOVE_[A-Z0-9_]+)\]\s*=\s*\{\s*0\s*\}\s*,?\s*$"
+        )
         while i < len(lines):
             ln = _clean_line(lines[i])
             i += 1
@@ -1586,6 +1603,18 @@ class MovesDataExtractor(PokemonDataExtractor):
 
             # start of a move struct
             if current is None:
+                # Single-line `[MOVE_FOO] = {0}` placeholder. We
+                # record the constant (so the validity filter below
+                # drops it cleanly with `len(info) == 1`) and stay
+                # in current=None state — this line is self-closing.
+                ph = placeholder_pat.match(ln)
+                if ph:
+                    const = ph.group(1)
+                    if const not in moves["moves"]:
+                        moves["moves"][const] = {
+                            "id": len(moves["moves"]) + 1
+                        }
+                    continue
                 m = re.match(r"\[(MOVE_[A-Z0-9_]+)\]\s*=", ln)
                 if m:
                     current = m.group(1)
@@ -1602,6 +1631,32 @@ class MovesDataExtractor(PokemonDataExtractor):
             if ln.startswith("}"):
                 current = None
                 awaiting_brace = False
+                continue
+
+            # Defensive: if we're inside a struct and we see another
+            # `[MOVE_*] = ...` designator, the previous block was
+            # malformed (likely a `[MOVE_FOO] = {0}` line whose
+            # closing brace was on the same line and didn't trigger
+            # the `}` reset path). Close out the current block and
+            # process this line as a fresh entry start.
+            if re.match(r"\[(MOVE_[A-Z0-9_]+)\]\s*=", ln):
+                current = None
+                awaiting_brace = False
+                ph = placeholder_pat.match(ln)
+                if ph:
+                    const = ph.group(1)
+                    if const not in moves["moves"]:
+                        moves["moves"][const] = {
+                            "id": len(moves["moves"]) + 1
+                        }
+                    continue
+                m = re.match(r"\[(MOVE_[A-Z0-9_]+)\]\s*=", ln)
+                if m:
+                    current = m.group(1)
+                    moves["moves"][current] = {
+                        "id": len(moves["moves"]) + 1
+                    }
+                    awaiting_brace = "{" not in ln
                 continue
 
             # key / value line – may span multiple lines
@@ -1631,6 +1686,41 @@ class MovesDataExtractor(PokemonDataExtractor):
             nm = name_pat.search(ln)
             if nm and nm.group(1) in moves["moves"]:
                 moves["moves"][nm.group(1)]["name"] = nm.group(2)
+
+        # ── Cascade-eat canary ─────────────────────────────────────
+        #
+        # Count how many single-line `[MOVE_NONE] = {0}` placeholder
+        # rows appear in the source. Vanilla pokefirered has ZERO
+        # — every move slot is either a full struct or omitted via
+        # C99 zero-fill. PorySuite's pre-fix writer produced one
+        # such line PER missing slot (see BUGS.md, 2026-05-09
+        # entry). Two or more is the smoking-gun signature of the
+        # cascade-eat corruption. With the patched writer + parser
+        # we should never see this — but if a future bug re-
+        # introduces the cascade, this canary surfaces it loudly
+        # so a maintainer can react instead of letting the next
+        # save cement another move's data loss into the .h file.
+        # We DON'T abort the load (the parser handles placeholder
+        # rows cleanly now); we just shout.
+        n_dupes = sum(
+            1 for ln in lines
+            if placeholder_pat.match(_clean_line(ln))
+            and ("MOVE_NONE" in _clean_line(ln))
+        )
+        if n_dupes > 1:
+            cascade_msg = (
+                f"PorySuite parser canary: src/data/battle_moves.h has "
+                f"{n_dupes} `[MOVE_NONE] = {{0}}` placeholder rows. "
+                "Vanilla pokefirered has zero — this pattern is the "
+                "smoking-gun signature of the cascade-eat corruption "
+                "(see BUGS.md). The patched writer prevents FURTHER "
+                "corruption, but recovering any already-lost move "
+                "data requires `git restore src/data/battle_moves.h` "
+                "from a clean commit, deleting src/data/moves.json, "
+                "and reloading the project."
+            )
+            print(cascade_msg)
+            self.messages.append(cascade_msg)
 
         valid_moves = {}
         for name, info in moves["moves"].items():

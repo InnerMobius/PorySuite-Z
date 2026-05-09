@@ -445,6 +445,18 @@ class SpeciesData(pokemon_data.SpeciesData):
         have already handled species_info.h, pokedex_entries.h, and
         pokedex_text_fr.h — skip to avoid double-writes.
         """
+        # Skip if no edit in species data since load. Prevents phantom
+        # git diffs in species_info.h / pokedex_entries.h / pokedex_text_fr.h
+        # when Save All runs without any Pokemon stat edits.
+        baseline = getattr(self, "_load_signature", None)
+        if baseline is not None:
+            try:
+                import json as _json_check
+                if _json_check.dumps(
+                    self.data, sort_keys=True, default=str) == baseline:
+                    return
+            except Exception:
+                pass
         super().parse_to_c_code()
 
         if getattr(self, "_skip_parse_to_c", False):
@@ -634,10 +646,13 @@ class SpeciesData(pokemon_data.SpeciesData):
             i += 1
 
         # ── Write species_info.h directly — no WriteSourceFile wrappers ──
+        # Byte-equality guard: skip the write if content is identical to
+        # what's already on disk. Prevents phantom git diffs when Save All
+        # runs but no Pokemon stats were actually changed.
         try:
-            with open(header_path, "w", encoding="utf-8", newline="\n") as f:
-                f.writelines(out)
-            print(f"Updated species_info.h for {total_updates} species")
+            from core.file_io import write_text_if_changed
+            if write_text_if_changed(header_path, "".join(out)):
+                print(f"Updated species_info.h for {total_updates} species")
         except Exception as e:
             print(f"Failed writing species_info.h: {e}")
 
@@ -728,10 +743,10 @@ class SpeciesData(pokemon_data.SpeciesData):
                 i += 1
 
             try:
-                with open(dex_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.writelines(dout)
-                if updated_categories:
-                    print(f"Updated pokedex_entries.h categoryName for {updated_categories} species")
+                from core.file_io import write_text_if_changed
+                if write_text_if_changed(dex_path, "".join(dout)):
+                    if updated_categories:
+                        print(f"Updated pokedex_entries.h categoryName for {updated_categories} species")
             except Exception as e:
                 print(f"Failed writing pokedex_entries.h: {e}")
 
@@ -804,9 +819,9 @@ class SpeciesData(pokemon_data.SpeciesData):
 
                 if rewrites:
                     try:
-                        with open(fr_path, "w", encoding="utf-8", newline="\n") as f:
-                            f.write(text_content)
-                        print(f"Updated pokedex_text_fr.h for {rewrites} entries")
+                        from core.file_io import write_text_if_changed
+                        if write_text_if_changed(fr_path, text_content):
+                            print(f"Updated pokedex_text_fr.h for {rewrites} entries")
                     except Exception as e:
                         print(f"Failed writing pokedex_text_fr.h: {e}")
 
@@ -847,9 +862,9 @@ class SpeciesData(pokemon_data.SpeciesData):
                         lg_content = lg_content[:idx] + new_def + lg_content[end + 2:]
                         lg_rewrites += 1
                     if lg_rewrites:
-                        with open(lg_path, "w", encoding="utf-8", newline="\n") as f:
-                            f.write(lg_content)
-                        print(f"Updated pokedex_text_lg.h for {lg_rewrites} entries")
+                        from core.file_io import write_text_if_changed
+                        if write_text_if_changed(lg_path, lg_content):
+                            print(f"Updated pokedex_text_lg.h for {lg_rewrites} entries")
             except Exception as e:
                 print(f"Note: could not update pokedex_text_lg.h: {e}")
 
@@ -2117,6 +2132,23 @@ class PokemonMoves(pokemon_data.PokemonMoves):
 
     @override
     def parse_to_c_code(self):
+        # Skip the entire writeback pipeline (battle_moves.h, move
+        # names/descriptions, learnsets, etc.) if no edit happened
+        # in this plugin since project load. Prevents phantom git
+        # diffs when Save All runs but no Pokemon-move data was edited.
+        # The lossy parse→render round-trip in this writer family
+        # otherwise produces byte-different output even with no edits.
+        baseline = getattr(self, "_load_signature", None)
+        if baseline is not None:
+            try:
+                import json as _json_check
+                _stable = lambda v: f"__nonjson_{type(v).__name__}__"
+                if _json_check.dumps(
+                    self.data, sort_keys=True,
+                    default=_stable) == baseline:
+                    return
+            except Exception:
+                pass  # fall through to normal save on snapshot failure
         super().parse_to_c_code()
         self._resolve_header_paths()
 
@@ -2148,43 +2180,155 @@ class PokemonMoves(pokemon_data.PokemonMoves):
 
             moves_by_const = dict(self.data.get("moves", {}).items())
 
-            with WriteSourceFile(self.project_info, rel_path) as f:
-                f.write("const struct BattleMove gBattleMoves[MOVES_COUNT] =\n{\n")
-                if max_move_index >= 0:
-                    # Emit one entry per index 0..max_move_index, padding gaps
-                    # with MOVE_NONE placeholders so the array is always dense.
-                    const_by_index: dict[int, str] = {}
-                    for k, v in index_by_move.items():
-                        if v not in const_by_index or const_by_index[v] == "MOVE_NONE":
-                            const_by_index[v] = k
-                    all_indices = list(range(max_move_index + 1))
-                    for loop_idx, slot in enumerate(all_indices):
-                        move_const = const_by_index.get(slot)
-                        if move_const and move_const != "MOVE_NONE" and move_const in moves_by_const:
-                            info = moves_by_const[move_const]
-                            f.write(f"    [{move_const}] =\n    {{\n")
-                            for key, val in info.items():
-                                if key in ("id", "description", "name", "animation"):
-                                    continue
-                                f.write(f"        .{key} = {val},\n")
-                            f.write("    },\n")
-                        else:
-                            f.write(f"    [MOVE_NONE] = {{0}},\n")
-                        if loop_idx < len(all_indices) - 1:
-                            f.write("\n")
-                else:
-                    # Fallback: no constants file — write densely as before
-                    move_items = list(moves_by_const.items())
-                    for idx, (move, info) in enumerate(move_items):
-                        f.write(f"    [{move}] =\n    {{\n")
-                        for key, val in info.items():
-                            if key in ("id", "description", "name", "animation"):
-                                continue
-                            f.write(f"        .{key} = {val},\n")
-                        f.write("    },\n")
-                        if idx < len(move_items) - 1:
-                            f.write("\n")
-                f.write("};\n")
+            # ── Defensive pre-write guard ────────────────────────────
+            #
+            # If we're about to write significantly fewer moves than
+            # the project actually has (per the constants header),
+            # SKIP the battle_moves.h write and log loudly. This
+            # catches a cascade-eating bug class where a parser
+            # glitch silently drops moves from the in-memory cache —
+            # the writer would then cement the loss into the .h
+            # file, where the next load rebuilds the cache from the
+            # now-truncated file and loses MORE moves on the next
+            # save. The pre-fix writer/parser interaction (see
+            # BUGS.md, "battle_moves.h: writer emitted duplicate ..."
+            # entry, 2026-05-09) ate POUND, KARATE_CHOP, DOUBLE_SLAP
+            # from the user's project across three separate saves
+            # before anyone noticed. This guard makes that class of
+            # failure impossible to repeat — even if some future bug
+            # re-introduces a cache truncation.
+            #
+            # Threshold: refuse the write if the live data has fewer
+            # than 80% of the constants. 80% is generous enough to
+            # allow a user to legitimately delete some moves (rare)
+            # without tripping the guard, while still catching the
+            # common "JSON cache lost moves" failure.
+            #
+            # We SKIP just battle_moves.h on guard fail — the rest of
+            # this method (move_names.h, descriptions, learnsets) is
+            # safe in-place patching that only touches known entries,
+            # so it's fine to let those run.
+            skip_battle_moves_write = False
+            if max_move_index >= 0:
+                full_moves_in_cache = sum(
+                    1 for c in moves_by_const
+                    if c != "MOVE_NONE"
+                    and isinstance(moves_by_const[c], dict)
+                    and len(moves_by_const[c]) > 1
+                )
+                # `max_move_index + 1` is total slot count; subtract
+                # one for slot 0 (MOVE_NONE) to get real-move count.
+                expected_real = max(0, max_move_index)
+                if (expected_real > 0
+                        and full_moves_in_cache < int(expected_real * 0.8)
+                        and not os.environ.get("PORYSUITE_FORCE_MOVES_WRITE")):
+                    logger.error(
+                        "PorySuite REFUSED to write src/data/battle_moves.h: "
+                        "in-memory cache has only %d full move entries but "
+                        "the constants header declares %d real moves. "
+                        "Writing now would cement data loss into the "
+                        "source. Likely cause: a parser bug or a stale "
+                        "moves.json cache. Recovery: delete "
+                        "src/data/moves.json and reload the project so the "
+                        "cache rebuilds from the source header. To override "
+                        "(only if you genuinely deleted 20%%+ of moves), "
+                        "set PORYSUITE_FORCE_MOVES_WRITE=1 in your "
+                        "environment.",
+                        full_moves_in_cache, expected_real,
+                    )
+                    skip_battle_moves_write = True
+
+            if not skip_battle_moves_write:
+                with WriteSourceFile(self.project_info, rel_path) as f:
+                  f.write("const struct BattleMove gBattleMoves[MOVES_COUNT] =\n{\n")
+                  if max_move_index >= 0:
+                      # Walk every slot 0..max_move_index. Three cases:
+                      #
+                      #   a) We have full data for the slot → emit the
+                      #      `[MOVE_FOO] = { .field = ..., }` block.
+                      #   b) Slot 0 (MOVE_NONE) → always emit the canonical
+                      #      one-line `[MOVE_NONE] = {0}` placeholder.
+                      #   c) Any other slot whose data is missing from the
+                      #      in-memory cache → emit `[MOVE_FOO] = {0}` under
+                      #      ITS OWN constant name. Critically, we do NOT
+                      #      emit a bare `[MOVE_NONE] = {0}` here — that
+                      #      would produce a duplicate-array-index error
+                      #      under agbcc (legacy `make` target, builds with
+                      #      `-Werror`) and a noisy warning under modern
+                      #      gcc, AND it would silently clobber slot 0's
+                      #      intent if a future loader only sees the
+                      #      placeholder. Using each slot's own name keeps
+                      #      every designator unique and round-trips
+                      #      cleanly back through the loader.
+                      const_by_index: dict[int, str] = {}
+                      for k, v in index_by_move.items():
+                          if v not in const_by_index or const_by_index[v] == "MOVE_NONE":
+                              const_by_index[v] = k
+                      wrote_any = False
+                      for slot in range(max_move_index + 1):
+                          move_const = const_by_index.get(slot)
+                          is_full = bool(
+                              move_const
+                              and move_const != "MOVE_NONE"
+                              and move_const in moves_by_const
+                          )
+                          if is_full:
+                              if wrote_any:
+                                  f.write("\n")
+                              wrote_any = True
+                              info = moves_by_const[move_const]
+                              f.write(f"    [{move_const}] =\n    {{\n")
+                              for key, val in info.items():
+                                  if key in ("id", "description", "name", "animation"):
+                                      continue
+                                  f.write(f"        .{key} = {val},\n")
+                              f.write("    },\n")
+                          elif slot == 0:
+                              # Canonical MOVE_NONE entry. Vanilla
+                              # pokefirered emits a full struct here
+                              # (effect=EFFECT_HIT, etc.); the one-line
+                              # `{0}` form is functionally equivalent
+                              # (every field zero-initialised) and is
+                              # what the engine already sees when a move
+                              # hasn't been edited inside PorySuite.
+                              if wrote_any:
+                                  f.write("\n")
+                              wrote_any = True
+                              f.write("    [MOVE_NONE] = {0},\n")
+                          elif move_const:
+                              # Non-zero slot whose data is missing from
+                              # the in-memory cache. Preserve the slot's
+                              # identity by writing `[MOVE_FOO] = {0}`
+                              # under its own designator. This produces
+                              # valid C99 and avoids the duplicate-
+                              # designator trap. The engine sees a zero-
+                              # initialised move at this slot — same as
+                              # if we omitted the line entirely (C99
+                              # zero-fills missing slots) — but the
+                              # named placeholder lets the loader and
+                              # the user see at a glance which move
+                              # slot has lost its data and may need to
+                              # be restored from `git` or re-imported.
+                              if wrote_any:
+                                  f.write("\n")
+                              wrote_any = True
+                              f.write(f"    [{move_const}] = {{0}},\n")
+                          # else: no name for this slot → omit entirely.
+                          # C99 zero-fills the missing slot; no designator
+                          # needed.
+                  else:
+                      # Fallback: no constants file — write densely as before
+                      move_items = list(moves_by_const.items())
+                      for idx, (move, info) in enumerate(move_items):
+                          f.write(f"    [{move}] =\n    {{\n")
+                          for key, val in info.items():
+                              if key in ("id", "description", "name", "animation"):
+                                  continue
+                              f.write(f"        .{key} = {val},\n")
+                          f.write("    },\n")
+                          if idx < len(move_items) - 1:
+                              f.write("\n")
+                  f.write("};\n")
         else:
             self._log_missing_header(rel_path)
 
@@ -2210,8 +2354,8 @@ class PokemonMoves(pokemon_data.PokemonMoves):
                         names_text = updated
                         changed = True
                 if changed:
-                    with open(names_h, "w", encoding="utf-8", newline="\n") as fh:
-                        fh.write(names_text)
+                    from core.file_io import write_text_if_changed
+                    write_text_if_changed(names_h, names_text)
             except Exception:
                 pass
 
@@ -2277,8 +2421,8 @@ class PokemonMoves(pokemon_data.PokemonMoves):
                                     desc_text = before + ptr_block + desc_text[close_idx:]
 
                     if desc_changed:
-                        with open(descs_c, "w", encoding="utf-8", newline="\n") as fh:
-                            fh.write(desc_text)
+                        from core.file_io import write_text_if_changed
+                        write_text_if_changed(descs_c, desc_text)
                 except Exception:
                     pass
 

@@ -432,6 +432,132 @@ def _write_gba_bin(
         f.write(pcm_data)
 
 
+def _write_pcm_as_wav(
+    output_path: str,
+    sample_rate: int,
+    signed_pcm: bytes,
+    loop: bool = False,
+    loop_start: int = 0,
+) -> None:
+    """Write signed-8-bit PCM as a standard 8-bit-unsigned mono WAV.
+
+    pokefirered's build pipeline runs ``wav2agb -b <input.wav> <output.bin>``
+    on every ``.wav`` under ``sound/`` (audio_rules.mk lines 24-25). Saving
+    a WAV alongside the imported ``.bin`` lets the source survive git's
+    blanket ``sound/**/*.bin`` ignore rule — collaborators who clone the
+    repo get the WAV, the build regenerates the BIN, and audio works.
+
+    WAV stores 8-bit samples as unsigned (0-255 with bias 128). Our PCM
+    bytes are stored in two's complement signed form (0x80=-128, 0x7F=+127),
+    so each byte gets shifted by +128 modulo 256 to produce the unsigned
+    representation.
+
+    When ``loop=True``, also embeds a standard ``smpl`` chunk so wav2agb
+    preserves the loop point during regeneration. Without this, looping
+    samples would lose their loop flag through the round-trip.
+    """
+    import struct as _struct
+
+    unsigned_pcm = bytes((b + 128) & 0xFF for b in signed_pcm)
+    pcm_size = len(unsigned_pcm)
+    # PCM data must be padded to even length per RIFF spec
+    pcm_padded = unsigned_pcm + (b"\x00" if pcm_size % 2 else b"")
+
+    # ── fmt chunk (16 bytes payload) ───────────────────────────────────
+    fmt_chunk = _struct.pack(
+        "<4sIHHIIHH",
+        b"fmt ", 16,            # chunk id + size
+        1,                      # format = PCM
+        1,                      # channels = 1 (mono)
+        sample_rate,            # samples per second
+        sample_rate,            # bytes per second (8-bit mono)
+        1,                      # block align (1 byte per frame)
+        8,                      # bits per sample
+    )
+
+    # ── data chunk ─────────────────────────────────────────────────────
+    data_chunk = _struct.pack("<4sI", b"data", pcm_size) + pcm_padded
+
+    # ── optional smpl chunk for loop info ──────────────────────────────
+    smpl_chunk = b""
+    if loop:
+        # Standard WAV sample loop: 36-byte header + 24-byte loop entry.
+        # wav2agb reads `dwEnd` at offset 36+12 == 48 inside the chunk
+        # data and enables looping when `cSampleLoops > 0`.
+        sample_period = int(1_000_000_000 // sample_rate)  # ns per sample
+        end = max(0, pcm_size - 1)
+        smpl_payload = _struct.pack(
+            "<IIIIIIIII"
+            "IIIIII",
+            0, 0,                # manufacturer, product
+            sample_period,
+            60,                  # MIDI unity note
+            0, 0, 0,             # MIDI pitch fraction, SMPTE format/offset
+            1,                   # number of sample loops
+            0,                   # sampler-data size (no extra data)
+            # ── one loop entry ──
+            0,                   # cue point ID
+            0,                   # type (0 = forward)
+            int(loop_start),     # start
+            int(end),            # end
+            0,                   # fraction
+            0,                   # play count (0 = infinite)
+        )
+        smpl_chunk = (
+            _struct.pack("<4sI", b"smpl", len(smpl_payload))
+            + smpl_payload)
+
+    # ── RIFF wrapper ───────────────────────────────────────────────────
+    payload = b"WAVE" + fmt_chunk + data_chunk + smpl_chunk
+    riff = _struct.pack("<4sI", b"RIFF", len(payload)) + payload
+
+    with open(output_path, "wb") as f:
+        f.write(riff)
+
+
+def backfill_missing_source_wavs(project_root: str) -> tuple[int, list[str]]:
+    """Generate a source ``.wav`` for every ``.bin`` in
+    ``sound/direct_sound_samples/`` that lacks one.
+
+    Useful for projects that imported samples before the WAV-saving
+    behaviour landed. The blanket ``sound/**/*.bin`` gitignore rule
+    means imported BINs aren't tracked; re-creating their WAV sources
+    here gives collaborators something to actually clone, and the build
+    will rebuild the BIN from the WAV.
+
+    The generated WAV holds the exact PCM data and rate from the BIN,
+    so ``wav2agb -b`` produces a byte-identical BIN at build time.
+
+    Returns ``(count, errors)`` — number of WAVs generated, list of
+    (path, reason) for any that failed.
+    """
+    samples_dir = os.path.join(
+        project_root, "sound", "direct_sound_samples")
+    if not os.path.isdir(samples_dir):
+        return 0, []
+
+    generated = 0
+    errors: list[str] = []
+    for fname in sorted(os.listdir(samples_dir)):
+        if not fname.endswith(".bin"):
+            continue
+        bin_path = os.path.join(samples_dir, fname)
+        wav_path = os.path.join(samples_dir, fname[:-4] + ".wav")
+        if os.path.isfile(wav_path):
+            continue  # WAV already there — leave it alone
+        try:
+            header, pcm = read_bin_sample(bin_path)
+            loop_enabled = (header.status & 0x4000) != 0
+            _write_pcm_as_wav(
+                wav_path, header.sample_rate, pcm,
+                loop=loop_enabled,
+                loop_start=int(header.loop_start))
+            generated += 1
+        except Exception as exc:
+            errors.append(f"{fname}: {exc}")
+    return generated, errors
+
+
 def import_wav_as_sample(
     project_root: str,
     wav_path: str,
@@ -477,8 +603,29 @@ def import_wav_as_sample(
         pcm = _resample_linear(pcm, rate, target_rate)
         rate = target_rate
 
-    # Write the GBA .bin file
+    # Write the GBA .bin file (the runtime/binary form).
     _write_gba_bin(bin_abs, rate, pcm)
+
+    # Also save a source WAV alongside the BIN so the import is
+    # repo-shareable. The blanket `sound/**/*.bin` gitignore rule means
+    # the BIN won't get committed; the WAV will, and pokefirered's
+    # `audio_rules.mk` rebuilds the BIN from the WAV automatically on
+    # `make`. The WAV holds the same rate + PCM data we just wrote, so
+    # `wav2agb -b` regenerates a byte-equivalent BIN. Fresh imports
+    # default to non-looping; the user can enable loop later via the
+    # instrument editor and that path also refreshes the WAV.
+    wav_dest = os.path.join(
+        project_root, 'sound', 'direct_sound_samples',
+        f"{label_suffix}.wav")
+    try:
+        _write_pcm_as_wav(wav_dest, rate, pcm, loop=False)
+    except Exception as exc:
+        # WAV save failure is non-fatal — the BIN is already on disk
+        # and works locally. The user just won't have a tracked source
+        # for this sample. Print and continue (no logger configured
+        # in this module).
+        print(f"Warning: could not save source WAV for "
+              f"{label_suffix}: {exc}")
 
     # Append to direct_sound_data.inc
     inc_path = os.path.join(project_root, 'sound', 'direct_sound_data.inc')
@@ -585,6 +732,22 @@ def replace_sample_from_wav(
         # Write the GBA .bin with chosen rate and loop settings
         _write_gba_bin(bin_abs, final_rate, pcm,
                        loop=orig_loop, loop_start=loop_start)
+
+        # Mirror the new audio into the source WAV so the tracked
+        # source matches the freshly-rewritten BIN. Without this the
+        # next `make` would rebuild the BIN from the stale WAV and
+        # collaborators would see different audio than the local user.
+        # Same gitignore-survival strategy as in `import_wav_as_sample`,
+        # plus loop preservation via embedded smpl chunk so wav2agb
+        # round-trips the loop flag.
+        try:
+            wav_dest = os.path.splitext(bin_abs)[0] + ".wav"
+            _write_pcm_as_wav(
+                wav_dest, final_rate, pcm,
+                loop=orig_loop, loop_start=loop_start)
+        except Exception as exc:
+            print(f"Warning: could not refresh source WAV for "
+                  f"{bin_abs}: {exc}")
 
         # Reload the sample data
         header, pcm_loaded = read_bin_sample(bin_abs)

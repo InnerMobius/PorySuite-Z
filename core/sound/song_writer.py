@@ -618,14 +618,46 @@ def notes_to_track_commands(
                 cmd='NOTE', tick=tick,
                 duration=duration, pitch=pitch, velocity=velocity)))
 
-    # Add structural commands from original
+    # Compute the last note's end tick for this track. Used below to
+    # auto-extend any FINE / GOTO that the original .s placed BEFORE
+    # the user's most-recent edits — without this, a FINE preserved
+    # from the original file silently truncates any new notes past it.
+    last_note_end = 0
+    for note in track_notes:
+        end = int(note.get('tick', 0)) + int(note.get('duration', 0) or 0)
+        if end > last_note_end:
+            last_note_end = end
+
+    # Add structural commands from original. If a FINE / GOTO sits at
+    # a tick before the user's last note, push it to AFTER that note
+    # so the user-added notes survive the writer's break-on-FINE/GOTO
+    # loop logic. Tracks that originally ended early (e.g. a single-note
+    # ocarina drone track in mus_ocarina_soaring_full) had FINE at the
+    # vanilla note's end-tick; without this auto-extend, any new note
+    # the user adds past that tick gets silently dropped.
     for cmd in all_structure:
         if cmd.cmd == 'LABEL':
             timeline.append((cmd.tick, 0, cmd))
         elif cmd.cmd == 'FINE':
-            timeline.append((cmd.tick, 4, cmd))
+            effective_tick = cmd.tick
+            if last_note_end > effective_tick:
+                effective_tick = last_note_end
+                cmd = TrackCommand(
+                    cmd='FINE', tick=effective_tick,
+                    target_label=cmd.target_label,
+                )
+            timeline.append((effective_tick, 4, cmd))
         elif cmd.cmd in ('GOTO', 'PATT', 'PEND'):
-            timeline.append((cmd.tick, 3, cmd))
+            effective_tick = cmd.tick
+            # GOTO terminates a track in the same way FINE does — extend
+            # if needed so the user's new notes aren't truncated.
+            if cmd.cmd == 'GOTO' and last_note_end > effective_tick:
+                effective_tick = last_note_end
+                cmd = TrackCommand(
+                    cmd='GOTO', tick=effective_tick,
+                    target_label=cmd.target_label,
+                )
+            timeline.append((effective_tick, 3, cmd))
 
     # Add user-edited loop GOTO into the timeline at the correct tick.
     # This must be in the timeline (not appended after) so it sorts

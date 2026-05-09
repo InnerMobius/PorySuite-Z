@@ -741,9 +741,15 @@ class TrainerClassEditor(QWidget):
         lbl2.setStyleSheet(_fs)
         edit_form.addRow(lbl2, self._money_spin)
 
-        note = QLabel("Base prize = level \u00d7 multiplier \u00d7 4")
-        note.setStyleSheet("color: #555; font-size: 9px; font-style: italic;")
-        edit_form.addRow("", note)
+        # Hint reflects the project's current prize-base multiplier so
+        # users with custom economies see their actual formula, not
+        # vanilla's hardcoded 4. The label is regenerated in load() once
+        # the project root is known.
+        self._prize_formula_note = QLabel(
+            "Base prize = level \u00d7 multiplier \u00d7 4")
+        self._prize_formula_note.setStyleSheet(
+            "color: #555; font-size: 9px; font-style: italic;")
+        edit_form.addRow("", self._prize_formula_note)
 
         edit_group.setLayout(edit_form)
         dl.addWidget(edit_group)
@@ -907,6 +913,17 @@ class TrainerClassEditor(QWidget):
         self._count_lbl.setText(f"{len(self._classes)} classes")
         self._populate_pic_combo()
         self._populate_list()
+
+        # Refresh the prize-formula hint to reflect this project's
+        # configured base multiplier (Config tab → Battle Economy).
+        # Falls back to vanilla's 4 when the macro hasn't been set yet.
+        try:
+            from core.battle_economy_patch import read_prize_multiplier
+            base = read_prize_multiplier(root)
+            self._prize_formula_note.setText(
+                f"Base prize = level × multiplier × {base}")
+        except Exception:
+            pass
 
     def flush(self) -> dict:
         """Return pending edits as dict with names, money, and pics."""
@@ -1302,11 +1319,24 @@ class TrainerClassEditor(QWidget):
         form = QFormLayout()
         form.setSpacing(8)
 
+        # Display name is the PRIMARY input — the user types this and the
+        # constant fills in automatically below. Putting it first matches
+        # how every other "+ Add" dialog in the app works (Add Trainer,
+        # Add Ability, etc.) and avoids forcing users to author C-style
+        # constants by hand when the convention is mechanical.
+        name_edit = QLineEdit()
+        name_edit.setMaxLength(12)
+        name_edit.setPlaceholderText("e.g. ARTIST")
+        name_edit.setStyleSheet(_input_ss)
+        form.addRow("Display Name:", name_edit)
+
         const_edit = QLineEdit()
-        const_edit.setPlaceholderText("e.g. TRAINER_CLASS_MY_CLASS")
+        const_edit.setPlaceholderText(
+            "Auto-generated from display name")
         const_edit.setStyleSheet(_input_ss)
-        # Hard-restrict input to A-Z, 0-9, and underscore so the user
-        # physically cannot type lowercase, spaces, or punctuation.
+        # Hard-restrict input to A-Z, 0-9, and underscore so an advanced
+        # user who manually overrides the auto-fill physically cannot
+        # type lowercase, spaces, or punctuation.
         from PyQt6.QtGui import QRegularExpressionValidator
         from PyQt6.QtCore import QRegularExpression
         const_edit.setValidator(
@@ -1314,12 +1344,6 @@ class TrainerClassEditor(QWidget):
                 QRegularExpression(r"^[A-Z][A-Z0-9_]*$"), const_edit)
         )
         form.addRow("Constant:", const_edit)
-
-        name_edit = QLineEdit()
-        name_edit.setMaxLength(12)
-        name_edit.setPlaceholderText("e.g. MY CLASS")
-        name_edit.setStyleSheet(_input_ss)
-        form.addRow("Display Name:", name_edit)
 
         money_spin = _NoScrollSpin()
         money_spin.setRange(0, 255)
@@ -1329,7 +1353,10 @@ class TrainerClassEditor(QWidget):
 
         layout.addLayout(form)
 
-        # Auto-format constant name as user types display name
+        # Auto-format constant name as user types display name. Skips the
+        # update once the user has manually edited the constant field, so
+        # advanced overrides aren't clobbered by subsequent display-name
+        # keystrokes.
         def _auto_const():
             txt = name_edit.text().strip().upper().replace(" ", "_")
             if txt and not const_edit.isModified():

@@ -521,9 +521,32 @@ def parse_song_file(filepath: str) -> SongData:
                 i += 1
                 continue
 
-            # --- Bare velocity (v000-v127) ---
+            # --- Bare velocity (v000-v127) — running-status NOTE ---
+            # In GBA M4A bytecode, a bare velocity token after a previous
+            # note means: "play a new note with the previous pitch AND
+            # the previous duration, but with this new velocity." mid2agb
+            # emits this compact form for descending-velocity sequences
+            # (e.g. an echoing/decaying same-pitch note tail).
+            #
+            # Without emitting a NOTE here, the only thing happening is a
+            # silent update of `pending_velocity`, and the run of repeated
+            # notes vanishes from the parsed song — a "missing notes" bug
+            # for any imported MIDI with sustained-decay tails (Sun Song,
+            # ocarina notes, drone instruments).
             if token.startswith('v') and token[1:].isdigit():
-                pending_velocity = int(token[1:])
+                velocity = int(token[1:])
+                pending_velocity = velocity
+                # Only emit a NOTE if there's a sticky pitch and duration
+                # to inherit. Without those, this is a setup token, not
+                # a running-status note (rare; happens at file head).
+                if pending_pitch is not None and pending_note_cmd is not None:
+                    duration = NOTE_TICKS.get(pending_note_cmd, 0)
+                    current_track.commands.append(TrackCommand(
+                        cmd='NOTE', tick=current_tick,
+                        duration=duration,
+                        pitch=pending_pitch, velocity=velocity,
+                        raw_line=stripped,
+                    ))
                 i += 1
                 continue
 

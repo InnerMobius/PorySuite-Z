@@ -1028,6 +1028,10 @@ class PianoRollWindow(QMainWindow):
 
             # If the user edited Song Structure, strip structural commands
             # so only controls remain — loop comes from the piano roll.
+            # Then inject the user's edited structure items back so their
+            # edited FINE / GOTO / LABEL ticks are honoured. Without the
+            # injection, the writer auto-places a fresh FINE at end-of-notes
+            # and the user's edited tick is silently lost.
             if self._structure_dirty:
                 _CONTROL_ONLY = {
                     'VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR',
@@ -1035,6 +1039,31 @@ class PianoRollWindow(QMainWindow):
                     'XCMD', 'PRIO',
                 }
                 orig_cmds = [c for c in orig_cmds if c.cmd in _CONTROL_ONLY]
+                # Inject the structure panel's items as TrackCommands so
+                # the writer's structure path picks them up. The panel
+                # stores friendly section names (e.g. "intro"); each track
+                # needs the asm-prefixed form (e.g. "mus_song_2_intro")
+                # since assembly labels are file-global unique per track.
+                for sitem in self._structure_panel.get_structure_items():
+                    if sitem.cmd not in (
+                            'LABEL', 'GOTO', 'PATT', 'PEND', 'FINE'):
+                        continue
+                    # Resolve target_label per-track. LABEL stores its own
+                    # name in `label`; GOTO/PATT reference another label
+                    # via `target`. PEND and FINE have no label reference.
+                    raw_name = ''
+                    if sitem.cmd == 'LABEL':
+                        raw_name = sitem.label
+                    elif sitem.cmd in ('GOTO', 'PATT'):
+                        raw_name = sitem.target
+                    target_label = (
+                        f"{track.label}_{raw_name}"
+                        if raw_name else None)
+                    orig_cmds.append(TrackCommand(
+                        cmd=sitem.cmd,
+                        tick=sitem.tick,
+                        target_label=target_label,
+                    ))
 
             # Replace editable control events (BEND/BENDR/VOL/PAN) with
             # the canvas's version — this includes user edits from the

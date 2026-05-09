@@ -431,9 +431,27 @@ class SoundEditorTab(QWidget):
             # Defer sample loading until playback — keeps startup fast
             self._sample_data = None
 
-            # Load any saved friendly voicegroup labels (UI-only)
-            from core.sound.voicegroup_labels import load_labels
+            # Load any saved friendly voicegroup labels (UI-only).
+            # If none exist for this project yet (every project gets its own
+            # cache slug, hashed from the absolute project path — two
+            # different folders both running pokefirered will have separate
+            # cache slugs and separate label files), auto-generate them
+            # from the song table so the user sees readable names on first
+            # open instead of bare "VG 000" / "VG 001" placeholders.
+            # The user can still rename any of them via the Voicegroups tab.
+            from core.sound.voicegroup_labels import (
+                load_labels, save_labels, generate_labels_from_song_table,
+            )
             self._vg_labels = load_labels(project_root)
+            if not self._vg_labels and self._song_table is not None:
+                try:
+                    generated = generate_labels_from_song_table(self._song_table)
+                    if generated:
+                        self._vg_labels = generated
+                        save_labels(project_root, self._vg_labels)
+                except Exception as exc:
+                    _log.warning(
+                        "Auto-generating voicegroup labels failed: %s", exc)
 
             self._populate_song_list()
 

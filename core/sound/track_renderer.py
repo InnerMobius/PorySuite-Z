@@ -36,7 +36,7 @@ from core.sound.sample_loader import SampleData
 # ---------------------------------------------------------------------------
 
 def ticks_to_samples(ticks: int, bpm: int, tbs: int = 1) -> int:
-    """Convert M4A ticks to output samples.
+    """Convert M4A ticks to output samples at a CONSTANT bpm.
 
     The GBA M4A engine runs its tick clock from the tempo:
       ticks_per_frame = tempo * tbs / 150
@@ -44,6 +44,10 @@ def ticks_to_samples(ticks: int, bpm: int, tbs: int = 1) -> int:
       ticks_per_second = ticks_per_frame * frames_per_second
 
     So: samples = ticks * OUTPUT_SAMPLE_RATE / ticks_per_second
+
+    For songs with mid-song tempo changes, this constant-tempo conversion
+    is wrong for any tick range that crosses a tempo change. Use
+    `tick_to_sample_at` with a tempo timeline instead.
     """
     if bpm <= 0:
         bpm = 120
@@ -52,6 +56,60 @@ def ticks_to_samples(ticks: int, bpm: int, tbs: int = 1) -> int:
     if ticks_per_second <= 0:
         return 0
     return int(ticks * OUTPUT_SAMPLE_RATE / ticks_per_second)
+
+
+def tick_to_sample_at(tick: int, tempo_changes: list, tbs: int = 1) -> int:
+    """Convert an absolute tick position to an absolute sample position,
+    walking a global tempo timeline.
+
+    `tempo_changes` is a sorted list of `(start_tick, bpm)` pairs starting
+    with `(0, opening_bpm)`. Each segment between consecutive change ticks
+    runs at its own bpm; we sum each segment's sample count to get the
+    sample at `tick`.
+
+    This is the correct formula for songs with mid-song TEMPO events.
+    Notes on non-conductor tracks would otherwise be positioned as if the
+    whole song ran at the opening tempo (since per-track flattening
+    doesn't see TEMPO events that live on track 0).
+    """
+    if not tempo_changes:
+        return ticks_to_samples(tick, 120, tbs)
+    samples = 0
+    prev_tick = 0
+    prev_bpm = tempo_changes[0][1]
+    for change_tick, change_bpm in tempo_changes:
+        if change_tick > tick:
+            break
+        if change_tick > prev_tick:
+            samples += ticks_to_samples(
+                change_tick - prev_tick, prev_bpm, tbs)
+        prev_tick = change_tick
+        prev_bpm = change_bpm
+    if tick > prev_tick:
+        samples += ticks_to_samples(tick - prev_tick, prev_bpm, tbs)
+    return samples
+
+
+def collect_tempo_changes(song, tbs: int) -> list:
+    """Walk every track in `song` (after PATT/GOTO flattening) and build a
+    sorted timeline of `(start_tick, bpm)` pairs.
+
+    The opening tempo (from the first TEMPO command on any track, via
+    `get_song_tempo`) is always the first entry at tick 0. Any later
+    TEMPO commands on any track are merged in sorted order. Duplicate
+    ticks keep only the last value (rare; real songs don't put two
+    different tempos at the same tick).
+    """
+    opening = get_song_tempo(song)
+    timeline: dict[int, int] = {0: opening}
+    for track in song.tracks:
+        flat = flatten_track_commands(track.commands, loop_count=1)
+        for cmd in flat:
+            if cmd.cmd == 'TEMPO' and cmd.value is not None:
+                bpm = (cmd.value * 2) // max(tbs, 1)
+                if bpm > 0:
+                    timeline[cmd.tick] = bpm
+    return sorted(timeline.items())
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +337,22 @@ def render_track(
     song_key_shift: int = 0,
     max_duration_ticks: Optional[int] = None,
     loop_count: int = 1,
+    tempo_timeline: Optional[list] = None,
 ) -> np.ndarray:
     """Render a single track to a stereo float32 buffer.
 
     Flattens PATT/PEND patterns and GOTO loops, then walks through the
     expanded command list rendering each note with per-note panning.
+
+    `tempo_timeline` is an optional sorted list of `(start_tick, bpm)`
+    pairs covering the WHOLE song (not just this track). When supplied,
+    note start positions are computed by walking the timeline so songs
+    with mid-song TEMPO events (where the TEMPO command lives on the
+    conductor track but notes live on others) play at correct timing.
+    Without it, all notes are positioned at the opening `bpm` — wrong
+    for any song that changes tempo (`MUS_OBTAIN_KEY_ITEM` is the
+    canonical broken case: opens 44 BPM, jumps to 72 mid-song; without
+    the timeline every track plays at 44 throughout).
 
     Returns a stereo float32 array of shape (N, 2).
     """
@@ -313,7 +382,13 @@ def render_track(
     else:
         effective_ticks = flat_max_tick
 
-    total_samples = ticks_to_samples(effective_ticks, bpm, tbs)
+    # Total-samples sizing uses the timeline when available so a song
+    # whose later sections run faster doesn't allocate a buffer sized
+    # at the slow opening tempo (which would clip the actual duration).
+    if tempo_timeline:
+        total_samples = tick_to_sample_at(effective_ticks, tempo_timeline, tbs)
+    else:
+        total_samples = ticks_to_samples(effective_ticks, bpm, tbs)
     _tlog(f"flat_max_tick={flat_max_tick} max_duration_ticks={max_duration_ticks} "
           f"effective_ticks={effective_ticks} total_samples={total_samples} bpm={bpm} tbs={tbs}")
     if total_samples <= 0:
@@ -350,6 +425,10 @@ def render_track(
             state.key_shift = cmd.value
 
         elif cmd.cmd == 'TEMPO' and cmd.value is not None:
+            # current_tempo is the per-track view of "tempo right now" —
+            # used for note DURATION conversion below. The global
+            # timeline (passed in via tempo_timeline) is what governs
+            # absolute note START positions across the whole song.
             current_tempo = (cmd.value * 2) // max(tbs, 1)
             state.tempo = current_tempo
 
@@ -398,7 +477,21 @@ def render_track(
             # then scale the rendered output by track volume.
             track_vol_scale = state.volume / 127.0
 
-            note_samples = ticks_to_samples(note_duration, current_tempo, tbs)
+            # Note duration uses the tempo IN EFFECT at the note's start
+            # tick (looked up from the global timeline if available, else
+            # the current per-track tempo). Tempo changes that occur
+            # PARTWAY through a note are not modelled — vanilla M4A
+            # behaviour matches: each note's playback rate is fixed by
+            # the tempo when it started.
+            if tempo_timeline:
+                tempo_at_start = tempo_timeline[0][1]
+                for change_tick, change_bpm in tempo_timeline:
+                    if change_tick > cmd.tick:
+                        break
+                    tempo_at_start = change_bpm
+            else:
+                tempo_at_start = current_tempo
+            note_samples = ticks_to_samples(note_duration, tempo_at_start, tbs)
             if note_samples <= 0:
                 continue
 
@@ -423,7 +516,14 @@ def render_track(
             # Apply per-note panning (GBA linear crossfade)
             note_stereo = apply_pan(note_audio, state.pan)
 
-            start_sample = ticks_to_samples(cmd.tick, current_tempo, tbs)
+            # Absolute start position — walks the global timeline so notes
+            # after a TEMPO change land at the correct cumulative time
+            # (NOT at the wrong "as if the whole song ran at the latest
+            # tempo" position the per-track current_tempo would give).
+            if tempo_timeline:
+                start_sample = tick_to_sample_at(cmd.tick, tempo_timeline, tbs)
+            else:
+                start_sample = ticks_to_samples(cmd.tick, current_tempo, tbs)
             if start_sample < len(buffer):
                 usable = min(len(note_stereo), len(buffer) - start_sample)
                 buffer[start_sample:start_sample + usable] += note_stereo[:usable]
@@ -465,7 +565,17 @@ def render_song(
 
     bpm = get_song_tempo(song)
     tbs = song.tempo_base if song.tempo_base else 1
-    _log(f"render_song: label={song.label} bpm={bpm} tbs={tbs} vg={song.voicegroup} tracks={len(song.tracks)}")
+    # Build the global tempo timeline once, before rendering any track,
+    # so all tracks share a consistent view of mid-song TEMPO changes.
+    # Without this, per-track render only saw TEMPO commands on the
+    # track they appeared on (typically just track 0), and notes on
+    # other tracks played at the opening tempo throughout. Canonical
+    # broken case before this fix: MUS_OBTAIN_KEY_ITEM (44 -> 72 BPM)
+    # played at 44 the whole way through.
+    tempo_timeline = collect_tempo_changes(song, tbs)
+    _log(f"render_song: label={song.label} bpm={bpm} tbs={tbs} "
+         f"vg={song.voicegroup} tracks={len(song.tracks)} "
+         f"tempo_changes={tempo_timeline}")
 
     # Resolve the voicegroup
     available_vgs = list(voicegroup_data.voicegroups.keys())[:10] if hasattr(voicegroup_data, 'voicegroups') else ['(no .voicegroups attr)']
@@ -501,6 +611,7 @@ def render_song(
                 bpm, tbs, song.master_volume, song.key_shift,
                 max_duration_ticks=max_duration_ticks,
                 loop_count=loop_count,
+                tempo_timeline=tempo_timeline,
             )
         except Exception as exc:
             import traceback
