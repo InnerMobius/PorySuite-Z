@@ -1112,8 +1112,26 @@ class FieldEffectEntry:
 
 
 def _scan_field_effect_sprites(root: str) -> List[FieldEffectEntry]:
-    """Scan graphics/field_effects/pics/ and graphics/misc/ for PNG sprites."""
+    """Scan the project's non-NPC overworld sprite directories for PNGs.
+
+    Covers:
+      - ``graphics/field_effects/pics/`` — the classic field effects
+        (grass rustle, sparkles, dust, splashes, shadows, etc.).
+      - ``graphics/misc/`` — global misc sprites (confetti, egg hatch,
+        emoticons, etc.).
+      - Sprite templates declared in ``field_effects/field_effect_objects.h``
+        whose pic table references a ``gObjectEventPic_*`` symbol
+        (cross-boundary case — the template lives with field effects but
+        the sprite asset lives in ``graphics/object_events/pics/``).
+        Without this catch the surf blob (and any future similarly-defined
+        sprite) would be invisible to BOTH the NPC Sprites tab (no
+        GraphicsInfo entry, no ``OBJ_EVENT_GFX_*`` constant) and the
+        Field Effect Sprites tab (PNG lives in the wrong folder for the
+        directory scan).
+    """
     entries: List[FieldEffectEntry] = []
+    seen_paths: set[str] = set()
+
     dirs = [
         (os.path.join(root, "graphics", "field_effects", "pics"), "Field Effects"),
         (os.path.join(root, "graphics", "misc"), "Misc"),
@@ -1132,6 +1150,46 @@ def _scan_field_effect_sprites(root: str) -> List[FieldEffectEntry]:
                 pal_path=pal if os.path.isfile(pal) else None,
                 category=category,
             ))
+            seen_paths.add(os.path.normcase(os.path.normpath(png)))
+
+    # Cross-boundary sweep: pick up sprites whose template is in
+    # field_effect_objects.h but whose pic asset lives in
+    # graphics/object_events/pics/. Currently just surf_blob; this loop
+    # finds any future entries automatically.
+    pic_paths = _parse_pic_symbol_to_path(root)
+    feo_path = os.path.join(root, "src", "data", "field_effects", "field_effect_objects.h")
+    if os.path.isfile(feo_path):
+        try:
+            with open(feo_path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        pic_ref_pat = re.compile(
+            r"static const struct SpriteFrameImage sPicTable_(\w+)\[\][^;]*?(gObjectEventPic_\w+)",
+            re.DOTALL,
+        )
+        for tm in pic_ref_pat.finditer(text):
+            template_name = tm.group(1)
+            pic_symbol = tm.group(2)
+            rel_4bpp = pic_paths.get(pic_symbol, "")
+            if not rel_4bpp.endswith(".4bpp"):
+                continue
+            png_rel = rel_4bpp[:-len(".4bpp")] + ".png"
+            png_abs = os.path.join(root, png_rel.replace("/", os.sep))
+            if not os.path.isfile(png_abs):
+                continue
+            normed = os.path.normcase(os.path.normpath(png_abs))
+            if normed in seen_paths:
+                continue
+            pal = png_abs[:-4] + ".pal"
+            entries.append(FieldEffectEntry(
+                name=template_name,
+                png_path=png_abs,
+                pal_path=pal if os.path.isfile(pal) else None,
+                category="Field Effects",
+            ))
+            seen_paths.add(normed)
+
     return sorted(entries, key=lambda e: (e.category, e.name.lower()))
 
 
@@ -1937,6 +1995,25 @@ class FieldEffectSpritesTab(QWidget):
                 else:
                     errors.append(f"fe-pal:{entry.name}")
                     continue
+
+            # If this field effect is covered by the dynamic palette
+            # refactor (e.g. shadows), also write the .gbapal binary
+            # the build reads via INCBIN. Without this, palette edits
+            # in PorySuite would update the PNG preview but NOT reach
+            # the game — the build would keep using the .gbapal from
+            # whatever was extracted at DOWP apply time.
+            try:
+                from core import field_effect_palette_refactor as _fer
+                from core.tilemap_data import _write_gbapal_file as _wgp
+                _refactor = _fer.find_refactor_for_png(
+                    os.path.relpath(entry.png_path, self._project_root).replace("\\", "/")
+                ) if entry.png_path and self._project_root else None
+                if _refactor:
+                    _gbapal_abs = _fer.gbapal_path_for_refactor(self._project_root, _refactor)
+                    if _wgp(_gbapal_abs, list(colors)):
+                        ok += 1
+            except Exception as _e:
+                errors.append(f"fe-gbapal:{entry.name} ({_e})")
 
             # Always bake into the PNG — whether or not there's a separate
             # .pal file. This way opening the PNG in GIMP shows the
@@ -3257,17 +3334,31 @@ class OverworldGraphicsTab(QWidget):
             return
 
         if is_dowp_enabled(self._project_root):
-            QMessageBox.information(self, "Already Enabled",
-                "Dynamic Overworld Palettes are already active in this project.")
-            return
+            # Project shows DOWP markers, but some patches may have failed earlier.
+            # Offer a re-apply pass for repair — the patcher is idempotent, so
+            # already-applied sites will be skipped.
+            reply = QMessageBox.question(
+                self,
+                "Re-apply Dynamic Palettes?",
+                "Dynamic Overworld Palettes appear to already be active in this project.\n\n"
+                "Re-applying will verify each patch site and repair any that didn't apply "
+                "cleanly the first time. Sites that are already patched will be skipped.\n\n"
+                "Note: reflection tint values can only be set on the first apply. If the "
+                "tint block is already patched, re-apply will leave it as-is.\n\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            tint_r, tint_g, tint_b = 5, 5, 10
+        else:
+            risks = scan_dowp_risks(self._project_root)
+            dlg = _DOWPApplyDialog(risks, parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            tint_r, tint_g, tint_b = dlg.tint_values()
 
-        risks = scan_dowp_risks(self._project_root)
-
-        dlg = _DOWPApplyDialog(risks, parent=self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        tint_r, tint_g, tint_b = dlg.tint_values()
         success, applied_list, failed_list = apply_dowp_patch(
             self._project_root, tint_r=tint_r, tint_g=tint_g, tint_b=tint_b
         )

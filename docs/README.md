@@ -207,7 +207,7 @@ Standalone toolbar page for managing constant labels. Add friendly names and not
 
 ### Tilesets (Tilemap Editor)
 
-GBA `.bin` tilemap viewer and editor with three sub-tabs:
+GBA `.bin` tilemap viewer and editor with four sub-tabs:
 
 **Tilemap Editor:**
 
@@ -218,7 +218,9 @@ GBA `.bin` tilemap viewer and editor with three sub-tabs:
 - **Rendered preview** with correct palettes, tile flips, and zoom (1-8x) with grid overlay
 - **Paint tool** -- click/drag tiles from the tile picker onto the tilemap
 - **Eyedropper tool** -- right-click any tile on the canvas to instantly pick it (sets tile index, palette, hflip, vflip). Left-click pick-tool mode also works.
-- **Undo/Redo** -- Ctrl+Z / Ctrl+Y (also Ctrl+Shift+Z). A drag-paint counts as ONE undo step regardless of how many cells you swept across. 100-step history.
+- **Multi-tile stamp** -- shift+right-click+drag in the canvas OR in the tile sheet picker grabs a rectangular region as the active stamp. Left-click then stamps the entire pattern at each click position, preserving each cell's tile index, flips, and palette. A badge in the toolbar reads `Stamp: 1×1` normally and `Stamp: W×H` in amber when a multi-tile region is active. A faint dashed outline under the cursor on the canvas shows where the stamp will land. Single-tile picks (left-click in picker, plain right-click eyedrop on canvas, palette/H-flip/V-flip toggle) reset the stamp back to 1×1.
+- **Flood fill** -- middle-mouse-click on a canvas cell to flood-fill the 4-connected region of cells whose `(tile_index, hflip, vflip, palette)` all match the clicked cell with the current single tile. Multi-tile stamps don't tile-pattern the fill — fill always uses the single-tile state. One undo step regardless of region size.
+- **Undo/Redo** -- Ctrl+Z / Ctrl+Y (also Ctrl+Shift+Z). A drag-paint counts as ONE undo step regardless of how many cells you swept across. Flood fill is one step. 100-step history.
 - **Per-tile controls** -- palette slot, horizontal/vertical flip
 - **Tile offset** -- VRAM base address spinner (0-1023) for games that load tile sheets at non-zero offsets
 - **Dimension re-wrap** -- changing width auto-recalculates height to keep all tilemap entries (never truncates)
@@ -268,6 +270,20 @@ Convert any PNG image to GBA-compatible indexed format:
 - **Export** -- save indexed PNG, JASC `.pal`, or both to the same folder. Compatible with Porymap, GRIT, and other GBA tools
 
 ![Image Indexer](image%20indexer.png)
+
+**Palette Baker:**
+
+Manual tool for rewriting an indexed PNG's embedded color table to match a separately-loaded palette file. Pixel indices are NEVER changed — only the color table is replaced. Use case: a PNG whose baked colors have drifted from the canonical palette (typical when one palette is shared across many PNGs that don't all live in tabs that own the palette — HUD elements, item icons, shared NPC palettes).
+
+- **Load PNG** + **Load Palette** — pick the indexed PNG and the `.pal` (JASC) or `.gbapal` (binary) you want to bake into it. Each independently loaded.
+- **Side-by-side preview** — left pane shows the PNG with its current embedded color table; right pane shows it with the loaded palette applied. Immediate visual diff.
+- **Per-slot stale highlighting** — palette-to-apply swatch row gets an amber border on every slot that differs from the currently-baked palette. Tells you at a glance how drifted the file is.
+- **Editable swatch row** — click any swatch in the "palette to apply" row for a color picker (GBA 15-bit clamped). Drag-reorder is supported; drop on slot 0 to set as background/transparent.
+- **Save** — overwrites the loaded PNG in place with the new color table. Byte-equality guarded (a no-op bake doesn't touch the file). Pushes to the sprite-palette bus on save so other tabs invalidate their sprite caches without an F5.
+- **Bake to other PNGs…** — once a palette is loaded, this opens a multi-select file picker so you can apply the same palette to any number of PNGs you choose in one operation. User-driven; no auto-resolution. Right primitive for the "one .pal shared by many PNGs" case.
+- **`.gbapal` support** — multi-palette binary `.gbapal` files are read directly (each pair of bytes is a 5-bit-per-channel BGR555 color), so region-map-style multi-sub-palette files load without conversion.
+
+This tab is intentionally manual — there's no project-wide scanner. pokefirered has many `.pal` files whose same-name PNG doesn't actually use them (battle anims get palettes at runtime from C code, intro scenes have palettes hardcoded, etc.), so automatic PNG↔palette resolution can't be reliable. You name the pair; the tab does the safe bake.
 
 ### Text Editor
 

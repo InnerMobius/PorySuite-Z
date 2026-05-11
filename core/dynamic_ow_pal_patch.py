@@ -172,6 +172,72 @@ def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
     reverted: List[str] = []
     failed: List[str] = []
 
+    # ── field_weather.c — restore sprite gamma type table ─────────────────────
+    fw_path = os.path.join(project_root, "src", "field_weather.c")
+    if os.path.isfile(fw_path):
+        fw = _read(fw_path)
+        patched_sprite_gamma = (
+            "    // sprite palettes — DOWP: all slots use GAMMA_NORMAL so any\n"
+            "    // dynamically-loaded palette gets consistent weather darkening\n"
+            "    // regardless of which slot it lands in.\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "};"
+        )
+        vanilla_sprite_gamma = (
+            "    // sprite palettes\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "};"
+        )
+        fw, ok = _replace_once(fw, patched_sprite_gamma, vanilla_sprite_gamma, "")
+        if ok:
+            reverted.append("field_weather.c: sprite gamma types restored")
+        elif vanilla_sprite_gamma in fw:
+            reverted.append("field_weather.c: sprite gamma types already vanilla")
+        else:
+            failed.append("Could not restore field_weather.c sprite gamma types")
+        _write(fw_path, fw)
+    else:
+        failed.append("field_weather.c not found")
+
+    # ── field effect palette refactor — reverse ──────────────────────────────
+    try:
+        from core import field_effect_palette_refactor as _fer
+        _ok, _reverted, _failed = _fer.remove(project_root)
+        reverted.extend(_reverted)
+        failed.extend(_failed)
+    except Exception as e:
+        failed.append(f"Field effect palette refactor (remove): {type(e).__name__}: {e}")
+
     # ── field_effect_helpers.c ────────────────────────────────────────────────
     feh_c_path = os.path.join(project_root, "src", "field_effect_helpers.c")
     if os.path.isfile(feh_c_path):
@@ -193,6 +259,30 @@ def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
             reverted.append("SetUpReflection: already restored")
         else:
             failed.append("Could not restore SetUpReflection")
+
+        # Restore UpdateObjectReflectionSprite's per-frame paletteNum line
+        # back to the vanilla gReflectionEffectPaletteMap lookup.
+        refl_callback_patched = (
+            "        // DOWP: track the reflection palette by tag (mainTag + 0x1000),\n"
+            "        // not via the hardcoded slot map which assumes vanilla layout.\n"
+            "        {\n"
+            "            u16 mainTag = GetSpritePaletteTagByPaletteNum(mainSprite->oam.paletteNum);\n"
+            "            u8 reflSlot = IndexOfSpritePaletteTag(mainTag + 0x1000);\n"
+            "            if (reflSlot != 0xFF)\n"
+            "                reflectionSprite->oam.paletteNum = reflSlot;\n"
+            "        }\n"
+        )
+        refl_callback_vanilla = (
+            "        reflectionSprite->oam.paletteNum = "
+            "gReflectionEffectPaletteMap[mainSprite->oam.paletteNum];\n"
+        )
+        fehc, ok = _replace_once(fehc, refl_callback_patched, refl_callback_vanilla, "")
+        if ok:
+            reverted.append("UpdateObjectReflectionSprite: per-frame paletteNum restored")
+        elif refl_callback_vanilla in fehc:
+            reverted.append("UpdateObjectReflectionSprite: per-frame paletteNum already vanilla")
+        else:
+            failed.append("Could not restore UpdateObjectReflectionSprite paletteNum")
 
         old_regular_refl = (
             "static void LoadObjectRegularReflectionPalette(struct ObjectEvent * objectEvent, u8 paletteIndex)\n"
@@ -342,20 +432,24 @@ def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
     else:
         failed.append("Could not restore ObjectEventSetGraphicsId")
 
-    # Site 4 paletteNum
-    eom, ok = _replace_once(eom,
+    # Site 4 paletteNum — anchor on the 4 invariant lines from vanilla.
+    s4_patched = (
         "        sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
         "        sprite->coordOffsetEnabled = TRUE;\n"
         "        sprite->data[0] = objectEventId;\n"
         "        objectEvent->spriteId = spriteId;\n"
-        "        // DEBUG — log return-to-field spawn",
+    )
+    s4_vanilla = (
         "        sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
         "        sprite->coordOffsetEnabled = TRUE;\n"
         "        sprite->data[0] = objectEventId;\n"
         "        objectEvent->spriteId = spriteId;\n"
-        "        // DEBUG — log return-to-field spawn", "")
+    )
+    eom, ok = _replace_once(eom, s4_patched, s4_vanilla, "")
     if ok:
         reverted.append("SpawnObjectEventOnReturnToField paletteNum: restored")
+    elif s4_vanilla in eom:
+        reverted.append("SpawnObjectEventOnReturnToField paletteNum: already restored")
     else:
         failed.append("Could not restore SpawnObjectEventOnReturnToField paletteNum")
 
@@ -411,20 +505,25 @@ def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
     else:
         failed.append("Could not restore CreateVirtualObject")
 
-    # Site 1
-    eom, ok = _replace_once(eom,
+    # Site 1 paletteNum — anchor on the 4 invariant lines from vanilla.
+    # 4-space indent disambiguates from Site 4 (which has 8-space indent).
+    s1_patched = (
         "    sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
         "    sprite->coordOffsetEnabled = TRUE;\n"
         "    sprite->data[0] = objectEventId;\n"
         "    objectEvent->spriteId = spriteId;\n"
-        "    // DEBUG — log object spawn position",
+    )
+    s1_vanilla = (
         "    sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
         "    sprite->coordOffsetEnabled = TRUE;\n"
         "    sprite->data[0] = objectEventId;\n"
         "    objectEvent->spriteId = spriteId;\n"
-        "    // DEBUG — log object spawn position", "")
+    )
+    eom, ok = _replace_once(eom, s1_patched, s1_vanilla, "")
     if ok:
         reverted.append("TrySetupObjectEventSprite paletteNum: restored")
+    elif s1_vanilla in eom:
+        reverted.append("TrySetupObjectEventSprite paletteNum: already restored")
     else:
         failed.append("Could not restore TrySetupObjectEventSprite paletteNum")
 
@@ -522,6 +621,47 @@ def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
     else:
         failed.append("Could not restore LoadObjectEventPalette decl")
 
+    # LoadObjectEventPalette body → strip weather sync call
+    body_patched = (
+        "        TryLoadObjectPalette(&sObjectEventSpritePalettes[i]);\n"
+        "        // DOWP: apply current weather tint to freshly loaded palette\n"
+        "        UpdateSpritePaletteWithWeather(IndexOfSpritePaletteTag(sObjectEventSpritePalettes[i].tag));\n"
+        "    }\n"
+        "}\n"
+    )
+    body_vanilla = (
+        "        TryLoadObjectPalette(&sObjectEventSpritePalettes[i]);\n"
+        "    }\n"
+        "}\n"
+    )
+    eom, ok = _replace_once(eom, body_patched, body_vanilla, "")
+    if ok:
+        reverted.append("LoadObjectEventPalette: weather sync removed")
+    elif body_vanilla in eom:
+        reverted.append("LoadObjectEventPalette: weather sync already removed")
+    else:
+        failed.append("Could not remove LoadObjectEventPalette weather sync")
+
+    # Remove the field_weather.h include we added. Safe to drop because vanilla
+    # pokefirered's event_object_movement.c doesn't need this header and no
+    # other DOWP patch in this file uses anything from it.
+    inc_patched = (
+        '#include "field_player_avatar.h"\n'
+        '#include "field_weather.h"\n'
+        '#include "fieldmap.h"\n'
+    )
+    inc_vanilla = (
+        '#include "field_player_avatar.h"\n'
+        '#include "fieldmap.h"\n'
+    )
+    eom, ok = _replace_once(eom, inc_patched, inc_vanilla, "")
+    if ok:
+        reverted.append("event_object_movement.c: field_weather.h include removed")
+    elif inc_vanilla in eom and '#include "field_weather.h"' not in eom:
+        reverted.append("event_object_movement.c: field_weather.h include already removed")
+    else:
+        failed.append("Could not remove field_weather.h include")
+
     _write(eom_path, eom)
 
     # ── Remove marker file ────────────────────────────────────────────────────
@@ -557,6 +697,27 @@ def apply_dowp_patch(project_root: str,
 
     eom = _read(eom_path)
 
+    # 1.0. Add #include "field_weather.h" so the dynamic loader can call
+    # UpdateSpritePaletteWithWeather. Vanilla pokefirered's event_object_movement.c
+    # doesn't include this header — we add it alphabetically between
+    # field_player_avatar.h and fieldmap.h.
+    old_inc = (
+        '#include "field_player_avatar.h"\n'
+        '#include "fieldmap.h"\n'
+    )
+    new_inc = (
+        '#include "field_player_avatar.h"\n'
+        '#include "field_weather.h"\n'
+        '#include "fieldmap.h"\n'
+    )
+    eom, ok = _replace_once(eom, old_inc, new_inc, "Add field_weather.h include")
+    if ok:
+        applied.append("event_object_movement.c: field_weather.h include added")
+    elif '#include "field_weather.h"' in eom:
+        applied.append("event_object_movement.c: field_weather.h include already present")
+    else:
+        failed.append("Could not add field_weather.h include")
+
     # 1a. Make LoadObjectEventPalette non-static (forward decl)
     eom, ok = _replace_once(eom,
         "static void LoadObjectEventPalette(u16);",
@@ -583,6 +744,33 @@ def apply_dowp_patch(project_root: str,
             applied.append("LoadObjectEventPalette: already non-static (def)")
         else:
             failed.append("Could not find LoadObjectEventPalette definition")
+
+    # 1b-2. Insert weather sync call in LoadObjectEventPalette's body so any
+    # palette that loads mid-gameplay inherits the active weather tint. Without
+    # this, NPCs that spawn into a weather-darkened map (Viridian Forest etc.)
+    # render at full brightness, and reflections generated via SetUpReflection
+    # similarly miss the tint. Anchor is the unique TryLoadObjectPalette call
+    # plus the two closing braces of the function body.
+    old_body = (
+        "        TryLoadObjectPalette(&sObjectEventSpritePalettes[i]);\n"
+        "    }\n"
+        "}\n"
+    )
+    new_body = (
+        "        TryLoadObjectPalette(&sObjectEventSpritePalettes[i]);\n"
+        "        // DOWP: apply current weather tint to freshly loaded palette\n"
+        "        UpdateSpritePaletteWithWeather(IndexOfSpritePaletteTag(sObjectEventSpritePalettes[i].tag));\n"
+        "    }\n"
+        "}\n"
+    )
+    eom, ok = _replace_once(eom, old_body, new_body,
+        "LoadObjectEventPalette: weather sync")
+    if ok:
+        applied.append("LoadObjectEventPalette: weather sync added")
+    elif new_body in eom:
+        applied.append("LoadObjectEventPalette: weather sync already added")
+    else:
+        failed.append("Could not add LoadObjectEventPalette weather sync")
 
     # 1c. Modify RemoveObjectEventInternal to free palette on destroy
     old_remove = (
@@ -681,17 +869,17 @@ def apply_dowp_patch(project_root: str,
     # 1f. All 5 paletteNum assignment sites → use IndexOfSpritePaletteTag
     #     We do this as a targeted replacement for each unique context line.
     palette_sites = [
-        # Site 1: TrySetupObjectEventSprite (after sprite creation)
+        # Site 1: TrySetupObjectEventSprite (after sprite creation).
+        # Anchor on the 4 invariant lines that exist in vanilla pokefirered.
+        # 4-space indent disambiguates from Site 4 (which has 8-space indent).
         ("    sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
          "    sprite->coordOffsetEnabled = TRUE;\n"
          "    sprite->data[0] = objectEventId;\n"
-         "    objectEvent->spriteId = spriteId;\n"
-         "    // DEBUG — log object spawn position",
+         "    objectEvent->spriteId = spriteId;\n",
          "    sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
          "    sprite->coordOffsetEnabled = TRUE;\n"
          "    sprite->data[0] = objectEventId;\n"
-         "    objectEvent->spriteId = spriteId;\n"
-         "    // DEBUG — log object spawn position",
+         "    objectEvent->spriteId = spriteId;\n",
          "TrySetupObjectEventSprite paletteNum"),
 
         # Site 2: CreateVirtualObject
@@ -739,28 +927,32 @@ def apply_dowp_patch(project_root: str,
         eom, ok = _replace_once(eom, old_site, new_site, desc)
         if ok:
             applied.append(f"{desc}: patched")
+        elif new_site in eom:
+            applied.append(f"{desc}: already patched")
         else:
             failed.append(f"Could not patch {desc}")
 
-    # Site 4 also needs paletteNum at its assignment line
+    # Site 4 paletteNum at its assignment line.
+    # Anchor on the 4 invariant lines from vanilla pokefirered.
+    # 8-space indent disambiguates from Site 1 (which has 4-space indent).
     old_s4_pal = (
         "        sprite->oam.paletteNum = graphicsInfo->paletteSlot;\n"
         "        sprite->coordOffsetEnabled = TRUE;\n"
         "        sprite->data[0] = objectEventId;\n"
         "        objectEvent->spriteId = spriteId;\n"
-        "        // DEBUG — log return-to-field spawn"
     )
     new_s4_pal = (
         "        sprite->oam.paletteNum = IndexOfSpritePaletteTag(graphicsInfo->paletteTag);\n"
         "        sprite->coordOffsetEnabled = TRUE;\n"
         "        sprite->data[0] = objectEventId;\n"
         "        objectEvent->spriteId = spriteId;\n"
-        "        // DEBUG — log return-to-field spawn"
     )
     eom, ok = _replace_once(eom, old_s4_pal, new_s4_pal,
         "SpawnObjectEventOnReturnToField paletteNum")
     if ok:
         applied.append("SpawnObjectEventOnReturnToField paletteNum: patched")
+    elif new_s4_pal in eom:
+        applied.append("SpawnObjectEventOnReturnToField paletteNum: already patched")
     else:
         failed.append("Could not patch SpawnObjectEventOnReturnToField paletteNum")
 
@@ -806,6 +998,8 @@ def apply_dowp_patch(project_root: str,
         "ObjectEventSetGraphicsId paletteNum")
     if ok:
         applied.append("ObjectEventSetGraphicsId paletteNum: patched")
+    elif new_s5_pal in eom:
+        applied.append("ObjectEventSetGraphicsId paletteNum: already patched")
     else:
         failed.append("Could not patch ObjectEventSetGraphicsId paletteNum")
 
@@ -937,7 +1131,11 @@ def apply_dowp_patch(project_root: str,
             "            reflSlot = LoadSpritePalette(&reflPal);\n"
             "        }\n"
             "        if (reflSlot != 0xFF)\n"
+            "        {\n"
             "            reflectionSprite->oam.paletteNum = reflSlot;\n"
+            "            // DOWP: apply current weather tint to the reflection palette\n"
+            "            UpdateSpritePaletteWithWeather(reflSlot);\n"
+            "        }\n"
             "    }"
         )
         fehc, ok = _replace_once(fehc, old_refl_map, new_refl_map,
@@ -993,12 +1191,143 @@ def apply_dowp_patch(project_root: str,
             else:
                 failed.append("Could not patch LoadObjectRegularReflectionPalette")
 
+        # UpdateObjectReflectionSprite runs every frame and was resetting the
+        # reflection sprite's paletteNum via gReflectionEffectPaletteMap — a
+        # hardcoded slot-to-slot lookup designed for vanilla's fixed palette
+        # slot assignments. Under DOWP, slots are dynamic and this lookup
+        # returns slots holding unrelated palettes (NPC palettes, field effect
+        # palettes, whatever happens to be at that slot). The result: SetUpReflection
+        # correctly assigned the DOWP-tinted slot, but on the very next frame
+        # this callback overwrote it with garbage.
+        #
+        # Patch: look up the reflection palette by tag (mainTag + 0x1000) on
+        # every frame, so the reflection sticks to its DOWP-generated slot
+        # even if that slot has moved between frames (e.g., palette pool
+        # reshuffles).
+        old_refl_callback_line = (
+            "        reflectionSprite->oam.paletteNum = "
+            "gReflectionEffectPaletteMap[mainSprite->oam.paletteNum];\n"
+        )
+        new_refl_callback_line = (
+            "        // DOWP: track the reflection palette by tag (mainTag + 0x1000),\n"
+            "        // not via the hardcoded slot map which assumes vanilla layout.\n"
+            "        {\n"
+            "            u16 mainTag = GetSpritePaletteTagByPaletteNum(mainSprite->oam.paletteNum);\n"
+            "            u8 reflSlot = IndexOfSpritePaletteTag(mainTag + 0x1000);\n"
+            "            if (reflSlot != 0xFF)\n"
+            "                reflectionSprite->oam.paletteNum = reflSlot;\n"
+            "        }\n"
+        )
+        fehc, ok = _replace_once(fehc, old_refl_callback_line, new_refl_callback_line,
+            "UpdateObjectReflectionSprite: track reflection palette by tag")
+        if ok:
+            applied.append("UpdateObjectReflectionSprite: per-frame paletteNum now tag-based")
+        elif "DOWP: track the reflection palette by tag" in fehc:
+            applied.append("UpdateObjectReflectionSprite: already patched")
+        else:
+            failed.append("Could not patch UpdateObjectReflectionSprite paletteNum")
+
         _write(feh_c_path, fehc)
     else:
         failed.append("field_effect_helpers.c not found")
 
-    # ════════════════════════════════════════════════════���═══════════════════
-    # 6. Write marker file
+    # ════════════════════════════════════════════════════════════════════════
+    # 6. field_weather.c — unify sprite palette gamma types
+    # ════════════════════════════════════════════════════════════════════════
+    # Vanilla pokefirered's sBasePaletteGammaTypes table assigns a fixed weather
+    # gamma type per slot. Sprite slots 0, 2-5, 10 use GAMMA_ALT (a weaker
+    # darkening curve, intended for reflection palettes that vanilla preloaded
+    # into those specific slots). Sprite slots 1, 6-9, 11-15 use GAMMA_NORMAL.
+    #
+    # Under DOWP, palettes load on demand into any slot. A field effect that
+    # happens to land in slot 0 gets GAMMA_ALT weather treatment instead of
+    # GAMMA_NORMAL — making it appear too bright in weather-darkened maps
+    # (Viridian Forest's WEATHER_SHADE etc.).
+    #
+    # Fix: set all 16 sprite slots to GAMMA_NORMAL so any palette gets the same
+    # darkening regardless of which slot it lands in. Reflections preserve their
+    # "lighter than source" look because the SetUpReflection tint block already
+    # lightens the palette at the +R/+G/+B level before storing.
+    fw_path = os.path.join(project_root, "src", "field_weather.c")
+    if os.path.isfile(fw_path):
+        fw = _read(fw_path)
+        old_sprite_gamma = (
+            "    // sprite palettes\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_ALT,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "};"
+        )
+        new_sprite_gamma = (
+            "    // sprite palettes — DOWP: all slots use GAMMA_NORMAL so any\n"
+            "    // dynamically-loaded palette gets consistent weather darkening\n"
+            "    // regardless of which slot it lands in.\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "    GAMMA_NORMAL,\n"
+            "};"
+        )
+        fw, ok = _replace_once(fw, old_sprite_gamma, new_sprite_gamma,
+            "field_weather.c: unify sprite gamma types")
+        if ok:
+            applied.append("field_weather.c: sprite gamma types unified to GAMMA_NORMAL")
+        elif "DOWP: all slots use GAMMA_NORMAL" in fw:
+            applied.append("field_weather.c: sprite gamma types already unified")
+        else:
+            failed.append("Could not unify field_weather.c sprite gamma types")
+        _write(fw_path, fw)
+    else:
+        failed.append("field_weather.c not found")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 7. Field effect palette refactor
+    # ════════════════════════════════════════════════════════════════════════
+    # Field effect sprite templates with paletteTag = TAG_NONE have no
+    # deterministic palette source — they render in whatever palette
+    # happens to be in the slot they're assigned at runtime. Under DOWP
+    # that slot is non-deterministic, producing wrong colors. The
+    # refactor gives each refactored template a real FLDEFF_PAL_TAG_*
+    # constant, palette data extracted from its source PNG, an INCBIN
+    # declaration, a SpritePalette struct, and (where applicable) a
+    # loadfadedpal step in its field effect script. Currently scoped
+    # to shadows; extending to other templates is one registry entry
+    # in core/field_effect_palette_refactor.py.
+    try:
+        from core import field_effect_palette_refactor as _fer
+        _ok, _applied, _failed = _fer.apply(project_root)
+        applied.extend(_applied)
+        failed.extend(_failed)
+    except Exception as e:
+        failed.append(f"Field effect palette refactor: {type(e).__name__}: {e}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 8. Write marker file
     # ════════════════════════════════════════════════════════════════════════
     marker_path = os.path.join(project_root, MARKER_FILE)
     with open(marker_path, "w") as f:

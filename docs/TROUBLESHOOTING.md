@@ -20,6 +20,19 @@ Fixed in two parts:
 
 For tilemaps already saved with wrong palette bits: open the affected `.bin` in the Tilemap Editor and click **Auto-Fix Palettes** in the toolbar. It scans every tile and rewrites the stored palette bits to match the dominant 16-color range in the artwork. One undo step.
 
+### Switching the Tilemap Editor's palette source from "Auto .pal" to "PNG colors" shows the old colors until I toggle twice
+Fixed in 2026-05-11. The picker's per-paint recolor was leaking the temporary color table back to the source `QImage` (a PyQt6 detach edge case in `_recolor_tile`). The fix switches the recolor functions from `QImage(tile)` to `tile.copy()`, which produces an independent deep copy. The Toggle-twice workaround is no longer needed.
+
+### A `.bin` file is bigger than it should be after I scrubbed the W/H spinners
+Fixed in 2026-05-11. The live rewrap path (`_on_dimensions_changed`) used to pad `self.entries` to fill `new_w * new_h` after a ceiling-division — scrubbing the spinner up by one and back grew the entry list each round trip, and `Tilemap.save()` then wrote those surplus entries. At runtime the engine's `LZDecompressVram` would overflow the BG tilemap buffer and crash on the first BG redraw.
+
+Two fixes together: the rewrap no longer touches `entries` at all (only the dimensions change), and `Tilemap.save()` now writes EXACTLY `width × height × 2` bytes — padding short, truncating long — so a stale entry count can't drive the file size. To repair a `.bin` already inflated by the old behavior: open it in the Tilemap Editor and hit Save. The new save logic truncates automatically.
+
+### My textbox1.pal / textbox2.pal got the same flat color list written to both files (or my .gbapal got picked over the .pal split)
+Fixed in 2026-05-11. `discover_assets` used to pick whichever same-stem pal file came first alphabetically AND had > 16 colors, which meant combined `<stem>.gbapal` build artifacts won over the canonical `<stem>1.pal` + `<stem>2.pal` source split. Saves then either wrote back to the wrong file or wrote the full 32-color flat list to both source files.
+
+`discover_assets` now detects the numbered-pal-set pattern (two or more `<stem><digit>.pal`) and prefers it over any same-stem combined file. `_flush_palette_edits` writes file N's 16-color slice to file N, not the full list to every file. Recovery: either restore the two `.pal` files from git, or open the tilemap in PorySuite, edit one swatch, and save — the per-file slice logic writes the right content from then on.
+
 ### Region rename / delete left my custom code referencing the old enum constant
 Both Rename Region and Delete Region now scan the project for external references to the affected `REGIONMAP_<NAME>` constant before applying. If references are found in `src/`, `include/`, or `data/`, the dialog lists them with `path:line` snippets and warns the build will fail until you update them manually. Cancel the op, fix the references, then retry.
 

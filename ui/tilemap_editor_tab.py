@@ -349,6 +349,12 @@ class TilemapCanvas(QWidget):
     tile_hovered = pyqtSignal(int, int)    # col, row
     tile_eyedrop = pyqtSignal(int, int)    # col, row — right button
     stroke_finished = pyqtSignal()         # left-button release — commit to undo
+    # Shift+right-drag rubber-band: emits the inclusive (c0, r0, c1, r1) of
+    # the selected rectangle on release. The tab uses this to capture a
+    # multi-tile stamp from the canvas.
+    region_selected = pyqtSignal(int, int, int, int)
+    # Middle-click on a cell triggers a flood fill from that origin.
+    fill_requested = pyqtSignal(int, int)  # col, row
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -361,6 +367,21 @@ class TilemapCanvas(QWidget):
         self._tile_offset = 0
         self._painting = False
         self._paint_callback = None  # fn(col, row) called on paint
+        # Shift+right-drag rubber-band state. ``_selecting`` is True
+        # between press and release; the rectangle is drawn live in the
+        # paint event from ``_sel_anchor`` to ``_sel_cursor``. On
+        # release we emit ``region_selected`` and clear the state.
+        self._selecting = False
+        self._sel_anchor: tuple[int, int] = (0, 0)
+        self._sel_cursor: tuple[int, int] = (0, 0)
+        # Hover ghost: when the parent has a multi-tile stamp active,
+        # we draw a faint outline at the would-be paint position so
+        # the user can see what's about to land where. Set by the tab
+        # via ``set_hover_stamp_size``.
+        self._hover_col = -1
+        self._hover_row = -1
+        self._hover_stamp_w = 1
+        self._hover_stamp_h = 1
         self.setMouseTracking(True)
         self.setMinimumSize(64, 64)
 
@@ -485,7 +506,54 @@ class TilemapCanvas(QWidget):
             for r in range(th + 1):
                 p.drawLine(0, r * tile_z, tw * tile_z, r * tile_z)
 
+        # Hover ghost — a thin outline showing where the active stamp
+        # would land if the user clicked here. Drawn for stamps of any
+        # size including 1×1, so the user always sees the paint
+        # target. Drawn beneath the rubber-band rectangle (which is
+        # higher-priority feedback) but above the grid.
+        if (self._hover_col >= 0 and self._tilemap
+                and not self._selecting):
+            tile_z = TILE_PX * z
+            sw, sh = self._hover_stamp_w, self._hover_stamp_h
+            # Clip to map bounds so the outline doesn't extend past
+            # the canvas edge.
+            cw = min(sw, self._tilemap.width - self._hover_col)
+            ch = min(sh, self._tilemap.height - self._hover_row)
+            if cw > 0 and ch > 0:
+                p.setPen(QPen(QColor(255, 255, 255, 120), 1,
+                              Qt.PenStyle.DashLine))
+                p.drawRect(
+                    self._hover_col * tile_z,
+                    self._hover_row * tile_z,
+                    cw * tile_z, ch * tile_z,
+                )
+
+        # Rubber-band rectangle while shift+right-dragging to grab a
+        # multi-tile stamp out of the canvas. Solid yellow border so
+        # it's visually distinct from the picker's selected-tile
+        # highlight (also yellow but on a different widget).
+        if self._selecting and self._tilemap:
+            tile_z = TILE_PX * z
+            c0, r0 = self._sel_anchor
+            c1, r1 = self._sel_cursor
+            lo_c, hi_c = min(c0, c1), max(c0, c1)
+            lo_r, hi_r = min(r0, r1), max(r0, r1)
+            p.setPen(QPen(QColor(255, 220, 0), 2))
+            p.drawRect(
+                lo_c * tile_z, lo_r * tile_z,
+                (hi_c - lo_c + 1) * tile_z,
+                (hi_r - lo_r + 1) * tile_z,
+            )
+
         p.end()
+
+    def set_hover_stamp_size(self, w: int, h: int) -> None:
+        """Tell the canvas the parent's active stamp size, so the hover
+        ghost can outline the right region under the cursor. Pass 1, 1
+        for single-tile state."""
+        self._hover_stamp_w = max(1, int(w))
+        self._hover_stamp_h = max(1, int(h))
+        self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -496,18 +564,47 @@ class TilemapCanvas(QWidget):
                 if self._paint_callback:
                     self._paint_callback(col, row)
         elif event.button() == Qt.MouseButton.RightButton:
-            # Right-click is always eyedrop, regardless of current tool mode.
+            col, row = self._tile_at(event.pos())
+            if col < 0:
+                return
+            # Shift+right-click+drag = rubber-band region selection
+            # for grabbing a multi-tile stamp out of the current
+            # tilemap. Plain right-click (no shift) stays as the
+            # single-tile eyedrop, preserving existing behaviour.
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                self._selecting = True
+                self._sel_anchor = (col, row)
+                self._sel_cursor = (col, row)
+                self.update()
+            else:
+                self.tile_eyedrop.emit(col, row)
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            # Middle-click — flood-fill from this cell. The tab
+            # decides what to fill with (always the current SINGLE
+            # tile per the agreed UX, never the multi-tile stamp).
             col, row = self._tile_at(event.pos())
             if col >= 0:
-                self.tile_eyedrop.emit(col, row)
+                self.fill_requested.emit(col, row)
 
     def mouseMoveEvent(self, event):
         col, row = self._tile_at(event.pos())
         if col >= 0:
             self.tile_hovered.emit(col, row)
+            # Track hover for the stamp-ghost overlay. Only repaint
+            # when the cell actually changed — repainting on every
+            # pixel-grain mouse move costs visible CPU on big maps.
+            if (col, row) != (self._hover_col, self._hover_row):
+                self._hover_col, self._hover_row = col, row
+                self.update()
         if self._painting and event.buttons() & Qt.MouseButton.LeftButton:
             if col >= 0 and self._paint_callback:
                 self._paint_callback(col, row)
+        if (self._selecting
+                and event.buttons() & Qt.MouseButton.RightButton):
+            if col >= 0:
+                if (col, row) != self._sel_cursor:
+                    self._sel_cursor = (col, row)
+                    self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -516,6 +613,25 @@ class TilemapCanvas(QWidget):
                 # Tell the tab the drag is over so it can commit the stroke
                 # to the undo stack as ONE entry (not one per cell painted).
                 self.stroke_finished.emit()
+        elif event.button() == Qt.MouseButton.RightButton:
+            if self._selecting:
+                self._selecting = False
+                c0, r0 = self._sel_anchor
+                c1, r1 = self._sel_cursor
+                # Normalise to (top-left, bottom-right) inclusive.
+                lo_c, hi_c = min(c0, c1), max(c0, c1)
+                lo_r, hi_r = min(r0, r1), max(r0, r1)
+                self.region_selected.emit(lo_c, lo_r, hi_c, hi_r)
+                self.update()
+
+    def leaveEvent(self, event):
+        # Clear hover state when the cursor leaves the canvas so the
+        # stamp ghost doesn't linger over an empty hover position.
+        if self._hover_col >= 0:
+            self._hover_col = -1
+            self._hover_row = -1
+            self.update()
+        super().leaveEvent(event)
 
     def wheelEvent(self, event: QWheelEvent):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -538,7 +654,11 @@ class TilemapCanvas(QWidget):
 class TilePickerWidget(QWidget):
     """Displays the tile sheet and lets user pick a tile index."""
 
-    tile_selected = pyqtSignal(int)  # tile index
+    tile_selected = pyqtSignal(int)  # tile index — single-click pick
+    # Shift+right-drag rubber-band: emits the inclusive (c0, r0, c1, r1)
+    # rect of the selected sheet region so the parent tab can build a
+    # multi-tile stamp from those source tiles.
+    region_selected = pyqtSignal(int, int, int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -547,6 +667,10 @@ class TilePickerWidget(QWidget):
         self._zoom = 2
         self._selected = 0
         self._pal_idx = 0
+        # Rubber-band selection state — same shape as the canvas.
+        self._selecting = False
+        self._sel_anchor: tuple[int, int] = (0, 0)
+        self._sel_cursor: tuple[int, int] = (0, 0)
         self.setMouseTracking(True)
         self.setMinimumSize(64, 64)
 
@@ -625,18 +749,76 @@ class TilePickerWidget(QWidget):
         for r in range(self._sheet.tiles_high + 1):
             p.drawLine(0, r * tile_z, self._sheet.tiles_wide * tile_z, r * tile_z)
 
+        # Rubber-band rectangle while shift+right-dragging.
+        if self._selecting:
+            c0, r0 = self._sel_anchor
+            c1, r1 = self._sel_cursor
+            lo_c, hi_c = min(c0, c1), max(c0, c1)
+            lo_r, hi_r = min(r0, r1), max(r0, r1)
+            p.setPen(QPen(QColor(255, 220, 0), 2))
+            p.drawRect(
+                lo_c * tile_z, lo_r * tile_z,
+                (hi_c - lo_c + 1) * tile_z,
+                (hi_r - lo_r + 1) * tile_z,
+            )
+
         p.end()
+
+    def _cell_at(self, pos) -> tuple[int, int]:
+        """Return (col, row) for the given pixel position, clamped to
+        the sheet's grid. Returns (-1, -1) if no sheet is loaded or
+        the cell is past the sheet bounds."""
+        if not self._sheet:
+            return -1, -1
+        z = self._zoom
+        col = int(pos.x()) // (TILE_PX * z)
+        row = int(pos.y()) // (TILE_PX * z)
+        if col < 0 or row < 0:
+            return -1, -1
+        if col >= self._sheet.tiles_wide or row >= self._sheet.tiles_high:
+            return -1, -1
+        return col, row
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._sheet:
-            z = self._zoom
-            col = event.pos().x() // (TILE_PX * z)
-            row = event.pos().y() // (TILE_PX * z)
+            col, row = self._cell_at(event.pos())
+            if col < 0:
+                return
             idx = row * self._sheet.tiles_wide + col
             if 0 <= idx < self._sheet.tile_count:
                 self._selected = idx
                 self.tile_selected.emit(idx)
                 self.update()
+        elif (event.button() == Qt.MouseButton.RightButton
+              and self._sheet
+              and event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            # Shift+right-drag in the picker grabs a rectangular region
+            # of the sheet as a multi-tile stamp.
+            col, row = self._cell_at(event.pos())
+            if col >= 0:
+                self._selecting = True
+                self._sel_anchor = (col, row)
+                self._sel_cursor = (col, row)
+                self.update()
+
+    def mouseMoveEvent(self, event):
+        if (self._selecting
+                and event.buttons() & Qt.MouseButton.RightButton):
+            col, row = self._cell_at(event.pos())
+            if col >= 0 and (col, row) != self._sel_cursor:
+                self._sel_cursor = (col, row)
+                self.update()
+
+    def mouseReleaseEvent(self, event):
+        if (event.button() == Qt.MouseButton.RightButton
+                and self._selecting):
+            self._selecting = False
+            c0, r0 = self._sel_anchor
+            c1, r1 = self._sel_cursor
+            lo_c, hi_c = min(c0, c1), max(c0, c1)
+            lo_r, hi_r = min(r0, r1), max(r0, r1)
+            self.region_selected.emit(lo_c, lo_r, hi_c, hi_r)
+            self.update()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -682,6 +864,19 @@ class TilemapEditorTab(QWidget):
         self._current_stroke: dict = {}
         self._undo_limit = 100             # cap to bound memory
 
+        # ── Multi-tile stamp state ──────────────────────────────────────────
+        # The "active stamp" is the rectangle of tiles a left-click
+        # paints in one go. By default it's 1×1 — a single tile
+        # described by ``_current_tile / _current_pal / _hflip /
+        # _vflip``. Shift+right-drag in the canvas OR the picker
+        # captures a larger rectangle into ``_stamp_grid``, which
+        # ``_paint_tile`` then uses to stamp multiple cells per click.
+        # Single-tile picks (left-click in picker, plain right-click
+        # eyedrop on the canvas) reset the stamp back to 1×1.
+        self._stamp_grid: list[list] = []  # row-major list of TileEntry
+        self._stamp_w: int = 1             # width in tiles
+        self._stamp_h: int = 1             # height in tiles
+
         self._build_ui()
         self._install_undo_shortcuts()
 
@@ -689,6 +884,12 @@ class TilemapEditorTab(QWidget):
         self._project_dir = project_dir
         if hasattr(self, '_anim_viewer'):
             self._anim_viewer.set_project(project_dir)
+        # Palette Baker is project-aware too — pass the root through so
+        # its scanner can walk graphics/. The tab's load() also doubles
+        # as its F5-clean reset (cancels in-flight scans, clears dirty
+        # state, re-kicks the audit).
+        if hasattr(self, '_palette_baker'):
+            self._palette_baker.load(project_dir)
 
     # ── UI Construction ──────────────────────────────────────────────────────
 
@@ -720,6 +921,23 @@ class TilemapEditorTab(QWidget):
             self._tab_widget.addTab(self._image_indexer, "Image Indexer")
         except Exception as e:
             print(f"[ImageIndexer] Failed to load: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # -- Tab 3: Palette Baker --
+        # Re-bakes canonical .pal palettes into stale PNG color tables
+        # across the project. Different from Image Indexer (which
+        # converts non-indexed sources INTO indexed form picking a new
+        # palette as it goes); this tab takes ALREADY-INDEXED PNGs
+        # whose embedded colour table has drifted from their canonical
+        # .pal neighbour and rewrites the colour table to match —
+        # pixel indices are never touched.
+        try:
+            from ui.palette_baker_tab import PaletteBakerTab
+            self._palette_baker = PaletteBakerTab()
+            self._tab_widget.addTab(self._palette_baker, "Palette Baker")
+        except Exception as e:
+            print(f"[PaletteBaker] Failed to load: {e}")
             import traceback
             traceback.print_exc()
 
@@ -880,6 +1098,8 @@ class TilemapEditorTab(QWidget):
         self._canvas.tile_hovered.connect(self._on_canvas_hover)
         self._canvas.tile_eyedrop.connect(self._on_canvas_eyedrop)
         self._canvas.stroke_finished.connect(self._on_stroke_finished)
+        self._canvas.region_selected.connect(self._on_canvas_region_selected)
+        self._canvas.fill_requested.connect(self._on_canvas_fill_requested)
         self._canvas.set_paint_callback(self._paint_tile)
 
         canvas_scroll = QScrollArea()
@@ -950,12 +1170,29 @@ class TilemapEditorTab(QWidget):
             "background: #222; border: 1px solid #555;")
         ctrl_row.addWidget(self._tile_preview)
 
+        # Stamp badge — shows "Stamp: 3×4" when a multi-tile region is
+        # active. Reads "Stamp: 1×1" by default. Hidden when no
+        # tilemap is loaded (kept simple — the badge always reflects
+        # the live stamp size, no special "no map" state).
+        self._stamp_badge = QLabel("Stamp: 1×1")
+        self._stamp_badge.setToolTip(
+            "Active stamp size. Shift+right-click+drag in the canvas "
+            "or the tile sheet to grab a multi-tile region. Single-"
+            "click a tile in the sheet (or right-click a tile on the "
+            "canvas) to reset to 1×1.")
+        self._stamp_badge.setStyleSheet(
+            "QLabel { color: #888; padding: 2px 6px; "
+            "border: 1px solid #444; border-radius: 3px; "
+            "background: #2a2a2a; }")
+        ctrl_row.addWidget(self._stamp_badge)
+
         ctrl_row.addStretch()
         right_layout.addLayout(ctrl_row)
 
         # -- Tile sheet picker — THE FOCUS of the right panel --
         self._picker = TilePickerWidget()
         self._picker.tile_selected.connect(self._on_tile_picked)
+        self._picker.region_selected.connect(self._on_picker_region_selected)
 
         picker_scroll = QScrollArea()
         picker_scroll.setWidget(self._picker)
@@ -1209,6 +1446,10 @@ class TilemapEditorTab(QWidget):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._current_stroke.clear()
+        # Multi-tile stamp doesn't survive a project / tilemap reload
+        # either — its tile entries reference indices and palettes
+        # specific to whatever tilemap was loaded before.
+        self._reset_stamp_to_single()
 
         fname = os.path.basename(bin_path)
         parent = os.path.basename(os.path.dirname(bin_path))
@@ -1330,19 +1571,54 @@ class TilemapEditorTab(QWidget):
             write_count = min(16, len(flat_colors))
         out_colors = flat_colors[:write_count]
 
+        # Decide whether the source paths are a split-palette set
+        # (multiple files, one 16-color sub-palette per file — the
+        # textbox1.pal / textbox2.pal pattern) or a single combined
+        # source. When split, write each file with ITS slice of the
+        # flat color list (file N gets colors [N*16 : (N+1)*16]).
+        # Writing the same flat list to every file would overwrite
+        # textbox1.pal with all 32 colors AND textbox2.pal with all
+        # 32 colors — both wrong, since the build's `cat textbox1
+        # textbox2 > textbox.gbapal` step would then produce a 64-
+        # color result the engine doesn't expect.
+        source_paths = list(self._palettes.source_paths or [])
+        is_split = (
+            len(source_paths) >= 2
+            and n_loaded >= len(source_paths)
+            and all(
+                _os.path.splitext(p)[1].lower() == ".pal"
+                for p in source_paths
+            )
+        )
+
         # Write each source palette file.
-        for path in self._palettes.source_paths or []:
+        for slot_idx, path in enumerate(source_paths):
             if not path:
                 continue
+            if is_split:
+                # File N gets palette N (16 colors). The flat list is
+                # already in palette-major order (slot 0 colors, then
+                # slot 1, …) — slice [slot_idx*16 : slot_idx*16+16].
+                file_colors = flat_colors[
+                    slot_idx * 16 : slot_idx * 16 + 16
+                ]
+                # Pad to 16 in case the in-memory palette had fewer
+                # colors (defensive — shouldn't happen but cheap to
+                # guard).
+                while len(file_colors) < 16:
+                    file_colors.append((0, 0, 0))
+            else:
+                # Single combined source — write the full flat list.
+                file_colors = list(out_colors)
             try:
                 ext = _os.path.splitext(path)[1].lower()
                 if ext == ".gbapal":
-                    if _write_gbapal_file(path, out_colors):
+                    if _write_gbapal_file(path, file_colors):
                         wrote.append(_os.path.basename(path))
                     else:
                         errors.append(f"{_os.path.basename(path)}: write failed")
                 else:
-                    if write_jasc_pal(path, out_colors):
+                    if write_jasc_pal(path, file_colors):
                         wrote.append(_os.path.basename(path))
                     else:
                         errors.append(f"{_os.path.basename(path)}: write failed")
@@ -1615,7 +1891,14 @@ class TilemapEditorTab(QWidget):
             + f" — Auto-fixed {len(proposed)} tile palette(s)")
 
     def has_unsaved_changes(self) -> bool:
-        return self._dirty or self._palette_dirty
+        # The Palette Baker sub-tab tracks its own dirty state (right-
+        # panel palette edits). Roll its dirty into ours so the
+        # unified save pipeline picks it up automatically.
+        baker_dirty = (
+            hasattr(self, '_palette_baker')
+            and self._palette_baker.has_unsaved_changes()
+        )
+        return self._dirty or self._palette_dirty or baker_dirty
 
     def flush_to_disk(self) -> tuple:
         """Save the tilemap .bin file AND any palette edits.
@@ -1651,6 +1934,15 @@ class TilemapEditorTab(QWidget):
             wrote, perrs = self._flush_palette_edits()
             ok += len(wrote)
             errors.extend(f"palette {e}" for e in perrs)
+        # Palette Baker — flush its right-panel dirty palette if any.
+        if hasattr(self, '_palette_baker') \
+                and self._palette_baker.has_unsaved_changes():
+            try:
+                bok, berrs = self._palette_baker.flush_to_disk()
+                ok += bok
+                errors.extend(f"palette-baker: {e}" for e in berrs)
+            except Exception as e:
+                errors.append(f"palette-baker: {e}")
         self._dirty = False
         self._palette_dirty = False
         return (ok, errors)
@@ -1702,7 +1994,8 @@ class TilemapEditorTab(QWidget):
     def _eyedrop_tile(self, col: int, row: int):
         """Pick the tile at (col, row) and load it as the current paint
         tile — sets tile index, palette, hflip, vflip, and refreshes the
-        picker selection + preview."""
+        picker selection + preview. Resets any active multi-tile stamp
+        back to 1×1 (a single-tile pick is a single-tile commitment)."""
         if not self._tilemap:
             return
         entry = self._tilemap.get(col, row)
@@ -1713,13 +2006,184 @@ class TilemapEditorTab(QWidget):
         self._update_tile_info()
         self._picker._selected = entry.tile_index
         self._picker.update()
+        self._reset_stamp_to_single()
 
     def _on_canvas_eyedrop(self, col: int, row: int):
         """Right-click handler — eyedrop regardless of current tool mode."""
         self._eyedrop_tile(col, row)
 
+    # ── Stamp helpers ─────────────────────────────────────────────────────
+
+    def _current_single_entry(self):
+        """Build a TileEntry for the toolbar's current single-tile state
+        (tile index, palette, flips). Used both as the 1×1 stamp and as
+        the fill replacement."""
+        from core.tilemap_data import TileEntry
+        return TileEntry(
+            tile_index=self._current_tile,
+            hflip=self._hflip,
+            vflip=self._vflip,
+            palette=self._current_pal,
+        )
+
+    def _reset_stamp_to_single(self) -> None:
+        """Drop the multi-tile stamp back to 1×1 from the toolbar's
+        current single-tile state. Idempotent — safe to call any time
+        a single-tile action runs (picker click, eyedrop, pal/flip
+        toggle, project reload)."""
+        self._stamp_grid = [[self._current_single_entry()]]
+        self._stamp_w = 1
+        self._stamp_h = 1
+        self._update_stamp_badge()
+        if hasattr(self, '_canvas'):
+            self._canvas.set_hover_stamp_size(1, 1)
+
+    def _update_stamp_badge(self) -> None:
+        """Update the toolbar badge label to reflect the active stamp
+        size. Bolder amber styling when multi-tile so the user notices
+        they're in stamp mode."""
+        if not hasattr(self, '_stamp_badge'):
+            return
+        self._stamp_badge.setText(f"Stamp: {self._stamp_w}×{self._stamp_h}")
+        if self._stamp_w == 1 and self._stamp_h == 1:
+            self._stamp_badge.setStyleSheet(
+                "QLabel { color: #888; padding: 2px 6px; "
+                "border: 1px solid #444; border-radius: 3px; "
+                "background: #2a2a2a; }")
+        else:
+            self._stamp_badge.setStyleSheet(
+                "QLabel { color: #ffb74d; padding: 2px 6px; "
+                "border: 1px solid #ffb74d; border-radius: 3px; "
+                "background: #2a2a2a; font-weight: bold; }")
+
+    def _on_canvas_region_selected(
+            self, c0: int, r0: int, c1: int, r1: int) -> None:
+        """Shift+right-drag in the canvas: capture the rectangular
+        region of the current tilemap as the active stamp. Each cell's
+        tile index, palette, and flips are copied verbatim — pasting
+        the stamp later reproduces the source region exactly."""
+        if not self._tilemap:
+            return
+        self._stamp_grid = []
+        for r in range(r0, r1 + 1):
+            row_entries = []
+            for c in range(c0, c1 + 1):
+                src = self._tilemap.get(c, r)
+                row_entries.append(self._copy_entry(src))
+            self._stamp_grid.append(row_entries)
+        self._stamp_w = c1 - c0 + 1
+        self._stamp_h = r1 - r0 + 1
+        self._update_stamp_badge()
+        self._canvas.set_hover_stamp_size(self._stamp_w, self._stamp_h)
+
+    def _on_picker_region_selected(
+            self, c0: int, r0: int, c1: int, r1: int) -> None:
+        """Shift+right-drag in the picker: build a stamp from a
+        rectangular region of the source tile sheet. Each cell uses the
+        toolbar's current palette / flips (the sheet has no per-tile
+        flip flags), with the tile index taken from the sheet grid.
+        """
+        if not self._sheet:
+            return
+        from core.tilemap_data import TileEntry
+        tw = self._sheet.tiles_wide
+        self._stamp_grid = []
+        for r in range(r0, r1 + 1):
+            row_entries = []
+            for c in range(c0, c1 + 1):
+                tile_idx = r * tw + c
+                # Fall back to MOVE-equivalent of "off-sheet" — empty
+                # entries get a 0-index entry. In practice the picker
+                # rejects out-of-bounds picks in _cell_at().
+                if tile_idx < 0 or tile_idx >= self._sheet.tile_count:
+                    row_entries.append(TileEntry(
+                        tile_index=0, hflip=False,
+                        vflip=False, palette=self._current_pal))
+                else:
+                    row_entries.append(TileEntry(
+                        tile_index=tile_idx,
+                        hflip=self._hflip, vflip=self._vflip,
+                        palette=self._current_pal))
+            self._stamp_grid.append(row_entries)
+        self._stamp_w = c1 - c0 + 1
+        self._stamp_h = r1 - r0 + 1
+        self._update_stamp_badge()
+        self._canvas.set_hover_stamp_size(self._stamp_w, self._stamp_h)
+        # Update the "current tile" + picker selection to the stamp's
+        # top-left so the toolbar stays consistent. Doesn't reset the
+        # stamp — that only happens on a single-tile pick (left-click
+        # in the picker), not on a stamp grab.
+        top_left = self._stamp_grid[0][0]
+        self._current_tile = top_left.tile_index
+        self._picker._selected = top_left.tile_index
+        self._picker.update()
+        self._update_tile_info()
+
+    def _on_canvas_fill_requested(self, col: int, row: int) -> None:
+        """Middle-click on the canvas: 4-connected flood-fill from
+        (col, row) replacing every connected cell whose tile_index +
+        flips + palette match the clicked cell with the current
+        SINGLE tile. The active multi-tile stamp is intentionally
+        ignored — fill always uses single-tile state to avoid
+        producing wallpaper-pattern artifacts at region boundaries.
+        Counts as one undo step.
+        """
+        if not self._tilemap:
+            return
+        target = self._tilemap.get(col, row)
+        replacement = self._current_single_entry()
+        # No-op if the click cell already has the replacement state —
+        # nothing to fill, and we'd just dirty the file.
+        if self._entries_equal(target, replacement):
+            return
+        # BFS so we don't blow the recursion stack on big maps.
+        from collections import deque
+        visited: set[tuple[int, int]] = set()
+        queue: deque[tuple[int, int]] = deque()
+        queue.append((col, row))
+        # Snapshot for undo as we go. This whole fill is one stroke,
+        # committed via _on_stroke_finished after the BFS completes.
+        old_entries: dict[tuple[int, int], object] = {}
+        w, h = self._tilemap.width, self._tilemap.height
+        while queue:
+            c, r = queue.popleft()
+            if (c, r) in visited:
+                continue
+            visited.add((c, r))
+            if c < 0 or r < 0 or c >= w or r >= h:
+                continue
+            cell = self._tilemap.get(c, r)
+            if not self._entries_equal(cell, target):
+                continue
+            old_entries[(c, r)] = self._copy_entry(cell)
+            self._tilemap.set(c, r, replacement)
+            self._canvas.refresh_tile(c, r)
+            queue.append((c + 1, r))
+            queue.append((c - 1, r))
+            queue.append((c, r + 1))
+            queue.append((c, r - 1))
+        if not old_entries:
+            return
+        # Commit the fill as a single undo entry — re-using the
+        # existing undo stack the same way a paint stroke does.
+        self._undo_stack.append(old_entries)
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._dirty = True
+        self.modified.emit()
+
     def _paint_tile(self, col: int, row: int):
-        """Called when canvas is clicked/dragged in paint mode."""
+        """Called when canvas is clicked/dragged in paint mode.
+
+        For a 1×1 stamp this places one tile, the same as the original
+        single-tile behaviour. For a multi-tile stamp (W×H), the stamp
+        is anchored at (col, row) and writes one TileEntry per stamp
+        cell that falls inside the tilemap bounds (cells past the
+        right or bottom edge are silently clipped). All written cells
+        belong to the same drag stroke and commit as a single undo
+        entry on mouse release.
+        """
         if not self._tilemap:
             return
 
@@ -1728,28 +2192,32 @@ class TilemapEditorTab(QWidget):
             self._eyedrop_tile(col, row)
             return
 
-        # Paint mode: place current tile.
-        from core.tilemap_data import TileEntry
-        entry = TileEntry(
-            tile_index=self._current_tile,
-            hflip=self._hflip,
-            vflip=self._vflip,
-            palette=self._current_pal,
-        )
-        # Record the OLD entry once per cell per stroke (a drag may revisit
-        # the same cell; we only want the entry that was there before the
-        # whole stroke started). copy() to detach from any future mutation.
-        if (col, row) not in self._current_stroke:
-            old = self._tilemap.get(col, row)
-            self._current_stroke[(col, row)] = self._copy_entry(old)
-        # No-op if the new entry is identical to what's already there —
-        # avoids dirtying the file for redundant clicks.
-        existing = self._tilemap.get(col, row)
-        if self._entries_equal(existing, entry):
-            return
-        self._tilemap.set(col, row, entry)
-        self._canvas.refresh_tile(col, row)
-        self._dirty = True
+        # Paint mode: stamp the active grid anchored at (col, row).
+        # When the stamp is 1×1 (the default), this is identical to
+        # the original single-tile paint path.
+        if not self._stamp_grid:
+            self._stamp_grid = [[self._current_single_entry()]]
+        for sr, row_entries in enumerate(self._stamp_grid):
+            for sc, src_entry in enumerate(row_entries):
+                tc = col + sc
+                tr = row + sr
+                if tc >= self._tilemap.width or tr >= self._tilemap.height:
+                    continue
+                if tc < 0 or tr < 0:
+                    continue
+                # Record the OLD entry once per cell per stroke (a drag
+                # may revisit the same cell; we only keep the entry
+                # that was there before the WHOLE stroke started).
+                if (tc, tr) not in self._current_stroke:
+                    old = self._tilemap.get(tc, tr)
+                    self._current_stroke[(tc, tr)] = self._copy_entry(old)
+                # No-op when nothing would change at this cell.
+                existing = self._tilemap.get(tc, tr)
+                if self._entries_equal(existing, src_entry):
+                    continue
+                self._tilemap.set(tc, tr, self._copy_entry(src_entry))
+                self._canvas.refresh_tile(tc, tr)
+                self._dirty = True
         self.modified.emit()
 
     # ── Undo / redo ──────────────────────────────────────────────────────────
@@ -1864,6 +2332,8 @@ class TilemapEditorTab(QWidget):
         pass  # Could show coords in status
 
     def _on_tile_picked(self, idx: int):
+        # Single-click in the picker is a single-tile commitment —
+        # collapses any active multi-tile stamp back to 1×1.
         self._current_tile = idx
         # When the sheet is 8bpp + multi-palette (region-map style), the
         # picker tile's pixel values directly encode which sub-palette it
@@ -1886,19 +2356,27 @@ class TilemapEditorTab(QWidget):
             except Exception:
                 pass
         self._update_tile_info()
+        self._reset_stamp_to_single()
 
     def _on_pal_changed(self, val: int):
+        # Toggling pal/H/V is a single-tile action (it conceptually
+        # only applies to one tile); collapse the stamp accordingly so
+        # the painted result matches the toolbar state the user just
+        # changed.
         self._current_pal = val
         self._picker.set_palette_index(val)
         self._update_tile_preview()
+        self._reset_stamp_to_single()
 
     def _on_hflip_changed(self, checked: bool):
         self._hflip = checked
         self._update_tile_preview()
+        self._reset_stamp_to_single()
 
     def _on_vflip_changed(self, checked: bool):
         self._vflip = checked
         self._update_tile_preview()
+        self._reset_stamp_to_single()
 
     def _on_zoom_changed(self, val: int):
         self._canvas.set_zoom(val)
@@ -2086,6 +2564,22 @@ class TilemapEditorTab(QWidget):
 
         For changing the tile COUNT (truncate or pad to a specific size),
         the Resize… button is the explicit operation.
+
+        DO NOT regress: an earlier version of this method padded
+        ``entries`` up to ``new_w * new_h`` on every spinner change
+        (via ceiling-division of the total). Scrubbing W from 64 to 65
+        and back to 64 ratcheted the entry count higher each round
+        trip — and ``Tilemap.save()`` then wrote those surplus entries,
+        producing a `.bin` larger than the declared dimensions. At
+        runtime ``CopyToBgTilemapBuffer``'s LZ decompressor overflowed
+        BG0's tilemap buffer and corrupted WRAM, crashing on entry to
+        battle. The fix here is to leave ``entries`` untouched on
+        rewrap — only ``width`` and ``height`` change. The data list
+        keeps exactly the count it had on load, so the round trip is
+        truly lossless. Cells past the entry list (when ``new_w *
+        new_h > len(entries)``) read as default ``TileEntry`` via
+        ``Tilemap.get`` — same visual outcome the old "pad with
+        blanks" path produced, without mutating the entries list.
         """
         if not self._tilemap:
             return
@@ -2094,12 +2588,12 @@ class TilemapEditorTab(QWidget):
         if new_w == self._tilemap.width and new_h == self._tilemap.height:
             return
 
-        from core.tilemap_data import TileEntry
-
-        # Total entry count from the source — never changes.
+        # Total entry count — preserved across the rewrap.
         total = len(self._tilemap.entries)
 
-        # Whichever spinner the user moved drives; the other recalculates.
+        # Whichever spinner the user moved drives; the other recalculates
+        # to the smallest height/width that COULD fit the existing
+        # entries at the new stride. Ceiling division — same as before.
         if new_w != self._tilemap.width:
             new_h = max(1, (total + new_w - 1) // new_w)
             self._height_spin.blockSignals(True)
@@ -2111,16 +2605,12 @@ class TilemapEditorTab(QWidget):
             self._width_spin.setValue(new_w)
             self._width_spin.blockSignals(False)
 
-        # Pad with blank tiles only when the recalc'd grid is slightly
-        # bigger than the entry count (last row not fully filled).
-        new_count = new_w * new_h
-        entries = list(self._tilemap.entries)
-        while len(entries) < new_count:
-            entries.append(TileEntry())
-
+        # Update the dimensions ONLY. Do not mutate ``entries`` — the
+        # rewrap is lossless and reversible because the entry list is
+        # the source of truth, not the W/H product. ``Tilemap.save``
+        # writes exactly ``width * height * 2`` bytes regardless.
         self._tilemap.width = new_w
         self._tilemap.height = new_h
-        self._tilemap.entries = entries[:new_count]
         self._refresh_canvas()
 
     def _on_resize(self):

@@ -787,6 +787,13 @@ class UnifiedMainWindow(QMainWindow):
                 anim_ed.modified.connect(
                     lambda: (self.set_page_dirty("tilesets", True),
                              self.setWindowModified(True)))
+            # Palette Baker — same dirty wiring as its siblings.
+            pal_baker = getattr(
+                self._tilemap_editor, '_palette_baker', None)
+            if pal_baker and hasattr(pal_baker, 'modified'):
+                pal_baker.modified.connect(
+                    lambda: (self.set_page_dirty("tilesets", True),
+                             self.setWindowModified(True)))
         except Exception as e:
             print(f"[TilemapEditor] Failed to load: {e}")
             import traceback; traceback.print_exc()

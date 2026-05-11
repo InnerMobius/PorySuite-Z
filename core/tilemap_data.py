@@ -96,13 +96,37 @@ class Tilemap:
         )
 
     def save(self, path: str = "") -> None:
-        """Write the tilemap back to a .bin file."""
+        """Write the tilemap back to a .bin file.
+
+        Writes EXACTLY ``width * height * 2`` bytes — never more, never
+        less. This is a hard invariant the engine relies on: the .bin
+        is loaded via ``CopyToBgTilemapBuffer`` which decompresses
+        straight into BG0's tilemap RAM (sized for the declared
+        dimensions). One extra byte and the decompressor overflows the
+        buffer and corrupts adjacent WRAM, crashing the game on the
+        first BG redraw. The user's "battle crashes on entry" bug from
+        the 2026-05-10 build report was this exact failure mode —
+        ``_on_dimensions_changed`` had ratcheted ``len(self.entries)``
+        past ``width * height`` via repeated spinner scrubs, and this
+        method was writing all of them.
+
+        If ``self.entries`` is shorter than ``width * height``, pad
+        with default ``TileEntry()`` (this can happen mid-construction
+        and is a non-issue at write time). If longer, the surplus is
+        ignored. Either way, the file size on disk is exactly the
+        declared dimensions.
+        """
         target = path or self.source_path
         if not target:
             raise ValueError("No path specified")
+        n_expected = self.width * self.height
+        # Take exactly width*height entries. Pad with defaults if short,
+        # truncate if long.
+        seq = list(self.entries[:n_expected])
+        while len(seq) < n_expected:
+            seq.append(TileEntry())
         data = struct.pack(
-            f"<{len(self.entries)}H",
-            *(e.to_u16() for e in self.entries),
+            f"<{n_expected}H", *(e.to_u16() for e in seq)
         )
         with open(target, "wb") as f:
             f.write(data)
@@ -553,8 +577,20 @@ def _recolor_tile(
     one palette but the tilemap references multiple palette slots — the
     game loads the same palette into different VRAM slots at runtime, but
     the tile artwork was drawn with the PNG's single embedded palette.
+
+    NOTE: uses ``tile.copy()`` (deep copy) rather than ``QImage(tile)``
+    (shallow / implicit-share). Qt's copy-on-write SHOULD detach on
+    ``setColorTable`` below, but in PyQt6 there's a documented edge
+    case where the color-table mutation doesn't trigger a full detach,
+    leaking the new color table back to the source image. That caused
+    the "switching from .pal to PNG colors shows wrong colors until
+    you toggle the source twice" bug — the picker's per-paint recolor
+    was clobbering ``sheet.image.colorTable()``, so the next
+    ``PaletteSet.from_indexed_image(sheet.image)`` read back the .pal
+    colors instead of the original PNG colors. ``.copy()`` produces an
+    independent QImage with its own data buffer; mutations stay local.
     """
-    recolored = QImage(tile)
+    recolored = tile.copy()
 
     # Determine which palette to actually use
     effective_pal = pal_idx
@@ -603,8 +639,11 @@ def _recolor_tile_8bpp(
     In GBA 256-color BG mode, each pixel's 8-bit value indexes directly
     into the full 256-entry palette. The palette bits in the tilemap entry
     are ignored by hardware.
+
+    See ``_recolor_tile`` for why ``.copy()`` is used instead of
+    ``QImage(other)`` — same PyQt6 detach edge case applies.
     """
-    recolored = QImage(tile)
+    recolored = tile.copy()
     # Extend or trim the flat color table to match what the tile needs
     ct_size = max(len(tile.colorTable()), 256)
     ct = list(flat_ct[:ct_size])
@@ -652,7 +691,8 @@ def _recolor_tile_8bpp_attr(
             ct.append(qRgba(r, g, b, 0))
         else:
             ct.append(qRgb(r, g, b))
-    recolored = QImage(tile)
+    # Deep copy — see ``_recolor_tile`` for the PyQt6 detach reason.
+    recolored = tile.copy()
     recolored.setColorTable(ct)
     return recolored
 
@@ -863,11 +903,58 @@ def discover_assets(bin_path: str) -> TilemapAssets:
         from ui.palette_utils import read_jasc_pal
         return read_jasc_pal(p)
 
-    best_pals = matching_pals
-    if matching_pals:
+    # Pokefirered convention for multi-palette assets: source files are
+    # named ``<stem>1.pal``, ``<stem>2.pal``, … (each holding 16 colors,
+    # JASC text), and the build pipeline concatenates them into
+    # ``<stem>.gbapal`` (binary, 32+ colors) via:
+    #   cat <stem>1.gbapal <stem>2.gbapal > <stem>.gbapal
+    # The combined file is a BUILD ARTIFACT — the .pal source files
+    # are the authoritative sources of truth (committed to git, edited
+    # by humans). PorySuite-Z must write back to those .pal files, not
+    # to the combined .gbapal — otherwise the next ``make`` regenerates
+    # the combined file from the (stale) source .pals and clobbers the
+    # editor's changes.
+    #
+    # Detect the split-source pattern: look for two-or-more JASC .pal
+    # files named ``<stem><digit>.pal`` (in stem-numeric order). If
+    # found, prefer them over any combined ``<stem>.pal`` /
+    # ``<stem>.gbapal``. This is the textbox / region-map / etc.
+    # canonical pattern.
+    import re as _re
+    numbered_pat = _re.compile(
+        r"^" + _re.escape(base_name) + r"(\d+)$"
+    )
+
+    def _numbered_jasc_pals() -> list:
+        """Return matching ``<stem><n>.pal`` files in numeric order, or
+        ``[]`` if fewer than two exist (one isn't a "split" pattern,
+        it's just a singular file with a digit in its name)."""
+        out: list[tuple[int, str]] = []
+        for p in matching_pals:
+            if not p.lower().endswith(".pal"):
+                continue
+            stem = os.path.splitext(os.path.basename(p))[0]
+            m = numbered_pat.match(stem)
+            if m:
+                out.append((int(m.group(1)), p))
+        if len(out) < 2:
+            return []
+        out.sort(key=lambda pair: pair[0])
+        return [p for _, p in out]
+
+    split_pals = _numbered_jasc_pals()
+
+    if split_pals:
+        # Multi-file split palette source — write back to each .pal in
+        # order on save. The matching ``<stem>.gbapal`` (if present) is
+        # a build artifact and stays out of ``best_pals``.
+        best_pals = split_pals
+    elif matching_pals:
         first_colors = _read_colors(matching_pals[0])
         if len(first_colors) > 16:
             best_pals = matching_pals[:1]
+        else:
+            best_pals = matching_pals
     else:
         # No name-matching palette. Auto-pick a multi-palette file in the
         # same directory if there's exactly one — this is the canonical
@@ -881,6 +968,8 @@ def discover_assets(bin_path: str) -> TilemapAssets:
                 multi_pal_candidates.append(p)
         if len(multi_pal_candidates) == 1:
             best_pals = multi_pal_candidates
+        else:
+            best_pals = []
 
     return TilemapAssets(
         bin_path=bin_path,
