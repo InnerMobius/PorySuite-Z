@@ -1,10 +1,22 @@
 """
-Scroll-wheel guard for QComboBox and QSpinBox widgets.
+Scroll-wheel guard for QComboBox / QSpinBox / QDoubleSpinBox / QSlider widgets.
 
-Prevents accidental value changes when the mouse wheel scrolls over a
-combo box or spin box that the user hasn't clicked into.  The widget must
-have strong focus (i.e. the user clicked it) before the scroll wheel will
-do anything.
+Per project rule (``CLAUDE.md`` → Persistent Instructions → UI/UX Rules):
+the mouse wheel MUST NEVER change a guarded widget's value while the widget
+is in its closed/idle state. The user clicks the widget (opening the
+dropdown for a combo, or focusing the spinbox/slider) and picks a value
+explicitly. Scrolling is for page scrolling, not value editing.
+
+This matters because the user runs PorySuite via Chrome Remote Desktop with
+two-finger scrolling. A focused-but-closed dropdown sitting under the
+scrolling cursor would otherwise commit dozens of silent value changes
+while the user scrolls the page — repeatedly observed via piano roll
+instrument dropdowns silently mutating song VOICE values to nearby slot
+indices like 53 (the empty slot in a typical voicegroup).
+
+When a combo box's popup IS open, wheel events go to the popup's QListView
+(a separate widget), so swallowing wheel events on the combo box itself
+does NOT prevent list navigation while the dropdown is open.
 
 Usage
 -----
@@ -24,13 +36,20 @@ _GUARDED_TYPES = (QComboBox, QSpinBox, QDoubleSpinBox, QSlider)
 
 
 class _WheelGuard(QObject):
-    """Event filter that eats wheel events unless the widget has focus."""
+    """Event filter that ALWAYS eats wheel events on the guarded widget.
+
+    Previously this filter only swallowed wheel events when the widget
+    lacked focus, on the theory that "user clicked it → user wants to
+    interact." That theory is wrong for value-bearing widgets in this
+    app — a clicked-then-scrolled dropdown can commit a value change
+    the user never intended, especially with remote-desktop scroll
+    streams. The rule is: wheel never commits a value. Period.
+    """
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
         if event.type() == QEvent.Type.Wheel and isinstance(obj, QWidget):
-            if not obj.hasFocus():
-                event.ignore()
-                return True  # swallow — don't let the widget handle it
+            event.ignore()
+            return True  # swallow — never let a wheel event commit a value
         return False
 
 
@@ -39,7 +58,10 @@ _guard = _WheelGuard()
 
 
 def install_scroll_guard(widget: QWidget) -> None:
-    """Make *widget* ignore scroll-wheel changes unless it has focus."""
+    """Make *widget* ignore the mouse wheel entirely (both focused and
+    unfocused). Click the widget and pick a value explicitly — scroll
+    never changes the value.
+    """
     widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     widget.installEventFilter(_guard)
 

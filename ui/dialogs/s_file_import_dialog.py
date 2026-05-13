@@ -76,27 +76,37 @@ class _SImportWorker(QThread):
             # Copy the .s file (overwrites if approved)
             shutil.copy2(self._source_s_path, dest_path)
 
-            # Create a placeholder .mid so the Makefile's wildcard picks up
-            # this song.  pokefirered derives MID_OBJS from *.mid — without a
-            # .mid the .s never gets assembled into a .o and the link fails.
-            self._create_placeholder_mid(dest_dir)
-
-            # Ensure .s is newer than .mid — make's %.s:%.mid rule runs
-            # mid2agb when .mid is newer, which would overwrite our .s.
-            # Touch .s to now AND backdate the .mid by 2 seconds.
-            os.utime(dest_path)
-            mid_file = os.path.join(dest_dir, self._label + ".mid")
-            if os.path.isfile(mid_file):
-                s_mtime = os.stat(dest_path).st_mtime
-                os.utime(mid_file, (s_mtime - 2, s_mtime - 2))
-
-            # Rewrite label references if the source label differs from our target label
+            # Rewrite label references BEFORE generating the companion .mid
+            # so the .mid is rendered from the same parsed content the user
+            # will see in the editor (correct label, voicegroup, etc).
             self._rewrite_labels(dest_path)
-
-            # Rewrite voicegroup reference if target differs from source
             if (self._target_vg_name and self._source_vg_name
                     and self._target_vg_name != self._source_vg_name):
                 self._rewrite_voicegroup(dest_path)
+
+            # Generate a real, content-matching .mid alongside the .s.
+            # This replaces the previous 26-byte placeholder approach,
+            # which left the .s exposed to build-time wipe: any later
+            # midi.cfg bump (rename, add-song, etc.) would fire the Make
+            # rule `%.s: %.mid midi.cfg` and overwrite the user's .s with
+            # the empty output of mid2agb running on the placeholder.
+            # With a content-matching .mid the worst-case mid2agb re-run
+            # produces an audibly-equivalent .s — no data loss.
+            self._create_companion_mid(dest_dir, dest_path)
+
+            # Ensure .s is newer than .mid — make's %.s:%.mid rule runs
+            # mid2agb when .mid is newer, which would overwrite our .s.
+            # 1-hour backdate (matching save_song_file) — 2 seconds was
+            # inside filesystem-clock-jitter range.  Label / voicegroup
+            # rewriting was already done above before the .mid render,
+            # so the .s on disk is already in its final form.
+            import time as _time
+            now = _time.time()
+            os.utime(dest_path, (now, now))
+            mid_file = os.path.join(dest_dir, self._label + ".mid")
+            if os.path.isfile(mid_file):
+                far_past = now - 3600
+                os.utime(mid_file, (far_past, far_past))
 
             # Register in song_table.inc, songs.h, midi.cfg
             # (skipped when reimporting — the song is already registered)
@@ -184,27 +194,78 @@ class _SImportWorker(QThread):
 
     @staticmethod
     def _make_placeholder_mid() -> bytes:
-        """Return a minimal valid MIDI file (format 0, 0 tracks worth of data).
+        """Return a 26-byte empty SMF.
 
-        This is just enough for the Makefile wildcard to find a .mid and
-        create a build target.  The .s file is always newer, so mid2agb
-        is never actually invoked on this placeholder.
+        DEPRECATED — kept only so call sites that still reference it during
+        a transition don't break.  Do NOT call this for new code: write a
+        real, content-matching .mid via `_create_companion_mid` instead.
+
+        Placeholder .mids are a regression vector: they sit on disk paired
+        with a real-content .s, and any future midi.cfg touch (rename,
+        add-song, etc.) makes midi.cfg newer than .s, which fires the
+        Make rule `%.s: %.mid midi.cfg` and overwrites the user's .s
+        with whatever the placeholder produces (empty 0-track output).
         """
         import struct
-        # MThd chunk: format 0, 1 track, 48 ticks/quarter
         header = b'MThd' + struct.pack('>I', 6) + struct.pack('>HHH', 0, 1, 48)
-        # MTrk chunk: just an end-of-track meta event (00 FF 2F 00)
         track_data = b'\x00\xff\x2f\x00'
         track = b'MTrk' + struct.pack('>I', len(track_data)) + track_data
         return header + track
 
-    def _create_placeholder_mid(self, midi_dir: str):
-        """Write a tiny .mid file next to the .s so the Makefile picks it up."""
-        mid_path = os.path.join(midi_dir, self._label + ".mid")
-        if not os.path.isfile(mid_path):
-            with open(mid_path, "wb") as f:
-                f.write(self._make_placeholder_mid())
-            _log.info("Created placeholder .mid: %s", mid_path)
+    def _create_companion_mid(self, dest_dir: str, s_path: str):
+        """Generate a real, playable .mid alongside the just-imported .s.
+
+        Parses the .s and runs `midi_exporter.write_midi_file` so the .mid
+        contains the same composition as the .s.  This protects the .s
+        from build-time wipe: even if midi.cfg gets bumped and mid2agb
+        runs, the regenerated .s is audibly equivalent to the user's
+        import — no silent data loss.
+
+        Falls back to the legacy 26-byte placeholder ONLY if .s parsing
+        or .mid rendering fails — in that case the placeholder is the
+        least-bad option (the song would otherwise not build at all
+        because the Makefile wildcard requires a .mid file to exist).
+        """
+        mid_path = os.path.join(dest_dir, self._label + ".mid")
+
+        # If the user already has a real-content .mid at this path, leave
+        # it alone — we don't want to nuke their DAW source.
+        if os.path.isfile(mid_path):
+            try:
+                if os.path.getsize(mid_path) > 30:
+                    _log.info(
+                        ".mid already has content; leaving alone: %s",
+                        mid_path)
+                    return
+            except OSError:
+                pass
+
+        try:
+            from core.sound.song_parser import parse_song_file
+            from core.sound.midi_exporter import write_midi_file
+            song = parse_song_file(s_path)
+            if song.tracks and write_midi_file(song, mid_path):
+                _log.info(
+                    "Generated content-matching .mid from %s",
+                    os.path.basename(s_path))
+                return
+        except Exception as exc:
+            _log.warning(
+                "Could not render .mid from %s — falling back to "
+                "placeholder. Reason: %s",
+                os.path.basename(s_path), exc, exc_info=True)
+
+        # Last-resort placeholder so the build doesn't fail completely.
+        # The Makefile wildcard requires a .mid file to exist; an empty
+        # SMF still satisfies the wildcard.  Save IS still risky if a
+        # later midi.cfg bump triggers mid2agb on this empty .mid — but
+        # the project-open integrity sweep (`song_integrity.run_sweep`)
+        # will catch and regenerate this on the next project load.
+        with open(mid_path, "wb") as f:
+            f.write(self._make_placeholder_mid())
+        _log.info(
+            "Wrote placeholder .mid (parser/exporter unavailable): %s",
+            mid_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -1279,18 +1279,52 @@ class UnifiedMainWindow(QMainWindow):
             self.statusBar().showMessage("Nothing to save.", 2000)
 
     def _on_make(self, extra_args: list):
-        """Delegate make to PorySuite's existing _run_make method."""
+        """Delegate make to PorySuite's existing _run_make method.
+
+        Two pre-build protections run before delegating:
+
+          1. **Song integrity sweep** — render a content-matching .mid for
+             any song where the .s has tracks but the .mid is a placeholder
+             (< 30 bytes).  This is the safety net for hand-edited .s files
+             that were never saved via the Piano Roll: without it, the Make
+             rule `%.s: %.mid midi.cfg` would run mid2agb on the placeholder
+             and wipe the .s back to 0 tracks.
+
+          2. **Touch all .s files** to bump their mtimes ahead of .mid and
+             midi.cfg.  This is the primary guard against mid2agb re-running
+             during a normal incremental build.
+
+        Step 1 must happen FIRST so that any newly-regenerated .mid gets
+        backdated by the sweep itself before step 2 touches the .s files.
+        """
         if not self._porysuite_window:
             self.log_message("Cannot build — no project loaded.")
             return
-        # Pre-build safety: touch every .s file in the midi directory so they
-        # are all newer than midi.cfg and their .mid placeholders.  This
-        # prevents make's `%.s: %.mid midi.cfg` rule from running mid2agb
-        # which would overwrite tool-edited .s files with empty skeletons.
-        try:
-            project_dir = self.project_info.get("dir", "")
-            midi_dir = os.path.join(project_dir, "sound", "songs", "midi")
-            if os.path.isdir(midi_dir):
+
+        project_dir = self.project_info.get("dir", "")
+        midi_dir = os.path.join(project_dir, "sound", "songs", "midi") if project_dir else ""
+
+        # Step 1: integrity sweep — regenerate placeholder .mids from .s
+        # content so a stale placeholder can't drive mid2agb to wipe the
+        # user's hand-composed work.
+        if project_dir and os.path.isdir(midi_dir):
+            try:
+                from core.sound.song_integrity import run_sweep
+                report = run_sweep(project_dir)
+                if report.regenerated:
+                    self.log_message(
+                        f"Pre-build integrity sweep: regenerated "
+                        f"{len(report.regenerated)} placeholder .mid file(s) "
+                        f"from .s content")
+                if report.errors:
+                    for label, err in report.errors:
+                        self.log_message(
+                            f"Pre-build sweep warning: {label} — {err}")
+            except Exception as exc:
+                self.log_message(f"Pre-build integrity sweep failed: {exc}")
+
+            # Step 2: touch every .s so they're newer than midi.cfg/.mid.
+            try:
                 touched = 0
                 for fn in os.listdir(midi_dir):
                     if fn.endswith('.s'):
@@ -1300,9 +1334,12 @@ class UnifiedMainWindow(QMainWindow):
                         except OSError:
                             pass
                 if touched:
-                    self.log_message(f"Pre-build: touched {touched} .s files to prevent mid2agb overwrite")
-        except Exception as e:
-            self.log_message(f"Pre-build .s protection warning: {e}")
+                    self.log_message(
+                        f"Pre-build: touched {touched} .s files to prevent "
+                        f"mid2agb overwrite")
+            except Exception as e:
+                self.log_message(f"Pre-build .s protection warning: {e}")
+
         self._porysuite_window._run_make(extra_args)
 
     def _on_expand_rom(self):

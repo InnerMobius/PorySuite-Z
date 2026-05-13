@@ -438,9 +438,34 @@ def rename_song(
     new_mid = os.path.join(midi_dir, entry.midi_filename)
     if os.path.isfile(old_mid) and old_mid != new_mid:
         try:
+            # Refuse to silently destroy an existing populated .mid at
+            # the destination. The earlier `os.remove(new_mid)`
+            # unconditional delete caused the
+            # mus_ocarina_soaring_full.mid corruption — a rename moved
+            # one song's .mid over another's, the build then read the
+            # surviving .mid and produced a wrong .s. If new_mid exists
+            # with non-stub content (>30 bytes — placeholders are 26),
+            # bail out with a ValueError so the caller (and ultimately
+            # the user via the rename dialog) gets a chance to back up
+            # before retrying. Stub-overwriting-stub is fine; that's
+            # just normal rename housekeeping.
             if os.path.isfile(new_mid):
+                try:
+                    target_size = os.path.getsize(new_mid)
+                except OSError:
+                    target_size = 0
+                if target_size > 30:
+                    raise ValueError(
+                        f"Refusing to overwrite '{entry.midi_filename}' "
+                        f"during rename — destination .mid already "
+                        f"contains {target_size} bytes of data and "
+                        f"would be destroyed. Back up or delete that "
+                        f"file manually before retrying the rename."
+                    )
                 os.remove(new_mid)
             os.rename(old_mid, new_mid)
+        except ValueError:
+            raise  # surface the guard up to the caller
         except OSError:
             # Non-fatal: the rename will surface as a build error and the
             # user can retry. Better than crashing the rename action.

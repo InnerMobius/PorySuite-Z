@@ -366,6 +366,41 @@ def run_mid2agb(
     # name (e.g. "battletest_FINAL.mid") leaves a stray .mid that the
     # Makefile's wildcard picks up and tries to build, breaking make.
     midi_dest = os.path.join(midi_dir, output_label + ".mid")
+
+    # Refuse to silently overwrite a populated .mid at the destination.
+    # If midi_dest exists with >30 bytes (i.e. it's not a placeholder
+    # stub) AND the incoming source has different content, bail out
+    # with a clear error. The classic failure mode this prevents: the
+    # user picks the wrong source file in the import dialog (e.g. epona's
+    # MIDI when intending soaring's), and shutil.copy2 silently destroys
+    # the existing soaring .mid. Subsequent builds then regenerate
+    # soaring.s from epona's notes, corrupting hand-edited work.
+    if os.path.isfile(midi_dest):
+        try:
+            existing_size = os.path.getsize(midi_dest)
+        except OSError:
+            existing_size = 0
+        if existing_size > 30:
+            try:
+                with open(midi_dest, 'rb') as df:
+                    existing_bytes = df.read()
+                with open(midi_path, 'rb') as sf:
+                    incoming_bytes = sf.read()
+            except OSError:
+                existing_bytes = b''
+                incoming_bytes = b'\x00'
+            if existing_bytes != incoming_bytes:
+                raise FileExistsError(
+                    f"Refusing to overwrite '{output_label}.mid' — "
+                    f"destination already contains {existing_size} bytes "
+                    f"of MIDI data that differs from the import source. "
+                    f"This protects against accidentally destroying a "
+                    f"song's existing .mid (which would otherwise cause "
+                    f"its .s to be regenerated with wrong content on the "
+                    f"next build). Back up or delete that .mid manually "
+                    f"before retrying the import."
+                )
+
     try:
         _KEEP_META = {'set_tempo', 'time_signature', 'end_of_track'}
         mid = mido.MidiFile(midi_path)

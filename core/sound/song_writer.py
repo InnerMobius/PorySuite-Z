@@ -800,13 +800,41 @@ def save_song_file(song: SongData, path: Optional[str] = None) -> str:
 
     If path is None, uses song.file_path (the original location).
 
-    After writing, ensures the .s file's mtime is newer than the
-    corresponding .mid file (if one exists).  pokefirered's Makefile has
-    a `%.s: %.mid` rule — if .mid is newer than .s, `make` runs mid2agb
-    which OVERWRITES the .s with whatever the .mid produces.  For songs
-    edited through the piano roll (where .s is the source of truth and
-    .mid is just a placeholder), this would destroy the user's work.
+    The .s file is the canonical, full-fidelity source of truth for any
+    song that's been edited in the Piano Roll or via the inline header
+    editor.  But we cannot afford to leave the .mid on disk stale,
+    because:
+
+      - The pokefirered Makefile rule `%.s: %.mid midi.cfg` will rerun
+        mid2agb if it sees the .mid as newer than the .s on disk.
+      - `git reset --hard FETCH_HEAD` / `git checkout` / `git pull`
+        restores any tracked .mid back to its committed content AND
+        bumps its mtime to "now" — which would defeat any mtime-only
+        protection and let a stale .mid silently overwrite the user's
+        hand-edited .s on the next build.
+
+    The defense in depth is:
+
+      1. Write the .s with the song's current in-memory content.
+      2. **Regenerate the .mid from that same in-memory song data** so
+         the .mid contents are byte-equivalent to the .s.  Even if a
+         future git operation restores the .mid (mtime bumped) and the
+         build pipeline runs mid2agb, the regenerated .s is audibly
+         equivalent — no silent data loss.  Also makes the .mid actually
+         playable in Windows Media Player / any DAW, which the previous
+         26-byte placeholder was not.
+      3. Backdate the .mid AND midi.cfg by 1 hour so pokefirered's
+         `%.s: %.mid midi.cfg` Make rule never decides to re-run
+         mid2agb during normal builds.  The .s is touched to "now" to
+         win against any filesystem-clock skew.
+
+    The .mid regeneration is byte-equality guarded inside
+    `write_midi_file` — re-saving an unchanged song doesn't dirty the
+    .mid's mtime or git status.
     """
+    import os
+    import time as _time
+
     output_path = path or song.file_path
     if not output_path:
         raise ValueError(f"No file path for song '{song.label}'")
@@ -815,16 +843,54 @@ def save_song_file(song: SongData, path: Optional[str] = None) -> str:
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(content)
 
-    # Protect against mid2agb overwrite: ensure .s is newer than .mid.
-    # Writing the file already sets mtime to now, but we also backdate
-    # the .mid to guarantee the ordering even if both happen in the same
-    # second (filesystem resolution can be 1-2 seconds on FAT/NTFS).
-    import os
-    mid_path = output_path.rsplit('.', 1)[0] + '.mid'
+    midi_dir = os.path.dirname(output_path)
+    base = os.path.basename(output_path).rsplit('.', 1)[0]
+    mid_path = os.path.join(midi_dir, base + '.mid')
+    cfg_path = os.path.join(midi_dir, 'midi.cfg')
+
+    # Step 2: regenerate the .mid from the in-memory song so the .mid
+    # on disk MATCHES the .s we just wrote.  Falls back gracefully if
+    # mido has an issue with the song data — the .s save already
+    # succeeded above, so a failed .mid render is non-fatal.
+    try:
+        from core.sound.midi_exporter import write_midi_file
+        write_midi_file(song, mid_path)
+    except Exception as _exc:
+        # Failures inside write_midi_file are already logged.  This
+        # outer guard catches the rarer case where the IMPORT fails
+        # (e.g. mido missing, midi_exporter syntax error during dev).
+        # Surface a single warning line so the user at least knows
+        # the .mid wasn't regenerated — don't propagate, because the
+        # .s save already succeeded and the .s is the canonical edit.
+        import logging as _logging
+        _logging.getLogger("SoundEditor.SongWriter").warning(
+            "Could not regenerate .mid for %s: %s — .s saved OK",
+            song.label, _exc)
+
+    # Step 3: timestamp lock.  Push .mid and midi.cfg 1 hour into the
+    # past so neither can ever appear newer than .s on the filesystem
+    # during a normal incremental build.
+    now = _time.time()
+    far_past = now - 3600
+    try:
+        os.utime(output_path, (now, now))
+    except OSError:
+        pass
     if os.path.isfile(mid_path):
-        s_stat = os.stat(output_path)
-        # Set .mid mtime to 2 seconds before the .s mtime
-        past = s_stat.st_mtime - 2
-        os.utime(mid_path, (past, past))
+        try:
+            os.utime(mid_path, (far_past, far_past))
+        except OSError:
+            pass
+    if os.path.isfile(cfg_path):
+        try:
+            cfg_mtime = os.stat(cfg_path).st_mtime
+            if cfg_mtime >= now:
+                # Only push it back if it's currently at/after our .s.
+                # If it's already in the past, leave it alone — other
+                # songs sharing midi.cfg shouldn't have their make
+                # dependency goalposts moved unnecessarily.
+                os.utime(cfg_path, (far_past, far_past))
+        except OSError:
+            pass
 
     return output_path

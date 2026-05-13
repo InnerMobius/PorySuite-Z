@@ -431,6 +431,33 @@ class SoundEditorTab(QWidget):
             # Defer sample loading until playback — keeps startup fast
             self._sample_data = None
 
+            # Run the song-integrity sweep BEFORE the song list paints.
+            # For every song whose .s has content but whose .mid is a
+            # placeholder, render a content-matching .mid from the .s
+            # and backdate timestamps.  This is the structural protection
+            # against the "hand-edited .s + placeholder .mid" failure
+            # mode that wiped storms_short and sun_short — even if the
+            # user composed by text-editing the .s without ever opening
+            # PorySuite, the sweep populates a matching .mid on the
+            # NEXT project open so a future Make run can't destroy the
+            # composition. Non-fatal: errors are logged and the sweep
+            # continues to other songs.
+            try:
+                from core.sound.song_integrity import run_sweep
+                _report = run_sweep(project_root)
+                if _report.regenerated:
+                    _log.info(
+                        "Song integrity sweep regenerated %d .mid file(s): %s",
+                        len(_report.regenerated),
+                        ", ".join(_report.regenerated))
+                if _report.errors:
+                    for label, err in _report.errors:
+                        _log.warning(
+                            "Song integrity sweep: %s — %s", label, err)
+            except Exception as exc:
+                _log.warning("Song integrity sweep failed: %s", exc,
+                             exc_info=True)
+
             # Load any saved friendly voicegroup labels (UI-only).
             # If none exist for this project yet (every project gets its own
             # cache slug, hashed from the absolute project path — two
@@ -977,13 +1004,45 @@ class SoundEditorTab(QWidget):
                         pass
                 raise
 
-            # ── Step 4: ensure a .mid placeholder exists (Makefile's
-            # MID_OBJS wildcard is `sound/songs/midi/*.mid`).
-            if not os.path.isfile(mid_path):
-                from ui.dialogs.s_file_import_dialog import _SImportWorker
-                with open(mid_path, "wb") as mf:
-                    mf.write(_SImportWorker._make_placeholder_mid())
-                _log.info("Created placeholder .mid for %s", entry.label)
+            # ── Step 4: ensure a content-matching .mid exists.
+            # The Makefile's MID_OBJS wildcard is `sound/songs/midi/*.mid`,
+            # so the file MUST exist or the build can't see this song.
+            # We render the .mid from the .s we just wrote so the two
+            # files agree on content — this is what protects the .s
+            # from build-time wipe: even if midi.cfg gets touched later
+            # and Make fires mid2agb, the regenerated .s is audibly
+            # equivalent to what we just wrote. A previous version of
+            # this path wrote a 26-byte empty placeholder, which left
+            # the .s exposed: any midi.cfg bump caused mid2agb to wipe
+            # the .s back to 0 tracks (this is exactly what destroyed
+            # storms_short and sun_short).
+            try:
+                from core.sound.song_parser import parse_song_file
+                from core.sound.midi_exporter import write_midi_file
+                parsed = parse_song_file(dest_path)
+                if parsed.tracks and write_midi_file(parsed, mid_path):
+                    _log.info(
+                        "Rendered content-matching .mid for %s",
+                        entry.label)
+                elif not os.path.isfile(mid_path):
+                    # Parsing returned no tracks (rare) AND no .mid
+                    # currently on disk — fall back to the placeholder
+                    # so the Makefile wildcard still finds something.
+                    from ui.dialogs.s_file_import_dialog import _SImportWorker
+                    with open(mid_path, "wb") as mf:
+                        mf.write(_SImportWorker._make_placeholder_mid())
+                    _log.info(
+                        "Wrote placeholder .mid (.s had no tracks) for %s",
+                        entry.label)
+            except Exception as exc:
+                _log.warning(
+                    "Could not render .mid from %s — falling back to "
+                    "placeholder. Reason: %s",
+                    entry.label, exc, exc_info=True)
+                if not os.path.isfile(mid_path):
+                    from ui.dialogs.s_file_import_dialog import _SImportWorker
+                    with open(mid_path, "wb") as mf:
+                        mf.write(_SImportWorker._make_placeholder_mid())
 
             # ── Step 5: lock mtimes so mid2agb CANNOT re-run on build.
             # pokefirered's audio_rules.mk declares:

@@ -204,11 +204,32 @@ def _postprocess_structure(s_path: str, loop_config: dict):
 
         # Protect against mid2agb overwrite: backdate the .mid so it's
         # older than the .s we just wrote.  make's %.s:%.mid rule skips
-        # mid2agb when .s is newer.
+        # mid2agb when .s is newer.  Use a 1-hour backdate (matching
+        # save_song_file's timestamp lock) — the previous 2-second value
+        # was inside filesystem-clock-jitter range.  Backdate midi.cfg
+        # too if it's currently at/after the .s, since midi.cfg is a
+        # co-dependency in the Make rule.
         mid_path = s_path.rsplit('.', 1)[0] + '.mid'
+        cfg_path = os.path.join(os.path.dirname(s_path), 'midi.cfg')
+        import time as _time
+        now = _time.time()
+        far_past = now - 3600
+        try:
+            os.utime(s_path, (now, now))
+        except OSError:
+            pass
         if os.path.isfile(mid_path):
-            s_mtime = os.stat(s_path).st_mtime
-            os.utime(mid_path, (s_mtime - 2, s_mtime - 2))
+            try:
+                os.utime(mid_path, (far_past, far_past))
+            except OSError:
+                pass
+        if os.path.isfile(cfg_path):
+            try:
+                cfg_mt = os.stat(cfg_path).st_mtime
+                if cfg_mt >= now:
+                    os.utime(cfg_path, (far_past, far_past))
+            except OSError:
+                pass
         return
 
     # Custom mode: we need to understand measure boundaries in the .s file.
@@ -338,16 +359,36 @@ def _postprocess_structure(s_path: str, loop_config: dict):
 
 
 def _backdate_mid(s_path: str) -> None:
-    """Backdate the .mid file so it's older than the .s we just wrote.
+    """Backdate the .mid file and midi.cfg so both are older than the
+    .s we just wrote.
 
-    pokefirered's Makefile has a %.s:%.mid rule — if .mid is newer than
-    .s, make runs mid2agb which OVERWRITES the .s.  Backdating prevents
-    that from wiping tool-edited assembly.
+    pokefirered's Makefile rule `%.s: %.mid midi.cfg` reruns mid2agb if
+    EITHER prereq is newer than the .s, so both must be locked.  Use a
+    1-hour backdate — the previous 2-second value was inside filesystem-
+    clock-jitter range and could fail after as little as a second of
+    real-time drift.
     """
+    import time as _time
     mid_path = s_path.rsplit('.', 1)[0] + '.mid'
+    cfg_path = os.path.join(os.path.dirname(s_path), 'midi.cfg')
+    now = _time.time()
+    far_past = now - 3600
+    try:
+        os.utime(s_path, (now, now))
+    except OSError:
+        pass
     if os.path.isfile(mid_path):
-        s_mtime = os.stat(s_path).st_mtime
-        os.utime(mid_path, (s_mtime - 2, s_mtime - 2))
+        try:
+            os.utime(mid_path, (far_past, far_past))
+        except OSError:
+            pass
+    if os.path.isfile(cfg_path):
+        try:
+            cfg_mt = os.stat(cfg_path).st_mtime
+            if cfg_mt >= now:
+                os.utime(cfg_path, (far_past, far_past))
+        except OSError:
+            pass
 
 
 # ── Filler detection (same logic as voicegroups_tab) ───────────────────────
