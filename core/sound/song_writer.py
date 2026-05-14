@@ -355,24 +355,53 @@ def _format_note(
 
     Notes with duration > 96 ticks are handled separately via TIE/EOT
     in notes_to_track_commands — this function only handles Nxx notes.
+
+    **Critical M4A engine behavior:** a bare velocity byte (e.g.
+    `.byte v112` alone, which assembles to byte 0x70) is interpreted by
+    the M4A engine as the **pitch argument** for the previous running-
+    status note command — NOT as a velocity update.  ply_note in
+    m4a_1.s reads the first byte at cmdPtr as the note's KEY and only
+    treats the second byte as velocity.  So emitting just `v112` after
+    `N01, Gn4, v120` produces a note at MIDI pitch 0x70 (En7) with the
+    previous velocity v120 retained — completely the wrong sound.
+
+    To avoid this, when the velocity changes we MUST also emit the
+    pitch token (and duration if it changed too).  The result is the
+    same compact form that vanilla mid2agb produces for repeated-pitch
+    velocity sequences: `.byte Gn4, v112`, which assembles to `4F 70`
+    and is correctly parsed by the engine via running status: byte 4F
+    < 0x80 → use running status N01 → ply_note reads 4F as KEY, then
+    70 as VELOCITY.  Round-trips cleanly through mid2agb.
+
+    PorySuite's own .s parser used to be permissive enough to interpret
+    bare `v112` lines as full NOTE re-triggers (inheriting both pitch
+    and duration), which made the in-app preview play correctly while
+    the in-game build sounded wrong.  This function is the fix's
+    source — produce only forms the engine actually understands.
     """
     parts = []
 
     # Clamp duration to 96 max (caller should use TIE for longer notes)
     duration = min(cmd.duration or 24, 96)
+    duration_changed = duration != last_dur
+    pitch_changed = cmd.pitch != last_pitch
+    velocity_changed = (
+        cmd.velocity is not None and cmd.velocity != last_vel)
 
     # Duration (Nxx) — only emit if changed
     dur_name = _best_note_name(duration)
-    if duration != last_dur:
+    if duration_changed:
         parts.append(dur_name)
 
-    # Pitch — only emit if changed
+    # Pitch — emit if changed, if duration changed (running-status
+    # requires it back), OR if velocity changed (so the velocity byte
+    # isn't misread by the engine as the KEY argument — see docstring).
     pitch_str = _pitch_name(cmd.pitch if cmd.pitch is not None else 60)
-    if cmd.pitch != last_pitch or duration != last_dur:
+    if pitch_changed or duration_changed or velocity_changed:
         parts.append(pitch_str)
 
     # Velocity — only emit if changed
-    if cmd.velocity is not None and cmd.velocity != last_vel:
+    if velocity_changed:
         parts.append(f'v{cmd.velocity:03d}')
 
     # Gate time
