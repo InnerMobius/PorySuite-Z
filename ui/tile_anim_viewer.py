@@ -1000,6 +1000,15 @@ class TileAnimEditorWidget(QWidget):
         btn_import_png_pal.clicked.connect(self._import_palette_from_png)
         pal_btns.addWidget(btn_import_png_pal)
 
+        btn_import_png_manual = QPushButton("Import PNG Manually")
+        btn_import_png_manual.setToolTip(
+            "Open the manual palette picker on any PNG.\n"
+            "Pick which colours land in which slot and set the BG slot."
+        )
+        btn_import_png_manual.clicked.connect(
+            self._import_palette_from_png_manual)
+        pal_btns.addWidget(btn_import_png_manual)
+
         pal_layout.addLayout(pal_btns)
         left_layout.addWidget(pal_group)
 
@@ -1894,44 +1903,64 @@ class TileAnimEditorWidget(QWidget):
                                 f"Could not write palette to:\n{path}")
 
     def _import_palette_from_png(self):
-        """Extract palette from an indexed PNG and apply to all frames."""
+        """Auto-extract palette from an indexed PNG and apply to all frames."""
+        self._do_import_palette_from_png(manual=False)
+
+    def _import_palette_from_png_manual(self):
+        """Open the manual palette picker on any PNG and apply to all frames."""
+        self._do_import_palette_from_png(manual=True)
+
+    def _do_import_palette_from_png(self, manual: bool):
         if not self._current_anim:
             return
         start_dir = self._current_anim.anim_dir or ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Indexed PNG", start_dir, "PNG Images (*.png)")
+            self, "Select PNG" if manual else "Select Indexed PNG",
+            start_dir, "PNG Images (*.png)")
         if not path:
             return
 
-        img = QImage(path)
-        if img.isNull():
-            QMessageBox.warning(self, "Import Failed",
-                                f"Could not load image:\n{path}")
-            return
+        if manual:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                pick_palette_manually_from_path,
+            )
+            colors = pick_palette_manually_from_path(
+                path, target_colors=16, parent=self,
+            )
+            if colors is None:
+                return
+            n_used = sum(1 for c in colors if c != (0, 0, 0))
+        else:
+            img = QImage(path)
+            if img.isNull():
+                QMessageBox.warning(self, "Import Failed",
+                                    f"Could not load image:\n{path}")
+                return
 
-        if img.format() != QImage.Format.Format_Indexed8:
-            QMessageBox.warning(
-                self, "Not an Indexed PNG",
-                "This PNG is not in indexed (palette) mode.\n\n"
-                "The image must be saved as an indexed-color PNG\n"
-                "(8-bit, up to 16 colors) so its embedded palette\n"
-                "can be extracted.")
-            return
+            if img.format() != QImage.Format.Format_Indexed8:
+                QMessageBox.warning(
+                    self, "Not an Indexed PNG",
+                    "This PNG is not in indexed (palette) mode.\n\n"
+                    "The image must be saved as an indexed-color PNG\n"
+                    "(8-bit, up to 16 colors) so its embedded palette\n"
+                    "can be extracted — or use 'Import PNG Manually'.")
+                return
 
-        ct = img.colorTable()
-        if not ct:
-            QMessageBox.warning(self, "Empty Palette",
-                                "The PNG has no color table entries.")
-            return
+            ct = img.colorTable()
+            if not ct:
+                QMessageBox.warning(self, "Empty Palette",
+                                    "The PNG has no color table entries.")
+                return
 
-        colors: List[Color] = []
-        for entry in ct[:16]:
-            r = (entry >> 16) & 0xFF
-            g = (entry >> 8) & 0xFF
-            b = entry & 0xFF
-            colors.append(clamp_to_gba(r, g, b))
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
+            colors: List[Color] = []
+            for entry in ct[:16]:
+                r = (entry >> 16) & 0xFF
+                g = (entry >> 8) & 0xFF
+                b = entry & 0xFF
+                colors.append(clamp_to_gba(r, g, b))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+            n_used = min(16, len(ct))
 
         self._loading = True
         self._pal_row.set_colors(colors)
@@ -1942,7 +1971,7 @@ class TileAnimEditorWidget(QWidget):
 
         QMessageBox.information(
             self, "Palette Imported",
-            f"Extracted {min(16, len(ct))} colors from:\n"
+            f"Extracted {n_used} colors from:\n"
             f"{os.path.basename(path)}\n\n"
             f"Applied to {self._current_anim.frame_count} frames.")
 

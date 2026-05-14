@@ -520,6 +520,15 @@ class TrainerGraphicsTab(QWidget):
         )
         ig.addWidget(self._import_png_btn)
 
+        self._import_png_manual_btn = QPushButton("Import Palette Manually…")
+        self._import_png_manual_btn.setToolTip(
+            "Open the manual palette picker on any PNG.\n"
+            "Pick which colours land in which slot, set the BG slot,\n"
+            "reorder freely.  The chosen palette is loaded into this\n"
+            "trainer's palette; pixel indices in the sprite are preserved."
+        )
+        ig.addWidget(self._import_png_manual_btn)
+
         self._import_pal_btn = QPushButton("Import .pal File…")
         self._import_pal_btn.setToolTip(
             "Pick a JASC .pal file and load its 16 colours into\n"
@@ -592,6 +601,8 @@ class TrainerGraphicsTab(QWidget):
         self._add_pic_btn.clicked.connect(self._on_add_trainer_pic)
         self._import_sprite_btn.clicked.connect(self._import_sprite_from_png)
         self._import_png_btn.clicked.connect(self._import_palette_from_png)
+        self._import_png_manual_btn.clicked.connect(
+            self._import_palette_from_png_manual)
         self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
         self._export_png_btn.clicked.connect(self._export_sprite_png)
         self._export_pal_btn.clicked.connect(self._export_palette_file)
@@ -1145,7 +1156,14 @@ class TrainerGraphicsTab(QWidget):
         )
 
     def _import_palette_from_png(self) -> None:
-        """Extract palette from an indexed PNG and load it."""
+        """Auto-extract palette from an indexed PNG and load it."""
+        self._do_palette_import_from_png(manual=False)
+
+    def _import_palette_from_png_manual(self) -> None:
+        """Open the manual palette picker on any PNG."""
+        self._do_palette_import_from_png(manual=True)
+
+    def _do_palette_import_from_png(self, manual: bool) -> None:
         if not self._current_pic:
             QMessageBox.information(
                 self, "No Trainer Pic Selected",
@@ -1164,44 +1182,82 @@ class TrainerGraphicsTab(QWidget):
             start_dir = self._project_root or ""
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Indexed PNG",
+            self, "Select PNG" if manual else "Select Indexed PNG",
             start_dir,
             "PNG Images (*.png)",
         )
         if not path:
             return
 
-        img = QImage(path)
-        if img.isNull():
-            QMessageBox.warning(
-                self, "Import Failed",
-                f"Could not load image:\n{path}",
+        remapped_img = None
+        if manual:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
             )
-            return
-
-        if img.format() != QImage.Format.Format_Indexed8:
-            QMessageBox.warning(
-                self, "Not an Indexed PNG",
-                "This PNG is not in indexed (palette) mode.\n\n"
-                "The image must be saved as an indexed-colour PNG\n"
-                "(8-bit, 16 colours) so its embedded palette can be\n"
-                "extracted. Convert it in your image editor first.",
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self,
             )
-            return
+            if result is None:
+                return
+            colors, remapped_img = result
+            n_used = sum(1 for c in colors if c != (0, 0, 0))
+        else:
+            img = QImage(path)
+            if img.isNull():
+                QMessageBox.warning(
+                    self, "Import Failed",
+                    f"Could not load image:\n{path}",
+                )
+                return
 
-        ct = img.colorTable()
-        if len(ct) < 1:
-            QMessageBox.warning(self, "Empty Palette", "The PNG has no colour table entries.")
-            return
+            if img.format() != QImage.Format.Format_Indexed8:
+                QMessageBox.warning(
+                    self, "Not an Indexed PNG",
+                    "This PNG is not in indexed (palette) mode.\n\n"
+                    "The image must be saved as an indexed-colour PNG\n"
+                    "(8-bit, 16 colours) so its embedded palette can be\n"
+                    "extracted — or use 'Import Palette Manually…' to\n"
+                    "pick colours from any PNG.",
+                )
+                return
 
-        colors: List[Color] = []
-        for entry in ct[:16]:
-            r = (entry >> 16) & 0xFF
-            g = (entry >> 8) & 0xFF
-            b = entry & 0xFF
-            colors.append(clamp_to_gba(r, g, b))
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
+            ct = img.colorTable()
+            if len(ct) < 1:
+                QMessageBox.warning(self, "Empty Palette",
+                                    "The PNG has no colour table entries.")
+                return
+
+            colors: List[Color] = []
+            for entry in ct[:16]:
+                r = (entry >> 16) & 0xFF
+                g = (entry >> 8) & 0xFF
+                b = entry & 0xFF
+                colors.append(clamp_to_gba(r, g, b))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+            n_used = min(len(ct), 16)
+
+        # Manual mode: overwrite the trainer's source PNG with the
+        # remapped indexed image so the on-disk sprite matches the new
+        # palette.  Auto mode preserves pixel indices.
+        if manual and remapped_img is not None and self._current_png_path:
+            try:
+                from ui.dialogs.manual_palette_pick_dialog import (
+                    save_remapped_image,
+                )
+                if not save_remapped_image(
+                        remapped_img, colors, self._current_png_path):
+                    QMessageBox.warning(
+                        self, "Image Save Failed",
+                        f"Palette loaded into the editor, but the "
+                        f"remapped PNG couldn't be written to:\n"
+                        f"{self._current_png_path}",
+                    )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Image Save Failed",
+                    f"Could not save the remapped image:\n{exc}",
+                )
 
         # Apply
         self._palettes[self._current_pic] = colors
@@ -1227,7 +1283,7 @@ class TrainerGraphicsTab(QWidget):
 
         QMessageBox.information(
             self, "Palette Imported",
-            f"Loaded {len(ct[:16])} colours from:\n"
+            f"Loaded {n_used} colours from:\n"
             f"{os.path.basename(path)}\n\n"
             f"Applied to: {self._current_pic}\n\n"
             "The preview has been updated. Click File → Save to\n"

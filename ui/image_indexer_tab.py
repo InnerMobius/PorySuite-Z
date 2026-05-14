@@ -103,7 +103,17 @@ class _ManualPickDialog(QDialog):
     """
 
     def __init__(self, candidates: list[tuple[int, int, int]],
-                 target: int, source_img: QImage, parent=None):
+                 target: int, source_img: QImage, parent=None,
+                 *,
+                 initial_palette: list[tuple[int, int, int]] | None = None):
+        """
+        initial_palette: optional seed for the result row.  When provided
+            (e.g. extracted from an already-indexed source PNG), the
+            dialog opens with these colours pre-loaded in slot order
+            instead of auto-filling from the candidate pool.  The user
+            can still reorder / edit / replace any of them.  Length is
+            clipped or padded with black to match `target`.
+        """
         super().__init__(parent)
         self.setWindowTitle(f"Pick & order {target} colours from {len(candidates)} candidates")
         self.setMinimumWidth(560)
@@ -118,10 +128,40 @@ class _ManualPickDialog(QDialog):
         # use but other sprites sharing the palette need.
         self._result_colors: list[tuple[int, int, int]] = []
         self._filled_count: int = 0
+        # Pre-fill hint for _build_ui — None means "use auto-fill", a
+        # list means "seed the result row with these colours in this
+        # order".  Stored here because _build_ui runs from __init__ and
+        # decides whether to call _auto_fill or _apply_initial_palette.
+        self._initial_palette = initial_palette
         # Suppress _on_result_colors_changed during programmatic set_colors.
         self._suppress_row_signal: bool = False
         self._candidate_swatches: list[_CandidateSwatch] = []
         self._build_ui()
+
+    def _apply_initial_palette(self, colors: list[tuple[int, int, int]]) -> None:
+        """Pre-fill the result row with a known palette (e.g. from an
+        already-indexed source PNG).  Pads or trims to `_target` length.
+        Counts the non-pure-black trailing slots as "real" so that the
+        filled count reflects what the source actually contained."""
+        seeded = list(colors[:self._target])
+        # Find the last non-black slot — that's where the meaningful
+        # palette content ends.  If the source had its slot-0 as black
+        # (transparent) that still counts as filled.
+        meaningful_end = 0
+        for i, c in enumerate(seeded):
+            if c != (0, 0, 0):
+                meaningful_end = i + 1
+        # If the source provides every slot (slot 0 = black BG + 15 real
+        # colours), treat the whole thing as filled.  When fewer entries
+        # are given, only count up to the last non-black one.
+        if len(seeded) == self._target:
+            self._filled_count = self._target
+        else:
+            self._filled_count = max(meaningful_end, len(seeded))
+        while len(seeded) < self._target:
+            seeded.append((0, 0, 0))
+        self._result_colors = seeded
+        self._refresh()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -232,8 +272,15 @@ class _ManualPickDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-        # Pre-fill with the first N candidates as a sensible starting point.
-        self._auto_fill()
+        # Pre-fill the result row.  When the caller supplied an existing
+        # palette (e.g. extracted from an already-indexed source PNG),
+        # honour its slot order so the user opens the dialog at the
+        # "current" palette instead of a generic auto-fill they'd then
+        # have to rebuild.  Without a seed, fall back to auto-fill.
+        if self._initial_palette:
+            self._apply_initial_palette(self._initial_palette)
+        else:
+            self._auto_fill()
 
     # ── State management ──────────────────────────────────────────────────
 

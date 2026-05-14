@@ -76,6 +76,23 @@ def _reskin_indexed_image(img: QImage,
         return None
 
 
+def _png_dims(path: str) -> Optional[Tuple[int, int]]:
+    """Return `(width, height)` of a PNG without paying the cost of a
+    full decode-into-pixmap.  Used by the Manual import flow to pick
+    which target (front.png / back.png) to write a remapped sprite to.
+    Returns None if the file is missing or unreadable.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        img = QImage(path)
+        if img.isNull():
+            return None
+        return (img.width(), img.height())
+    except Exception:
+        return None
+
+
 def _reskin_indexed_png(path: str, palette: List[Color]) -> Optional[QPixmap]:
     """Recolour an indexed-palette PNG using a new 16-colour palette.
 
@@ -678,6 +695,17 @@ class GraphicsTabWidget(QWidget):
         )
         ig_import.addWidget(self._import_png_btn)
 
+        self._import_png_manual_btn = QPushButton("Import PNG Manually...")
+        self._import_png_manual_btn.setToolTip(
+            "Open the manual palette picker on a PNG (any format —\n"
+            "indexed or full-colour).  You choose which colours land\n"
+            "in which slot, mark the BG/transparent slot, reorder\n"
+            "freely, and see a live preview of the remap.  The result\n"
+            "is loaded into the Normal or Shiny palette (whichever\n"
+            "radio is selected above)."
+        )
+        ig_import.addWidget(self._import_png_manual_btn)
+
         self._import_pal_btn = QPushButton("Import .pal File...")
         self._import_pal_btn.setToolTip(
             "Pick a JASC .pal file and load its 16 colours into the\n"
@@ -773,6 +801,8 @@ class GraphicsTabWidget(QWidget):
 
         self._open_folder_btn.clicked.connect(self._open_graphics_folder)
         self._import_png_btn.clicked.connect(self._import_palette_from_png)
+        self._import_png_manual_btn.clicked.connect(
+            self._import_palette_from_png_manual)
         self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
 
     def _make_thumb(self, display_size: int, title: str):
@@ -1307,7 +1337,16 @@ class GraphicsTabWidget(QWidget):
 
     # ────────────────────────────── palette import from indexed PNG ──
     def _import_palette_from_png(self) -> None:
-        """Extract palette from an indexed PNG and load it as Normal or Shiny."""
+        """Auto-extract palette from an indexed PNG and load it as
+        Normal or Shiny."""
+        self._do_import_palette_from_png(manual=False)
+
+    def _import_palette_from_png_manual(self) -> None:
+        """Open the manual palette picker on ANY PNG (indexed or not)
+        and load the chosen palette as Normal or Shiny."""
+        self._do_import_palette_from_png(manual=True)
+
+    def _do_import_palette_from_png(self, manual: bool) -> None:
         if not self._current_species:
             QMessageBox.information(
                 self, "No Species Selected",
@@ -1327,52 +1366,65 @@ class GraphicsTabWidget(QWidget):
         if not start_dir:
             start_dir = self._project_root or ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Indexed PNG",
+            self, "Select PNG" if manual else "Select Indexed PNG",
             start_dir,
             "PNG Images (*.png)",
         )
         if not path:
             return
 
-        # Read the PNG and extract its color table
-        img = QImage(path)
-        if img.isNull():
-            QMessageBox.warning(
-                self, "Import Failed",
-                f"Could not load image:\n{path}",
+        remapped_img = None
+        if manual:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
             )
-            return
-
-        # Must be an indexed (palette-mode) image
-        from PyQt6.QtGui import QImage as _QI
-        if img.format() != _QI.Format.Format_Indexed8:
-            QMessageBox.warning(
-                self, "Not an Indexed PNG",
-                "This PNG is not in indexed (palette) mode.\n\n"
-                "The image must be saved as an indexed-color PNG\n"
-                "(8-bit, 16 colors) so its embedded palette can be\n"
-                "extracted. Convert it in your image editor first.",
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self,
             )
-            return
+            if result is None:
+                return
+            colors, remapped_img = result
+        else:
+            # Read the PNG and extract its color table
+            img = QImage(path)
+            if img.isNull():
+                QMessageBox.warning(
+                    self, "Import Failed",
+                    f"Could not load image:\n{path}",
+                )
+                return
 
-        ct = img.colorTable()
-        if len(ct) < 1:
-            QMessageBox.warning(
-                self, "Empty Palette",
-                "The PNG has no color table entries.",
-            )
-            return
+            # Must be an indexed (palette-mode) image
+            from PyQt6.QtGui import QImage as _QI
+            if img.format() != _QI.Format.Format_Indexed8:
+                QMessageBox.warning(
+                    self, "Not an Indexed PNG",
+                    "This PNG is not in indexed (palette) mode.\n\n"
+                    "The image must be saved as an indexed-color PNG\n"
+                    "(8-bit, 16 colors) so its embedded palette can be\n"
+                    "extracted — or use 'Import PNG Manually…' to pick\n"
+                    "colours from any PNG.",
+                )
+                return
 
-        # Extract up to 16 colors, GBA-clamp each one
-        colors: List[Color] = []
-        for entry in ct[:16]:
-            r = (entry >> 16) & 0xFF
-            g = (entry >> 8) & 0xFF
-            b = entry & 0xFF
-            colors.append(clamp_to_gba(r, g, b))
-        # Pad to 16 if the palette has fewer entries
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
+            ct = img.colorTable()
+            if len(ct) < 1:
+                QMessageBox.warning(
+                    self, "Empty Palette",
+                    "The PNG has no color table entries.",
+                )
+                return
+
+            # Extract up to 16 colors, GBA-clamp each one
+            colors: List[Color] = []
+            for entry in ct[:16]:
+                r = (entry >> 16) & 0xFF
+                g = (entry >> 8) & 0xFF
+                b = entry & 0xFF
+                colors.append(clamp_to_gba(r, g, b))
+            # Pad to 16 if the palette has fewer entries
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
 
         # Determine target (Normal or Shiny)
         is_shiny = self._import_shiny_rb.isChecked()
@@ -1395,6 +1447,77 @@ class GraphicsTabWidget(QWidget):
         finally:
             self._loading = False
 
+        # Manual mode: also remap+save the source PNG to front.png so
+        # the species's sprite art reflects the user's import.  Front is
+        # chosen as the default because that's where custom species art
+        # almost always targets — the user can import a separate back
+        # PNG via the same flow if they have one.  Auto mode never
+        # touches the PNG (palette-only — pixel indices preserved).
+        image_saved_to: Optional[str] = None
+        image_size_warning = ""
+        if manual and remapped_img is not None:
+            paths = self._sprite_paths.get(self._current_species, {})
+            front_path = paths.get("front", "")
+            back_path = paths.get("back", "")
+            # Prefer the one that matches the source's dimensions.  This
+            # auto-routes a back-view PNG to back.png if the user has one
+            # of those, while keeping front.png as the default target.
+            front_dims = _png_dims(front_path)
+            back_dims = _png_dims(back_path)
+            src_dims = (remapped_img.width(), remapped_img.height())
+            dest_path = ""
+            if front_dims and src_dims == front_dims:
+                dest_path = front_path
+            elif back_dims and src_dims == back_dims:
+                dest_path = back_path
+            elif front_path:
+                # Dimensions don't match either — default to front.png
+                # but warn that the on-disk sprite dimensions change.
+                dest_path = front_path
+                if front_dims and src_dims != front_dims:
+                    image_size_warning = (
+                        f"\n\nWarning: the imported image is "
+                        f"{src_dims[0]}×{src_dims[1]} pixels but the "
+                        f"existing front.png is "
+                        f"{front_dims[0]}×{front_dims[1]}.  The on-disk "
+                        f"front.png now has the new dimensions.  Run "
+                        f"Make Modern to rebuild — the build may fail "
+                        f"if the project expects a specific frame size."
+                    )
+            if dest_path:
+                try:
+                    from ui.dialogs.manual_palette_pick_dialog import (
+                        save_remapped_image,
+                    )
+                    if save_remapped_image(
+                            remapped_img, colors, dest_path):
+                        image_saved_to = dest_path
+                    else:
+                        QMessageBox.warning(
+                            self, "Image Save Failed",
+                            f"Palette loaded, but couldn't write the "
+                            f"remapped PNG to:\n{dest_path}",
+                        )
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self, "Image Save Failed",
+                        f"Could not save the remapped image:\n{exc}",
+                    )
+            # If we wrote a new sprite PNG, refresh the species's cached
+            # front/back QPixmap so the preview reflects it immediately.
+            if image_saved_to:
+                try:
+                    self._sprite_paths.setdefault(
+                        self._current_species, {})
+                    if image_saved_to == paths.get("front", ""):
+                        self._front_src = self._load_pix(image_saved_to)
+                        self._preview.set_front_pixmap(self._front_src)
+                    elif image_saved_to == paths.get("back", ""):
+                        self._back_src = self._load_pix(image_saved_to)
+                        self._preview.set_back_pixmap(self._back_src)
+                except Exception:
+                    pass
+
         # Refresh the battle scene preview so the user sees it immediately
         show_shiny = self._preview_shiny
         if (is_shiny and show_shiny) or (not is_shiny and not show_shiny):
@@ -1402,16 +1525,27 @@ class GraphicsTabWidget(QWidget):
 
         self._mark_modified()
 
+        n_used_msg = (
+            sum(1 for c in colors if c != (0, 0, 0))
+            if manual else min(len(ct), 16)
+        )
+        image_msg = (
+            f"\nImage written to: "
+            f"{os.path.basename(image_saved_to)}"
+            if image_saved_to else ""
+        )
         QMessageBox.information(
             self, "Palette Imported",
-            f"Loaded {len(ct[:16])} colors from:\n"
+            f"Loaded {n_used_msg} colors from:\n"
             f"{os.path.basename(path)}\n\n"
             f"Applied to: {target_label} palette\n"
-            f"Species: {self._current_species}\n\n"
+            f"Species: {self._current_species}"
+            f"{image_msg}\n\n"
             "The palette's order was preserved as-is. If the transparent\n"
             "slot is in the wrong position, drag the correct colour onto\n"
             "slot 0 in the palette row.\n\n"
-            "Click File → Save to write the .pal file to disk.",
+            "Click File → Save to write the .pal file to disk."
+            f"{image_size_warning}",
         )
 
     def _import_palette_from_pal(self) -> None:

@@ -1501,6 +1501,12 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_import_png_btn = QPushButton("Import Palette from PNG…")
         self._fe_import_png_btn.setToolTip(
             "Extract palette from an indexed PNG and apply it to this sprite.")
+        self._fe_import_manual_btn = QPushButton("Import Manually…")
+        self._fe_import_manual_btn.setToolTip(
+            "Open the manual palette picker on a PNG.\n"
+            "You choose which colours land in which slot, set the\n"
+            "BG/transparent slot, and reorder freely.  Works on any\n"
+            "PNG (indexed or full-colour).")
         self._fe_import_pal_btn = QPushButton("Import from .pal…")
         self._fe_import_pal_btn.setToolTip(
             "Load a JASC .pal file and apply it to this sprite.")
@@ -1515,6 +1521,7 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_browse_folder_btn.setToolTip(
             "Open the field_effects/pics folder.")
         fe_pal_btns.addWidget(self._fe_import_png_btn)
+        fe_pal_btns.addWidget(self._fe_import_manual_btn)
         fe_pal_btns.addWidget(self._fe_import_pal_btn)
         fe_pal_btns.addWidget(self._fe_rebake_tag_btn)
         fe_pal_btns.addWidget(self._fe_browse_folder_btn)
@@ -1535,6 +1542,7 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_cat_combo.currentIndexChanged.connect(self._rebuild_list)
         self._fe_search.textChanged.connect(self._rebuild_list)
         self._fe_import_png_btn.clicked.connect(self._import_palette_from_png)
+        self._fe_import_manual_btn.clicked.connect(self._import_palette_from_png_manual)
         self._fe_import_pal_btn.clicked.connect(self._import_palette_from_pal)
         self._fe_rebake_tag_btn.clicked.connect(self._rebake_from_palette_tag)
         self._fe_browse_folder_btn.clicked.connect(self._open_sprite_folder)
@@ -1781,31 +1789,81 @@ class FieldEffectSpritesTab(QWidget):
     # ── import ────────────────────────────────────────────────────────────────
 
     def _import_palette_from_png(self) -> None:
+        """Auto-extract: read the PNG's existing 16-colour palette table."""
+        self._do_palette_import_from_png(manual=False)
+
+    def _import_palette_from_png_manual(self) -> None:
+        """Manual pick: choose which colours go in which slots."""
+        self._do_palette_import_from_png(manual=True)
+
+    def _do_palette_import_from_png(self, manual: bool) -> None:
         if not self._current:
             QMessageBox.information(self, "No Sprite", "Select a sprite first.")
             return
         start = os.path.dirname(self._current.png_path) if self._current.png_path else ""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Indexed PNG", start, "PNG Images (*.png)",
+            self, "Select PNG" if manual else "Select Indexed PNG",
+            start, "PNG Images (*.png)",
         )
         if not path:
             return
-        img = QImage(path)
-        if img.isNull():
-            QMessageBox.warning(self, "Import Failed", f"Could not load:\n{path}")
-            return
-        if img.format() != QImage.Format.Format_Indexed8:
-            QMessageBox.warning(
-                self, "Not an Indexed PNG",
-                "Convert to indexed-colour PNG (8-bit, 16 colours) in your image editor first.",
+
+        remapped_img = None
+        if manual:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
             )
-            return
-        ct = img.colorTable()
-        colors: List[Color] = []
-        for c in ct[:16]:
-            colors.append(clamp_to_gba((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF))
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self,
+            )
+            if result is None:
+                return
+            colors, remapped_img = result
+            n_colors_used = sum(1 for c in colors if c != (0, 0, 0))
+        else:
+            img = QImage(path)
+            if img.isNull():
+                QMessageBox.warning(self, "Import Failed",
+                                    f"Could not load:\n{path}")
+                return
+            if img.format() != QImage.Format.Format_Indexed8:
+                QMessageBox.warning(
+                    self, "Not an Indexed PNG",
+                    "Convert to indexed-colour PNG (8-bit, 16 colours) "
+                    "in your image editor first — or use 'Import "
+                    "Manually…' to pick colours from any PNG.",
+                )
+                return
+            ct = img.colorTable()
+            colors: List[Color] = []
+            for c in ct[:16]:
+                colors.append(clamp_to_gba(
+                    (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+            n_colors_used = min(len(ct), 16)
+
+        # Manual mode: overwrite the field-effect's source PNG with the
+        # remapped indexed image so the on-disk graphic matches the
+        # newly-imported palette.  Auto mode preserves pixel indices.
+        if manual and remapped_img is not None and self._current.png_path:
+            try:
+                from ui.dialogs.manual_palette_pick_dialog import (
+                    save_remapped_image,
+                )
+                if not save_remapped_image(
+                        remapped_img, colors, self._current.png_path):
+                    QMessageBox.warning(
+                        self, "Image Save Failed",
+                        f"Palette loaded into the editor, but the "
+                        f"remapped PNG couldn't be written to:\n"
+                        f"{self._current.png_path}",
+                    )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Image Save Failed",
+                    f"Could not save the remapped image:\n{exc}",
+                )
 
         key = self._bus_key(self._current)
         self._palettes[key] = colors
@@ -1822,7 +1880,7 @@ class FieldEffectSpritesTab(QWidget):
         self.modified.emit()
         QMessageBox.information(
             self, "Palette Imported",
-            f"Loaded {min(len(ct), 16)} colours from {os.path.basename(path)}.\n"
+            f"Loaded {n_colors_used} colours from {os.path.basename(path)}.\n"
             "Click File → Save to write the changes.",
         )
 
@@ -2434,7 +2492,15 @@ class OverworldGraphicsTab(QWidget):
         self._import_btn.setToolTip(
             "Extract palette from an indexed PNG and apply it to\n"
             "this sprite's palette. If the palette is shared, all\n"
-            "sprites using it will be affected."
+            "sprites using it will be affected (or, under DOWP, you'll\n"
+            "be offered the option to fork a new per-sprite palette)."
+        )
+        self._import_manual_btn = QPushButton("Import Manually…")
+        self._import_manual_btn.setToolTip(
+            "Open the manual palette picker on a PNG.\n"
+            "You choose which colours land in which slot, set the\n"
+            "BG/transparent slot, and reorder freely.  Works on any\n"
+            "PNG (indexed or full-colour)."
         )
         self._import_pal_btn = QPushButton("Import from .pal…")
         self._import_pal_btn.setToolTip(
@@ -2444,6 +2510,7 @@ class OverworldGraphicsTab(QWidget):
         self._open_folder_btn = QPushButton("Open Palettes Folder")
         self._open_folder_btn.setToolTip("Open the overworld palettes directory.")
         pal_btn_row.addWidget(self._import_btn)
+        pal_btn_row.addWidget(self._import_manual_btn)
         pal_btn_row.addWidget(self._import_pal_btn)
         pal_btn_row.addWidget(self._open_folder_btn)
         pal_btn_row.addStretch(1)
@@ -2474,6 +2541,7 @@ class OverworldGraphicsTab(QWidget):
         self._pal_row.palette_reordered.connect(self._on_palette_reordered)
         self._pal_row.swatch_set_as_bg.connect(self._on_set_swatch_as_bg)
         self._import_btn.clicked.connect(self._import_palette_from_png)
+        self._import_manual_btn.clicked.connect(self._import_palette_from_png_manual)
         self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
         self._open_folder_btn.clicked.connect(self._open_palettes_folder)
         self._open_sprite_folder_btn.clicked.connect(self._open_current_sprite_folder)
@@ -2911,6 +2979,35 @@ class OverworldGraphicsTab(QWidget):
         self._four_dir.load_sprite(entry.png_path, palette, fw, fh, anim)
 
     def _import_palette_from_png(self) -> None:
+        """Import a 16-colour palette from an indexed PNG.
+
+        When DOWP is enabled AND the current sprite shares its palette
+        with other sprites, the user is offered three choices:
+
+          1. **Apply to this sprite only** (default under DOWP): fork a
+             new unique palette tag for this sprite alone, leaving the
+             other sharing sprites untouched.  This is the natural DOWP
+             workflow — that's what DOWP buys you, per-sprite palettes
+             without the 4-slot ceiling.
+          2. **Apply to all N sharing sprites**: legacy behaviour —
+             rewrite the shared palette data, every sprite that points
+             at the tag is updated.
+          3. **Cancel** — back out without changes.
+
+        When DOWP is off, or when the palette isn't shared, the old
+        2-option flow is preserved (no fork option exposed; the fork
+        operation only makes sense under DOWP).
+        """
+        self._do_palette_import_from_png(manual=False)
+
+    def _import_palette_from_png_manual(self) -> None:
+        """Same as `_import_palette_from_png` but routes the source PNG
+        through the shared manual indexer first so the user can pick
+        which colours land in which slot (and slot 0 = BG/transparent).
+        """
+        self._do_palette_import_from_png(manual=True)
+
+    def _do_palette_import_from_png(self, manual: bool) -> None:
         if not self._current_sprite:
             QMessageBox.information(
                 self, "No Sprite Selected",
@@ -2920,19 +3017,69 @@ class OverworldGraphicsTab(QWidget):
 
         tag = self._current_sprite.palette_tag
         pool = self._pools_by_tag.get(tag)
+        shared_count = len(pool.sprites) if pool else 0
 
-        # Warn if shared palette
-        if pool and len(pool.sprites) > 1:
-            ret = QMessageBox.question(
-                self, "Shared Palette",
-                f"This sprite's palette ({pool.display_name}) is shared by\n"
-                f"{len(pool.sprites)} sprites. Importing will change all of them.\n\n"
-                "Continue?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ret != QMessageBox.StandardButton.Yes:
-                return
+        # ── Fork-vs-apply-all decision (only relevant under DOWP) ─────
+        # We collect this BEFORE the file picker so the user can cancel
+        # without being asked to pick a file first.
+        dowp_on = False
+        try:
+            from core.dynamic_ow_pal_patch import is_dowp_enabled
+            dowp_on = is_dowp_enabled(self._project_root)
+        except Exception:
+            dowp_on = False
 
+        fork_mode = False  # True = forge a new unique tag for this sprite
+        if pool and shared_count > 1:
+            if dowp_on:
+                # Three-way dialog: fork / apply-to-all / cancel.
+                box = QMessageBox(self)
+                box.setWindowTitle("Shared Palette")
+                box.setIcon(QMessageBox.Icon.Question)
+                box.setText(
+                    f"This sprite's palette ({pool.display_name}) is "
+                    f"shared by {shared_count} sprites."
+                )
+                box.setInformativeText(
+                    "Dynamic Overworld Palettes is enabled, so you can "
+                    "give this sprite its own unique palette without "
+                    "affecting the others.\n\n"
+                    "How would you like to apply the imported palette?"
+                )
+                btn_fork = box.addButton(
+                    "Apply to this sprite only",
+                    QMessageBox.ButtonRole.AcceptRole,
+                )
+                btn_all = box.addButton(
+                    f"Apply to all {shared_count} sharing sprites",
+                    QMessageBox.ButtonRole.AcceptRole,
+                )
+                btn_cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+                box.setDefaultButton(btn_fork)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked is btn_fork:
+                    fork_mode = True
+                elif clicked is btn_all:
+                    fork_mode = False
+                else:
+                    return  # Cancel
+            else:
+                # DOWP off — legacy two-option dialog.
+                ret = QMessageBox.question(
+                    self, "Shared Palette",
+                    f"This sprite's palette ({pool.display_name}) is "
+                    f"shared by\n{shared_count} sprites. Importing will "
+                    f"change all of them.\n\n"
+                    "Continue?\n\n"
+                    "(Tip: enable Dynamic Overworld Palettes to get a "
+                    "per-sprite option here.)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if ret != QMessageBox.StandardButton.Yes:
+                    return
+
+        # ── File picker ───────────────────────────────────────────────
         start_dir = ""
         if self._current_sprite.png_path:
             candidate = os.path.dirname(self._current_sprite.png_path)
@@ -2951,33 +3098,94 @@ class OverworldGraphicsTab(QWidget):
         if not path:
             return
 
-        img = QImage(path)
-        if img.isNull():
-            QMessageBox.warning(self, "Import Failed", f"Could not load:\n{path}")
+        # ── Extract palette colours (and, in manual mode, remap the
+        #    source PNG to those colours so the image is replaced
+        #    consistent with the new palette — same behaviour the
+        #    standalone Image Indexer tab provides) ─────────────────────
+        remapped_img: Optional[QImage] = None
+        if manual:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
+            )
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self,
+            )
+            if result is None:
+                return
+            colors, remapped_img = result
+        else:
+            img = QImage(path)
+            if img.isNull():
+                QMessageBox.warning(self, "Import Failed",
+                                    f"Could not load:\n{path}")
+                return
+            if img.format() != QImage.Format.Format_Indexed8:
+                QMessageBox.warning(
+                    self, "Not an Indexed PNG",
+                    "This PNG is not in indexed (palette) mode.\n\n"
+                    "Convert it to an indexed-colour PNG (8-bit, 16 colours)\n"
+                    "in your image editor first — or use 'Import Manually…' "
+                    "to remap a non-indexed PNG into the palette.",
+                )
+                return
+
+            ct = img.colorTable()
+            if len(ct) < 1:
+                QMessageBox.warning(self, "Empty Palette",
+                                    "No colour table entries.")
+                return
+
+            colors = []
+            for c_entry in ct[:16]:
+                r = (c_entry >> 16) & 0xFF
+                g = (c_entry >> 8) & 0xFF
+                b = c_entry & 0xFF
+                colors.append(clamp_to_gba(r, g, b))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+
+        # ── Manual mode: write the remapped PNG over the sprite's own
+        #    source PNG.  Auto mode never touches the image because the
+        #    user is opting into "palette only — preserve pixel indices".
+        if manual and remapped_img is not None:
+            self._save_remapped_sprite_png(remapped_img, colors)
+
+        # ── Apply: either fork a new tag or rewrite the shared one ────
+        if fork_mode:
+            self._apply_palette_fork(colors)
+        else:
+            self._apply_palette_to_tag(tag, colors)
+
+    def _save_remapped_sprite_png(
+        self, remapped: QImage, palette: List[Color],
+    ) -> None:
+        """Overwrite the current sprite's source PNG with a remapped
+        indexed image.  Surfaces a clear error dialog on failure so the
+        user knows the palette landed but the image didn't.
+        """
+        if not self._current_sprite or not self._current_sprite.png_path:
             return
-        if img.format() != QImage.Format.Format_Indexed8:
+        dest = self._current_sprite.png_path
+        try:
+            from ui.dialogs.manual_palette_pick_dialog import save_remapped_image
+            ok = save_remapped_image(remapped, palette, dest)
+        except Exception as exc:
+            ok = False
             QMessageBox.warning(
-                self, "Not an Indexed PNG",
-                "This PNG is not in indexed (palette) mode.\n\n"
-                "Convert it to an indexed-colour PNG (8-bit, 16 colours)\n"
-                "in your image editor first.",
+                self, "Image Save Failed",
+                f"Couldn't save the remapped image to:\n{dest}\n\n{exc}",
             )
             return
+        if not ok:
+            QMessageBox.warning(
+                self, "Image Save Failed",
+                f"Couldn't save the remapped image to:\n{dest}\n\n"
+                "The palette was loaded into the editor but the PNG on "
+                "disk was not updated.  Check folder permissions.",
+            )
 
-        ct = img.colorTable()
-        if len(ct) < 1:
-            QMessageBox.warning(self, "Empty Palette", "No colour table entries.")
-            return
-
-        colors: List[Color] = []
-        for c_entry in ct[:16]:
-            r = (c_entry >> 16) & 0xFF
-            g = (c_entry >> 8) & 0xFF
-            b = c_entry & 0xFF
-            colors.append(clamp_to_gba(r, g, b))
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
-
+    def _apply_palette_to_tag(self, tag: str, colors: List[Color]) -> None:
+        """Existing in-memory + bus update for the (possibly shared) tag."""
         self._palettes[tag] = colors
         self._palette_dirty.add(tag)
         _get_palette_bus().set_overworld_palette(tag, colors)
@@ -2993,15 +3201,77 @@ class OverworldGraphicsTab(QWidget):
         self._rebuild_grid()
         self.modified.emit()
 
-        affected = len(pool.sprites) if pool else 1
+    def _apply_palette_fork(self, colors: List[Color]) -> None:
+        """Run the engine refactor: forge a new palette tag, write its
+        .gbapal, register it in the engine palette array, and rewrite
+        this sprite's `.paletteTag` to point at the new tag.
+
+        On success, reloads the project's overworld data so the UI
+        immediately reflects the new pool layout (the current sprite
+        now lives in a new 1-sprite pool, freshly created).
+        """
+        if not self._project_root or not self._current_sprite:
+            return
+
+        info_name = self._current_sprite.info_name
+        old_tag = self._current_sprite.palette_tag
+
+        try:
+            from core.overworld_palette_fork import fork_palette_for_sprite
+            success, applied, errors, new_tag = fork_palette_for_sprite(
+                self._project_root,
+                info_name,
+                colors,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Fork Failed",
+                f"Could not create a new palette tag for "
+                f"{self._current_sprite.display_name}:\n\n{e}",
+            )
+            return
+
+        if not success or not new_tag:
+            err_str = "\n".join(f"  • {e}" for e in errors)
+            QMessageBox.warning(
+                self, "Fork Partially Applied",
+                f"Some steps failed while creating a new palette tag.\n\n"
+                f"Applied:\n" + "\n".join(f"  + {a}" for a in applied)
+                + (f"\n\nErrors:\n{err_str}" if errors else ""),
+            )
+            # Even on partial success the disk may have stale state;
+            # reload to surface whatever DID land.
+            self.load(self._project_root)
+            return
+
+        # Push palette into the bus immediately so other tabs / icon
+        # caches see the new colours before the reload completes.
+        try:
+            _get_palette_bus().set_overworld_palette(new_tag, colors)
+        except Exception:
+            pass
+
+        # Brief plain-English summary so the user knows what happened.
         QMessageBox.information(
-            self, "Palette Imported",
-            f"Loaded {len(ct[:16])} colours from:\n"
-            f"{os.path.basename(path)}\n\n"
-            f"Applied to: {tag}\n"
-            f"({affected} sprite(s) affected)\n\n"
-            "Click File → Save to write the .pal file.",
+            self, "Palette Forked",
+            f"{self._current_sprite.display_name} now uses its own "
+            f"palette tag:\n  {new_tag}\n\n"
+            f"The other sprites that previously shared "
+            f"{old_tag} are unchanged.\n\n"
+            f"Click Make Modern (Ctrl+Shift+M) to rebuild.",
         )
+        # Reload so the UI rebuilds its pools / sprite list around the
+        # new tag.  The sprite list re-selects by gfx_const so the user
+        # stays on the same sprite after reload.
+        target_gfx = self._current_sprite.gfx_const
+        self.load(self._project_root)
+        try:
+            for entry in self._all_sprites.values():
+                if entry.gfx_const == target_gfx:
+                    self._on_sprite_clicked(entry)
+                    break
+        except Exception:
+            pass
 
     def _import_palette_from_pal(self) -> None:
         """Import a JASC .pal file and apply it to the selected sprite's palette."""
