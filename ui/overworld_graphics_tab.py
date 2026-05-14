@@ -964,6 +964,9 @@ class NewSpriteDialog(QDialog):
         self._pal_combo.wheelEvent = lambda e: e.ignore()
         if dowp_enabled:
             self._pal_combo.addItem("Create new palette from PNG", "NEW")
+            self._pal_combo.addItem(
+                "Pick palette manually (indexer)…", "NEW_MANUAL",
+            )
         from core.overworld_sprite_creator import NPC_PALETTE_SLOTS
         for tag, slot, name in NPC_PALETTE_SLOTS:
             self._pal_combo.addItem(f"{name} ({tag})", tag)
@@ -1090,9 +1093,64 @@ class NewSpriteDialog(QDialog):
             QMessageBox.warning(
                 self, "No Palette",
                 "The PNG must be an indexed-color image (8-bit, 16 colors)\n"
-                "to create a new palette from it."
+                "to create a new palette from it — or pick "
+                "'Pick palette manually (indexer)…' to remap any PNG."
             )
             return
+
+        # Manual pick — open the indexer dialog on the chosen PNG.  The
+        # user picks/orders 16 colours; we save those as the new palette
+        # AND remap the source PNG to that palette so the saved image
+        # uses the new indices.  Indexed-source PNGs auto-load their
+        # existing palette as the initial result so the user just needs
+        # to confirm / tweak slot order.
+        if pal_data == "NEW_MANUAL":
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
+            )
+            result = import_image_manually_from_path(
+                self._png_path, target_colors=16, parent=self,
+            )
+            if result is None:
+                # User cancelled the picker — don't close the Add dialog.
+                return
+            colors, remapped_img = result
+            self._palette_colors = list(colors)
+            # Save the remapped indexed PNG over the source the dialog
+            # was pointing at, so when create_overworld_sprite copies
+            # the PNG into the project it brings the new pixel indices
+            # along with the new palette.  Garbage-free: if save fails
+            # the source PNG is unchanged.
+            try:
+                from ui.dialogs.manual_palette_pick_dialog import (
+                    save_remapped_image,
+                )
+                if not save_remapped_image(
+                        remapped_img, colors, self._png_path):
+                    QMessageBox.warning(
+                        self, "Save Failed",
+                        "Couldn't write the remapped PNG.  The palette "
+                        "you picked is loaded in memory but the source "
+                        "image on disk is unchanged.  Check folder "
+                        "permissions and retry, or use 'Create new "
+                        "palette from PNG' instead.",
+                    )
+                    return
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "Save Failed",
+                    f"Couldn't remap the image:\n{exc}",
+                )
+                return
+            # Refresh the preview so the user sees the remapped image
+            # before they confirm the OK that closes the dialog.
+            pix = QPixmap(self._png_path)
+            if not pix.isNull():
+                self._preview_lbl.setPixmap(pix.scaled(
+                    self._preview_lbl.width(), self._preview_lbl.height(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                ))
 
         self.accept()
 
@@ -2596,6 +2654,32 @@ class OverworldGraphicsTab(QWidget):
         self._add_sprite_btn.clicked.connect(self._add_new_sprite)
         lv.addWidget(self._add_sprite_btn)
 
+        # Delete-sprite button.  Lives directly under "Add New Sprite"
+        # so the two destructive-ish actions sit together visually.
+        # Always present in the layout; greys out when no sprite is
+        # selected.  Click pops a multi-step confirmation before any
+        # source file is touched — refusing to silently destroy data
+        # is part of the project-agnostic safety contract.
+        self._delete_sprite_btn = QPushButton("Delete Selected Sprite…")
+        self._delete_sprite_btn.setStyleSheet(
+            "QPushButton { background: #4d2222; color: #ffa0a0; "
+            "border: 1px solid #804040; padding: 6px; border-radius: 3px; "
+            "font-weight: bold; }"
+            "QPushButton:hover { background: #6d3232; }"
+            "QPushButton:disabled { background: #2a2222; color: #663333; "
+            "border-color: #4a3030; }"
+        )
+        self._delete_sprite_btn.setToolTip(
+            "Remove the currently-selected overworld sprite from the "
+            "project — deletes its GraphicsInfo, pointer entry, "
+            "OBJ_EVENT_GFX_ #define, pic table, and (when uniquely "
+            "owned) its palette tag + .png/.gbapal/.pal files. Shows "
+            "exactly what will be touched before doing anything."
+        )
+        self._delete_sprite_btn.setEnabled(False)
+        self._delete_sprite_btn.clicked.connect(self._delete_selected_sprite)
+        lv.addWidget(self._delete_sprite_btn)
+
         # Dynamic Overworld Palettes buttons
         self._dowp_btn = QPushButton("Enable Dynamic Palettes…")
         self._dowp_btn.setToolTip(
@@ -2822,6 +2906,9 @@ class OverworldGraphicsTab(QWidget):
         self._gbapal_paths.clear()
         self._pools_by_tag.clear()
         self._current_sprite = None
+        # Delete button is meaningless without a selected sprite.
+        if hasattr(self, "_delete_sprite_btn"):
+            self._delete_sprite_btn.setEnabled(False)
 
         # Reset ALL right-panel visual state to clean.  Without this the
         # palette-frame amber highlight, stale swatch colours, and stale sprite
@@ -3377,8 +3464,126 @@ class OverworldGraphicsTab(QWidget):
         self._current_sprite = entry
         self._show_sprite_detail(entry)
         self._load_sprite_palette(entry)
+        # Enable the Delete button now that a sprite is selected.
+        if hasattr(self, "_delete_sprite_btn"):
+            self._delete_sprite_btn.setEnabled(True)
         # Rebuild grid to update selection highlight
         self._rebuild_grid()
+
+    def _delete_selected_sprite(self) -> None:
+        """Delete the currently-selected overworld sprite from the project.
+
+        Two-stage confirmation: shows a preview of every source file
+        the operation will touch + every file that will be deleted,
+        then asks for an explicit Yes before mutating anything.  The
+        backend (`delete_overworld_sprite`) is atomic per file and
+        garbage-free (no .bak/.tmp left behind).
+        """
+        entry = self._current_sprite
+        if entry is None or not self._project_root:
+            return
+
+        # Pre-flight: show the user exactly what's about to happen.
+        # We display the sprite's display name, gfx_const, png path,
+        # palette tag, and any other sprites that share its pic table /
+        # palette tag (those won't be touched).
+        info_name = entry.info_name
+        pic_neighbours = sum(
+            1 for s in self._all_sprites.values()
+            if s is not entry and getattr(s, "info_name", None)
+            and s.info_name != info_name
+            # Heuristic: shared pic_table → same image asset
+            # (we can't import the parsed pic_table mapping here cheaply;
+            # the backend re-parses for correctness)
+        )
+        pool = self._pools_by_tag.get(entry.palette_tag)
+        shared_pal = len(pool.sprites) - 1 if pool else 0
+
+        msg = (
+            f"<b>Delete overworld sprite '{entry.display_name}'</b>"
+            f" ({entry.gfx_const})?<br><br>"
+            f"This is reversible only by re-creating the sprite from "
+            f"scratch.<br><br>"
+            f"<b>Will be removed from source:</b><br>"
+            f"&nbsp;&nbsp;• <code>gObjectEventGraphicsInfo_{info_name}</code> "
+            f"block<br>"
+            f"&nbsp;&nbsp;• Its pointer-table entry + forward declaration<br>"
+            f"&nbsp;&nbsp;• <code>{entry.gfx_const}</code> #define "
+            f"(other gfx constants will be renumbered down by 1)<br>"
+            f"&nbsp;&nbsp;• Its <code>sPicTable_*</code> block "
+            f"(if no other sprite uses it)<br>"
+            f"&nbsp;&nbsp;• Its <code>gObjectEventPic_*</code> INCBIN "
+            f"(if no other pic table references it)<br>"
+        )
+        if shared_pal > 0:
+            msg += (
+                f"<br><b>Palette '{entry.palette_tag}' is shared with "
+                f"{shared_pal} other sprite(s) — it will be left "
+                f"alone.</b><br>"
+            )
+        else:
+            msg += (
+                f"<br><b>Palette '{entry.palette_tag}' is unique to "
+                f"this sprite — its #define, "
+                f"<code>sObjectEventSpritePalettes</code> entry, INCBIN, "
+                f"and <code>.gbapal</code>/<code>.pal</code> files will "
+                f"also be removed.</b><br>"
+            )
+        msg += (
+            f"<br><b>On-disk files removed</b> "
+            f"(only if not referenced elsewhere):<br>"
+            f"&nbsp;&nbsp;• <code>{os.path.relpath(entry.png_path, self._project_root)}</code><br>"
+            f"&nbsp;&nbsp;• The matching <code>.4bpp</code> build "
+            f"artefact, <code>.gbapal</code>, and <code>.pal</code>"
+        )
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete Sprite")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(msg)
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.Cancel,
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            from core.overworld_sprite_creator import delete_overworld_sprite
+            success, applied, errors = delete_overworld_sprite(
+                self._project_root, info_name, delete_files=True,
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Delete Failed",
+                f"Couldn't delete sprite — operation aborted:\n\n{exc}",
+            )
+            return
+
+        if not success or errors:
+            err_lines = "\n".join(f"  • {e}" for e in errors)
+            apl_lines = "\n".join(f"  + {a}" for a in applied) or "  (none)"
+            QMessageBox.warning(
+                self, "Delete Partially Completed",
+                f"Some steps failed.  The project may be in a partial "
+                f"state — review the source changes before rebuilding.\n\n"
+                f"Applied:\n{apl_lines}\n\nErrors:\n{err_lines}",
+            )
+            # Reload anyway so the UI reflects whatever did land.
+            self.load(self._project_root)
+            return
+
+        QMessageBox.information(
+            self, "Sprite Deleted",
+            f"Removed '{entry.display_name}' ({entry.gfx_const}).\n\n"
+            + ("Changes:\n" + "\n".join(f"  + {a}" for a in applied)
+               if applied else "")
+            + "\n\nClick Make Modern (Ctrl+Shift+M) to rebuild.",
+        )
+        # Reload the tab so the grid + pools rebuild without this sprite.
+        self.load(self._project_root)
 
     def _load_sprite_palette(self, entry: SpriteEntry) -> None:
         """Load the selected sprite's palette into the swatch editor."""
@@ -4000,9 +4205,15 @@ class OverworldGraphicsTab(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Determine palette settings
+        # Determine palette settings.  Both "NEW" (auto-extract from
+        # indexed PNG) and "NEW_MANUAL" (manual indexer pick) flow into
+        # the same create_overworld_sprite path — the only difference
+        # is HOW dlg.palette_colors got populated.  Manual mode also
+        # remapped the source PNG before reaching this code, so
+        # create_overworld_sprite's PNG copy step picks up the new
+        # pixel indices automatically.
         pal_choice = dlg.palette_choice
-        create_new = (pal_choice == "NEW")
+        create_new = pal_choice in ("NEW", "NEW_MANUAL")
         pal_tag = None if create_new else pal_choice
         pal_slot = None
         pal_colors = dlg.palette_colors if create_new else None
@@ -4023,7 +4234,9 @@ class OverworldGraphicsTab(QWidget):
             f"  Frame: {dlg.frame_width}x{dlg.frame_height}px\n"
             f"  Animation: {dlg.anim_table}\n"
             f"  Category: {dlg.category}\n"
-            f"  Palette: {'New custom palette' if create_new else pal_choice}\n\n"
+            f"  Palette: "
+            f"{('New custom palette (manual pick)' if pal_choice == 'NEW_MANUAL' else 'New custom palette' if create_new else pal_choice)}"
+            f"\n\n"
             f"Several C source/header files will be modified.\n"
             f"Make sure you have a backup or git commit first.\n\n"
             f"Continue?",

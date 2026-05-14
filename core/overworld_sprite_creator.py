@@ -407,3 +407,407 @@ const struct ObjectEventGraphicsInfo gObjectEventGraphicsInfo_{pascal} = {{
 
     success = len(errors) == 0
     return success, applied, errors
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Delete an overworld sprite from a project
+# ════════════════════════════════════════════════════════════════════════════
+
+def delete_overworld_sprite(
+    root: str,
+    info_name: str,
+    *,
+    delete_files: bool = True,
+) -> Tuple[bool, List[str], List[str]]:
+    """Remove every trace of an overworld sprite from a pokefirered fork.
+
+    Reverses what `create_overworld_sprite` adds.  Project-agnostic — no
+    hardcoded names.  Targets `info_name` (PascalCase identifier of the
+    sprite as it appears in `gObjectEventGraphicsInfo_<info_name>`).
+
+    What gets removed:
+      1. `#define OBJ_EVENT_GFX_<UPPER_NAME>` line in
+         `include/constants/event_objects.h`, and `NUM_OBJ_EVENT_GFX` is
+         decremented to match.  All other `#define`s with higher values
+         are renumbered down by 1 so the pointer table stays packed.
+      2. The sprite's row in `object_event_graphics_info_pointers.h`
+         (both the `[OBJ_EVENT_GFX_<NAME>] = &gObjectEventGraphicsInfo_*`
+         array entry AND the forward declaration up top).
+      3. The full `const struct ObjectEventGraphicsInfo
+         gObjectEventGraphicsInfo_<name> = { ... };` block in
+         `object_event_graphics_info.h`.
+      4. The `sPicTable_<name>[]` block in
+         `object_event_pic_tables.h` — IF no other sprite still
+         references it.
+      5. The `gObjectEventPic_<name>[]` INCBIN line in
+         `object_event_graphics.h` — IF no other sprite still
+         references it (`sPicTable_*` arrays elsewhere).
+      6. The sprite's PNG (`graphics/object_events/pics/<cat>/<slug>.png`)
+         and its build artefact (`<slug>.4bpp`) — IF `delete_files=True`
+         AND no other entry references the same .4bpp.
+      7. If the sprite is a forked palette holder (its palette tag's
+         `gObjectEventPal_<name>` symbol is referenced ONLY by this
+         sprite's GraphicsInfo), also remove:
+           - The `OBJ_EVENT_PAL_TAG_<UPPER_NAME>` `#define`
+           - The `{gObjectEventPal_<name>, OBJ_EVENT_PAL_TAG_<NAME>}`
+             entry in `sObjectEventSpritePalettes[]`
+           - The `gObjectEventPal_<name>[]` INCBIN line
+           - The `<slug>.gbapal` AND `<slug>.pal` files on disk
+
+    Garbage-free contract:
+      - No `.bak`/`.tmp` files left behind.
+      - PNG and .gbapal files are only deleted when nothing else in the
+        project references them, so a shared sprite asset can't be
+        accidentally orphaned.
+      - All file writes are atomic-replace via temp+rename.
+
+    Returns `(success, applied_messages, error_messages)`.
+    """
+    applied: List[str] = []
+    errors: List[str] = []
+
+    # ── Derive related names from info_name ──────────────────────────
+    # `info_name` is PascalCase ("BugCatcher").  The matching slug is
+    # snake_case ("bug_catcher"); UPPER_SNAKE is the constant suffix
+    # ("BUG_CATCHER").  We deliberately don't trust filename-based slug
+    # mapping — derive everything from info_name and discover paths
+    # by source-tree scan.
+    upper = _camel_to_upper_snake(info_name)
+    gfx_const = f"OBJ_EVENT_GFX_{upper}"
+    info_symbol = f"gObjectEventGraphicsInfo_{info_name}"
+    pic_table = f"sPicTable_{info_name}"
+    pic_symbol = f"gObjectEventPic_{info_name}"
+    pal_symbol = f"gObjectEventPal_{info_name}"
+
+    # ── 1. Parse the GraphicsInfo block to learn .images, .paletteTag,
+    #       and the sprite's PNG/category for cleanup decisions ───────
+    gi_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics_info.h",
+    )
+    if not os.path.isfile(gi_path):
+        errors.append(f"missing {gi_path}")
+        return False, applied, errors
+    gi_text = _read_file(gi_path)
+    info_match = re.search(
+        r"const\s+struct\s+ObjectEventGraphicsInfo\s+"
+        + re.escape(info_symbol)
+        + r"\s*=\s*\{(?P<body>[^;]*?)\};",
+        gi_text, flags=re.DOTALL,
+    )
+    if not info_match:
+        errors.append(
+            f"GraphicsInfo block for {info_symbol} not found — "
+            f"sprite may already be removed or named differently"
+        )
+        return False, applied, errors
+    info_body = info_match.group("body")
+    cur_pic_table = _grab_field(info_body, "images") or pic_table
+    cur_pal_tag = _grab_field(info_body, "paletteTag") or ""
+
+    # ── 2. Decide which shared assets we can safely delete ───────────
+    # Pic table / pic symbol — safe to remove only if no OTHER
+    # GraphicsInfo block references this pic table.
+    pic_table_others = [
+        m.start() for m in re.finditer(
+            r"\.images\s*=\s*" + re.escape(cur_pic_table) + r"\b",
+            gi_text,
+        )
+    ]
+    # Subtract our own occurrence (we'll be deleting it anyway)
+    own_images_match = re.search(
+        r"\.images\s*=\s*" + re.escape(cur_pic_table) + r"\b",
+        info_body,
+    )
+    pic_table_is_unique = (
+        len(pic_table_others) == 1 if own_images_match else False
+    )
+
+    # Palette: safe to remove only if no OTHER GraphicsInfo references
+    # the SAME paletteTag.
+    pal_tag_others = []
+    if cur_pal_tag and cur_pal_tag != "OBJ_EVENT_PAL_TAG_NONE":
+        pal_tag_others = [
+            m.start() for m in re.finditer(
+                r"\.paletteTag\s*=\s*" + re.escape(cur_pal_tag) + r"\b",
+                gi_text,
+            )
+        ]
+    pal_is_unique = (
+        len(pal_tag_others) == 1 if cur_pal_tag else False
+    )
+
+    # ── 3. Remove the GraphicsInfo block ─────────────────────────────
+    new_gi_text = (
+        gi_text[:info_match.start()] + gi_text[info_match.end():]
+    )
+    # Tidy: collapse the leading newline before the block we removed so
+    # we don't leave a triple-blank.
+    new_gi_text = re.sub(r"\n{3,}", "\n\n", new_gi_text)
+    _atomic_write(gi_path, new_gi_text)
+    applied.append(f"Removed {info_symbol} block from object_event_graphics_info.h")
+
+    # ── 4. Remove the pointer entry + forward declaration ────────────
+    ptrs_path = os.path.join(
+        root, "src", "data", "object_events",
+        "object_event_graphics_info_pointers.h",
+    )
+    if os.path.isfile(ptrs_path):
+        ptrs_text = _read_file(ptrs_path)
+        # Forward declaration at the top (`const struct ... gObjectEventGraphicsInfo_X;`)
+        new_ptrs = re.sub(
+            r"const\s+struct\s+ObjectEventGraphicsInfo\s+"
+            + re.escape(info_symbol) + r"\s*;\s*\n",
+            "", ptrs_text, count=1,
+        )
+        # Pointer-table row (`[OBJ_EVENT_GFX_X] = &gObjectEventGraphicsInfo_X,`)
+        new_ptrs = re.sub(
+            r"\s*\[\s*" + re.escape(gfx_const)
+            + r"\s*\][^,]*=\s*&" + re.escape(info_symbol) + r"\s*,\s*\n",
+            "\n", new_ptrs, count=1,
+        )
+        if new_ptrs != ptrs_text:
+            _atomic_write(ptrs_path, new_ptrs)
+            applied.append(f"Removed pointer-table entry + fwd decl for {gfx_const}")
+
+    # ── 5. Remove the gfx_const #define + renumber NUM_OBJ_EVENT_GFX ─
+    eo_path = os.path.join(root, "include", "constants", "event_objects.h")
+    if os.path.isfile(eo_path):
+        eo_text = _read_file(eo_path)
+        # Capture the deleted sprite's value so we can renumber every
+        # higher #define down by 1.
+        deleted_value: Optional[int] = None
+        m = re.search(
+            r"#define\s+" + re.escape(gfx_const) + r"\s+(\d+)",
+            eo_text,
+        )
+        if m:
+            deleted_value = int(m.group(1))
+            new_eo = re.sub(
+                r"#define\s+" + re.escape(gfx_const) + r"\s+\d+\s*\n",
+                "", eo_text, count=1,
+            )
+            # Renumber every OBJ_EVENT_GFX_* with a value > deleted_value
+            def _decrement(m2):
+                name = m2.group(1)
+                val = int(m2.group(2))
+                if val > deleted_value:
+                    val -= 1
+                return f"#define {name} {val}"
+            new_eo = re.sub(
+                r"#define\s+(OBJ_EVENT_GFX_\w+)\s+(\d+)",
+                _decrement, new_eo,
+            )
+            # Decrement NUM_OBJ_EVENT_GFX
+            num_match = re.search(
+                r"#define\s+(NUM_OBJ_EVENT_GFX)\s+(\d+)", new_eo,
+            )
+            if num_match:
+                old_num = int(num_match.group(2))
+                new_eo = re.sub(
+                    r"(#define\s+NUM_OBJ_EVENT_GFX\s+)\d+",
+                    rf"\g<1>{old_num - 1}", new_eo, count=1,
+                )
+            _atomic_write(eo_path, new_eo)
+            applied.append(
+                f"Removed #define {gfx_const} = {deleted_value} and "
+                f"decremented NUM_OBJ_EVENT_GFX"
+            )
+        else:
+            errors.append(
+                f"#define {gfx_const} not found — already removed?"
+            )
+
+    # ── 6. Remove pic table + pic INCBIN if unique to this sprite ─────
+    pt_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_pic_tables.h",
+    )
+    if pic_table_is_unique and os.path.isfile(pt_path):
+        pt_text = _read_file(pt_path)
+        new_pt = re.sub(
+            r"static\s+const\s+struct\s+SpriteFrameImage\s+"
+            + re.escape(cur_pic_table) + r"\s*\[\]\s*=\s*\{[^}]*\}\s*;\s*",
+            "", pt_text, count=1, flags=re.DOTALL,
+        )
+        if new_pt != pt_text:
+            new_pt = re.sub(r"\n{3,}", "\n\n", new_pt)
+            _atomic_write(pt_path, new_pt)
+            applied.append(f"Removed {cur_pic_table}[] from pic_tables.h")
+
+    # Remove gObjectEventPic_<name>[] INCBIN if nothing else references
+    # the pic symbol (e.g. another pic table).
+    gfx_h_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics.h",
+    )
+    if os.path.isfile(gfx_h_path):
+        gfx_text = _read_file(gfx_h_path)
+        other_refs = list(re.finditer(
+            r"\b" + re.escape(pic_symbol) + r"\b",
+            gfx_text,
+        ))
+        # One ref is the INCBIN line itself; check pic_tables.h + eom.c
+        # for any LIVE consumers (after our edits above).
+        pic_consumers = 0
+        for path in (pt_path, os.path.join(root, "src", "event_object_movement.c")):
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    pic_consumers += f.read().count(pic_symbol)
+        if pic_consumers == 0:
+            new_gfx = re.sub(
+                r"const\s+u16\s+" + re.escape(pic_symbol)
+                + r"\s*\[\]\s*=\s*INCBIN_U\d+\([^)]*\);\s*\n",
+                "", gfx_text, count=1,
+            )
+            if new_gfx != gfx_text:
+                _atomic_write(gfx_h_path, new_gfx)
+                applied.append(
+                    f"Removed {pic_symbol} INCBIN from object_event_graphics.h"
+                )
+
+    # ── 7. Remove palette wiring if uniquely owned by this sprite ────
+    if pal_is_unique and cur_pal_tag and cur_pal_tag != "OBJ_EVENT_PAL_TAG_NONE":
+        # Remove from sObjectEventSpritePalettes[] in event_object_movement.c
+        eom_path = os.path.join(root, "src", "event_object_movement.c")
+        if os.path.isfile(eom_path):
+            eom_text = _read_file(eom_path)
+            # Array row: {gObjectEventPal_X, OBJ_EVENT_PAL_TAG_X},
+            new_eom = re.sub(
+                r"\s*\{\s*" + re.escape(pal_symbol)
+                + r"\s*,\s*" + re.escape(cur_pal_tag) + r"\s*\}\s*,\s*\n",
+                "\n", eom_text, count=1,
+            )
+            # #define OBJ_EVENT_PAL_TAG_X 0xNNNN
+            new_eom = re.sub(
+                r"#define\s+" + re.escape(cur_pal_tag) + r"\s+0x[0-9a-fA-F]+\s*\n",
+                "", new_eom, count=1,
+            )
+            if new_eom != eom_text:
+                _atomic_write(eom_path, new_eom)
+                applied.append(
+                    f"Removed {cur_pal_tag} #define + sObjectEventSpritePalettes entry"
+                )
+
+        # Remove gObjectEventPal_X INCBIN line
+        if os.path.isfile(gfx_h_path):
+            gfx_text = _read_file(gfx_h_path)
+            new_gfx = re.sub(
+                r"const\s+u16\s+" + re.escape(pal_symbol)
+                + r"\s*\[\]\s*=\s*INCBIN_U\d+\(\"([^\"]+)\"\)\s*;\s*\n",
+                "", gfx_text, count=1,
+            )
+            if new_gfx != gfx_text:
+                # Capture the .gbapal path before we drop the INCBIN so
+                # we can delete the on-disk file (its sibling .pal too).
+                m_gba = re.search(
+                    r"const\s+u16\s+" + re.escape(pal_symbol)
+                    + r"\s*\[\]\s*=\s*INCBIN_U\d+\(\"([^\"]+)\"\)",
+                    gfx_text,
+                )
+                _atomic_write(gfx_h_path, new_gfx)
+                applied.append(
+                    f"Removed {pal_symbol} INCBIN from object_event_graphics.h"
+                )
+                if delete_files and m_gba:
+                    rel = m_gba.group(1)
+                    abs_gba = os.path.join(root, rel)
+                    abs_pal = os.path.splitext(abs_gba)[0] + ".pal"
+                    for path in (abs_gba, abs_pal):
+                        if os.path.isfile(path):
+                            try:
+                                os.remove(path)
+                                applied.append(
+                                    f"Deleted {os.path.relpath(path, root)}"
+                                )
+                            except OSError as exc:
+                                errors.append(
+                                    f"Could not delete {path}: {exc}"
+                                )
+
+    # ── 8. Delete the sprite's PNG + .4bpp build artefact ─────────────
+    # Only if nothing else in the source still references the pic
+    # symbol's .4bpp file (which is what gbagfx generates from the PNG).
+    if delete_files and os.path.isfile(gfx_h_path):
+        # The PNG path can no longer be inferred from the INCBIN (we
+        # removed it).  Re-derive from cur_pic_table: pic_tables.h had
+        # `overworld_frame(gObjectEventPic_<X>, ...)`.  The .4bpp
+        # filename matches the pic symbol's INCBIN target.  We already
+        # removed the INCBIN, but we captured the path during the
+        # palette removal above.  For sprites whose palette wasn't
+        # uniquely theirs, we never grabbed the path — try a slug-based
+        # filename match as a fallback.
+        slug = upper.lower()
+        for cat in ("people", "pokemon", "misc"):
+            for ext in (".png", ".4bpp"):
+                p = os.path.join(
+                    root, "graphics", "object_events", "pics", cat,
+                    f"{slug}{ext}",
+                )
+                if os.path.isfile(p):
+                    # Sanity-check: is anything in the source still
+                    # referencing this file path?  If so, leave it.
+                    rel = os.path.relpath(p, root).replace("\\", "/")
+                    referenced = False
+                    for ref_path in (
+                        gfx_h_path,
+                        os.path.join(root, "src", "data", "object_events",
+                                     "object_event_pic_tables.h"),
+                    ):
+                        if os.path.isfile(ref_path):
+                            with open(ref_path, encoding="utf-8",
+                                      errors="replace") as f:
+                                if rel in f.read():
+                                    referenced = True
+                                    break
+                    if not referenced:
+                        try:
+                            os.remove(p)
+                            applied.append(f"Deleted {rel}")
+                        except OSError as exc:
+                            errors.append(f"Could not delete {p}: {exc}")
+
+    success = len(errors) == 0
+    return success, applied, errors
+
+
+# ── private helpers ────────────────────────────────────────────────────
+
+def _atomic_write(path: str, text: str) -> None:
+    """Write text atomically via temp+rename; clean up .tmp on failure.
+
+    Used by delete_overworld_sprite to ensure partial-write corruption
+    can't leave a project source file in a half-edited state.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _camel_to_upper_snake(name: str) -> str:
+    """`BugCatcherR` -> `BUG_CATCHER_R`.  Matches the convention used
+    by overworld_palette_fork — keep in sync if either is changed.
+    """
+    if "_" in name:
+        return name.upper()
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).upper()
+
+
+def _grab_field(struct_body: str, field: str) -> Optional[str]:
+    """Pull `.field = VALUE,` from a C struct body.  Returns the
+    VALUE token or None if not found."""
+    m = re.search(
+        r"\." + re.escape(field) + r"\s*=\s*(\S+)\s*,",
+        struct_body,
+    )
+    return m.group(1) if m else None
