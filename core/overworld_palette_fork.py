@@ -136,6 +136,25 @@ def _write_gbapal(path: str, colors: List[Color]) -> None:
             f.write(b"\x00\x00")
 
 
+def _write_jasc_pal(path: str, colors: List[Color]) -> None:
+    """Write a JASC-PAL 0100 text-format palette next to the binary
+    .gbapal.  PorySuite's overworld save loop targets the .pal sibling
+    when writing edits — without one, the loop falls back to the
+    .gbapal path and writes JASC text into the binary file, which
+    corrupts the file the build reads (gbagfx then rejects it with
+    "Size 2 doesn't evenly divide file size 149" or similar).  Creating
+    both files at fork time keeps subsequent saves on the JASC track.
+    """
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("JASC-PAL\n0100\n16\n")
+        n = min(len(colors), 16)
+        for i in range(n):
+            r, g, b = colors[i]
+            f.write(f"{int(r)} {int(g)} {int(b)}\n")
+        for _ in range(16 - n):
+            f.write("0 0 0\n")
+
+
 # ───────────────────────────── public API ────────────────────────────────────
 
 def fork_palette_for_sprite(
@@ -200,16 +219,26 @@ def fork_palette_for_sprite(
     pascal = _to_pascal(slug)
     tag_value = _next_palette_tag_value(existing)
 
-    # ── Step 1: write the .gbapal file ───────────────────────────────────
+    # ── Step 1: write BOTH the .gbapal (binary, what the build reads via
+    # INCBIN) AND the .pal sibling (JASC text, what PorySuite's overworld
+    # save loop edits when palette colours change in the editor).
+    # Creating only the .gbapal leaves the .pal missing, so PorySuite's
+    # save loop falls back to writing JASC text into the .gbapal path
+    # itself — which corrupts the binary file and breaks the next build
+    # ("Size 2 doesn't evenly divide file size 149").  Both files are
+    # written at fork time so subsequent edits stay on the JASC track.
     try:
         os.makedirs(pal_dir, exist_ok=True)
         gbapal_path = os.path.join(pal_dir, f"{slug}.gbapal")
+        jasc_path = os.path.join(pal_dir, f"{slug}.pal")
         _write_gbapal(gbapal_path, new_colors)
+        _write_jasc_pal(jasc_path, new_colors)
         applied.append(
-            f"Wrote palette: graphics/object_events/palettes/{slug}.gbapal"
+            f"Wrote palette: graphics/object_events/palettes/"
+            f"{slug}.gbapal (+ {slug}.pal sibling)"
         )
     except Exception as e:
-        errors.append(f"Write .gbapal: {e}")
+        errors.append(f"Write palette files: {e}")
         return False, applied, errors, None
 
     # ── Step 2: add `#define` for new tag in event_object_movement.c ─────
