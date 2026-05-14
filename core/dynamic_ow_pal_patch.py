@@ -260,6 +260,30 @@ def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
         else:
             failed.append("Could not restore SetUpReflection")
 
+        # ── Remove the no-reflection-tag guard added on enable ──────────
+        # Matches the inline block we inserted at the top of
+        # SetUpReflection.  Strip it out so the disabled state is byte-
+        # identical to vanilla.
+        guard_pat = re.compile(
+            r"\n\n    // DOWP guard: skip reflection sprite creation entirely\n"
+            r"    // for sprites that do not declare a reflection palette\.\n"
+            r"    // Without this, the dynamic palette allocator below can\n"
+            r"    // evict the main sprite slot and clobber its colours\.\n"
+            r"    \{\n"
+            r"        const struct ObjectEventGraphicsInfo \*info =\n"
+            r"            GetObjectEventGraphicsInfo\(objectEvent->graphicsId\);\n"
+            r"        if \(info->disableReflectionPaletteLoad\) return;\n"
+            r"        if \(info->reflectionPaletteTag == OBJ_EVENT_PAL_TAG_NONE\) return;\n"
+            r"    \}\n",
+        )
+        if guard_pat.search(fehc):
+            fehc = guard_pat.sub("\n", fehc, count=1)
+            reverted.append("SetUpReflection: no-reflection-tag guard removed")
+        else:
+            # Not present (either never patched or already reverted) —
+            # this is fine for a disable pass.
+            reverted.append("SetUpReflection: no-reflection-tag guard already absent")
+
         # Restore UpdateObjectReflectionSprite's per-frame paletteNum line
         # back to the vanilla gReflectionEffectPaletteMap lookup.
         refl_callback_patched = (
@@ -1147,6 +1171,83 @@ def apply_dowp_patch(project_root: str,
                 applied.append("SetUpReflection: already patched")
             else:
                 failed.append("Could not patch SetUpReflection reflection palette")
+
+        # ── SetUpReflection: early-return guard for sprites without a
+        # reflection palette tag ──────────────────────────────────────────
+        # Vanilla pokefirered called SetUpReflection for ANY sprite that
+        # stepped on a water/ice metatile, regardless of whether the
+        # sprite's GraphicsInfo declared a reflectionPaletteTag.  Vanilla
+        # got away with this because its static gReflectionEffectPaletteMap
+        # always produced a "reasonable" reflection palette per OBJ slot,
+        # and reflection sprites were positioned BELOW the main sprite by
+        # UpdateObjectReflectionSprite using hasReflection as the gate.
+        #
+        # Under DOWP, the dynamic palette generation in SetUpReflection
+        # allocates new OBJ palette slots on the fly via LoadSpritePalette.
+        # If all 16 slots are in use, the engine evicts one — and the
+        # eviction can clobber the main sprite's slot, leaving the main
+        # sprite rendering with whatever palette landed in its old slot.
+        # Symptom: NPCs that should have no reflection visually (e.g.
+        # standing on the blue mart floor) render as a tinted "ghost"
+        # blob of themselves in white/blue.
+        #
+        # Fix: skip reflection sprite creation entirely for sprites whose
+        # GraphicsInfo has either `reflectionPaletteTag = OBJ_EVENT_PAL_TAG_NONE`
+        # or `disableReflectionPaletteLoad = TRUE`.  Vanilla's reflection
+        # was effectively a no-op for these sprites anyway (visually it
+        # was a tiny tint underneath that nobody saw), so removing it
+        # changes nothing the player will notice — but it stops the slot
+        # eviction that wrecks main-sprite rendering for forked palettes.
+        #
+        # This is the project-agnostic fix: every pokefirered fork gets
+        # the same guard, every sprite with reflectionPaletteTag = NONE
+        # is protected.
+        old_setup_open = (
+            "void SetUpReflection(struct ObjectEvent * objectEvent, "
+            "struct Sprite *sprite, bool8 stillReflection)\n"
+            "{\n"
+            "    struct Sprite *reflectionSprite;\n"
+            "\n"
+            "    reflectionSprite = "
+        )
+        new_setup_open = (
+            "void SetUpReflection(struct ObjectEvent * objectEvent, "
+            "struct Sprite *sprite, bool8 stillReflection)\n"
+            "{\n"
+            "    struct Sprite *reflectionSprite;\n"
+            "\n"
+            "    // DOWP guard: skip reflection sprite creation entirely\n"
+            "    // for sprites that do not declare a reflection palette.\n"
+            "    // Without this, the dynamic palette allocator below can\n"
+            "    // evict the main sprite slot and clobber its colours.\n"
+            "    {\n"
+            "        const struct ObjectEventGraphicsInfo *info =\n"
+            "            GetObjectEventGraphicsInfo(objectEvent->graphicsId);\n"
+            "        if (info->disableReflectionPaletteLoad) return;\n"
+            "        if (info->reflectionPaletteTag == OBJ_EVENT_PAL_TAG_NONE) return;\n"
+            "    }\n"
+            "\n"
+            "    reflectionSprite = "
+        )
+        if "DOWP guard: skip reflection sprite creation" in fehc:
+            applied.append(
+                "SetUpReflection: no-reflection-tag guard already in place"
+            )
+        else:
+            fehc, ok_guard = _replace_once(
+                fehc, old_setup_open, new_setup_open,
+                "SetUpReflection: no-reflection-tag guard",
+            )
+            if ok_guard:
+                applied.append(
+                    "SetUpReflection: added guard so sprites with "
+                    "reflectionPaletteTag = NONE skip reflection creation"
+                )
+            else:
+                failed.append(
+                    "Could not insert SetUpReflection no-reflection-tag guard "
+                    "(function shape may have drifted from the expected layout)"
+                )
 
         # Replace LoadObjectRegularReflectionPalette to use dynamic tinting
         old_regular_refl = (

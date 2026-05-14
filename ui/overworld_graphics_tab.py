@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QFileDialog, QMessageBox, QListWidget, QListWidgetItem,
     QScrollArea, QGridLayout, QFrame, QSplitter, QSizePolicy, QLineEdit,
     QDialog, QFormLayout, QSpinBox, QDialogButtonBox, QTabWidget,
+    QCheckBox,
 )
 
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
@@ -327,12 +328,24 @@ class SpriteEntry:
 
 
 class PalettePool:
-    """One shared palette with its tag, file path, and list of sprites."""
-    __slots__ = ("tag_name", "display_name", "pal_path", "sprites")
+    """One shared palette with its tag, file paths, and list of sprites.
 
-    def __init__(self, tag_name: str, pal_path: str):
+    `pal_path` and `gbapal_path` are BOTH tracked: the JASC text file
+    PorySuite's UI reads from and edits, plus the binary .gbapal the
+    project's build pipeline INCBINs.  Save writes both atomically so
+    they can never diverge — keeping the .gbapal binary in lockstep
+    with the .pal sibling is what makes palette edits actually reach
+    the in-game rendering (previously only the .pal got updated, so
+    the build kept using stale colours).
+    """
+    __slots__ = (
+        "tag_name", "display_name", "pal_path", "gbapal_path", "sprites",
+    )
+
+    def __init__(self, tag_name: str, pal_path: str, gbapal_path: str = ""):
         self.tag_name = tag_name
         self.pal_path = pal_path
+        self.gbapal_path = gbapal_path
         # Friendly name: OBJ_EVENT_PAL_TAG_NPC_BLUE → NPC Blue
         self.display_name = (
             tag_name.replace("OBJ_EVENT_PAL_TAG_", "")
@@ -346,25 +359,44 @@ def build_overworld_data(root: str) -> Tuple[List[PalettePool], Dict[str, Sprite
 
     Returns (palette_pools sorted by name, all_sprites dict by gfx_const).
     """
-    # 1. Palette tag → symbol → file path chain
+    # 1. Palette tag → symbol → file path chain.
+    # The INCBIN entry in object_event_graphics.h gives us the binary
+    # .gbapal path (the canonical anchor — that's what the build reads).
+    # The JASC .pal sibling lives in the same dir with `.pal` extension;
+    # we ALWAYS register it (whether or not the file exists yet), and
+    # the project-open self-heal below creates any missing siblings from
+    # their existing .gbapal binaries so subsequent saves stay on the
+    # JASC track.
     tag_to_symbol = _parse_palette_table(root)
     symbol_to_relpath = _parse_pal_symbol_to_path(root)
 
-    # Build tag → abs .pal path
+    from core.overworld_palette_io import (
+        pal_sibling_for_gbapal, ensure_pal_sibling,
+    )
+
     tag_to_pal: Dict[str, str] = {}
+    tag_to_gbapal: Dict[str, str] = {}
     for tag, sym in tag_to_symbol.items():
         rel = symbol_to_relpath.get(sym, "")
-        if rel:
-            # Convert .gbapal path to .pal path
-            pal_rel = rel.replace(".gbapal", ".pal")
-            abs_path = os.path.join(root, pal_rel)
-            if os.path.isfile(abs_path):
-                tag_to_pal[tag] = abs_path
-            else:
-                # Fall back to .gbapal if .pal doesn't exist
-                abs_gba = os.path.join(root, rel)
-                if os.path.isfile(abs_gba):
-                    tag_to_pal[tag] = abs_gba
+        if not rel:
+            continue
+        abs_gbapal = os.path.join(root, rel)
+        if not os.path.isfile(abs_gbapal):
+            # Symbol references a .gbapal that doesn't exist on disk —
+            # nothing to register or heal.  This is the case for tags
+            # whose source files haven't been built yet (fresh clone).
+            continue
+        tag_to_gbapal[tag] = abs_gbapal
+        tag_to_pal[tag] = pal_sibling_for_gbapal(abs_gbapal)
+        # Project-open self-heal: if the .pal sibling is missing OR the
+        # .gbapal has been corrupted by the prior save-path bug
+        # (JASC text written into the binary file), repair both files
+        # so subsequent saves and builds stay consistent.  Garbage-free
+        # — only touches palettes that actually exist on disk.
+        try:
+            ensure_pal_sibling(abs_gbapal)
+        except Exception:
+            pass
 
     # 2. GFX const → info name, and info → palette tag + images
     gfx_to_info = _parse_pic_tables(root)
@@ -406,7 +438,9 @@ def build_overworld_data(root: str) -> Tuple[List[PalettePool], Dict[str, Sprite
     for tag, path in tag_to_pal.items():
         if "REFLECTION" in tag or tag == "OBJ_EVENT_PAL_TAG_NONE":
             continue  # Skip reflection palettes and NONE
-        pools_by_tag[tag] = PalettePool(tag, path)
+        pools_by_tag[tag] = PalettePool(
+            tag, path, gbapal_path=tag_to_gbapal.get(tag, ""),
+        )
 
     for entry in all_sprites.values():
         tag = entry.palette_tag
@@ -2245,6 +2279,169 @@ class _DOWPApplyDialog(QDialog):
         return self._spin_r.value(), self._spin_g.value(), self._spin_b.value()
 
 
+class _EmoteReviewDialog(QDialog):
+    """Multi-select review dialog for the emote-upgrade sweep.
+
+    Lists every sprite whose PNG has unused frame(s) beyond what its
+    current anim table references.  Each row shows a thumbnail of the
+    unused frame rendered with the sprite's current palette, so the
+    user can see what pose they're about to wire up.
+
+    Project-agnostic — works on any pokefirered fork.  The candidates
+    are passed in; the dialog doesn't reach into any tab state.
+    """
+
+    def __init__(
+        self,
+        project_root: str,
+        candidates: List,  # List[EmoteCandidate]
+        palette_resolver,  # callable: tag -> List[Color]
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Wire Up the Extra Frame — Emote / VS-Seeker")
+        self.setMinimumWidth(640)
+        self.setMinimumHeight(480)
+        self._candidates = candidates
+        self._palette_resolver = palette_resolver
+        self._project_root = project_root
+        self._checkboxes: List[QCheckBox] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "<p>Every sprite below has a frame on disk that isn't being "
+            "used by its current animation table.</p>"
+            "<p>Wiring it up creates an <b>ANIM_EMOTE</b> animation "
+            "state pointing at that frame — usable in scripts via "
+            "<code>objectevent_emote</code> (added in a follow-up "
+            "release) and also serving as the fallback target for "
+            "VS-seeker dispatch.</p>"
+            "<p>Pick which sprites to upgrade. Each thumbnail shows the "
+            "currently-unused frame rendered with that sprite's "
+            "palette.</p>"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #ccc; font-size: 11px;")
+        layout.addWidget(info)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        container = QWidget()
+        grid = QGridLayout(container)
+        grid.setContentsMargins(4, 4, 4, 4)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+
+        # Resolve graphics-info data once (palette tag per info_name) so
+        # we can look up palettes without a full project re-scan.
+        from ui.overworld_graphics_tab import _parse_graphics_info as _gpi
+        info_data = _gpi(self._project_root)
+
+        for row, cand in enumerate(self._candidates):
+            cb = QCheckBox()
+            cb.setChecked(True)
+            self._checkboxes.append(cb)
+            grid.addWidget(cb, row, 0)
+
+            # Thumbnail of the first unused frame
+            thumb = QLabel()
+            thumb.setFixedSize(40, 40)
+            thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb.setStyleSheet(
+                "background: #1a1a1a; border: 1px solid #333;"
+            )
+            info = info_data.get(cand.info_name, {})
+            tag = info.get("paletteTag", "")
+            palette = self._palette_resolver(tag) if tag else None
+            pix = self._render_thumbnail(cand, palette)
+            if pix:
+                thumb.setPixmap(pix.scaled(
+                    36, 36,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.FastTransformation,
+                ))
+            grid.addWidget(thumb, row, 1)
+
+            label = QLabel(
+                f"<b>{cand.info_name}</b>  "
+                f"<span style='color:#888'>"
+                f"{cand.frame_w}×{cand.frame_h}  "
+                f"+{cand.extra_frames} unused frame"
+                f"{'s' if cand.extra_frames != 1 else ''}"
+                f"</span>"
+            )
+            label.setStyleSheet("font-size: 11px;")
+            grid.addWidget(label, row, 2)
+
+        grid.setColumnStretch(2, 1)
+        container.setLayout(grid)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        # Bulk-select buttons + dialog buttons
+        bar = QHBoxLayout()
+        all_btn = QPushButton("Select All")
+        all_btn.clicked.connect(lambda: [
+            cb.setChecked(True) for cb in self._checkboxes
+        ])
+        bar.addWidget(all_btn)
+        none_btn = QPushButton("Deselect All")
+        none_btn.clicked.connect(lambda: [
+            cb.setChecked(False) for cb in self._checkboxes
+        ])
+        bar.addWidget(none_btn)
+        bar.addStretch(1)
+        layout.addLayout(bar)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+        )
+        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if ok_btn:
+            ok_btn.setText("Upgrade Selected")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _render_thumbnail(
+        self, cand, palette: Optional[List[Color]],
+    ) -> Optional[QPixmap]:
+        if not cand.png_path or not os.path.isfile(cand.png_path):
+            return None
+        try:
+            img = QImage(cand.png_path)
+            if img.isNull():
+                return None
+            if img.format() != QImage.Format.Format_Indexed8:
+                img = img.convertToFormat(QImage.Format.Format_Indexed8)
+            pix = (_apply_palette_to_image(img, palette)
+                   if palette else QPixmap.fromImage(img))
+            if pix is None or pix.isNull():
+                return None
+            # Crop to the first unused frame.
+            fw, fh = cand.frame_w, cand.frame_h
+            idx = cand.frames_used
+            x = (idx * fw) % max(1, pix.width())
+            y = ((idx * fw) // max(1, pix.width())) * fh
+            if x + fw <= pix.width() and y + fh <= pix.height():
+                return pix.copy(x, y, fw, fh)
+            return pix
+        except Exception:
+            return None
+
+    def selected_info_names(self) -> List[str]:
+        return [
+            self._candidates[i].info_name
+            for i, cb in enumerate(self._checkboxes)
+            if cb.isChecked()
+        ]
+
+
 class OverworldGraphicsTab(QWidget):
     """Sprite-first overworld graphics editor.
 
@@ -2282,8 +2479,14 @@ class OverworldGraphicsTab(QWidget):
         # Populated only by the Index-as-Background path (pixel remaps).
         self._sprite_imgs: Dict[str, QImage] = {}
         self._sprite_png_dirty: set[str] = set()
-        # Map tag → .pal file path for saving
+        # Tag → .pal file path (JASC text) — what the editor UI reads and
+        # writes for palette edits.  Always set even if the file doesn't
+        # exist yet; the save path creates it via the paired write.
         self._pal_paths: Dict[str, str] = {}
+        # Tag → .gbapal file path (binary) — what the build INCBINs.
+        # Save writes this alongside .pal so the two formats stay locked
+        # in sync.  Without this, .pal edits never reach in-game rendering.
+        self._gbapal_paths: Dict[str, str] = {}
         # Reverse lookup: tag → PalettePool
         self._pools_by_tag: Dict[str, PalettePool] = {}
 
@@ -2347,6 +2550,37 @@ class OverworldGraphicsTab(QWidget):
         self._grid_layout.setSpacing(6)
         self._grid_scroll.setWidget(self._grid_container)
         lv.addWidget(self._grid_scroll, 1)
+
+        # Amber notice strip — surfaces sprites with unused 10th frames
+        # detected by the emote scan.  Hidden by default; only shown
+        # after `load_project` runs the scan and finds candidates.
+        # See `_refresh_emote_notice` for the trigger logic.
+        self._emote_notice_widget = QWidget()
+        self._emote_notice_widget.setStyleSheet(
+            "QWidget { background: #3d2e00; border: 1px solid #ffb74d; "
+            "border-radius: 4px; }"
+        )
+        notice_layout = QHBoxLayout(self._emote_notice_widget)
+        notice_layout.setContentsMargins(8, 6, 8, 6)
+        notice_layout.setSpacing(8)
+        self._emote_notice_label = QLabel("")
+        self._emote_notice_label.setStyleSheet(
+            "color: #ffb74d; background: transparent; border: none; "
+            "font-size: 11px;"
+        )
+        self._emote_notice_label.setWordWrap(True)
+        notice_layout.addWidget(self._emote_notice_label, 1)
+        self._emote_review_btn = QPushButton("Review & Upgrade…")
+        self._emote_review_btn.setStyleSheet(
+            "QPushButton { background: #5a4400; color: #ffe0a0; "
+            "border: 1px solid #ffb74d; padding: 4px 10px; "
+            "border-radius: 3px; font-weight: bold; }"
+            "QPushButton:hover { background: #7a5a00; }"
+        )
+        self._emote_review_btn.clicked.connect(self._open_emote_review_dialog)
+        notice_layout.addWidget(self._emote_review_btn, 0)
+        self._emote_notice_widget.setVisible(False)
+        lv.addWidget(self._emote_notice_widget, 0)
 
         # Add New Sprite button
         self._add_sprite_btn = QPushButton("+ Add New Sprite…")
@@ -2518,6 +2752,16 @@ class OverworldGraphicsTab(QWidget):
 
         rv.addWidget(pal_frame, 0)
 
+        # Per-sprite emote upgrade section.  Empty placeholder by default;
+        # populated by `_show_sprite_detail` when the selected sprite is
+        # a candidate per the project-open scan.  Hidden when not.
+        self._emote_per_sprite_container = QWidget()
+        self._emote_per_sprite_container.setVisible(False)
+        _epsc_layout = QVBoxLayout(self._emote_per_sprite_container)
+        _epsc_layout.setContentsMargins(0, 0, 0, 0)
+        _epsc_layout.setSpacing(0)
+        rv.addWidget(self._emote_per_sprite_container, 0)
+
         splitter.addWidget(right)
         splitter.setSizes([340, 660])
 
@@ -2575,6 +2819,7 @@ class OverworldGraphicsTab(QWidget):
         self._sprite_imgs.clear()
         self._sprite_png_dirty.clear()
         self._pal_paths.clear()
+        self._gbapal_paths.clear()
         self._pools_by_tag.clear()
         self._current_sprite = None
 
@@ -2598,6 +2843,8 @@ class OverworldGraphicsTab(QWidget):
         # Cache palette paths and pools
         for pool in self._pools:
             self._pal_paths[pool.tag_name] = pool.pal_path
+            if pool.gbapal_path:
+                self._gbapal_paths[pool.tag_name] = pool.gbapal_path
             self._pools_by_tag[pool.tag_name] = pool
 
         # Build flat sorted sprite list
@@ -2617,6 +2864,235 @@ class OverworldGraphicsTab(QWidget):
         # Load field effect sprites tab
         self._fe_tab.load(project_root)
 
+        # Emote / VS-seeker frame-9 sweep.  For projects whose vanilla NPC
+        # PNGs already carry a 10th frame the engine doesn't currently
+        # reference, surface a notice so the user can wire it up with one
+        # click.  Project-agnostic: this only flags sprites whose
+        # current Standard-family anim table doesn't already cover the
+        # extra frames.  A project that's hand-rolled its anim tables
+        # (like the one this is being tested against) gets zero flagged
+        # and the notice strip stays hidden.
+        try:
+            from core.anim_table_upgrade import scan_emote_candidates
+            self._emote_report = scan_emote_candidates(project_root)
+        except Exception as exc:
+            self._emote_report = None
+            try:
+                from logging import getLogger
+                getLogger("OverworldGraphics").warning(
+                    "Emote scan failed: %s", exc, exc_info=True,
+                )
+            except Exception:
+                pass
+        self._refresh_emote_notice()
+
+    def _refresh_emote_notice(self) -> None:
+        """Show/hide the amber notice strip based on the scan result.
+
+        Called after `load_project` finishes and again after any upgrade
+        completes (the post-upgrade scan should show fewer candidates so
+        the notice text updates or disappears).
+        """
+        if not hasattr(self, "_emote_notice_widget"):
+            return  # UI not built yet
+        report = getattr(self, "_emote_report", None)
+        if not report or not report.candidates:
+            self._emote_notice_widget.setVisible(False)
+            return
+        n = len(report.candidates)
+        self._emote_notice_label.setText(
+            f"⚠ {n} sprite{'s' if n != 1 else ''} have an unused 10th "
+            f"frame in their PNG that isn't wired to any animation."
+        )
+        self._emote_notice_widget.setVisible(True)
+
+    def _open_emote_review_dialog(self) -> None:
+        """Open the multi-select review dialog for emote candidates."""
+        report = getattr(self, "_emote_report", None)
+        if not report or not report.candidates:
+            return
+        dlg = _EmoteReviewDialog(
+            self._project_root,
+            report.candidates,
+            self._get_palette_for_sprite_by_tag,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dlg.selected_info_names()
+        if not selected:
+            return
+        self._run_emote_upgrade_batch(selected)
+
+    def _get_palette_for_sprite_by_tag(self, tag: str) -> List[Color]:
+        """Public-ish helper so the review dialog can fetch a palette
+        for thumbnail rendering without reaching into private state."""
+        if tag in self._palettes:
+            return self._palettes[tag]
+        bus_colors = _get_palette_bus().get_overworld_palette(tag)
+        if bus_colors:
+            return bus_colors
+        gbapal_path = self._gbapal_paths.get(tag, "")
+        if gbapal_path:
+            from core.overworld_palette_io import read_palette_pair
+            loaded = read_palette_pair(gbapal_path)
+            if loaded:
+                return loaded
+        return [(0, 0, 0)] * 16
+
+    def _run_emote_upgrade_batch(self, info_names: List[str]) -> None:
+        """Run `upgrade_sprite_to_emote` for each selected sprite,
+        collect outcomes, and reload the tab so the new state shows.
+        """
+        from core.anim_table_upgrade import upgrade_sprite_to_emote
+        ok_count = 0
+        applied_all: List[str] = []
+        errors_all: List[Tuple[str, str]] = []
+        for info_name in info_names:
+            try:
+                success, applied, errors = upgrade_sprite_to_emote(
+                    self._project_root, info_name,
+                )
+            except Exception as exc:
+                errors_all.append((info_name, f"unexpected: {exc}"))
+                continue
+            applied_all.extend(applied)
+            if success:
+                ok_count += 1
+            else:
+                for e in errors:
+                    errors_all.append((info_name, e))
+
+        summary_lines = [
+            f"Upgraded {ok_count} of {len(info_names)} sprites."
+        ]
+        if errors_all:
+            summary_lines.append("")
+            summary_lines.append("Errors:")
+            for info_name, e in errors_all[:10]:
+                summary_lines.append(f"  • {info_name}: {e}")
+            if len(errors_all) > 10:
+                summary_lines.append(
+                    f"  … and {len(errors_all) - 10} more (see log)"
+                )
+        summary_lines.append("")
+        summary_lines.append(
+            "Run Make Modern (Ctrl+Shift+M) to rebuild — the new "
+            "anim slot is now usable in scripts as ANIM_EMOTE."
+        )
+
+        QMessageBox.information(
+            self, "Emote Upgrade Complete",
+            "\n".join(summary_lines),
+        )
+
+        # Reload so the survey updates and per-sprite detail panels
+        # reflect the new state.
+        self.load(self._project_root)
+
+    def _build_per_sprite_emote_section(self, entry: SpriteEntry) -> Optional[QWidget]:
+        """Return a widget showing the 10th-frame thumbnail + an Upgrade
+        button for `entry`, OR None if this sprite isn't a candidate.
+
+        Called from `_show_sprite_detail` so the section appears only
+        for sprites that the scan flagged.
+        """
+        report = getattr(self, "_emote_report", None)
+        if not report:
+            return None
+        cand = next(
+            (c for c in report.candidates if c.info_name == entry.info_name),
+            None,
+        )
+        if not cand:
+            return None
+
+        box = QGroupBox("Extra Frame Available")
+        box.setStyleSheet(
+            "QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; "
+            "margin-top: 6px; padding-top: 10px; }"
+            "QGroupBox::title { color: #ffb74d; subcontrol-origin: margin; "
+            "left: 8px; padding: 0 4px; }"
+        )
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+
+        info_lbl = QLabel(
+            f"This sprite's PNG has {cand.frames_on_disk} frames. "
+            f"Frames 0–{cand.frames_used - 1} are wired to the standard "
+            f"walk cycle. Frame {cand.frames_used} is on disk but unused."
+        )
+        info_lbl.setWordWrap(True)
+        info_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
+        layout.addWidget(info_lbl)
+
+        # Frame-N thumbnail (N = first unused frame index).
+        thumb = QLabel()
+        thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        thumb.setFixedSize(64, 64)
+        thumb.setStyleSheet("background: #1a1a1a; border: 1px solid #333;")
+        palette = self._get_palette_for_sprite(entry)
+        pix = self._render_frame_thumbnail(
+            cand.png_path, palette, cand.frames_used,
+            cand.frame_w, cand.frame_h,
+        )
+        if pix:
+            thumb.setPixmap(pix.scaled(
+                60, 60,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            ))
+        layout.addWidget(thumb, 0, Qt.AlignmentFlag.AlignCenter)
+
+        btn = QPushButton("Wire frame as emote / VS-seeker pose")
+        btn.setToolTip(
+            "Adds an ANIM_EMOTE animation state that plays this frame.\n"
+            "The slot also serves as the fallback for VS-seeker dispatch."
+        )
+        btn.clicked.connect(
+            lambda _checked, name=entry.info_name: (
+                self._run_emote_upgrade_batch([name])
+            )
+        )
+        layout.addWidget(btn)
+
+        return box
+
+    def _render_frame_thumbnail(
+        self,
+        png_path: str,
+        palette: Optional[List[Color]],
+        frame_idx: int,
+        frame_w: int,
+        frame_h: int,
+    ) -> Optional[QPixmap]:
+        """Render a single frame from a sprite sheet with the given
+        palette — used by the emote review dialog and per-sprite panel.
+        """
+        if not png_path or not os.path.isfile(png_path):
+            return None
+        try:
+            img = QImage(png_path)
+            if img.isNull():
+                return None
+            if img.format() != QImage.Format.Format_Indexed8:
+                img = img.convertToFormat(QImage.Format.Format_Indexed8)
+            if palette:
+                pix = _apply_palette_to_image(img, palette)
+            else:
+                pix = QPixmap.fromImage(img)
+            if pix is None or pix.isNull():
+                return None
+            # crop to the requested frame
+            x = (frame_idx * frame_w) % max(1, pix.width())
+            y = ((frame_idx * frame_w) // max(1, pix.width())) * frame_h
+            if x + frame_w <= pix.width() and y + frame_h <= pix.height():
+                return pix.copy(x, y, frame_w, frame_h)
+            return pix
+        except Exception:
+            return None
+
     def _get_palette_for_sprite(self, entry: SpriteEntry) -> Optional[List[Color]]:
         """Get the palette for a sprite — RAM-first via the bus, then disk.
 
@@ -2632,9 +3108,27 @@ class OverworldGraphicsTab(QWidget):
             if bus_colors:
                 self._palettes[tag] = bus_colors
             else:
-                # 2) Fall back to the .pal file on disk.
-                pal_path = self._pal_paths.get(tag, "")
-                colors = read_jasc_pal(pal_path) if pal_path else []
+                # 2) Fall back to disk.  Use the paired-IO read so we
+                #    pick up whichever of (.pal, .gbapal) is the current
+                #    representation — the helper prefers the JASC sibling
+                #    when present and falls back to the binary file
+                #    (including the corrupt-by-prior-bug case where the
+                #    .gbapal contains JASC text from the broken save
+                #    path that this release fixes).
+                gbapal_path = self._gbapal_paths.get(tag, "")
+                colors: List[Color] = []
+                if gbapal_path:
+                    from core.overworld_palette_io import read_palette_pair
+                    loaded = read_palette_pair(gbapal_path)
+                    if loaded:
+                        colors = loaded
+                if not colors:
+                    # Legacy fallback for the rare case where _gbapal_paths
+                    # has no entry but _pal_paths does (e.g. ad-hoc tag
+                    # added by a non-project-open code path).
+                    pal_path = self._pal_paths.get(tag, "")
+                    if pal_path:
+                        colors = read_jasc_pal(pal_path)
                 if not colors:
                     colors = [(0, 0, 0)] * 16
                 self._palettes[tag] = colors
@@ -2977,6 +3471,31 @@ class OverworldGraphicsTab(QWidget):
         fh = entry.height if isinstance(entry.height, int) else 0
         anim = getattr(entry, "anim_table", "sAnimTable_Standard")
         self._four_dir.load_sprite(entry.png_path, palette, fw, fh, anim)
+
+        # Per-sprite emote upgrade section — shown only when the scan
+        # flagged THIS sprite as a candidate.  Built fresh on each
+        # selection so the thumbnail uses the current palette.
+        self._refresh_per_sprite_emote_section(entry)
+
+    def _refresh_per_sprite_emote_section(self, entry: SpriteEntry) -> None:
+        """Populate (or hide) the per-sprite emote upgrade section."""
+        container = getattr(self, "_emote_per_sprite_container", None)
+        if container is None:
+            return
+        # Clear out any previous widget
+        layout = container.layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        # Build a fresh section if this sprite is a candidate
+        section = self._build_per_sprite_emote_section(entry)
+        if section is None:
+            container.setVisible(False)
+            return
+        layout.addWidget(section)
+        container.setVisible(True)
 
     def _import_palette_from_png(self) -> None:
         """Import a 16-colour palette from an indexed PNG.
@@ -3747,12 +4266,31 @@ class OverworldGraphicsTab(QWidget):
         baked_pngs: set[str] = set()
         for tag in list(self._palette_dirty):
             pal_path = self._pal_paths.get(tag, "")
-            if not pal_path:
+            gbapal_path = self._gbapal_paths.get(tag, "")
+            if not pal_path or not gbapal_path:
                 errors.append(f"overworld-pal:{tag} (no path)")
                 continue
             colors = self._palettes.get(tag)
-            if not (colors and write_jasc_pal(pal_path, colors)):
-                errors.append(f"overworld-pal:{tag}")
+            if not colors:
+                errors.append(f"overworld-pal:{tag} (no colours)")
+                continue
+            # Write BOTH formats atomically.  The .pal (JASC text) is
+            # what PorySuite's UI reads on reload; the .gbapal (binary)
+            # is what the project's build pipeline INCBINs.  Writing
+            # only one made the two formats drift out of sync and the
+            # build kept using the old colours even when the editor
+            # showed the new ones.
+            from core.overworld_palette_io import write_palette_pair
+            ok_gba, ok_pal = write_palette_pair(gbapal_path, pal_path, colors)
+            if not (ok_gba and ok_pal):
+                missing = []
+                if not ok_gba:
+                    missing.append(".gbapal")
+                if not ok_pal:
+                    missing.append(".pal")
+                errors.append(
+                    f"overworld-pal:{tag} (failed to write {', '.join(missing)})"
+                )
                 continue
             self._palette_dirty.discard(tag)
             ok += 1

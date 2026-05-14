@@ -110,13 +110,60 @@ def _camel_to_upper_snake(name: str) -> str:
     return s.upper()
 
 
+# Tag values reserved by other pokefirered subsystems that share the same
+# OBJ-palette tag namespace as object event palettes.  When forking, we
+# MUST avoid these — collision means the sprite renders with the other
+# system's palette at runtime.
+#
+# Sources (vanilla pokefirered):
+#   - 0x1004..0x100F  FLDEFF_PAL_TAG_*  (include/constants/field_effects.h)
+#   - 0x1100..0x111F  OBJ_EVENT_PAL_TAG_* (vanilla NPCs, player, etc.)
+#   - 0x11FF          OBJ_EVENT_PAL_TAG_NONE — the array terminator value
+#   - 0x1200          TAG_WEATHER_START — the weather palette base tag.
+#                     `StartWeather()` calls `AllocSpritePalette(0x1200)`
+#                     every map load; ANY sprite tag of 0x1200 collides
+#                     and gets the weather palette at runtime (the bug
+#                     that produced Boy's "blue blob" rendering).
+#   - 0x1300, 0x1301  FLDEFF_PAL_TAG_FLDEFF_SHADOW / _SURF_BLOB (PorySuite-
+#                     added in the field effect palette refactor).
+#
+# We start forking at 0x1400 — comfortably clear of every reserved range
+# above.  64K tags above that before another wrap-around concern.
+_RESERVED_TAG_VALUES = frozenset({
+    0x1200,  # TAG_WEATHER_START
+    0x1300,  # FLDEFF_PAL_TAG_FLDEFF_SHADOW
+    0x1301,  # FLDEFF_PAL_TAG_FLDEFF_SURF_BLOB
+})
+_FORK_BASE_TAG = 0x1400
+_OBJ_EVENT_PAL_TAG_NONE = 0x11FF  # not a "real" tag; never count toward "next"
+
+
 def _next_palette_tag_value(existing: dict[str, int]) -> int:
-    """Lowest free integer tag value above the current maximum.  Defaults
-    to 0x1300 (PorySuite's reserved fork range) if no tags exist yet.
+    """Pick the next free OBJ-palette tag value for a new fork.
+
+    Skips reserved system tag values (TAG_WEATHER_START at 0x1200, the
+    field-effect refactor tags at 0x1300/0x1301, etc.) so forked NPC
+    palettes can't collide with another subsystem at runtime.  Always
+    returns >= `_FORK_BASE_TAG` (0x1400) so we stay above every reserved
+    range vanilla pokefirered defines.
     """
-    if not existing:
-        return 0x1300
-    return max(existing.values()) + 1
+    # Filter out the NONE sentinel from "existing" — its value (0x11FF)
+    # is a terminator, not a real tag.  `max(existing.values()) + 1` of
+    # that would land on 0x1200 (TAG_WEATHER_START) which is exactly the
+    # collision that produced the original bug.
+    real_values = [
+        v for tag, v in existing.items()
+        if tag != "OBJ_EVENT_PAL_TAG_NONE"
+    ]
+    if real_values:
+        candidate = max(max(real_values) + 1, _FORK_BASE_TAG)
+    else:
+        candidate = _FORK_BASE_TAG
+    # Skip over reserved values + any value already in use.
+    used = set(real_values)
+    while candidate in _RESERVED_TAG_VALUES or candidate in used:
+        candidate += 1
+    return candidate
 
 
 def _write_gbapal(path: str, colors: List[Color]) -> None:
