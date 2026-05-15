@@ -157,6 +157,44 @@ class DragSwatch(QLabel):
         for lbl in dlg.findChildren(QLabel):
             if lbl.text().rstrip(":").strip().upper() in ("HTML", "&HTML"):
                 lbl.setText("Hex:")
+
+        # Live GBA-quantized preview alongside Qt's own preview.  The
+        # GBA stores 5 bits per channel (32 levels, multiples of 8), so
+        # picks like #F9C890 round-trip back to #F8C890 with no visible
+        # change.  Without showing the rounded-down value, users assume
+        # the picker is broken when their fine-tuned tweaks evaporate.
+        gba_preview = QLabel()
+        gba_preview.setMinimumSize(48, 24)
+        gba_preview.setStyleSheet(
+            "border: 1px solid #555; background: rgb({}, {}, {});".format(
+                *clamp_to_gba(r, g, b)
+            )
+        )
+        gba_label = QLabel(
+            "GBA preview (rounded to 5-bit channels — what actually saves):"
+        )
+        gba_label.setWordWrap(True)
+        gba_hex = QLabel(f"#{r:02X}{g:02X}{b:02X}")
+        gba_hex.setStyleSheet("color: #aaa; font-family: monospace;")
+        # Push the previews into the dialog's layout, at the bottom.
+        layout = dlg.layout()
+        if layout is not None:
+            row = QHBoxLayout()
+            row.addWidget(gba_preview)
+            row.addWidget(gba_hex)
+            row.addStretch(1)
+            layout.addWidget(gba_label)
+            layout.addLayout(row)
+
+        def _refresh_gba_preview(qc):
+            gr, gg, gb = clamp_to_gba(qc.red(), qc.green(), qc.blue())
+            gba_preview.setStyleSheet(
+                f"border: 1px solid #555; background: rgb({gr}, {gg}, {gb});"
+            )
+            gba_hex.setText(f"#{gr:02X}{gg:02X}{gb:02X}")
+
+        dlg.currentColorChanged.connect(_refresh_gba_preview)
+
         if dlg.exec() == QColorDialog.DialogCode.Accepted:
             qc = dlg.currentColor()
             if qc.isValid():
@@ -166,6 +204,25 @@ class DragSwatch(QLabel):
                     self._refresh()
                     self._refresh_tooltip()
                     self.color_changed.emit(self._index, new)
+                elif (qc.red(), qc.green(), qc.blue()) != self._color:
+                    # The user picked SOMETHING different from the
+                    # current swatch, but it quantizes to the same GBA
+                    # value.  Tell them why their change appears to do
+                    # nothing — better than silently swallowing the
+                    # input and leaving them to guess.
+                    from PyQt6.QtWidgets import QMessageBox
+                    raw = (qc.red(), qc.green(), qc.blue())
+                    QMessageBox.information(
+                        top, "GBA palette resolution",
+                        f"The color you picked (#{raw[0]:02X}{raw[1]:02X}{raw[2]:02X}) "
+                        f"rounds down to #{new[0]:02X}{new[1]:02X}{new[2]:02X} "
+                        "in the GBA's 15-bit palette format — the same as "
+                        "the current swatch.\n\n"
+                        "GBA palettes only have 32 distinct levels per "
+                        "channel (multiples of 8: 0, 8, 16, …, 248).  "
+                        "Pick a colour that differs by at least 8 in one "
+                        "channel to register a change."
+                    )
 
     # right-click menu — "Index as Background"
     def contextMenuEvent(self, event):

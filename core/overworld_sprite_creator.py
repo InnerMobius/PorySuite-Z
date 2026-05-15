@@ -62,6 +62,86 @@ def _to_upper(slug: str) -> str:
     return slug.upper()
 
 
+def _ensure_spritesheet_rule(
+    root: str,
+    category: str,
+    sprite_slug: str,
+    tile_w: int,
+    tile_h: int,
+) -> bool:
+    """Add a per-frame metatile rule to ``spritesheet_rules.mk`` for a
+    new overworld sprite.
+
+    The default ``%.4bpp: %.png`` Makefile rule runs ``gbagfx`` with no
+    metatile flags, so it lays out the resulting .4bpp tiles in
+    *row-major* order across the entire image.  The engine's
+    ``overworld_frame(ptr, w, h, frame)`` macro expects each frame's
+    tiles to be *contiguous* in the .4bpp.  Without the explicit
+    ``-mwidth N -mheight N`` flags, frame 0 actually loads the top
+    halves of frames 0 AND 1 stitched horizontally — manifesting
+    in-game as "two heads stacked" for small sprites.
+
+    Idempotent: returns ``False`` if a rule already exists for this
+    PNG.  Returns ``True`` if a new rule was appended.
+    """
+    rules_path = os.path.join(root, "spritesheet_rules.mk")
+    rel_4bpp = (
+        f"$(OBJEVENTGFXDIR)/{category}/{sprite_slug}.4bpp"
+    )
+    text = _read_file(rules_path)
+    # Match any line that starts with this exact .4bpp target — both the
+    # `target: pattern: pattern` form used by every vanilla rule, and
+    # bare ``target:`` lines if someone hand-added one differently.
+    pat = re.compile(
+        r"^" + re.escape(rel_4bpp) + r"\s*:",
+        re.MULTILINE,
+    )
+    if pat.search(text):
+        return False  # rule already present, no-op
+
+    block = (
+        f"\n{rel_4bpp}: %.4bpp: %.png\n"
+        f"\t$(GFX) $< $@ -mwidth {tile_w} -mheight {tile_h}\n"
+    )
+    # Append at end of file.  Order doesn't matter to Make; the
+    # vanilla file is alphabetised within each category but Make
+    # picks the most-specific rule regardless of position.
+    if not text.endswith("\n"):
+        text += "\n"
+    text += block
+    _write_file(rules_path, text)
+    return True
+
+
+def _remove_spritesheet_rule(
+    root: str,
+    rel_4bpp_path: str,
+) -> bool:
+    """Remove the per-sprite rule block from ``spritesheet_rules.mk``.
+
+    ``rel_4bpp_path`` is the path as it appears in the rules file
+    (e.g. ``$(OBJEVENTGFXDIR)/people/gravekid.4bpp``).  Returns
+    ``True`` if a rule was found and removed.
+    """
+    rules_path = os.path.join(root, "spritesheet_rules.mk")
+    if not os.path.isfile(rules_path):
+        return False
+    text = _read_file(rules_path)
+    # Match the 2-line rule block plus surrounding blank lines.
+    pat = re.compile(
+        r"\n?"
+        + re.escape(rel_4bpp_path)
+        + r"\s*:[^\n]*\n\t[^\n]*\n",
+        re.MULTILINE,
+    )
+    m = pat.search(text)
+    if not m:
+        return False
+    text = text[:m.start()] + text[m.end():]
+    _write_file(rules_path, text)
+    return True
+
+
 def get_next_gfx_id(root: str) -> Tuple[int, str]:
     """Read the current NUM_OBJ_EVENT_GFX value and return (next_id, file_path)."""
     path = os.path.join(root, "include", "constants", "event_objects.h")
@@ -380,6 +460,26 @@ const struct ObjectEventGraphicsInfo gObjectEventGraphicsInfo_{pascal} = {{
             errors.append("Could not find closing }; in pointers.h")
     except Exception as e:
         errors.append(f"Pointer entry: {e}")
+
+    # ── Step 7a: Ensure spritesheet_rules.mk has a per-frame metatile
+    #            rule for this PNG.  Without `-mwidth N -mheight N` the
+    #            default `%.4bpp: %.png` rule emits row-major tile order,
+    #            but the engine's `overworld_frame` macro expects per-frame
+    #            contiguous tiles.  Skipping this rule produces a sprite
+    #            where each in-game "frame" actually shows the top halves
+    #            of two adjacent source frames stitched together — i.e.
+    #            two heads stacked vertically.
+    try:
+        added = _ensure_spritesheet_rule(
+            root, category, sprite_slug, tile_w, tile_h,
+        )
+        if added:
+            applied.append(
+                f"Added spritesheet_rules.mk rule "
+                f"(-mwidth {tile_w} -mheight {tile_h})"
+            )
+    except Exception as e:
+        errors.append(f"spritesheet rule: {e}")
 
     # ── Step 7: Add OBJ_EVENT_GFX_ define and bump NUM ──────────────────
     try:
@@ -764,8 +864,228 @@ def delete_overworld_sprite(
                         except OSError as exc:
                             errors.append(f"Could not delete {p}: {exc}")
 
+    # ── 9. Strip the sprite's per-frame metatile rule from
+    #       spritesheet_rules.mk (no-op if the sprite was deleted
+    #       before the rule was ever added).  Iterate every category
+    #       because we can't infer it from a sprite that's already
+    #       been gutted from source.
+    slug = upper.lower()
+    for cat in ("people", "pokemon", "misc"):
+        rel_4bpp = f"$(OBJEVENTGFXDIR)/{cat}/{slug}.4bpp"
+        try:
+            if _remove_spritesheet_rule(root, rel_4bpp):
+                applied.append(
+                    f"Removed spritesheet_rules.mk rule for {cat}/{slug}"
+                )
+        except Exception as exc:
+            errors.append(
+                f"Could not remove spritesheet rule for {cat}/{slug}: {exc}"
+            )
+
     success = len(errors) == 0
     return success, applied, errors
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Project-wide self-heal: ensure every overworld sprite has a per-frame
+# metatile rule in spritesheet_rules.mk
+# ════════════════════════════════════════════════════════════════════════════
+
+def ensure_all_overworld_spritesheet_rules(
+    root: str,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Scan every overworld sprite's GraphicsInfo + INCBIN path and make
+    sure ``spritesheet_rules.mk`` has a matching per-frame metatile rule.
+
+    This protects against the historical bug where ``create_overworld_sprite``
+    didn't add the rule, leaving the .4bpp to be built by the generic
+    ``%.4bpp: %.png`` rule (no ``-mwidth``/``-mheight``).  The resulting
+    file uses row-major tile order across the whole strip — but the engine's
+    ``overworld_frame`` macro reads bytes as if frames were contiguous.
+    The render glitch is "frame N shows the top halves of N and N+1 stacked".
+
+    What we do:
+
+    1. Parse every ``gObjectEventPic_<X>[] = INCBIN_U16(...)`` from
+       ``object_event_graphics.h`` to get the PNG path per pic symbol.
+    2. Cross-reference each pic symbol with its
+       ``gObjectEventGraphicsInfo_<X>`` (via the ``.images = sPicTable_<X>``
+       linkage and the matching ``.width / .height`` fields) to determine
+       per-frame pixel dimensions.
+    3. For every PNG whose .4bpp target lacks a rule in
+       ``spritesheet_rules.mk``, append a new rule with the correct
+       ``-mwidth tile_w -mheight tile_h``.
+    4. Delete any stale ``.4bpp`` that was previously built without
+       the rule, so the next build regenerates it with correct tile order.
+
+    Idempotent: re-running adds nothing if all rules already exist.
+    Project-agnostic: derives everything from source-tree state — no
+    hardcoded sprite names or dimensions.
+
+    Returns ``(rules_added, files_invalidated, errors)`` — each a list
+    of plain-English descriptions for the user-facing log.
+    """
+    rules_added: List[str] = []
+    invalidated: List[str] = []
+    errors: List[str] = []
+
+    gfx_h_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics.h"
+    )
+    gi_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics_info.h"
+    )
+    pt_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_pic_tables.h"
+    )
+    rules_path = os.path.join(root, "spritesheet_rules.mk")
+    for p in (gfx_h_path, gi_path, pt_path, rules_path):
+        if not os.path.isfile(p):
+            errors.append(f"missing {os.path.relpath(p, root)}")
+            return rules_added, invalidated, errors
+
+    try:
+        gfx_text = _read_file(gfx_h_path)
+        gi_text = _read_file(gi_path)
+        pt_text = _read_file(pt_path)
+        rules_text = _read_file(rules_path)
+    except Exception as exc:
+        errors.append(f"read source: {exc}")
+        return rules_added, invalidated, errors
+
+    # Map pic_symbol -> (category, slug)  from INCBIN lines like
+    #   const u16 gObjectEventPic_Gravekid[] =
+    #       INCBIN_U16("graphics/object_events/pics/people/gravekid.4bpp");
+    pic_to_path: Dict[str, Tuple[str, str]] = {}
+    for m in re.finditer(
+        r"const\s+u16\s+(gObjectEventPic_\w+)\s*\[\]\s*=\s*"
+        r"INCBIN_U\d+\(\"graphics/object_events/pics/([^/]+)/([^./]+)\.4bpp\"\)",
+        gfx_text,
+    ):
+        pic_to_path[m.group(1)] = (m.group(2), m.group(3))
+
+    # Walk every GraphicsInfo block; correlate to its pic symbol via the
+    # `.images = sPicTable_<X>` line, then look up that pic table in
+    # pic_tables.h to find its pic symbol.  Doing it this way matches
+    # vanilla layout AND user-edited projects without assuming naming
+    # parity between info_name and pic_symbol.
+    pic_dims: Dict[str, Tuple[int, int]] = {}
+    for m in re.finditer(
+        r"const\s+struct\s+ObjectEventGraphicsInfo\s+gObjectEventGraphicsInfo_\w+\s*=\s*\{(?P<body>[^;]*?)\};",
+        gi_text, flags=re.DOTALL,
+    ):
+        body = m.group("body")
+        pt_match = re.search(r"\.images\s*=\s*(sPicTable_\w+)", body)
+        w_match = re.search(r"\.width\s*=\s*(\d+)", body)
+        h_match = re.search(r"\.height\s*=\s*(\d+)", body)
+        if not (pt_match and w_match and h_match):
+            continue
+        pic_table = pt_match.group(1)
+        frame_w = int(w_match.group(1))
+        frame_h = int(h_match.group(1))
+        # Find the pic table's first entry to get its pic symbol.
+        pt_block_match = re.search(
+            r"static\s+const\s+struct\s+SpriteFrameImage\s+"
+            + re.escape(pic_table)
+            + r"\s*\[\]\s*=\s*\{(?P<body>[^}]*)\}",
+            pt_text, flags=re.DOTALL,
+        )
+        if not pt_block_match:
+            continue
+        first_pic = re.search(
+            r"overworld_frame\s*\(\s*(gObjectEventPic_\w+)",
+            pt_block_match.group("body"),
+        )
+        if not first_pic:
+            continue
+        pic_dims[first_pic.group(1)] = (frame_w, frame_h)
+
+    # For each pic symbol that has both a path and dimensions, check
+    # whether spritesheet_rules.mk already has a rule.  If not, append.
+    # Track which .4bpp files need to be deleted so they get rebuilt.
+    #
+    # CRITICAL heuristic: only add a rule for sprites that are
+    # HORIZONTAL STRIPS of multiple frames (PNG width > frame width).
+    # Single-frame sprites (PNG width == frame width) work fine with
+    # the default ``%.4bpp: %.png`` rule because row-major tile order
+    # IS per-frame order when there's only one frame.  Adding rules to
+    # single-frame sprites is harmless (gbagfx produces identical
+    # output either way) but invalidates the existing .4bpp and forces
+    # an unnecessary rebuild.  So we skip them.
+    try:
+        from PyQt6.QtGui import QImage
+    except Exception:
+        QImage = None  # type: ignore
+
+    appended_any = False
+    new_rules_text = rules_text
+    for pic_symbol, (category, slug) in pic_to_path.items():
+        if pic_symbol not in pic_dims:
+            continue
+        frame_w, frame_h = pic_dims[pic_symbol]
+        tile_w = frame_w // 8
+        tile_h = frame_h // 8
+        if tile_w <= 0 or tile_h <= 0:
+            continue
+
+        # Skip single-frame sprites — they don't need the rule.  Determine
+        # frame count by reading the PNG width.  If we can't read it (no
+        # PyQt6, missing file), be conservative and skip — the user has
+        # already shipped without the rule, so adding one now would only
+        # invalidate the existing .4bpp.
+        png_path = os.path.join(
+            root, "graphics", "object_events", "pics", category, f"{slug}.png"
+        )
+        if QImage is None or not os.path.isfile(png_path):
+            continue
+        png = QImage(png_path)
+        if png.isNull():
+            continue
+        if png.width() <= frame_w:
+            continue  # single-frame; rule not needed
+
+        rel_4bpp = f"$(OBJEVENTGFXDIR)/{category}/{slug}.4bpp"
+        pat = re.compile(
+            r"^" + re.escape(rel_4bpp) + r"\s*:",
+            re.MULTILINE,
+        )
+        if pat.search(new_rules_text):
+            continue  # already has a rule
+
+        block = (
+            f"\n{rel_4bpp}: %.4bpp: %.png\n"
+            f"\t$(GFX) $< $@ -mwidth {tile_w} -mheight {tile_h}\n"
+        )
+        if not new_rules_text.endswith("\n"):
+            new_rules_text += "\n"
+        new_rules_text += block
+        appended_any = True
+        rules_added.append(
+            f"{category}/{slug}.4bpp (-mwidth {tile_w} -mheight {tile_h})"
+        )
+
+        # The existing .4bpp was built without the rule and has wrong
+        # tile order.  Delete it so the next build regenerates with
+        # gbagfx's per-frame metatile flag.
+        stale_4bpp = os.path.join(
+            root, "graphics", "object_events", "pics", category, f"{slug}.4bpp"
+        )
+        if os.path.isfile(stale_4bpp):
+            try:
+                os.remove(stale_4bpp)
+                invalidated.append(f"{category}/{slug}.4bpp")
+            except OSError as exc:
+                errors.append(
+                    f"Could not delete stale {stale_4bpp}: {exc}"
+                )
+
+    if appended_any:
+        try:
+            _atomic_write(rules_path, new_rules_text)
+        except Exception as exc:
+            errors.append(f"write spritesheet_rules.mk: {exc}")
+
+    return rules_added, invalidated, errors
 
 
 # ── private helpers ────────────────────────────────────────────────────

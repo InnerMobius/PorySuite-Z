@@ -1304,6 +1304,74 @@ class UnifiedMainWindow(QMainWindow):
         project_dir = self.project_info.get("dir", "")
         midi_dir = os.path.join(project_dir, "sound", "songs", "midi") if project_dir else ""
 
+        # Step 0: pre-flight .gba lock check.  If an emulator (mGBA, VBA-M,
+        # etc.) still has the previously-built .gba open, the final objcopy
+        # step will fail with a cryptic "Invalid argument" error.  Detect it
+        # here and surface a plain-English message before kicking off Make.
+        if project_dir:
+            for gba_name in ("pokefirered_modern.gba", "pokefirered.gba"):
+                gba_path = os.path.join(project_dir, gba_name)
+                if not os.path.isfile(gba_path):
+                    continue
+                try:
+                    # Try to open for read+write without truncating.  If
+                    # another process holds an exclusive write lock (as
+                    # emulators typically do on Windows), this raises
+                    # PermissionError / OSError immediately.
+                    with open(gba_path, "r+b"):
+                        pass
+                except (PermissionError, OSError) as exc:
+                    QMessageBox.warning(
+                        self, "Build blocked — ROM file is locked",
+                        f"The file <b>{gba_name}</b> appears to be open in "
+                        f"another program (likely the emulator from a "
+                        f"previous Play session).<br><br>"
+                        f"Close the emulator window and press Make again."
+                        f"<br><br><span style='color:#888'>"
+                        f"({type(exc).__name__}: {exc})</span>")
+                    self.log_message(
+                        f"Build aborted: {gba_name} is locked by another "
+                        f"process. Close the emulator and retry.")
+                    return
+
+        # Step 0b: overworld sprite metatile-rule self-heal.  Without
+        # this, any sprite added through "Add New Sprite" (or by hand)
+        # that lacks an explicit -mwidth/-mheight rule in
+        # spritesheet_rules.mk will be built by the generic
+        # `%.4bpp: %.png` rule and emit a row-major .4bpp — which the
+        # engine's `overworld_frame` macro then misreads as two adjacent
+        # frames stitched together.  In-game symptom: a small sprite
+        # shows two heads stacked vertically per direction.
+        if project_dir and os.path.isfile(
+            os.path.join(project_dir, "spritesheet_rules.mk")
+        ):
+            try:
+                from core.overworld_sprite_creator import (
+                    ensure_all_overworld_spritesheet_rules,
+                )
+                rules_added, invalidated, ow_errors = (
+                    ensure_all_overworld_spritesheet_rules(project_dir)
+                )
+                if rules_added:
+                    self.log_message(
+                        f"Pre-build self-heal: added "
+                        f"{len(rules_added)} missing spritesheet rule(s): "
+                        + ", ".join(rules_added[:8])
+                        + (" ..." if len(rules_added) > 8 else "")
+                    )
+                if invalidated:
+                    self.log_message(
+                        f"Pre-build self-heal: deleted "
+                        f"{len(invalidated)} stale .4bpp file(s) — will "
+                        f"rebuild with correct tile order"
+                    )
+                for err in ow_errors:
+                    self.log_message(f"Pre-build self-heal warning: {err}")
+            except Exception as exc:
+                self.log_message(
+                    f"Pre-build overworld self-heal failed: {exc}"
+                )
+
         # Step 1: integrity sweep — regenerate placeholder .mids from .s
         # content so a stale placeholder can't drive mid2agb to wipe the
         # user's hand-composed work.
@@ -1323,20 +1391,71 @@ class UnifiedMainWindow(QMainWindow):
             except Exception as exc:
                 self.log_message(f"Pre-build integrity sweep failed: {exc}")
 
-            # Step 2: touch every .s so they're newer than midi.cfg/.mid.
+            # Step 2: SELECTIVELY touch .s files.
+            #
+            # The Make rule `%.s: %.mid midi.cfg` re-runs mid2agb whenever
+            # .mid or midi.cfg is newer than .s.  The original protection
+            # touched EVERY .s file to NOW, defeating the rule across the
+            # board — including for songs where the .mid is real content
+            # that the user explicitly wants regenerated (e.g. they just
+            # copied a vanilla .mid in to replace a corrupted song).
+            #
+            # Correct semantics:
+            #   - If .mid is a placeholder (< 30 bytes), the .s is the
+            #     source of truth — hand-composed via piano roll or
+            #     imported from .s.  Touch the .s to prevent mid2agb from
+            #     wiping it on a stale-midi.cfg-mtime build.
+            #   - If .mid is real content (>= 30 bytes), the .mid is the
+            #     source of truth — let mid2agb regenerate the .s normally
+            #     so the user's .mid edits / replacements take effect.
+            try:
+                from core.sound.song_integrity import _PLACEHOLDER_MAX_BYTES
+            except ImportError:
+                _PLACEHOLDER_MAX_BYTES = 30
+
             try:
                 touched = 0
+                allowed_regen = 0
                 for fn in os.listdir(midi_dir):
-                    if fn.endswith('.s'):
+                    if not fn.endswith('.s'):
+                        continue
+                    s_path = os.path.join(midi_dir, fn)
+                    mid_path = s_path[:-2] + '.mid'
+
+                    # Treat missing .mid as "no real source" — protect the .s.
+                    mid_is_real = False
+                    if os.path.isfile(mid_path):
                         try:
-                            os.utime(os.path.join(midi_dir, fn))
+                            if os.path.getsize(mid_path) > _PLACEHOLDER_MAX_BYTES:
+                                mid_is_real = True
+                        except OSError:
+                            pass
+
+                    if mid_is_real:
+                        # .mid is the source of truth.  Don't touch — let
+                        # Make handle it.  If the .mid is newer than the
+                        # .s, mid2agb regenerates correctly.  If the .s
+                        # is newer (e.g. user just saved via Sound Editor),
+                        # Make skips and the user's saved .s wins.
+                        allowed_regen += 1
+                    else:
+                        # .mid is placeholder — protect .s.
+                        try:
+                            os.utime(s_path)
                             touched += 1
                         except OSError:
                             pass
+
                 if touched:
                     self.log_message(
-                        f"Pre-build: touched {touched} .s files to prevent "
-                        f"mid2agb overwrite")
+                        f"Pre-build: protected {touched} hand-composed "
+                        f"song(s) from mid2agb overwrite (placeholder .mid)"
+                    )
+                if allowed_regen:
+                    self.log_message(
+                        f"Pre-build: {allowed_regen} song(s) with real .mid "
+                        f"content will follow normal Make dependency tracking"
+                    )
             except Exception as e:
                 self.log_message(f"Pre-build .s protection warning: {e}")
 

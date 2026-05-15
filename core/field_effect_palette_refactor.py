@@ -588,15 +588,572 @@ def _restore_script_line(
 # ── Public API ────────────────────────────────────────────────────────────
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Auto-discovery: scan field_effect_objects.h for any sprite template still
+# carrying `paletteTag = TAG_NONE` and synthesise a refactor entry for each.
+# This is the structural answer to the "whack-a-mole" pattern — every time
+# the user added DOWP and hit another broken field-effect sprite, we had to
+# manually add an explicit REFACTORS entry.  Now the catch is automatic: any
+# new vanilla-shaped template (or a template the user adds themselves) that
+# leaves paletteTag unset gets discovered, allocated a unique tag from the
+# 0x1302+ range, hooked into a freshly-baked .gbapal, and patched through.
+# ════════════════════════════════════════════════════════════════════════════
+
+# State file recording auto-discovered refactors that have been applied.
+# Lives in the project root.  Lets `remove()` reverse what `apply()` did
+# without having to re-scan (which wouldn't work — by the time we're
+# reversing, the paletteTag values are no longer TAG_NONE).
+_AUTO_STATE_REL = os.path.join("porysuite", "field_effect_auto_refactors.json")
+
+
+# Reserved tag values we must never allocate to a new fldeff palette.
+# Mirrors the namespace map documented in BUGS.md.  If a future engine
+# refactor claims more values in 0x1300-0x13FF, add them here.
+_RESERVED_TAG_VALUES = {
+    0x1200,  # TAG_WEATHER_START (and adjacent weather sub-tags)
+}
+
+
+_TEMPLATE_NAME_RE = re.compile(
+    r"const\s+struct\s+SpriteTemplate\s+(gFieldEffectObjectTemplate_(\w+))\s*=\s*\{",
+)
+
+
+def _parse_template_metadata(project_root: str) -> List[Dict[str, str]]:
+    """Walk `field_effect_objects.h` and return one dict per
+    `gFieldEffectObjectTemplate_*` struct.
+
+    Each dict contains:
+      - ``template_symbol``: full symbol name
+      - ``name``: PascalCase suffix
+      - ``palette_tag``: literal text of the ``.paletteTag = ...`` line
+        (may be ``TAG_NONE`` or a real ``FLDEFF_PAL_TAG_*`` constant)
+      - ``images``: literal text of the ``.images = ...`` line, or
+        ``"NULL"`` / missing entries flagged as ``None``
+      - ``pic_symbol``: ``gFieldEffectObjectPic_X`` extracted from the
+        first ``overworld_frame`` entry of the pic table, when present.
+        ``None`` when the template uses no pic table.
+
+    The parser is line-oriented inside each struct body — robust to
+    formatting variations (extra blank lines, comments).
+    """
+    feo_path = os.path.join(
+        project_root, "src", "data", "field_effects", "field_effect_objects.h"
+    )
+    if not os.path.isfile(feo_path):
+        return []
+    text = _read(feo_path)
+
+    out: List[Dict[str, str]] = []
+    for m in _TEMPLATE_NAME_RE.finditer(text):
+        template_symbol = m.group(1)
+        name = m.group(2)
+        # Body is everything between the opening { and its matching }.
+        body_start = m.end() - 1  # position of `{`
+        depth = 0
+        body_end = body_start
+        for i in range(body_start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    body_end = i
+                    break
+        body = text[body_start:body_end]
+
+        # Extract palette tag (literal text after the `=`).
+        pal_m = re.search(r"\.paletteTag\s*=\s*([^,\n]+?)\s*,", body)
+        palette_tag = pal_m.group(1).strip() if pal_m else ""
+
+        # Extract images field (look for sPicTable_X or NULL).
+        img_m = re.search(r"\.images\s*=\s*([^,\n]+?)\s*,", body)
+        images = img_m.group(1).strip() if img_m else None
+
+        pic_symbol = None
+        if images and images != "NULL":
+            # images = sPicTable_X — find that pic table block and
+            # extract the gFieldEffectObjectPic_Y from its first frame.
+            pic_table_re = re.compile(
+                rf"static\s+const\s+struct\s+SpriteFrameImage\s+{re.escape(images)}\s*\[\]\s*=\s*\{{([^}}]*)\}}",
+                re.DOTALL,
+            )
+            pt = pic_table_re.search(text)
+            if pt:
+                frame_m = re.search(
+                    r"overworld_frame\s*\(\s*(gFieldEffectObjectPic_\w+)",
+                    pt.group(1),
+                )
+                if frame_m:
+                    pic_symbol = frame_m.group(1)
+
+        out.append({
+            "template_symbol": template_symbol,
+            "name": name,
+            "palette_tag": palette_tag,
+            "images": images,
+            "pic_symbol": pic_symbol,
+        })
+    return out
+
+
+def _parse_pic_to_png_map(project_root: str) -> Dict[str, str]:
+    """Map ``gFieldEffectObjectPic_X`` → relative path of source PNG.
+
+    Walks `src/data/object_events/object_event_graphics.h` (which holds
+    all field-effect INCBINs alongside object event ones) and extracts the
+    `.4bpp` path from each line, swapping the extension to `.png` for the
+    source.
+    """
+    graphics_h = os.path.join(
+        project_root, "src", "data", "object_events", "object_event_graphics.h"
+    )
+    if not os.path.isfile(graphics_h):
+        return {}
+    text = _read(graphics_h)
+    result: Dict[str, str] = {}
+    for m in re.finditer(
+        r"(gFieldEffectObjectPic_\w+)\s*\[\]\s*=\s*INCBIN_U\d+\(\"([^\"]+)\.4bpp\"\)",
+        text,
+    ):
+        symbol = m.group(1)
+        rel_4bpp = m.group(2)
+        result[symbol] = rel_4bpp + ".png"
+    return result
+
+
+def _parse_fldeffobj_to_template(project_root: str) -> Dict[str, str]:
+    """Map ``FLDEFFOBJ_X`` → ``gFieldEffectObjectTemplate_X`` by parsing
+    the template-pointers array.
+    """
+    fp_path = os.path.join(
+        project_root, "src", "data", "field_effects",
+        "field_effect_object_template_pointers.h",
+    )
+    if not os.path.isfile(fp_path):
+        return {}
+    text = _read(fp_path)
+    return dict(re.findall(
+        r"\[(FLDEFFOBJ_\w+)\]\s*=\s*&(gFieldEffectObjectTemplate_\w+)",
+        text,
+    ))
+
+
+def _script_label_for(project_root: str, name: str) -> str:
+    """Return the literal `gFldEffScript_<X>::` label that corresponds
+    to template `<name>`, or empty string if no matching script exists.
+
+    The mapping is usually direct (`Bird` → `gFldEffScript_Bird`), but
+    a few vanilla templates have a "Placeholder" suffix that the script
+    name doesn't carry (`SandDisguisePlaceholder` →
+    `gFldEffScript_SandDisguise`).  Try the direct match first, then
+    fall back to stripping common suffixes.
+    """
+    s_path = os.path.join(project_root, "data", "field_effect_scripts.s")
+    if not os.path.isfile(s_path):
+        return ""
+    text = _read(s_path)
+    candidates = [name]
+    if name.endswith("Placeholder"):
+        candidates.append(name[: -len("Placeholder")])
+    for cand in candidates:
+        label = f"gFldEffScript_{cand}"
+        if f"{label}::" in text:
+            return label
+    return ""
+
+
+def _has_script_label(project_root: str, name: str) -> bool:
+    """True when a corresponding script label exists for `<name>`."""
+    return bool(_script_label_for(project_root, name))
+
+
+def _script_callnative_func(project_root: str, label: str) -> str:
+    """Return the literal function name that *label* currently passes to
+    ``callnative``, or empty string if the script body can't be parsed.
+
+    Vanilla pokefirered's scripts don't follow a strict
+    ``FldEff_<Name>`` naming convention — TreeDisguise calls
+    ``ShowTreeDisguiseFieldEffect``, MountainDisguise calls
+    ``ShowMountainDisguiseFieldEffect``, and so on.  The patcher must
+    use whatever name is actually in the script body so the patched
+    ``loadfadedpal_callnative`` keeps the same target.
+
+    The scan window is bounded to the current script's body (between
+    `label::` and the next `^gFldEffScript_` label or `^end` directive),
+    not a fixed character count — otherwise short scripts leak into the
+    next entry and we pick up the wrong callnative function.
+    """
+    s_path = os.path.join(project_root, "data", "field_effect_scripts.s")
+    if not os.path.isfile(s_path):
+        return ""
+    text = _read(s_path)
+    label_pat = re.compile(rf"^{re.escape(label)}::\s*$", re.MULTILINE)
+    m = label_pat.search(text)
+    if not m:
+        return ""
+    # Bound the window at the next script label or `end` directive.
+    rest = text[m.end():]
+    next_label = re.search(r"^gFldEffScript_\w+::\s*$", rest, re.MULTILINE)
+    next_end = re.search(r"^\s*end\s*$", rest, re.MULTILINE)
+    bound = min(
+        (x.start() for x in (next_label, next_end) if x is not None),
+        default=len(rest),
+    )
+    window = rest[:bound]
+    # Prefer the already-patched form (so we extract the function name
+    # even if the patcher has run before on this script).
+    patched_m = re.search(
+        r"^\s*loadfadedpal_callnative\s+\S+\s*,\s*(\S+)",
+        window, re.MULTILINE,
+    )
+    if patched_m:
+        return patched_m.group(1).strip().rstrip(",")
+    call_m = re.search(r"^\s*callnative\s+(\S+)", window, re.MULTILINE)
+    if call_m:
+        return call_m.group(1).strip().rstrip(",")
+    return ""
+
+
+def _find_c_create_sites(
+    project_root: str, fldeffobj_const: str,
+) -> List[Tuple[str, str]]:
+    """Find every line in C source under `src/` that creates a sprite
+    via the named FLDEFFOBJ constant.
+
+    Returns a list of ``(relative_path, exact_line_text)`` tuples.  Each
+    line is captured verbatim — including leading whitespace — so a
+    subsequent string-replace patch hits the exact bytes on disk.
+    """
+    pat = re.compile(
+        r"^[^\n]*CreateSprite[A-Za-z_]*\s*\(\s*gFieldEffectObjectTemplatePointers\s*\[\s*"
+        + re.escape(fldeffobj_const)
+        + r"\s*\][^\n]*$",
+        re.MULTILINE,
+    )
+    sites: List[Tuple[str, str]] = []
+    src_root = os.path.join(project_root, "src")
+    for dirpath, _, filenames in os.walk(src_root):
+        for fn in filenames:
+            if not fn.endswith(".c"):
+                continue
+            abs_path = os.path.join(dirpath, fn)
+            try:
+                text = _read(abs_path)
+            except OSError:
+                continue
+            for m in pat.finditer(text):
+                rel = os.path.relpath(abs_path, project_root).replace("\\", "/")
+                sites.append((rel, m.group(0)))
+    return sites
+
+
+def _find_palettenum_override_block(
+    project_root: str, rel_file: str, create_site_line: str,
+) -> Tuple[str, str]:
+    """Locate a `sprite->oam.paletteNum = 0;` override following the
+    given create-site call.  Returns a tuple of
+    ``(intervening_text, override_line)`` where ``intervening_text``
+    is the exact text between the end of the create line and the start
+    of the override line (typically a short declaration block) — this
+    is what binds the override to its specific call site, so the
+    surrounding c_edit can target one occurrence at a time even when
+    multiple call sites share identical override text.
+
+    Returns ``("", "")`` if no override is found within ~20 lines or
+    if `create_site_line` itself isn't in the file.
+
+    Same pattern that the SurfBlob refactor handles via its explicit
+    c_edit: some FldEff_* C functions reset `paletteNum` to 0 right
+    after `CreateSprite`, silently undoing the template-tag-resolved
+    palette slot.  We detect those and emit a stripping c_edit so the
+    auto-discovery covers the same case without a hand-written entry.
+    """
+    abs_path = os.path.join(project_root, rel_file)
+    if not os.path.isfile(abs_path):
+        return "", ""
+    text = _read(abs_path)
+    idx = text.find(create_site_line)
+    if idx < 0:
+        return "", ""
+    window_start = idx + len(create_site_line)
+    window_end = min(len(text), window_start + 800)
+    close_brace = text.find("\n}", window_start, window_end)
+    if close_brace >= 0:
+        window_end = close_brace
+    window = text[window_start:window_end]
+    m = re.search(
+        r"^[ \t]*(?:sprite|gSprites\s*\[\s*\w+\s*\])->oam\.paletteNum\s*=\s*0\s*;[^\n]*$",
+        window, re.MULTILINE,
+    )
+    if not m:
+        return "", ""
+    return window[: m.start()], m.group(0)
+
+
+class _FldeffTagAllocator:
+    """Assigns unique FLDEFF_PAL_TAG_FLDEFF_* values from the 0x1302+ range.
+
+    Pre-claims every value used by the explicit REFACTORS list plus any
+    reserved-namespace values (currently `0x1200` for TAG_WEATHER_START).
+    Subsequent `allocate()` calls return the next free slot.
+    """
+
+    def __init__(self) -> None:
+        self._used = set(_RESERVED_TAG_VALUES)
+        for r in REFACTORS:
+            self._used.add(r["tag_value"])
+        self._next = 0x1302  # first slot after Shadow (0x1300) + SurfBlob (0x1301)
+
+    def allocate(self) -> int:
+        while self._next in self._used or self._next > 0x13FF:
+            if self._next > 0x13FF:
+                raise RuntimeError(
+                    "FLDEFF palette tag range 0x1300-0x13FF exhausted"
+                )
+            self._next += 1
+        v = self._next
+        self._used.add(v)
+        self._next += 1
+        return v
+
+
+def _camel_to_snake(name: str) -> str:
+    """``BirdBig`` → ``bird_big``."""
+    s = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    return s
+
+
+def _discover_auto_refactors(project_root: str) -> List[Dict]:
+    """Build a list of synthesised REFACTOR dicts covering every
+    field-effect template that still has ``paletteTag = TAG_NONE`` and
+    references a real image.  Skips templates whose ``.images`` is
+    ``NULL`` (e.g. invisible affine-anim anchors like
+    `ReflectionDistortion`) because they have no pixels to colour.
+
+    Templates that already match an explicit REFACTORS entry are
+    skipped too — those are handled by the hand-tuned path.
+    """
+    explicit_templates = set()
+    for r in REFACTORS:
+        explicit_templates.update(r.get("templates", []))
+
+    templates = _parse_template_metadata(project_root)
+    pic_to_png = _parse_pic_to_png_map(project_root)
+    fldeffobj_to_template = _parse_fldeffobj_to_template(project_root)
+    template_to_fldeffobj = {v: k for k, v in fldeffobj_to_template.items()}
+
+    allocator = _FldeffTagAllocator()
+    refactors: List[Dict] = []
+
+    for meta in templates:
+        if meta["palette_tag"] != "TAG_NONE":
+            continue
+        if not meta["images"] or meta["images"] == "NULL":
+            continue
+        if meta["template_symbol"] in explicit_templates:
+            continue
+        pic_symbol = meta["pic_symbol"]
+        if not pic_symbol:
+            continue
+        source_png = pic_to_png.get(pic_symbol)
+        if not source_png:
+            continue
+        png_abs = os.path.join(project_root, source_png)
+        if not os.path.isfile(png_abs):
+            continue
+
+        name = meta["name"]
+        snake = _camel_to_snake(name)
+        try:
+            tag_value = allocator.allocate()
+        except RuntimeError:
+            break  # exhausted namespace — stop discovering rather than fail apply
+
+        refactor: Dict = {
+            "name": name,
+            "tag_const": f"FLDEFF_PAL_TAG_FLDEFF_{snake.upper()}",
+            "tag_value": tag_value,
+            "palette_symbol": f"gSpritePalette_FldEff_{name}",
+            "data_symbol": f"gFieldEffectPal_FldEff_{name}",
+            "gbapal_path": f"graphics/field_effects/palettes/fldeff_{snake}.gbapal",
+            "source_png": source_png,
+            "templates": [meta["template_symbol"]],
+            "script_edits": [],
+            "c_edits": [],
+            "_auto": True,  # marker so reverse path knows this came from auto-discovery
+        }
+
+        # Decide where the palette load must be injected.  Two paths:
+        #
+        # 1. If a field-effect script `gFldEffScript_<Name>` exists,
+        #    rewrite its `callnative FldEff_<Name>` to
+        #    `loadfadedpal_callnative ...`.  This is the same pattern
+        #    that Shadow / SurfBlob use.
+        # 2. If no script exists, find every C call site that does
+        #    `CreateSprite*(gFieldEffectObjectTemplatePointers[FLDEFFOBJ_<NAME>], ...)`
+        #    and inject a `LoadSpritePalette(...);` line directly above it.
+        #
+        # Both paths can fire if a template is invoked both ways
+        # (rare but possible).  The `_patch_c_edit` / `_patch_script_line`
+        # helpers are idempotent so double-application is safe.
+        # Look up the actual script label (handles `Placeholder` suffix
+        # cases where template name != script name).
+        script_label = _script_label_for(project_root, name)
+        if script_label:
+            # Don't assume `FldEff_<Name>` — vanilla pokefirered uses
+            # arbitrary function names in script callnative directives
+            # (`ShowTreeDisguiseFieldEffect` etc.).  Read the actual
+            # function out of the existing script body and reuse it.
+            func = _script_callnative_func(project_root, script_label)
+            if func:
+                refactor["script_edits"].append({
+                    "label": script_label,
+                    "vanilla": f"\tcallnative {func}",
+                    "patched": (
+                        f"\tloadfadedpal_callnative {refactor['palette_symbol']}, "
+                        f"{func}"
+                    ),
+                })
+
+        fldeffobj = template_to_fldeffobj.get(meta["template_symbol"])
+        if fldeffobj:
+            for rel_file, line in _find_c_create_sites(project_root, fldeffobj):
+                # Preserve the original indentation in the injected
+                # LoadSpritePalette line so the patched code stays
+                # idiomatic when read by humans.
+                indent_match = re.match(r"^([ \t]*)", line)
+                indent = indent_match.group(1) if indent_match else ""
+
+                load_block = (
+                    f"{indent}extern const struct SpritePalette "
+                    f"{refactor['palette_symbol']};\n"
+                    f"{indent}LoadSpritePalette(&{refactor['palette_symbol']});\n"
+                )
+
+                # Look for a hardcoded `sprite->oam.paletteNum = 0;`
+                # override in the next ~20 lines.  Vanilla
+                # `FldEff_NpcFlyOut` and `CreateFlyBirdSprite` both
+                # silently reset paletteNum to 0 right after their
+                # CreateSprite call, which defeats the whole refactor —
+                # the template-tag-resolved slot gets overwritten with
+                # slot 0.  When found, bundle the strip into the SAME
+                # c_edit as the load injection so both call sites
+                # patch correctly even when their override lines are
+                # byte-identical (a separate per-site c_edit would
+                # short-circuit on `patched in text` after the first
+                # site's strip lands).
+                intervening, override_line = _find_palettenum_override_block(
+                    project_root, rel_file, line,
+                )
+                if override_line:
+                    override_indent = re.match(
+                        r"^([ \t]*)", override_line
+                    ).group(1)
+                    override_body = override_line.lstrip()
+                    commented = (
+                        f"{override_indent}// {override_body}"
+                        f"  // DOWP: stripped — template tag resolves slot"
+                    )
+                    # Single c_edit covering both the load injection and
+                    # the override strip.  Vanilla = create line +
+                    # intervening text + override; patched = load
+                    # injection + create line + intervening text +
+                    # commented override.  The intervening block is
+                    # what makes this string unique per call site, so
+                    # multiple sites in the same file all patch
+                    # correctly.
+                    refactor["c_edits"].append({
+                        "file": rel_file,
+                        "vanilla": line + intervening + override_line,
+                        "patched": (
+                            load_block + line + intervening + commented
+                        ),
+                    })
+                else:
+                    # No override to strip — just inject the load call
+                    # ahead of the create line.
+                    refactor["c_edits"].append({
+                        "file": rel_file,
+                        "vanilla": line,
+                        "patched": load_block + line,
+                    })
+
+        refactors.append(refactor)
+
+    return refactors
+
+
+def _save_auto_state(project_root: str, auto_refactors: List[Dict]) -> None:
+    """Persist the list of auto-discovered refactors so `remove()` can
+    reverse them later.  Written under `porysuite/` so the user's
+    `.gitignore` (which we configure to ignore that directory) keeps it
+    out of commits.
+    """
+    state_path = os.path.join(project_root, _AUTO_STATE_REL)
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    import json
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(auto_refactors, f, indent=2)
+
+
+def _load_auto_state(project_root: str) -> List[Dict]:
+    """Read the previously-saved auto-discovered refactors.  Returns
+    an empty list if no state file exists.
+    """
+    state_path = os.path.join(project_root, _AUTO_STATE_REL)
+    if not os.path.isfile(state_path):
+        return []
+    import json
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def _clear_auto_state(project_root: str) -> None:
+    """Delete the saved auto-refactor state file (used during full DOWP
+    disable so a future re-enable rediscovers from scratch).
+    """
+    state_path = os.path.join(project_root, _AUTO_STATE_REL)
+    try:
+        os.remove(state_path)
+    except OSError:
+        pass
+
+
 def apply(project_root: str) -> Tuple[bool, List[str], List[str]]:
-    """Apply every refactor in the REGISTRY to the project.
+    """Apply every refactor in the REGISTRY to the project, PLUS any
+    auto-discovered field-effect templates that still have
+    ``paletteTag = TAG_NONE`` (see ``_discover_auto_refactors`` for the
+    structural rationale).
 
     Returns ``(success, applied_messages, failed_messages)``.
     """
     applied: List[str] = []
     failed: List[str] = []
 
-    for r in REFACTORS:
+    # Auto-discovery pass.  Synthesise a refactor entry for every
+    # un-tagged field-effect template the user's project contains, then
+    # merge with the explicit list so the apply loop processes both the
+    # same way.  Persist the discovered set so `remove()` can reverse
+    # them without re-scanning (which wouldn't work — TAG_NONE will be
+    # gone after apply).
+    try:
+        auto_refactors = _discover_auto_refactors(project_root)
+        if auto_refactors:
+            _save_auto_state(project_root, auto_refactors)
+            applied.append(
+                f"Auto-discovered {len(auto_refactors)} field-effect "
+                f"template(s) needing palette refactor: "
+                + ", ".join(r["name"] for r in auto_refactors)
+            )
+    except Exception as exc:
+        failed.append(f"auto-discovery failed: {type(exc).__name__}: {exc}")
+        auto_refactors = []
+
+    for r in REFACTORS + auto_refactors:
         name = r["name"]
 
         # 1. Palette data file.
@@ -659,7 +1216,8 @@ def apply(project_root: str) -> Tuple[bool, List[str], List[str]]:
 
 
 def remove(project_root: str) -> Tuple[bool, List[str], List[str]]:
-    """Reverse every refactor in the REGISTRY.
+    """Reverse every refactor in the REGISTRY plus every auto-discovered
+    refactor recorded during the last `apply()`.
 
     Note: the .gbapal binary files are NOT deleted on remove. They're
     kept on disk so the user can re-enable DOWP without losing their
@@ -669,7 +1227,18 @@ def remove(project_root: str) -> Tuple[bool, List[str], List[str]]:
     reverted: List[str] = []
     failed: List[str] = []
 
-    for r in REFACTORS:
+    # Load the saved auto-discovered list so we reverse exactly what
+    # apply() wrote.  Re-discovery wouldn't work at this point — the
+    # paletteTags we set during apply have replaced the TAG_NONE markers
+    # the discovery function looks for.
+    auto_refactors = _load_auto_state(project_root)
+    if auto_refactors:
+        reverted.append(
+            f"Reversing {len(auto_refactors)} auto-discovered field-effect "
+            f"refactor(s): " + ", ".join(r["name"] for r in auto_refactors)
+        )
+
+    for r in REFACTORS + auto_refactors:
         name = r["name"]
 
         # Reverse order: c_edits → script edits → templates → palette → INCBIN → tag.
@@ -717,6 +1286,11 @@ def remove(project_root: str) -> Tuple[bool, List[str], List[str]]:
             failed.append(f"{name}: {r['tag_const']} {status}")
         else:
             reverted.append(f"{name}: {r['tag_const']} {status}")
+
+    # Clear the saved auto-state — a future DOWP enable will rediscover
+    # whatever templates are still in TAG_NONE state at that point.
+    if auto_refactors:
+        _clear_auto_state(project_root)
 
     return len(failed) == 0, reverted, failed
 

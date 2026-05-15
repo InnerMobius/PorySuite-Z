@@ -729,25 +729,45 @@ def replace_sample_from_wav(
             loop_frac = orig_loop_start / orig_size
             loop_start = int(loop_frac * len(pcm))
 
-        # Write the GBA .bin with chosen rate and loop settings
+        # Write the GBA .bin with chosen rate and loop settings.
         _write_gba_bin(bin_abs, final_rate, pcm,
                        loop=orig_loop, loop_start=loop_start)
 
-        # Mirror the new audio into the source WAV so the tracked
-        # source matches the freshly-rewritten BIN. Without this the
-        # next `make` would rebuild the BIN from the stale WAV and
-        # collaborators would see different audio than the local user.
-        # Same gitignore-survival strategy as in `import_wav_as_sample`,
-        # plus loop preservation via embedded smpl chunk so wav2agb
-        # round-trips the loop flag.
+        # Mirror the new audio into the source WAV so the tracked source
+        # matches the freshly-rewritten BIN.  This is the single most
+        # important step for cross-collaborator consistency AND for our
+        # own build pipeline: `audio_rules.mk` declares
+        #
+        #     %.bin: %.wav
+        #         wav2agb -b $< $@
+        #
+        # If the .wav write SILENTLY FAILS (the old code's `except: print`
+        # behavior) but the .bin write succeeded, the project ends up in a
+        # ghost state: the .bin contains the new audio, the .wav still
+        # contains the old audio, and Make sees `.bin newer than .wav` so
+        # it never re-runs wav2agb to reconcile.  The wrong samples then
+        # play in-game for weeks until someone notices.
+        #
+        # Loud failure beats silent corruption: if the WAV write fails,
+        # raise — the outer except restores the .bin backup so neither
+        # file has changed.  No partial-write state survives the call.
+        wav_dest = os.path.splitext(bin_abs)[0] + ".wav"
+        _write_pcm_as_wav(
+            wav_dest, final_rate, pcm,
+            loop=orig_loop, loop_start=loop_start)
+
+        # Stamp the .wav one second AHEAD of the .bin so the next build
+        # treats the .wav as the source of truth — wav2agb will re-derive
+        # the .bin from the .wav and produce identical output (the .wav
+        # we just wrote is the round-trip of the same PCM we put into the
+        # .bin).  This invariant — `.wav mtime >= .bin mtime` for every
+        # sample we touch — is what `core/sound/sample_integrity.py`'s
+        # pre-build self-heal relies on to detect and reverse drift.
         try:
-            wav_dest = os.path.splitext(bin_abs)[0] + ".wav"
-            _write_pcm_as_wav(
-                wav_dest, final_rate, pcm,
-                loop=orig_loop, loop_start=loop_start)
-        except Exception as exc:
-            print(f"Warning: could not refresh source WAV for "
-                  f"{bin_abs}: {exc}")
+            bin_mt = os.stat(bin_abs).st_mtime
+            os.utime(wav_dest, (bin_mt + 1, bin_mt + 1))
+        except OSError:
+            pass
 
         # Reload the sample data
         header, pcm_loaded = read_bin_sample(bin_abs)
@@ -755,7 +775,7 @@ def replace_sample_from_wav(
         existing_sample.pcm_data = pcm_loaded
 
     except Exception:
-        # Restore backup on failure
+        # Restore backup on failure — also delete any partial .wav write.
         if os.path.isfile(backup_path):
             shutil.move(backup_path, bin_abs)
         raise

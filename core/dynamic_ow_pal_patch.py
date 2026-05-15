@@ -238,6 +238,15 @@ def remove_dowp_patch(project_root: str) -> Tuple[bool, List[str], List[str]]:
     except Exception as e:
         failed.append(f"Field effect palette refactor (remove): {type(e).__name__}: {e}")
 
+    # ── emoticons palette refactor — reverse ─────────────────────────────────
+    try:
+        from core import emoticons_palette_refactor as _epr
+        _ok, _reverted, _failed = _epr.remove(project_root)
+        reverted.extend(_reverted)
+        failed.extend(_failed)
+    except Exception as e:
+        failed.append(f"Emoticons palette refactor (remove): {type(e).__name__}: {e}")
+
     # ── field_effect_helpers.c ────────────────────────────────────────────────
     feh_c_path = os.path.join(project_root, "src", "field_effect_helpers.c")
     if os.path.isfile(feh_c_path):
@@ -1426,6 +1435,30 @@ def apply_dowp_patch(project_root: str,
         failed.extend(_failed)
     except Exception as e:
         failed.append(f"Field effect palette refactor: {type(e).__name__}: {e}")
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 7b. Emoticons palette refactor
+    # ════════════════════════════════════════════════════════════════════════
+    # The emoticons sprite template in src/trainer_see.c uses paletteTag =
+    # 0xFFFF (TAG_NONE) and paletteNum = 0, meaning it renders through
+    # whatever palette landed in OBJ palette slot 0 at runtime.  Vanilla
+    # pokefirered statically loads the player palette into slot 0 at
+    # field-map init, so the emoticons' colour indices line up correctly.
+    # Under DOWP that slot is non-deterministic — an unrelated NPC palette
+    # ends up there, and the yellow exclamation mark renders pink (or
+    # whatever colour sits at index 13 of the random palette).
+    # The companion patch in core/emoticons_palette_refactor.py gives the
+    # emoticons a proper OBJ_EVENT_PAL_TAG_EMOTICONS tag, bakes a dedicated
+    # .gbapal, registers it, and inserts LoadObjectEventPalette calls into
+    # every FldEff_*Icon function so the palette is allocated before the
+    # sprite resolves its tag to a slot.
+    try:
+        from core import emoticons_palette_refactor as _epr
+        _ok, _applied, _failed = _epr.apply(project_root)
+        applied.extend(_applied)
+        failed.extend(_failed)
+    except Exception as e:
+        failed.append(f"Emoticons palette refactor: {type(e).__name__}: {e}")
 
     # ════════════════════════════════════════════════════════════════════════
     # 8. Write marker file

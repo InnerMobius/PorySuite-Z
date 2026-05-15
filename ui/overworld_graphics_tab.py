@@ -381,22 +381,45 @@ def build_overworld_data(root: str) -> Tuple[List[PalettePool], Dict[str, Sprite
         if not rel:
             continue
         abs_gbapal = os.path.join(root, rel)
-        if not os.path.isfile(abs_gbapal):
-            # Symbol references a .gbapal that doesn't exist on disk —
-            # nothing to register or heal.  This is the case for tags
-            # whose source files haven't been built yet (fresh clone).
+        sibling_pal = pal_sibling_for_gbapal(abs_gbapal)
+
+        # Fresh-clone friendliness: vanilla pokefirered ships only `.pal`
+        # source files for overworld palettes.  The `.gbapal` binary is a
+        # build artefact, created by `gbagfx` during `make` from the .pal
+        # source.  Before the first build, .gbapal doesn't exist on disk
+        # — but the `.pal` is right there and contains the same colours.
+        #
+        # The previous behaviour was to SKIP any palette whose .gbapal
+        # was absent, which left every vanilla NPC palette unregistered.
+        # All sprites then rendered black in the editor because
+        # `_get_palette_for_sprite` couldn't find a palette source to
+        # read from.  Affected every fresh-clone project that hadn't yet
+        # been built.
+        #
+        # New behaviour: register the tag whenever EITHER .gbapal OR .pal
+        # exists.  The reader (`read_palette_pair`) already prefers .pal
+        # when present and falls back to .gbapal — both paths produce the
+        # same colour table.  On first save the writer creates both files,
+        # restoring full pair consistency.
+        if os.path.isfile(abs_gbapal):
+            tag_to_gbapal[tag] = abs_gbapal
+            tag_to_pal[tag] = sibling_pal
+            # Project-open self-heal: create missing .pal sibling and
+            # repair any .gbapal corrupted by an earlier save-path bug
+            # (JASC text written into the binary file).
+            try:
+                ensure_pal_sibling(abs_gbapal)
+            except Exception:
+                pass
+        elif os.path.isfile(sibling_pal):
+            # Pre-build state: only .pal exists.  Register without the
+            # .gbapal path; the reader uses .pal as the source of truth
+            # and on save the writer will emit both files.
+            tag_to_gbapal[tag] = abs_gbapal  # path is valid even if file is absent
+            tag_to_pal[tag] = sibling_pal
+        else:
+            # Neither file exists — nothing the editor can render.  Skip.
             continue
-        tag_to_gbapal[tag] = abs_gbapal
-        tag_to_pal[tag] = pal_sibling_for_gbapal(abs_gbapal)
-        # Project-open self-heal: if the .pal sibling is missing OR the
-        # .gbapal has been corrupted by the prior save-path bug
-        # (JASC text written into the binary file), repair both files
-        # so subsequent saves and builds stay consistent.  Garbage-free
-        # — only touches palettes that actually exist on disk.
-        try:
-            ensure_pal_sibling(abs_gbapal)
-        except Exception:
-            pass
 
     # 2. GFX const → info name, and info → palette tag + images
     gfx_to_info = _parse_pic_tables(root)
