@@ -1545,6 +1545,8 @@ class BattleAnimTab(QWidget):
         self._play_idx = 0
         self._play_wait = 0
         self._play_tick = 0
+        self._last_sound_tick = -100   # reset throttle so replays play sound
+        self._pending_task_wait = 0    # createvisualtask duration owed to waitforvisualfinish
         self._play_layers = []
         self._tl_play_move_btn.setText("⏹  Stop")
         # Process the first batch of commands immediately.
@@ -1613,6 +1615,12 @@ class BattleAnimTab(QWidget):
             return
 
         self._play_tick += 1   # global frame clock (drives motion + cycling)
+        # Retire sprites whose approximate lifetime has elapsed, so the scene
+        # is multi-step (the nail clears before the ghost appears) instead of
+        # accumulating every spawn to the end.  L[9] = death_tick.
+        if self._play_layers:
+            self._play_layers = [L for L in self._play_layers
+                                 if self._play_tick <= L[9]]
         # Cycle each live layer's frames (~15 fps) using the pre-baked cache.
         if self._play_tick % 4 == 0:
             for L in self._play_layers:
@@ -1654,6 +1662,28 @@ class BattleAnimTab(QWidget):
                 self._stop_play_move()
                 return
 
+            # waitforvisualfinish blocks until the live sprites + the most
+            # recent visual task would finish.  Without this it's a no-op and
+            # late sprites (e.g. the Curse ghost) spawn and vanish in one tick
+            # because `end` follows immediately — the scene must hold while
+            # they animate.  Approximated as the longest remaining lifetime.
+            if cmd.name in ("waitforvisualfinish", "waitsound"):
+                wait = self._pending_task_wait
+                for L in self._play_layers:
+                    wait = max(wait, L[9] - self._play_tick)   # remaining life
+                self._pending_task_wait = 0
+                if wait > 0:
+                    self._play_wait = min(wait, 120)
+                    self._render_play_composite()
+                    return
+                continue
+
+            # Visual tasks aren't drawn yet (Phase 3), but their duration is
+            # owed to the next waitforvisualfinish so timing stays right.
+            if cmd.name in ("createvisualtask", "createsoundtask"):
+                self._pending_task_wait = max(self._pending_task_wait, 24)
+                continue
+
             if cmd.name == "createsprite":
                 cs = parse_createsprite(cmd)
                 if cs:
@@ -1662,10 +1692,11 @@ class BattleAnimTab(QWidget):
                         arch, start, end, dur, vis, flip = self._layer_geometry(cs)
                         if vis:
                             subpri = self._int_or(cs.subpriority)
-                            # [tag,start,end,dur,spawn,frame_idx,arch,subpri,flip]
+                            death = self._play_tick + self._layer_lifetime(arch, dur)
+                            # [tag,start,end,dur,spawn,frame_idx,arch,subpri,flip,death]
                             self._play_layers.append(
                                 [tag, start, end, dur, self._play_tick, 0,
-                                 arch, subpri, flip])
+                                 arch, subpri, flip, death])
 
             if cmd.kind == KIND_SOUND and cmd.args:
                 self._fire_play_sound(cmd.args[0])
@@ -1696,7 +1727,7 @@ class BattleAnimTab(QWidget):
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
         for L in sorted(self._play_layers, key=lambda L: -L[7]):  # subpri
-            tag, start, end, dur, spawn, fidx, arch, _sp, flip = L
+            tag, start, end, dur, spawn, fidx, arch, _sp, flip, _death = L
             frames = self._play_frame_cache.get(tag, [])
             if not frames:
                 continue
@@ -1821,6 +1852,17 @@ class BattleAnimTab(QWidget):
         if arch == MOTION_ARC_TO_TARGET:
             y -= math.sin(math.pi * frac) * 24.0
         return (int(round(x)), int(round(y)))
+
+    @staticmethod
+    def _layer_lifetime(arch: str, dur: int) -> int:
+        """Approximate how many ticks a spawned sprite lives before the
+        engine would destroy it.  Real sprites self-destroy in their
+        callbacks; we approximate so the composite is genuinely multi-step
+        (early sprites clear out before later ones appear) instead of every
+        sprite piling up to the end."""
+        if arch in (MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET):
+            return max(1, dur) + 12      # dies shortly after reaching target
+        return 60                        # static/on-mon/unknown: ~1s, then clears
 
     def _first_frame_for_tag(self, tag: str) -> Optional[QPixmap]:
         sprite = self._sprites.get(tag)

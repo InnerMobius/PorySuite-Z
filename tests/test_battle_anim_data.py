@@ -233,11 +233,30 @@ def test_classify_callback_body_heuristics():
     # Static at attacker only.
     sa = "{ InitSpritePosToAnimAttacker(sprite, TRUE); }"
     assert mod._classify_callback_body(sa) == mod.MOTION_STATIC_ATTACKER
-    # Invisible utility sprite.
+    # Invisible utility sprite: hides itself at the top level (unconditional).
     inv = "{ sprite->invisible = TRUE; BeginNormalPaletteFade(x); }"
     assert mod._classify_callback_body(inv) == mod.MOTION_INVISIBLE
     # Nothing recognisable.
     assert mod._classify_callback_body("{ sprite->data[0] = 5; }") == mod.MOTION_UNKNOWN
+
+
+def test_visible_sprite_that_hides_at_end_is_not_invisible():
+    # A VISIBLE sprite (moves via Sin) that only sets invisible deep inside a
+    # nested conditional at the end of its fade — like AnimGhostStatusSprite —
+    # must NOT be classified invisible, or it never renders.
+    ghost = (
+        "{\n"
+        "    sprite->x2 = Sin(sprite->data[0], 12);\n"
+        "    if (sprite->data[7] > 30)\n"
+        "    {\n"
+        "        if (coeffB == 16)\n"
+        "        {\n"
+        "            sprite->invisible = TRUE;\n"   # depth 3 — terminal hide
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    assert mod._classify_callback_body(ghost) != mod.MOTION_INVISIBLE
 
 
 def test_curated_archetypes_cover_high_impact_callbacks():

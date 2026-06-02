@@ -398,9 +398,17 @@ def _extract_sprite_callback_bodies(texts: List[str]) -> Dict[str, str]:
 
 def _classify_callback_body(body: str) -> str:
     """Heuristic motion archetype from a sprite callback's C body."""
-    # Utility/controller sprites mark themselves invisible — don't draw them.
-    if "->invisible = TRUE" in body or "-> invisible = TRUE" in body:
-        return MOTION_INVISIBLE
+    # Utility/controller sprites (palette fades, mon-movers) mark themselves
+    # invisible UNCONDITIONALLY, at the function-body level.  A *visible*
+    # sprite that merely hides at the END of its animation sets invisible
+    # deep inside a conditional (e.g. AnimGhostStatusSprite fades then hides)
+    # — that must NOT be treated as invisible, or it never renders.  Use the
+    # brace-nesting depth at the assignment to tell them apart.
+    idx = body.find("invisible = TRUE")
+    if idx != -1:
+        depth = body[:idx].count("{") - body[:idx].count("}")
+        if depth <= 1:                       # set at the top level → utility
+            return MOTION_INVISIBLE
     attacker_init = "InitSpritePosToAnimAttacker" in body
     target_init = "InitSpritePosToAnimTarget" in body
     # Does it set up a translation that ends on the target?
