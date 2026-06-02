@@ -235,6 +235,9 @@ class BattleAnimTab(QWidget):
         self._template_tags: Dict[str, str] = {}            # template symbol -> ANIM_TAG
         self._tpl_callbacks: Dict[str, str] = {}            # template symbol -> callback symbol
         self._callback_arch: Dict[str, str] = {}            # callback symbol -> MOTION_*
+        # Reference-mon provider (set by the host once species data is loaded):
+        self._mon_dirs: Dict[str, str] = {}                 # slug -> graphics/pokemon/<slug> dir
+        self._species_name_override: Dict[str, str] = {}    # slug -> project display name
         self._cur_timeline: list = []                       # resolved Commands of selected move
         self._dirty_moves: set = set()                      # labels with unsaved edits (amber)
 
@@ -350,6 +353,22 @@ class BattleAnimTab(QWidget):
         self._move_prev_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
         self._move_prev_lbl.setWordWrap(True)
         pv.addWidget(self._move_prev_lbl)
+        # Reference Pokémon — drop real battle sprites onto the scene so you
+        # can judge anim placement against the actual mons (player = back
+        # sprite at bottom-left, enemy = front sprite at top-right).
+        ref_row = QHBoxLayout()
+        ref_row.setSpacing(6)
+        self._ref_player_combo = QComboBox()
+        self._ref_enemy_combo = QComboBox()
+        for c in (self._ref_player_combo, self._ref_enemy_combo):
+            c.setEnabled(False)
+            c.wheelEvent = lambda e: e.ignore()   # no scroll-to-change (RDP safety)
+            c.currentIndexChanged.connect(lambda _i: self._apply_ref_mons())
+        ref_row.addWidget(QLabel("Player:"))
+        ref_row.addWidget(self._ref_player_combo, 1)
+        ref_row.addWidget(QLabel("Enemy:"))
+        ref_row.addWidget(self._ref_enemy_combo, 1)
+        pv.addLayout(ref_row)
         cv.addWidget(prev_box)
 
         # Layer / frame scrubber — drives the SELECTED sprite layer's own
@@ -707,6 +726,10 @@ class BattleAnimTab(QWidget):
         self._timeline.clear()
         self._update_edit_buttons()
         self._rebuild_move_list()
+        # Reference mons: self-resolve from the project's graphics/pokemon
+        # tree on every load / F5 (no host wiring needed), then push to the
+        # preview so real battle sprites sit behind the animation.
+        self._populate_ref_combos()
 
     # ── grid ─────────────────────────────────────────────────────────
 
@@ -1879,6 +1902,86 @@ class BattleAnimTab(QWidget):
         if not frames:
             return None
         return frames[max(0, min(idx, len(frames) - 1))]
+
+    # ── reference Pokémon (real battle sprites behind the anim) ────────
+
+    def set_species_provider(self, species_pairs, resolver) -> None:
+        """Optional host hook: supply project display names so the reference
+        dropdowns show the project's own species names (respecting renames).
+
+        Sprite resolution itself is self-contained (the tab scans
+        ``graphics/pokemon/`` directly in :meth:`load`), so the preview shows
+        mons even if this is never called — but when it is, the combo labels
+        use the project names instead of folder slugs.  ``resolver`` is kept
+        for backward compatibility and no longer required."""
+        # Map folder slug → project display name (SPECIES_CHARIZARD → charizard).
+        self._species_name_override = {}
+        for const, name in (species_pairs or []):
+            slug = const.replace("SPECIES_", "").lower()
+            if slug and name:
+                self._species_name_override[slug] = name
+        self._populate_ref_combos()
+
+    def _populate_ref_combos(self):
+        """Fill the reference-mon dropdowns by scanning the project's
+        ``graphics/pokemon/`` tree (self-contained — no host wiring needed)."""
+        if not hasattr(self, "_ref_player_combo") or not self._project_root:
+            return
+        from core.battle_mon_ref import list_mon_sprites, mon_display_name
+        mons = list_mon_sprites(self._project_root)
+        self._mon_dirs = {slug: d for slug, d in mons}
+        prev_player = self._ref_player_combo.currentData()
+        prev_enemy = self._ref_enemy_combo.currentData()
+        for combo in (self._ref_player_combo, self._ref_enemy_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(none)", "")
+            for slug, _d in mons:
+                name = self._species_name_override.get(slug) or mon_display_name(slug)
+                combo.addItem(name, slug)
+            combo.setEnabled(bool(mons))
+            combo.blockSignals(False)
+        # Restore the prior pick, else default both to the first real species
+        # so the user sees mons immediately (a concrete reference beats empty).
+        def _restore(combo, prev, default_idx):
+            combo.blockSignals(True)
+            idx = combo.findData(prev) if prev else -1
+            combo.setCurrentIndex(idx if idx >= 0 else default_idx)
+            combo.blockSignals(False)
+        default = 1 if len(mons) >= 1 else 0
+        _restore(self._ref_player_combo, prev_player, default)
+        _restore(self._ref_enemy_combo, prev_enemy, default)
+        self._apply_ref_mons()
+
+    def _ref_mon_pixmap(self, slug: str, view: str) -> Optional[QPixmap]:
+        """Load a species' front/back battle sprite with its real palette
+        (RAM-first via the bus, ``.gbapal`` fallback), or None.  ``view`` is
+        ``"front"`` (enemy) or ``"back"`` (player)."""
+        if not slug or not self._project_root:
+            return None
+        d = self._mon_dirs.get(slug)
+        if not d:
+            return None
+        from core.battle_mon_ref import mon_sprite_path, mon_palette
+        path = mon_sprite_path(d, view)
+        if not path:
+            return None
+        try:
+            pal = mon_palette(self._project_root, slug, d)
+            return load_sprite_pixmap(path, pal) if pal else QPixmap(path)
+        except Exception:
+            _log.exception("reference mon render failed: %s %s", slug, view)
+            return None
+
+    def _apply_ref_mons(self):
+        """Push the chosen reference mons onto the battle-scene preview
+        (player → back sprite, enemy → front sprite)."""
+        if not hasattr(self, "_ref_player_combo"):
+            return
+        back = self._ref_mon_pixmap(self._ref_player_combo.currentData(), "back")
+        front = self._ref_mon_pixmap(self._ref_enemy_combo.currentData(), "front")
+        self._move_preview.set_back_pixmap(back)
+        self._move_preview.set_front_pixmap(front)
 
     def _update_move_composite(self):
         """Static composite of every sprite spawned from the script start
