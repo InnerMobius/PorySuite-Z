@@ -243,6 +243,7 @@ class BattleAnimTab(QWidget):
         # Reference-mon provider (set by the host once species data is loaded):
         self._mon_dirs: Dict[str, str] = {}                 # slug -> graphics/pokemon/<slug> dir
         self._species_name_override: Dict[str, str] = {}    # slug -> project display name
+        self._gfx_data = None                               # GraphicsDataCache: per-species y-offsets/elevation
         self._cur_timeline: list = []                       # resolved Commands of selected move
         self._dirty_moves: set = set()                      # labels with unsaved edits (amber)
         self._branch_choice: int = 0                        # choosetwoturnanim variant index
@@ -695,6 +696,15 @@ class BattleAnimTab(QWidget):
             self._template_tags = parse_template_tags(project_root)
             self._tpl_callbacks = parse_template_callbacks(project_root)
             self._callback_arch = classify_anim_callbacks(project_root)
+            # Per-species sprite y-offsets + elevation — the SAME data the
+            # Pokemon Graphics tab uses to position mons, so the reference
+            # mons here sit exactly where they do there (and in-game).
+            try:
+                from ui.graphics_data import GraphicsDataCache
+                self._gfx_data = GraphicsDataCache(project_root)
+                self._gfx_data.load()
+            except Exception:
+                self._gfx_data = None
         except Exception:
             self._move_table, self._scripts, self._move_names = [], {}, {}
             self._sound_effects, self._scripts_text = [], ""
@@ -2072,15 +2082,33 @@ class BattleAnimTab(QWidget):
             _log.exception("reference mon render failed: %s %s", slug, view)
             return None
 
+    @staticmethod
+    def _mon_const(slug: str) -> str:
+        """Folder slug → SPECIES_ const (charizard → SPECIES_CHARIZARD)."""
+        return ("SPECIES_" + slug.replace("-", "_").upper()) if slug else ""
+
     def _apply_ref_mons(self):
         """Push the chosen reference mons onto the battle-scene preview
-        (player → back sprite, enemy → front sprite)."""
+        (player → back sprite, enemy → front sprite), positioned with the
+        SAME per-species y-offsets + elevation the Pokemon Graphics tab uses
+        so the mons sit exactly where they do there / in-game."""
         if not hasattr(self, "_ref_player_combo"):
             return
-        back = self._ref_mon_pixmap(self._ref_player_combo.currentData(), "back")
-        front = self._ref_mon_pixmap(self._ref_enemy_combo.currentData(), "front")
-        self._move_preview.set_back_pixmap(back)
-        self._move_preview.set_front_pixmap(front)
+        pslug = self._ref_player_combo.currentData()
+        eslug = self._ref_enemy_combo.currentData()
+        self._move_preview.set_back_pixmap(self._ref_mon_pixmap(pslug, "back"))
+        self._move_preview.set_front_pixmap(self._ref_mon_pixmap(eslug, "front"))
+        gd = self._gfx_data
+        if gd is not None:
+            try:
+                self._move_preview.set_back_y_offset(
+                    gd.get_back_y(self._mon_const(pslug)) if pslug else 0)
+                self._move_preview.set_front_y_offset(
+                    gd.get_front_y(self._mon_const(eslug)) if eslug else 0)
+                self._move_preview.set_enemy_elevation(
+                    gd.get_elevation(self._mon_const(eslug)) if eslug else 0)
+            except Exception:
+                pass
 
     def _update_move_composite(self):
         """Static composite of every sprite spawned from the script start
