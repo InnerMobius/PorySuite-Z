@@ -631,6 +631,17 @@ def _build_rematch_map(entries: list[dict]) -> tuple[dict, dict, set]:
         for tier_const in entry["trainers"][1:]:
             if tier_const and tier_const != _SKIP:
                 variants.add(tier_const)
+    # A trainer that is its OWN first rematch tier must NOT be hidden.
+    # Vanilla FRLG's most common VS-Seeker pattern is {TRAINER_X, TRAINER_X}
+    # (136 of 221 entries) — the rematch reuses the original battle's data,
+    # so the base const also appears as tiers[1].  The loop above added it
+    # to `variants`, which would hide the base trainer from the list
+    # entirely (the user can't reach it because it's a real standalone
+    # trainer, not a rematch-only variant accessed via the tier dropdown).
+    # Subtract every base const from the variant set so self-rematch bases
+    # stay visible.  Distinct-tier variants (TRAINER_X_2/_3/_4) are not
+    # bases, so they remain correctly hidden.
+    variants -= set(base_map.keys())
     return base_map, any_map, variants
 
 
@@ -3055,8 +3066,20 @@ class TrainersTabWidget(QWidget):
             cls_label = self._class_names.get(cls_const, cls_const)
             groups[cls_label].append(const)
 
-        for cls_label in sorted(groups.keys()):
-            for const in groups[cls_label]:
+        for cls_label in sorted(groups.keys(), key=str.lower):
+            # Within each class group, order trainers alphabetically by
+            # display NAME (case-insensitive), with the const as a stable
+            # tiebreaker for same-named trainers.  Previously the inner
+            # order was trainers.h definition order, which isn't
+            # alphabetical -- the list read as "class A->Z, then arbitrary"
+            # within each class.  _display_name is "<Class> <Name>" and the
+            # class prefix is identical for every const in this group, so
+            # sorting by the full display string sorts by name in practice.
+            ordered_consts = sorted(
+                groups[cls_label],
+                key=lambda c: (self._display_name(c).lower(), c),
+            )
+            for const in ordered_consts:
                 display = self._display_name(const)
                 item    = QListWidgetItem(display)
                 item.setData(Qt.ItemDataRole.UserRole, const)
