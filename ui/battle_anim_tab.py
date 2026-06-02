@@ -219,6 +219,19 @@ class BattleAnimTab(QWidget):
         self._layer_timer.setInterval(160)
         self._layer_timer.timeout.connect(self._advance_layer_frame)
 
+        # Whole-move playback state.  Walks the resolved timeline by its
+        # delays, spawning sprite layers + firing sounds in order, and
+        # cycling each live layer's frames — an approximate dry-run of the
+        # move (real motion/lifetimes are computed by the engine in C).
+        self._playing = False
+        self._play_idx = 0
+        self._play_wait = 0        # ticks remaining on the current delay
+        self._play_tick = 0
+        self._play_layers: list = []   # [tag, cx, cy, subpri, frame_idx]
+        self._play_timer = QTimer(self)
+        self._play_timer.setInterval(16)   # ~60 fps, so delays read game-speed
+        self._play_timer.timeout.connect(self._play_step)
+
         # Frame-cycle preview state.
         self._frames: List[QPixmap] = []
         self._frame_idx = 0
@@ -368,15 +381,24 @@ class BattleAnimTab(QWidget):
         tv.addWidget(self._timeline, 1)
         # Preview the selected sound row through the Sound Editor.
         tl_btn_row = QHBoxLayout()
-        self._tl_play_btn = QPushButton("▶  Preview Sound")
+        # ▶ Play Move — runs the whole animation in sequence with delays
+        self._tl_play_move_btn = QPushButton("▶  Play Move")
+        self._tl_play_move_btn.setToolTip(
+            "Simulate the full animation: sprites layer in order, sounds fire, "
+            "delays advance time.  Positions approximate.")
+        self._tl_play_move_btn.clicked.connect(self._toggle_play_move)
+        self._tl_play_move_btn.setEnabled(False)
+        # ▶ Preview Sound — fires the selected row's SE through the Sound Editor
+        self._tl_play_btn = QPushButton("▶  Sound")
         self._tl_play_btn.setToolTip(
             "Play the selected sound row's effect through the Sound Editor.")
         self._tl_play_btn.clicked.connect(self._preview_selected_sound)
         self._tl_stop_btn = QPushButton("⏹")
         self._tl_stop_btn.setFixedWidth(36)
-        self._tl_stop_btn.setToolTip("Stop preview")
+        self._tl_stop_btn.setToolTip("Stop sound preview")
         self._tl_stop_btn.clicked.connect(
             lambda: _stop_sound_cb and _stop_sound_cb())
+        tl_btn_row.addWidget(self._tl_play_move_btn)
         tl_btn_row.addWidget(self._tl_play_btn)
         tl_btn_row.addWidget(self._tl_stop_btn)
         tl_btn_row.addStretch(1)
@@ -605,6 +627,7 @@ class BattleAnimTab(QWidget):
             self._loading = False
 
         # Reset + rebuild the Move Animations sub-tab.
+        self._stop_play_move()
         self._layer_timer.stop()
         self._layer_frames = []
         self._layer_idx = 0
@@ -1099,6 +1122,7 @@ class BattleAnimTab(QWidget):
         label = current.data(Qt.ItemDataRole.UserRole)
         if not label:
             return
+        self._stop_play_move()
         self._move_current = label
         self._populate_timeline(label)
 
@@ -1157,7 +1181,9 @@ class BattleAnimTab(QWidget):
                 select_row = self._timeline.count()
             self._timeline.addItem(item)
         self._timeline.blockSignals(False)
-        if self._timeline.count():
+        has_timeline = bool(self._timeline.count())
+        self._tl_play_move_btn.setEnabled(has_timeline)
+        if has_timeline:
             self._timeline.setCurrentRow(
                 min(select_row, self._timeline.count() - 1))
         else:
@@ -1420,6 +1446,142 @@ class BattleAnimTab(QWidget):
         so the timeline + move list reflect edits without touching disk."""
         from core.battle_anim_script import parse_scripts_text
         self._scripts = parse_scripts_text(self._scripts_text)
+
+    # ── whole-move playback ───────────────────────────────────────────
+    # Walks the resolved timeline by delay counts at 60 fps (1 tick ≈ 1 GBA
+    # frame) — spawns sprite layers, fires sounds in order, cycles frames.
+    # Positions are approximate (same caveat as the static composite).
+
+    def _toggle_play_move(self):
+        if self._playing:
+            self._stop_play_move()
+        else:
+            self._start_play_move()
+
+    def _start_play_move(self):
+        """Begin the whole-move animation playback sequence."""
+        timeline = self._cur_timeline
+        if not timeline:
+            return
+        self._playing = True
+        self._play_idx = 0
+        self._play_wait = 0
+        self._play_tick = 0
+        self._play_layers = []   # live list of [tag, cx, cy, subpri, frame_idx]
+        self._tl_play_move_btn.setText("⏹  Stop")
+        # Walk the timeline forward until the first non-instant event so the
+        # display shows something right away.
+        self._play_step()
+        self._play_timer.start()
+
+    def _stop_play_move(self):
+        """Stop playback and reset the button label."""
+        self._play_timer.stop()
+        self._playing = False
+        self._play_layers = []
+        self._tl_play_move_btn.setText("▶  Play Move")
+        # Reset preview back to the static composite for the current row.
+        self._update_move_composite()
+
+    def _play_step(self):
+        """Advance one 60-fps tick of the animation playback.
+
+        Consumes timeline commands greedily (multiple non-delay commands in a
+        row all fire the same tick) until hitting a ``delay N`` (which burns
+        N ticks), ``end``/``return`` (stop), or the end of the timeline.
+        Sounds fire through the SE callback.  Sprite layers accumulate; each
+        live layer's frame cycles every 8 ticks (~7.5 fps) for a rough cycle.
+        """
+        timeline = self._cur_timeline
+        if not timeline:
+            self._stop_play_move()
+            return
+
+        # If we're mid-delay, count it down.
+        if self._play_wait > 0:
+            self._play_wait -= 1
+            # Cycle each live layer's frames.
+            self._play_tick += 1
+            if self._play_tick % 8 == 0:
+                for L in self._play_layers:
+                    tag = L[0]
+                    sprite = self._sprites.get(tag)
+                    if sprite and sprite.png_exists:
+                        frames = self._slice_frames(
+                            sprite, self._palette_for(sprite))
+                        if len(frames) > 1:
+                            L[4] = (L[4] + 1) % len(frames)
+            self._render_play_composite()
+            return
+
+        # Consume commands until we hit a delay or terminal.
+        while self._play_idx < len(timeline):
+            cmd = timeline[self._play_idx]
+            self._play_idx += 1
+
+            # Highlight the current row in the timeline list.
+            if self._play_idx - 1 < self._timeline.count():
+                self._timeline.setCurrentRow(self._play_idx - 1)
+
+            if cmd.name == "delay" and cmd.args:
+                try:
+                    n = int(cmd.args[0], 0)
+                except ValueError:
+                    n = 1
+                self._play_wait = max(1, n)
+                self._render_play_composite()
+                return
+
+            if cmd.name in ("end", "return"):
+                self._stop_play_move()
+                return
+
+            if cmd.name == "createsprite":
+                cs = parse_createsprite(cmd)
+                if cs:
+                    tag = self._template_tags.get(cs.template, "")
+                    if tag:
+                        acx, acy = self._battler_anchor(cs.battler)
+                        xoff = (self._int_or(cs.args[0])
+                                if len(cs.args) >= 1 else 0)
+                        yoff = (self._int_or(cs.args[1])
+                                if len(cs.args) >= 2 else 0)
+                        subpri = self._int_or(cs.subpriority)
+                        self._play_layers.append(
+                            [tag, acx + xoff, acy + yoff, subpri, 0])
+
+            if cmd.kind == KIND_SOUND and cmd.args:
+                if _preview_sound_cb is not None:
+                    _preview_sound_cb(cmd.args[0])
+
+        # Ran off the end without hitting `end` — stop.
+        self._stop_play_move()
+
+    def _render_play_composite(self):
+        """Paint the current _play_layers state onto the battle preview.
+        Layers are ordered by subpriority (higher value = drawn first = behind)."""
+        from PyQt6.QtGui import QPainter
+        if not self._play_layers:
+            self._move_preview.set_anim_pixmap(None)
+            return
+        layers = sorted(self._play_layers, key=lambda L: -L[3])
+        P = self._move_preview
+        canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
+        canvas.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(canvas)
+        for tag, cx, cy, _sp, fidx in layers:
+            sprite = self._sprites.get(tag)
+            if not sprite or not sprite.png_exists:
+                continue
+            frames = self._slice_frames(sprite, self._palette_for(sprite))
+            if not frames:
+                continue
+            pix = frames[max(0, min(fidx, len(frames) - 1))]
+            painter.drawPixmap(cx - pix.width() // 2,
+                               cy - pix.height() // 2, pix)
+        painter.end()
+        self._move_preview.set_anim_pixmap(canvas, P.CANVAS_W // 2,
+                                           P.CANVAS_H // 2)
 
     # ── layered composite preview ─────────────────────────────────────
 
