@@ -145,3 +145,69 @@ class TestAgainstRealProject:
         sprites = mod.parse_battle_anim_sprites(_PROJECT)
         tags = [s.tag for s in sprites]
         assert len(tags) == len(set(tags)), "duplicate ANIM_TAG in parsed set"
+
+    def test_frame_sizes_resolve_known_sprites(self):
+        sizes = mod.parse_anim_frame_sizes(_PROJECT)
+        # Coverage: a good chunk of tags resolve via their templates.
+        assert len(sizes) >= 150, f"only {len(sizes)} frame sizes resolved"
+        # Known sprites with known OAM sizes.
+        assert sizes.get("ANIM_TAG_BONE") == (32, 32)
+        assert sizes.get("ANIM_TAG_SWORD") == (32, 64)
+
+    def test_template_tags_resolve_in_real_project(self):
+        tags = mod.parse_template_tags(_PROJECT)
+        # Hundreds of templates map to an ANIM_TAG.
+        assert len(tags) >= 150, f"only {len(tags)} template->tag mappings"
+        # A known one: the ember sprite template.
+        assert tags.get("gEmberSpriteTemplate") == "ANIM_TAG_SMALL_EMBER"
+
+
+def test_oam_size_from_name():
+    assert mod._oam_size_from_name("gOamData_AffineOff_ObjNormal_32x32") == (32, 32)
+    assert mod._oam_size_from_name("gOamData_AffineNormal_ObjNormal_16x32") == (16, 32)
+    assert mod._oam_size_from_name("gSomethingWithoutSize") is None
+
+
+def test_build_oam_size_map_from_struct():
+    text = (
+        "const struct OamData gOamData_X =\n{\n"
+        "    .shape = SPRITE_SHAPE(16x32),\n"
+        "    .size = SPRITE_SIZE(16x32),\n"
+        "};\n"
+    )
+    out = mod._build_oam_size_map([text])
+    assert out == {"gOamData_X": (16, 32)}
+
+
+def test_parse_template_tags_maps_symbol_to_tag(tmp_path):
+    bah = tmp_path / "src" / "data"
+    bah.mkdir(parents=True)
+    (bah / "battle_anim.h").write_text(
+        "const struct SpriteTemplate gEmberSpriteTemplate =\n{\n"
+        "    .tileTag = ANIM_TAG_SMALL_EMBER,\n"
+        "    .oam = &gOamData_X,\n};\n"
+        "const struct SpriteTemplate gNoTagTemplate =\n{\n"
+        "    .tileTag = TAG_NONE,\n};\n",
+        encoding="utf-8")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    tags = mod.parse_template_tags(str(tmp_path))
+    assert tags.get("gEmberSpriteTemplate") == "ANIM_TAG_SMALL_EMBER"
+    # A template whose tileTag isn't an ANIM_TAG is omitted.
+    assert "gNoTagTemplate" not in tags
+
+
+def test_parse_anim_frame_sizes_resolves_via_template(tmp_path):
+    # Synthetic: a template links a tag to a sized OAM struct.
+    bah = tmp_path / "src" / "data"
+    bah.mkdir(parents=True)
+    (bah / "battle_anim.h").write_text(
+        "const struct OamData gOamData_Big =\n{\n"
+        "    .size = SPRITE_SIZE(64x64),\n};\n"
+        "const struct SpriteTemplate gFooTemplate =\n{\n"
+        "    .tileTag = ANIM_TAG_FOO,\n"
+        "    .oam = &gOamData_Big,\n"
+        "    .callback = AnimFoo,\n};\n",
+        encoding="utf-8")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    sizes = mod.parse_anim_frame_sizes(str(tmp_path))
+    assert sizes.get("ANIM_TAG_FOO") == (64, 64)

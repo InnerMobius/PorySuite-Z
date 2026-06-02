@@ -54,8 +54,10 @@ they live in later phases / their own modules.
 
 from __future__ import annotations
 
+import glob
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -247,3 +249,127 @@ def parse_battle_anim_sprites(project_root: str) -> List[BattleAnimSprite]:
 def battle_anim_sprites_dir(project_root: str) -> str:
     """Absolute path of the battle-anim sprites source folder."""
     return os.path.join(project_root, _SPRITES_DIR_REL)
+
+
+# ──────────────────────────────────────── frame-size resolution ──
+# A battle-anim sprite's true per-frame size comes from the SpriteTemplate
+# that uses its ANIM_TAG: the template's ``.oam`` points at an OamData
+# struct whose ``SPRITE_SIZE(WxH)`` (and conventional ``_WxH`` symbol
+# suffix) give the frame's pixel dimensions.  Resolving this lets the UI
+# slice the sheet into exact frames instead of guessing square frames.
+
+_OAM_NAME_SIZE_RE = re.compile(r"_(\d+)x(\d+)\s*$")
+_OAM_STRUCT_RE = re.compile(
+    r"struct\s+OamData\s+(\w+)\s*=\s*\{(?P<body>.*?)\};", re.DOTALL)
+_SPRITE_SIZE_RE = re.compile(r"SPRITE_SIZE\(\s*(\d+)x(\d+)\s*\)")
+_TEMPLATE_RE = re.compile(
+    r"struct\s+SpriteTemplate\s+(?P<name>\w+)\s*=\s*\{(?P<body>.*?)\};",
+    re.DOTALL)
+_TPL_TILETAG_RE = re.compile(r"\.tileTag\s*=\s*(ANIM_TAG_\w+)")
+_TPL_OAM_RE = re.compile(r"\.oam\s*=\s*&?(\w+)")
+
+
+def _oam_size_from_name(symbol: str) -> Optional[Tuple[int, int]]:
+    m = _OAM_NAME_SIZE_RE.search(symbol)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _build_oam_size_map(texts: List[str]) -> Dict[str, Tuple[int, int]]:
+    """``{oam_symbol: (w, h)}`` from every OamData struct in *texts*,
+    read from its ``SPRITE_SIZE(WxH)`` field."""
+    out: Dict[str, Tuple[int, int]] = {}
+    for text in texts:
+        for m in _OAM_STRUCT_RE.finditer(text):
+            sym = m.group(1)
+            sm = _SPRITE_SIZE_RE.search(m.group("body"))
+            if sm:
+                out[sym] = (int(sm.group(1)), int(sm.group(2)))
+    return out
+
+
+def _battle_anim_source_texts(project_root: str) -> List[str]:
+    """Read the source files that hold battle-anim SpriteTemplates +
+    OamData structs (``src/data/battle_anim.h`` + ``src/battle_anim*.c``).
+
+    Returns the file contents as a list of strings (skipping unreadable
+    files).  Shared by every template-scanning parser so the disk is read
+    once per call site, never raises.
+    """
+    files: List[str] = []
+    bah = os.path.join(project_root, _BATTLE_ANIM_H_REL)
+    if os.path.isfile(bah):
+        files.append(bah)
+    files.extend(sorted(glob.glob(
+        os.path.join(project_root, "src", "battle_anim*.c"))))
+
+    texts: List[str] = []
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                texts.append(f.read())
+        except OSError:
+            continue
+    return texts
+
+
+def parse_template_tags(project_root: str) -> Dict[str, str]:
+    """Map ``{template_symbol: ANIM_TAG_*}`` for every SpriteTemplate whose
+    ``.tileTag`` is an ``ANIM_TAG_*``.
+
+    This is the link a ``createsprite gXxxTemplate, ...`` command needs to
+    resolve to the battle-anim sprite it spawns, so the composite preview
+    can show the right image for each layer.  Templates whose tileTag is
+    not an ANIM_TAG (or has none) are omitted.  Never raises.
+    """
+    out: Dict[str, str] = {}
+    for text in _battle_anim_source_texts(project_root):
+        for m in _TEMPLATE_RE.finditer(text):
+            tt = _TPL_TILETAG_RE.search(m.group("body"))
+            if tt:
+                out[m.group("name")] = tt.group(1)
+    return out
+
+
+def parse_anim_frame_sizes(project_root: str) -> Dict[str, Tuple[int, int]]:
+    """Map ``{ANIM_TAG_*: (frame_w, frame_h)}`` by resolving each tag
+    through the SpriteTemplate that uses it → its OAM → pixel size.
+
+    Scans ``src/battle_anim*.c`` + ``src/data/battle_anim.h`` (where the
+    templates and OamData structs live).  When a tag is used by multiple
+    templates with differing sizes, the most common size wins (tie →
+    largest area).  Tags with no resolvable template are simply absent
+    (the caller falls back to square-frame inference).  Never raises.
+    """
+    texts = _battle_anim_source_texts(project_root)
+    if not texts:
+        return {}
+
+    oam_size = _build_oam_size_map(texts)
+
+    def _size_for_oam(sym: str) -> Optional[Tuple[int, int]]:
+        if sym in oam_size:
+            return oam_size[sym]
+        return _oam_size_from_name(sym)
+
+    # tag -> list of (w, h) from every template that uses it.
+    per_tag: Dict[str, List[Tuple[int, int]]] = {}
+    for text in texts:
+        for m in _TEMPLATE_RE.finditer(text):
+            body = m.group("body")
+            tt = _TPL_TILETAG_RE.search(body)
+            oam = _TPL_OAM_RE.search(body)
+            if not (tt and oam):
+                continue
+            size = _size_for_oam(oam.group(1))
+            if size:
+                per_tag.setdefault(tt.group(1), []).append(size)
+
+    out: Dict[str, Tuple[int, int]] = {}
+    for tag, sizes in per_tag.items():
+        # Most common size wins; tie-break by largest area.
+        counts = Counter(sizes)
+        best = max(counts, key=lambda s: (counts[s], s[0] * s[1]))
+        out[tag] = best
+    return out

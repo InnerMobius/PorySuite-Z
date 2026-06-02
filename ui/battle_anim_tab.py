@@ -36,14 +36,20 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QGroupBox, QScrollArea, QGridLayout, QFrame, QSplitter, QSizePolicy,
     QTabWidget, QMessageBox, QFileDialog, QListWidget, QListWidgetItem,
-    QComboBox, QSpinBox, QDialog, QDialogButtonBox, QFormLayout,
+    QComboBox, QSpinBox, QDialog, QDialogButtonBox, QFormLayout, QSlider,
+    QToolButton, QStackedWidget,
 )
 
-from core.battle_anim_data import parse_battle_anim_sprites, BattleAnimSprite
+from core.battle_anim_data import (
+    parse_battle_anim_sprites, parse_anim_frame_sizes, parse_template_tags,
+    BattleAnimSprite)
 from core.battle_anim_script import (
     parse_move_anim_table, parse_anim_scripts, resolve_timeline,
     parse_move_names, move_display_name, parse_sound_effects,
     rewrite_script_command, format_command,
+    insert_script_command, delete_script_command, move_script_command,
+    parse_createsprite, format_createsprite, CreateSpriteCmd,
+    parse_createvisualtask, format_createvisualtask,
     KIND_SOUND, KIND_SPRITE, KIND_TASK, KIND_DELAY, KIND_GFX, KIND_CONTROL,
 )
 from core.sprite_render import load_sprite_pixmap
@@ -110,13 +116,16 @@ class _AnimCard(QWidget):
 
     clicked = pyqtSignal(str)  # emits the sprite tag
 
-    def __init__(self, tag: str, name: str, pix: Optional[QPixmap]):
+    def __init__(self, tag: str, name: str, pix: Optional[QPixmap],
+                 shared: bool = False, share_tip: str = ""):
         super().__init__()
         self._tag = tag
         self._selected = False
         self._dirty = False
         self.setFixedSize(_CARD_W, _CARD_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        if shared:
+            self.setToolTip(share_tip or "Shares its image with other sprites")
         v = QVBoxLayout(self)
         v.setContentsMargins(2, 2, 2, 2)
         v.setSpacing(1)
@@ -128,7 +137,8 @@ class _AnimCard(QWidget):
                                 Qt.TransformationMode.FastTransformation)
             self._thumb.setPixmap(scaled)
         v.addWidget(self._thumb)
-        lbl = QLabel(name)
+        # 🔗 prefix marks a shared image at a glance in the grid.
+        lbl = QLabel(("🔗 " if shared else "") + name)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setWordWrap(True)
         lbl.setStyleSheet("font-size: 9px; color: #ccc;")
@@ -187,6 +197,7 @@ class BattleAnimTab(QWidget):
         self._palette_dirty: set = set()                     # tags with unsaved palette
         self._current: Optional[str] = None                  # selected tag
         self._gfx_groups: Dict[str, List[str]] = {}          # gfx_symbol -> [tags] sharing the image
+        self._frame_sizes: Dict[str, Tuple[int, int]] = {}   # tag -> (fw, fh) from sprite templates
 
         # Move-animation (timeline) state.
         self._move_table: List[str] = []                    # script labels by move idx
@@ -196,6 +207,17 @@ class BattleAnimTab(QWidget):
         self._scripts_text: str = ""                        # raw battle_anim_scripts.s
         self._scripts_dirty: bool = False                   # unsaved timeline edits?
         self._sound_effects: List[str] = []                 # SE_* constants for picker
+        self._template_tags: Dict[str, str] = {}            # template symbol -> ANIM_TAG
+        self._cur_timeline: list = []                       # resolved Commands of selected move
+        self._dirty_moves: set = set()                      # labels with unsaved edits (amber)
+
+        # Composite-preview / layer-scrubber state (Move Animations tab).
+        self._layer_frames: List[QPixmap] = []              # frames of selected layer sprite
+        self._layer_idx = 0
+        self._layer_tag = ""                                # selected layer's ANIM_TAG
+        self._layer_timer = QTimer(self)
+        self._layer_timer.setInterval(160)
+        self._layer_timer.timeout.connect(self._advance_layer_frame)
 
         # Frame-cycle preview state.
         self._frames: List[QPixmap] = []
@@ -248,7 +270,7 @@ class BattleAnimTab(QWidget):
         lv.addWidget(self._move_list, 1)
         splitter.addWidget(left)
 
-        # ── CENTER: battle-scene preview (own instance) ──
+        # ── CENTER: battle-scene preview (layered composite) ──
         center = QWidget()
         cv = QVBoxLayout(center)
         prev_box = QGroupBox("Battle Scene Preview")
@@ -259,8 +281,43 @@ class BattleAnimTab(QWidget):
         self._move_prev_lbl = QLabel("Select a move")
         self._move_prev_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._move_prev_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._move_prev_lbl.setWordWrap(True)
         pv.addWidget(self._move_prev_lbl)
         cv.addWidget(prev_box)
+
+        # Layer / frame scrubber — drives the SELECTED sprite layer's own
+        # frame cycle so you can step through (or play) its frames.
+        scrub_box = QGroupBox("Selected Sprite — Frames")
+        sv = QVBoxLayout(scrub_box)
+        self._layer_lbl = QLabel("Select a sprite-spawn row to inspect its frames.")
+        self._layer_lbl.setWordWrap(True)
+        self._layer_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
+        sv.addWidget(self._layer_lbl)
+        scrub_row = QHBoxLayout()
+        self._layer_play = QToolButton()
+        self._layer_play.setText("▶")
+        self._layer_play.setToolTip("Play this sprite's frame cycle")
+        self._layer_play.clicked.connect(self._toggle_layer_play)
+        self._layer_play.setEnabled(False)
+        scrub_row.addWidget(self._layer_play)
+        self._layer_slider = QSlider(Qt.Orientation.Horizontal)
+        self._layer_slider.setMinimum(0)
+        self._layer_slider.setMaximum(0)
+        self._layer_slider.setEnabled(False)
+        self._layer_slider.valueChanged.connect(self._on_layer_scrub)
+        scrub_row.addWidget(self._layer_slider, 1)
+        self._layer_frame_lbl = QLabel("—")
+        self._layer_frame_lbl.setFixedWidth(64)
+        self._layer_frame_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
+        scrub_row.addWidget(self._layer_frame_lbl)
+        sv.addLayout(scrub_row)
+        self._layer_edit_btn = QPushButton("Edit this sprite (image + palette) ▸")
+        self._layer_edit_btn.setToolTip(
+            "Jump to the Sprites tab to edit this sprite's image and palette.")
+        self._layer_edit_btn.clicked.connect(self._edit_selected_layer_sprite)
+        self._layer_edit_btn.setEnabled(False)
+        sv.addWidget(self._layer_edit_btn)
+        cv.addWidget(scrub_box)
         cv.addStretch(1)
         splitter.addWidget(center)
 
@@ -275,11 +332,39 @@ class BattleAnimTab(QWidget):
         self._tl_header.setWordWrap(True)
         self._tl_header.setStyleSheet("color: #aaa; font-size: 11px;")
         tv.addWidget(self._tl_header)
+
+        # ── Edit toolbar: add / edit / delete / reorder commands ──
+        edit_row = QHBoxLayout()
+        edit_row.setSpacing(4)
+
+        def _mk(text, tip, slot, width=34):
+            b = QToolButton()
+            b.setText(text)
+            b.setToolTip(tip)
+            b.setFixedWidth(width)
+            b.clicked.connect(slot)
+            b.setEnabled(False)
+            edit_row.addWidget(b)
+            return b
+
+        self._tl_add_btn = _mk("＋", "Add a new command after the selected row",
+                               self._tl_add, 60)
+        self._tl_add_btn.setText("＋ Add")
+        self._tl_edit_btn = _mk("✎", "Edit the selected command", self._tl_edit)
+        self._tl_del_btn = _mk("🗑", "Delete the selected command", self._tl_delete)
+        self._tl_up_btn = _mk("▲", "Move the selected command earlier",
+                              lambda: self._tl_move(-1))
+        self._tl_down_btn = _mk("▼", "Move the selected command later",
+                                lambda: self._tl_move(+1))
+        edit_row.addStretch(1)
+        tv.addLayout(edit_row)
+
         self._timeline = QListWidget()
         self._timeline.setStyleSheet(
             "QListWidget { background: #141414; border: 1px solid #2e2e2e; "
             "font-family: Consolas, monospace; font-size: 11px; }")
         self._timeline.itemDoubleClicked.connect(self._on_timeline_double_click)
+        self._timeline.currentRowChanged.connect(self._on_timeline_row_changed)
         tv.addWidget(self._timeline, 1)
         # Preview the selected sound row through the Sound Editor.
         tl_btn_row = QHBoxLayout()
@@ -459,6 +544,12 @@ class BattleAnimTab(QWidget):
         self._order = [s.tag for s in sorted(
             sprites, key=lambda s: (s.display_name.lower(), s.tag))]
 
+        # Exact per-frame sizes resolved from sprite templates (OAM).
+        try:
+            self._frame_sizes = parse_anim_frame_sizes(project_root)
+        except Exception:
+            self._frame_sizes = {}
+
         # Group sprites that SHARE an image (same gfx symbol = same PNG).
         # Replacing the image of one hits them all; the detail panel
         # surfaces the group + lets the user hop between them.
@@ -474,15 +565,19 @@ class BattleAnimTab(QWidget):
         # Parse move-animation table + scripts + the project's move names,
         # and hold the raw script file text for in-place edits.
         self._scripts_dirty = False
+        self._dirty_moves.clear()
+        self._cur_timeline = []
         try:
             self._move_table = parse_move_anim_table(project_root)
             self._scripts = parse_anim_scripts(project_root)
             self._move_names = parse_move_names(project_root)
             self._sound_effects = parse_sound_effects(project_root)
             self._scripts_text = self._read_scripts_text(project_root)
+            self._template_tags = parse_template_tags(project_root)
         except Exception:
             self._move_table, self._scripts, self._move_names = [], {}, {}
             self._sound_effects, self._scripts_text = [], ""
+            self._template_tags = {}
 
         # Visual reset of the detail/right panel.
         self._pal_frame.setStyleSheet("")
@@ -510,6 +605,11 @@ class BattleAnimTab(QWidget):
             self._loading = False
 
         # Reset + rebuild the Move Animations sub-tab.
+        self._layer_timer.stop()
+        self._layer_frames = []
+        self._layer_idx = 0
+        self._layer_tag = ""
+        self._reset_layer_scrubber()
         self._move_preview.set_anim_pixmap(None)
         self._move_prev_lbl.setText("Select a move")
         # Sound preview is available only when the Sound Editor wired the
@@ -524,6 +624,7 @@ class BattleAnimTab(QWidget):
             "Select a move to see its animation script — sounds, sprite "
             "spawns, delays, and visual effects in play order.")
         self._timeline.clear()
+        self._update_edit_buttons()
         self._rebuild_move_list()
 
     # ── grid ─────────────────────────────────────────────────────────
@@ -551,7 +652,15 @@ class BattleAnimTab(QWidget):
         for tag in tags:
             sprite = self._sprites[tag]
             pix = self._thumb_pixmap(sprite)
-            card = _AnimCard(tag, sprite.display_name, pix)
+            group = self._gfx_groups.get(sprite.gfx_symbol, [])
+            shared = len(group) > 1
+            share_tip = ""
+            if shared:
+                names = ", ".join(self._sprites[t].display_name
+                                  for t in group if t != tag)
+                share_tip = f"Shares its image with: {names}"
+            card = _AnimCard(tag, sprite.display_name, pix,
+                             shared=shared, share_tip=share_tip)
             card.clicked.connect(self._on_card_clicked)
             if tag == self._current:
                 card.set_selected(True)
@@ -678,8 +787,14 @@ class BattleAnimTab(QWidget):
         if self._frames:
             self._preview.set_anim_pixmap(self._frames[0])
             n = len(self._frames)
+            exact = sprite.tag in self._frame_sizes
+            if exact:
+                fw, fh = self._frame_sizes[sprite.tag]
+                qual = f"{fw}×{fh}"
+            else:
+                qual = "approx"
             self._frame_lbl.setText(
-                f"{n} frame{'s' if n != 1 else ''} (approx)"
+                f"{n} frame{'s' if n != 1 else ''} ({qual})"
                 + ("  ·  cycling" if n > 1 else ""))
             if n > 1:
                 self._frame_timer.start()
@@ -734,6 +849,16 @@ class BattleAnimTab(QWidget):
         w, h = sheet.width(), sheet.height()
         if w <= 0 or h <= 0:
             return []
+        # EXACT frame size from the sprite template's OAM, when resolved —
+        # slice the sheet into a row-major grid of fw×fh frames.
+        fw, fh = self._frame_sizes.get(sprite.tag, (0, 0))
+        if fw > 0 and fh > 0 and w % fw == 0 and h % fh == 0:
+            cols, rows = w // fw, h // fh
+            if cols * rows >= 1:
+                return [sheet.copy(c * fw, r * fh, fw, fh)
+                        for r in range(rows) for c in range(cols)]
+        # Fallback: approximate square-frame inference (tag had no
+        # resolvable template, or the sheet doesn't divide evenly).
         if w > h and w % h == 0:
             fw = fh = h
             n = w // fw
@@ -951,11 +1076,22 @@ class BattleAnimTab(QWidget):
             item = QListWidgetItem(name)
             item.setData(Qt.ItemDataRole.UserRole, label)
             item.setToolTip(f"{label}   (move #{idx})")
+            # Per-item amber for moves with unsaved timeline edits (Pattern A).
+            if label in self._dirty_moves:
+                item.setBackground(QColor("#3d2e00"))
             self._move_list.addItem(item)
             if label == self._move_current:
                 self._move_list.setCurrentItem(item)
         self._move_count_lbl.setText(f"{len(rows)} moves")
         self._move_list.blockSignals(False)
+
+    def _mark_move_dirty(self, label: str):
+        """Tint the given move's row amber (unsaved edits)."""
+        for i in range(self._move_list.count()):
+            it = self._move_list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == label:
+                it.setBackground(QColor("#3d2e00"))
+                return
 
     def _on_move_selected(self, current, _previous):
         if current is None:
@@ -966,49 +1102,196 @@ class BattleAnimTab(QWidget):
         self._move_current = label
         self._populate_timeline(label)
 
-    def _populate_timeline(self, label: str):
+    def _populate_timeline(self, label: str, select_own_idx: Optional[int] = None):
         """Resolve the move's script into a flat timeline and render it as
-        an icon-tagged, colour-coded, depth-indented command list."""
+        an icon-tagged, colour-coded, depth-indented command list.
+
+        Every depth-0 row carries ``(label, own_idx, kind, depth)`` so the
+        edit toolbar can target it; inlined (depth>0) rows carry
+        ``own_idx = -1`` and stay read-only.  ``select_own_idx`` re-selects
+        a specific own-command row after a structural edit (so focus stays
+        on what the user just changed)."""
+        self._timeline.blockSignals(True)
         self._timeline.clear()
         timeline = resolve_timeline(self._scripts, label, inline_calls=True)
+        self._cur_timeline = timeline
         name = move_display_name(label, self._move_names)
         n_sound = sum(1 for c in timeline if c.kind == KIND_SOUND)
         n_spr = sum(1 for c in timeline if c.kind == KIND_SPRITE)
+        dirty = (" — <span style='color:#ffb74d'>unsaved edits</span>"
+                 if label in self._dirty_moves else "")
         self._tl_header.setText(
-            f"<b>{name}</b>  ({label})<br>"
+            f"<b>{name}</b>  ({label}){dirty}<br>"
             f"{len(timeline)} steps · {n_sound} sound(s) · {n_spr} sprite spawn(s)"
             f"  —  indented rows are shared sub-scripts (read-only).<br>"
-            f"Rows marked ✎ (sounds &amp; delays on this move) are editable — "
-            f"<b>double-click</b> to change.")
-        # Track the index within the move's OWN script (depth-0 commands
-        # only), so an editable row maps back to a precise rewrite target.
+            f"Select a row, then use the toolbar to add / edit / delete / "
+            f"reorder.  Double-click a row to edit it.")
         own_idx = -1
+        select_row = 0
         for cmd in timeline:
             if cmd.depth == 0:
                 own_idx += 1
             glyph, colour = _KIND_STYLE.get(cmd.kind, _KIND_DEFAULT)
             indent = "    " * cmd.depth
-            # Editable = a sound or delay on the move's OWN script (depth 0).
+            # Every depth-0 row is editable now (add/edit/delete/reorder).
             # Inlined shared-subroutine rows (depth>0) stay read-only so an
             # edit can't silently change every move that calls them.
-            editable = (cmd.depth == 0 and cmd.kind in (KIND_SOUND, KIND_DELAY))
-            suffix = "   ✎" if editable else ""
+            own_editable = (cmd.depth == 0)
+            suffix = "   ✎" if own_editable else ""
             item = QListWidgetItem(f"{indent}{glyph}  {cmd.summary}{suffix}")
             item.setForeground(QColor(colour))
             tip = cmd.raw
-            if editable:
-                tip += "\n(double-click to edit)"
-            elif cmd.depth > 0 and cmd.kind in (KIND_SOUND, KIND_DELAY):
+            if own_editable:
+                tip += "\n(double-click to edit; toolbar to add / delete / reorder)"
+            elif cmd.depth > 0:
                 tip += "\n(shared sub-script — edit it on the move it belongs to)"
             item.setToolTip(tip)
-            if editable:
-                item.setData(Qt.ItemDataRole.UserRole, (label, own_idx, cmd.kind))
+            item.setData(Qt.ItemDataRole.UserRole,
+                         (label, own_idx if cmd.depth == 0 else -1,
+                          cmd.kind, cmd.depth))
             # Any sound row (incl. inlined) carries its SE_* for preview.
             if cmd.kind == KIND_SOUND and cmd.args:
                 item.setData(_SOUND_ROLE, cmd.args[0])
+            if (select_own_idx is not None and cmd.depth == 0
+                    and own_idx == select_own_idx):
+                select_row = self._timeline.count()
             self._timeline.addItem(item)
-        # Show the move's primary sprite on the battle scene (first gfx load).
-        self._update_move_preview(timeline)
+        self._timeline.blockSignals(False)
+        if self._timeline.count():
+            self._timeline.setCurrentRow(
+                min(select_row, self._timeline.count() - 1))
+        else:
+            self._update_edit_buttons()
+            self._update_move_composite()
+
+    # ── timeline editing (add / edit / delete / reorder) ──────────────
+
+    def _on_timeline_row_changed(self, row: int):
+        """Selection moved: refresh edit-button enablement, the layered
+        composite (spawns through this row) and the frame scrubber."""
+        self._update_edit_buttons()
+        # Load the selected row's sprite into the frame scrubber, if it's a
+        # sprite-spawn (createsprite) or gfx-load row.
+        tag = ""
+        if 0 <= row < len(self._cur_timeline):
+            cmd = self._cur_timeline[row]
+            if cmd.name == "createsprite":
+                cs = parse_createsprite(cmd)
+                if cs:
+                    tag = self._template_tags.get(cs.template, "")
+            elif cmd.name in ("loadspritegfx", "unloadspritegfx") and cmd.args:
+                tag = cmd.args[0]
+        self._load_layer_scrubber(tag)
+        self._update_move_composite()
+
+    def _update_edit_buttons(self):
+        """Enable/disable the edit toolbar from the current selection."""
+        has_move = bool(self._move_current)
+        self._tl_add_btn.setEnabled(has_move)
+        item = self._timeline.currentItem()
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        depth0 = bool(data) and data[3] == 0
+        self._tl_edit_btn.setEnabled(depth0)
+        self._tl_del_btn.setEnabled(depth0)
+        if depth0:
+            label, own_idx = data[0], data[1]
+            n = len(self._scripts.get(label, []))
+            self._tl_up_btn.setEnabled(own_idx > 0)
+            self._tl_down_btn.setEnabled(own_idx < n - 1)
+        else:
+            self._tl_up_btn.setEnabled(False)
+            self._tl_down_btn.setEnabled(False)
+
+    def _selected_depth0(self):
+        """Return ``(label, own_idx)`` for the selected depth-0 row, else
+        ``None``."""
+        item = self._timeline.currentItem()
+        data = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if data and data[3] == 0:
+            return data[0], data[1]
+        return None
+
+    def _apply_structural_edit(self, new_text: Optional[str], label: str,
+                               select_own_idx: Optional[int]) -> bool:
+        """Commit an in-memory edit of the script text, re-parse, repopulate
+        the timeline (restoring focus), and mark everything dirty."""
+        if new_text is None:
+            QMessageBox.warning(
+                self, "Edit Timeline",
+                "Couldn't locate that command in the script source — "
+                "no change made.")
+            return False
+        self._scripts_text = new_text
+        self._scripts_dirty = True
+        self._dirty_moves.add(label)
+        self._reparse_scripts_from_text()
+        self._mark_move_dirty(label)
+        self._populate_timeline(label, select_own_idx=select_own_idx)
+        self.modified.emit()
+        return True
+
+    def _tl_add(self):
+        """Insert a new command after the selected row (or at the end of
+        the move's own script)."""
+        label = self._move_current
+        if not label:
+            return
+        sel = self._selected_depth0()
+        at_idx = (sel[1] + 1) if sel else len(self._scripts.get(label, []))
+        new_cmd = self._command_editor_dialog(label, None)
+        if not new_cmd:
+            return
+        new_text = insert_script_command(
+            self._scripts_text, label, at_idx, new_cmd)
+        self._apply_structural_edit(new_text, label, select_own_idx=at_idx)
+
+    def _tl_edit(self):
+        sel = self._selected_depth0()
+        if not sel:
+            return
+        label, own_idx = sel
+        cmds = self._scripts.get(label, [])
+        if own_idx >= len(cmds):
+            return
+        cmd = cmds[own_idx]
+        new_cmd = self._command_editor_dialog(label, cmd)
+        if new_cmd is None or new_cmd == cmd.raw:
+            return
+        new_text = rewrite_script_command(
+            self._scripts_text, label, own_idx, new_cmd)
+        self._apply_structural_edit(new_text, label, select_own_idx=own_idx)
+
+    def _tl_delete(self):
+        sel = self._selected_depth0()
+        if not sel:
+            return
+        label, own_idx = sel
+        cmds = self._scripts.get(label, [])
+        if own_idx >= len(cmds):
+            return
+        raw = cmds[own_idx].raw
+        if QMessageBox.question(
+                self, "Delete Command",
+                f"Delete this command from {label}?\n\n    {raw}",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+        new_text = delete_script_command(self._scripts_text, label, own_idx)
+        new_count = len(cmds) - 1
+        sel_idx = min(own_idx, new_count - 1) if new_count > 0 else None
+        self._apply_structural_edit(new_text, label, select_own_idx=sel_idx)
+
+    def _tl_move(self, delta: int):
+        sel = self._selected_depth0()
+        if not sel:
+            return
+        label, own_idx = sel
+        new_text = move_script_command(
+            self._scripts_text, label, own_idx, delta)
+        if new_text is None:
+            return  # at an edge
+        self._apply_structural_edit(
+            new_text, label, select_own_idx=own_idx + delta)
 
     def _preview_selected_sound(self):
         """Play the selected timeline row's sound (if it is one) through the
@@ -1025,38 +1308,11 @@ class BattleAnimTab(QWidget):
             _preview_sound_cb(se)
 
     def _on_timeline_double_click(self, item: QListWidgetItem):
-        """Edit a depth-0 sound or delay command in place."""
+        """Double-click a depth-0 row → open the command editor."""
         data = item.data(Qt.ItemDataRole.UserRole)
-        if not data:
-            return  # not an editable row
-        label, own_idx, kind = data
-        cmds = self._scripts.get(label, [])
-        if own_idx >= len(cmds):
-            return
-        cmd = cmds[own_idx]
-        if kind == KIND_DELAY:
-            new_cmd = self._edit_delay_dialog(cmd)
-        elif kind == KIND_SOUND:
-            new_cmd = self._edit_sound_dialog(cmd)
-        else:
-            return
-        if new_cmd is None or new_cmd == cmd.raw:
-            return
-        # Rewrite the .s text in place, then re-parse + refresh.
-        new_text = rewrite_script_command(
-            self._scripts_text, label, own_idx, new_cmd)
-        if new_text is None:
-            QMessageBox.warning(
-                self, "Edit Timeline",
-                "Couldn't locate that command in the script source — "
-                "no change made.")
-            return
-        self._scripts_text = new_text
-        self._scripts_dirty = True
-        # Re-parse so the in-memory model + timeline reflect the edit.
-        self._reparse_scripts_from_text()
-        self._populate_timeline(label)
-        self.modified.emit()
+        if not data or data[3] != 0:
+            return  # inlined / read-only row
+        self._tl_edit()
 
     def _edit_delay_dialog(self, cmd) -> Optional[str]:
         cur = 0
@@ -1165,26 +1421,437 @@ class BattleAnimTab(QWidget):
         from core.battle_anim_script import parse_scripts_text
         self._scripts = parse_scripts_text(self._scripts_text)
 
-    def _update_move_preview(self, timeline):
-        """Approximate context: drop the first sprite the move loads onto
-        the battle scene (read-only viewer — not a faithful playback)."""
-        tag = ""
-        for cmd in timeline:
-            if cmd.kind == KIND_GFX and cmd.name == "loadspritegfx" and cmd.args:
-                tag = cmd.args[0]
-                break
-        sprite = self._sprites.get(tag) if tag else None
-        if sprite is not None and sprite.png_exists:
-            pal = self._palette_for(sprite)
-            frames = self._slice_frames(sprite, pal)
-            if frames:
-                self._move_preview.set_anim_pixmap(frames[0])
-                self._move_prev_lbl.setText(
-                    f"First loaded sprite: {sprite.display_name}  ({tag})")
-                return
-        self._move_preview.set_anim_pixmap(None)
+    # ── layered composite preview ─────────────────────────────────────
+
+    @staticmethod
+    def _int_or(s, default=0):
+        """Parse a C-style int literal (incl. negatives / 0x), else default
+        (used for best-effort x/y/subpriority — many args are constants we
+        can't evaluate without the engine)."""
+        try:
+            return int(str(s).strip(), 0)
+        except (ValueError, TypeError):
+            return default
+
+    def _battler_anchor(self, battler: str) -> Tuple[int, int]:
+        """Frame-center for the given anim battler on the 240×160 canvas."""
+        P = self._move_preview
+        if (battler or "").strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER"):
+            return P.PLAYER_CX, P.PLAYER_CY
+        return P.ENEMY_CX, P.ENEMY_CY      # target / default
+
+    def _first_frame_for_tag(self, tag: str) -> Optional[QPixmap]:
+        sprite = self._sprites.get(tag)
+        if not sprite or not sprite.png_exists:
+            return None
+        frames = self._slice_frames(sprite, self._palette_for(sprite))
+        return frames[0] if frames else None
+
+    def _frame_for_tag(self, tag: str, idx: int) -> Optional[QPixmap]:
+        sprite = self._sprites.get(tag)
+        if not sprite or not sprite.png_exists:
+            return None
+        frames = self._slice_frames(sprite, self._palette_for(sprite))
+        if not frames:
+            return None
+        return frames[max(0, min(idx, len(frames) - 1))]
+
+    def _update_move_composite(self):
+        """Composite every sprite spawned from the start of the move's
+        script through the SELECTED timeline row, layered by subpriority,
+        anchored to its battler with best-effort x/y offset.  The selected
+        row's sprite (if any) shows its scrubbed frame; the rest show
+        frame 0.  Positions are approximate (the engine computes exact
+        motion in C) — this conveys what's on screen and how it layers."""
+        from PyQt6.QtGui import QPainter
+        timeline = self._cur_timeline
+        through = self._timeline.currentRow()
+        if through < 0:
+            through = len(timeline) - 1
+        layers = []          # (subpri, cx, cy, pixmap, tag)
+        names = []
+        for i, cmd in enumerate(timeline[:through + 1] if timeline else []):
+            if cmd.name != "createsprite":
+                continue
+            cs = parse_createsprite(cmd)
+            if not cs:
+                continue
+            tag = self._template_tags.get(cs.template, "")
+            # Selected row uses the scrubbed frame; others frame 0.
+            if i == through and tag and tag == self._layer_tag:
+                pix = self._frame_for_tag(tag, self._layer_idx)
+            else:
+                pix = self._first_frame_for_tag(tag)
+            if pix is None:
+                continue
+            acx, acy = self._battler_anchor(cs.battler)
+            xoff = self._int_or(cs.args[0]) if len(cs.args) >= 1 else 0
+            yoff = self._int_or(cs.args[1]) if len(cs.args) >= 2 else 0
+            subpri = self._int_or(cs.subpriority)
+            layers.append((subpri, acx + xoff, acy + yoff, pix, tag))
+            names.append(self._sprites[tag].display_name)
+
+        if not layers:
+            self._move_preview.set_anim_pixmap(None)
+            self._move_prev_lbl.setText(
+                "No sprite spawns up to here (effect may use tasks / mon "
+                "sprites).  Positions shown elsewhere are approximate.")
+            return
+
+        # Higher subpriority draws first (further back); lower on top.
+        layers.sort(key=lambda L: -L[0])
+        P = self._move_preview
+        canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
+        canvas.fill(QColor(0, 0, 0, 0))
+        painter = QPainter(canvas)
+        for _sp, cx, cy, pix, _tag in layers:
+            painter.drawPixmap(cx - pix.width() // 2,
+                               cy - pix.height() // 2, pix)
+        painter.end()
+        # The composite IS the full canvas, so center it on canvas center.
+        self._move_preview.set_anim_pixmap(canvas, P.CANVAS_W // 2,
+                                           P.CANVAS_H // 2)
+        uniq = []
+        for n in names:
+            if n not in uniq:
+                uniq.append(n)
         self._move_prev_lbl.setText(
-            "No dedicated sprite to preview (effect uses tasks / mon sprites).")
+            f"{len(layers)} sprite layer(s) through this step: "
+            + ", ".join(uniq[:6]) + ("…" if len(uniq) > 6 else ""))
+
+    # ── selected-sprite frame scrubber ────────────────────────────────
+
+    def _reset_layer_scrubber(self):
+        self._layer_timer.stop()
+        self._layer_tag = ""
+        self._layer_frames = []
+        self._layer_idx = 0
+        self._layer_slider.blockSignals(True)
+        self._layer_slider.setMaximum(0)
+        self._layer_slider.setValue(0)
+        self._layer_slider.setEnabled(False)
+        self._layer_slider.blockSignals(False)
+        self._layer_play.setEnabled(False)
+        self._layer_play.setText("▶")
+        self._layer_edit_btn.setEnabled(False)
+        self._layer_frame_lbl.setText("—")
+        self._layer_lbl.setText(
+            "Select a sprite-spawn row to inspect its frames.")
+
+    def _load_layer_scrubber(self, tag: str):
+        """Point the frame scrubber at the given sprite's frames."""
+        self._layer_timer.stop()
+        self._layer_play.setText("▶")
+        sprite = self._sprites.get(tag) if tag else None
+        frames = (self._slice_frames(sprite, self._palette_for(sprite))
+                  if sprite and sprite.png_exists else [])
+        if not frames:
+            self._reset_layer_scrubber()
+            return
+        self._layer_tag = tag
+        self._layer_frames = frames
+        self._layer_idx = 0
+        n = len(frames)
+        self._layer_slider.blockSignals(True)
+        self._layer_slider.setMaximum(n - 1)
+        self._layer_slider.setValue(0)
+        self._layer_slider.setEnabled(n > 1)
+        self._layer_slider.blockSignals(False)
+        self._layer_play.setEnabled(n > 1)
+        self._layer_edit_btn.setEnabled(True)
+        self._layer_frame_lbl.setText(f"1 / {n}")
+        exact = " (exact)" if tag in self._frame_sizes else " (approx)"
+        self._layer_lbl.setText(
+            f"<b>{sprite.display_name}</b>  ({tag}) — {n} frame(s){exact}")
+
+    def _on_layer_scrub(self, value: int):
+        self._layer_idx = value
+        n = len(self._layer_frames)
+        if n:
+            self._layer_frame_lbl.setText(f"{value + 1} / {n}")
+        self._update_move_composite()
+
+    def _toggle_layer_play(self):
+        if self._layer_timer.isActive():
+            self._layer_timer.stop()
+            self._layer_play.setText("▶")
+        elif len(self._layer_frames) > 1:
+            self._layer_timer.start()
+            self._layer_play.setText("⏸")
+
+    def _advance_layer_frame(self):
+        n = len(self._layer_frames)
+        if n <= 1:
+            self._layer_timer.stop()
+            return
+        self._layer_idx = (self._layer_idx + 1) % n
+        self._layer_slider.blockSignals(True)
+        self._layer_slider.setValue(self._layer_idx)
+        self._layer_slider.blockSignals(False)
+        self._layer_frame_lbl.setText(f"{self._layer_idx + 1} / {n}")
+        self._update_move_composite()
+
+    def _edit_selected_layer_sprite(self):
+        """Jump to the Sprites sub-tab and select this layer's sprite so
+        the user can edit its image + palette."""
+        if not self._layer_tag:
+            return
+        self._subtabs.setCurrentIndex(0)
+        self._select_sprite_by_tag(self._layer_tag)
+
+    # ── command editor dialog (add / edit any opcode) ─────────────────
+
+    # Display label -> opcode, for the command-type chooser.
+    _CMD_TYPES = [
+        ("Spawn sprite", "createsprite"),
+        ("Play sound (with pan)", "playsewithpan"),
+        ("Play sound", "playse"),
+        ("Wait / delay", "delay"),
+        ("Load sprite graphics", "loadspritegfx"),
+        ("Unload sprite graphics", "unloadspritegfx"),
+        ("Visual task", "createvisualtask"),
+        ("Wait for visuals to finish", "waitforvisualfinish"),
+        ("End animation", "end"),
+        ("Raw command…", "__raw__"),
+    ]
+
+    def _command_editor_dialog(self, label: str, cmd) -> Optional[str]:
+        """Add (``cmd=None``) or edit a single command.  Returns the new
+        command source string, or ``None`` if cancelled.
+
+        A command-type chooser drives a stacked set of field panels:
+        createsprite gets a real sprite picker + battler + layer + x/y;
+        sounds reuse the existing sound editor; everything else has a
+        focused panel, with a raw-text fallback for any opcode."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Command" if cmd else "Add Command")
+        dlg.setMinimumWidth(440)
+        outer = QVBoxLayout(dlg)
+
+        type_combo = QComboBox()
+        for disp, _op in self._CMD_TYPES:
+            type_combo.addItem(disp)
+        type_combo.wheelEvent = lambda e: e.ignore()
+        trow = QFormLayout()
+        trow.addRow("Command type:", type_combo)
+        outer.addLayout(trow)
+
+        stack = QStackedWidget()
+        outer.addWidget(stack)
+
+        # Map opcode -> (build_panel() -> (widget, getter)).
+        panels = {}
+
+        def add_panel(op, widget, getter):
+            idx = stack.addWidget(widget)
+            panels[op] = (idx, getter)
+
+        # — createsprite —
+        cs_w = QWidget()
+        cs_f = QFormLayout(cs_w)
+        cs_tpl = QComboBox()
+        cs_tpl.setEditable(True)
+        cs_tpl.addItems(sorted(self._template_tags.keys()))
+        cs_tpl.wheelEvent = lambda e: e.ignore()
+        cs_battler = QComboBox()
+        cs_battler.addItems(["ANIM_TARGET", "ANIM_ATTACKER",
+                             "ANIM_ATK_PARTNER", "ANIM_DEF_PARTNER"])
+        cs_battler.wheelEvent = lambda e: e.ignore()
+        cs_subpri = QSpinBox()
+        cs_subpri.setRange(0, 127)
+        cs_subpri.setValue(2)
+        cs_subpri.wheelEvent = lambda e: e.ignore()
+        cs_args = QLineEdit()
+        cs_args.setPlaceholderText("e.g.  20, 0, -16, 24, 20, 1")
+        cs_prev = QLabel()
+        cs_prev.setFixedHeight(40)
+        cs_prev.setStyleSheet("color:#7cc; font-size:10px;")
+
+        def _cs_preview():
+            tag = self._template_tags.get(cs_tpl.currentText().strip(), "")
+            if tag and tag in self._sprites:
+                cs_prev.setText(f"→ {self._sprites[tag].display_name}  ({tag})")
+            else:
+                cs_prev.setText("→ (template not recognised — raw is fine too)")
+        cs_tpl.currentTextChanged.connect(lambda _t: _cs_preview())
+        cs_f.addRow("Sprite template:", cs_tpl)
+        cs_f.addRow("Anchored to:", cs_battler)
+        cs_f.addRow("Layer (subpriority):", cs_subpri)
+        cs_f.addRow("Args (x, y, …):", cs_args)
+        cs_f.addRow("", cs_prev)
+
+        def cs_get():
+            tpl = cs_tpl.currentText().strip()
+            if not tpl:
+                return None
+            args = [a.strip() for a in cs_args.text().split(",") if a.strip()]
+            return format_createsprite(CreateSpriteCmd(
+                template=tpl, battler=cs_battler.currentText().strip(),
+                subpriority=str(cs_subpri.value()), args=args))
+        add_panel("createsprite", cs_w, cs_get)
+
+        # — loadspritegfx / unloadspritegfx (shared tag picker) —
+        def make_gfx_panel(op):
+            w = QWidget()
+            f = QFormLayout(w)
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.addItems(sorted(self._sprites.keys()))
+            combo.wheelEvent = lambda e: e.ignore()
+            f.addRow("Sprite tag:", combo)
+            return w, combo, (lambda: (f"{op} {combo.currentText().strip()}"
+                                       if combo.currentText().strip() else None))
+        lg_w, lg_combo, lg_get = make_gfx_panel("loadspritegfx")
+        add_panel("loadspritegfx", lg_w, lg_get)
+        ug_w, ug_combo, ug_get = make_gfx_panel("unloadspritegfx")
+        add_panel("unloadspritegfx", ug_w, ug_get)
+
+        # — createvisualtask —
+        vt_w = QWidget()
+        vt_f = QFormLayout(vt_w)
+        vt_addr = QLineEdit()
+        vt_addr.setPlaceholderText("AnimTask_…")
+        vt_pri = QSpinBox()
+        vt_pri.setRange(0, 15)
+        vt_pri.setValue(2)
+        vt_pri.wheelEvent = lambda e: e.ignore()
+        vt_args = QLineEdit()
+        vt_args.setPlaceholderText("optional args, comma-separated")
+        vt_f.addRow("Task function:", vt_addr)
+        vt_f.addRow("Priority:", vt_pri)
+        vt_f.addRow("Args:", vt_args)
+
+        def vt_get():
+            addr = vt_addr.text().strip()
+            if not addr:
+                return None
+            from core.battle_anim_script import CreateVisualTaskCmd
+            args = [a.strip() for a in vt_args.text().split(",") if a.strip()]
+            return format_createvisualtask(CreateVisualTaskCmd(
+                addr=addr, priority=str(vt_pri.value()), args=args))
+        add_panel("createvisualtask", vt_w, vt_get)
+
+        # — no-field control opcodes —
+        for op, msg in (("waitforvisualfinish",
+                         "Pauses the script until all visual tasks finish."),
+                        ("end", "Ends the move's animation.")):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            lbl = QLabel(msg)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color:#aaa;")
+            v.addWidget(lbl)
+            v.addStretch(1)
+            add_panel(op, w, (lambda o=op: o))
+
+        # — raw fallback —
+        raw_w = QWidget()
+        raw_f = QFormLayout(raw_w)
+        raw_edit = QLineEdit()
+        raw_edit.setPlaceholderText("opcode arg1, arg2, …")
+        raw_f.addRow("Raw command:", raw_edit)
+        add_panel("__raw__", raw_w, lambda: raw_edit.text().strip() or None)
+
+        # Sound + delay panels defer to their dedicated dialogs on accept
+        # (sound = SE picker with preview; delay = frames spinbox).  Show a
+        # small hint panel here so the chooser stays consistent.
+        for op, hint in (
+                ("playsewithpan", "Press OK to choose the sound effect (with preview)."),
+                ("playse", "Press OK to choose the sound effect (with preview)."),
+                ("delay", "Press OK to set the wait duration in frames.")):
+            w = QWidget()
+            v = QVBoxLayout(w)
+            lbl = QLabel(hint)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color:#aaa;")
+            v.addWidget(lbl)
+            v.addStretch(1)
+            add_panel(op, w, (lambda o=op: o))   # placeholder; real value via dedicated dlg
+
+        def _switch(disp_idx):
+            op = self._CMD_TYPES[disp_idx][1]
+            stack.setCurrentIndex(panels[op][0])
+        type_combo.currentIndexChanged.connect(_switch)
+
+        # Pre-fill from the command being edited.
+        sound_seed = cmd if (cmd and cmd.kind == KIND_SOUND) else None
+        delay_seed = cmd if (cmd and cmd.kind == KIND_DELAY) else None
+        if cmd:
+            op = cmd.name
+            disp_idx = next((i for i, (_d, o) in enumerate(self._CMD_TYPES)
+                             if o == op), None)
+            if op == "createsprite":
+                cs = parse_createsprite(cmd)
+                if cs:
+                    i = cs_tpl.findText(cs.template)
+                    if i >= 0:
+                        cs_tpl.setCurrentIndex(i)
+                    else:
+                        cs_tpl.setEditText(cs.template)
+                    j = cs_battler.findText(cs.battler)
+                    if j >= 0:
+                        cs_battler.setCurrentIndex(j)
+                    else:
+                        cs_battler.setEditText(cs.battler)
+                    cs_subpri.setValue(self._int_or(cs.subpriority, 2))
+                    cs_args.setText(", ".join(cs.args))
+            elif op in ("loadspritegfx", "unloadspritegfx"):
+                combo = lg_combo if op == "loadspritegfx" else ug_combo
+                if cmd.args:
+                    k = combo.findText(cmd.args[0])
+                    if k >= 0:
+                        combo.setCurrentIndex(k)
+                    else:
+                        combo.setEditText(cmd.args[0])
+            elif op == "createvisualtask":
+                t = parse_createvisualtask(cmd)
+                if t:
+                    vt_addr.setText(t.addr)
+                    vt_pri.setValue(self._int_or(t.priority, 2))
+                    vt_args.setText(", ".join(t.args))
+            elif op == "delay":
+                pass  # handled by the dedicated dialog on accept
+            elif op in ("playse", "playsewithpan"):
+                pass  # handled by the dedicated dialog on accept
+            elif disp_idx is None:
+                # Unknown opcode → raw editor seeded with the raw line.
+                disp_idx = len(self._CMD_TYPES) - 1
+                raw_edit.setText(cmd.raw)
+            if disp_idx is not None:
+                type_combo.setCurrentIndex(disp_idx)
+                _switch(disp_idx)
+        else:
+            type_combo.setCurrentIndex(0)
+            _switch(0)
+        _cs_preview()
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        outer.addWidget(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        op = self._CMD_TYPES[type_combo.currentIndex()][1]
+        # Sounds + delay defer to their dedicated dialogs (preview / spinbox).
+        if op in ("playse", "playsewithpan"):
+            seed = sound_seed
+            if seed is None:
+                # Build a minimal seed command of the right shape.
+                from core.battle_anim_script import Command
+                args = (["SE_SELECT", "SOUND_PAN_TARGET"]
+                        if op == "playsewithpan" else ["SE_SELECT"])
+                seed = Command(name=op, args=args, kind=KIND_SOUND)
+            return self._edit_sound_dialog(seed)
+        if op == "delay":
+            seed = delay_seed
+            if seed is None:
+                from core.battle_anim_script import Command
+                seed = Command(name="delay", args=["1"], kind=KIND_DELAY)
+            return self._edit_delay_dialog(seed)
+        getter = panels[op][1]
+        return getter()
 
     # ── save ─────────────────────────────────────────────────────────
 
@@ -1206,6 +1873,12 @@ class BattleAnimTab(QWidget):
                 with open(path, "w", encoding="utf-8", newline="\n") as f:
                     f.write(self._scripts_text)
                 self._scripts_dirty = False
+                # Clear per-move amber markers + refresh the live header.
+                self._dirty_moves.clear()
+                for i in range(self._move_list.count()):
+                    self._move_list.item(i).setBackground(QColor(0, 0, 0, 0))
+                if self._move_current:
+                    self._populate_timeline(self._move_current)
                 saved += 1
             except Exception as exc:
                 errors.append(f"battle-anim-script: write failed ({exc})")

@@ -240,6 +240,148 @@ def test_rewrite_script_command_missing_label_or_index():
     assert mod.rewrite_script_command(text, "Move_X", 99, "delay 1") is None
 
 
+# ───────────────────────────────────── structural edits (insert/del/move) ──
+
+_EDIT_SAMPLE = (
+    "Move_POUND:\n"
+    "\tloadspritegfx ANIM_TAG_IMPACT\n"          # idx 0
+    "\tplaysewithpan SE_M_POUND, SOUND_PAN_TARGET\n"  # idx 1
+    "\tdelay 5\n"                                 # idx 2
+    "\tend\n"                                     # idx 3
+)
+
+
+def _cmds(mod_, text, label):
+    """Re-parse a block's depth-0 command names for assertions."""
+    return [c.name for c in mod_.parse_scripts_text(text).get(label, [])]
+
+
+def test_insert_command_in_middle_shifts_rest_down():
+    out = mod.insert_script_command(
+        _EDIT_SAMPLE, "Move_POUND", 2, "createsprite gFoo, ANIM_TARGET, 2")
+    assert out is not None
+    names = _cmds(mod, out, "Move_POUND")
+    # New command became index 2; delay/end pushed down.
+    assert names == ["loadspritegfx", "playsewithpan",
+                     "createsprite", "delay", "end"]
+    # Indentation copied from the insertion point (one tab).
+    assert "\tcreatesprite gFoo, ANIM_TARGET, 2\n" in out
+
+
+def test_insert_command_at_end_appends():
+    out = mod.insert_script_command(
+        _EDIT_SAMPLE, "Move_POUND", 4, "nop")
+    names = _cmds(mod, out, "Move_POUND")
+    assert names[-1] == "nop"
+
+
+def test_insert_command_into_empty_block_uses_tab_indent():
+    text = "Move_EMPTY:\nMove_NEXT:\n\tend\n"
+    out = mod.insert_script_command(text, "Move_EMPTY", 0, "end")
+    assert "Move_EMPTY:\n\tend\n" in out
+    # Did not bleed into Move_NEXT.
+    assert _cmds(mod, out, "Move_NEXT") == ["end"]
+
+
+def test_insert_command_out_of_range_or_missing():
+    assert mod.insert_script_command(
+        _EDIT_SAMPLE, "Move_POUND", 99, "nop") is None
+    assert mod.insert_script_command(
+        _EDIT_SAMPLE, "Move_NOPE", 0, "nop") is None
+
+
+def test_delete_command_removes_only_that_line():
+    out = mod.delete_script_command(_EDIT_SAMPLE, "Move_POUND", 1)
+    names = _cmds(mod, out, "Move_POUND")
+    assert names == ["loadspritegfx", "delay", "end"]
+    assert "playsewithpan" not in out
+
+
+def test_delete_command_out_of_range_or_missing():
+    assert mod.delete_script_command(_EDIT_SAMPLE, "Move_POUND", 99) is None
+    assert mod.delete_script_command(_EDIT_SAMPLE, "Move_NOPE", 0) is None
+
+
+def test_move_command_down_swaps_with_next():
+    out = mod.move_script_command(_EDIT_SAMPLE, "Move_POUND", 1, +1)
+    names = _cmds(mod, out, "Move_POUND")
+    # playse (1) and delay (2) swap.
+    assert names == ["loadspritegfx", "delay", "playsewithpan", "end"]
+
+
+def test_move_command_up_swaps_with_prev():
+    out = mod.move_script_command(_EDIT_SAMPLE, "Move_POUND", 2, -1)
+    names = _cmds(mod, out, "Move_POUND")
+    assert names == ["loadspritegfx", "delay", "playsewithpan", "end"]
+
+
+def test_move_command_preserves_indentation_and_hops_comments():
+    text = (
+        "Move_X:\n"
+        "\tplayse SE_A\n"          # idx 0
+        "\t@ a comment between\n"
+        "\tdelay 7\n"              # idx 1
+        "\tend\n"                  # idx 2
+    )
+    out = mod.move_script_command(text, "Move_X", 0, +1)
+    names = _cmds(mod, out, "Move_X")
+    assert names == ["delay", "playse", "end"]
+    # Comment stayed where it was (command hopped over it).
+    assert "\t@ a comment between\n" in out
+    assert "\tdelay 7\n" in out and "\tplayse SE_A\n" in out
+
+
+def test_move_command_edges_and_bad_delta_return_none():
+    assert mod.move_script_command(_EDIT_SAMPLE, "Move_POUND", 0, -1) is None
+    assert mod.move_script_command(_EDIT_SAMPLE, "Move_POUND", 3, +1) is None
+    assert mod.move_script_command(_EDIT_SAMPLE, "Move_POUND", 1, 2) is None
+    assert mod.move_script_command(_EDIT_SAMPLE, "Move_NOPE", 0, +1) is None
+
+
+# ───────────────────────── structured createsprite / createvisualtask ──
+
+def test_parse_createsprite_splits_fields():
+    c = mod._parse_command_line(
+        "\tcreatesprite gEmberSpriteTemplate, ANIM_TARGET, 2, 20, 0, -16, 24, 20, 1")
+    cs = mod.parse_createsprite(c)
+    assert cs is not None
+    assert cs.template == "gEmberSpriteTemplate"
+    assert cs.battler == "ANIM_TARGET"
+    assert cs.subpriority == "2"
+    assert cs.args == ["20", "0", "-16", "24", "20", "1"]
+
+
+def test_format_createsprite_round_trips():
+    c = mod._parse_command_line(
+        "\tcreatesprite gBasicHitSplatSpriteTemplate, ANIM_ATTACKER, 2, -8, 0, ANIM_TARGET, 2")
+    cs = mod.parse_createsprite(c)
+    out = mod.format_createsprite(cs)
+    assert out == ("createsprite gBasicHitSplatSpriteTemplate, "
+                   "ANIM_ATTACKER, 2, -8, 0, ANIM_TARGET, 2")
+    # And re-parsing the formatted form yields the same structure.
+    cs2 = mod.parse_createsprite(mod._parse_command_line("\t" + out))
+    assert (cs2.template, cs2.battler, cs2.subpriority, cs2.args) == \
+           (cs.template, cs.battler, cs.subpriority, cs.args)
+
+
+def test_parse_createsprite_rejects_non_createsprite_or_short():
+    assert mod.parse_createsprite(
+        mod._parse_command_line("\tdelay 5")) is None
+    assert mod.parse_createsprite(
+        mod._parse_command_line("\tcreatesprite gFoo, ANIM_TARGET")) is None
+
+
+def test_parse_and_format_createvisualtask():
+    c = mod._parse_command_line(
+        "\tcreatevisualtask AnimTask_ShakeMon, 2, ANIM_TARGET, 3, 0, 6, 1")
+    t = mod.parse_createvisualtask(c)
+    assert t.addr == "AnimTask_ShakeMon"
+    assert t.priority == "2"
+    assert t.args == ["ANIM_TARGET", "3", "0", "6", "1"]
+    assert mod.format_createvisualtask(t) == (
+        "createvisualtask AnimTask_ShakeMon, 2, ANIM_TARGET, 3, 0, 6, 1")
+
+
 def test_resolve_timeline_cycle_guard(tmp_path):
     # A subroutine that calls itself must not hang.
     text = (

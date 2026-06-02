@@ -347,6 +347,182 @@ def rewrite_script_command(text: str, label: str, cmd_index: int,
     return None
 
 
+def _block_command_indices(lines: List[str], label: str):
+    """Locate script ``label``'s body in ``lines`` (keepends-split).
+
+    Returns ``(start, cmd_line_indices)`` where ``start`` is the index of
+    the first line after the label and ``cmd_line_indices`` is the list of
+    indices (into ``lines``) of each depth-0 COMMAND line in that block,
+    counted the SAME way the parser counts (skipping blanks / comments /
+    directives), in order.  The block ends at the next label or EOF.
+
+    Returns ``(None, [])`` when the label isn't found.  This is the shared
+    spine of every structural edit (insert / delete / move / rewrite) so
+    they all agree on what "command N of this script" means.
+    """
+    label_re = re.compile(r"^" + re.escape(label) + r":\s*$")
+    start = None
+    for i, ln in enumerate(lines):
+        if label_re.match(ln):
+            start = i + 1
+            break
+    if start is None:
+        return None, []
+    cmd_idx: List[int] = []
+    for i in range(start, len(lines)):
+        if _LABEL_RE.match(lines[i]):
+            break
+        if _parse_command_line(lines[i]) is not None:
+            cmd_idx.append(i)
+    return start, cmd_idx
+
+
+def _line_parts(ln: str):
+    """Split a source line into ``(indent, content, newline)`` so an edit
+    can swap the content while preserving the slot's indentation + EOL."""
+    stripped = ln.rstrip("\r\n")
+    newline = ln[len(stripped):]
+    indent = stripped[: len(stripped) - len(stripped.lstrip())]
+    return indent, stripped.strip(), newline
+
+
+def insert_script_command(text: str, label: str, cmd_index: int,
+                          new_command: str) -> Optional[str]:
+    """Return ``text`` with ``new_command`` inserted as the
+    ``cmd_index``-th command of script ``label``.
+
+    ``cmd_index`` is 0-based and ranges over ``[0, count]`` (where
+    ``count`` is the script's own depth-0 command count): inserting at
+    ``i`` makes the new command the i-th, pushing the old i-th and the
+    rest down; inserting at ``count`` appends after the last command.
+    Indentation is copied from the command at the insertion point (or the
+    last command when appending, or one tab in an empty block).
+
+    Only ever touches the script's OWN commands — inlined ``call``
+    subroutines are never editable — so a move's timeline edit can't
+    rewrite a shared sub-script.  Returns ``None`` (no write) when the
+    label is missing or the index is out of range.
+    """
+    lines = text.splitlines(keepends=True)
+    start, cmd_idx = _block_command_indices(lines, label)
+    if start is None:
+        return None
+    count = len(cmd_idx)
+    if not (0 <= cmd_index <= count):
+        return None
+    if count == 0:
+        indent, newline, insert_at = "\t", "\n", start
+    elif cmd_index < count:
+        indent, _c, newline = _line_parts(lines[cmd_idx[cmd_index]])
+        newline = newline or "\n"
+        insert_at = cmd_idx[cmd_index]
+    else:  # append after the last command
+        indent, _c, newline = _line_parts(lines[cmd_idx[-1]])
+        newline = newline or "\n"
+        insert_at = cmd_idx[-1] + 1
+    lines.insert(insert_at, f"{indent}{new_command}{newline}")
+    return "".join(lines)
+
+
+def delete_script_command(text: str, label: str,
+                          cmd_index: int) -> Optional[str]:
+    """Return ``text`` with the ``cmd_index``-th command of script
+    ``label`` removed entirely (the whole source line).
+
+    Same indexing as :func:`insert_script_command` / the parser.  Only the
+    script's own depth-0 commands are addressable.  Returns ``None`` when
+    the label or index can't be found.
+    """
+    lines = text.splitlines(keepends=True)
+    start, cmd_idx = _block_command_indices(lines, label)
+    if start is None or not (0 <= cmd_index < len(cmd_idx)):
+        return None
+    del lines[cmd_idx[cmd_index]]
+    return "".join(lines)
+
+
+def move_script_command(text: str, label: str, cmd_index: int,
+                        delta: int) -> Optional[str]:
+    """Return ``text`` with the ``cmd_index``-th command of script
+    ``label`` swapped with its neighbour ``delta`` positions away
+    (``-1`` = move up / earlier, ``+1`` = move down / later).
+
+    Only the command CONTENT is swapped; each slot keeps its own
+    indentation + EOL, and any comment / blank lines physically between
+    the two commands stay put (the command hops over them).  Same indexing
+    and own-commands-only rule as the other editors.  Returns ``None`` when
+    ``delta`` isn't ±1 or either index is out of range.
+    """
+    if delta not in (-1, 1):
+        return None
+    lines = text.splitlines(keepends=True)
+    start, cmd_idx = _block_command_indices(lines, label)
+    if start is None:
+        return None
+    j = cmd_index + delta
+    if not (0 <= cmd_index < len(cmd_idx)) or not (0 <= j < len(cmd_idx)):
+        return None
+    a, b = cmd_idx[cmd_index], cmd_idx[j]
+    ind_a, con_a, nl_a = _line_parts(lines[a])
+    ind_b, con_b, nl_b = _line_parts(lines[b])
+    lines[a] = f"{ind_a}{con_b}{nl_a}"
+    lines[b] = f"{ind_b}{con_a}{nl_b}"
+    return "".join(lines)
+
+
+# ──────────────────────────── structured createsprite / task editing ──
+# A createsprite/createvisualtask command's tokens have fixed leading
+# fields then a variable arg list; parsing them into named fields lets the
+# UI offer real per-field editors (which sprite, anchored to whom, layer
+# order, x/y offset) instead of raw text.
+
+@dataclass
+class CreateSpriteCmd:
+    """Parsed ``createsprite template, battler, subpriority, argv...``."""
+
+    template: str           # SpriteTemplate symbol, e.g. gEmberSpriteTemplate
+    battler: str            # ANIM_ATTACKER / ANIM_TARGET / ...
+    subpriority: str        # subpriority offset (layer order); may be expr
+    args: List[str] = field(default_factory=list)  # gBattleAnimArgs values
+
+
+def parse_createsprite(cmd: "Command") -> Optional[CreateSpriteCmd]:
+    """Structure a ``createsprite`` Command, or ``None`` if it isn't one /
+    is malformed (fewer than the 3 required leading fields)."""
+    if cmd.name != "createsprite" or len(cmd.args) < 3:
+        return None
+    return CreateSpriteCmd(
+        template=cmd.args[0], battler=cmd.args[1], subpriority=cmd.args[2],
+        args=list(cmd.args[3:]))
+
+
+def format_createsprite(cs: CreateSpriteCmd) -> str:
+    """Render a :class:`CreateSpriteCmd` back to a source command string."""
+    parts = [cs.template, cs.battler, cs.subpriority, *cs.args]
+    return "createsprite " + ", ".join(p.strip() for p in parts if p.strip())
+
+
+@dataclass
+class CreateVisualTaskCmd:
+    """Parsed ``createvisualtask addr, priority, argv...``."""
+
+    addr: str               # task function symbol, e.g. AnimTask_ShakeMon
+    priority: str
+    args: List[str] = field(default_factory=list)
+
+
+def parse_createvisualtask(cmd: "Command") -> Optional[CreateVisualTaskCmd]:
+    if cmd.name != "createvisualtask" or len(cmd.args) < 2:
+        return None
+    return CreateVisualTaskCmd(
+        addr=cmd.args[0], priority=cmd.args[1], args=list(cmd.args[2:]))
+
+
+def format_createvisualtask(t: CreateVisualTaskCmd) -> str:
+    parts = [t.addr, t.priority, *t.args]
+    return "createvisualtask " + ", ".join(p.strip() for p in parts if p.strip())
+
+
 def parse_sound_effects(root: str) -> List[str]:
     """Parse ``#define SE_*`` from ``include/constants/songs.h`` into an
     ordered list of sound-effect constant names (for the sound picker).
