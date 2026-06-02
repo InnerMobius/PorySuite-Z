@@ -62,6 +62,7 @@ from core.battle_anim_data import (
     parse_battle_anim_sprites, parse_anim_frame_sizes, parse_template_tags,
     parse_template_callbacks, classify_anim_callbacks,
     MOTION_STATIC_TARGET, MOTION_STATIC_ATTACKER, MOTION_ON_MON_POS,
+    MOTION_AT_TARGET, MOTION_AT_ATTACKER,
     MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET, MOTION_INVISIBLE,
     MOTION_UNKNOWN,
     BattleAnimSprite)
@@ -77,6 +78,8 @@ from core.battle_anim_script import (
 )
 from core.battle_anim_vm import (
     AnimSim, AnimContext, Battler, spawn as vm_spawn, is_ported as vm_is_ported,
+    new_sprite as vm_new_sprite, setup_static as vm_setup_static,
+    setup_linear as vm_setup_linear, setup_arc as vm_setup_arc,
     SIDE_PLAYER, SIDE_OPPONENT)
 from core.sprite_render import load_sprite_pixmap
 from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_BATTLE_ANIM
@@ -1783,14 +1786,46 @@ class BattleAnimTab(QWidget):
         # Per-spawn args feed the VM init (only the init reads them).
         self._anim_sim.ctx.args = [self._int_or(a) for a in cs.args]
         on_attacker = cs.battler.strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
-        sprite = vm_spawn(cb, self._anim_sim.ctx, tag=tag,
-                          subpriority=self._int_or(cs.subpriority),
-                          fallback_battler_is_attacker=on_attacker)
+        subpri = self._int_or(cs.subpriority)
+        if vm_is_ported(cb):
+            # Faithful hand-ported callback (exact motion).
+            sprite = vm_spawn(cb, self._anim_sim.ctx, tag=tag,
+                              subpriority=subpri,
+                              fallback_battler_is_attacker=on_attacker)
+        else:
+            # Unported: drive motion from the coarse archetype so it still
+            # animates (fly-to-target / arc / on-mon / static) instead of
+            # freezing.  Geometry (start/end/dur/flip) comes from the same
+            # archetype model the static composite uses.
+            arch, start, end, dur, vis, flip = self._layer_geometry(cs)
+            if not vis:
+                return
+            sprite = vm_new_sprite(tag=tag, subpriority=subpri)
+            sprite.x, sprite.y = start
+            if arch in (MOTION_ARC_TO_TARGET, MOTION_LINEAR_TO_TARGET):
+                # Move toward the target — but ONLY if the computed end is on
+                # the canvas.  A callback whose args don't match the standard
+                # layout (e.g. arg2 = speed, not an x-offset) could otherwise
+                # fling the sprite off-screen; fall back to static there.
+                if dur <= 0:
+                    dur = 20          # default travel time when args omit it
+                if -48 <= end[0] <= self._move_preview.CANVAS_W + 48 \
+                        and -48 <= end[1] <= self._move_preview.CANVAS_H + 48:
+                    if arch == MOTION_ARC_TO_TARGET:
+                        vm_setup_arc(sprite, end, dur)
+                    else:
+                        vm_setup_linear(sprite, end, dur)
+                else:
+                    vm_setup_static(sprite, 60)
+            else:
+                vm_setup_static(sprite, 60)   # static/at-mon/on-mon/unknown
+            sprite.flip = flip
         if sprite is not None:
-            # H-flip: attacker-anchored sprites mirror when the attacker is on
-            # the player side (matches the engine's side-dependent HFLIP).
-            sprite.flip = on_attacker and (self._play_direction == "player")
-        self._anim_sim.add(sprite)
+            if vm_is_ported(cb):
+                # H-flip: attacker-anchored sprites mirror when the attacker
+                # is on the player side (engine's side-dependent HFLIP).
+                sprite.flip = on_attacker and (self._play_direction == "player")
+            self._anim_sim.add(sprite)
 
     @staticmethod
     def _apply_flip(pix: QPixmap, flip: bool) -> QPixmap:
@@ -1925,6 +1960,10 @@ class BattleAnimTab(QWidget):
         if arch == MOTION_STATIC_TARGET:
             pos = (tgt[0] + xdir * (arg(0) + ex), tgt[1] + arg(1) + ey)
             return (arch, pos, pos, 0, True, False)
+        if arch == MOTION_AT_TARGET:        # raw target coord, no arg offset
+            return (arch, tgt, tgt, 0, True, False)
+        if arch == MOTION_AT_ATTACKER:      # raw attacker coord, no arg offset
+            return (arch, atk, atk, 0, True, player_attacks)
         # UNKNOWN → static at the createsprite's declared battler (best guess).
         on_attacker = cs.battler.strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
         anchor = atk if on_attacker else tgt

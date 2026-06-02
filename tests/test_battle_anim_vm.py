@@ -130,6 +130,56 @@ def test_fallback_sits_then_destroys():
     assert not s.alive      # destroyed after lifetime
 
 
+def test_setup_linear_travels_and_destroys():
+    ctx = _ctx()
+    s = vm.new_sprite(tag="x")
+    s.x, s.y = 72, 80
+    vm.setup_linear(s, (176, 40), 20)
+    xs = [s.render_x]
+    for _ in range(20):
+        if not s.alive:
+            break
+        s.step(ctx)
+        xs.append(s.render_x)
+    assert xs[-1] > xs[0] + 30, xs            # moved toward the dest
+    for _ in range(8):
+        if not s.alive:
+            break
+        s.step(ctx)
+    assert not s.alive                        # destroyed after arrival
+
+
+def test_setup_arc_rises_then_lands():
+    ctx = _ctx()
+    s = vm.new_sprite(tag="x")
+    s.x, s.y = 72, 80
+    vm.setup_arc(s, (176, 80), 20, height=30)
+    ys = []
+    for _ in range(20):
+        if not s.alive:
+            break
+        s.step(ctx)
+        ys.append(s.render_y)
+    # Peaks above the straight line (some y well above the 80 endpoints).
+    assert min(ys) < 70, ys
+    assert not s.alive or s.render_x > 150     # ends near the dest x
+
+
+def test_setup_static_holds_then_destroys():
+    ctx = _ctx()
+    s = vm.new_sprite(tag="x")
+    s.x, s.y = 100, 100
+    vm.setup_static(s, 5)
+    for _ in range(4):
+        s.step(ctx)
+    assert s.alive and s.render_x == 100      # held in place
+    for _ in range(4):
+        if not s.alive:
+            break
+        s.step(ctx)
+    assert not s.alive
+
+
 def test_animsim_steps_and_prunes():
     ctx = _ctx()
     sim = vm.AnimSim(ctx)

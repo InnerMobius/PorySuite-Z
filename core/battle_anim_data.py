@@ -343,6 +343,8 @@ def parse_template_tags(project_root: str) -> Dict[str, str]:
 
 MOTION_STATIC_TARGET = "static_target"      # sits at target + (arg0,arg1)
 MOTION_STATIC_ATTACKER = "static_attacker"  # sits at attacker + (arg0,arg1)
+MOTION_AT_TARGET = "at_target"              # sits ON the target (raw coord, no arg offset)
+MOTION_AT_ATTACKER = "at_attacker"          # sits ON the attacker (raw coord, no arg offset)
 MOTION_ON_MON_POS = "on_mon_pos"            # attacker if arg2==0 else target
 MOTION_LINEAR_TO_TARGET = "linear_to_target"  # attacker(arg0,1) → target(arg2,3), dur arg4
 MOTION_ARC_TO_TARGET = "arc_to_target"      # like linear but a parabolic toss
@@ -434,6 +436,17 @@ def _classify_callback_body(body: str) -> str:
         return MOTION_STATIC_ATTACKER
     if target_init and not attacker_init:
         return MOTION_STATIC_TARGET
+    # No InitSpritePos / translation — but it may set its position directly
+    # from a battler's coords (e.g. AnimAirCutterSlice: sprite->x =
+    # GetBattlerSpriteCoord(gBattleAnimTarget, ...)).  Those sit ON that mon
+    # with NO arg offset.  Prefer target (most "appear on the victim" hits).
+    sets_pos = ("sprite->x =" in body or "sprite->x=" in body
+                or "SetSpriteCoordsToAnim" in body)
+    if sets_pos:
+        if "gBattleAnimTarget" in body or "SetSpriteCoordsToAnimTargetCoords" in body:
+            return MOTION_AT_TARGET
+        if "gBattleAnimAttacker" in body or "SetSpriteCoordsToAnimAttackerCoords" in body:
+            return MOTION_AT_ATTACKER
     return MOTION_UNKNOWN
 
 

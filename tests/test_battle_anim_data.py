@@ -236,6 +236,11 @@ def test_classify_callback_body_heuristics():
     # Invisible utility sprite: hides itself at the top level (unconditional).
     inv = "{ sprite->invisible = TRUE; BeginNormalPaletteFade(x); }"
     assert mod._classify_callback_body(inv) == mod.MOTION_INVISIBLE
+    # Direct battler-coord assignment → sits ON that mon (no arg offset),
+    # like AnimAirCutterSlice (sprite->x = GetBattlerSpriteCoord(target,...)).
+    at_tgt = ("{ a = GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_X);"
+              " sprite->x = a; sprite->y = b; }")
+    assert mod._classify_callback_body(at_tgt) == mod.MOTION_AT_TARGET
     # Nothing recognisable.
     assert mod._classify_callback_body("{ sprite->data[0] = 5; }") == mod.MOTION_UNKNOWN
 

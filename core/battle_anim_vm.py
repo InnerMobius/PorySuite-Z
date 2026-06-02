@@ -319,6 +319,67 @@ def spawn(callback: str, ctx: AnimContext, *, tag: str = "",
     return s
 
 
+# ───────────────────────── archetype-driven motion (for unported cbs) ──
+# Callbacks we haven't hand-ported still have a coarse motion archetype from
+# the classifier (linear-to-target / arc / static / on-mon).  Rather than
+# leave them frozen, the UI builds a sprite with the matching motion using
+# these primitives — so a large fraction of moves animate without a bespoke
+# port.  (Hand-ported callbacks in CALLBACKS still take precedence.)
+
+def new_sprite(tag: str = "", subpriority: int = 0) -> Sprite:
+    return Sprite(tag=tag, subpriority=subpriority)
+
+
+def setup_static(s: Sprite, lifetime: int = 48) -> None:
+    """Sit in place for ``lifetime`` frames, then destroy."""
+    s.data[0] = max(1, lifetime)
+    s.callback6 = _destroy
+    s.callback = _wait_for_duration
+
+
+def setup_linear(s: Sprite, dest: tuple, dur: int) -> None:
+    """Travel from the sprite's current pos to ``dest`` over ``dur`` frames
+    (via the engine's real linear-translation primitive), then destroy."""
+    if dur <= 0 or (s.x, s.y) == tuple(dest):
+        setup_static(s, 24)
+        return
+    s.data[0] = dur
+    s.data[1] = s.x          # InitX
+    s.data[2] = int(dest[0])  # DestX
+    s.data[3] = s.y          # InitY
+    s.data[4] = int(dest[1])  # DestY
+    _init_linear_translation(s)
+    s.callback6 = _destroy
+    s.callback = _translate_linear_with_followup
+
+
+def _arc_step(s: Sprite, ctx: AnimContext) -> None:
+    if s.data[0] <= 0:
+        s.alive = False
+        return
+    total = s.data[1] or 1
+    frac = (total - s.data[0]) / total
+    sx, sy, dx, dy, h = s.data[2], s.data[3], s.data[4], s.data[5], s.data[6]
+    s.x = int(round(sx + (dx - sx) * frac))
+    s.y = int(round(sy + (dy - sy) * frac - math.sin(math.pi * frac) * h))
+    s.data[0] -= 1
+
+
+def setup_arc(s: Sprite, dest: tuple, dur: int, height: int = 26) -> None:
+    """Parabolic toss from the current pos to ``dest`` over ``dur`` frames."""
+    if dur <= 0 or (s.x, s.y) == tuple(dest):
+        setup_static(s, 24)
+        return
+    s.data[0] = dur            # frames remaining
+    s.data[1] = dur            # total
+    s.data[2] = s.x            # start x
+    s.data[3] = s.y            # start y
+    s.data[4] = int(dest[0])   # dest x
+    s.data[5] = int(dest[1])   # dest y
+    s.data[6] = height
+    s.callback = _arc_step
+
+
 class AnimSim:
     """Holds the live sprites for a playing animation + advances them."""
 
