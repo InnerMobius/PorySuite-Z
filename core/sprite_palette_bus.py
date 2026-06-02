@@ -24,6 +24,8 @@ Categories currently supported:
 * ``"icon_palette"`` — key ``"<0|1|2>"`` (the three shared Pokemon icon
   palettes in ``graphics/pokemon/icon_palettes/``). 16 RGB entries.
 * ``"overworld"`` — key ``"<palette_tag>"``. 16 RGB entries.
+* ``"battle_anim"`` — key ``"<ANIM_TAG_*>"`` (battle-animation sprite
+  palette). 16 RGB entries.
 
 Signal payload: ``palette_changed.emit(category, key)`` — subscribers
 should filter on category and (if caching) on key to avoid unnecessary
@@ -53,6 +55,7 @@ CAT_TRAINER_PIC = "trainer_pic"
 CAT_ITEM_ICON = "item_icon"
 CAT_ICON_PALETTE = "icon_palette"
 CAT_OVERWORLD = "overworld"
+CAT_BATTLE_ANIM = "battle_anim"  # key = ANIM_TAG_* const. 16 RGB entries.
 
 
 def _pokemon_key(species_const: str, kind: str) -> str:
@@ -240,6 +243,46 @@ class SpritePaletteBus(QObject):
 
     def get_overworld_palette(self, tag: str) -> Optional[List[Color]]:
         return self.get_palette(CAT_OVERWORLD, tag)
+
+    # ── Battle-animation sprite palette ──────────────────────────────
+
+    def set_battle_anim_palette(self, tag: str,
+                                colors: List[Color]) -> None:
+        """Push a battle-anim palette edit, keyed by its ``ANIM_TAG_*``."""
+        self.set_palette(CAT_BATTLE_ANIM, tag, colors)
+
+    def get_battle_anim_palette(self, tag: str) -> Optional[List[Color]]:
+        return self.get_palette(CAT_BATTLE_ANIM, tag)
+
+    def ensure_battle_anim_palette(self, tag: str,
+                                   pal_path: str) -> List[Color]:
+        """RAM-first, disk fallback for a battle-anim sprite palette.
+
+        Battle-anim palettes build to compressed ``.gbapal.lz`` but the
+        editable source is a ``.pal`` JASC sidecar (preferred) or the
+        ``.gbapal`` binary -- ``read_palette_pair`` resolves whichever is
+        current.  ``pal_path`` is the path the data layer resolved (may
+        be a ``.pal`` or a ``.gbapal``; normalised to ``.gbapal`` here so
+        the pair reader's sibling logic applies).
+
+        Returns a COPY (safe to mutate); empty list when the sprite has
+        no dedicated palette on disk (the caller then falls back to the
+        PNG's own embedded colour table).  A successful disk read seeds
+        the cache quietly (no signal -- nothing changed, we hydrated).
+        """
+        pal = self.get_palette(CAT_BATTLE_ANIM, tag)
+        if pal is not None:
+            return pal
+        if not pal_path:
+            return []
+        gbapal = pal_path
+        if gbapal.endswith(".pal"):
+            gbapal = gbapal[: -len(".pal")] + ".gbapal"
+        from core.overworld_palette_io import read_palette_pair
+        colors = read_palette_pair(gbapal) or []
+        if colors:
+            self._cache[(CAT_BATTLE_ANIM, tag)] = list(colors)
+        return list(colors)
 
 
 # ── Module-level singleton ──────────────────────────────────────────

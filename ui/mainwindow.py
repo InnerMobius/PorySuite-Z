@@ -251,6 +251,7 @@ from ui.trainer_class_editor import (
 )
 from ui.trainer_graphics_tab import TrainerGraphicsTab
 from ui.overworld_graphics_tab import OverworldGraphicsTab
+from ui.battle_anim_tab import BattleAnimTab
 from ui.pokedex_detail_panel import PokedexDetailPanel
 from ui.dex_description_edit import attach_dex_limit_ui
 from ui.moves_tab_widget import MovesTabWidget
@@ -508,6 +509,26 @@ QTabBar::tab:hover:!selected {
             )
         except Exception:
             self.overworld_gfx_tab_index = -1
+
+        # ── Battle Animations tab (top-level) ───────────────────────────────
+        try:
+            _ba_res = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "res", "images",
+            )
+            self.battle_anim_tab = BattleAnimTab(_ba_res)
+            self.battle_anim_tab.modified.connect(
+                lambda: (
+                    self.setWindowModified(True),
+                    self.sectionDirtyChanged.emit("battle_anim", True),
+                )
+            )
+            self.ui.mainTabs.addTab(self.battle_anim_tab, "Battle Anims")
+            self.battle_anim_tab_index = self.ui.mainTabs.indexOf(
+                self.battle_anim_tab
+            )
+        except Exception:
+            self.battle_anim_tab_index = -1
 
         # ── Config tab ───────────────────────────────────────────────────────
         self.config_tab = ConfigTabWidget(self.ui.tab_config)
@@ -1158,6 +1179,13 @@ QTabBar::tab:hover:!selected {
                 _ow_dir = str(self.project_info.get("dir", "") or "")
                 if _ow_dir:
                     self.overworld_graphics_tab.load(_ow_dir)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "battle_anim_tab") and self.project_info:
+                _ba_dir = str(self.project_info.get("dir", "") or "")
+                if _ba_dir:
+                    self.battle_anim_tab.load(_ba_dir)
         except Exception:
             pass
 
@@ -3918,6 +3946,11 @@ QTabBar::tab:hover:!selected {
                     self.overworld_graphics_tab.load(_project_dir)
             except Exception:
                 pass
+            try:
+                if hasattr(self, "battle_anim_tab"):
+                    self.battle_anim_tab.load(_project_dir)
+            except Exception:
+                pass
 
         # Enable Refresh, Open in EVENTide, and all Git menu actions now that a project is loaded
         if hasattr(self, "_refresh_action"):
@@ -4325,7 +4358,8 @@ QTabBar::tab:hover:!selected {
         # Clear every known section's dot indicator.
         for section in ("species", "pokedex", "items", "moves", "abilities",
                         "trainers", "starters", "encounters", "credits",
-                        "title", "sound", "overworld", "trainer_graphics"):
+                        "title", "sound", "overworld", "trainer_graphics",
+                        "battle_anim"):
             try:
                 self.sectionDirtyChanged.emit(section, False)
             except Exception:
@@ -9457,6 +9491,23 @@ QTabBar::tab:hover:!selected {
             import logging
             logging.getLogger(__name__).warning("_save_overworld_graphics: %s", exc)
 
+    def _save_battle_anims(self):
+        """Flush BattleAnimTab palette edits to .pal/.gbapal on disk."""
+        if not hasattr(self, "battle_anim_tab"):
+            return
+        if not self.battle_anim_tab.has_unsaved_changes():
+            return
+        try:
+            saved, errs = self.battle_anim_tab.flush_to_disk()
+            if errs:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "_save_battle_anims errors: %s", errs
+                )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("_save_battle_anims: %s", exc)
+
     def _on_trainer_rename_from_panel(self, old_const: str):
         """Handle rename_requested from TrainersTabWidget."""
         if not self.source_data or not old_const:
@@ -10126,6 +10177,10 @@ QTabBar::tab:hover:!selected {
             except Exception:
                 pass
             try:
+                self._save_battle_anims()
+            except Exception:
+                pass
+            try:
                 self.save_abilities_editor()
             except Exception:
                 pass
@@ -10222,6 +10277,10 @@ QTabBar::tab:hover:!selected {
                     pass
                 try:
                     self._save_overworld_graphics()
+                except Exception:
+                    pass
+                try:
+                    self._save_battle_anims()
                 except Exception:
                     pass
 

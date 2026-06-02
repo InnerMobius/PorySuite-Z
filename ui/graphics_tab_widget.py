@@ -384,6 +384,14 @@ class BattleScenePreview(QWidget):
         self._enemy_elevation = 0
         self._show_shadow = True
 
+        # Optional battle-animation sprite overlay (used by the Battle
+        # Anims tab; the Pokemon Graphics tab leaves this None so its
+        # behaviour is unchanged).  Drawn frame-CENTERED on
+        # (_anim_cx, _anim_cy), above the mons and below the textbox.
+        self._anim_pix: Optional[QPixmap] = None
+        self._anim_cx = self.ENEMY_CX
+        self._anim_cy = self.ENEMY_CY
+
         w = self.CANVAS_W * self.SCALE
         h = self.CANVAS_H * self.SCALE
         self.setFixedSize(w, h)
@@ -425,6 +433,19 @@ class BattleScenePreview(QWidget):
 
     def set_show_shadow(self, show: bool) -> None:
         self._show_shadow = bool(show)
+        self.update()
+
+    def set_anim_pixmap(self, pix: Optional[QPixmap],
+                        cx: Optional[int] = None,
+                        cy: Optional[int] = None) -> None:
+        """Overlay a battle-animation sprite frame, centered on (cx, cy)
+        in 240x160 canvas coords (defaults to the target battler spot).
+        Pass ``None`` to clear it."""
+        self._anim_pix = pix
+        if cx is not None:
+            self._anim_cx = int(cx)
+        if cy is not None:
+            self._anim_cy = int(cy)
         self.update()
 
     # -- paint ---------------------------------------------------------------
@@ -475,6 +496,18 @@ class BattleScenePreview(QWidget):
             frame_left = self.PLAYER_CX - bw // 2
             p.drawPixmap(frame_left * s, frame_top * s,
                          bw * s, bh * s, self._back_pix)
+
+        # Battle-animation sprite overlay (Battle Anims tab) — frame
+        # CENTERED on (_anim_cx, _anim_cy), above the mons, below the
+        # textbox.  Approximate placement: real animations move the
+        # sprite around via script, but a centered overlay conveys
+        # "this effect plays on the target" for the editor preview.
+        if self._anim_pix and not self._anim_pix.isNull():
+            aw = self._anim_pix.width()
+            ah = self._anim_pix.height()
+            ax = (self._anim_cx - aw // 2) * s
+            ay = (self._anim_cy - ah // 2) * s
+            p.drawPixmap(ax, ay, aw * s, ah * s, self._anim_pix)
 
         # Textbox overlay at the bottom
         if self._textbox and not self._textbox.isNull():

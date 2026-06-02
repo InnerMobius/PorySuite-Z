@@ -159,6 +159,7 @@ class UnifiedMainWindow(QMainWindow):
             "title": "settings",
             "sound": "sound",
             "overworld": "overworld",
+            "battle_anim": "battle_anim",
             "trainer_graphics": "trainers",
             "events":    "events",
             "maps":      "maps",
@@ -235,6 +236,7 @@ class UnifiedMainWindow(QMainWindow):
             ("trainers",   "Trainers"),
             ("starters",   "Starters"),
             ("overworld",  "Overworld Graphics"),
+            ("battle_anim", "Battle Animations"),
             ("credits",    "Credits"),
             ("sound",      "Sound Editor"),
         ]
@@ -436,6 +438,7 @@ class UnifiedMainWindow(QMainWindow):
             ("pokemon", "Pokemon"), ("pokedex", "Pokedex"), ("moves", "Moves"),
             ("items", "Items"), ("trainers", "Trainers"), ("starters", "Starters"),
             ("overworld", "Overworld Graphics"),
+            ("battle_anim", "Battle Animations"),
         ]:
             act = QAction(label, self)
             act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
@@ -679,6 +682,12 @@ class UnifiedMainWindow(QMainWindow):
             ow_widget = porysuite_main.overworld_graphics_tab
             idx = self.stack.addWidget(ow_widget)
             self._page_indices["overworld"] = idx
+
+        # ── Battle Animations (standalone page pulled from MainWindow) ──────
+        if hasattr(porysuite_main, "battle_anim_tab"):
+            ba_widget = porysuite_main.battle_anim_tab
+            idx = self.stack.addWidget(ba_widget)
+            self._page_indices["battle_anim"] = idx
 
         # ── Credits editor (standalone page) ─────────────────────────────────
         try:
@@ -926,6 +935,17 @@ class UnifiedMainWindow(QMainWindow):
                 _eet_mod._open_in_sound_editor_cb = self._sound_open_song
                 _eet_mod._stop_preview_cb = self._sound_stop_preview
             _eet_mod._open_ow_sprite_cb = self._open_ow_sprite
+        except Exception:
+            pass
+
+        # ── Sound Editor ↔ Battle Anims integration ─────────────────────────
+        # The Battle Anims timeline sound-edit dialog previews SE_* the same
+        # way EVENTide's playse ▶ does — through the Sound Editor.
+        try:
+            import ui.battle_anim_tab as _ba_mod
+            if hasattr(self, '_sound_editor'):
+                _ba_mod._preview_sound_cb = self._sound_preview_song
+                _ba_mod._stop_sound_cb = self._sound_stop_preview
         except Exception:
             pass
 
