@@ -27,8 +27,26 @@ amber palette groupbox frame (Pattern C) both track ``_palette_dirty``.
 from __future__ import annotations
 
 import os
+import logging
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+
+# File logger — battle-anim playback runs on a timer in the live app where a
+# crash leaves no console output, so progress is written to battle_anim.log
+# (next to the other module logs) to make any hard crash diagnosable.
+_log = logging.getLogger("BattleAnim")
+if not _log.handlers:
+    try:
+        _h = logging.FileHandler(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "battle_anim.log"),
+            mode="a", encoding="utf-8")
+        _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        _log.addHandler(_h)
+        _log.setLevel(logging.DEBUG)
+        _log.propagate = False
+    except OSError:
+        pass
 
 from PyQt6.QtCore import Qt, QObject, QEvent, QTimer, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPixmap
@@ -230,9 +248,11 @@ class BattleAnimTab(QWidget):
         # cycling each live layer's frames — an approximate dry-run of the
         # move (real motion/lifetimes are computed by the engine in C).
         self._playing = False
+        self._in_play_step = False  # re-entrancy guard (sound cb can pump events)
         self._play_idx = 0
         self._play_wait = 0        # ticks remaining on the current delay
         self._play_tick = 0
+        self._last_sound_tick = -100   # throttle rapid/overlapping sound previews
         self._play_layers: list = []   # [tag, cx, cy, subpri, frame_idx]
         self._play_frame_cache: Dict[str, List[QPixmap]] = {}  # pre-baked at start
         self._play_direction = "player"  # "player" = player attacks; "enemy" = enemy attacks
@@ -264,6 +284,10 @@ class BattleAnimTab(QWidget):
         outer.addWidget(self._subtabs)
         self._subtabs.addTab(self._build_sprites_tab(), "Sprites")
         self._subtabs.addTab(self._build_move_anim_tab(), "Move Animations")
+        # Stop whole-move playback when the user leaves the Move Animations
+        # sub-tab, so the timer never runs against a hidden / stale view.
+        self._subtabs.currentChanged.connect(
+            lambda _i: self._stop_play_move())
 
     def _build_move_anim_tab(self) -> QWidget:
         page = QWidget()
@@ -1529,31 +1553,58 @@ class BattleAnimTab(QWidget):
 
     def _stop_play_move(self):
         """Stop playback and reset the button label."""
+        was_playing = self._playing
         self._play_timer.stop()
         self._playing = False
         self._play_layers = []
         self._tl_play_move_btn.setText("▶  Play Move")
         # Reset preview back to the static composite for the current row.
+        # Guard against re-entrancy from the composite touching widgets.
+        if was_playing:
+            _log.debug("playback stopped at idx=%s tick=%s",
+                       self._play_idx, self._play_tick)
         self._update_move_composite()
+
+    def hideEvent(self, ev):
+        """Stop the playback timer whenever the tab is hidden (project
+        close, window switch) so it never fires against a dead view."""
+        self._stop_play_move()
+        super().hideEvent(ev)
 
     def _play_step(self):
         """Advance one 60-fps tick of the animation playback.
 
-        Consumes timeline commands greedily (multiple non-delay commands in a
-        row all fire the same tick) until hitting a ``delay N`` (which burns
-        N ticks), ``end``/``return`` (stop), or the end of the timeline.
-        Sounds fire through the SE callback.  Sprite layers accumulate; each
-        live layer's frame cycles every 4 ticks (~15 fps) using pre-baked
-        frames — no disk access during playback.
-        Wrapped in try/except so any Python error stops the timer cleanly
-        rather than crashing the whole app.
+        Re-entrancy guarded (the sound callback can pump the Qt event loop,
+        which would otherwise let the timer fire this slot again mid-tick and
+        corrupt the layer list — a likely live-only crash).  Wrapped in
+        try/except with a logged traceback so a Python error stops the timer
+        cleanly instead of taking down the app.
         """
+        if self._in_play_step:
+            return
+        self._in_play_step = True
         try:
             self._play_step_inner()
         except Exception:
-            import traceback as _tb
-            _tb.print_exc()
+            _log.exception("play_step crashed at idx=%s tick=%s",
+                           getattr(self, "_play_idx", "?"),
+                           getattr(self, "_play_tick", "?"))
             self._stop_play_move()
+        finally:
+            self._in_play_step = False
+
+    def _fire_play_sound(self, se: str):
+        """Fire a timeline sound during playback, throttled + guarded so a
+        burst of sounds can't overwhelm / crash the audio backend."""
+        if _preview_sound_cb is None or not se:
+            return
+        if self._play_tick - self._last_sound_tick < 3:
+            return   # throttle overlapping previews (~20/sec max)
+        self._last_sound_tick = self._play_tick
+        try:
+            _preview_sound_cb(se)
+        except Exception:
+            _log.exception("sound preview failed for %s", se)
 
     def _play_step_inner(self):
         timeline = self._cur_timeline
@@ -1608,21 +1659,29 @@ class BattleAnimTab(QWidget):
                 if cs:
                     tag = self._template_tags.get(cs.template, "")
                     if tag and tag in self._play_frame_cache:
-                        arch, start, end, dur, vis = self._layer_geometry(cs)
+                        arch, start, end, dur, vis, flip = self._layer_geometry(cs)
                         if vis:
                             subpri = self._int_or(cs.subpriority)
-                            # [tag, start, end, dur, spawn_tick, frame_idx, arch, subpri]
+                            # [tag,start,end,dur,spawn,frame_idx,arch,subpri,flip]
                             self._play_layers.append(
                                 [tag, start, end, dur, self._play_tick, 0,
-                                 arch, subpri])
+                                 arch, subpri, flip])
 
             if cmd.kind == KIND_SOUND and cmd.args:
-                if _preview_sound_cb is not None:
-                    _preview_sound_cb(cmd.args[0])
+                self._fire_play_sound(cmd.args[0])
 
         # Fell off the end without end/return — stop.
         self._render_play_composite()
         self._stop_play_move()
+
+    @staticmethod
+    def _apply_flip(pix: QPixmap, flip: bool) -> QPixmap:
+        """Return a horizontally-mirrored copy when ``flip`` (side-dependent
+        ST_OAM_HFLIP), else the pixmap unchanged."""
+        if not flip:
+            return pix
+        from PyQt6.QtGui import QTransform
+        return pix.transformed(QTransform().scale(-1, 1))
 
     def _render_play_composite(self):
         """Paint the current _play_layers onto the battle preview, each at
@@ -1637,11 +1696,12 @@ class BattleAnimTab(QWidget):
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
         for L in sorted(self._play_layers, key=lambda L: -L[7]):  # subpri
-            tag, start, end, dur, spawn, fidx, arch, _sp = L
+            tag, start, end, dur, spawn, fidx, arch, _sp, flip = L
             frames = self._play_frame_cache.get(tag, [])
             if not frames:
                 continue
-            pix = frames[max(0, min(fidx, len(frames) - 1))]
+            pix = self._apply_flip(
+                frames[max(0, min(fidx, len(frames) - 1))], flip)
             cx, cy = self._interp_pos(start, end, dur, self._play_tick - spawn, arch)
             painter.drawPixmap(cx - pix.width() // 2,
                                cy - pix.height() // 2, pix)
@@ -1692,15 +1752,25 @@ class BattleAnimTab(QWidget):
         cb = self._tpl_callbacks.get(template, "")
         return self._callback_arch.get(cb, MOTION_UNKNOWN)
 
+    # A few callbacks add a fixed pixel offset beyond the args (read from
+    # source).  {callback: (dx_toward_target, dy)} — dx is signed toward the
+    # target (matching the engine's side-dependent x handling).
+    _CALLBACK_EXTRA_OFFSET = {
+        "AnimCurseNail": (24, 0),   # nail sits 24px out from the attacker
+    }
+
     def _layer_geometry(self, cs):
         """Resolve a createsprite into ``(archetype, start_xy, end_xy,
-        duration, visible)`` using the sprite callback's motion archetype +
-        direction-aware battler anchors.
+        duration, visible, flip)`` using the sprite callback's motion
+        archetype + direction-aware battler anchors.
 
         Grounded in the engine's shared helpers: ``+arg0`` x-offset points
         from attacker toward target (SetAnimSpriteInitialXOffset); the
         common callbacks anchor at attacker/target and either sit still,
         ride to the target (arg2/arg3 end-offset over arg4 frames), or arc.
+        ``flip`` mirrors the sprite horizontally — attacker-anchored sprites
+        are H-flipped when the attacker is on the player side (back sprite),
+        matching the engine's side-dependent ST_OAM_HFLIP (e.g. Curse nail).
         Positions are approximate — the long tail of bespoke callbacks falls
         back to a static placement at the declared battler.
         """
@@ -1711,28 +1781,33 @@ class BattleAnimTab(QWidget):
         def arg(i):
             return a[i] if i < len(a) else 0
 
+        cb = self._tpl_callbacks.get(cs.template, "")
+        ex, ey = self._CALLBACK_EXTRA_OFFSET.get(cb, (0, 0))
+        player_attacks = (self._play_direction == "player")
+
         arch = self._archetype_for_template(cs.template)
         if arch == MOTION_INVISIBLE:
-            return (arch, (0, 0), (0, 0), 0, False)
+            return (arch, (0, 0), (0, 0), 0, False, False)
         if arch in (MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET):
-            start = (atk[0] + xdir * arg(0), atk[1] + arg(1))
+            start = (atk[0] + xdir * (arg(0) + ex), atk[1] + arg(1) + ey)
             end = (tgt[0] + xdir * arg(2), tgt[1] + arg(3))
-            return (arch, start, end, max(1, arg(4)), True)
+            return (arch, start, end, max(1, arg(4)), True, player_attacks)
         if arch == MOTION_ON_MON_POS:
-            anchor = atk if arg(2) == 0 else tgt
-            pos = (anchor[0] + xdir * arg(0), anchor[1] + arg(1))
-            return (arch, pos, pos, 0, True)
+            on_attacker = (arg(2) == 0)
+            anchor = atk if on_attacker else tgt
+            pos = (anchor[0] + xdir * (arg(0) + ex), anchor[1] + arg(1) + ey)
+            return (arch, pos, pos, 0, True, on_attacker and player_attacks)
         if arch == MOTION_STATIC_ATTACKER:
-            pos = (atk[0] + xdir * arg(0), atk[1] + arg(1))
-            return (arch, pos, pos, 0, True)
+            pos = (atk[0] + xdir * (arg(0) + ex), atk[1] + arg(1) + ey)
+            return (arch, pos, pos, 0, True, player_attacks)
         if arch == MOTION_STATIC_TARGET:
-            pos = (tgt[0] + xdir * arg(0), tgt[1] + arg(1))
-            return (arch, pos, pos, 0, True)
+            pos = (tgt[0] + xdir * (arg(0) + ex), tgt[1] + arg(1) + ey)
+            return (arch, pos, pos, 0, True, False)
         # UNKNOWN → static at the createsprite's declared battler (best guess).
-        anchor = (atk if cs.battler.strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
-                  else tgt)
-        pos = (anchor[0] + xdir * arg(0), anchor[1] + arg(1))
-        return (MOTION_UNKNOWN, pos, pos, 0, True)
+        on_attacker = cs.battler.strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
+        anchor = atk if on_attacker else tgt
+        pos = (anchor[0] + xdir * (arg(0) + ex), anchor[1] + arg(1) + ey)
+        return (MOTION_UNKNOWN, pos, pos, 0, True, on_attacker and player_attacks)
 
     def _interp_pos(self, start, end, dur, t, arch):
         """Interpolated position at tick ``t`` into a moving layer's life
@@ -1788,7 +1863,7 @@ class BattleAnimTab(QWidget):
             if not cs:
                 continue
             tag = self._template_tags.get(cs.template, "")
-            arch, start, end, dur, vis = self._layer_geometry(cs)
+            arch, start, end, dur, vis, flip = self._layer_geometry(cs)
             if not vis:
                 n_hidden += 1
                 continue
@@ -1799,6 +1874,7 @@ class BattleAnimTab(QWidget):
                 pix = self._first_frame_for_tag(tag)
             if pix is None:
                 continue
+            pix = self._apply_flip(pix, flip)
             # Representative position: impact (end) for moving sprites,
             # resting place for static ones.
             x, y = end if dur > 0 else start
