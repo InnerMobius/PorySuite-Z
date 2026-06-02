@@ -199,10 +199,41 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
     def test_not_installed_on_vanilla(self):
         self.assertFalse(patch.is_engine_installed(self.tmp))
 
-    def test_install_returns_success_on_vanilla(self):
+    def test_install_succeeds_on_vanilla_but_skips_npctakestep_patch(self):
+        # Vanilla pokefirered has no free-pixel-movement infrastructure
+        # (no gPlayerAvatar.pixelX field, no FreeStepNpcXBlocked function).
+        # The NpcTakeStep patch uses gPlayerAvatar.pixelX, which would
+        # break the vanilla build with "no field 'pixelX' in struct
+        # PlayerAvatar".  Installer MUST silently skip the NpcTakeStep
+        # patch in this case — vanilla doesn't need the pause feature
+        # anyway because tile-locked movement already prevents the
+        # softlock this fixes.
         ok, _msgs = patch.ensure_npc_pause_engine_support(self.tmp)
+        # Installer succeeded (silent no-op for the NpcTakeStep patch).
         self.assertTrue(ok)
-        self.assertTrue(patch.is_engine_installed(self.tmp))
+        # But is_engine_installed reports False — the sentinel is NOT
+        # present in event_object_movement.c because we skipped the
+        # patch.  This is correct behaviour.
+        self.assertFalse(patch.is_engine_installed(self.tmp))
+        # And the file is BYTE-IDENTICAL to vanilla — the NpcTakeStep
+        # body is unchanged.
+        with open(
+            os.path.join(self.tmp, "src", "event_object_movement.c"),
+            encoding="utf-8",
+        ) as f:
+            patched = f.read()
+        with open(
+            os.path.join(
+                _VANILLA_ROOT, "src", "event_object_movement.c"),
+            encoding="utf-8",
+        ) as f:
+            vanilla = f.read()
+        # The footprint engine's own patches WILL have landed (footprint
+        # engine is vanilla-compatible by design), so the files won't be
+        # byte-identical.  But the NpcTakeStep body MUST be the vanilla
+        # one with no PORYSUITE-NPCPAUSE markers.
+        self.assertNotIn("PORYSUITE-NPCPAUSE pause-step", patched)
+        self.assertIn(patch._VANILLA_NPCTAKESTEP_BODY, patched)
 
     # ── NpcTakeStep — vanilla install ────────────────────────────
 
@@ -219,6 +250,8 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
         )
 
     def test_install_patches_vanilla_npctakestep(self):
+        # Free-pixel-movement file present → NpcTakeStep patch lands.
+        _write_synthetic_field_player(self.tmp)
         ok, _msgs = patch.ensure_npc_pause_engine_support(self.tmp)
         self.assertTrue(ok)
         with open(
@@ -248,6 +281,7 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
         )
 
     def test_install_is_idempotent(self):
+        _write_synthetic_field_player(self.tmp)
         patch.ensure_npc_pause_engine_support(self.tmp)
         path = os.path.join(self.tmp, "src", "event_object_movement.c")
         with open(path, encoding="utf-8") as f:
@@ -266,6 +300,7 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
 
     def test_install_only_inserts_one_pause_block_on_rerun(self):
         # Triple-check the patch doesn't accidentally stack duplicates.
+        _write_synthetic_field_player(self.tmp)
         patch.ensure_npc_pause_engine_support(self.tmp)
         patch.ensure_npc_pause_engine_support(self.tmp)
         patch.ensure_npc_pause_engine_support(self.tmp)
@@ -279,9 +314,50 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
             "pause-step block was stacked across re-runs",
         )
 
+    def test_vanilla_project_with_no_field_player_file_skips_patch(self):
+        # Absolute vanilla case: no field_player_avatar.c at all
+        # (extremely cut-down test project).  Installer must succeed
+        # and the NpcTakeStep body must be unchanged.
+        path = os.path.join(self.tmp, "src", "field_player_avatar.c")
+        if os.path.exists(path):
+            os.remove(path)
+        ok, _msgs = patch.ensure_npc_pause_engine_support(self.tmp)
+        self.assertTrue(ok)
+        with open(
+            os.path.join(self.tmp, "src", "event_object_movement.c"),
+            encoding="utf-8",
+        ) as f:
+            text = f.read()
+        self.assertNotIn("PORYSUITE-NPCPAUSE pause-step", text)
+        self.assertIn(patch._VANILLA_NPCTAKESTEP_BODY, text)
+
+    def test_vanilla_field_player_present_still_skips_patch(self):
+        # field_player_avatar.c is present but VANILLA (no free-pixel-
+        # movement symbols).  Still should skip the patch.
+        vanilla_player_path = os.path.join(
+            _VANILLA_ROOT, "src", "field_player_avatar.c")
+        if os.path.exists(vanilla_player_path):
+            dst = os.path.join(self.tmp, "src", "field_player_avatar.c")
+            shutil.copy2(vanilla_player_path, dst)
+            ok, _msgs = patch.ensure_npc_pause_engine_support(self.tmp)
+            self.assertTrue(ok)
+            with open(
+                os.path.join(
+                    self.tmp, "src", "event_object_movement.c"),
+                encoding="utf-8",
+            ) as f:
+                text = f.read()
+            self.assertNotIn("PORYSUITE-NPCPAUSE pause-step", text)
+            self.assertIn(patch._VANILLA_NPCTAKESTEP_BODY, text)
+
     # ── NpcTakeStep — legacy 'Step 2.13' hand-edit upgrade ────────
 
     def test_legacy_step213_block_gets_replaced(self):
+        # The legacy 'Step 2.13' hand-edit only exists on projects with
+        # free-pixel-movement (it's a precursor to the pause feature
+        # users like InnerMobius hand-rolled before the patcher).  Add
+        # the synthetic field_player_avatar.c so the gate lets us in.
+        _write_synthetic_field_player(self.tmp)
         # Stuff a legacy hand-edit into the temp NpcTakeStep so the
         # patcher's upgrade branch fires.
         path = os.path.join(self.tmp, "src", "event_object_movement.c")
@@ -328,6 +404,10 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
     # ── NpcTakeStep — refusal on unrecognised hand-edit ──────────
 
     def test_refuses_when_npctakestep_modified_beyond_recognition(self):
+        # Refusal only fires when the patcher actually tries to install
+        # — gated on free-pixel-movement being present.  Add the
+        # synthetic field_player_avatar.c so the gate lets us in.
+        _write_synthetic_field_player(self.tmp)
         path = os.path.join(self.tmp, "src", "event_object_movement.c")
         with open(path, encoding="utf-8") as f:
             text = f.read()

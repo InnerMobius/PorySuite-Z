@@ -346,6 +346,46 @@ def is_engine_installed(project_root: str) -> bool:
         return False
 
 
+def _project_has_free_pixel_movement(project_root: str) -> bool:
+    """Probe whether the project uses a free-pixel-movement system.
+
+    Vanilla pokefirered's player avatar is tile-locked: ``gPlayerAvatar``
+    has no pixel-level position fields, and there's no ``FreeStepNpcXBlocked``
+    function.  Projects that mod in a free-pixel movement system (the
+    pattern the NPC pause feature is built for) add EITHER:
+
+      * ``gPlayerAvatar.pixelX`` / ``pixelY`` fields on the PlayerAvatar
+        struct, AND
+      * ``FreeStepNpcXBlocked(s8 dx)`` / ``FreeStepNpcYBlocked(s8 dy)``
+        helper functions called from the player's pixel-step routine.
+
+    The NpcTakeStep patch this module installs uses
+    ``gPlayerAvatar.pixelX`` to compute the player's HEAD tile, which
+    breaks the build on any vanilla project (struct field doesn't
+    exist).  This gate keeps the patcher a silent no-op for vanilla
+    pokefirered users — they don't NEED the pause feature anyway,
+    because vanilla tile-locked movement already blocks two object
+    events from occupying the same tile.
+
+    Probe: look for ``FreeStepNpcXBlocked`` definition in
+    ``src/field_player_avatar.c``.  Cheap, reliable, doesn't require
+    parsing the PlayerAvatar struct.
+    """
+    path = os.path.join(project_root, _PLAYER_C_REL)
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return False
+    # Either signature is enough.  Both is the standard pattern.
+    return (
+        "FreeStepNpcXBlocked(s8 dx)" in text
+        or "gPlayerAvatar.pixelX" in text
+    )
+
+
 def ensure_npc_pause_engine_support(
     project_root: str,
 ) -> Tuple[bool, List[str]]:
@@ -358,6 +398,16 @@ def ensure_npc_pause_engine_support(
     delegates to ``core.footprint_engine_patch.ensure_footprint_engine_support``
     first; if that fails the NPC pause patches are skipped so a partial
     install never lands.
+
+    **Vanilla pokefirered users get a silent no-op for the NpcTakeStep
+    edit.**  The pause block uses ``gPlayerAvatar.pixelX``/``pixelY``
+    which only exist on free-pixel-movement mod projects (Zeldamon-style
+    overhauls); installing it on a vanilla project would break the
+    build with "no field 'pixelX' in struct PlayerAvatar".  The probe
+    in ``_project_has_free_pixel_movement`` gates the install.  Vanilla
+    projects don't need the pause feature anyway: their tile-locked
+    movement already prevents two object events from occupying the
+    same tile, so the softlock this patch fixes can't happen there.
 
     Returns ``(success, messages)`` -- ``messages`` lists touched files
     on a fresh install and is empty on a no-op re-run.
@@ -378,10 +428,21 @@ def ensure_npc_pause_engine_support(
         for m in fp_msgs:
             messages.append(f"(prereq) {m}")
 
-        npctake_msg = _patch_npctakestep(project_root)
-        if npctake_msg:
-            messages.append(npctake_msg)
+        # Gate the NpcTakeStep patch on free-pixel-movement detection.
+        # Vanilla pokefirered has no pixelX/pixelY fields; installing
+        # the patch breaks the build.  Vanilla users don't need the
+        # feature either — tile-locked movement already blocks the
+        # softlock this fixes.
+        if _project_has_free_pixel_movement(project_root):
+            npctake_msg = _patch_npctakestep(project_root)
+            if npctake_msg:
+                messages.append(npctake_msg)
+        # else: silent no-op.  Vanilla project, nothing to do.
 
+        # The escape-pass patch in field_player_avatar.c is already
+        # gated by _patch_free_step_blocked itself (which silently
+        # no-ops when the file is missing or has no FreeStepNpc*Blocked
+        # functions).
         escape_msg = _patch_free_step_blocked(project_root)
         if escape_msg:
             messages.append(escape_msg)
