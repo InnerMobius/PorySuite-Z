@@ -371,6 +371,60 @@ def test_parse_createsprite_rejects_non_createsprite_or_short():
         mod._parse_command_line("\tcreatesprite gFoo, ANIM_TARGET")) is None
 
 
+def test_resolve_timeline_follows_goto_tail_jump():
+    text = (
+        "Move_X:\n"
+        "\tloadspritegfx ANIM_TAG_A\n"
+        "\tgoto SharedEnd\n"
+        "\tplayse SE_NEVER\n"      # after a goto — must NOT appear
+        "SharedEnd:\n"
+        "\tplayse SE_DONE\n"
+        "\tend\n"
+    )
+    scripts = mod.parse_scripts_text(text)
+    tl = mod.resolve_timeline(scripts, "Move_X")
+    names = [c.name for c in tl]
+    assert "goto" in names
+    assert "loadspritegfx" in names
+    # The goto target's commands are inlined…
+    assert any(c.name == "playse" and c.args == ["SE_DONE"] for c in tl)
+    # …and nothing after the goto in the original block runs.
+    assert not any(c.args == ["SE_NEVER"] for c in tl)
+
+
+def test_resolve_timeline_follows_choosetwoturnanim_first_branch():
+    text = (
+        "Move_CURSEISH:\n"
+        "\tchoosetwoturnanim BranchA, BranchB\n"
+        "BranchA:\n"
+        "\tcreatesprite gFoo, ANIM_TARGET, 2\n"
+        "\tend\n"
+        "BranchB:\n"
+        "\tplayse SE_OTHER\n"
+        "\tend\n"
+    )
+    scripts = mod.parse_scripts_text(text)
+    tl = mod.resolve_timeline(scripts, "Move_CURSEISH")
+    # The first branch (BranchA) is followed; BranchB is not.
+    assert any(c.name == "createsprite" for c in tl)
+    assert not any(c.args == ["SE_OTHER"] for c in tl)
+
+
+def test_resolve_timeline_branch_commands_are_read_only_depth():
+    text = (
+        "Move_Y:\n\tgoto Tail\n"
+        "Tail:\n\tplayse SE_X\n\tend\n"
+    )
+    scripts = mod.parse_scripts_text(text)
+    tl = mod.resolve_timeline(scripts, "Move_Y")
+    # The goto itself is depth 0; the inlined tail commands are depth>0
+    # (a different label) so the editor treats them read-only.
+    goto = next(c for c in tl if c.name == "goto")
+    tail = next(c for c in tl if c.name == "playse")
+    assert goto.depth == 0
+    assert tail.depth > 0
+
+
 def test_parse_and_format_createvisualtask():
     c = mod._parse_command_line(
         "\tcreatevisualtask AnimTask_ShakeMon, 2, ANIM_TARGET, 3, 0, 6, 1")

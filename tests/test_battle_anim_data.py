@@ -161,6 +161,18 @@ class TestAgainstRealProject:
         # A known one: the ember sprite template.
         assert tags.get("gEmberSpriteTemplate") == "ANIM_TAG_SMALL_EMBER"
 
+    def test_callback_classification_in_real_project(self):
+        cbs = mod.parse_template_callbacks(_PROJECT)
+        arch = mod.classify_anim_callbacks(_PROJECT)
+        assert len(cbs) >= 150
+        # Ember's callback resolves and classifies as a to-target translation.
+        ember_cb = cbs.get("gEmberSpriteTemplate")
+        assert ember_cb == "TranslateAnimSpriteToTargetMonLocation"
+        assert arch.get(ember_cb) == mod.MOTION_LINEAR_TO_TARGET
+        # The high-usage hit-splat anchors on a mon; palette blend is invisible.
+        assert arch.get("AnimHitSplatBasic") == mod.MOTION_ON_MON_POS
+        assert arch.get("AnimSimplePaletteBlend") == mod.MOTION_INVISIBLE
+
 
 def test_oam_size_from_name():
     assert mod._oam_size_from_name("gOamData_AffineOff_ObjNormal_32x32") == (32, 32)
@@ -194,6 +206,65 @@ def test_parse_template_tags_maps_symbol_to_tag(tmp_path):
     assert tags.get("gEmberSpriteTemplate") == "ANIM_TAG_SMALL_EMBER"
     # A template whose tileTag isn't an ANIM_TAG is omitted.
     assert "gNoTagTemplate" not in tags
+
+
+def test_parse_template_callbacks(tmp_path):
+    bah = tmp_path / "src" / "data"
+    bah.mkdir(parents=True)
+    (bah / "battle_anim.h").write_text(
+        "const struct SpriteTemplate gEmberSpriteTemplate =\n{\n"
+        "    .tileTag = ANIM_TAG_SMALL_EMBER,\n"
+        "    .callback = TranslateAnimSpriteToTargetMonLocation,\n};\n",
+        encoding="utf-8")
+    (tmp_path / "src").mkdir(exist_ok=True)
+    cbs = mod.parse_template_callbacks(str(tmp_path))
+    assert cbs.get("gEmberSpriteTemplate") == "TranslateAnimSpriteToTargetMonLocation"
+
+
+def test_classify_callback_body_heuristics():
+    # Linear-to-target: attacker init + target translation.
+    linear = ("{ InitSpritePosToAnimAttacker(sprite, TRUE); "
+              "sprite->data[2] = GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_X_2); "
+              "sprite->callback = StartAnimLinearTranslation; }")
+    assert mod._classify_callback_body(linear) == mod.MOTION_LINEAR_TO_TARGET
+    # Static at target only.
+    st = "{ InitSpritePosToAnimTarget(sprite, TRUE); sprite->callback = WaitAnimForDuration; }"
+    assert mod._classify_callback_body(st) == mod.MOTION_STATIC_TARGET
+    # Static at attacker only.
+    sa = "{ InitSpritePosToAnimAttacker(sprite, TRUE); }"
+    assert mod._classify_callback_body(sa) == mod.MOTION_STATIC_ATTACKER
+    # Invisible utility sprite.
+    inv = "{ sprite->invisible = TRUE; BeginNormalPaletteFade(x); }"
+    assert mod._classify_callback_body(inv) == mod.MOTION_INVISIBLE
+    # Nothing recognisable.
+    assert mod._classify_callback_body("{ sprite->data[0] = 5; }") == mod.MOTION_UNKNOWN
+
+
+def test_curated_archetypes_cover_high_impact_callbacks():
+    # The big-usage callbacks we read directly are pinned.
+    assert mod._CURATED_ARCHETYPES["AnimHitSplatBasic"] == mod.MOTION_ON_MON_POS
+    assert mod._CURATED_ARCHETYPES["AnimSimplePaletteBlend"] == mod.MOTION_INVISIBLE
+    assert mod._CURATED_ARCHETYPES["TranslateAnimSpriteToTargetMonLocation"] \
+        == mod.MOTION_LINEAR_TO_TARGET
+    assert mod._CURATED_ARCHETYPES["AnimThrowProjectile"] == mod.MOTION_ARC_TO_TARGET
+
+
+def test_extract_sprite_callback_bodies_brace_matches():
+    text = (
+        "static void AnimFoo(struct Sprite *sprite)\n{\n"
+        "    if (x) { y(); }\n"
+        "    z();\n"
+        "}\n"
+        "void Other(int a) {}\n"
+    )
+    bodies = mod._extract_sprite_callback_bodies([text])
+    assert "AnimFoo" in bodies
+    # Brace-matched: includes the nested block + trailing z(), ends at the
+    # function's closing brace (not the inner one).
+    assert "z();" in bodies["AnimFoo"]
+    assert bodies["AnimFoo"].count("{") == bodies["AnimFoo"].count("}")
+    # Non-sprite function is not captured.
+    assert "Other" not in bodies
 
 
 def test_parse_anim_frame_sizes_resolves_via_template(tmp_path):

@@ -332,6 +332,127 @@ def parse_template_tags(project_root: str) -> Dict[str, str]:
     return out
 
 
+# ──────────────────────────────── sprite-callback motion archetypes ──
+# A createsprite's on-screen position + motion are decided by the sprite
+# template's C ``.callback`` — NOT by the script args directly.  We can't
+# port all ~340 callbacks, but most funnel through a few shared helpers
+# (InitSpritePosToAnimAttacker/Target + a linear/arc translator), so we
+# classify each callback into a coarse motion archetype the preview can
+# reproduce.  Anything we can't read confidently → UNKNOWN (the UI then
+# falls back to a clearly-labelled static placement).
+
+MOTION_STATIC_TARGET = "static_target"      # sits at target + (arg0,arg1)
+MOTION_STATIC_ATTACKER = "static_attacker"  # sits at attacker + (arg0,arg1)
+MOTION_ON_MON_POS = "on_mon_pos"            # attacker if arg2==0 else target
+MOTION_LINEAR_TO_TARGET = "linear_to_target"  # attacker(arg0,1) → target(arg2,3), dur arg4
+MOTION_ARC_TO_TARGET = "arc_to_target"      # like linear but a parabolic toss
+MOTION_INVISIBLE = "invisible"              # utility/controller sprite — never drawn
+MOTION_UNKNOWN = "unknown"                  # couldn't classify
+
+# Curated overrides for callbacks whose bodies were read directly — these
+# win over the heuristic (which can misread unusual structures).
+_CURATED_ARCHETYPES = {
+    "TranslateAnimSpriteToTargetMonLocation": MOTION_LINEAR_TO_TARGET,
+    "AnimThrowProjectile": MOTION_ARC_TO_TARGET,
+    "AnimMissileArc": MOTION_ARC_TO_TARGET,
+    "AnimToTargetInSinWave": MOTION_LINEAR_TO_TARGET,
+    "AnimSpriteOnMonPos": MOTION_ON_MON_POS,       # arg2==0 ? attacker : target
+    "AnimHitSplatBasic": MOTION_ON_MON_POS,        # same arg2 anchor rule (190 uses)
+    "AnimFirePlume": MOTION_STATIC_ATTACKER,
+    "SpriteCallbackDummy": MOTION_STATIC_TARGET,
+    # Invisible utility sprites: palette fades + mon-movers — never drawn.
+    "AnimSimplePaletteBlend": MOTION_INVISIBLE,
+    "AnimComplexPaletteBlend": MOTION_INVISIBLE,
+    "SlideMonToOriginalPos": MOTION_INVISIBLE,
+    "SlideMonToOffset": MOTION_INVISIBLE,
+    "DoHorizontalLunge": MOTION_INVISIBLE,
+}
+
+_SPRITE_FN_RE = re.compile(
+    r"(?:static\s+)?void\s+(\w+)\s*\(\s*struct\s+Sprite\s*\*\s*\w+\s*\)\s*\{")
+
+
+def _extract_sprite_callback_bodies(texts: List[str]) -> Dict[str, str]:
+    """Map ``{callback_name: body}`` for every ``void Name(struct Sprite *)``
+    function across *texts*, brace-matched so the body is the real block."""
+    out: Dict[str, str] = {}
+    for text in texts:
+        for m in _SPRITE_FN_RE.finditer(text):
+            name = m.group(1)
+            i = text.index("{", m.start())
+            depth = 0
+            j = i
+            n = len(text)
+            while j < n:
+                ch = text[j]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            out[name] = text[i:j + 1]
+    return out
+
+
+def _classify_callback_body(body: str) -> str:
+    """Heuristic motion archetype from a sprite callback's C body."""
+    # Utility/controller sprites mark themselves invisible — don't draw them.
+    if "->invisible = TRUE" in body or "-> invisible = TRUE" in body:
+        return MOTION_INVISIBLE
+    attacker_init = "InitSpritePosToAnimAttacker" in body
+    target_init = "InitSpritePosToAnimTarget" in body
+    # Does it set up a translation that ends on the target?
+    moves_to_target = (
+        "gBattleAnimTarget" in body and (
+            "StartAnimLinearTranslation" in body
+            or "InitAnimLinearTranslation" in body
+            or "InitAnimArcTranslation" in body
+            or "TranslateAnimHorizontalArc" in body
+            or "BATTLER_COORD_X_2" in body))
+    is_arc = ("InitAnimArcTranslation" in body
+              or "TranslateAnimHorizontalArc" in body
+              or "TranslateAnimArc" in body
+              or "Parabol" in body or "Parabola" in body)
+    if moves_to_target and (attacker_init or "gBattleAnimAttacker" in body):
+        return MOTION_ARC_TO_TARGET if is_arc else MOTION_LINEAR_TO_TARGET
+    if attacker_init and not target_init:
+        return MOTION_STATIC_ATTACKER
+    if target_init and not attacker_init:
+        return MOTION_STATIC_TARGET
+    return MOTION_UNKNOWN
+
+
+def parse_template_callbacks(project_root: str) -> Dict[str, str]:
+    """Map ``{template_symbol: callback_symbol}`` for every battle-anim
+    SpriteTemplate (so the preview can resolve a createsprite's motion)."""
+    _TPL_CB_RE = re.compile(r"\.callback\s*=\s*(\w+)")
+    out: Dict[str, str] = {}
+    for text in _battle_anim_source_texts(project_root):
+        for m in _TEMPLATE_RE.finditer(text):
+            cb = _TPL_CB_RE.search(m.group("body"))
+            if cb:
+                out[m.group("name")] = cb.group(1)
+    return out
+
+
+def classify_anim_callbacks(project_root: str) -> Dict[str, str]:
+    """Map ``{callback_symbol: MOTION_*}`` for every sprite callback in the
+    battle-anim sources.  Curated reads win; otherwise a body heuristic;
+    callbacks with no readable body are omitted (caller treats as UNKNOWN).
+    Never raises."""
+    texts = _battle_anim_source_texts(project_root)
+    bodies = _extract_sprite_callback_bodies(texts)
+    out: Dict[str, str] = {}
+    for name, body in bodies.items():
+        out[name] = _CURATED_ARCHETYPES.get(name) or _classify_callback_body(body)
+    # Make sure curated names exist even if their body wasn't matched.
+    for name, arch in _CURATED_ARCHETYPES.items():
+        out.setdefault(name, arch)
+    return out
+
+
 def parse_anim_frame_sizes(project_root: str) -> Dict[str, Tuple[int, int]]:
     """Map ``{ANIM_TAG_*: (frame_w, frame_h)}`` by resolving each tag
     through the SpriteTemplate that uses it → its OAM → pixel size.

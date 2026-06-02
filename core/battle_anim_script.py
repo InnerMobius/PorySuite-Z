@@ -550,15 +550,27 @@ def format_command(name: str, args: List[str]) -> str:
 
 def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                      inline_calls: bool = True,
-                     max_depth: int = 2) -> List[Command]:
+                     max_depth: int = 6) -> List[Command]:
     """Flatten a script into a linear timeline.
 
-    Top-level commands of ``label`` in order.  When ``inline_calls`` is
-    set, each ``call X`` is followed by X's commands (minus its trailing
-    ``return``) at ``depth+1``, so the UI can show the shared subroutine's
-    sounds/sprites in place.  Depth-limited and cycle-guarded so a
-    recursive/looping script can't hang.  ``end``/``return`` terminate
-    the current level.
+    Top-level commands of ``label`` in order.  When ``inline_calls`` is set
+    the resolver also follows control flow so a move that lives in a
+    branched-to label still shows its real commands:
+
+      * ``call X``               → inline X's commands at ``depth+1``,
+                                    then continue after the call.
+      * ``goto X``               → tail-jump: inline X then stop this block.
+      * ``choosetwoturnanim A,B`` → follow the first branch (A) as a
+                                    representative animation, then stop.
+
+    Conditional jumps (``jumpifmoveturn`` / ``jumpargeq`` / ``jumpret*``)
+    are left as fall-through — their guarded label is an alternate path we
+    can't evaluate without the engine, so we show the main line.
+
+    Depth-limited and cycle-guarded so a recursive/looping script can't
+    hang.  ``end``/``return`` terminate the current level.  Branch-inlined
+    commands carry ``depth>0`` so the editor treats them read-only (they
+    live in a different label).
     """
     out: List[Command] = []
 
@@ -575,8 +587,16 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 out.append(c)
                 return
             out.append(c)
-            if inline_calls and cmd.name == "call" and cmd.call_target:
+            if not inline_calls:
+                continue
+            if cmd.name == "call" and cmd.call_target:
                 _walk(cmd.call_target, depth + 1, seen2)
+            elif cmd.name == "goto" and cmd.args:
+                _walk(cmd.args[0], depth + 1, seen2)
+                return  # tail-jump: nothing after a goto runs
+            elif cmd.name == "choosetwoturnanim" and cmd.args:
+                _walk(cmd.args[0], depth + 1, seen2)
+                return  # follow the first (representative) branch
 
     _walk(label, 0, frozenset())
     return out

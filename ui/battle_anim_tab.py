@@ -42,6 +42,10 @@ from PyQt6.QtWidgets import (
 
 from core.battle_anim_data import (
     parse_battle_anim_sprites, parse_anim_frame_sizes, parse_template_tags,
+    parse_template_callbacks, classify_anim_callbacks,
+    MOTION_STATIC_TARGET, MOTION_STATIC_ATTACKER, MOTION_ON_MON_POS,
+    MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET, MOTION_INVISIBLE,
+    MOTION_UNKNOWN,
     BattleAnimSprite)
 from core.battle_anim_script import (
     parse_move_anim_table, parse_anim_scripts, resolve_timeline,
@@ -208,6 +212,8 @@ class BattleAnimTab(QWidget):
         self._scripts_dirty: bool = False                   # unsaved timeline edits?
         self._sound_effects: List[str] = []                 # SE_* constants for picker
         self._template_tags: Dict[str, str] = {}            # template symbol -> ANIM_TAG
+        self._tpl_callbacks: Dict[str, str] = {}            # template symbol -> callback symbol
+        self._callback_arch: Dict[str, str] = {}            # callback symbol -> MOTION_*
         self._cur_timeline: list = []                       # resolved Commands of selected move
         self._dirty_moves: set = set()                      # labels with unsaved edits (amber)
 
@@ -615,10 +621,14 @@ class BattleAnimTab(QWidget):
             self._sound_effects = parse_sound_effects(project_root)
             self._scripts_text = self._read_scripts_text(project_root)
             self._template_tags = parse_template_tags(project_root)
+            self._tpl_callbacks = parse_template_callbacks(project_root)
+            self._callback_arch = classify_anim_callbacks(project_root)
         except Exception:
             self._move_table, self._scripts, self._move_names = [], {}, {}
             self._sound_effects, self._scripts_text = [], ""
             self._template_tags = {}
+            self._tpl_callbacks = {}
+            self._callback_arch = {}
 
         # Visual reset of the detail/right panel.
         self._pal_frame.setStyleSheet("")
@@ -1551,15 +1561,17 @@ class BattleAnimTab(QWidget):
             self._stop_play_move()
             return
 
-        # Mid-delay: count down, cycle frames using the pre-baked cache.
+        self._play_tick += 1   # global frame clock (drives motion + cycling)
+        # Cycle each live layer's frames (~15 fps) using the pre-baked cache.
+        if self._play_tick % 4 == 0:
+            for L in self._play_layers:
+                frames = self._play_frame_cache.get(L[0], [])
+                if len(frames) > 1:
+                    L[5] = (L[5] + 1) % len(frames)   # L[5] = frame_idx
+
+        # Mid-delay: just keep rendering (sprites keep moving toward target).
         if self._play_wait > 0:
             self._play_wait -= 1
-            self._play_tick += 1
-            if self._play_tick % 4 == 0:   # ~15 fps frame cycle
-                for L in self._play_layers:
-                    frames = self._play_frame_cache.get(L[0], [])
-                    if len(frames) > 1:
-                        L[4] = (L[4] + 1) % len(frames)
             self._render_play_composite()
             return
 
@@ -1568,14 +1580,13 @@ class BattleAnimTab(QWidget):
             cmd = timeline[self._play_idx]
             self._play_idx += 1
 
-            # Advance the timeline cursor (signals are suppressed during
-            # playback so _on_timeline_row_changed won't fight us).
+            # Advance the timeline cursor (signals suppressed during playback
+            # so _on_timeline_row_changed won't fight us).
             row = self._play_idx - 1
             if row < self._timeline.count():
                 self._timeline.blockSignals(True)
                 self._timeline.setCurrentRow(row)
                 self._timeline.blockSignals(False)
-                # Scroll to keep cursor visible without triggering row-change.
                 self._timeline.scrollToItem(self._timeline.item(row))
 
             if cmd.name == "delay" and cmd.args:
@@ -1597,14 +1608,13 @@ class BattleAnimTab(QWidget):
                 if cs:
                     tag = self._template_tags.get(cs.template, "")
                     if tag and tag in self._play_frame_cache:
-                        acx, acy = self._battler_anchor(cs.battler)
-                        xoff = (self._int_or(cs.args[0])
-                                if len(cs.args) >= 1 else 0)
-                        yoff = (self._int_or(cs.args[1])
-                                if len(cs.args) >= 2 else 0)
-                        subpri = self._int_or(cs.subpriority)
-                        self._play_layers.append(
-                            [tag, acx + xoff, acy + yoff, subpri, 0])
+                        arch, start, end, dur, vis = self._layer_geometry(cs)
+                        if vis:
+                            subpri = self._int_or(cs.subpriority)
+                            # [tag, start, end, dur, spawn_tick, frame_idx, arch, subpri]
+                            self._play_layers.append(
+                                [tag, start, end, dur, self._play_tick, 0,
+                                 arch, subpri])
 
             if cmd.kind == KIND_SOUND and cmd.args:
                 if _preview_sound_cb is not None:
@@ -1615,23 +1625,24 @@ class BattleAnimTab(QWidget):
         self._stop_play_move()
 
     def _render_play_composite(self):
-        """Paint the current _play_layers state onto the battle preview.
-        Uses pre-baked frames from _play_frame_cache — no disk access.
-        Layers are ordered by subpriority (higher value = drawn first = behind)."""
+        """Paint the current _play_layers onto the battle preview, each at
+        its interpolated position for the current tick.  Uses pre-baked
+        frames (no disk access).  Ordered by subpriority (lower on top)."""
         from PyQt6.QtGui import QPainter as _QPainter
         if not self._play_layers:
             self._move_preview.set_anim_pixmap(None)
             return
-        layers = sorted(self._play_layers, key=lambda L: -L[3])
         P = self._move_preview
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
-        for tag, cx, cy, _sp, fidx in layers:
+        for L in sorted(self._play_layers, key=lambda L: -L[7]):  # subpri
+            tag, start, end, dur, spawn, fidx, arch, _sp = L
             frames = self._play_frame_cache.get(tag, [])
             if not frames:
                 continue
             pix = frames[max(0, min(fidx, len(frames) - 1))]
+            cx, cy = self._interp_pos(start, end, dur, self._play_tick - spawn, arch)
             painter.drawPixmap(cx - pix.width() // 2,
                                cy - pix.height() // 2, pix)
         painter.end()
@@ -1660,25 +1671,81 @@ class BattleAnimTab(QWidget):
         else:
             self._update_move_composite()
 
-    def _battler_anchor(self, battler: str) -> Tuple[int, int]:
-        """Frame-center for the given anim battler on the 240×160 canvas.
+    def _anim_battlers(self):
+        """Return ``((atk_cx,atk_cy),(tgt_cx,tgt_cy))`` for the current
+        direction toggle.
 
         Battle animations run from BOTH sides — the same gBattleAnims_Moves
-        entry is used whether the player or the enemy is attacking.  The
-        engine picks attacker/target based on who owns the move at runtime.
-        The direction toggle lets the preview show both cases:
-
-          Player attacks  →  ANIM_ATTACKER = back/player  (72, 80)
-                             ANIM_TARGET   = front/enemy  (176, 40)
-          Enemy attacks   →  ANIM_ATTACKER = front/enemy  (176, 40)
-                             ANIM_TARGET   = back/player  (72, 80)
+        entry is used whether the player or the enemy attacks; the engine
+        binds attacker/target at runtime.  The toggle shows both cases:
+          Player attacks → attacker = back/player (72,80), target = enemy (176,40)
+          Enemy attacks  → attacker = front/enemy (176,40), target = player (72,80)
         """
         P = self._move_preview
-        is_attacker = (battler or "").strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
-        if self._play_direction == "player":
-            return (P.PLAYER_CX, P.PLAYER_CY) if is_attacker else (P.ENEMY_CX, P.ENEMY_CY)
-        else:
-            return (P.ENEMY_CX, P.ENEMY_CY) if is_attacker else (P.PLAYER_CX, P.PLAYER_CY)
+        player = (P.PLAYER_CX, P.PLAYER_CY)
+        enemy = (P.ENEMY_CX, P.ENEMY_CY)
+        return (player, enemy) if self._play_direction == "player" else (enemy, player)
+
+    def _archetype_for_template(self, template: str) -> str:
+        """Motion archetype (MOTION_*) for a createsprite template, via its
+        C callback.  Unrecognised callbacks → MOTION_UNKNOWN."""
+        cb = self._tpl_callbacks.get(template, "")
+        return self._callback_arch.get(cb, MOTION_UNKNOWN)
+
+    def _layer_geometry(self, cs):
+        """Resolve a createsprite into ``(archetype, start_xy, end_xy,
+        duration, visible)`` using the sprite callback's motion archetype +
+        direction-aware battler anchors.
+
+        Grounded in the engine's shared helpers: ``+arg0`` x-offset points
+        from attacker toward target (SetAnimSpriteInitialXOffset); the
+        common callbacks anchor at attacker/target and either sit still,
+        ride to the target (arg2/arg3 end-offset over arg4 frames), or arc.
+        Positions are approximate — the long tail of bespoke callbacks falls
+        back to a static placement at the declared battler.
+        """
+        atk, tgt = self._anim_battlers()
+        xdir = 1 if tgt[0] >= atk[0] else -1
+        a = [self._int_or(x) for x in cs.args]
+
+        def arg(i):
+            return a[i] if i < len(a) else 0
+
+        arch = self._archetype_for_template(cs.template)
+        if arch == MOTION_INVISIBLE:
+            return (arch, (0, 0), (0, 0), 0, False)
+        if arch in (MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET):
+            start = (atk[0] + xdir * arg(0), atk[1] + arg(1))
+            end = (tgt[0] + xdir * arg(2), tgt[1] + arg(3))
+            return (arch, start, end, max(1, arg(4)), True)
+        if arch == MOTION_ON_MON_POS:
+            anchor = atk if arg(2) == 0 else tgt
+            pos = (anchor[0] + xdir * arg(0), anchor[1] + arg(1))
+            return (arch, pos, pos, 0, True)
+        if arch == MOTION_STATIC_ATTACKER:
+            pos = (atk[0] + xdir * arg(0), atk[1] + arg(1))
+            return (arch, pos, pos, 0, True)
+        if arch == MOTION_STATIC_TARGET:
+            pos = (tgt[0] + xdir * arg(0), tgt[1] + arg(1))
+            return (arch, pos, pos, 0, True)
+        # UNKNOWN → static at the createsprite's declared battler (best guess).
+        anchor = (atk if cs.battler.strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
+                  else tgt)
+        pos = (anchor[0] + xdir * arg(0), anchor[1] + arg(1))
+        return (MOTION_UNKNOWN, pos, pos, 0, True)
+
+    def _interp_pos(self, start, end, dur, t, arch):
+        """Interpolated position at tick ``t`` into a moving layer's life
+        (linear, plus a parabolic rise for arc archetypes)."""
+        if dur <= 0 or start == end:
+            return start
+        import math
+        frac = max(0.0, min(1.0, t / dur))
+        x = start[0] + (end[0] - start[0]) * frac
+        y = start[1] + (end[1] - start[1]) * frac
+        if arch == MOTION_ARC_TO_TARGET:
+            y -= math.sin(math.pi * frac) * 24.0
+        return (int(round(x)), int(round(y)))
 
     def _first_frame_for_tag(self, tag: str) -> Optional[QPixmap]:
         sprite = self._sprites.get(tag)
@@ -1697,12 +1764,12 @@ class BattleAnimTab(QWidget):
         return frames[max(0, min(idx, len(frames) - 1))]
 
     def _update_move_composite(self):
-        """Composite every sprite spawned from the start of the move's
-        script through the SELECTED timeline row, layered by subpriority,
-        anchored to its battler with best-effort x/y offset.  The selected
-        row's sprite (if any) shows its scrubbed frame; the rest show
-        frame 0.  Positions are approximate (the engine computes exact
-        motion in C) — this conveys what's on screen and how it layers."""
+        """Static composite of every sprite spawned from the script start
+        through the SELECTED timeline row, placed via its motion archetype
+        (moving sprites shown at their END/impact point, static ones in
+        place), layered by subpriority.  Invisible utility sprites (palette
+        fades, mon-movers) are skipped; visual tasks are counted in the
+        caption since they animate the mon directly and aren't drawn here."""
         from PyQt6.QtGui import QPainter
         timeline = self._cur_timeline
         through = self._timeline.currentRow()
@@ -1710,13 +1777,21 @@ class BattleAnimTab(QWidget):
             through = len(timeline) - 1
         layers = []          # (subpri, cx, cy, pixmap, tag)
         names = []
+        n_tasks = n_hidden = n_approx = 0
         for i, cmd in enumerate(timeline[:through + 1] if timeline else []):
+            if cmd.name in ("createvisualtask", "createsoundtask"):
+                n_tasks += 1
+                continue
             if cmd.name != "createsprite":
                 continue
             cs = parse_createsprite(cmd)
             if not cs:
                 continue
             tag = self._template_tags.get(cs.template, "")
+            arch, start, end, dur, vis = self._layer_geometry(cs)
+            if not vis:
+                n_hidden += 1
+                continue
             # Selected row uses the scrubbed frame; others frame 0.
             if i == through and tag and tag == self._layer_tag:
                 pix = self._frame_for_tag(tag, self._layer_idx)
@@ -1724,18 +1799,25 @@ class BattleAnimTab(QWidget):
                 pix = self._first_frame_for_tag(tag)
             if pix is None:
                 continue
-            acx, acy = self._battler_anchor(cs.battler)
-            xoff = self._int_or(cs.args[0]) if len(cs.args) >= 1 else 0
-            yoff = self._int_or(cs.args[1]) if len(cs.args) >= 2 else 0
+            # Representative position: impact (end) for moving sprites,
+            # resting place for static ones.
+            x, y = end if dur > 0 else start
+            if arch == MOTION_UNKNOWN:
+                n_approx += 1
             subpri = self._int_or(cs.subpriority)
-            layers.append((subpri, acx + xoff, acy + yoff, pix, tag))
+            layers.append((subpri, x, y, pix, tag))
             names.append(self._sprites[tag].display_name)
 
         if not layers:
             self._move_preview.set_anim_pixmap(None)
-            self._move_prev_lbl.setText(
-                "No sprite spawns up to here (effect may use tasks / mon "
-                "sprites).  Positions shown elsewhere are approximate.")
+            if n_tasks:
+                self._move_prev_lbl.setText(
+                    f"No drawn sprites yet — this move runs {n_tasks} visual "
+                    f"task(s) that animate the mon directly (shake / flash / "
+                    f"palette / background), which aren't reproduced here.")
+            else:
+                self._move_prev_lbl.setText(
+                    "No sprite spawns up to here.")
             return
 
         # Higher subpriority draws first (further back); lower on top.
@@ -1748,16 +1830,22 @@ class BattleAnimTab(QWidget):
             painter.drawPixmap(cx - pix.width() // 2,
                                cy - pix.height() // 2, pix)
         painter.end()
-        # The composite IS the full canvas, so center it on canvas center.
         self._move_preview.set_anim_pixmap(canvas, P.CANVAS_W // 2,
                                            P.CANVAS_H // 2)
         uniq = []
         for n in names:
             if n not in uniq:
                 uniq.append(n)
-        self._move_prev_lbl.setText(
-            f"{len(layers)} sprite layer(s) through this step: "
-            + ", ".join(uniq[:6]) + ("…" if len(uniq) > 6 else ""))
+        caption = (f"{len(layers)} sprite layer(s): "
+                   + ", ".join(uniq[:5]) + ("…" if len(uniq) > 5 else ""))
+        extra = []
+        if n_tasks:
+            extra.append(f"{n_tasks} visual task(s) (mon shake/flash, not drawn)")
+        if n_approx:
+            extra.append(f"{n_approx} ≈ approximate position")
+        if extra:
+            caption += "  ·  " + "  ·  ".join(extra)
+        self._move_prev_lbl.setText(caption)
 
     # ── selected-sprite frame scrubber ────────────────────────────────
 
