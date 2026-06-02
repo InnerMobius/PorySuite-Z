@@ -247,20 +247,167 @@ def _parse_anim_max_frame(root: str) -> Dict[str, int]:
     return table_max
 
 
+# Friendly display names for the well-known object-event anim tables;
+# any table not listed gets a name derived from its symbol.  The generic
+# Loop<N>Sequential / Loop<N>Random entries are added lazily below once
+# GENERIC_LOOP_FRAME_COUNTS is defined.
+_ANIM_TABLE_FRIENDLY = {
+    "sAnimTable_Standard": "Walk Cycle (standard NPC)",
+    "sAnimTable_Inanimate": "Static / Inanimate",
+    "sAnimTable_RedGreenNormal": "Walk Cycle (Player-style)",
+    "sAnimTable_StandardWithEmote": "Walk Cycle + Emote",
+}
+
+
+def _prettify_anim_symbol(sym: str) -> str:
+    """A human-readable name from an ``sAnimTable_*`` symbol."""
+    base = sym[len("sAnimTable_"):] if sym.startswith("sAnimTable_") else sym
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", base)
+    return spaced or sym
+
+
+# Pattern catching per-sprite cycle tables (sAnimTable_<InfoName>Cycle and
+# sAnimTable_<InfoName>RandomCycle) so the scanner can route them through a
+# distinct label/sort path — they are visually grouped UNDER their parent
+# sprite, not next to the project-wide presets.
+_PER_SPRITE_CYCLE_RE = re.compile(
+    r"^sAnimTable_(?P<info>\w+?)(?P<kind>RandomCycle|Cycle)$"
+)
+
+# Pattern catching the project-wide generic loop tables that
+# ensure_generic_loop_tables installs.  Splitting these out lets
+# scan_anim_tables present them as a single block in the dropdown with a
+# consistent label.
+_GENERIC_LOOP_RE = re.compile(
+    r"^sAnimTable_Loop(?P<n>\d+)(?P<order>Sequential|Random)$"
+)
+
+
+def _classify_anim_table(sym: str) -> Tuple[int, str, str]:
+    """Bucket a table symbol for sorting + labeling.
+
+    Returns ``(group_rank, sort_within_group, friendly_label_or_empty)``.
+
+    Group ranks (lower sorts higher in the dropdown):
+      0  Walk Cycle (standard NPC)
+      1  Walk Cycle + Emote
+      2  Generic loops (project-wide presets)
+      3  Static / Inanimate
+      4  Per-sprite cycle tables (sAnimTable_<X>Cycle / <X>RandomCycle)
+      5  Everything else (alphabetic)
+    """
+    if sym == "sAnimTable_Standard":
+        return (0, "", "")
+    if sym == "sAnimTable_StandardWithEmote":
+        return (1, "", "")
+    m = _GENERIC_LOOP_RE.match(sym)
+    if m:
+        n = int(m.group("n"))
+        order_rank = 0 if m.group("order") == "Sequential" else 1
+        # "02-0" sorts before "02-1" sorts before "03-0" sorts before "03-1"…
+        return (2, f"{n:02d}-{order_rank}", "")
+    if sym == "sAnimTable_Inanimate":
+        return (3, "", "")
+    m = _PER_SPRITE_CYCLE_RE.match(sym)
+    if m:
+        info = m.group("info")
+        kind_rank = 0 if m.group("kind") == "Cycle" else 1
+        return (4, f"{info.lower()}-{kind_rank}", "")
+    return (5, sym, "")
+
+
+def _label_for_anim_table(sym: str, frame_count: int) -> str:
+    """Build the dropdown label for an anim table.  Generic loops, per-sprite
+    cycles, and the well-known named tables all get tailored wording; anything
+    else falls back to the prettified symbol.  ``frame_count`` is the highest
+    ``ANIMCMD_FRAME`` index referenced + 1 (i.e. how many sheet frames the
+    table touches)."""
+    # Generic loop presets.
+    m = _GENERIC_LOOP_RE.match(sym)
+    if m:
+        n = int(m.group("n"))
+        order = ("sequential" if m.group("order") == "Sequential"
+                 else "random pace")
+        return f"Generic Loop · {n} frames · {order}"
+
+    # Per-sprite cycle tables — surface the source sprite name so the user
+    # knows the table is shaped specifically for that sprite (and that
+    # assigning it to a DIFFERENT-sized sprite will render wrong).
+    m = _PER_SPRITE_CYCLE_RE.match(sym)
+    if m:
+        info = m.group("info")
+        kind = ("Random Cycle" if m.group("kind") == "RandomCycle"
+                else "Sequential Cycle")
+        return f"{info}'s {kind}  ·  {frame_count} frames"
+
+    name = _ANIM_TABLE_FRIENDLY.get(sym) or _prettify_anim_symbol(sym)
+    return f"{name}  ·  {frame_count} frame{'' if frame_count == 1 else 's'}"
+
+
+def scan_anim_tables(root: str) -> List[Tuple[str, str]]:
+    """Return ``[(symbol, label), ...]`` for every object-event animation
+    table the project defines in ``object_event_anims.h``.
+
+    ``label`` carries a frame-count hint where useful — the number of
+    sprite-sheet frames the table's animations reference (highest
+    ``ANIMCMD_FRAME`` index + 1).  Items are grouped so the dropdown reads
+    naturally:
+
+      1. Walk Cycle (standard NPC)
+      2. Walk Cycle + Emote
+      3. Generic Loop presets (project-wide), sorted by frame count
+      4. Static / Inanimate
+      5. Per-sprite cycle tables (named ``sAnimTable_<X>Cycle`` /
+         ``<X>RandomCycle``), alphabetic by sprite name
+      6. Everything else (alphabetic)
+
+    Falls back to a minimal built-in pair when the anim header cannot be
+    read.
+    """
+    table_max = _parse_anim_max_frame(root)
+    if not table_max:
+        return [
+            ("sAnimTable_Standard",
+             "Walk Cycle (standard NPC)  ·  9 frames"),
+            ("sAnimTable_Inanimate",
+             "Static / Inanimate  ·  1 frame"),
+        ]
+
+    def _key(sym: str) -> Tuple[int, str]:
+        group, within, _label = _classify_anim_table(sym)
+        return (group, within)
+
+    out: List[Tuple[str, str]] = []
+    for sym in sorted(table_max, key=_key):
+        n = table_max[sym] + 1   # highest frame index -> frame count
+        out.append((sym, _label_for_anim_table(sym, n)))
+    return out
+
+
 def _png_frame_count(png_path: str, frame_w: int, frame_h: int) -> int:
     """Return the number of frames the PNG holds at the declared frame
-    size.  Returns 0 if PIL can't open the file or the dimensions don't
+    size.  Returns 0 if the image can't be read or the dimensions don't
     cleanly divide.
+
+    Uses Qt's QImage, NOT PIL.  PyQt6 is a hard dependency of PorySuite-Z
+    (every sprite viewer is built on it); Pillow is NOT in requirements.txt.
+    A PIL-based reader threw ImportError in any environment without Pillow
+    installed and the `except` swallowed it as "0 frames" — silently
+    breaking both this and the emote scan (every sprite resolved to 0
+    frames).  QImage reads raster dimensions and needs no running
+    QApplication.
     """
     if frame_w <= 0 or frame_h <= 0:
         return 0
     try:
-        from PIL import Image
-        img = Image.open(png_path)
-        w, h = img.size
+        from PyQt6.QtGui import QImage
+        img = QImage(png_path)
+        if img.isNull():
+            return 0
+        w, h = img.width(), img.height()
     except Exception:
         return 0
-    if w % frame_w != 0 or h % frame_h != 0:
+    if w <= 0 or h <= 0 or w % frame_w != 0 or h % frame_h != 0:
         return 0
     return (w // frame_w) * (h // frame_h)
 
@@ -667,3 +814,751 @@ def _rewrite_sprite_anims(
         f"Rewrote gObjectEventGraphicsInfo_{info_name}.anims → "
         f"{new_table_name}"
     )
+
+
+def _rewrite_sprite_inanimate(
+    root: str, info_name: str, inanimate: bool,
+) -> Tuple[bool, str]:
+    """Rewrite `gObjectEventGraphicsInfo_<info_name>.inanimate` to TRUE/FALSE.
+
+    A frame-cycle entity MUST be non-inanimate: the object-event spawn path
+    only calls `StartSpriteAnim` when `!graphicsInfo->inanimate`, and without
+    that initial StartSpriteAnim the sprite never starts its loop.
+
+    Returns (success, message).  Treated as a no-op success when the field
+    already holds the requested value.
+    """
+    path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics_info.h"
+    )
+    if not os.path.isfile(path):
+        return False, f"missing {path}"
+    text = _read(path)
+    want = "TRUE" if inanimate else "FALSE"
+    pat = re.compile(
+        r"(gObjectEventGraphicsInfo_" + re.escape(info_name)
+        + r"\s*=\s*\{[^;]*?\.inanimate\s*=\s*)"
+        + r"(\w+)"
+        + r"(,)",
+        re.DOTALL,
+    )
+    m = pat.search(text)
+    if m is None:
+        return False, (
+            f"could not find .inanimate field for {info_name}"
+        )
+    if m.group(2) == want:
+        return True, f"{info_name}.inanimate already {want}"
+    new_text = text[:m.start(2)] + want + text[m.end(2):]
+    if not _atomic_write_text(path, new_text):
+        return False, f"failed to write {path}"
+    return True, f"Rewrote gObjectEventGraphicsInfo_{info_name}.inanimate → {want}"
+
+
+# ───────────────── sequential frame-cycle animation ─────────────────────────
+#
+# A "frame-cycle" entity is a stationary object event whose sprite cycles
+# every sheet frame in sequence — a painting, a flickering torch, an idle
+# animated decoration.  It is NOT direction-based, so it sidesteps the
+# East-mirror problem entirely (the standard table fakes East by hFlipping
+# the West frame; a frame-cycle table never hFlips anything).
+#
+# Mechanism (verified against pokefirered's engine, 2026-05-18):
+#   - The cycle table points EVERY one of the 21 standard animation slots
+#     at one shared multi-frame loop.  No slot is the mirrored-East form,
+#     so the sprite can never hFlip no matter what faces it.
+#   - The object event is placed in Porymap with MOVEMENT_TYPE_NONE.  That
+#     maps to MovementType_None — an empty-callback movement type that
+#     never calls FaceDirection (which would set sprite->animPaused = TRUE
+#     and freeze the sprite, the way MOVEMENT_TYPE_FACE_DOWN does).
+#   - At spawn, a non-inanimate object event runs
+#     StartSpriteAnim(ANIM_STD_FACE_SOUTH) and animPaused stays FALSE, so
+#     AnimateSprites free-runs the loop forever.
+#   - Frame index 9 is always excluded — that slot is the VS-seeker / emote
+#     pose every standard NPC PNG carries.
+
+# The 21 animation slots sAnimTable_Standard fills.  A frame-cycle table
+# points every one at the same loop.
+_STANDARD_ANIM_SLOTS = (
+    "ANIM_STD_FACE_SOUTH", "ANIM_STD_FACE_NORTH",
+    "ANIM_STD_FACE_WEST", "ANIM_STD_FACE_EAST",
+    "ANIM_STD_GO_SOUTH", "ANIM_STD_GO_NORTH",
+    "ANIM_STD_GO_WEST", "ANIM_STD_GO_EAST",
+    "ANIM_STD_GO_FAST_SOUTH", "ANIM_STD_GO_FAST_NORTH",
+    "ANIM_STD_GO_FAST_WEST", "ANIM_STD_GO_FAST_EAST",
+    "ANIM_STD_GO_FASTER_SOUTH", "ANIM_STD_GO_FASTER_NORTH",
+    "ANIM_STD_GO_FASTER_WEST", "ANIM_STD_GO_FASTER_EAST",
+    "ANIM_STD_GO_FASTEST_SOUTH", "ANIM_STD_GO_FASTEST_NORTH",
+    "ANIM_STD_GO_FASTEST_WEST", "ANIM_STD_GO_FASTEST_EAST",
+    "ANIM_RAISE_HAND",
+)
+
+# Frame index every frame-cycle skips — the VS-seeker / emote pose slot.
+CYCLE_SKIP_FRAME_INDEX = 9
+
+# ANIMCMD_FRAME's `duration` is a 6-bit bitfield in the engine — see
+# include/sprite.h, `struct AnimFrameCmd { ... u32 duration:6; ... }`.  A
+# value above 63 silently wraps modulo 64 (100 -> 36, 64 -> 0).  Every
+# generated frame duration is clamped to this so the in-ROM timing is
+# exactly what the tool intends.
+_ANIMCMD_DURATION_MAX = 63
+
+
+def _cycle_sentinels(info_name: str) -> Tuple[str, str]:
+    """Open/close sentinel comments wrapping a generated cycle block, so a
+    re-generation (duration change, frame-count change) replaces it cleanly
+    instead of leaving a stale duplicate behind."""
+    return (
+        f"// >>> PorySuite-Z frame-cycle: {info_name} >>>",
+        f"// <<< PorySuite-Z frame-cycle: {info_name} <<<",
+    )
+
+
+def cycle_table_symbol(info_name: str) -> str:
+    """The anim-table symbol a frame-cycle for `info_name` is generated under."""
+    return f"sAnimTable_{info_name}Cycle"
+
+
+def _generate_cycle_block(
+    info_name: str, frame_count: int, frame_duration: int,
+) -> str:
+    """Return the C source for `sAnim_<Name>Cycle` + `sAnimTable_<Name>Cycle`,
+    wrapped in regeneration sentinels."""
+    anim_name = f"sAnim_{info_name}Cycle"
+    table_name = cycle_table_symbol(info_name)
+    open_s, close_s = _cycle_sentinels(info_name)
+
+    dur = max(1, min(_ANIMCMD_DURATION_MAX, frame_duration))
+    frames = [i for i in range(frame_count) if i != CYCLE_SKIP_FRAME_INDEX]
+    frame_lines = "\n".join(
+        f"    ANIMCMD_FRAME({i}, {dur})," for i in frames
+    )
+    slot_lines = "\n".join(
+        f"    [{slot}] = {anim_name}," for slot in _STANDARD_ANIM_SLOTS
+    )
+    return (
+        f"{open_s}\n"
+        f"// Sequential frame-cycle for {info_name} (PorySuite-Z generated).\n"
+        f"// Loops every sheet frame except index {CYCLE_SKIP_FRAME_INDEX} "
+        f"(VS-seeker / emote pose).\n"
+        f"// Every slot points at the same loop: the sprite animates the\n"
+        f"// same in all directions and NEVER hFlips.  Drive it with\n"
+        f"// MOVEMENT_TYPE_FRAME_CYCLE on a non-inanimate object event.\n"
+        f"static const union AnimCmd {anim_name}[] = {{\n"
+        f"{frame_lines}\n"
+        f"    ANIMCMD_JUMP(0),\n"
+        f"}};\n"
+        f"\n"
+        f"static const union AnimCmd *const {table_name}[] = {{\n"
+        f"{slot_lines}\n"
+        f"}};\n"
+        f"{close_s}"
+    )
+
+
+def ensure_cycle_anim_table(
+    root: str, info_name: str, frame_count: int, frame_duration: int = 16,
+) -> Tuple[bool, str, List[str]]:
+    """Generate (or regenerate) a sequential frame-cycle anim table for
+    `info_name` in `object_event_anims.h`.
+
+    Idempotent by sentinel: a pre-existing cycle block for this `info_name`
+    is replaced wholesale, so re-running with a different duration or frame
+    count simply updates it — no stale duplicates.
+
+    Returns `(success, table_symbol, messages)`.
+    """
+    msgs: List[str] = []
+    table_name = cycle_table_symbol(info_name)
+
+    if frame_count < 2:
+        return False, table_name, [
+            f"{info_name}: a frame-cycle needs at least 2 frames "
+            f"(sheet resolves to {frame_count})"
+        ]
+
+    anims_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_anims.h"
+    )
+    if not os.path.isfile(anims_path):
+        return False, table_name, [f"missing {anims_path}"]
+
+    text = _read(anims_path)
+    block = _generate_cycle_block(info_name, frame_count, frame_duration)
+    open_s, close_s = _cycle_sentinels(info_name)
+
+    existing = re.compile(
+        re.escape(open_s) + r".*?" + re.escape(close_s), re.DOTALL,
+    )
+    if existing.search(text):
+        # lambda replacement — block may contain chars re would treat as
+        # group backreferences if passed as a plain repl string.
+        text = existing.sub(lambda _m: block, text, count=1)
+        msgs.append(f"Updated {table_name} in object_event_anims.h")
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+        msgs.append(f"Added {table_name} to object_event_anims.h")
+
+    if not _atomic_write_text(anims_path, text):
+        return False, table_name, [f"failed to write {anims_path}"]
+
+    return True, table_name, msgs
+
+
+# ──────────────────── random frame-cycle ────────────────────────────────────
+#
+# Same idea as the sequential frame-cycle, but the loop visits the sheet
+# frames in a shuffled order instead of 0->N.  The GBA ANIMCMD interpreter has
+# no "pick a random frame" opcode, so true per-frame RNG would need engine
+# code AND would stutter whenever the RNG rolled the same frame twice in a
+# row.  Instead the table bakes a long pre-shuffled sequence (no two
+# consecutive frames alike); over its 64-frame period it reads as random, and
+# it is pure data — the existing MOVEMENT_TYPE_FRAME_CYCLE drives it unchanged.
+#
+# Each frame in that sequence is also held a *random* number of ticks within
+# a caller-supplied [min, max] range — so the cycle varies its pace (some
+# frames flick by, some linger) the way the vanilla LOOK_AROUND / WANDER idle
+# movement types do, instead of metronome-stepping at one fixed speed.
+#
+# Both the shuffled order and the per-frame durations are seeded
+# deterministically from the sprite name, so regenerating the same sprite
+# yields the same table (idempotent) while two different sprites differ.
+
+RANDOM_CYCLE_SEQUENCE_LENGTH = 64
+
+
+def random_cycle_table_symbol(info_name: str) -> str:
+    """The anim-table symbol a RANDOM frame-cycle for `info_name` uses."""
+    return f"sAnimTable_{info_name}RandomCycle"
+
+
+def _generate_random_cycle_block(
+    info_name: str, frame_count: int, hold_min: int, hold_max: int,
+    seq_len: int = RANDOM_CYCLE_SEQUENCE_LENGTH,
+) -> str:
+    """Return the C source for `sAnim_<Name>RandomCycle` +
+    `sAnimTable_<Name>RandomCycle`, wrapped in the shared frame-cycle
+    sentinels (so it is mutually exclusive with the sequential block).
+
+    Each frame in the shuffled sequence is held a random number of ticks in
+    `[hold_min, hold_max]`, so the cycle varies its pace instead of flicking
+    at one fixed speed.  Frame order AND durations are seeded deterministically
+    from `info_name`.
+    """
+    import random as _random
+    import zlib
+
+    # Clamp into [1, 63] — ANIMCMD_FRAME's duration field is 6-bit, so a
+    # larger value would silently wrap in the ROM.
+    lo = max(1, min(_ANIMCMD_DURATION_MAX, hold_min, hold_max))
+    hi = max(lo, min(_ANIMCMD_DURATION_MAX, max(hold_min, hold_max)))
+
+    anim_name = f"sAnim_{info_name}RandomCycle"
+    table_name = random_cycle_table_symbol(info_name)
+    open_s, close_s = _cycle_sentinels(info_name)
+
+    pool = [i for i in range(frame_count) if i != CYCLE_SKIP_FRAME_INDEX]
+    rng = _random.Random(zlib.crc32(info_name.encode("utf-8")))
+    seq: List[int] = []
+    for _ in range(max(2, seq_len)):
+        choices = [f for f in pool if not seq or f != seq[-1]]
+        seq.append(rng.choice(choices))
+    # Don't let the ANIMCMD_JUMP wrap show the same frame twice (last==first).
+    if len(pool) > 1 and seq[-1] == seq[0]:
+        alt = [f for f in pool
+               if f != seq[0] and (len(seq) < 2 or f != seq[-2])]
+        if alt:
+            seq[-1] = rng.choice(alt)
+
+    # Each frame gets its own random hold in [lo, hi] — varied pacing.
+    frame_lines = "\n".join(
+        f"    ANIMCMD_FRAME({i}, {rng.randint(lo, hi)})," for i in seq
+    )
+    slot_lines = "\n".join(
+        f"    [{slot}] = {anim_name}," for slot in _STANDARD_ANIM_SLOTS
+    )
+    return (
+        f"{open_s}\n"
+        f"// Random frame-cycle for {info_name} (PorySuite-Z generated).\n"
+        f"// A {len(seq)}-entry pre-shuffled sequence of every sheet frame\n"
+        f"// except index {CYCLE_SKIP_FRAME_INDEX} (VS-seeker / emote pose),\n"
+        f"// no two consecutive frames alike, each held a random {lo}-{hi}\n"
+        f"// tick span, looped with ANIMCMD_JUMP(0).  Every slot points at\n"
+        f"// the same loop: the sprite animates the same in all directions\n"
+        f"// and NEVER hFlips.  Drive it with MOVEMENT_TYPE_FRAME_CYCLE on a\n"
+        f"// non-inanimate object event.\n"
+        f"static const union AnimCmd {anim_name}[] = {{\n"
+        f"{frame_lines}\n"
+        f"    ANIMCMD_JUMP(0),\n"
+        f"}};\n"
+        f"\n"
+        f"static const union AnimCmd *const {table_name}[] = {{\n"
+        f"{slot_lines}\n"
+        f"}};\n"
+        f"{close_s}"
+    )
+
+
+def ensure_random_cycle_anim_table(
+    root: str, info_name: str, frame_count: int,
+    hold_min: int = 24, hold_max: int = 120,
+    seq_len: int = RANDOM_CYCLE_SEQUENCE_LENGTH,
+) -> Tuple[bool, str, List[str]]:
+    """Generate (or regenerate) a RANDOM-order frame-cycle anim table for
+    `info_name` in `object_event_anims.h`.
+
+    Each frame is held a random number of ticks in `[hold_min, hold_max]`, so
+    the cycle varies its pace instead of stepping at one fixed speed.
+
+    Shares the `_cycle_sentinels` block with the sequential
+    `ensure_cycle_anim_table` — the two modes are mutually exclusive per
+    sprite, so picking one replaces the other's block instead of leaving an
+    orphaned table behind.  The caller must repoint the sprite's `.anims` to
+    the returned symbol (the sequential and random tables have different
+    names, so a stale `.anims` would dangle).
+
+    Returns `(success, table_symbol, messages)`.
+    """
+    msgs: List[str] = []
+    table_name = random_cycle_table_symbol(info_name)
+
+    if frame_count < 2:
+        return False, table_name, [
+            f"{info_name}: a frame-cycle needs at least 2 frames "
+            f"(sheet resolves to {frame_count})"
+        ]
+
+    anims_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_anims.h"
+    )
+    if not os.path.isfile(anims_path):
+        return False, table_name, [f"missing {anims_path}"]
+
+    text = _read(anims_path)
+    block = _generate_random_cycle_block(
+        info_name, frame_count, hold_min, hold_max, seq_len)
+    open_s, close_s = _cycle_sentinels(info_name)
+
+    existing = re.compile(
+        re.escape(open_s) + r".*?" + re.escape(close_s), re.DOTALL,
+    )
+    if existing.search(text):
+        text = existing.sub(lambda _m: block, text, count=1)
+        msgs.append(f"Updated {table_name} in object_event_anims.h")
+    else:
+        text = text.rstrip() + "\n\n" + block + "\n"
+        msgs.append(f"Added {table_name} to object_event_anims.h")
+
+    if not _atomic_write_text(anims_path, text):
+        return False, table_name, [f"failed to write {anims_path}"]
+
+    return True, table_name, msgs
+
+
+# ──────────────── generic loop tables (project-wide, reusable) ──────────────
+#
+# Unlike the per-sprite cycle tables generated by ensure_cycle_anim_table /
+# ensure_random_cycle_anim_table, the GENERIC loop tables are a fixed set of
+# project-wide presets any sprite can share.  They cover the common case of
+# a sprite that has only a handful of frames and just needs to idle-cycle in
+# place — flickering torches, a two-frame breathing NPC, background filler
+# characters, decorative animated props, etc.
+#
+# Two ways to think about it:
+#
+#   - sAnimTable_<Name>Cycle / <Name>RandomCycle: per-sprite, sized to a
+#     specific sprite's frame count.  Assigning sprite B's table to sprite A
+#     produces wrong rendering if their frame counts differ.
+#
+#   - sAnimTable_Loop<N>Sequential / Loop<N>Random: project-wide presets, one
+#     per frame count.  Any sprite whose first N frames make a complete loop
+#     can opt in to the same table — no per-sprite generation needed, no
+#     cross-sprite mismatch, dropdown reads "Generic Loop · 2 frames ·
+#     sequential" so the user knows exactly what they're picking.
+#
+# Differences from the per-sprite cycle tables:
+#   - NO frame index is skipped.  The per-sprite cycles skip frame 9 because
+#     they're aimed at standard 10-frame NPC sheets where slot 9 is the
+#     VS-seeker emote pose.  Generic loops target sprites that have N (< 10)
+#     frames with no emote slot, so frames are dense from 0.
+#   - One shared definition lives in the project source forever — installed
+#     once via ensure_generic_loop_tables(root), idempotent on re-runs.
+#   - Drive any sprite using a generic loop with MOVEMENT_TYPE_FRAME_CYCLE,
+#     same as per-sprite cycles.  The engine support is identical.
+
+# Frame counts the toolkit ships generic presets for.  2-8 covers the typical
+# "small idle cycle" range; sprites with 9+ frames usually need the per-sprite
+# generator (and its frame-9 skip) anyway.
+GENERIC_LOOP_FRAME_COUNTS = (2, 3, 4, 5, 6, 7, 8)
+
+# Default per-frame hold for the sequential preset (game ticks at ~60/sec).
+# 16 ticks ≈ 0.27s per frame — reads as a comfortable idle pace.
+_GENERIC_SEQ_DURATION = 16
+
+# Random preset: each frame held a random hold in this range, so the cycle
+# varies its pace instead of metronome-stepping.  Matches the per-sprite
+# random-cycle defaults.
+_GENERIC_RND_HOLD_MIN = 20   # ~0.33s
+_GENERIC_RND_HOLD_MAX = 60   # ~1s
+_GENERIC_RND_SEQ_LEN = 64
+
+# Sentinel comments wrapping the whole generic-loop block so re-installs
+# replace cleanly without leaving stale duplicates.
+_GENERIC_LOOP_SENTINEL_OPEN = "// >>> PorySuite-Z generic loop tables >>>"
+_GENERIC_LOOP_SENTINEL_CLOSE = "// <<< PorySuite-Z generic loop tables <<<"
+
+
+def generic_loop_table_symbol(frame_count: int, randomized: bool) -> str:
+    """Symbol name for the generic loop preset of ``frame_count`` frames in
+    sequential (``randomized=False``) or random (``randomized=True``) order.
+
+    Same naming scheme as the per-sprite cycle tables but with the literal
+    ``Loop<N>`` instead of an ``<InfoName>`` — so the dropdown groups them
+    together and a project-wide grep finds every site at once.
+    """
+    suffix = "Random" if randomized else "Sequential"
+    return f"sAnimTable_Loop{frame_count}{suffix}"
+
+
+def _generic_loop_anim_name(frame_count: int, randomized: bool) -> str:
+    """The per-loop ``sAnim_*`` symbol referenced by the generic table."""
+    suffix = "Random" if randomized else "Sequential"
+    return f"sAnim_Loop{frame_count}{suffix}"
+
+
+def _generate_generic_loop_block() -> str:
+    """Return the full sentinel-fenced C source for every generic loop
+    table (both orderings × every frame count in
+    ``GENERIC_LOOP_FRAME_COUNTS``).
+
+    Sequential variants: every frame held ``_GENERIC_SEQ_DURATION`` ticks.
+    Random variants: a deterministic-but-pseudo-random pre-shuffled sequence
+    (seeded from the frame count so a re-install is byte-stable), each frame
+    held a random ``[_GENERIC_RND_HOLD_MIN, _GENERIC_RND_HOLD_MAX]`` ticks.
+    """
+    import random as _random
+    import zlib
+
+    parts: List[str] = [_GENERIC_LOOP_SENTINEL_OPEN]
+    parts.append(
+        "// Project-wide preset loops generated by PorySuite-Z.  Any sprite\n"
+        "// whose first N frames make a complete idle cycle can assign its\n"
+        "// .anims to one of these — no per-sprite table generation needed.\n"
+        "// Every direction slot points at the same loop, the sprite never\n"
+        "// hFlips, and NO frame index is skipped (these target sprites with\n"
+        "// no VS-seeker emote pose).  Drive the sprite with\n"
+        "// MOVEMENT_TYPE_FRAME_CYCLE on a non-inanimate object event."
+    )
+
+    # ── Sequential variants ─────────────────────────────────────────────
+    for n in GENERIC_LOOP_FRAME_COUNTS:
+        anim_name = _generic_loop_anim_name(n, randomized=False)
+        table_name = generic_loop_table_symbol(n, randomized=False)
+        frame_lines = "\n".join(
+            f"    ANIMCMD_FRAME({i}, {_GENERIC_SEQ_DURATION}),"
+            for i in range(n)
+        )
+        slot_lines = "\n".join(
+            f"    [{slot}] = {anim_name}," for slot in _STANDARD_ANIM_SLOTS
+        )
+        parts.append(
+            f"static const union AnimCmd {anim_name}[] = {{\n"
+            f"{frame_lines}\n"
+            f"    ANIMCMD_JUMP(0),\n"
+            f"}};\n"
+            f"static const union AnimCmd *const {table_name}[] = {{\n"
+            f"{slot_lines}\n"
+            f"}};"
+        )
+
+    # ── Random variants ─────────────────────────────────────────────────
+    for n in GENERIC_LOOP_FRAME_COUNTS:
+        anim_name = _generic_loop_anim_name(n, randomized=True)
+        table_name = generic_loop_table_symbol(n, randomized=True)
+        rng = _random.Random(
+            zlib.crc32(f"PorySuiteZ_GenericLoop_{n}".encode("utf-8")))
+        pool = list(range(n))
+        seq: List[int] = []
+        for _ in range(max(2, _GENERIC_RND_SEQ_LEN)):
+            choices = [f for f in pool if not seq or f != seq[-1]]
+            seq.append(rng.choice(choices) if choices else pool[0])
+        # Avoid same-frame at the ANIMCMD_JUMP wrap (last == first).
+        if len(pool) > 1 and seq[-1] == seq[0]:
+            alt = [f for f in pool
+                   if f != seq[0] and (len(seq) < 2 or f != seq[-2])]
+            if alt:
+                seq[-1] = rng.choice(alt)
+        frame_lines = "\n".join(
+            f"    ANIMCMD_FRAME({i}, "
+            f"{rng.randint(_GENERIC_RND_HOLD_MIN, _GENERIC_RND_HOLD_MAX)}),"
+            for i in seq
+        )
+        slot_lines = "\n".join(
+            f"    [{slot}] = {anim_name}," for slot in _STANDARD_ANIM_SLOTS
+        )
+        parts.append(
+            f"static const union AnimCmd {anim_name}[] = {{\n"
+            f"{frame_lines}\n"
+            f"    ANIMCMD_JUMP(0),\n"
+            f"}};\n"
+            f"static const union AnimCmd *const {table_name}[] = {{\n"
+            f"{slot_lines}\n"
+            f"}};"
+        )
+
+    parts.append(_GENERIC_LOOP_SENTINEL_CLOSE)
+    return "\n\n".join(parts)
+
+
+def ensure_generic_loop_tables(root: str) -> Tuple[bool, List[str]]:
+    """Install (or refresh) the project-wide generic loop tables.
+
+    Two orderings (Sequential / Random) × every frame count in
+    ``GENERIC_LOOP_FRAME_COUNTS`` get written into
+    ``object_event_anims.h`` inside a single sentinel-fenced block.  A
+    re-run replaces the block wholesale, never duplicates.
+
+    Returns ``(success, messages)``.  An installation that already matches
+    the current generator output is a clean no-op (empty messages list).
+    """
+    msgs: List[str] = []
+    anims_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_anims.h",
+    )
+    if not os.path.isfile(anims_path):
+        return False, [f"missing {anims_path}"]
+
+    text = _read(anims_path)
+    block = _generate_generic_loop_block()
+
+    existing = re.compile(
+        re.escape(_GENERIC_LOOP_SENTINEL_OPEN) + r".*?"
+        + re.escape(_GENERIC_LOOP_SENTINEL_CLOSE),
+        re.DOTALL,
+    )
+    if existing.search(text):
+        new_text = existing.sub(lambda _m: block, text, count=1)
+        action = "Refreshed"
+    else:
+        new_text = text.rstrip() + "\n\n" + block + "\n"
+        action = "Installed"
+
+    if new_text == text:
+        return True, []
+    if not _atomic_write_text(anims_path, new_text):
+        return False, [f"failed to write {anims_path}"]
+    msgs.append(
+        f"{action} generic loop tables in object_event_anims.h "
+        f"({len(GENERIC_LOOP_FRAME_COUNTS)} frame counts × 2 orderings)"
+    )
+    return True, msgs
+
+
+# ──────────────────── frame-cycle movement type ─────────────────────────────
+#
+# A frame-cycle entity must be placed in Porymap with MOVEMENT_TYPE_FRAME_CYCLE
+# — NOT MOVEMENT_TYPE_NONE.
+#
+# Why a dedicated movement type exists:  MOVEMENT_TYPE_NONE has an *empty*
+# movement callback — once the entity spawns the engine never touches it
+# again.  That looks fine until the player talks to the entity.  A talk
+# script runs `lock` (freezes the object, pausing its animation) and
+# `faceplayer` (issues a face-direction held movement that ends in the engine
+# function FaceDirection(), which sets sprite->animPaused = TRUE).  `release`
+# restores the pre-freeze pause state, but with an empty callback NOTHING
+# re-drives the animation afterwards, so the entity is left frozen on a single
+# frame.  Ordinary idle NPCs escape this because their movement callbacks
+# (LookAround, FaceDirection, …) run every frame and keep re-issuing movement.
+#
+# MovementType_FrameCycle is that missing callback: every idle frame it
+# re-clears animPaused (and disableAnim), so the cycle animation free-runs
+# forever no matter what a conversation did to the sprite.
+
+FRAME_CYCLE_MOVEMENT_TYPE = "MOVEMENT_TYPE_FRAME_CYCLE"
+FRAME_CYCLE_MOVEMENT_FUNC = "MovementType_FrameCycle"
+
+
+def _fc_movement_function_block() -> str:
+    """The C source for MovementType_FrameCycle + its per-frame callback."""
+    return (
+        "// >>> PorySuite-Z frame-cycle movement type >>>\n"
+        "// A stationary entity whose animation table free-runs forever.\n"
+        "// Unlike MovementType_None (an empty callback), the callback below\n"
+        "// re-clears animPaused every idle frame, so a conversation cannot\n"
+        "// leave the entity frozen: `lock` and `faceplayer` both pause the\n"
+        "// sprite, and with an empty callback nothing un-pauses it again.\n"
+        "// PorySuite-Z's Frame Cycle tool drives its sprites with this type.\n"
+        "static u8 MovementType_FrameCycle_callback(struct ObjectEvent *, struct Sprite *);\n"
+        "void MovementType_FrameCycle(struct Sprite *sprite)\n"
+        "{\n"
+        "    UpdateObjectEventCurrentMovement(&gObjectEvents[sprite->data[0]], sprite, MovementType_FrameCycle_callback);\n"
+        "}\n"
+        "static u8 MovementType_FrameCycle_callback(struct ObjectEvent *objectEvent, struct Sprite *sprite)\n"
+        "{\n"
+        "    sprite->animPaused = FALSE;\n"
+        "    objectEvent->disableAnim = FALSE;\n"
+        "    return 0;\n"
+        "}\n"
+        "// <<< PorySuite-Z frame-cycle movement type <<<"
+    )
+
+
+def _fc_insert_before_array_close(
+    text: str, array_decl_re: str, entry_line: str,
+) -> Tuple[bool, str]:
+    """Insert `entry_line` just before the closing `};` of the C array whose
+    declaration matches `array_decl_re`.
+
+    The frame-cycle target arrays (`sMovementTypeCallbacks`,
+    `gInitialMovementTypeFacingDirections`) are flat designated-initializer
+    lists with no nested braces, so the first `\\n};` after the declaration is
+    reliably the array's close.
+    """
+    m = re.search(array_decl_re, text)
+    if not m:
+        return False, text
+    close = text.find("\n};", m.end())
+    if close < 0:
+        return False, text
+    # text[:close + 1] keeps the newline that ends the last entry; entry_line
+    # ends in its own newline; text[close + 1:] starts at "};".
+    return True, text[:close + 1] + entry_line + text[close + 1:]
+
+
+def ensure_frame_cycle_movement_type(root: str) -> Tuple[bool, List[str]]:
+    """Install MOVEMENT_TYPE_FRAME_CYCLE engine support (idempotent).
+
+    Five engine edits, each guarded by a unique marker so the call is safe to
+    repeat and a partially-applied install self-heals on the next call:
+
+      1. include/constants/event_object_movement.h — define the constant and
+         bump MOVEMENT_TYPES_COUNT by one.
+      2. src/event_object_movement.c — forward-declare MovementType_FrameCycle.
+      3. src/event_object_movement.c — register it in sMovementTypeCallbacks[].
+      4. src/event_object_movement.c — give it a sensible initial facing in
+         gInitialMovementTypeFacingDirections[].
+      5. src/event_object_movement.c — define MovementType_FrameCycle and its
+         per-frame callback.
+
+    Project-agnostic: the new constant takes whatever MOVEMENT_TYPES_COUNT
+    currently is (vanilla 0x51, or higher on a fork that added its own types),
+    and the count is bumped from that — no hardcoded numbering.
+
+    Returns (success, messages).
+    """
+    msgs: List[str] = []
+
+    hdr = os.path.join(
+        root, "include", "constants", "event_object_movement.h")
+    src = os.path.join(root, "src", "event_object_movement.c")
+    for p in (hdr, src):
+        if not os.path.isfile(p):
+            return False, [f"missing {p}"]
+
+    # ── Edit 1: header constant + MOVEMENT_TYPES_COUNT bump ──────────────
+    htext = _read(hdr)
+    if re.search(r"\bMOVEMENT_TYPE_FRAME_CYCLE\b", htext):
+        msgs.append("MOVEMENT_TYPE_FRAME_CYCLE already defined")
+    else:
+        m = re.search(
+            r"^([ \t]*#define[ \t]+MOVEMENT_TYPES_COUNT[ \t]+)"
+            r"(0[xX][0-9A-Fa-f]+|\d+)[ \t]*$",
+            htext, re.MULTILINE,
+        )
+        if not m:
+            return False, [
+                "could not find the MOVEMENT_TYPES_COUNT #define in "
+                "event_object_movement.h"]
+        count_txt = m.group(2)
+        is_hex = count_txt[:2].lower() == "0x"
+        count_val = int(count_txt, 16) if is_hex else int(count_txt, 10)
+        new_count = count_val + 1
+        if is_hex:
+            new_val_s, new_count_s = f"0x{count_val:02X}", f"0x{new_count:02X}"
+        else:
+            new_val_s, new_count_s = str(count_val), str(new_count)
+        value_col = len(m.group(1))            # column the value starts at
+        new_define = "#define " + FRAME_CYCLE_MOVEMENT_TYPE
+        pad = " " * max(1, value_col - len(new_define))
+        block = (
+            "// >>> PorySuite-Z frame-cycle movement type >>>\n"
+            f"{new_define}{pad}{new_val_s}\n"
+            "// <<< PorySuite-Z frame-cycle movement type <<<\n"
+            f"{m.group(1)}{new_count_s}"
+        )
+        htext = htext.replace(m.group(0), block, 1)
+        if not _atomic_write_text(hdr, htext):
+            return False, [f"failed to write {hdr}"]
+        msgs.append(
+            f"event_object_movement.h: added {FRAME_CYCLE_MOVEMENT_TYPE} = "
+            f"{new_val_s}, MOVEMENT_TYPES_COUNT -> {new_count_s}")
+
+    # ── Edits 2-5: event_object_movement.c ───────────────────────────────
+    stext = _read(src)
+    before = stext
+
+    # Edit 2 — forward declaration (used by sMovementTypeCallbacks below)
+    fwd_decl = "static void MovementType_FrameCycle(struct Sprite *);"
+    if fwd_decl not in stext:
+        anchor = "static void MovementType_None(struct Sprite *);"
+        if anchor not in stext:
+            return False, [
+                "could not find the MovementType_None forward declaration "
+                "in event_object_movement.c"]
+        stext = stext.replace(
+            anchor,
+            anchor + "\n" + fwd_decl + "  // PorySuite-Z frame-cycle",
+            1,
+        )
+        msgs.append("event_object_movement.c: forward-declared "
+                    "MovementType_FrameCycle")
+
+    # Edit 3 — register in sMovementTypeCallbacks[]
+    cb_entry = "[MOVEMENT_TYPE_FRAME_CYCLE] = MovementType_FrameCycle,"
+    if cb_entry not in stext:
+        ok, stext = _fc_insert_before_array_close(
+            stext,
+            r"sMovementTypeCallbacks\[MOVEMENT_TYPES_COUNT\]",
+            "    " + cb_entry + "  // PorySuite-Z frame-cycle\n",
+        )
+        if not ok:
+            return False, [
+                "could not locate sMovementTypeCallbacks[] in "
+                "event_object_movement.c"]
+        msgs.append("event_object_movement.c: registered MovementType_"
+                    "FrameCycle in sMovementTypeCallbacks[]")
+
+    # Edit 4 — initial facing direction
+    dir_entry = "[MOVEMENT_TYPE_FRAME_CYCLE] = DIR_SOUTH,"
+    if dir_entry not in stext:
+        ok, stext = _fc_insert_before_array_close(
+            stext,
+            r"gInitialMovementTypeFacingDirections\[MOVEMENT_TYPES_COUNT\]",
+            "    " + dir_entry + "  // PorySuite-Z frame-cycle\n",
+        )
+        if not ok:
+            return False, [
+                "could not locate gInitialMovementTypeFacingDirections[] in "
+                "event_object_movement.c"]
+        msgs.append("event_object_movement.c: added frame-cycle entry to "
+                    "gInitialMovementTypeFacingDirections[]")
+
+    # Edit 5 — the function definition
+    if "void MovementType_FrameCycle(struct Sprite *sprite)" not in stext:
+        anchor = "movement_type_empty_callback(MovementType_None)"
+        if anchor not in stext:
+            return False, [
+                "could not find movement_type_empty_callback(MovementType_"
+                "None) in event_object_movement.c"]
+        stext = stext.replace(
+            anchor,
+            anchor + "\n\n" + _fc_movement_function_block(),
+            1,
+        )
+        msgs.append("event_object_movement.c: defined MovementType_FrameCycle")
+
+    if stext != before:
+        if not _atomic_write_text(src, stext):
+            return False, [f"failed to write {src}"]
+
+    return True, msgs

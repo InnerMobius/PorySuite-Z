@@ -731,20 +731,12 @@ class PianoRollWindow(QMainWindow):
 
     def _on_track_instrument(self, track_index: int, voice_slot: int):
         """User changed the instrument for a track via the sidebar spinner."""
-        import traceback, os, time
-        log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'voice_debug.log')
-        with open(log_path, 'a', encoding='utf-8') as _f:
-            _f.write(f"[{time.strftime('%H:%M:%S')}] _on_track_instrument: track={track_index} voice={voice_slot}\n")
-            traceback.print_stack(limit=8, file=_f)
-            _f.write('\n')
         if 0 <= track_index < len(self._song.tracks):
             track = self._song.tracks[track_index]
             # Update the VOICE command in the track
             found = False
             for cmd in track.commands:
                 if cmd.cmd == 'VOICE':
-                    with open(log_path, 'a', encoding='utf-8') as _f:
-                        _f.write(f"  overwriting VOICE {cmd.value} -> {voice_slot}\n")
                     cmd.value = voice_slot
                     found = True
                     break
@@ -994,6 +986,21 @@ class PianoRollWindow(QMainWindow):
         notes = self._piano_roll.canvas.get_notes()
         track_states = extract_track_play_states(self._song)
 
+        # Capture the LIVE tick-0 TEMPO value before the loop replaces
+        # any track.commands.  The BPM slider (_on_bpm) mutates the live
+        # song's TEMPO command in place, but _original_track_commands is
+        # a snapshot frozen at piano-roll-open time — without passing the
+        # live value through, notes_to_track_commands would reuse the
+        # stale snapshot TEMPO and silently revert the user's BPM edit.
+        live_tempo = None
+        for _trk in self._song.tracks:
+            for _cmd in _trk.commands:
+                if _cmd.cmd == 'TEMPO' and _cmd.value is not None:
+                    live_tempo = _cmd.value
+                    break
+            if live_tempo is not None:
+                break
+
         # Get loop region from the piano roll canvas
         loop_start = self._piano_roll.canvas._loop_start
         loop_end = self._piano_roll.canvas._loop_end
@@ -1009,18 +1016,11 @@ class PianoRollWindow(QMainWindow):
 
         _EDITABLE_CTRL = {'BEND', 'BENDR', 'VOL', 'PAN'}
 
-        import os, time as _time
-        _log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'voice_debug.log')
-        with open(_log_path, 'a', encoding='utf-8') as _f:
-            _f.write(f"\n[{_time.strftime('%H:%M:%S')}] === SAVE START ===\n")
-
         for i, track in enumerate(self._song.tracks):
             ts = track_states.get(i)
             voice = ts.voice if ts else 0
             volume = ts.volume if ts else 100
             pan = ts.pan if ts else 64
-            with open(_log_path, 'a', encoding='utf-8') as _f:
-                _f.write(f"  Track {i}: voice={voice} vol={volume} pan={pan}\n")
 
             # Use the ORIGINAL commands from when the song was loaded,
             # not the current (potentially already-synced) commands.
@@ -1105,6 +1105,7 @@ class PianoRollWindow(QMainWindow):
                 loop_end_tick=loop_end,
                 loop_label=track_loop_label,
                 original_commands=orig_cmds,
+                tempo=live_tempo,
             )
 
     def has_unsaved_changes(self) -> bool:

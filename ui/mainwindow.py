@@ -4,6 +4,7 @@ import sys
 import json
 import copy
 import datetime
+import shutil
 import subprocess
 import logging
 from contextlib import contextmanager
@@ -383,11 +384,6 @@ class MainWindow(QMainWindow):
         # requiring save.
         self.trainer_class_editor.class_name_edited.connect(
             self.trainers_editor.apply_class_name
-        )
-        # Rename... button → open shared RenameDialog and drive the rename
-        # through refactor_service (cross-project source-file rename).
-        self.trainer_class_editor.rename_class_requested.connect(
-            self._on_trainer_class_rename
         )
 
         self.trainer_graphics_tab = TrainerGraphicsTab()
@@ -2737,18 +2733,222 @@ QTabBar::tab:hover:!selected {
         worker = _PushWorker(self._git_exe(), project_dir, branch)
         self._git_worker = worker
 
+        # Capture remote URL for the success dialog so the user can copy
+        # it (handy for opening the repo in a browser to verify the
+        # commits landed).
+        captured_remote_url = (remote_url or "").strip()
+
         def _on_done(ok: bool, msg: str):
             self._refresh_action.setEnabled(True)
             self._git_set_all_enabled(True)
+            self._git_refresh_status_bar()
             if ok:
-                self.statusBar().showMessage(f"Push complete: {branch} → origin", 5000)
-                self._git_refresh_status_bar()
+                self.statusBar().showMessage(
+                    f"Push complete: {branch} → origin", 5000)
+                self._show_push_success_dialog(branch, captured_remote_url, msg)
             else:
                 self.statusBar().showMessage("Push failed.", 4000)
-                QMessageBox.critical(self, "Push Failed", f"git reported:\n\n{msg}")
+                self._show_push_failure_dialog(branch, msg)
 
         worker.done.connect(_on_done)
         worker.start()
+
+    # ── Push result dialogs ───────────────────────────────────────────────
+
+    def _show_push_success_dialog(
+        self, branch: str, remote_url: str, output: str,
+    ) -> None:
+        """Explicit success confirmation after a push completes.
+
+        The status bar already shows ``Push complete: <branch> → origin``
+        for 5 seconds, but that's easy to miss if the user has tabbed
+        away.  This dialog is the visible "yes it worked" signal — short
+        body, full git output behind Show Details, OK button to close.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Push Complete")
+        box.setText(f"Pushed <b>{branch}</b> to origin successfully.")
+        info_lines = []
+        if remote_url:
+            info_lines.append(f"Remote: {remote_url}")
+        info_lines.append(
+            "The remote branch is now up to date with your local commits."
+        )
+        box.setInformativeText("\n\n".join(info_lines))
+        if output:
+            box.setDetailedText(output)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def _show_push_failure_dialog(self, branch: str, output: str) -> None:
+        """Categorise the failure via ``git_push_errors.classify_push_error``
+        and show an actionable dialog.  Auth failures get a one-click
+        Re-authenticate button that launches ``gh auth login`` in a new
+        terminal so the user doesn't have to leave the app.  Other
+        categories surface plain-English next-step guidance with the raw
+        git output behind Show Details.
+        """
+        try:
+            from core.git_push_errors import classify_push_error
+            category = classify_push_error(output)
+        except Exception:
+            category = None
+
+        if category == "auth":
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle("Push Failed — Authentication")
+            box.setText(
+                "GitHub rejected your credentials when pushing "
+                f"<b>{branch}</b>."
+            )
+            box.setInformativeText(
+                "Your stored token has likely expired or been revoked.\n\n"
+                "Click <b>Re-authenticate</b> below to launch <code>gh auth login</code> "
+                "in a new terminal window, follow the prompts, then return "
+                "here and click Push again.\n\n"
+                "If you'd rather fix it manually, run <code>gh auth login</code> "
+                "(or update your Git credential manager) in a terminal."
+            )
+            box.setDetailedText(output)
+            reauth_btn = box.addButton(
+                "Re-authenticate (gh auth login)",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            box.addButton(QMessageBox.StandardButton.Close)
+            box.setDefaultButton(reauth_btn)
+            box.exec()
+            if box.clickedButton() is reauth_btn:
+                self._launch_gh_auth_login()
+            return
+
+        if category == "non_fast_forward":
+            QMessageBox.warning(
+                self, "Push Failed — Pull First",
+                f"<b>{branch}</b> is behind the remote, so the push was rejected.\n\n"
+                "Pull the remote changes first (Git → Pull), resolve any "
+                "merge conflicts if they come up, then try Push again.\n\n"
+                "<b>Git output:</b>\n" + output
+            )
+            return
+
+        if category == "network":
+            QMessageBox.critical(
+                self, "Push Failed — Network",
+                "PorySuite-Z couldn't reach the remote.\n\n"
+                "Check your internet connection, then try Push again.  If "
+                "you're on a VPN or behind a firewall, that may be blocking "
+                "the connection.\n\n"
+                "<b>Git output:</b>\n" + output
+            )
+            return
+
+        if category == "no_repo":
+            QMessageBox.critical(
+                self, "Push Failed — Repo Not Found",
+                "The remote repository doesn't exist, or your account no "
+                "longer has access to it.\n\n"
+                "Verify the remote URL via <b>Git → Configure Remote…</b>.  "
+                "If the URL is correct, make sure you've been added as a "
+                "collaborator on the GitHub repo.\n\n"
+                "<b>Git output:</b>\n" + output
+            )
+            return
+
+        if category == "protected_branch":
+            QMessageBox.warning(
+                self, "Push Failed — Branch Protection",
+                f"The remote blocked the push to <b>{branch}</b> because of "
+                "branch-protection rules (required reviews, required CI "
+                "checks, etc.).\n\n"
+                "Either push to a feature branch and open a pull request, "
+                "or have an admin loosen the protection rules.\n\n"
+                "<b>Git output:</b>\n" + output
+            )
+            return
+
+        # Unknown / unhandled — fall back to the original generic dialog
+        # but with Show Details so the raw output is at least scrollable.
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Push Failed")
+        box.setText(f"git push to <b>{branch}</b> failed.")
+        box.setInformativeText(
+            "PorySuite-Z couldn't classify this error automatically.  "
+            "Click <b>Show Details</b> for the raw git output — if it "
+            "mentions authentication or credentials, run <code>gh auth login</code> "
+            "and try again."
+        )
+        box.setDetailedText(output)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        box.exec()
+
+    def _launch_gh_auth_login(self) -> None:
+        """Launch ``gh auth login`` in a new console window so the user
+        can do the interactive auth flow.
+
+        On Windows: opens a new ``cmd`` window with the gh command pre-
+        typed.  On macOS / Linux: best-effort attempt via the platform's
+        default terminal.  Falls back to a clear instructional dialog if
+        gh isn't installed.
+        """
+        gh_path = shutil.which("gh")
+        if not gh_path:
+            QMessageBox.warning(
+                self, "GitHub CLI Not Found",
+                "PorySuite-Z couldn't find the <code>gh</code> command on your "
+                "system.\n\n"
+                "Install GitHub CLI from <a href='https://cli.github.com/'>"
+                "cli.github.com</a>, then run <code>gh auth login</code> in a "
+                "terminal.\n\n"
+                "Once you've logged in, return here and click Push again."
+            )
+            return
+
+        try:
+            if os.name == "nt":
+                # New cmd window left open after the command runs so the
+                # user can see the auth flow output.  /k = keep window
+                # open after the command exits.
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "cmd", "/k", f"\"{gh_path}\" auth login"],
+                    shell=False,
+                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+                )
+            elif sys.platform == "darwin":
+                # macOS — open in Terminal.app via osascript.
+                subprocess.Popen([
+                    "osascript", "-e",
+                    f'tell app "Terminal" to do script "{gh_path} auth login"'
+                ])
+            else:
+                # Linux — try a few common terminals in order.
+                for term in ("x-terminal-emulator", "gnome-terminal",
+                             "konsole", "xterm"):
+                    if shutil.which(term):
+                        subprocess.Popen([term, "-e", gh_path, "auth", "login"])
+                        break
+                else:
+                    raise RuntimeError("no supported terminal found")
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Launch Failed",
+                "Couldn't open a terminal automatically.\n\n"
+                f"Open a terminal yourself and run:\n\n"
+                f"<code>{gh_path} auth login</code>\n\n"
+                f"(Error: {exc})"
+            )
+            return
+
+        QMessageBox.information(
+            self, "Re-authentication Started",
+            "A new terminal window has been opened with <code>gh auth login</code>.\n\n"
+            "Follow the prompts there (it usually opens a browser tab for "
+            "GitHub login).\n\n"
+            "When the terminal says <i>Logged in as &lt;your-username&gt;</i>, "
+            "return here and click Push again."
+        )
 
     def _combo_wheel_filter(self):
         """Return a shared event filter that blocks wheel events on unfocused combo boxes."""
@@ -7952,146 +8152,6 @@ QTabBar::tab:hover:!selected {
             import traceback
             traceback.print_exc()
 
-    def _on_trainer_class_rename(self, old_const: str):
-        """Rename a TRAINER_CLASS_* constant across the whole project.
-
-        Mirrors _on_ability_rename / _on_move_rename: opens the shared
-        RenameDialog (display name + auto-derived constant), drives the
-        source-file pass through refactor_service.rename_trainer_class,
-        and calls into the Trainer Class editor to update its in-memory
-        caches so the list text + detail panel stay consistent without
-        a full reload.
-        """
-        if not self.source_data or not old_const:
-            return
-        try:
-            from ui.custom_widgets.rename_dialog import RenameDialog
-            dlg = RenameDialog(
-                self, prefix="TRAINER_CLASS_",
-                entity_type="Trainer Class", show_display=True,
-            )
-            dlg.set_old_constant(old_const)
-
-            tce = getattr(self, "trainer_class_editor", None)
-            # Pre-populate display name from the editor's current view of
-            # the class (picks up any in-progress _dirty_names edit).
-            cur_name = ""
-            if tce is not None:
-                try:
-                    cur_name = tce._dirty_names.get(
-                        old_const, tce._names.get(old_const, "")
-                    )
-                except Exception:
-                    cur_name = ""
-            if not cur_name:
-                base = old_const[len("TRAINER_CLASS_"):] if old_const.startswith("TRAINER_CLASS_") else old_const
-                cur_name = base.replace("_", " ").title()
-            dlg.set_display_name(cur_name)
-
-            # Live preview of source-file hits
-            def _preview():
-                _, new_const, display_name = dlg.get_values()
-                if new_const and new_const != old_const:
-                    try:
-                        svc = getattr(getattr(self, "source_data", None), "refactor_service", None)
-                        if svc:
-                            previews = svc.rename_trainer_class(
-                                old_const, new_const,
-                                display_name=display_name or "",
-                                preview=True,
-                            )
-                            dlg.set_preview(previews or [])
-                    except Exception:
-                        pass
-            dlg.suffix_edit.textChanged.connect(_preview)
-            try:
-                dlg.display_edit.textChanged.connect(_preview)
-            except Exception:
-                pass
-
-            if dlg.exec() != QDialog.DialogCode.Accepted:
-                return
-            _, new_const, display_name = dlg.get_values()
-            if not new_const:
-                return
-
-            const_changed = new_const != old_const
-            # Pull the ORIGINAL on-disk display name for comparison. Anything
-            # the user typed into the live-name field counts as a pending
-            # edit, not the "old" value.
-            original_display = ""
-            if tce is not None:
-                try:
-                    original_display = tce._names.get(old_const, "")
-                except Exception:
-                    original_display = ""
-            display_changed = display_name != original_display
-
-            if not const_changed and not display_changed:
-                return
-
-            previews = []
-            if const_changed:
-                svc = getattr(getattr(self, "source_data", None), "refactor_service", None)
-                if svc is None:
-                    QMessageBox.warning(self, "Rename", "Refactor service unavailable.")
-                    return
-                previews = svc.rename_trainer_class(
-                    old_const, new_const,
-                    display_name=display_name or "",
-                )
-
-            # Update the class editor's in-memory state in place so the list
-            # and detail panel immediately show the new name/constant.
-            if tce is not None:
-                try:
-                    tce.rename_class_key(old_const, new_const, display_name or "")
-                except Exception:
-                    import traceback; traceback.print_exc()
-                # Track display-name rename so Save writes the new string
-                # to trainer_class_names.h even if only the display changed.
-                if not const_changed and display_changed:
-                    try:
-                        tce._dirty_names[old_const] = display_name or ""
-                    except Exception:
-                        pass
-
-            # Also update the Trainers editor's cached class-name map so
-            # the "class" column / picker shows the new name without reload.
-            try:
-                if hasattr(self.trainers_editor, "apply_class_name"):
-                    target_const = new_const if const_changed else old_const
-                    self.trainers_editor.apply_class_name(
-                        target_const, display_name or ""
-                    )
-            except Exception:
-                pass
-
-            self.setWindowModified(True)
-
-            if const_changed:
-                n = len(previews)
-                maybe_exec(
-                    key="rename_queued_trainer_class",
-                    parent=self,
-                    title="Rename Queued",
-                    text=(
-                        f"Trainer class rename  {old_const}  \u2192  {new_const}  staged.\n"
-                        f"{n} reference(s) found in source files.\n\n"
-                        "Changes will be written to disk on File \u2192 Save."
-                    ),
-                )
-            else:
-                maybe_exec(
-                    key="rename_queued_trainer_class",
-                    parent=self,
-                    title="Name Updated",
-                    text=f"Display name changed to \"{display_name}\".",
-                )
-        except Exception:
-            import traceback
-            traceback.print_exc()
-
     def _jump_to_species(self, species_const: str):
         """Jump to a species in the Pokemon tab."""
         try:
@@ -10079,37 +10139,14 @@ QTabBar::tab:hover:!selected {
 
             # Save general data
             if hasattr(self, "source_data") and self.source_data is not None:
-                # Optional review of C header write-backs for safety
-                confirm_headers = True
-                try:
-                    pmoves = self.source_data.data.get("pokemon_moves")
-                    preview = pmoves.plan_writebacks() if pmoves and hasattr(pmoves, "plan_writebacks") else {}
-                    if preview:
-                        lines = ["The following headers will be updated:"]
-                        for path, species in preview.items():
-                            if not species:
-                                continue
-                            lst = ", ".join(species[:5]) + ("..." if len(species) > 5 else "")
-                            lines.append(f"- {path}: {len(species)} species ({lst})")
-                        lines.append("\nProceed with writing these changes?")
-                        msg = "\n".join(lines)
-                        # Re-enable central widget while showing the confirmation dialog
-                        if central:
-                            central.setUpdatesEnabled(True)
-                        ret = maybe_exec(
-                            key="save_header_confirm",
-                            parent=self,
-                            title="Apply C Header Changes",
-                            text=msg,
-                            icon=QMessageBox.Icon.Question,
-                            buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                            default_button=QMessageBox.StandardButton.Yes,
-                        )
-                        confirm_headers = ret == QMessageBox.StandardButton.Yes
-                        if central:
-                            central.setUpdatesEnabled(False)
-                except Exception:
-                    pass
+                # Header regeneration below is UNCONDITIONAL.  A former
+                # "Apply C Header Changes?" confirmation dialog used to gate
+                # the whole header-writing block — but save_data() above had
+                # ALREADY written every src/data/*.json, so clicking "No"
+                # silently desynced the .h files from the JSON: a renamed
+                # trainer kept its old name in-game while the editor (which
+                # reads the JSON) showed the new one.  A save must always
+                # write both halves, so that veto has been removed.
 
                 # If there are staged renames, apply them first and reload, then avoid
                 # reassigning dex numbers this save to preserve ordering.
@@ -10223,84 +10260,93 @@ QTabBar::tab:hover:!selected {
                 dlg.log_line("Project JSON saved")
 
                 dlg.step("Writing C headers")
-                if confirm_headers:
-                    # Write species stats directly to species_info.h — this
-                    # bypasses the broken plugin parse_to_c_code pipeline and
-                    # mirrors the approach used by the evolution editor.
-                    n_patched = self._write_species_info_header()
-                    if n_patched >= 0:
-                        dlg.log_line(f"species_info.h updated ({n_patched} species patched)")
-                    else:
-                        dlg.log_line("species_info.h: skipped (file not found or error)")
+                # Header writes are UNCONDITIONAL — save() above already wrote
+                # every src/data/*.json, so the matching .h files must always
+                # be regenerated in the same save or the build compiles stale
+                # headers (the json/header-split bug).
+                # Write species stats directly to species_info.h — this
+                # bypasses the broken plugin parse_to_c_code pipeline and
+                # mirrors the approach used by the evolution editor.
+                n_patched = self._write_species_info_header()
+                if n_patched >= 0:
+                    dlg.log_line(f"species_info.h updated ({n_patched} species patched)")
+                else:
+                    dlg.log_line("species_info.h: skipped (file not found or error)")
 
-                    # Write pokedex entries (category) and description text
-                    n_dex = self._write_pokedex_entries_header()
-                    if n_dex and n_dex > 0:
-                        dlg.log_line(f"pokedex_entries.h updated ({n_dex} categories)")
-                    n_desc = self._write_pokedex_text_header()
-                    if n_desc and n_desc > 0:
-                        dlg.log_line(f"pokedex_text_fr.h updated ({n_desc} descriptions)")
+                # Write pokedex entries (category) and description text
+                n_dex = self._write_pokedex_entries_header()
+                if n_dex and n_dex > 0:
+                    dlg.log_line(f"pokedex_entries.h updated ({n_dex} categories)")
+                n_desc = self._write_pokedex_text_header()
+                if n_desc and n_desc > 0:
+                    dlg.log_line(f"pokedex_text_fr.h updated ({n_desc} descriptions)")
 
-                    # Write moves/learnsets directly to C headers
-                    n_moves = self._write_moves_headers()
-                    if n_moves >= 0:
-                        dlg.log_line(f"Learnset headers updated ({n_moves} species patched)")
-                    else:
-                        dlg.log_line("Learnset headers: skipped (error)")
+                # Write moves/learnsets directly to C headers
+                n_moves = self._write_moves_headers()
+                if n_moves >= 0:
+                    dlg.log_line(f"Learnset headers updated ({n_moves} species patched)")
+                else:
+                    dlg.log_line("Learnset headers: skipped (error)")
 
-                    # Regenerate items.h from items.json
-                    n_items = self._write_items_header()
-                    if n_items >= 0:
-                        dlg.log_line(f"items.h regenerated ({n_items} items)")
-                    else:
-                        dlg.log_line("items.h: skipped (file not found or error)")
+                # Regenerate items.h from items.json
+                n_items = self._write_items_header()
+                if n_items >= 0:
+                    dlg.log_line(f"items.h regenerated ({n_items} items)")
+                else:
+                    dlg.log_line("items.h: skipped (file not found or error)")
 
-                    # Write new move entries to header files if any were added
-                    try:
-                        new_moves_set = self.ui.moves_widget.get_new_moves() if hasattr(self.ui, "moves_widget") else set()
-                        if new_moves_set:
-                            all_moves = self.source_data.get_pokemon_moves() or {}
-                            all_descs = {}
-                            try:
-                                pm = self.source_data.data.get("pokemon_moves")
-                                if pm and pm.data:
-                                    all_descs = pm.data.get("move_descriptions", {})
-                            except Exception:
-                                pass
-                            new_moves_data = {k: all_moves[k] for k in new_moves_set if k in all_moves}
-                            dlg.step("Writing new move headers")
-                            nc = self._write_new_move_constants(new_moves_data)
-                            if nc > 0:
-                                dlg.log_line(f"moves.h: {nc} new constants added")
-                            nn = self._write_new_move_names(new_moves_data)
-                            if nn > 0:
-                                dlg.log_line(f"move_names.h: {nn} new names added")
-                            nd = self._write_new_move_descriptions(new_moves_data, all_descs)
-                            if nd > 0:
-                                dlg.log_line(f"move_descriptions.c: {nd} new descriptions added")
-                            na = self._write_new_move_animations(new_moves_data)
-                            if na > 0:
-                                dlg.log_line(f"battle_anim_scripts.s: {na} new animation entries added")
-                            self.ui.moves_widget.clear_new_moves()
-                    except Exception:
-                        pass
+                # Write new move entries to header files if any were added
+                try:
+                    new_moves_set = self.ui.moves_widget.get_new_moves() if hasattr(self.ui, "moves_widget") else set()
+                    if new_moves_set:
+                        all_moves = self.source_data.get_pokemon_moves() or {}
+                        all_descs = {}
+                        try:
+                            pm = self.source_data.data.get("pokemon_moves")
+                            if pm and pm.data:
+                                all_descs = pm.data.get("move_descriptions", {})
+                        except Exception:
+                            pass
+                        new_moves_data = {k: all_moves[k] for k in new_moves_set if k in all_moves}
+                        dlg.step("Writing new move headers")
+                        nc = self._write_new_move_constants(new_moves_data)
+                        if nc > 0:
+                            dlg.log_line(f"moves.h: {nc} new constants added")
+                        nn = self._write_new_move_names(new_moves_data)
+                        if nn > 0:
+                            dlg.log_line(f"move_names.h: {nn} new names added")
+                        nd = self._write_new_move_descriptions(new_moves_data, all_descs)
+                        if nd > 0:
+                            dlg.log_line(f"move_descriptions.c: {nd} new descriptions added")
+                        na = self._write_new_move_animations(new_moves_data)
+                        if na > 0:
+                            dlg.log_line(f"battle_anim_scripts.s: {na} new animation entries added")
+                        self.ui.moves_widget.clear_new_moves()
+                except Exception:
+                    pass
 
-                    # Let the plugin pipeline handle remaining headers
-                    # (trainers, battle_moves, move_names, move_descriptions, etc.)
-                    # Mark plugins whose files were already written by direct
-                    # writers above so they don't double-write.
+                # Regenerate the plugin-pipeline headers (trainers.h,
+                # battle_anim_scripts.s, evolutions / constants / starters /
+                # pokedex …).  Like the direct writers above this MUST run on
+                # every save — save_data() already wrote every src/data/*.json,
+                # so skipping the matching .h regeneration leaves the build
+                # compiling stale headers (a renamed trainer keeps its OLD
+                # name in-game while the editor, which reads the JSON, shows
+                # the new one).  species / items / moves are flagged so this
+                # pass does not double-write the headers the direct writers
+                # above already produced, nor run the legacy species pipeline.
+                for key in ("species_data", "pokemon_items", "pokemon_moves"):
+                    plugin = self.source_data.data.get(key)
+                    if plugin:
+                        plugin._skip_parse_to_c = True
+                try:
+                    self.source_data.parse_to_c_code()
+                finally:
                     for key in ("species_data", "pokemon_items", "pokemon_moves"):
                         plugin = self.source_data.data.get(key)
                         if plugin:
-                            plugin._skip_parse_to_c = True
-                    try:
-                        self.source_data.parse_to_c_code()
-                    finally:
-                        for key in ("species_data", "pokemon_items", "pokemon_moves"):
-                            plugin = self.source_data.data.get(key)
-                            if plugin:
-                                plugin._skip_parse_to_c = False
-                    dlg.log_line("trainers.h, battle_moves.h updated")
+                            plugin._skip_parse_to_c = False
+                dlg.log_line("trainers.h, battle_moves.h updated")
 
                 # Re-touch JSON caches so their mtime is newer than headers,
                 # preventing unnecessary re-extraction on next startup.

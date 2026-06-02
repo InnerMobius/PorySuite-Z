@@ -12,25 +12,15 @@ import re
 import shutil
 from typing import Dict, List, Optional, Tuple
 
+from core import overworld_subsprite_gen as subsprite_gen
+from core.overworld_sprite_geometry import decompose, validate
+
 Color = Tuple[int, int, int]
 
-# ── OAM / subsprite table lookup by pixel dimensions ────────────────────────
-
-_OAM_TABLE = {
-    (16, 16): ("gObjectEventBaseOam_16x16", "gObjectEventSpriteOamTables_16x16"),
-    (16, 32): ("gObjectEventBaseOam_16x32", "gObjectEventSpriteOamTables_16x32"),
-    (32, 32): ("gObjectEventBaseOam_32x32", "gObjectEventSpriteOamTables_32x32"),
-    (32, 64): ("gObjectEventBaseOam_32x32", "gObjectEventSpriteOamTables_32x64"),
-    (64, 64): ("gObjectEventBaseOam_64x64", "gObjectEventSpriteOamTables_64x64"),
-}
-
-# ── Animation table names for user-facing choices ───────────────────────────
-
-ANIM_TABLE_CHOICES = [
-    ("sAnimTable_Standard", "Walk Cycle (standard 9-frame)"),
-    ("sAnimTable_Inanimate", "Static / Inanimate"),
-    ("sAnimTable_RedGreenNormal", "Walk Cycle (Player-style)"),
-]
+# Animation-table choices for the New Sprite dialog are no longer a
+# hardcoded list — `core.anim_table_upgrade.scan_anim_tables` discovers
+# every sAnimTable_* the project actually defines, with a frame-count
+# hint per option.
 
 # ── Standard NPC palette slots (non-DOWP) ──────────────────────────────────
 
@@ -69,8 +59,13 @@ def _ensure_spritesheet_rule(
     tile_w: int,
     tile_h: int,
 ) -> bool:
-    """Add a per-frame metatile rule to ``spritesheet_rules.mk`` for a
-    new overworld sprite.
+    """Add a metatile rule to ``spritesheet_rules.mk`` for a new
+    overworld sprite.
+
+    ``tile_w``/``tile_h`` are the gbagfx ``-mwidth``/``-mheight`` values:
+    the sprite's uniform hardware-piece size in tiles — equal to the
+    frame size for a single-OAM sprite, the subsprite piece size for a
+    composite.
 
     The default ``%.4bpp: %.png`` Makefile rule runs ``gbagfx`` with no
     metatile flags, so it lays out the resulting .4bpp tiles in
@@ -111,6 +106,85 @@ def _ensure_spritesheet_rule(
     text += block
     _write_file(rules_path, text)
     return True
+
+
+def _update_spritesheet_rule(
+    root: str,
+    category: str,
+    sprite_slug: str,
+    tile_w: int,
+    tile_h: int,
+) -> Tuple[bool, str]:
+    """Update an existing per-sprite ``spritesheet_rules.mk`` rule's
+    ``-mwidth`` / ``-mheight`` flags in place.
+
+    Why this exists separately from ``_ensure_spritesheet_rule``:
+        ``_ensure_spritesheet_rule`` is a NO-OP when a rule already
+        exists — it never touches a rule's flags.  That's correct for
+        new-sprite creation, but ``replace_sprite_sheet`` needs to
+        rewrite the existing rule's metatile flags when the frame size
+        changes, because the flags determine how ``gbagfx`` packs tiles
+        into the .4bpp.  A stale flag set produces a malformed .4bpp
+        that the engine renders as garbage no matter how clean the
+        GraphicsInfo / pic table are.
+
+    Behaviour:
+      - Rule exists → rewrite both ``-mwidth`` and ``-mheight`` to the
+        passed values.  Idempotent: a re-run with the same values is a
+        clean no-op (returns ``(False, "")``).
+      - Rule missing → calls ``_ensure_spritesheet_rule`` so a sprite
+        without an explicit rule gets one created with the correct
+        flags (rather than silently falling back to the default rule
+        that emits row-major tiles).
+
+    Returns ``(changed, detail)``.  ``detail`` is a human-readable
+    summary of what changed, suitable for the applied-messages list.
+    """
+    rules_path = os.path.join(root, "spritesheet_rules.mk")
+    rel_4bpp = f"$(OBJEVENTGFXDIR)/{category}/{sprite_slug}.4bpp"
+    if not os.path.isfile(rules_path):
+        return False, f"missing {rules_path}"
+
+    text = _read_file(rules_path)
+
+    # Two-line rule: header (`$(...)/X.4bpp: %.4bpp: %.png`) followed
+    # by an indented `$(GFX) $< $@ -mwidth N -mheight M` recipe.  Capture
+    # the full block so we can rewrite the flags without touching the
+    # rule's targets.
+    pat = re.compile(
+        r"(^" + re.escape(rel_4bpp) + r"\s*:[^\n]*\n)"
+        r"(\t\$\(GFX\)\s+\$<\s+\$@\s+-mwidth\s+)(\d+)"
+        r"(\s+-mheight\s+)(\d+)(\s*\n)",
+        re.MULTILINE,
+    )
+    m = pat.search(text)
+    if not m:
+        # No existing rule → add a fresh one with the right flags.
+        added = _ensure_spritesheet_rule(
+            root, category, sprite_slug, tile_w, tile_h)
+        if added:
+            return True, (
+                f"spritesheet_rules.mk: added rule for "
+                f"{category}/{sprite_slug}.4bpp "
+                f"(-mwidth {tile_w} -mheight {tile_h})"
+            )
+        return False, ""
+
+    old_w, old_h = int(m.group(3)), int(m.group(5))
+    if old_w == tile_w and old_h == tile_h:
+        return False, ""  # already correct, no-op
+
+    new_recipe = (
+        m.group(1) + m.group(2) + str(tile_w)
+        + m.group(4) + str(tile_h) + m.group(6)
+    )
+    text = text[:m.start()] + new_recipe + text[m.end():]
+    _write_file(rules_path, text)
+    return True, (
+        f"spritesheet_rules.mk: updated {category}/{sprite_slug}.4bpp "
+        f"(-mwidth {old_w} -mheight {old_h}) → "
+        f"(-mwidth {tile_w} -mheight {tile_h})"
+    )
 
 
 def _remove_spritesheet_rule(
@@ -205,7 +279,25 @@ def create_overworld_sprite(
     tile_h = frame_h // 8
     sprite_size = (frame_w * frame_h) // 2  # 4bpp
 
-    # Determine frame count from PNG dimensions
+    # ── Geometry: validate the size, then decompose it ──────────────────
+    # Replaces the old 5-entry hardcoded _OAM_TABLE.  Any frame whose
+    # width and height are both multiples of 8 is handled — a single GBA
+    # hardware sprite or a composite — and the exact OAM template and
+    # subsprite table it needs are computed here, then generated below
+    # if the project doesn't already define them.
+    ok, reasons = validate(frame_w, frame_h)
+    if not ok:
+        errors.append("Invalid frame size: " + "; ".join(reasons))
+        return False, applied, errors
+    geo = decompose(frame_w, frame_h)
+    oam_name = geo.oam_symbol
+    # The decomposition picks the subsprite table symbol: a reusable
+    # vanilla single-OAM table keeps its name, everything else (every
+    # composite) gets a generated ``Ps``-named table — so a composite
+    # never binds to a vanilla WxH table with an incompatible layout.
+    sub_name = geo.subsprite_symbol
+
+    # Determine frame count from the imported (horizontal) PNG strip.
     try:
         from PyQt6.QtGui import QImage
         img = QImage(png_source)
@@ -217,22 +309,31 @@ def create_overworld_sprite(
         errors.append(f"Failed to read PNG: {e}")
         return False, applied, errors
 
-    # OAM lookup
-    oam_key = (frame_w, frame_h)
-    if oam_key not in _OAM_TABLE:
-        # Find closest match
-        oam_name = f"gObjectEventBaseOam_{frame_w}x{frame_h}"
-        sub_name = f"gObjectEventSpriteOamTables_{frame_w}x{frame_h}"
-    else:
-        oam_name, sub_name = _OAM_TABLE[oam_key]
-
-    # ── Step 1: Copy PNG to project ─────────────────────────────────────
+    # ── Step 1: Bring the PNG into the project ──────────────────────────
+    # A single-OAM sprite keeps the imported horizontal frame strip.  A
+    # multi-frame composite is re-laid-out as a VERTICAL strip: gbagfx
+    # emits each metatile (one hardware piece) row-major DOWN the image,
+    # so frames must stack vertically for every frame's tiles to land in
+    # the one contiguous run the engine's ``overworld_frame`` macro reads.
     dest_dir = os.path.join(root, "graphics", "object_events", "pics", category)
     os.makedirs(dest_dir, exist_ok=True)
     dest_png = os.path.join(dest_dir, f"{sprite_slug}.png")
     try:
-        shutil.copy2(png_source, dest_png)
-        applied.append(f"Copied PNG to graphics/object_events/pics/{category}/{sprite_slug}.png")
+        if num_frames > 1 and not geo.is_single_oam:
+            _write_vertical_frame_strip(
+                png_source, dest_png, frame_w, frame_h, num_frames,
+            )
+            applied.append(
+                f"Imported PNG as a vertical {num_frames}-frame strip to "
+                f"graphics/object_events/pics/{category}/{sprite_slug}.png "
+                f"(composite sprites need a vertical tile layout)"
+            )
+        else:
+            shutil.copy2(png_source, dest_png)
+            applied.append(
+                f"Copied PNG to graphics/object_events/pics/"
+                f"{category}/{sprite_slug}.png"
+            )
     except Exception as e:
         errors.append(f"Copy PNG: {e}")
         return False, applied, errors
@@ -389,6 +490,39 @@ def create_overworld_sprite(
     except Exception as e:
         errors.append(f"Pic table: {e}")
 
+    # ── Step 4b: Generate the OAM template + subsprite table ────────────
+    # The geometry decomposition above named the OAM template and
+    # subsprite table this size needs.  The generator writes any the
+    # project doesn't already define (vanilla or previously generated).
+    # Idempotent — a clean no-op for the standard NPC sizes vanilla
+    # already ships tables for.
+    try:
+        for res in subsprite_gen.ensure_overworld_geometry(root, geo):
+            if res.changed:
+                applied.append(res.detail)
+    except Exception as e:
+        errors.append(f"OAM/subsprite generation: {e}")
+
+    # ── Step 4c: Ensure the composite-sprite depth-sort engine fix ──────
+    # pokefirered's SortSprites breaks subpriority ties using the sprite's
+    # top corner, so a tall composite sprite loses every tie and draws
+    # behind the player.  This one-time, idempotent engine patch rewrites
+    # the tie-break to compare feet.  Applied on the first New Sprite and
+    # a no-op thereafter.
+    try:
+        from core import sprite_depth_patch
+        dres = sprite_depth_patch.ensure_sprite_depth_fix(root)
+        if dres.changed:
+            applied.append(dres.detail)
+        elif not dres.ok:
+            # Best-effort: a missing or hand-modified sprite.c must NOT
+            # fail sprite creation — the sprite is still valid, it just
+            # won't depth-sort until the engine is patchable.  Surface
+            # it as a note, never as a creation error.
+            applied.append(f"Note — composite depth fix skipped: {dres.detail}")
+    except Exception as e:
+        applied.append(f"Note — composite depth fix skipped: {e}")
+
     # ── Step 5: Add GraphicsInfo to object_event_graphics_info.h ────────
     gi_path = os.path.join(
         root, "src", "data", "object_events", "object_event_graphics_info.h"
@@ -471,12 +605,13 @@ const struct ObjectEventGraphicsInfo gObjectEventGraphicsInfo_{pascal} = {{
     #            two heads stacked vertically.
     try:
         added = _ensure_spritesheet_rule(
-            root, category, sprite_slug, tile_w, tile_h,
+            root, category, sprite_slug,
+            geo.metatile_w, geo.metatile_h,
         )
         if added:
             applied.append(
                 f"Added spritesheet_rules.mk rule "
-                f"(-mwidth {tile_w} -mheight {tile_h})"
+                f"(-mwidth {geo.metatile_w} -mheight {geo.metatile_h})"
             )
     except Exception as e:
         errors.append(f"spritesheet rule: {e}")
@@ -507,6 +642,438 @@ const struct ObjectEventGraphicsInfo gObjectEventGraphicsInfo_{pascal} = {{
 
     success = len(errors) == 0
     return success, applied, errors
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Replace an overworld sprite's sheet (the dynamic Import Manually path)
+# ════════════════════════════════════════════════════════════════════════════
+
+def replace_sprite_sheet(
+    root: str,
+    info_name: str,
+    new_png_path: str,
+    new_frame_w: int,
+    new_frame_h: int,
+    *,
+    palette_colors: Optional[List[Color]] = None,
+    remapped_img=None,
+) -> Tuple[bool, List[str], List[str]]:
+    """Replace an existing sprite's sheet AND keep all metadata in sync.
+
+    Why this exists
+    ===============
+
+    The Overworld Graphics tab's "Import Manually…" button replaces a
+    sprite's PNG on disk with a user-picked source, optionally remapped to
+    a new palette.  Before this function existed, NOTHING ELSE was kept
+    in sync — GraphicsInfo `.width`/`.height`/`.size`/`.oam`/
+    `.subspriteTables` and the `sPicTable_<X>[]` entry count all stayed
+    pinned to the OLD sprite's geometry.
+
+    So importing a new ``128×32`` sheet at the user's intended 16×32
+    frame size over a 16×16 vanilla Jigglypuff entry made the engine
+    slice the new PNG as 16 frames of 16×16 (top row of heads + bottom
+    row of feet/bodies), wired a stale 16-entry pic table to those bogus
+    indices, and triggered the emote-upgrade scan to "fix" a 10th-frame
+    that didn't exist in the user's layout.  Symptoms: preview shows
+    only feet, Frame Cycle reports 16 frames, the emote upgrade
+    overrides the user's chosen anim table.
+
+    This function repairs that by updating EVERY in-source piece of
+    metadata together with the PNG swap:
+
+      - Saves the new PNG (palette-remapped if ``remapped_img`` is
+        passed; raw-copied otherwise) to the existing sprite's PNG path.
+      - Updates ``gObjectEventGraphicsInfo_<info_name>``:
+        ``.width``, ``.height``, ``.size``, ``.oam``, ``.subspriteTables``
+        to match the new frame size.  ``.paletteTag`` is untouched
+        (palette changes go through the separate Import-Palette flow).
+        ``.anims`` is untouched (let the user pick separately so the
+        existing Generic Loop / Cycle / custom choice isn't clobbered).
+      - Rebuilds ``sPicTable_<info_name>[]`` to exactly
+        ``new_frame_count`` entries (= ``new_png_width // new_frame_w``)
+        with the correct ``tile_w`` / ``tile_h``.
+      - Ensures any OAM template or subsprite table the new geometry
+        needs is present (via ``ensure_overworld_geometry``).
+
+    What it deliberately does NOT do:
+      - Touch `.anims`.  Users pick their anim table explicitly; an
+        anim that references frames the new sheet doesn't have will look
+        wrong in-game, but that's a user-visible mistake to fix in the
+        Animation dropdown — not something we silently overwrite.
+      - Touch the palette.  Palette imports route through the existing
+        Import Palette flow; this function only consumes a passed-in
+        ``palette_colors`` + ``remapped_img`` to bake the right colours
+        into the saved PNG.
+      - Decrement / renumber any constants.  This is an in-place edit,
+        not a delete-and-recreate.
+
+    Returns ``(success, applied, errors)``.
+    """
+    applied: List[str] = []
+    errors: List[str] = []
+
+    # ── Geometry validation ──────────────────────────────────────────
+    ok, reasons = validate(new_frame_w, new_frame_h)
+    if not ok:
+        errors.append(
+            f"Invalid frame size {new_frame_w}×{new_frame_h}: "
+            + "; ".join(reasons))
+        return False, applied, errors
+
+    # Read new PNG dimensions to derive frame count.
+    try:
+        from PyQt6.QtGui import QImage
+        probe = QImage(new_png_path)
+        if probe.isNull():
+            errors.append(f"Could not load source PNG: {new_png_path}")
+            return False, applied, errors
+        png_w, png_h = probe.width(), probe.height()
+    except Exception as e:
+        errors.append(f"PNG probe failed: {e}")
+        return False, applied, errors
+
+    if png_w % new_frame_w != 0 or png_h % new_frame_h != 0:
+        errors.append(
+            f"PNG dimensions ({png_w}×{png_h}) don't cleanly divide "
+            f"by frame size ({new_frame_w}×{new_frame_h}). "
+            f"Pad or resize the source first."
+        )
+        return False, applied, errors
+    cols = png_w // new_frame_w
+    rows = png_h // new_frame_h
+    num_frames = cols * rows
+    if num_frames < 1:
+        errors.append("New sheet resolves to 0 frames.")
+        return False, applied, errors
+
+    geo = decompose(new_frame_w, new_frame_h)
+    sprite_size = (new_frame_w * new_frame_h) // 2  # 4bpp bytes/frame
+    tile_w = new_frame_w // 8
+    tile_h = new_frame_h // 8
+
+    # ── Locate the GraphicsInfo block ────────────────────────────────
+    gi_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics_info.h",
+    )
+    if not os.path.isfile(gi_path):
+        errors.append(f"missing {gi_path}")
+        return False, applied, errors
+    gi_text = _read_file(gi_path)
+    info_symbol = f"gObjectEventGraphicsInfo_{info_name}"
+    block_match = re.search(
+        r"(const\s+struct\s+ObjectEventGraphicsInfo\s+"
+        + re.escape(info_symbol)
+        + r"\s*=\s*\{)(?P<body>[^;]*?)(\};)",
+        gi_text, flags=re.DOTALL,
+    )
+    if not block_match:
+        errors.append(
+            f"Could not find {info_symbol} in object_event_graphics_info.h"
+        )
+        return False, applied, errors
+    body = block_match.group("body")
+
+    # Pull the existing pic-table reference + PNG path before we change
+    # any geometry — both are needed for the pic-table rebuild and the
+    # PNG save below.
+    pic_match = re.search(r"\.images\s*=\s*(sPicTable_\w+)", body)
+    if not pic_match:
+        errors.append(f"{info_symbol} has no .images field")
+        return False, applied, errors
+    pic_table_name = pic_match.group(1)
+
+    # ── Ensure any new OAM template + subsprite table exist ──────────
+    try:
+        for res in subsprite_gen.ensure_overworld_geometry(root, geo):
+            if res.changed:
+                applied.append(res.detail)
+    except Exception as e:
+        errors.append(f"OAM/subsprite ensure: {e}")
+        return False, applied, errors
+
+    # ── Rebuild GraphicsInfo body in place ───────────────────────────
+    # Each .X = Y line is rewritten exactly once.  Anything not listed
+    # below (.paletteTag, .anims, .images, .tracks, .inanimate, …) is
+    # left intact so user-set fields survive the resize.
+    def _replace_field(text: str, field: str, value: str) -> str:
+        pat = re.compile(
+            r"(\." + re.escape(field) + r"\s*=\s*)([^,\n]+)(,)",
+        )
+        new_text, n = pat.subn(r"\g<1>" + value + r"\3", text, count=1)
+        if n == 0:
+            # Field didn't exist; append it before the closing brace.
+            return text.rstrip() + f"\n    .{field} = {value},\n"
+        return new_text
+
+    new_body = body
+    new_body = _replace_field(new_body, "size", str(sprite_size))
+    new_body = _replace_field(new_body, "width", str(new_frame_w))
+    new_body = _replace_field(new_body, "height", str(new_frame_h))
+    new_body = _replace_field(new_body, "oam", f"&{geo.oam_symbol}")
+    new_body = _replace_field(
+        new_body, "subspriteTables", geo.subsprite_symbol)
+
+    gi_text = (gi_text[:block_match.start()]
+               + block_match.group(1) + new_body + block_match.group(3)
+               + gi_text[block_match.end():])
+    try:
+        _write_file(gi_path, gi_text)
+        applied.append(
+            f"Updated {info_symbol}: "
+            f"size={sprite_size}, "
+            f"width={new_frame_w}, height={new_frame_h}, "
+            f"oam=&{geo.oam_symbol}, "
+            f"subspriteTables={geo.subsprite_symbol}"
+        )
+    except Exception as e:
+        errors.append(f"GraphicsInfo write: {e}")
+        return False, applied, errors
+
+    # ── Rebuild the pic table to exactly num_frames entries ──────────
+    pt_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_pic_tables.h",
+    )
+    if not os.path.isfile(pt_path):
+        errors.append(f"missing {pt_path}")
+        return False, applied, errors
+    pt_text = _read_file(pt_path)
+    pt_block_pat = re.compile(
+        r"(static\s+const\s+struct\s+SpriteFrameImage\s+"
+        + re.escape(pic_table_name)
+        + r"\s*\[\]\s*=\s*\{)"
+        + r"(?P<body>[^}]*?)"
+        + r"(\};)",
+        re.DOTALL,
+    )
+    pt_match = pt_block_pat.search(pt_text)
+    if not pt_match:
+        errors.append(
+            f"Could not find {pic_table_name} in object_event_pic_tables.h"
+        )
+        return False, applied, errors
+    pic_symbol_match = re.search(
+        r"overworld_frame\(\s*(gObjectEventPic_\w+)",
+        pt_match.group("body"),
+    )
+    if not pic_symbol_match:
+        errors.append(
+            f"{pic_table_name} body has no overworld_frame entries "
+            f"to learn the pic symbol from"
+        )
+        return False, applied, errors
+    pic_symbol = pic_symbol_match.group(1)
+    new_body_lines = [""]
+    for i in range(num_frames):
+        new_body_lines.append(
+            f"    overworld_frame({pic_symbol}, {tile_w}, {tile_h}, {i}),"
+        )
+    new_body_lines.append("")
+    new_pt = pt_match.group(1) + "\n".join(new_body_lines) + pt_match.group(3)
+    pt_text = pt_text[:pt_match.start()] + new_pt + pt_text[pt_match.end():]
+    try:
+        _write_file(pt_path, pt_text)
+        applied.append(
+            f"Rebuilt {pic_table_name}: {num_frames} entries "
+            f"({tile_w}×{tile_h} tiles per frame)"
+        )
+    except Exception as e:
+        errors.append(f"pic table write: {e}")
+        return False, applied, errors
+
+    # ── Save the new PNG to the sprite's existing PNG path ──────────
+    # The PNG path lives in the INCBIN line — we read it from
+    # object_event_graphics.h via _scan_pic_png_path.  We delegate to
+    # manual_palette_pick_dialog's save_remapped_image when a remapped
+    # QImage + palette were passed (the manual-import case); fall back
+    # to a raw shutil.copy2 for the auto case.
+    #
+    # Composite (multi-OAM) sprites need the PNG written as a VERTICAL
+    # frame strip — gbagfx emits each metatile row-major DOWN the image,
+    # so frames must stack vertically for every frame's tiles to land in
+    # the one contiguous run the engine's overworld_frame macro reads.
+    # Single-OAM sprites use the horizontal strip layout unchanged.  This
+    # matches what create_overworld_sprite does for new sprites.
+    dest_png = _scan_pic_png_path(root, pic_symbol)
+    if not dest_png:
+        errors.append(
+            f"Could not resolve on-disk PNG path for {pic_symbol}"
+        )
+        return False, applied, errors
+
+    needs_vertical_strip = (not geo.is_single_oam) and num_frames > 1
+
+    try:
+        if remapped_img is not None and palette_colors is not None:
+            # Manual palette path — bake the remapped QImage to the
+            # destination, then re-layout vertically if the geometry is
+            # composite.
+            from ui.dialogs.manual_palette_pick_dialog import (
+                save_remapped_image,
+            )
+            if not save_remapped_image(
+                    remapped_img, palette_colors, dest_png):
+                errors.append(
+                    f"Could not write remapped PNG to {dest_png}"
+                )
+                return False, applied, errors
+            if needs_vertical_strip:
+                # Re-read the just-written horizontal strip and rewrite
+                # it as a vertical strip in place.  Two-step is safer
+                # than trying to skip _write_vertical_frame_strip's
+                # I/O — it's already battle-tested by the new-sprite path.
+                tmp_path = dest_png + ".horiz.tmp.png"
+                shutil.move(dest_png, tmp_path)
+                try:
+                    _write_vertical_frame_strip(
+                        tmp_path, dest_png,
+                        new_frame_w, new_frame_h, num_frames,
+                    )
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                applied.append(
+                    f"Saved remapped sheet as a vertical {num_frames}-frame "
+                    f"strip to {os.path.relpath(dest_png, root)}"
+                )
+            else:
+                applied.append(
+                    f"Saved remapped sheet to "
+                    f"{os.path.relpath(dest_png, root)}"
+                )
+        else:
+            if needs_vertical_strip:
+                _write_vertical_frame_strip(
+                    new_png_path, dest_png,
+                    new_frame_w, new_frame_h, num_frames,
+                )
+                applied.append(
+                    f"Saved sheet as a vertical {num_frames}-frame strip "
+                    f"to {os.path.relpath(dest_png, root)}"
+                )
+            elif os.path.abspath(new_png_path) == os.path.abspath(dest_png):
+                # Same file on both sides — happens when the silent sync
+                # in Import Manually re-runs over the sprite's own PNG to
+                # keep metadata in lockstep.  shutil.copy2 would raise
+                # SameFileError on Windows here; instead bump the mtime
+                # so the makefile build sees the PNG as "newer than the
+                # .4bpp" and regenerates with whatever current
+                # spritesheet_rules.mk metatile flags are in force.
+                os.utime(dest_png, None)
+                applied.append(
+                    f"Touched {os.path.relpath(dest_png, root)} "
+                    f"(same source — bumped mtime to trigger rebuild)"
+                )
+            else:
+                shutil.copy2(new_png_path, dest_png)
+                applied.append(
+                    f"Copied sheet to {os.path.relpath(dest_png, root)}"
+                )
+    except Exception as e:
+        errors.append(f"PNG save: {e}")
+        return False, applied, errors
+
+    # ── Update spritesheet_rules.mk to match the new tile geometry ──
+    # gbagfx's -mwidth / -mheight flags are how each frame's tiles get
+    # packed into the .4bpp.  Without this update the .4bpp stays
+    # generated with the OLD metatile size — engine reads the wrong
+    # tile run per frame and renders garbage no matter how clean the
+    # GraphicsInfo and pic table are.
+    #
+    # geo.metatile_w / metatile_h is the uniform piece size in tiles —
+    # equal to the frame size for single-OAM sprites, equal to the
+    # sub-sprite piece size for composites.  This matches what the
+    # matching new-sprite path uses (`_ensure_spritesheet_rule(...,
+    # geo.metatile_w, geo.metatile_h)`).
+    rule_tw, rule_th = geo.metatile_w, geo.metatile_h
+
+    # Derive (category, slug) from the resolved PNG path.  The PNG sits
+    # at `<root>/graphics/object_events/pics/<category>/<slug>.png`, so
+    # the parent folder name is the category and the basename (sans
+    # extension) is the slug.
+    rel_png = os.path.relpath(dest_png, root).replace(os.sep, "/")
+    cat_slug_m = re.search(
+        r"graphics/object_events/pics/([^/]+)/([^/]+)\.png$",
+        rel_png,
+    )
+    if cat_slug_m:
+        category, slug = cat_slug_m.group(1), cat_slug_m.group(2)
+        try:
+            changed, detail = _update_spritesheet_rule(
+                root, category, slug, rule_tw, rule_th,
+            )
+            if changed:
+                applied.append(detail)
+                # CRITICAL: make tracks file dependencies, not recipe
+                # changes.  When the -mwidth/-mheight flags in
+                # spritesheet_rules.mk change but the PNG mtime is older
+                # than the existing .4bpp, make says "the .4bpp is up to
+                # date" and skips the rebuild -- so the .4bpp stays
+                # packed in the OLD metatile layout and the engine
+                # renders garbage no matter how clean the GraphicsInfo
+                # and pic table are.  Force a rebuild by bumping the
+                # PNG's mtime now that the recipe has changed.  Safe
+                # even on a no-op rerun: re-touching a PNG that already
+                # bumped is idempotent for build correctness.
+                try:
+                    os.utime(dest_png, None)
+                except OSError:
+                    # If we can't touch (read-only?), leave alone — the
+                    # user will see "make says nothing to do" and we
+                    # have a CHANGELOG note documenting this risk.
+                    pass
+        except Exception as e:
+            errors.append(f"spritesheet rule update: {e}")
+            return False, applied, errors
+    else:
+        # Non-standard layout (sprite PNG outside the pics/<cat>/ tree).
+        # Surface this as a non-fatal warning — the .4bpp may still build
+        # if the project has a non-standard rule, but the user should
+        # double-check.
+        applied.append(
+            f"Note — PNG at {rel_png} not under "
+            f"graphics/object_events/pics/<category>/<slug>.png; "
+            f"skipped spritesheet_rules.mk update.  Verify the "
+            f"-mwidth / -mheight flags manually if the build looks wrong."
+        )
+
+    return True, applied, errors
+
+
+def _scan_pic_png_path(root: str, pic_symbol: str) -> str:
+    """Best-effort: find the on-disk PNG path for ``gObjectEventPic_<X>``
+    by scanning the project's spritesheet rules + INCBIN declarations.
+
+    Returns an empty string when the path can't be confidently resolved.
+    """
+    # The INCBIN tells us the .4bpp path; the matching .png lives at the
+    # same relative location with the .4bpp extension swapped.
+    pic_inc_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics.h",
+    )
+    if not os.path.isfile(pic_inc_path):
+        return ""
+    try:
+        with open(pic_inc_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return ""
+    # Pic INCBIN format in vanilla pokefirered:
+    #   const u<8|16|32> gObjectEventPic_<X>[] = INCBIN_U<N>("graphics/...");
+    # All three storage widths appear in the source; allow any.
+    pat = re.compile(
+        r"const\s+u(?:8|16|32)\s+" + re.escape(pic_symbol)
+        + r"\s*\[\]\s*=\s*INCBIN_U\d+\s*\(\s*\"([^\"]+\.4bpp)\"",
+    )
+    m = pat.search(text)
+    if not m:
+        return ""
+    rel_4bpp = m.group(1)
+    rel_png = rel_4bpp[:-len(".4bpp")] + ".png"
+    return os.path.join(root, rel_png.replace("/", os.sep))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -603,6 +1170,8 @@ def delete_overworld_sprite(
     info_body = info_match.group("body")
     cur_pic_table = _grab_field(info_body, "images") or pic_table
     cur_pal_tag = _grab_field(info_body, "paletteTag") or ""
+    cur_w = _grab_field(info_body, "width") or ""
+    cur_h = _grab_field(info_body, "height") or ""
 
     # ── 2. Decide which shared assets we can safely delete ───────────
     # Pic table / pic symbol — safe to remove only if no OTHER
@@ -882,6 +1451,32 @@ def delete_overworld_sprite(
                 f"Could not remove spritesheet rule for {cat}/{slug}: {exc}"
             )
 
+    # ── 10. Remove generated OAM/subsprite scaffolding if this was the
+    #        last sprite of its size.  Only PorySuite-generated (fenced)
+    #        blocks are touched — `remove_*` leaves vanilla tables alone.
+    if cur_w.isdigit() and cur_h.isdigit():
+        w_i, h_i = int(cur_w), int(cur_h)
+        still_used = False
+        for om in re.finditer(
+            r"\.width\s*=\s*(\d+)\s*,[^;]*?\.height\s*=\s*(\d+)\s*,",
+            new_gi_text, flags=re.DOTALL,
+        ):
+            if int(om.group(1)) == w_i and int(om.group(2)) == h_i:
+                still_used = True
+                break
+        if not still_used:
+            try:
+                for res in (
+                    subsprite_gen.remove_subsprite_table(root, w_i, h_i),
+                    subsprite_gen.remove_oam_base(root, w_i, h_i),
+                ):
+                    if res.changed:
+                        applied.append(res.detail)
+            except Exception as exc:
+                errors.append(
+                    f"Could not remove generated {w_i}x{h_i} tables: {exc}"
+                )
+
     success = len(errors) == 0
     return success, applied, errors
 
@@ -1089,6 +1684,104 @@ def ensure_all_overworld_spritesheet_rules(
 
 
 # ── private helpers ────────────────────────────────────────────────────
+
+def _write_vertical_frame_strip(
+    src_png: str,
+    dest_png: str,
+    frame_w: int,
+    frame_h: int,
+    num_frames: int,
+) -> None:
+    """Re-lay-out a horizontal frame strip as a vertical one.
+
+    Composite overworld sprites are built with gbagfx metatile flags
+    sized to one hardware *piece*.  gbagfx emits metatiles row-major
+    DOWN the image, so for every frame's tiles to land in the one
+    contiguous run that ``overworld_frame`` indexes, the frames must be
+    stacked vertically rather than side by side.
+
+    The copy is index-for-index, so the sprite's 4bpp colour table —
+    including the transparent slot 0 — is preserved exactly.
+    """
+    from PyQt6.QtGui import QImage
+
+    src = QImage(src_png)
+    if src.isNull():
+        raise ValueError(f"could not read PNG: {src_png}")
+    out = QImage(frame_w, frame_h * num_frames, src.format())
+    color_table = src.colorTable()
+    indexed = bool(color_table)
+    if indexed:
+        out.setColorTable(color_table)
+    out.fill(0)
+    for f in range(num_frames):
+        for y in range(frame_h):
+            dst_y = f * frame_h + y
+            for x in range(frame_w):
+                src_x = f * frame_w + x
+                if indexed:
+                    out.setPixel(x, dst_y, src.pixelIndex(src_x, y))
+                else:
+                    out.setPixel(x, dst_y, src.pixel(src_x, y))
+    if not out.save(dest_png, "PNG"):
+        raise ValueError(f"could not write PNG: {dest_png}")
+
+
+def pad_sprite_sheet(
+    src_png: str,
+    num_frames: int,
+    dest_png: str,
+) -> Tuple[int, int]:
+    """Pad every frame of a horizontal sprite sheet up to the next
+    multiple of 16 in both dimensions, writing a new horizontal strip.
+
+    For an odd sheet — e.g. 72x40 imported as two 36x40 frames — this
+    turns each frame into a build-legal canvas (48x48) instead of the
+    editor rejecting the import.  The original frame is placed
+    bottom-centred in its padded cell, so a character keeps standing on
+    the floor; the new margin is transparent (palette index 0).
+
+    Returns the padded ``(frame_w, frame_h)``.  Raises ``ValueError`` if
+    ``num_frames`` does not evenly divide the sheet width.
+    """
+    from PyQt6.QtGui import QImage
+
+    src = QImage(src_png)
+    if src.isNull():
+        raise ValueError(f"could not read PNG: {src_png}")
+    iw, ih = src.width(), src.height()
+    if num_frames < 1 or iw % num_frames != 0:
+        raise ValueError(
+            f"{num_frames} frame(s) do not divide a {iw}px-wide sheet "
+            f"evenly — pick a frame count that divides {iw}."
+        )
+    src_fw = iw // num_frames
+    src_fh = ih
+    pad_fw = ((src_fw + 15) // 16) * 16
+    pad_fh = ((src_fh + 15) // 16) * 16
+
+    out = QImage(pad_fw * num_frames, pad_fh, src.format())
+    color_table = src.colorTable()
+    indexed = bool(color_table)
+    if indexed:
+        out.setColorTable(color_table)
+    out.fill(0)                        # index 0 = transparent margin
+    x_off = (pad_fw - src_fw) // 2      # centre the frame horizontally
+    y_off = pad_fh - src_fh            # bottom-align it (feet on the floor)
+    for f in range(num_frames):
+        for y in range(src_fh):
+            for x in range(src_fw):
+                sx = f * src_fw + x
+                dx = f * pad_fw + x_off + x
+                dy = y_off + y
+                if indexed:
+                    out.setPixel(dx, dy, src.pixelIndex(sx, y))
+                else:
+                    out.setPixel(dx, dy, src.pixel(sx, y))
+    if not out.save(dest_png, "PNG"):
+        raise ValueError(f"could not write PNG: {dest_png}")
+    return pad_fw, pad_fh
+
 
 def _atomic_write(path: str, text: str) -> None:
     """Write text atomically via temp+rename; clean up .tmp on failure.

@@ -105,7 +105,8 @@ class _ManualPickDialog(QDialog):
     def __init__(self, candidates: list[tuple[int, int, int]],
                  target: int, source_img: QImage, parent=None,
                  *,
-                 initial_palette: list[tuple[int, int, int]] | None = None):
+                 initial_palette: list[tuple[int, int, int]] | None = None,
+                 bg_transparent: bool = False):
         """
         initial_palette: optional seed for the result row.  When provided
             (e.g. extracted from an already-indexed source PNG), the
@@ -133,6 +134,9 @@ class _ManualPickDialog(QDialog):
         # order".  Stored here because _build_ui runs from __init__ and
         # decides whether to call _auto_fill or _apply_initial_palette.
         self._initial_palette = initial_palette
+        # When True, slot 0 is the transparent BG colour — the live
+        # preview renders it see-through (the sprite import sets this).
+        self._bg_transparent = bg_transparent
         # Suppress _on_result_colors_changed during programmatic set_colors.
         self._suppress_row_signal: bool = False
         self._candidate_swatches: list[_CandidateSwatch] = []
@@ -470,7 +474,10 @@ class _ManualPickDialog(QDialog):
         if not selected or self._source_img is None:
             return
         try:
-            preview_img = remap_to_palette(self._source_img, selected, dither=False)
+            preview_img = remap_to_palette(
+                self._source_img, selected, dither=False,
+                bg_transparent=self._bg_transparent,
+            )
             argb = preview_img.convertToFormat(QImage.Format.Format_ARGB32)
             pm = QPixmap.fromImage(argb)
             scaled = pm.scaled(
@@ -647,7 +654,14 @@ class ImageIndexerWidget(QWidget):
         self._color_custom_spin = QSpinBox()
         self._color_custom_spin.setRange(2, 256)
         self._color_custom_spin.setValue(32)
-        self._color_custom_spin.setFixedWidth(60)
+        # 60px was too narrow — the default spin-arrow buttons ate enough
+        # width that a 3-digit value ("256") was clipped.  Widen the field
+        # and constrain the up/down buttons to a sane fixed width so the
+        # number is always fully visible.
+        self._color_custom_spin.setFixedWidth(84)
+        self._color_custom_spin.setStyleSheet(
+            "QSpinBox::up-button, QSpinBox::down-button { width: 16px; }"
+        )
         self._color_custom_spin.setEnabled(False)
         self._color_custom_spin.setToolTip("Number of palette colors (2-256)")
         self._color_custom_spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)

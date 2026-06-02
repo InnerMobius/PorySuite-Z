@@ -504,11 +504,12 @@ class TrainerGraphicsTab(QWidget):
 
         self._import_sprite_btn = QPushButton("Import PNG as Sprite…")
         self._import_sprite_btn.setToolTip(
-            "Pick an indexed (palette-mode) PNG and REPLACE the\n"
-            "trainer's sprite image with it (pixels AND palette).\n"
-            "The new PNG must be 8-bit indexed with up to 16 colours.\n"
-            "The on-disk sprite is not overwritten until you click\n"
-            "File → Save on the toolbar."
+            "Pick a PNG and REPLACE the trainer's sprite image with\n"
+            "it (pixels AND palette).  An indexed 8-bit PNG (≤16\n"
+            "colours) is used directly; any other PNG automatically\n"
+            "opens the manual palette picker so you can choose the\n"
+            "16 colours and remap the image.  The on-disk sprite is\n"
+            "not overwritten until you click File → Save on the toolbar."
         )
         ig.addWidget(self._import_sprite_btn)
 
@@ -1051,9 +1052,12 @@ class TrainerGraphicsTab(QWidget):
         File → Save on the toolbar — so the action is reversible up until
         that point via undo (reload the project without saving).
 
-        The picked PNG must be an indexed-colour PNG (8-bit, ≤16 colours)
-        so the game can use it. An RGB PNG is rejected with a dialog
-        telling the user to convert first.
+        If the picked PNG is already a project-format indexed PNG (8-bit,
+        ≤16 colours) it's used directly.  If it ISN'T — an RGB PNG, or
+        indexed with too many colours — the manual palette picker opens
+        so the user can choose/order 16 colours and the image is remapped
+        to them.  Same flow the Overworld editor uses for non-indexed
+        imports; no PNG is rejected outright.
         """
         if not self._current_pic:
             QMessageBox.information(
@@ -1073,7 +1077,7 @@ class TrainerGraphicsTab(QWidget):
             start_dir = self._project_root or ""
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Indexed PNG to Replace Sprite",
+            self, "Select PNG to Replace Sprite",
             start_dir,
             "PNG Images (*.png)",
         )
@@ -1088,34 +1092,34 @@ class TrainerGraphicsTab(QWidget):
             )
             return
 
-        if img.format() != QImage.Format.Format_Indexed8:
-            QMessageBox.warning(
-                self, "Not an Indexed PNG",
-                "This PNG is not in indexed (palette) mode.\n\n"
-                "The game loads trainer sprites as indexed PNGs (8-bit,\n"
-                "up to 16 colours). Convert the image in your editor to\n"
-                "indexed mode with 16 colours, then try again.",
-            )
-            return
-
-        ct = img.colorTable()
-        if not ct:
-            QMessageBox.warning(
-                self, "Empty Palette",
-                "The PNG has no colour table entries.",
-            )
-            return
-
-        # Extract up to 16 GBA-safe colours — trims anything past slot 15
-        # which the GBA can't address.
         colors: List[Color] = []
-        for entry in ct[:16]:
-            r = (entry >> 16) & 0xFF
-            g = (entry >> 8) & 0xFF
-            b = entry & 0xFF
-            colors.append(clamp_to_gba(r, g, b))
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
+        ct = img.colorTable() if img.format() == QImage.Format.Format_Indexed8 else []
+        # An indexed PNG with ≤16 distinct colour-table entries is already
+        # in project format — use it directly with no extra dialog.
+        if (img.format() == QImage.Format.Format_Indexed8
+                and ct and len(set(ct)) <= 16):
+            for entry in ct[:16]:
+                r = (entry >> 16) & 0xFF
+                g = (entry >> 8) & 0xFF
+                b = entry & 0xFF
+                colors.append(clamp_to_gba(r, g, b))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+        else:
+            # Not a project-format indexed PNG (RGB, or indexed with too
+            # many colours) — open the manual palette picker so the user
+            # chooses/orders 16 colours, then remap the image to them.
+            # Identical to the Overworld editor's non-indexed import flow.
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
+            )
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self,
+            )
+            if result is None:
+                return  # user cancelled the picker
+            colors, img = result
+            colors = list(colors)
 
         # Apply: in-memory sprite + palette both get replaced, and both
         # dirty sets are flagged so flush_to_disk writes PNG + .pal.

@@ -501,21 +501,44 @@ def remap_to_palette(
     img: QImage,
     target_palette: list[Color],
     dither: bool = False,
+    *,
+    bg_transparent: bool = False,
 ) -> QImage:
     """
     Remap an image's colors to the nearest match in `target_palette`.
 
     Returns an indexed QImage using target_palette.
+
+    ``bg_transparent`` — pass True when the caller has designated
+    palette slot 0 as the transparent background colour (the manual
+    sprite indexer does exactly this).  Then index 0 is marked
+    transparent unconditionally, and any fully-transparent source
+    pixels are routed onto it — so a source pixel that maps to the
+    slot-0 colour, or that was already alpha-transparent, comes out
+    see-through.  Left False (the default), slot 0 is only transparent
+    when the source itself carried an alpha channel — correct for
+    opaque BG tilemaps / region maps, where the slot-0-transparent
+    convention would otherwise bake a "hole" into the result.
     """
     if not target_palette:
         # Empty palette — return a black indexed image
         target_palette = [(0, 0, 0)]
     rgb, alpha = _qimage_to_rgb_array(img)
     indices = _remap_pixels(rgb, target_palette, dither)
-    # See quantize_image — only mark slot 0 transparent when the source
-    # actually had alpha. For fully-opaque BG sources, the slot-0-
-    # transparent convention is wrong and bakes a "hole" into the result.
-    transparent_idx = 0 if alpha is not None else -1
+    if bg_transparent:
+        # The caller owns slot 0 as the BG colour.  Route any fully
+        # transparent source pixels onto it, and mark index 0
+        # transparent regardless of whether the source PNG carried an
+        # alpha channel — every pixel nearest the slot-0 colour IS the
+        # background and must render see-through.
+        if alpha is not None:
+            indices[alpha == 0] = 0
+        transparent_idx = 0
+    else:
+        # See quantize_image — only mark slot 0 transparent when the
+        # source actually had alpha.  For fully-opaque BG sources the
+        # slot-0-transparent convention is wrong and bakes a "hole".
+        transparent_idx = 0 if alpha is not None else -1
     return _indexed_array_to_qimage(
         indices, target_palette, transparent_index=transparent_idx,
     )

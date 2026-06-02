@@ -686,12 +686,14 @@ class GraphicsTabWidget(QWidget):
         target_row.addStretch(1)
         ig_import.addLayout(target_row)
 
-        self._import_png_btn = QPushButton("Select Indexed PNG...")
+        self._import_png_btn = QPushButton("Import PNG...")
         self._import_png_btn.setToolTip(
-            "Pick an indexed (palette-mode) PNG and import its color\n"
-            "table into the Normal or Shiny .pal file for this species.\n"
-            "The PNG's embedded palette is extracted — the image itself\n"
-            "is not modified or copied."
+            "Pick a PNG to import into the Normal or Shiny palette.\n"
+            "An indexed (palette-mode) PNG has its colour table\n"
+            "extracted directly — the image itself isn't modified.\n"
+            "A non-indexed PNG (or one with more than 16 colours)\n"
+            "automatically opens the manual palette picker so you\n"
+            "can choose the 16 colours and remap the image."
         )
         ig_import.addWidget(self._import_png_btn)
 
@@ -1374,6 +1376,27 @@ class GraphicsTabWidget(QWidget):
             return
 
         remapped_img = None
+
+        # Auto-route: a PNG that ISN'T a project-format indexed image
+        # (RGB, or indexed with >16 distinct colours) can't yield a clean
+        # 16-colour palette by table extraction — it needs the manual
+        # picker.  Detect that here and flip `manual` on, so the user
+        # never hits a "not indexed" rejection.  Same single-action
+        # import the Overworld editor offers.
+        from PyQt6.QtGui import QImage as _QI
+        if not manual:
+            _peek = QImage(path)
+            if _peek.isNull():
+                QMessageBox.warning(
+                    self, "Import Failed",
+                    f"Could not load image:\n{path}",
+                )
+                return
+            _ct = (_peek.colorTable()
+                   if _peek.format() == _QI.Format.Format_Indexed8 else [])
+            if not (_ct and len(set(_ct)) <= 16):
+                manual = True  # non-indexed / too many colours
+
         if manual:
             from ui.dialogs.manual_palette_pick_dialog import (
                 import_image_manually_from_path,
@@ -1385,37 +1408,11 @@ class GraphicsTabWidget(QWidget):
                 return
             colors, remapped_img = result
         else:
-            # Read the PNG and extract its color table
+            # Already a project-format indexed PNG — extract its colour
+            # table directly (the auto-route above guarantees we only
+            # land here for valid ≤16-colour indexed images).
             img = QImage(path)
-            if img.isNull():
-                QMessageBox.warning(
-                    self, "Import Failed",
-                    f"Could not load image:\n{path}",
-                )
-                return
-
-            # Must be an indexed (palette-mode) image
-            from PyQt6.QtGui import QImage as _QI
-            if img.format() != _QI.Format.Format_Indexed8:
-                QMessageBox.warning(
-                    self, "Not an Indexed PNG",
-                    "This PNG is not in indexed (palette) mode.\n\n"
-                    "The image must be saved as an indexed-color PNG\n"
-                    "(8-bit, 16 colors) so its embedded palette can be\n"
-                    "extracted — or use 'Import PNG Manually…' to pick\n"
-                    "colours from any PNG.",
-                )
-                return
-
             ct = img.colorTable()
-            if len(ct) < 1:
-                QMessageBox.warning(
-                    self, "Empty Palette",
-                    "The PNG has no color table entries.",
-                )
-                return
-
-            # Extract up to 16 colors, GBA-clamp each one
             colors: List[Color] = []
             for entry in ct[:16]:
                 r = (entry >> 16) & 0xFF

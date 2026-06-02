@@ -169,6 +169,7 @@ def pick_palette_manually(
         source_img=source_img,
         parent=parent,
         initial_palette=initial,
+        bg_transparent=True,
     )
     if source_label:
         title_suffix = " (indexed source — palette pre-loaded)" if initial else ""
@@ -229,7 +230,9 @@ def import_image_manually_from_path(
     # transparent (via tRNS) when the source has alpha=0 pixels.
     from core.gba_image_utils import remap_to_palette
     try:
-        remapped = remap_to_palette(img, palette, dither=dither)
+        remapped = remap_to_palette(
+            img, palette, dither=dither, bg_transparent=True,
+        )
     except Exception as exc:
         if parent is not None:
             QMessageBox.warning(

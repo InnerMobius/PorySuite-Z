@@ -516,10 +516,6 @@ class TrainerClassEditor(QWidget):
     # Used to push pending name renames to the sibling Trainers editor live,
     # so the trainer list/detail reflect pending class name edits without save.
     class_name_edited = pyqtSignal(str, str)
-    # Emitted when the user clicks the Rename button — mainwindow opens
-    # the shared RenameDialog and routes the rename through refactor_service
-    # so the constant gets renamed across every source file at once.
-    rename_class_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -695,7 +691,7 @@ class TrainerClassEditor(QWidget):
         edit_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         edit_form.setSpacing(8)
 
-        # Display name + Rename button
+        # Display name field
         name_row = QHBoxLayout()
         name_row.setContentsMargins(0, 0, 0, 0)
         name_row.setSpacing(6)
@@ -703,26 +699,12 @@ class TrainerClassEditor(QWidget):
         self._name_edit.setMaxLength(12)
         self._name_edit.setStyleSheet(_input_ss)
         self._name_edit.setToolTip(
-            "Updates only the in-game display string for this class.\n"
-            "Does NOT rename the TRAINER_CLASS_* constant — use the\n"
-            "Rename... button for that (updates all source files)."
+            "The in-game display string for this trainer class.  Editing "
+            "it and saving is all a class rename needs — the underlying "
+            "TRAINER_CLASS_* constant name is left unchanged."
         )
         self._name_edit.textChanged.connect(self._on_name_changed)
         name_row.addWidget(self._name_edit, 1)
-        self._rename_btn = QPushButton("Rename...")
-        self._rename_btn.setFixedWidth(80)
-        self._rename_btn.setToolTip(
-            "Rename the TRAINER_CLASS_* constant across every source file\n"
-            "(opponents.h, trainer_class_names.h, battle_main.c, trainers.json,\n"
-            "scripts, maps, etc.). Display name and constant suffix update\n"
-            "together, like the Pokémon / Item / Move / Ability rename flow."
-        )
-        self._rename_btn.setStyleSheet(
-            "background: #2a2a3a; color: #aac; border: 1px solid #3a3a4a; "
-            "padding: 3px 8px; border-radius: 3px; font-size: 10px;"
-        )
-        self._rename_btn.clicked.connect(self._on_rename_clicked)
-        name_row.addWidget(self._rename_btn)
         lbl = QLabel("Display Name:")
         lbl.setStyleSheet(_fs)
         edit_form.addRow(lbl, name_row)
@@ -1174,75 +1156,6 @@ class TrainerClassEditor(QWidget):
         self.class_name_edited.emit(self._current_class, effective)
 
         self.changed.emit()
-
-    def _on_rename_clicked(self):
-        """User clicked the Rename... button — delegate to mainwindow so it
-        can open the shared RenameDialog and drive the cross-project rename
-        through refactor_service. Mainwindow calls back via
-        ``rename_class_key`` to update this widget's in-memory data."""
-        if not self._current_class:
-            return
-        self.rename_class_requested.emit(self._current_class)
-
-    def rename_class_key(self, old_const: str, new_const: str, display_name: str) -> None:
-        """Re-key every in-memory dict from old_const to new_const and swap
-        the selected trainer-class constant. Called by mainwindow after the
-        refactor service has queued (or applied) the global rename, so the
-        editor's list + widgets stay in sync without a full reload.
-
-        display_name is written into self._names under the NEW key so the
-        list item text / summary reflect the combined rename+displayname.
-        """
-        if not old_const or not new_const or old_const == new_const:
-            # Display-only change — just update the name caches.
-            if old_const in self._names:
-                self._names[old_const] = display_name
-            if self._current_class == old_const:
-                self._name_edit.blockSignals(True)
-                self._name_edit.setText(display_name)
-                self._name_edit.blockSignals(False)
-                self._update_name_counter(display_name)
-            return
-
-        def _rekey(d: dict):
-            if old_const in d:
-                d[new_const] = d.pop(old_const)
-
-        _rekey(self._classes)
-        _rekey(self._names)
-        _rekey(self._money)
-        _rekey(self._class_to_pic)
-        _rekey(self._class_to_fac)
-        _rekey(self._dirty_names)
-        _rekey(self._dirty_money)
-        _rekey(self._dirty_pics)
-        # display_name overrides whatever was in _names — refactor_service
-        # has already queued the name write, keep caches consistent.
-        self._names[new_const] = display_name
-
-        # Swap the list item's stored const + visible text.
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if item and item.data(Qt.ItemDataRole.UserRole) == old_const:
-                item.setData(Qt.ItemDataRole.UserRole, new_const)
-                item.setText(display_name or new_const)
-                break
-
-        if self._current_class == old_const:
-            self._current_class = new_const
-            self._name_edit.blockSignals(True)
-            self._name_edit.setText(display_name)
-            self._name_edit.blockSignals(False)
-            self._update_name_counter(display_name)
-            # The identity label at the top of the detail panel also needs
-            # to refresh. Not all builds of this editor have _const_lbl, so
-            # guard the access.
-            const_lbl = getattr(self, "_const_lbl", None)
-            if const_lbl is not None:
-                try:
-                    const_lbl.setText(new_const)
-                except Exception:
-                    pass
 
     def _on_money_changed(self, value: int):
         if not self._current_class:

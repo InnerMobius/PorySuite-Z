@@ -95,6 +95,16 @@ class _InAppBuildDialog(QDialog):
         self._log.setReadOnly(True)
         self._log.setFont(QFont("Consolas", 9))
         self._log.setStyleSheet("background:#1e1e1e; color:#d4d4d4;")
+        # Cap the document so a noisy build can't grind the UI thread to
+        # a halt as it accumulates -- QTextEdit's layout cost grows with
+        # the document and a clean pokefirered build prints thousands of
+        # lines.  4000 blocks ≈ the last several minutes of output;
+        # plenty for reading errors at the tail.  Without this the
+        # dialog could become unresponsive to drag / close events while
+        # the GUI thread caught up with insertions.
+        self._log.document().setMaximumBlockCount(4000)
+        # The log is read-only, so undo/redo is just memory we never use.
+        self._log.setUndoRedoEnabled(False)
         layout.addWidget(self._log, 1)
 
         btn_row = QHBoxLayout()
@@ -127,7 +137,14 @@ class _InAppBuildDialog(QDialog):
             text = raw.decode("utf-8", errors="replace")
         except Exception:
             text = str(raw)
-        self._output_text = getattr(self, "_output_text", "") + text
+        # NOTE: an earlier version accumulated every chunk into a
+        # ``self._output_text`` string that nothing ever read.  String
+        # concat on every readyRead is O(N) in the running total, so a
+        # noisy build (many MB of make output across thousands of
+        # chunks) made each new chunk slower than the last and backed
+        # the GUI thread up until the dialog stopped responding to
+        # drag/close.  The dead variable is gone and the log document
+        # is capped above, so the per-chunk cost is now bounded.
         self._log.moveCursor(QTextCursor.MoveOperation.End)
         self._log.insertPlainText(text)
         self._log.moveCursor(QTextCursor.MoveOperation.End)

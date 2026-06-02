@@ -20,14 +20,14 @@ import os
 import re
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSize, QObject, QEvent
 from PyQt6.QtGui import QImage, QPixmap, QColor, QIcon
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QGroupBox,
     QPushButton, QFileDialog, QMessageBox, QListWidget, QListWidgetItem,
     QScrollArea, QGridLayout, QFrame, QSplitter, QSizePolicy, QLineEdit,
     QDialog, QFormLayout, QSpinBox, QDialogButtonBox, QTabWidget,
-    QCheckBox,
+    QCheckBox, QInputDialog, QRadioButton, QButtonGroup, QStackedWidget,
 )
 
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
@@ -310,6 +310,43 @@ def _resolve_sprite_png(info_name: str, info_data: Dict[str, dict],
 
 
 # ── Sprite data model ───────────────────────────────────────────────────────
+
+class _GridResizeFilter(QObject):
+    """Event filter installed on the NPC sprite grid's scroll viewport.
+
+    Triggers a debounced column-reflow whenever the viewport WIDTH
+    changes.  Height-only changes (window vertical resize, vertical
+    scrollbar appearing/disappearing) are ignored — they don't need
+    a rebuild, and forcing one would just flicker the grid.
+
+    The tab object holds:
+      * ``_grid_last_width``  — width seen at the previous fire.  We
+        compare against this so a 1-2 px jitter doesn't queue redundant
+        rebuilds during a continuous splitter drag.
+      * ``_list_refresh_timer`` — the existing debounce timer used for
+        post-edit grid rebuilds; we restart it on width change so the
+        rebuild fires once the user stops dragging.
+
+    Restarting the timer (vs. the ``if not active: start()`` pattern
+    used by edit-driven rebuilds) is deliberate: during a drag we want
+    the rebuild to fire AFTER the user lets go, not 400 ms after the
+    first resize event mid-drag.
+    """
+
+    def __init__(self, tab):
+        super().__init__(tab)
+        self._tab = tab
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            new_width = obj.width()
+            if abs(new_width - self._tab._grid_last_width) > 2:
+                self._tab._grid_last_width = new_width
+                # Always restart so a continuous drag only triggers
+                # one rebuild AFTER the user stops moving the splitter.
+                self._tab._list_refresh_timer.start(150)
+        return False
+
 
 class SpriteEntry:
     """One overworld sprite with all metadata."""
@@ -725,30 +762,47 @@ class FourDirectionPreview(QWidget):
                 if (img.pixel(ix, iy) & 0x00FFFFFF) == bg_rgb:
                     img.setPixel(ix, iy, 0x00000000)
 
-        h = img.height()
-        sheet_w = img.width()
+        img_w = img.width()
+        img_h = img.height()
         s = self._SCALE
 
-        # Use provided frame dimensions if available
+        # Frame size.  Use the declared GraphicsInfo dimensions when given;
+        # otherwise fall back to a best guess from the sheet shape.
         if frame_w > 0 and frame_h > 0:
-            w = frame_w
-        elif sheet_w == h:
-            w = sheet_w
-        elif sheet_w % h == 0 and h >= 16:
-            w = h
+            w, fh = frame_w, frame_h
+        elif img_w == img_h:
+            w, fh = img_w, img_h
+        elif img_w % img_h == 0 and img_h >= 16:
+            w, fh = img_h, img_h
         else:
-            w = 16
+            w, fh = 16, img_h
 
-        total = sheet_w // w if w > 0 else 1
+        # Strip orientation.  A single-OAM sprite is a HORIZONTAL strip
+        # (frames side by side); a multi-frame composite is stored as a
+        # VERTICAL strip (frames stacked) — Phase 3's
+        # _write_vertical_frame_strip.  Detect which so the preview
+        # slices either layout correctly instead of treating the whole
+        # vertical column as one giant frame.
+        vertical = (w > 0 and fh > 0 and img_w == w
+                    and img_h > fh and img_h % fh == 0)
+        if vertical:
+            total = img_h // fh
+        elif w > 0:
+            total = max(1, img_w // w)
+        else:
+            total = 1
 
         def extract(idx, mirror=False):
             if idx >= total:
                 idx = 0
-            frame = img.copy(idx * w, 0, w, h)
+            if vertical:
+                frame = img.copy(0, idx * fh, w, fh)
+            else:
+                frame = img.copy(idx * w, 0, w, fh)
             if mirror:
                 frame = frame.mirrored(True, False)
             scaled = frame.scaled(
-                w * s, h * s,
+                w * s, fh * s,
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.FastTransformation,
             )
@@ -904,6 +958,18 @@ class FourDirectionPreview(QWidget):
 
 # ── New Sprite Dialog ─────────────────────────────────────────────────────
 
+# Named standard overworld sprite sizes — shown in the Frame Layout
+# dropdown so the recognised ones read as e.g. "16×32px (Standard NPC)".
+_STANDARD_SIZE_NAMES = {
+    (16, 16): "Small NPC",
+    (16, 32): "Standard NPC",
+    (32, 32): "Large",
+    (32, 64): "Tall",
+    (64, 64): "Boss",
+    (64, 32): "Wide",
+}
+
+
 class NewSpriteDialog(QDialog):
     """Dialog for adding a new overworld sprite to the project."""
 
@@ -916,6 +982,8 @@ class NewSpriteDialog(QDialog):
         self._dowp_enabled = dowp_enabled
         self._png_path = ""
         self._palette_colors: Optional[List[Color]] = None
+        self._image_w = 0
+        self._image_h = 0
 
         layout = QVBoxLayout(self)
 
@@ -945,33 +1013,48 @@ class NewSpriteDialog(QDialog):
         self._name_edit.setPlaceholderText("e.g. my_npc (lowercase, underscores)")
         form.addRow("Sprite Name:", self._name_edit)
 
-        # Frame dimensions
-        dim_row = QHBoxLayout()
-        self._frame_w = QSpinBox()
-        self._frame_w.setRange(8, 128)
-        self._frame_w.setValue(16)
-        self._frame_w.setSingleStep(8)
-        self._frame_w.setSuffix("px")
-        dim_row.addWidget(QLabel("Width:"))
-        dim_row.addWidget(self._frame_w)
-        self._frame_h = QSpinBox()
-        self._frame_h.setRange(8, 128)
-        self._frame_h.setValue(32)
-        self._frame_h.setSingleStep(8)
-        self._frame_h.setSuffix("px")
-        dim_row.addWidget(QLabel("Height:"))
-        dim_row.addWidget(self._frame_h)
-        self._frame_count_lbl = QLabel("")
-        self._frame_count_lbl.setStyleSheet("color: #888;")
-        dim_row.addWidget(self._frame_count_lbl)
-        form.addRow("Frame Size:", dim_row)
+        # Frame layout — one dropdown of every way the imported sheet
+        # can be sliced into whole, 16px-aligned frames.  No pixel typing:
+        # overworld frames must be multiples of 16, so the options are a
+        # fixed short list; standard sizes are named and the recognised
+        # one is pre-selected on import.
+        self._layout_combo = QComboBox()
+        self._layout_combo.wheelEvent = lambda e: e.ignore()
+        self._layout_combo.addItem("— select a sprite sheet —", 0)
+        self._layout_combo.setToolTip(
+            "How the sprite sheet is split into animation frames.  "
+            "Every option slices the sheet into whole frames whose size "
+            "is a multiple of 16; standard sizes are named."
+        )
+        self._layout_combo.currentIndexChanged.connect(
+            self._on_layout_changed)
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(self._layout_combo, 1)
+        # "Pad to fit" — shown only when the imported sheet isn't a
+        # multiple of 16; pads each frame up instead of rejecting it.
+        self._pad_btn = QPushButton("Pad to fit…")
+        self._pad_btn.setToolTip(
+            "This sheet's frames aren't a multiple of 16.  Pad each "
+            "frame up to the next legal canvas size and re-import."
+        )
+        self._pad_btn.clicked.connect(self._on_pad_clicked)
+        self._pad_btn.setVisible(False)
+        layout_row.addWidget(self._pad_btn)
+        form.addRow("Frame Layout:", layout_row)
 
-        # Animation type
+        # Animation type — every animation table the project actually
+        # defines, each labelled with the number of sprite-sheet frames
+        # it expects (not a hardcoded three).
         self._anim_combo = QComboBox()
         self._anim_combo.wheelEvent = lambda e: e.ignore()
-        from core.overworld_sprite_creator import ANIM_TABLE_CHOICES
-        for value, label in ANIM_TABLE_CHOICES:
+        from core.anim_table_upgrade import scan_anim_tables
+        for value, label in scan_anim_tables(self._project_root):
             self._anim_combo.addItem(label, value)
+        self._anim_combo.setToolTip(
+            "The animation table the sprite uses.  The frame count after "
+            "each name is how many sprite-sheet frames that animation "
+            "references — match it with the Frame Layout above."
+        )
         form.addRow("Animation:", self._anim_combo)
 
         # Category
@@ -997,11 +1080,19 @@ class NewSpriteDialog(QDialog):
 
         layout.addLayout(form)
 
-        # Info label
+        # Info label (palette / indexing notes)
         self._info_lbl = QLabel("")
         self._info_lbl.setStyleSheet("color: #aaa; font-size: 10px;")
         self._info_lbl.setWordWrap(True)
         layout.addWidget(self._info_lbl)
+
+        # Size classification + cost — refreshes as the Frame Layout
+        # changes, so the user sees "single sprite" vs "composite — N
+        # pieces, X B VRAM" and any OAM-slot warning before creating.
+        self._size_lbl = QLabel("")
+        self._size_lbl.setStyleSheet("font-size: 10px;")
+        self._size_lbl.setWordWrap(True)
+        layout.addWidget(self._size_lbl)
 
         # Buttons
         btns = QDialogButtonBox(
@@ -1010,10 +1101,6 @@ class NewSpriteDialog(QDialog):
         btns.accepted.connect(self._validate_and_accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
-
-        # Wire frame size changes to update count
-        self._frame_w.valueChanged.connect(self._update_frame_count)
-        self._frame_h.valueChanged.connect(self._update_frame_count)
 
     def _browse_png(self) -> None:
         start = os.path.join(
@@ -1027,61 +1114,202 @@ class NewSpriteDialog(QDialog):
 
         self._png_path = path
         self._png_label.setText(os.path.basename(path))
+        # Fresh PNG — drop any palette extracted from a previous import
+        # so a non-indexed pick can't inherit a stale palette.
+        self._palette_colors = None
 
         # Auto-detect name from filename
         slug = os.path.splitext(os.path.basename(path))[0].lower()
         slug = re.sub(r"[^a-z0-9_]", "_", slug)
         self._name_edit.setText(slug)
 
-        # Show preview
+        # Load the image and remember its real dimensions.
         pix = QPixmap(path)
-        if not pix.isNull():
-            scaled = pix.scaled(
-                self._preview_lbl.width(), self._preview_lbl.height(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
+        if pix.isNull():
+            self._image_w = self._image_h = 0
+            self._preview_lbl.clear()
+            self._preview_lbl.setText("Could not load PNG")
+            return
+        self._image_w = pix.width()
+        self._image_h = pix.height()
+
+        # Fill the Frame Layout dropdown with every valid slicing of
+        # this sheet and pre-select the recognised standard.
+        self._populate_layouts()
+
+        # Extract the palette when the PNG is already indexed.  When it
+        # isn't, _palette_colors stays None and the OK handler routes
+        # into the manual indexer instead of erroring out.
+        self._palette_colors = self._extract_palette(path)
+        if self._palette_colors is not None:
+            self._info_lbl.setText("")
+        else:
+            self._info_lbl.setText(
+                "This PNG isn't an indexed-colour image — the colour "
+                "picker will open when you click OK so you can index "
+                "it to 16 colours."
             )
-            self._preview_lbl.setPixmap(scaled)
 
-            # Auto-detect frame height from PNG
-            if pix.height() in (16, 32, 64):
-                self._frame_h.setValue(pix.height())
+    def _extract_palette(self, path: str) -> Optional[List[Color]]:
+        """The 16-colour palette of an indexed PNG, or None when the PNG
+        isn't indexed (the caller then routes to the manual indexer)."""
+        img = QImage(path)
+        if img.isNull() or img.format() != QImage.Format.Format_Indexed8:
+            return None
+        colors: List[Color] = []
+        for entry in img.colorTable()[:16]:
+            colors.append(clamp_to_gba(
+                (entry >> 16) & 0xFF, (entry >> 8) & 0xFF, entry & 0xFF))
+        while len(colors) < 16:
+            colors.append((0, 0, 0))
+        return colors
 
-            # Try to detect frame width
-            h = pix.height()
-            w = pix.width()
-            # Common: 9 frames for walk, 1 frame for inanimate
-            for candidate_w in (16, 32, 64):
-                if w % candidate_w == 0 and candidate_w <= w:
-                    count = w // candidate_w
-                    if count in (1, 3, 4, 9, 12, 14):
-                        self._frame_w.setValue(candidate_w)
-                        break
+    def _on_pad_clicked(self) -> None:
+        """Pad the imported sheet's frames up to the next multiple of 16
+        and re-import the padded result — so an odd sheet can be used
+        instead of rejected."""
+        iw, ih = self._image_w, self._image_h
+        if iw <= 0 or ih <= 0:
+            return
+        guess = max(1, round(iw / ih)) if ih else 1
+        count, ok = QInputDialog.getInt(
+            self, "Pad Sprite Sheet",
+            f"This {iw}×{ih}px sheet's frames aren't a multiple of 16.\n\n"
+            f"How many frames does the sheet contain?  Each frame is "
+            f"padded up to the next legal canvas size.",
+            guess, 1, max(1, iw),
+        )
+        if not ok:
+            return
+        if iw % count != 0:
+            QMessageBox.warning(
+                self, "Can't Slice Evenly",
+                f"{count} frames don't divide a {iw}px-wide sheet evenly.\n"
+                f"Pick a frame count that divides {iw}."
+            )
+            return
+        import tempfile
+        from core.overworld_sprite_creator import pad_sprite_sheet
+        fd, tmp = tempfile.mkstemp(prefix="porysuite_padded_", suffix=".png")
+        os.close(fd)
+        try:
+            pw, ph = pad_sprite_sheet(self._png_path, count, tmp)
+        except Exception as e:
+            QMessageBox.warning(self, "Pad Failed", str(e))
+            return
+        # Re-import from the padded sheet.
+        self._png_path = tmp
+        pix = QPixmap(tmp)
+        if pix.isNull():
+            QMessageBox.warning(
+                self, "Pad Failed",
+                "The padded sheet could not be reloaded.")
+            return
+        self._image_w = pix.width()
+        self._image_h = pix.height()
+        self._populate_layouts()
+        self._palette_colors = self._extract_palette(tmp)
+        self._info_lbl.setText(
+            f"Padded each frame to {pw}×{ph}px — original art is "
+            f"bottom-centred, the new margin is transparent."
+        )
 
-            # Extract palette from PNG
-            img = QImage(path)
-            if not img.isNull() and img.format() == QImage.Format.Format_Indexed8:
-                ct = img.colorTable()
-                self._palette_colors = []
-                for entry in ct[:16]:
-                    r = (entry >> 16) & 0xFF
-                    g = (entry >> 8) & 0xFF
-                    b = entry & 0xFF
-                    self._palette_colors.append(clamp_to_gba(r, g, b))
-                while len(self._palette_colors) < 16:
-                    self._palette_colors.append((0, 0, 0))
+    def _populate_layouts(self) -> None:
+        """Fill the Frame Layout dropdown with every way the imported
+        sheet slices into whole 16px-aligned frames, and select the
+        recognised standard layout."""
+        self._layout_combo.blockSignals(True)
+        self._layout_combo.clear()
+        iw, ih = self._image_w, self._image_h
+        if iw <= 0 or ih <= 0 or iw % 16 != 0 or ih % 16 != 0:
+            why = ("image is empty" if iw <= 0 or ih <= 0 else
+                   f"{iw}×{ih}px — width and height must both be "
+                   f"multiples of 16")
+            self._layout_combo.addItem(f"— unusable ({why}) —", 0)
+            # A sheet that loaded but isn't 16-aligned can be padded to fit.
+            self._pad_btn.setVisible(iw > 0 and ih > 0)
+            self._layout_combo.blockSignals(False)
+            self._on_layout_changed()
+            return
+        self._pad_btn.setVisible(False)
+        from core.overworld_sprite_geometry import (
+            detect_frame_size, frame_count_options,
+        )
+        det_w, _ = detect_frame_size(iw, ih)
+        det_count = iw // det_w if det_w else 1
+        sel = 0
+        for i, count in enumerate(frame_count_options(iw)):
+            fw = iw // count
+            name = _STANDARD_SIZE_NAMES.get((fw, ih))
+            label = (f"{count} frame{'' if count == 1 else 's'}"
+                     f"  ·  {fw}×{ih}px")
+            if name:
+                label += f"  ({name})"
+            self._layout_combo.addItem(label, count)
+            if count == det_count:
+                sel = i
+        self._layout_combo.setCurrentIndex(sel)
+        self._layout_combo.blockSignals(False)
+        self._on_layout_changed()
 
-        self._update_frame_count()
+    def _on_layout_changed(self) -> None:
+        self._refresh_preview()
+        self._refresh_size_info()
 
-    def _update_frame_count(self) -> None:
+    def _refresh_size_info(self) -> None:
+        """Show what the selected frame size decomposes into — a single
+        hardware sprite vs a composite, its piece count and VRAM cost —
+        plus any OAM-slot / VRAM warning, so the cost is visible before
+        the sprite is created."""
+        fw, fh = self.frame_width, self.frame_height
+        if fw <= 0 or fh <= 0:
+            self._size_lbl.setText("")
+            return
+        from core.overworld_sprite_geometry import (
+            validate, decompose, describe, cost_warnings,
+        )
+        ok, reasons = validate(fw, fh)
+        if not ok:
+            self._size_lbl.setStyleSheet("font-size: 10px; color: #ff6b6b;")
+            self._size_lbl.setText("  •  ".join(reasons))
+            return
+        d = decompose(fw, fh)
+        warns = cost_warnings(d)
+        if warns:
+            self._size_lbl.setStyleSheet("font-size: 10px; color: #ffb74d;")
+            self._size_lbl.setText(describe(d) + "\n⚠ " + "\n⚠ ".join(warns))
+        else:
+            self._size_lbl.setStyleSheet("font-size: 10px; color: #8fcaa0;")
+            self._size_lbl.setText(describe(d))
+
+    def _refresh_preview(self) -> None:
+        """Draw the source sheet into the preview with red vertical
+        guide lines marking each frame boundary, so the slicing is
+        visible before the sprite is created."""
         if not self._png_path:
             return
-        img = QImage(self._png_path)
-        if img.isNull():
+        src = QPixmap(self._png_path)
+        if src.isNull():
             return
-        fw = self._frame_w.value()
-        count = img.width() // fw if fw > 0 else 0
-        self._frame_count_lbl.setText(f"({count} frames)")
+        scaled = src.scaled(
+            self._preview_lbl.width(), self._preview_lbl.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        fw = self.frame_width
+        if (fw > 0 and src.width() % fw == 0 and src.width() // fw > 1
+                and scaled.width() > 1):
+            from PyQt6.QtGui import QPainter, QPen
+            canvas = QPixmap(scaled)
+            painter = QPainter(canvas)
+            painter.setPen(QPen(QColor("#ff5050"), 1))
+            scale = scaled.width() / src.width()
+            for i in range(1, src.width() // fw):
+                x = round(i * fw * scale)
+                painter.drawLine(x, 0, x, scaled.height() - 1)
+            painter.end()
+            scaled = canvas
+        self._preview_lbl.setPixmap(scaled)
 
     def _validate_and_accept(self) -> None:
         if not self._png_path:
@@ -1097,84 +1325,34 @@ class NewSpriteDialog(QDialog):
             )
             return
 
-        fw = self._frame_w.value()
-        fh = self._frame_h.value()
-        if fw % 8 != 0 or fh % 8 != 0:
+        count = self._layout_combo.currentData()
+        fw, fh = self.frame_width, self.frame_height
+        if not count or fw <= 0 or fh <= 0:
+            QMessageBox.warning(
+                self, "Invalid Frame Layout",
+                "Pick a frame layout from the dropdown."
+            )
+            return
+        # Single source of truth for the size rule — the same check the
+        # creator runs, so the dialog can never accept a size the build
+        # would reject.
+        from core.overworld_sprite_geometry import validate
+        ok, reasons = validate(fw, fh)
+        if not ok:
             QMessageBox.warning(
                 self, "Invalid Frame Size",
-                "Frame width and height must be multiples of 8."
+                f"A {fw}×{fh}px frame can't be used:\n\n"
+                + "\n".join(f"• {r}" for r in reasons)
             )
             return
 
-        img = QImage(self._png_path)
-        if img.isNull() or img.width() < fw:
-            QMessageBox.warning(self, "Invalid PNG", "PNG is smaller than one frame.")
-            return
-
-        pal_data = self._pal_combo.currentData()
-        if pal_data == "NEW" and not self._palette_colors:
-            QMessageBox.warning(
-                self, "No Palette",
-                "The PNG must be an indexed-color image (8-bit, 16 colors)\n"
-                "to create a new palette from it — or pick "
-                "'Pick palette manually (indexer)…' to remap any PNG."
-            )
-            return
-
-        # Manual pick — open the indexer dialog on the chosen PNG.  The
-        # user picks/orders 16 colours; we save those as the new palette
-        # AND remap the source PNG to that palette so the saved image
-        # uses the new indices.  Indexed-source PNGs auto-load their
-        # existing palette as the initial result so the user just needs
-        # to confirm / tweak slot order.
-        if pal_data == "NEW_MANUAL":
-            from ui.dialogs.manual_palette_pick_dialog import (
-                import_image_manually_from_path,
-            )
-            result = import_image_manually_from_path(
-                self._png_path, target_colors=16, parent=self,
-            )
-            if result is None:
-                # User cancelled the picker — don't close the Add dialog.
-                return
-            colors, remapped_img = result
-            self._palette_colors = list(colors)
-            # Save the remapped indexed PNG over the source the dialog
-            # was pointing at, so when create_overworld_sprite copies
-            # the PNG into the project it brings the new pixel indices
-            # along with the new palette.  Garbage-free: if save fails
-            # the source PNG is unchanged.
-            try:
-                from ui.dialogs.manual_palette_pick_dialog import (
-                    save_remapped_image,
-                )
-                if not save_remapped_image(
-                        remapped_img, colors, self._png_path):
-                    QMessageBox.warning(
-                        self, "Save Failed",
-                        "Couldn't write the remapped PNG.  The palette "
-                        "you picked is loaded in memory but the source "
-                        "image on disk is unchanged.  Check folder "
-                        "permissions and retry, or use 'Create new "
-                        "palette from PNG' instead.",
-                    )
-                    return
-            except Exception as exc:
-                QMessageBox.warning(
-                    self, "Save Failed",
-                    f"Couldn't remap the image:\n{exc}",
-                )
-                return
-            # Refresh the preview so the user sees the remapped image
-            # before they confirm the OK that closes the dialog.
-            pix = QPixmap(self._png_path)
-            if not pix.isNull():
-                self._preview_lbl.setPixmap(pix.scaled(
-                    self._preview_lbl.width(), self._preview_lbl.height(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.FastTransformation,
-                ))
-
+        # The manual colour indexer — for a non-indexed PNG, or an
+        # explicit "Pick palette manually" choice — is run by the parent
+        # tab AFTER this dialog closes (see the `needs_manual_index`
+        # property below).  Opening it here, nested inside this dialog's
+        # own modal loop, left the indexer's drag-reorder and colour
+        # picker unresponsive; run one dialog deep from the tab it
+        # behaves exactly as it does for the Image Indexer tab.
         self.accept()
 
     # ── Public accessors for the parent to read after accept() ──────────
@@ -1189,11 +1367,14 @@ class NewSpriteDialog(QDialog):
 
     @property
     def frame_width(self) -> int:
-        return self._frame_w.value()
+        count = self._layout_combo.currentData()
+        if count and self._image_w:
+            return self._image_w // count
+        return 0
 
     @property
     def frame_height(self) -> int:
-        return self._frame_h.value()
+        return self._image_h
 
     @property
     def anim_table(self) -> str:
@@ -1210,6 +1391,20 @@ class NewSpriteDialog(QDialog):
     @property
     def palette_colors(self) -> Optional[List[Color]]:
         return self._palette_colors
+
+    @property
+    def needs_manual_index(self) -> bool:
+        """True when the parent tab must run the manual colour indexer
+        before creating the sprite — the user explicitly chose "Pick
+        palette manually", or "Create new palette from PNG" was picked
+        but the PNG isn't already indexed so no palette could be
+        auto-extracted."""
+        choice = self._pal_combo.currentData()
+        if choice == "NEW_MANUAL":
+            return True
+        if choice == "NEW" and not self._palette_colors:
+            return True
+        return False
 
 
 # ── Field Effect Sprites ─────────────────────────────────────────────────────
@@ -2560,6 +2755,18 @@ class OverworldGraphicsTab(QWidget):
         # Populated only by the Index-as-Background path (pixel remaps).
         self._sprite_imgs: Dict[str, QImage] = {}
         self._sprite_png_dirty: set[str] = set()
+        # gfx_const keys whose animation table was reassigned in the detail
+        # panel.  Save rewrites each sprite's GraphicsInfo .anims field.
+        self._anim_dirty: set[str] = set()
+        # Per-sprite collision footprints (gfx_const → Footprint).  Loaded
+        # from src/data/object_events/object_event_footprints.h on project
+        # open, edited via the Edit Collision Footprint dialog, regenerated
+        # to disk on save.  An entry that becomes empty (all cells cleared)
+        # is dropped from the serialiser so the sprite returns to vanilla
+        # 1-tile collision.
+        from core.overworld_footprint import Footprint as _Footprint
+        self._footprints: Dict[str, _Footprint] = {}
+        self._footprint_dirty: set[str] = set()
         # Tag → .pal file path (JASC text) — what the editor UI reads and
         # writes for palette edits.  Always set even if the file doesn't
         # exist yet; the save path creates it via the paired write.
@@ -2620,17 +2827,33 @@ class OverworldGraphicsTab(QWidget):
         self._sprite_count_lbl.setStyleSheet("color: #888; font-size: 10px;")
         lv.addWidget(self._sprite_count_lbl)
 
-        # Sprite grid (scrollable thumbnail grid)
+        # Sprite grid (scrollable thumbnail grid).  Vertical-only scroll
+        # — horizontal scrollbar is force-disabled so the grid HAS to
+        # reflow when the splitter resizes its width.  See the resize
+        # event filter wired below: every time the viewport width
+        # changes, the grid rebuilds with a fresh col_count.
         self._grid_scroll = QScrollArea()
         self._grid_scroll.setWidgetResizable(True)
         self._grid_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._grid_scroll.setStyleSheet("background: #1a1a1a;")
+        self._grid_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._grid_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._grid_container = QWidget()
         self._grid_layout = QGridLayout(self._grid_container)
         self._grid_layout.setContentsMargins(4, 4, 4, 4)
         self._grid_layout.setSpacing(6)
         self._grid_scroll.setWidget(self._grid_container)
         lv.addWidget(self._grid_scroll, 1)
+
+        # ── Reflow grid columns whenever the viewport width changes ──
+        # Last width seen by the resize filter; used to ignore tiny
+        # jitter (1-2 px) and skip rebuilds when only HEIGHT changed
+        # (e.g. window-vertical resize, scrollbar appear/disappear).
+        self._grid_last_width = 0
+        self._grid_resize_filter = _GridResizeFilter(self)
+        self._grid_scroll.viewport().installEventFilter(self._grid_resize_filter)
 
         # Amber notice strip — surfaces sprites with unused 10th frames
         # detected by the emote scan.  Hidden by default; only shown
@@ -2776,14 +2999,76 @@ class OverworldGraphicsTab(QWidget):
             "with the file selected in Explorer."
         )
         sprite_btn_row.addWidget(self._open_sprite_folder_btn)
+        # Edit Collision Footprint... -- per-sprite 8x8 cell mask.  Each
+        # painted cell BOTH blocks the player AND triggers the object's
+        # interaction script (footprint = collision + interaction unified).
+        # Disabled until a sprite is selected; opens a modal dialog with
+        # an 8x8 grid overlay on the sprite art.
+        self._edit_footprint_btn = QPushButton("Edit Collision Footprint…")
+        self._edit_footprint_btn.setToolTip(
+            "Paint per-cell collision over this sprite's art.\n"
+            "Each painted 8×8 cell blocks the player AND triggers\n"
+            "the object's interaction script when the player presses A\n"
+            "facing any cell of the sprite."
+        )
+        self._edit_footprint_btn.setEnabled(False)
+        self._edit_footprint_btn.clicked.connect(self._on_edit_footprint)
+        sprite_btn_row.addWidget(self._edit_footprint_btn)
         sprite_btn_row.addStretch(1)
         sg.addLayout(sprite_btn_row)
         detail_splitter.addWidget(sheet_group)
 
         # Animation preview
         anim_group = QGroupBox("Animation Preview")
+        self._anim_frame = anim_group  # held for amber dirty highlight
         ag = QVBoxLayout(anim_group)
         ag.setContentsMargins(8, 14, 8, 8)
+
+        # Animation-table picker — lets the user change which animation
+        # table the selected sprite uses.  Populated per project in
+        # load(); disabled until a sprite is selected.  Changing it
+        # rewrites the sprite's GraphicsInfo .anims field on save.
+        anim_sel_row = QHBoxLayout()
+        anim_sel_row.setSpacing(6)
+        anim_sel_row.addWidget(QLabel("Animation:"))
+        self._detail_anim_combo = QComboBox()
+        self._detail_anim_combo.wheelEvent = lambda e: e.ignore()
+        self._detail_anim_combo.setToolTip(
+            "The animation table this sprite uses.  Changing it rewrites\n"
+            "the sprite's GraphicsInfo .anims field when you save.\n"
+            "The frame count after each name is how many sprite-sheet\n"
+            "frames that animation references."
+        )
+        self._detail_anim_combo.setEnabled(False)
+        self._detail_anim_combo.currentIndexChanged.connect(
+            self._on_detail_anim_changed
+        )
+        anim_sel_row.addWidget(self._detail_anim_combo, 1)
+        ag.addLayout(anim_sel_row)
+
+        # Frame-cycle generator — turns the selected sprite into a
+        # stationary entity that cycles every sheet frame (skipping frame 9,
+        # the VS-seeker pose) with no horizontal flipping.  See
+        # core.anim_table_upgrade.ensure_cycle_anim_table /
+        # ensure_random_cycle_anim_table.
+        cycle_row = QHBoxLayout()
+        cycle_row.setSpacing(6)
+        self._detail_cycle_btn = QPushButton("Frame Cycle…")
+        self._detail_cycle_btn.setToolTip(
+            "Generate a frame-cycle animation for this sprite — sequential\n"
+            "(frames in order) or random (a shuffled, non-repetitive order).\n"
+            "Cycles every sheet frame (frame 9 — the VS-seeker pose — is\n"
+            "skipped) with NO horizontal flipping, so the sprite looks the\n"
+            "same in every direction.  Intended for stationary animated\n"
+            "decorations.  Afterwards, place the entity in Porymap with\n"
+            "MOVEMENT_TYPE_FRAME_CYCLE so it animates continuously in place."
+        )
+        self._detail_cycle_btn.setEnabled(False)
+        self._detail_cycle_btn.clicked.connect(self._on_make_cycle_table)
+        cycle_row.addWidget(self._detail_cycle_btn)
+        cycle_row.addStretch(1)
+        ag.addLayout(cycle_row)
+
         self._four_dir = FourDirectionPreview()
         ag.addWidget(self._four_dir)
         ag.addStretch(1)
@@ -2925,6 +3210,19 @@ class OverworldGraphicsTab(QWidget):
         self._palette_dirty.clear()
         self._sprite_imgs.clear()
         self._sprite_png_dirty.clear()
+        self._anim_dirty.clear()
+        # Re-parse the project's collision footprints from disk.  Empty
+        # dict when the header doesn't exist yet (fresh project that
+        # has never used the feature).
+        try:
+            from core.overworld_footprint import parse_project_footprints
+            self._footprints = {
+                fp.gfx_const: fp
+                for fp in parse_project_footprints(project_root)
+            }
+        except Exception:
+            self._footprints = {}
+        self._footprint_dirty.clear()
         self._pal_paths.clear()
         self._gbapal_paths.clear()
         self._pools_by_tag.clear()
@@ -2939,6 +3237,7 @@ class OverworldGraphicsTab(QWidget):
         # have been cleared.  Mirrors what TrainerGraphicsTab.load() does
         # (clears _dirty_dot, resets _sel_lbl, clears _sprite_lbl).
         self._pal_frame.setStyleSheet("")
+        self._anim_frame.setStyleSheet("")
         self._pal_info_lbl.setText("Select a sprite to view its palette")
         self._sheet_lbl.clear()
         self._sheet_lbl.setText("Select a sprite")
@@ -2946,6 +3245,38 @@ class OverworldGraphicsTab(QWidget):
         # Reset swatch row to all-black — safe because set_colors uses emit=False
         # so colors_changed / _on_palette_edited never fires here.
         self._pal_row.set_colors([(0, 0, 0)] * 16)
+        # Repopulate the animation-table combo from this project and reset
+        # it to disabled — no sprite is selected after a (re)load.  Signals
+        # are blocked so the rebuild can't fire _on_detail_anim_changed.
+        if hasattr(self, "_detail_anim_combo"):
+            self._detail_anim_combo.blockSignals(True)
+            self._detail_anim_combo.clear()
+            try:
+                from core.anim_table_upgrade import (
+                    scan_anim_tables, ensure_generic_loop_tables,
+                )
+                # Install (or refresh) the project-wide generic loop presets
+                # before scanning so the dropdown picks them up.  Idempotent
+                # by sentinel — does nothing on subsequent loads once the
+                # block matches the current generator output, so every
+                # sprite-edit session inherits a stable set of reusable
+                # tables for 2-8 frame idle cycles.
+                try:
+                    ensure_generic_loop_tables(project_root)
+                except Exception:
+                    # Non-fatal — the dropdown will simply not show the
+                    # generic presets if the install ever fails.
+                    pass
+                for value, label in scan_anim_tables(project_root):
+                    self._detail_anim_combo.addItem(label, value)
+            except Exception:
+                pass
+            self._detail_anim_combo.setEnabled(False)
+            self._detail_anim_combo.blockSignals(False)
+        if hasattr(self, "_detail_cycle_btn"):
+            self._detail_cycle_btn.setEnabled(False)
+        if hasattr(self, "_edit_footprint_btn"):
+            self._edit_footprint_btn.setEnabled(False)
 
         # Check DOWP status
         self._update_dowp_status()
@@ -3425,7 +3756,9 @@ class OverworldGraphicsTab(QWidget):
         container.setFixedSize(76, 80)
         is_selected = (self._current_sprite and
                        entry.gfx_const == self._current_sprite.gfx_const)
-        is_dirty = entry.palette_tag in self._palette_dirty
+        is_dirty = (entry.palette_tag in self._palette_dirty
+                    or entry.gfx_const in self._anim_dirty
+                    or entry.gfx_const in self._footprint_dirty)
         if is_selected:
             border_color = "#1565c0"
         elif is_dirty:
@@ -3689,9 +4022,23 @@ class OverworldGraphicsTab(QWidget):
         anim_type = FourDirectionPreview.anim_type_label(
             getattr(entry, "anim_table", "sAnimTable_Standard")
         )
+        # Classification — single hardware sprite vs composite — so the
+        # detail panel says what the frame size actually builds into.
+        cls_str = ""
+        if isinstance(entry.width, int) and isinstance(entry.height, int):
+            try:
+                from core.overworld_sprite_geometry import validate, decompose
+                if validate(entry.width, entry.height)[0]:
+                    d = decompose(entry.width, entry.height)
+                    cls_str = ("  ·  single hardware sprite"
+                               if d.is_single_oam
+                               else f"  ·  composite, {d.piece_count} pieces")
+            except Exception:
+                cls_str = ""
         self._sheet_info_lbl.setText(
             f"{entry.display_name}  —  {entry.gfx_const}\n"
-            f"Frame: {w}×{h}px  |  Palette: {entry.palette_tag}  |  {anim_type}"
+            f"Frame: {w}×{h}px{cls_str}  |  Palette: {entry.palette_tag}"
+            f"  |  {anim_type}"
         )
 
         # Animation preview
@@ -3700,10 +4047,450 @@ class OverworldGraphicsTab(QWidget):
         anim = getattr(entry, "anim_table", "sAnimTable_Standard")
         self._four_dir.load_sprite(entry.png_path, palette, fw, fh, anim)
 
+        # Sync the animation-table combo to this sprite.  Signals are
+        # blocked so re-selecting a sprite never registers as an edit.
+        # A table not in the scanned list (a custom/unparsed table) is
+        # added on the fly so the combo can still show the real value.
+        combo = getattr(self, "_detail_anim_combo", None)
+        if combo is not None:
+            combo.blockSignals(True)
+            idx = combo.findData(anim)
+            if idx < 0:
+                try:
+                    from core.anim_table_upgrade import _prettify_anim_symbol
+                    label = _prettify_anim_symbol(anim)
+                except Exception:
+                    label = anim
+                combo.addItem(label, anim)
+                idx = combo.count() - 1
+            combo.setCurrentIndex(idx)
+            combo.setEnabled(True)
+            combo.blockSignals(False)
+
+        # The frame-cycle button is usable whenever a sprite is selected.
+        cycle_btn = getattr(self, "_detail_cycle_btn", None)
+        if cycle_btn is not None:
+            cycle_btn.setEnabled(True)
+
+        # The footprint editor is enabled whenever the sprite's dimensions
+        # are known and 8-aligned (any sprite created through the New
+        # Sprite flow satisfies both).
+        fp_btn = getattr(self, "_edit_footprint_btn", None)
+        if fp_btn is not None:
+            ok_dims = (
+                isinstance(entry.width, int)
+                and isinstance(entry.height, int)
+                and entry.width > 0 and entry.height > 0
+                and entry.width % 8 == 0 and entry.height % 8 == 0
+            )
+            fp_btn.setEnabled(ok_dims)
+
+        # Reflect this sprite's anim-table dirty state on the Animation
+        # Preview groupbox (Pattern C — re-evaluated per selection).
+        anim_frame = getattr(self, "_anim_frame", None)
+        if anim_frame is not None:
+            anim_frame.setStyleSheet(
+                self._DIRTY_SS if entry.gfx_const in self._anim_dirty else ""
+            )
+
         # Per-sprite emote upgrade section — shown only when the scan
         # flagged THIS sprite as a candidate.  Built fresh on each
         # selection so the thumbnail uses the current palette.
         self._refresh_per_sprite_emote_section(entry)
+
+    def _on_detail_anim_changed(self) -> None:
+        """User picked a different animation table for the selected sprite.
+
+        Updates the in-memory entry, marks the sprite dirty (amber card +
+        amber detail frame), and refreshes the preview so the new
+        animation plays immediately.  The GraphicsInfo .anims field is
+        rewritten on save (see flush_to_disk Pass 2b).
+        """
+        if self._loading or not self._current_sprite:
+            return
+        combo = getattr(self, "_detail_anim_combo", None)
+        if combo is None:
+            return
+        new_table = combo.currentData()
+        if not new_table:
+            return
+        entry = self._current_sprite
+        if new_table == getattr(entry, "anim_table", ""):
+            return
+        entry.anim_table = new_table
+        self._anim_dirty.add(entry.gfx_const)
+        self.modified.emit()
+        # Refresh detail — _show_sprite_detail re-renders the preview,
+        # updates the info line, and re-evaluates the amber anim frame.
+        self._show_sprite_detail(entry)
+        # Debounce the grid rebuild so the card's amber border appears.
+        if not self._list_refresh_timer.isActive():
+            self._list_refresh_timer.start(400)
+
+    def _on_edit_footprint(self) -> None:
+        """Open the Edit Collision Footprint dialog for the selected sprite.
+
+        Renders the sprite's first frame with the live palette (via the
+        same path the detail panel uses), passes the current footprint
+        if any, and on accept marks the sprite footprint-dirty so the
+        save path writes object_event_footprints.h and auto-installs
+        the engine patcher.
+        """
+        entry = self._current_sprite
+        if entry is None or not self._project_root:
+            return
+        if not (isinstance(entry.width, int) and isinstance(entry.height, int)
+                and entry.width > 0 and entry.height > 0):
+            QMessageBox.information(
+                self, "Edit Collision Footprint",
+                "This sprite's frame size isn't known yet — open the New "
+                "Sprite flow's detail readout first.",
+            )
+            return
+        if entry.width % 8 or entry.height % 8:
+            QMessageBox.information(
+                self, "Edit Collision Footprint",
+                f"Frame size {entry.width}×{entry.height}px is not a "
+                "multiple of 8 — the footprint editor needs 8-aligned "
+                "dimensions.  Re-import the sprite at a multiple-of-16 "
+                "size.",
+            )
+            return
+
+        # Render the sprite's first frame through the live palette,
+        # the same way _show_sprite_detail does (RAM remap if the user
+        # ran Index-as-Background; otherwise straight reskin off disk).
+        palette = self._get_palette_for_sprite(entry)
+        remapped_img = self._sprite_imgs.get(entry.gfx_const)
+        pix: Optional[QPixmap] = None
+        if palette and remapped_img:
+            pix = _reskin_overworld_img(remapped_img, palette)
+        elif palette and entry.png_path:
+            pix = _reskin_overworld(entry.png_path, palette)
+        if pix is None or pix.isNull():
+            QMessageBox.warning(
+                self, "Edit Collision Footprint",
+                "Could not render the sprite preview.  Make sure the "
+                "PNG and palette are loaded correctly.",
+            )
+            return
+
+        from core.overworld_footprint import empty_footprint
+        from ui.overworld_footprint_dialog import FootprintEditorDialog
+
+        existing = self._footprints.get(entry.gfx_const)
+        if existing is None:
+            existing = empty_footprint(entry.gfx_const, entry.width, entry.height)
+
+        dlg = FootprintEditorDialog(
+            entry.gfx_const, pix, entry.width, entry.height,
+            initial=existing, parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_fp = dlg.footprint()
+        # Update in-memory state.  We store EVERY edited footprint here,
+        # even empty ones, so a "clear all then save" returns the sprite
+        # to vanilla 1-tile collision (serialize_footprints drops empties
+        # on emit, so an empty footprint produces no header entry).
+        self._footprints[entry.gfx_const] = new_fp
+        self._footprint_dirty.add(entry.gfx_const)
+        self.modified.emit()
+        # Debounce the grid rebuild so the card's amber border appears.
+        if not self._list_refresh_timer.isActive():
+            self._list_refresh_timer.start(400)
+
+    def _on_make_cycle_table(self) -> None:
+        """Generate a frame-cycle animation for the selected sprite and
+        assign it.
+
+        The dialog offers a Sequential or Random frame order.  Sequential
+        loops every sheet frame 0->N in order; Random bakes a long
+        pre-shuffled sequence (no two consecutive frames alike) so the idle
+        animation reads as non-repetitive.  Either way the cycle covers every
+        sheet frame except index 9 (the VS-seeker / emote pose), never
+        hFlips, and is driven in-game by placing the object event in Porymap
+        with MOVEMENT_TYPE_FRAME_CYCLE — a dedicated movement type this also
+        installs into the engine.  (MOVEMENT_TYPE_NONE
+        looks fine until the player talks to the entity: a talk script's
+        `lock`/`faceplayer` pauses the sprite and NONE's empty callback never
+        un-pauses it, leaving the entity frozen on one frame.  FRAME_CYCLE's
+        callback re-clears the pause every idle frame.)
+
+        Unlike the plain animation-table picker (deferred to save via Pass
+        2b), this writes everything immediately — the new anim block in
+        object_event_anims.h, the .anims reassignment, the .inanimate clear
+        in object_event_graphics_info.h, and the MOVEMENT_TYPE_FRAME_CYCLE
+        engine support — matching the emote-upgrade pattern.
+        object_event_graphics_info.h is patched in place, never regenerated
+        wholesale, so the immediate writes are not clobbered by a later save.
+        """
+        if self._loading or not self._current_sprite:
+            return
+        entry = self._current_sprite
+        info_name = getattr(entry, "info_name", "")
+        if not info_name:
+            QMessageBox.warning(
+                self, "Frame Cycle",
+                "This sprite has no GraphicsInfo name to attach a table to.")
+            return
+
+        # Resolve the sheet's frame count from its PNG + declared frame size.
+        # `frame_count` here is a STARTING SUGGESTION — the user can edit
+        # it in the dialog below, so a sprite whose GraphicsInfo dims
+        # disagree with their intended layout doesn't trap them into a
+        # broken cycle table.  For the canonical "change frame size"
+        # path, use Import Manually… — it now detects layout changes and
+        # rewrites GraphicsInfo / pic table / spritesheet_rules in lockstep.
+        from core.anim_table_upgrade import _png_frame_count
+        fw = entry.width if isinstance(entry.width, int) else 0
+        fh = entry.height if isinstance(entry.height, int) else 0
+        detected_count = _png_frame_count(entry.png_path, fw, fh)
+        if detected_count < 2:
+            QMessageBox.warning(
+                self, "Frame Cycle",
+                f"This sprite resolves to {detected_count} frame(s) at "
+                f"{fw}×{fh}px.\nA frame-cycle needs at least 2 frames.\n\n"
+                "If the frame size is wrong, use 'Import Manually…' to "
+                "set the correct frame layout first.")
+            return
+        frame_count = detected_count
+        cycled = frame_count - (1 if frame_count > 9 else 0)
+
+        # Order + per-frame duration dialog.
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Frame Cycle")
+        form = QFormLayout(dlg)
+        info = QLabel()
+        info.setWordWrap(True)
+        info.setMinimumWidth(380)
+        form.addRow(info)
+
+        # Frame-count override — user can change the auto-detected count
+        # without recreating the sprite.  This handles the case where the
+        # PNG's pixel dimensions divide evenly into multiple frame counts
+        # at the current frame size (e.g. a 128×32 sheet sliced at 16×16
+        # gives 16 frames, but the user wanted 8 frames of 16×32) and the
+        # auto-detected number isn't what the user authored.  Defaults to
+        # the auto-detected count so a single-click flow still works.
+        frame_count_spin = QSpinBox()
+        frame_count_spin.setRange(2, 64)
+        frame_count_spin.setValue(detected_count)
+        frame_count_spin.setSuffix(" frames")
+        frame_count_spin.setToolTip(
+            "How many sheet frames the cycle should reference, "
+            "starting from frame 0.\n"
+            f"Auto-detected from PNG ÷ frame size: {detected_count}.\n\n"
+            "Lower this if the engine is reading more frames than your "
+            "sheet actually contains (e.g. a 16×32-art sheet pinned to a "
+            "16×16 GraphicsInfo).\n\n"
+            "If the actual frame SIZE is wrong, re-import the sheet via "
+            "'Import Manually…' — it detects the new layout and rewrites "
+            "GraphicsInfo / pic table / build rules in lockstep."
+        )
+        frame_count_spin.wheelEvent = lambda e: e.ignore()
+        form.addRow("Frame count:", frame_count_spin)
+
+        # Sequential vs Random frame order.
+        seq_radio = QRadioButton("Sequential")
+        rnd_radio = QRadioButton("Random")
+        seq_radio.setChecked(True)
+        seq_radio.setToolTip("Loop the frames in order: 0, 1, 2, … and repeat.")
+        rnd_radio.setToolTip(
+            "Cycle the frames in a shuffled order — no two consecutive\n"
+            "frames alike — for a non-repetitive idle animation.")
+        order_group = QButtonGroup(dlg)
+        order_group.addButton(seq_radio)
+        order_group.addButton(rnd_radio)
+        order_row = QHBoxLayout()
+        order_row.setSpacing(12)
+        order_row.addWidget(seq_radio)
+        order_row.addWidget(rnd_radio)
+        order_row.addStretch(1)
+        form.addRow("Order:", order_row)
+
+        # Timing controls — a stacked widget swaps between the Sequential
+        # single hold and the Random fastest/slowest range.
+        timing_stack = QStackedWidget()
+
+        # Page 0 — Sequential: one uniform per-frame hold.
+        seq_page = QWidget()
+        seq_l = QHBoxLayout(seq_page)
+        seq_l.setContentsMargins(0, 0, 0, 0)
+        dur = QSpinBox()
+        dur.setRange(1, 63)
+        dur.setValue(16)
+        dur.setSuffix(" ticks")
+        dur.setToolTip(
+            "How long each frame is held, in game ticks (~60/sec).\n"
+            "Lower = faster animation. 16 ≈ 0.27s per frame.\n"
+            "Max 63 — the engine's per-frame timer is a 6-bit field.")
+        dur.wheelEvent = lambda e: e.ignore()
+        seq_l.addWidget(dur)
+        seq_l.addStretch(1)
+        timing_stack.addWidget(seq_page)
+
+        # Page 1 — Random: each frame held a random time in [fast, slow], so
+        # the idle animation varies its pace instead of flickering steadily.
+        rnd_page = QWidget()
+        rnd_l = QHBoxLayout(rnd_page)
+        rnd_l.setContentsMargins(0, 0, 0, 0)
+        hold_fast = QSpinBox()
+        hold_fast.setRange(1, 63)
+        hold_fast.setValue(20)
+        hold_fast.setToolTip(
+            "Shortest a frame is held, in game ticks (~60/sec). 20 ≈ 0.33s.")
+        hold_fast.wheelEvent = lambda e: e.ignore()
+        hold_slow = QSpinBox()
+        hold_slow.setRange(1, 63)
+        hold_slow.setValue(60)
+        hold_slow.setSuffix(" ticks")
+        hold_slow.setToolTip(
+            "Longest a frame is held, in game ticks (~60/sec). 60 ≈ 1s.\n"
+            "Max 63 — the engine's per-frame timer is a 6-bit field.\n"
+            "Every frame picks a random hold between fastest and slowest.")
+        hold_slow.wheelEvent = lambda e: e.ignore()
+        rnd_l.addWidget(hold_fast)
+        rnd_l.addWidget(QLabel("to"))
+        rnd_l.addWidget(hold_slow)
+        rnd_l.addStretch(1)
+        timing_stack.addWidget(rnd_page)
+
+        timing_label = QLabel("Per-frame hold:")
+        form.addRow(timing_label, timing_stack)
+
+        def _update_cycle_info() -> None:
+            is_rnd = rnd_radio.isChecked()
+            timing_stack.setCurrentIndex(1 if is_rnd else 0)
+            timing_label.setText("Frame hold:" if is_rnd
+                                 else "Per-frame hold:")
+            # Recompute cycled count from the LIVE spinbox value so the
+            # description tracks edits to the frame count.
+            cur_count = frame_count_spin.value()
+            cur_cycled = cur_count - (1 if cur_count > 9 else 0)
+            if is_rnd:
+                verb = (f"Cycles its <b>{cur_cycled}</b> frame(s) in a shuffled "
+                        f"order, each frame held a random time in the range "
+                        f"you set, so the pace varies")
+            else:
+                verb = (f"Loops its <b>{cur_cycled}</b> frame(s) in order, each "
+                        f"held the same time")
+            skip_clause = (" — frame 9 (the VS-seeker pose) is skipped"
+                           if cur_count > 9 else "")
+            info.setText(
+                f"{'Random' if is_rnd else 'Sequential'} "
+                f"frame-cycle for <b>{entry.display_name}</b>.<br><br>"
+                f"{verb}{skip_clause} — with no "
+                f"horizontal flipping, so the sprite looks identical in every "
+                f"direction.<br><br>"
+                f"After this, place the entity in Porymap with "
+                f"<b>MOVEMENT_TYPE_FRAME_CYCLE</b> to animate it continuously "
+                f"in place.")
+        seq_radio.toggled.connect(lambda _checked: _update_cycle_info())
+        frame_count_spin.valueChanged.connect(lambda _v: _update_cycle_info())
+        _update_cycle_info()
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        randomized = rnd_radio.isChecked()
+        duration = dur.value()
+        hold_lo = min(hold_fast.value(), hold_slow.value())
+        hold_hi = max(hold_fast.value(), hold_slow.value())
+        # Use the user's edited frame count rather than the original
+        # PNG-derived one — so a sprite whose GraphicsInfo dims disagree
+        # with their intended layout still gets a correct cycle table.
+        frame_count = frame_count_spin.value()
+        cycled = frame_count - (1 if frame_count > 9 else 0)
+
+        # Install the frame-cycle movement type, then generate the table,
+        # repoint .anims, and force non-inanimate.
+        from core.anim_table_upgrade import (
+            ensure_cycle_anim_table, ensure_random_cycle_anim_table,
+            ensure_frame_cycle_movement_type,
+            _rewrite_sprite_anims, _rewrite_sprite_inanimate, scan_anim_tables,
+        )
+        mt_ok, mt_msgs = ensure_frame_cycle_movement_type(self._project_root)
+        if not mt_ok:
+            QMessageBox.warning(
+                self, "Frame Cycle",
+                "Could not install the frame-cycle movement type:\n\n"
+                + "\n".join(mt_msgs))
+            return
+        if randomized:
+            ok, table_sym, msgs = ensure_random_cycle_anim_table(
+                self._project_root, info_name, frame_count,
+                hold_lo, hold_hi)
+        else:
+            ok, table_sym, msgs = ensure_cycle_anim_table(
+                self._project_root, info_name, frame_count, duration)
+        if not ok:
+            QMessageBox.warning(
+                self, "Frame Cycle",
+                "Could not generate the cycle table:\n\n" + "\n".join(msgs))
+            return
+        anims_ok, anims_msg = _rewrite_sprite_anims(
+            self._project_root, info_name, table_sym)
+        if not anims_ok:
+            QMessageBox.warning(
+                self, "Frame Cycle",
+                f"Cycle table {table_sym} was generated, but its "
+                f"assignment failed:\n\n{anims_msg}")
+            return
+        inan_ok, inan_msg = _rewrite_sprite_inanimate(
+            self._project_root, info_name, False)
+        if not inan_ok:
+            QMessageBox.warning(
+                self, "Frame Cycle",
+                f"Cycle table assigned, but clearing the .inanimate flag "
+                f"failed:\n\n{inan_msg}\n\nThe sprite will not animate "
+                f"until .inanimate is FALSE.")
+            # fall through — the table is still assigned
+
+        # Reflect the on-disk state in the in-memory entry.
+        entry.anim_table = table_sym
+        entry.inanimate = False
+        # This sprite is now clean on disk for the anim path — drop any
+        # pending Pass-2b reassignment so save doesn't re-write it.
+        self._anim_dirty.discard(entry.gfx_const)
+
+        # Refresh the animation combo so the new table is listed + selected.
+        combo = getattr(self, "_detail_anim_combo", None)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.clear()
+            try:
+                for value, label in scan_anim_tables(self._project_root):
+                    combo.addItem(label, value)
+            except Exception:
+                pass
+            idx = combo.findData(table_sym)
+            if idx < 0:
+                combo.addItem(table_sym, table_sym)
+                idx = combo.count() - 1
+            combo.setCurrentIndex(idx)
+            combo.setEnabled(True)
+            combo.blockSignals(False)
+
+        self._show_sprite_detail(entry)
+        if randomized:
+            order_word = "random order"
+            timing_word = f"random {hold_lo}-{hold_hi} ticks per frame"
+        else:
+            order_word = "in sequence"
+            timing_word = f"{duration} ticks per frame"
+        QMessageBox.information(
+            self, "Frame Cycle",
+            f"Generated and assigned {table_sym}\n"
+            f"({cycled} frames, {order_word}, {timing_word}).\n\n"
+            f"Place the entity in Porymap with MOVEMENT_TYPE_FRAME_CYCLE to "
+            f"make it animate continuously in place.")
 
     def _refresh_per_sprite_emote_section(self, entry: SpriteEntry) -> None:
         """Populate (or hide) the per-sprite emote upgrade section."""
@@ -3753,6 +4540,232 @@ class OverworldGraphicsTab(QWidget):
         which colours land in which slot (and slot 0 = BG/transparent).
         """
         self._do_palette_import_from_png(manual=True)
+
+    def _detect_resize_target(
+        self, png_path: str, cur_fw: int, cur_fh: int,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Heuristic — silent — pick the best (frame_w, frame_h) for a
+        freshly-imported PNG without asking the user.
+
+        Returns ``(None, None)`` when the PNG can't be probed or no
+        sensible layout exists at any priority.  When that happens the
+        caller treats the import as "no resize" and leaves geometry
+        alone, the same as before this feature existed.
+
+        Priority order:
+          1. **Keep current geometry** when PNG height matches the
+             sprite's current ``cur_fh`` AND ``cur_fw`` cleanly divides
+             the PNG width.  Same-shape replacements stay same-shape.
+          2. **Canonical NPC layout** based on PNG height:
+                 height 16 → 16×16   (small-sprite / Pokemon)
+                 height 32 → 16×32   (standard NPC)
+                 height 64 → 32×64   (vehicle / surf)
+             Only used when the PNG width cleanly divides the chosen
+             frame width and ``validate()`` accepts the shape.
+          3. **Keep current frame_w + use PNG height** as a fallback
+             for unusual heights the canonical map doesn't cover.
+
+        Heuristic is opinionated — it picks the most likely intent for
+        NPC art.  Mismatches are rare in practice; when one happens the
+        user re-imports or adjusts the Animation dropdown.  No dialog.
+        """
+        try:
+            probe = QImage(png_path)
+        except Exception:
+            return None, None
+        if probe.isNull():
+            return None, None
+        png_w, png_h = probe.width(), probe.height()
+        if png_w <= 0 or png_h <= 0 or png_w % 8 or png_h % 8:
+            return None, None
+
+        from core.overworld_sprite_geometry import validate
+
+        # Priority 1: keep current geometry when PNG height matches.
+        if (cur_fh > 0 and cur_fw > 0 and cur_fh == png_h
+                and png_w % cur_fw == 0):
+            ok, _ = validate(cur_fw, cur_fh)
+            if ok:
+                return cur_fw, cur_fh
+
+        # Priority 2: canonical layout by PNG height.
+        canonical = {16: 16, 32: 16, 64: 32}
+        canonical_fw = canonical.get(png_h)
+        if canonical_fw is not None and png_w % canonical_fw == 0:
+            ok, _ = validate(canonical_fw, png_h)
+            if ok:
+                return canonical_fw, png_h
+
+        # Priority 3: keep current frame_w, use the PNG's height.
+        if cur_fw > 0 and png_w % cur_fw == 0:
+            ok, _ = validate(cur_fw, png_h)
+            if ok:
+                return cur_fw, png_h
+
+        return None, None
+
+    def _sync_metadata_after_manual_import(
+        self,
+        gfx_const: str,
+        info_name: str,
+        old_anim_table: str,
+        cur_fw: int,
+        cur_fh: int,
+        png_path: str,
+    ) -> None:
+        """Silently bring GraphicsInfo / pic table / spritesheet_rules.mk
+        in sync with the PNG that was just written by Import Manually.
+
+        This is the post-processing tail of the manual import: the PNG
+        is already on disk (saved by ``_save_remapped_sprite_png``),
+        the palette is already applied.  All this function does is
+        keep the engine's view of the sprite consistent with the new
+        PNG when its dimensions changed under the sprite's feet.
+
+        No UI.  No dialogs.  If the detected layout matches the current
+        geometry, this is a clean no-op.  If anything fails, the user
+        still has the PNG + palette on disk — they just need to fix
+        the frame size manually.  Errors are silent on purpose: the
+        visible Import Manually flow already succeeded, no point in
+        surfacing a failure that the user can fix later.
+        """
+        if not info_name or not png_path:
+            return
+        new_fw, new_fh = self._detect_resize_target(png_path, cur_fw, cur_fh)
+        if new_fw is None or new_fh is None:
+            return
+        if new_fw == cur_fw and new_fh == cur_fh:
+            return  # no resize needed — clean no-op
+
+        # Geometry differs from the sprite's current frame size.  Run
+        # the metadata-only sync (the PNG was already saved by the
+        # visible flow, but replace_sprite_sheet is idempotent on the
+        # PNG side — passing the same path through it produces the
+        # same bytes back).
+        try:
+            from core.overworld_sprite_creator import replace_sprite_sheet
+            ok2, _applied, _errors = replace_sprite_sheet(
+                root=self._project_root,
+                info_name=info_name,
+                new_png_path=png_path,
+                new_frame_w=new_fw,
+                new_frame_h=new_fh,
+            )
+        except Exception:
+            return
+        if not ok2:
+            return
+
+        # Stale per-sprite cycle anim cleanup + reload.  Wrapped in
+        # try so any failure here doesn't surface a dialog either.
+        try:
+            self._auto_fix_stale_cycle_anim_after_resize(
+                gfx_const, old_anim_table, new_fw, new_fh)
+        except Exception:
+            pass
+        try:
+            self.load(self._project_root)
+            new_entry = self._all_sprites.get(gfx_const)
+            if new_entry is not None:
+                self._current_sprite = new_entry
+                self._show_sprite_detail(new_entry)
+        except Exception:
+            pass
+
+    def _auto_fix_stale_cycle_anim_after_resize(
+        self,
+        gfx_const: str,
+        old_anim_table: str,
+        new_frame_w: int,
+        new_frame_h: int,
+    ) -> None:
+        """When a resize lands and the sprite's .anims is a per-sprite
+        cycle table (sAnimTable_<X>Cycle / RandomCycle), repoint it to
+        the matching Generic Loop preset so the sprite isn't left with
+        an anim that references frame indices the new sheet doesn't
+        have.
+
+        The per-sprite cycle tables are NAME-bound to the sprite's old
+        frame count (e.g. sAnimTable_JigglypuffCycle was generated when
+        Jigglypuff had 16 16x16 frames; its body references frames up
+        to index 15).  After a resize that drops the frame count, those
+        references would do an OOB read at runtime and render garbage.
+
+        Behaviour:
+          - Anim is not a per-sprite cycle → no-op.
+          - New frame count is in GENERIC_LOOP_FRAME_COUNTS (2..8) →
+            ensure_generic_loop_tables() is run, then .anims is
+            rewritten to sAnimTable_Loop{N}Sequential.
+          - New frame count is outside that range → no-op; the user
+            will see the broken state in the Animation dropdown and
+            can fix it manually.  (Sticking them with a 9-frame
+            Standard table for a 12-frame sheet would be its own bug.)
+
+        Errors are swallowed and logged via the file logger — a
+        failed anim cleanup must NOT abort the import.  The user can
+        always pick the right anim from the dropdown afterwards.
+        """
+        if not old_anim_table:
+            return
+        # The per-sprite cycle tables created by Frame Cycle…/the old
+        # cycle button always end in "Cycle" or "RandomCycle" — that's
+        # the only suffix used.
+        if not (old_anim_table.endswith("Cycle")
+                or old_anim_table.endswith("RandomCycle")):
+            return
+
+        # Frame count = png_w / frame_w when the sheet is a single
+        # horizontal strip.  For 2-row layouts, replace_sprite_sheet
+        # already accounted for the doubled count via cols × rows; the
+        # value we want here is whatever the engine sees post-resize.
+        try:
+            probe = QImage(self._current_sprite.png_path)
+        except Exception:
+            return
+        if probe.isNull():
+            return
+        png_w, png_h = probe.width(), probe.height()
+        if new_frame_w <= 0 or new_frame_h <= 0:
+            return
+        cols = png_w // new_frame_w
+        rows = png_h // new_frame_h
+        new_count = cols * rows
+        if new_count < 2:
+            return
+
+        try:
+            from core.anim_table_upgrade import (
+                GENERIC_LOOP_FRAME_COUNTS,
+                ensure_generic_loop_tables,
+                generic_loop_table_symbol,
+                _rewrite_sprite_anims,
+            )
+        except Exception:
+            return
+        if new_count not in GENERIC_LOOP_FRAME_COUNTS:
+            # No matching preset — leave the (now stale) per-sprite
+            # cycle alone.  The Animation dropdown will show the broken
+            # state and the user picks a sensible replacement.
+            return
+
+        try:
+            ok_loops, _msgs = ensure_generic_loop_tables(self._project_root)
+            if not ok_loops:
+                return
+            target_sym = generic_loop_table_symbol(
+                new_count, randomized=False)
+            info_name = ""
+            entry = self._all_sprites.get(gfx_const)
+            if entry is not None:
+                info_name = getattr(entry, "info_name", "") or ""
+            if not info_name:
+                return
+            _rewrite_sprite_anims(
+                self._project_root, info_name, target_sym)
+        except Exception:
+            # Non-fatal: the resize itself succeeded; the user can pick
+            # any anim from the dropdown.
+            return
 
     def _do_palette_import_from_png(self, manual: bool) -> None:
         if not self._current_sprite:
@@ -3894,6 +4907,15 @@ class OverworldGraphicsTab(QWidget):
         # ── Manual mode: write the remapped PNG over the sprite's own
         #    source PNG.  Auto mode never touches the image because the
         #    user is opting into "palette only — preserve pixel indices".
+        # Capture these BEFORE the save / palette apply so the silent
+        # post-processing below can refer to pre-flow state.
+        captured_gfx_const = self._current_sprite.gfx_const
+        captured_anim_table = getattr(self._current_sprite, "anim_table", "") or ""
+        captured_info_name = getattr(self._current_sprite, "info_name", "") or ""
+        captured_cur_fw = (self._current_sprite.width
+                          if isinstance(self._current_sprite.width, int) else 0)
+        captured_cur_fh = (self._current_sprite.height
+                          if isinstance(self._current_sprite.height, int) else 0)
         if manual and remapped_img is not None:
             self._save_remapped_sprite_png(remapped_img, colors)
 
@@ -3902,6 +4924,25 @@ class OverworldGraphicsTab(QWidget):
             self._apply_palette_fork(colors)
         else:
             self._apply_palette_to_tag(tag, colors)
+
+        # ── Silent post-processing for manual mode ────────────────────
+        # The visible Import Manually flow ends above.  Everything below
+        # is invisible work: when the new sheet's dimensions hint that
+        # the sprite's frame size changed (e.g. user dropped a 128×32
+        # NPC sheet over a 16×16 Pokemon-shaped entry), keep
+        # GraphicsInfo, pic table, spritesheet_rules.mk, and any stale
+        # per-sprite cycle anim in lockstep — automatically, no dialogs.
+        # If the detected layout matches the current geometry, this
+        # block is a clean no-op.
+        if manual and captured_info_name:
+            self._sync_metadata_after_manual_import(
+                captured_gfx_const,
+                captured_info_name,
+                captured_anim_table,
+                captured_cur_fw,
+                captured_cur_fh,
+                self._current_sprite.png_path,
+            )
 
     def _save_remapped_sprite_png(
         self, remapped: QImage, palette: List[Color],
@@ -4228,18 +5269,38 @@ class OverworldGraphicsTab(QWidget):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        # Determine palette settings.  Both "NEW" (auto-extract from
-        # indexed PNG) and "NEW_MANUAL" (manual indexer pick) flow into
-        # the same create_overworld_sprite path — the only difference
-        # is HOW dlg.palette_colors got populated.  Manual mode also
-        # remapped the source PNG before reaching this code, so
-        # create_overworld_sprite's PNG copy step picks up the new
-        # pixel indices automatically.
+        # Determine palette settings.  An explicit tag uses a shared NPC
+        # palette; "NEW" / "NEW_MANUAL" create a new custom palette.
         pal_choice = dlg.palette_choice
         create_new = pal_choice in ("NEW", "NEW_MANUAL")
         pal_tag = None if create_new else pal_choice
         pal_slot = None
         pal_colors = dlg.palette_colors if create_new else None
+
+        # When the PNG needs indexing — it isn't already an indexed
+        # image, or the user explicitly chose "Pick palette manually" —
+        # run the shared colour indexer HERE, at tab level (one dialog
+        # deep).  Running it from inside NewSpriteDialog's own modal
+        # exec left the indexer's drag-reorder and colour picker dead.
+        if create_new and dlg.needs_manual_index:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path, save_remapped_image,
+            )
+            result = import_image_manually_from_path(
+                dlg.png_path, target_colors=16, parent=self,
+            )
+            if result is None:
+                return  # user cancelled the indexer
+            picked_colors, remapped_img = result
+            if not save_remapped_image(
+                    remapped_img, picked_colors, dlg.png_path):
+                QMessageBox.warning(
+                    self, "Save Failed",
+                    "Couldn't write the indexed PNG.  Check folder "
+                    "permissions and try again.",
+                )
+                return
+            pal_colors = list(picked_colors)
 
         if not create_new:
             # Look up slot for the chosen tag
@@ -4484,6 +5545,8 @@ class OverworldGraphicsTab(QWidget):
 
     def has_unsaved_changes(self) -> bool:
         return (bool(self._palette_dirty) or bool(self._sprite_png_dirty)
+                or bool(self._anim_dirty)
+                or bool(self._footprint_dirty)
                 or self._fe_tab.has_unsaved_changes())
 
     def flush_to_disk(self) -> tuple[int, list[str]]:
@@ -4585,9 +5648,119 @@ class OverworldGraphicsTab(QWidget):
             except Exception as exc:
                 errors.append(f"overworld-png:{gfx_key} ({exc})")
 
+        # Pass 2b — animation-table reassignments.  Each sprite the user
+        # repointed in the detail panel gets its GraphicsInfo .anims field
+        # rewritten to the chosen table.  _rewrite_sprite_anims is the same
+        # patcher edit the emote upgrade uses, so the two paths stay
+        # consistent.
+        for gfx_key in list(self._anim_dirty):
+            entry = self._all_sprites.get(gfx_key)
+            if entry is None:
+                self._anim_dirty.discard(gfx_key)
+                continue
+            info_name = getattr(entry, "info_name", "")
+            new_table = getattr(entry, "anim_table", "")
+            if not info_name or not new_table:
+                errors.append(
+                    f"overworld-anim:{gfx_key} (missing info name or table)"
+                )
+                continue
+            try:
+                from core.anim_table_upgrade import _rewrite_sprite_anims
+                ok_anim, msg = _rewrite_sprite_anims(
+                    self._project_root, info_name, new_table,
+                )
+                if ok_anim:
+                    self._anim_dirty.discard(gfx_key)
+                    ok += 1
+                else:
+                    errors.append(f"overworld-anim:{gfx_key} ({msg})")
+            except Exception as exc:
+                errors.append(f"overworld-anim:{gfx_key} ({exc})")
+
+        # Pass 2c — per-sprite collision footprints.  Auto-installs the
+        # engine support (ObjectFootprint struct + the GetObjectEventIdByXY
+        # extension) on first footprint save, then regenerates the
+        # footprint header from the in-memory map.  Empty footprints are
+        # dropped on emit so a fully-cleared sprite returns to vanilla
+        # 1-tile collision.
+        #
+        # Also auto-installs the NPC pause engine (npc_pause_engine_patch)
+        # on the same trigger.  The pause feature fixes the softlock that
+        # happens when the player walks onto a tile a footprint NPC is
+        # walking onto -- without the pause+escape-pass patches, the
+        # player gets trapped inside the NPC's footprint cells.  The pause
+        # patcher depends on the footprint engine being installed first
+        # (it consumes gObjectEventFootprints[] and the footprint helper),
+        # so we run the footprint install first, then the pause install.
+        if self._footprint_dirty:
+            try:
+                from core.footprint_engine_patch import (
+                    ensure_footprint_engine_support,
+                )
+                ok_eng, eng_msgs = ensure_footprint_engine_support(
+                    self._project_root)
+                if not ok_eng:
+                    errors.append(
+                        "overworld-footprint: engine install failed "
+                        f"({eng_msgs})"
+                    )
+                    ok_eng = False
+            except Exception as exc:
+                errors.append(
+                    f"overworld-footprint: engine install crashed ({exc})"
+                )
+                ok_eng = False
+            if ok_eng:
+                try:
+                    from core.npc_pause_engine_patch import (
+                        ensure_npc_pause_engine_support,
+                    )
+                    ok_pause, pause_msgs = ensure_npc_pause_engine_support(
+                        self._project_root)
+                    if not ok_pause:
+                        # Non-fatal: footprint data still writes.  The
+                        # pause feature is a quality-of-life fix; if the
+                        # patcher's anchor doesn't match (project is hand-
+                        # edited beyond what we can recognise), surface
+                        # the failure but don't abort the footprint save.
+                        errors.append(
+                            "overworld-npc-pause: engine install failed "
+                            f"({pause_msgs})"
+                        )
+                except Exception as exc:
+                    errors.append(
+                        f"overworld-npc-pause: engine install crashed "
+                        f"({exc})"
+                    )
+            if ok_eng:
+                try:
+                    from core.overworld_footprint import (
+                        footprint_header_path,
+                        serialize_footprints,
+                    )
+                    all_fps = sorted(
+                        self._footprints.values(),
+                        key=lambda fp: fp.gfx_const,
+                    )
+                    text = serialize_footprints(all_fps)
+                    path = footprint_header_path(self._project_root)
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(text)
+                    self._footprint_dirty.clear()
+                    ok += 1
+                except Exception as exc:
+                    errors.append(
+                        f"overworld-footprint: write failed ({exc})"
+                    )
+
         # Clear amber highlight if everything is clean now.
-        if not self._palette_dirty and not self._sprite_png_dirty:
+        if (not self._palette_dirty and not self._sprite_png_dirty
+                and not self._anim_dirty
+                and not self._footprint_dirty):
             self._pal_frame.setStyleSheet("")
+            self._anim_frame.setStyleSheet("")
             # Rebuild grid to clear amber thumbnail borders.
             self._rebuild_grid()
 

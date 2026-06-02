@@ -40,6 +40,20 @@ In vanilla pokefirered no code outside `region_map.c` references the region cons
 
 ---
 
+## Overworld Editor — Frame Cycle
+
+### A Frame Cycle sprite freezes (or races through frames) after the player talks to it
+Fixed in two parts:
+
+1. **Movement type (fixed 2026-05-18).** The Frame Cycle entity MUST be placed in Porymap with `MOVEMENT_TYPE_FRAME_CYCLE`, not `MOVEMENT_TYPE_NONE`. The first time you press the Frame Cycle button, PorySuite installs the new movement type into the engine automatically and the dialog tells you which one to pick in Porymap. If a sprite was placed with `MOVEMENT_TYPE_NONE` before this fix, just switch its movement type in Porymap and save — no rebuild trick needed.
+
+2. **Random preset only — duration overflow (fixed 2026-05-19).** The engine's per-frame hold value is a 6-bit field (maximum 63). The Random Frame Cycle dialog used to allow holds up to 120 ticks, and any value above 63 silently wrapped on its way into the ROM (64 became 0, 100 became 36, 120 became 56). A wrapped-to-zero hold flashed a frame past instantly, so the cycle looked frozen or sped up. The dialog's "fastest" and "slowest" spinboxes are now capped at 63 ticks and the codegen clamps every duration to the same range. If you have a Random table generated before this fix and it still misbehaves, open the Frame Cycle dialog on that sprite and click OK to regenerate the table within the new range.
+
+### "Frame Cycle…" button says my sprite has 0 frames
+Fixed 2026-05-18. The frame-count helper used to require Pillow (PIL), which isn't shipped in `requirements.txt`. Without it, every sprite came back as 0 frames. Frame counting now uses PyQt6's `QImage`, which is already a hard dependency. Update PorySuite and try the button again.
+
+---
+
 ## v0.0.63b — recently fixed
 
 ### `src/data/items.json` keeps showing as "modified" in Git after a pull (even without editing anything)

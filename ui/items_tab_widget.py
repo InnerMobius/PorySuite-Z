@@ -168,6 +168,55 @@ def write_item_icon_entry(
         return False
 
 
+def resolve_item_icon_files(
+    project_path: str, icon_sym: str, palette_sym: str
+) -> tuple[str, str]:
+    """Resolve an item's icon symbols to their on-disk SOURCE files.
+
+    Returns ``(icon_png_abs, palette_pal_abs)``.  Either may be empty
+    string if the symbol couldn't be resolved.
+
+    The chain: ``src/data/graphics/items.h`` maps each symbol to a
+    compressed build artefact —
+      ``gItemIcon_X``        -> ``graphics/items/icons/x.4bpp.lz``
+      ``gItemIconPalette_Y`` -> ``graphics/items/icon_palettes/y.gbapal.lz``
+    The editable SOURCE files sit at the same paths with ``.png`` /
+    ``.pal`` extensions.  The palette name is NOT assumed to match the
+    icon name — it's resolved independently from ``palette_sym`` because
+    several items legitimately share one palette across differently-named
+    icons.
+    """
+    gfx_header = os.path.join(
+        project_path, "src", "data", "graphics", "items.h"
+    )
+    sym_to_rel: dict[str, str] = {}
+    try:
+        text = open(gfx_header, encoding="utf-8",
+                    errors="surrogateescape").read()
+        for m in re.finditer(
+            r'const u32 (\w+)\[\]\s*=\s*INCBIN_U32\("([^"]+)"\)', text
+        ):
+            sym_to_rel[m.group(1)] = m.group(2)
+    except OSError:
+        return "", ""
+
+    icon_png = ""
+    icon_rel = sym_to_rel.get(icon_sym, "")
+    if icon_rel:
+        icon_png = os.path.join(
+            project_path, re.sub(r"\.4bpp\.lz$", ".png", icon_rel)
+        )
+
+    pal_pal = ""
+    pal_rel = sym_to_rel.get(palette_sym, "")
+    if pal_rel:
+        pal_pal = os.path.join(
+            project_path, re.sub(r"\.gbapal\.lz$", ".pal", pal_rel)
+        )
+
+    return icon_png, pal_pal
+
+
 # ── styling ───────────────────────────────────────────────────────────────────
 
 _CARD_SS = """
@@ -393,6 +442,7 @@ class ItemDetailPanel(QWidget):
     """Full-detail editor for a single item."""
 
     changed = pyqtSignal()
+    import_icon_requested = pyqtSignal()   # user clicked "Import PNG as Icon…"
 
     # Scaled sizes for icon display
     _ICON_SIZE = 56    # pixels displayed in header
@@ -482,6 +532,29 @@ class ItemDetailPanel(QWidget):
         """)
         self._open_icon_btn.clicked.connect(self._on_open_icon)
         icon_btn_row.addWidget(self._open_icon_btn)
+
+        self._import_icon_btn = QPushButton("Import PNG as Icon…")
+        self._import_icon_btn.setFixedHeight(26)
+        self._import_icon_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._import_icon_btn.setToolTip(
+            "Replace this item's icon with a PNG.  An indexed 8-bit PNG\n"
+            "(≤16 colours) is used directly; any other PNG opens the\n"
+            "manual palette picker so you choose the 16 colours and the\n"
+            "image is remapped.  Item icons are 24×24.  Writes the icon\n"
+            "PNG + palette to disk — run Make to rebuild."
+        )
+        self._import_icon_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2a2a2a; color: #aaaaaa;
+                border: 1px solid #3a3a3a; border-radius: 4px;
+                padding: 0 12px; font-size: 11px;
+            }
+            QPushButton:hover  { background-color: #333333; color: #cccccc; }
+            QPushButton:pressed { background-color: #222222; }
+        """)
+        self._import_icon_btn.clicked.connect(self.import_icon_requested.emit)
+        icon_btn_row.addWidget(self._import_icon_btn)
+
         icon_btn_row.addStretch(1)
         icon_form.addRow(icon_btn_row)
 
@@ -1035,6 +1108,7 @@ class ItemsTabWidget(QWidget):
             "ItemDetailPanel { background-color: #1a1a1a; }" + _FIELD_SS
         )
         self._detail.changed.connect(self._on_changed)
+        self._detail.import_icon_requested.connect(self._on_import_icon)
         scroll.setWidget(self._detail)
 
         splitter.addWidget(left)
@@ -1176,6 +1250,179 @@ class ItemsTabWidget(QWidget):
                     itm.setText(name)
                     break
         self.item_modified.emit()
+
+    def _on_import_icon(self):
+        """Replace the current item's icon with a user-picked PNG.
+
+        Indexed ≤16-colour PNGs are used directly; any other PNG opens
+        the manual palette picker (same auto-route as the Trainer and
+        Pokémon graphics tabs).  Writes the icon's `.png` SOURCE and the
+        icon palette's `.pal` SOURCE, then clears the stale compressed
+        build artefacts (`.4bpp` / `.4bpp.lz` / `.gbapal` / `.gbapal.lz`)
+        so the next Make regenerates them.
+        """
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from PyQt6.QtGui import QImage
+        from core.gba_image_utils import clamp_to_gba
+
+        const = self._current
+        if not const or not self._project_path:
+            QMessageBox.information(
+                self, "No Item Selected",
+                "Select an item first, then import an icon.",
+            )
+            return
+
+        syms = self._item_syms.get(const)
+        if not syms:
+            QMessageBox.warning(
+                self, "No Icon Entry",
+                f"{const} has no entry in item_icon_table.h — there's no\n"
+                "icon file to replace.",
+            )
+            return
+        icon_sym, pal_sym = syms
+
+        icon_png, pal_pal = resolve_item_icon_files(
+            self._project_path, icon_sym, pal_sym,
+        )
+        if not icon_png:
+            QMessageBox.warning(
+                self, "Couldn't Resolve Icon",
+                f"Couldn't resolve the on-disk PNG for {icon_sym} from\n"
+                "src/data/graphics/items.h.",
+            )
+            return
+
+        start = (os.path.dirname(icon_png) if os.path.isfile(icon_png)
+                 else self._project_path)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select PNG for Item Icon", start, "PNG Images (*.png)",
+        )
+        if not path:
+            return
+
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(
+                self, "Import Failed", f"Could not load image:\n{path}",
+            )
+            return
+
+        # Auto-route: a project-format indexed PNG (≤16 colours) is used
+        # directly; anything else goes through the manual palette picker.
+        colors: list = []
+        ct = (img.colorTable()
+              if img.format() == QImage.Format.Format_Indexed8 else [])
+        if (img.format() == QImage.Format.Format_Indexed8
+                and ct and len(set(ct)) <= 16):
+            for entry in ct[:16]:
+                colors.append(clamp_to_gba(
+                    (entry >> 16) & 0xFF, (entry >> 8) & 0xFF, entry & 0xFF))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+            remapped = img
+        else:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
+            )
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self,
+            )
+            if result is None:
+                return  # user cancelled the picker
+            colors, remapped = result
+            colors = list(colors)
+
+        # Soft size check — item icons are 24×24.
+        if (remapped.width(), remapped.height()) != (24, 24):
+            ans = QMessageBox.question(
+                self, "Unusual Icon Size",
+                f"Item icons are normally 24×24 pixels — this image is "
+                f"{remapped.width()}×{remapped.height()}.\n\n"
+                "Import anyway?  The build may fail or the icon may render "
+                "wrong if it isn't 24×24.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        # Shared-icon warning — the icon symbol may be referenced by
+        # several items; replacing the PNG changes the icon for ALL of them.
+        sharers = [c for c, (i, _p) in self._item_syms.items() if i == icon_sym]
+        if len(sharers) > 1:
+            preview = ", ".join(sorted(sharers)[:8])
+            if len(sharers) > 8:
+                preview += " …"
+            ans = QMessageBox.question(
+                self, "Shared Icon",
+                f"{len(sharers)} items share the icon '{icon_sym}':\n"
+                f"{preview}\n\n"
+                "Replacing the PNG changes the icon for ALL of them.\n"
+                "Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        # Write the icon PNG SOURCE.
+        from ui.dialogs.manual_palette_pick_dialog import save_remapped_image
+        from ui.palette_utils import write_jasc_pal
+        if not save_remapped_image(remapped, colors, icon_png):
+            QMessageBox.warning(
+                self, "Save Failed",
+                f"Couldn't write the icon PNG:\n{icon_png}",
+            )
+            return
+
+        # Write the icon palette .pal SOURCE so the colours match.
+        pal_written = bool(pal_pal) and write_jasc_pal(pal_pal, colors)
+
+        # Clear stale compressed build artefacts so the next Make
+        # regenerates them from the freshly-written sources.  Relying on
+        # mtime alone is fragile (see the sample-corruption bug), so the
+        # artefacts are deleted outright.
+        stale = [
+            re.sub(r"\.png$", ".4bpp", icon_png),
+            re.sub(r"\.png$", ".4bpp.lz", icon_png),
+        ]
+        if pal_written:
+            stale += [
+                re.sub(r"\.pal$", ".gbapal", pal_pal),
+                re.sub(r"\.pal$", ".gbapal.lz", pal_pal),
+            ]
+        for f in stale:
+            try:
+                if os.path.isfile(f):
+                    os.remove(f)
+            except OSError:
+                pass
+
+        # Refresh.  Push the new palette to the bus FIRST — otherwise
+        # set_icon's `ensure_item_palette_from_png` would return a stale
+        # cached palette and the header would render the old colours.
+        try:
+            _get_palette_bus().set_item_palette(icon_png, colors)
+        except Exception:
+            pass
+        self._detail.set_icon(icon_png)
+
+        msg = (
+            f"Icon imported for {const}.\n\n"
+            f"Wrote: {os.path.relpath(icon_png, self._project_path)}\n"
+        )
+        if pal_written:
+            msg += f"Wrote: {os.path.relpath(pal_pal, self._project_path)}\n"
+        else:
+            msg += (
+                "\nNote: the icon's palette source couldn't be resolved, "
+                "so the image was remapped to the existing palette's "
+                "colours instead of writing a new one.\n"
+            )
+        msg += "\nRun Make to rebuild the compressed icon data."
+        QMessageBox.information(self, "Icon Imported", msg)
 
     def rename_item_key(self, old_const: str, new_const: str) -> None:
         """Update the in-memory item data when an item constant is renamed."""

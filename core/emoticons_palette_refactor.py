@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # Tag namespace map (cross-referenced with BUGS.md's reserved-tag list):
 #   0x1100–0x111F   vanilla OBJ_EVENT_PAL_TAG_*
@@ -279,34 +279,78 @@ def _restore_template_tag(ts_text: str) -> Tuple[str, bool]:
     )
 
 
-# Each FldEff_*Icon function gets a one-line LoadObjectEventPalette call
-# inserted at the top of its body (right after the opening brace).
-# Vanilla example:
-#     u8 FldEff_ExclamationMarkIcon1(void)
-#     {
-#         u8 spriteId = CreateSpriteAtEnd(&sSpriteTemplate_Emoticons, 0, 0, 0x53);
-#         ...
-# Patched:
-#     u8 FldEff_ExclamationMarkIcon1(void)
-#     {
-#         // DOWP: ensure the emoticons palette is loaded before the sprite
-#         // is created so CreateSpriteAtEnd can resolve OBJ_EVENT_PAL_TAG_EMOTICONS
-#         // to its allocated OBJ palette slot.
-#         LoadObjectEventPalette(OBJ_EVENT_PAL_TAG_EMOTICONS);
-#         u8 spriteId = CreateSpriteAtEnd(&sSpriteTemplate_Emoticons, 0, 0, 0x53);
-#         ...
-
-_LOAD_LINE = (
+# Each FldEff_*Icon function must load the emoticons palette before its
+# CreateSpriteAtEnd call.  The load is folded INTO the create call via the
+# comma operator:
+#
+#     u8 spriteId = (LoadObjectEventPalette(OBJ_EVENT_PAL_TAG_EMOTICONS),
+#                    CreateSpriteAtEnd(&sSpriteTemplate_Emoticons, 0, 0, 0x53));
+#
+# A comma expression as the initialiser keeps the line a *declaration*.  The
+# pre-2026-05-18 patcher instead inserted a standalone LoadObjectEventPalette()
+# *statement* above the declaration — illegal in C89 (a statement may not
+# precede a declaration in a block), which agbcc rejects outright.
+#
+# `_LEGACY_LOAD_LINE` is the exact block that broken patcher inserted; it is
+# kept verbatim so `_patch_fldeff_body` can detect and repair functions still
+# in that form.
+_LEGACY_LOAD_LINE = (
     "    // DOWP: ensure the emoticons palette is loaded before the sprite\n"
     "    // is created so CreateSpriteAtEnd can resolve OBJ_EVENT_PAL_TAG_EMOTICONS\n"
     "    // to its allocated OBJ palette slot.\n"
     "    LoadObjectEventPalette(" + TAG_CONST + ");\n"
 )
 
+_EMOTICON_CREATE_RE = re.compile(
+    r"^[ \t]*[^\n]*CreateSpriteAtEnd\s*\(\s*&sSpriteTemplate_Emoticons[^\n]*$",
+    re.MULTILINE,
+)
+
+
+def _emoticon_comma_wrap(line: str) -> Optional[str]:
+    """``<lhs>CreateSpriteAtEnd(<args>);`` ->
+    ``<lhs>(LoadObjectEventPalette(TAG), CreateSpriteAtEnd(<args>));``
+
+    Folding the load into the create call via the comma operator keeps the
+    line a declaration (or a statement) — C89-legal in every context, unlike
+    a standalone ``LoadObjectEventPalette()`` statement above a declaration.
+    Returns ``None`` if ``line`` isn't a single ``... CreateSpriteAtEnd(...);``
+    line, or is already wrapped.
+    """
+    idx = line.find("CreateSpriteAtEnd")
+    if idx < 0:
+        return None
+    prefix = line[:idx]
+    rest = line[idx:]
+    stripped = rest.rstrip()
+    if not stripped.endswith(";"):
+        return None
+    trailing = rest[len(stripped):]
+    call_expr = stripped[:-1]
+    if "LoadObjectEventPalette" in prefix or "LoadObjectEventPalette" in call_expr:
+        return None                          # already wrapped
+    return (f"{prefix}(LoadObjectEventPalette({TAG_CONST}), "
+            f"{call_expr});{trailing}")
+
+
+def _emoticon_comma_unwrap(line: str) -> Optional[str]:
+    """Reverse of :func:`_emoticon_comma_wrap`."""
+    wrap_prefix = f"(LoadObjectEventPalette({TAG_CONST}), "
+    if wrap_prefix not in line:
+        return None
+    out = line.replace(wrap_prefix, "", 1)
+    stripped = out.rstrip()
+    trailing = out[len(stripped):]
+    if stripped.endswith("));"):              # drop the comma expr's `)`
+        stripped = stripped[:-3] + ");"
+    return stripped + trailing
+
 
 def _patch_fldeff_body(ts_text: str, func_name: str) -> Tuple[str, bool]:
-    """Insert the LoadObjectEventPalette call at the top of one
-    FldEff_*Icon function body.  Idempotent.
+    """Make FldEff_<func>'s CreateSpriteAtEnd call load the emoticons palette
+    first, via a comma expression.  Also repairs the legacy form (a standalone
+    LoadObjectEventPalette statement above the declaration, C89-illegal).
+    Idempotent.
     """
     pat = re.compile(
         r"(u8\s+" + re.escape(func_name) + r"\s*\(\s*void\s*\)\s*\n\{\n)",
@@ -315,27 +359,80 @@ def _patch_fldeff_body(ts_text: str, func_name: str) -> Tuple[str, bool]:
     if not m:
         return ts_text, False
     body_start = m.end()
-    # Already patched?  Skip.
-    if ts_text[body_start:body_start + 60].startswith("    // DOWP: ensure the emoticons"):
-        return ts_text, False
-    return (
-        ts_text[:body_start] + _LOAD_LINE + ts_text[body_start:],
-        True,
-    )
+    changed = False
+
+    # Strip the legacy 3-comment-line + statement block if present.
+    if ts_text[body_start:body_start + len(_LEGACY_LOAD_LINE)] == _LEGACY_LOAD_LINE:
+        ts_text = (ts_text[:body_start]
+                   + ts_text[body_start + len(_LEGACY_LOAD_LINE):])
+        changed = True
+
+    # Fold the load into the CreateSpriteAtEnd call.
+    region = ts_text[body_start:body_start + 600]
+    cm = _EMOTICON_CREATE_RE.search(region)
+    if not cm:
+        return ts_text, changed
+    create_line = cm.group(0)
+    wrapped = _emoticon_comma_wrap(create_line)
+    if wrapped is None or wrapped == create_line:
+        return ts_text, changed              # already wrapped / odd shape
+    abs_s = body_start + cm.start()
+    abs_e = body_start + cm.end()
+    return ts_text[:abs_s] + wrapped + ts_text[abs_e:], True
 
 
 def _unpatch_fldeff_body(ts_text: str, func_name: str) -> Tuple[str, bool]:
+    """Reverse :func:`_patch_fldeff_body` — handles both the comma-expression
+    form and the legacy standalone-statement form."""
     pat = re.compile(
-        r"(u8\s+" + re.escape(func_name) + r"\s*\(\s*void\s*\)\s*\n\{\n)"
-        + re.escape(_LOAD_LINE),
+        r"(u8\s+" + re.escape(func_name) + r"\s*\(\s*void\s*\)\s*\n\{\n)",
     )
     m = pat.search(ts_text)
     if not m:
         return ts_text, False
-    return (
-        ts_text[:m.end(1)] + ts_text[m.end():],
-        True,
-    )
+    body_start = m.end()
+
+    # Legacy form: strip the injected comment + statement block.
+    if ts_text[body_start:body_start + len(_LEGACY_LOAD_LINE)] == _LEGACY_LOAD_LINE:
+        return (ts_text[:body_start]
+                + ts_text[body_start + len(_LEGACY_LOAD_LINE):], True)
+
+    # Comma form: un-wrap the CreateSpriteAtEnd call.
+    region = ts_text[body_start:body_start + 600]
+    cm = _EMOTICON_CREATE_RE.search(region)
+    if cm:
+        unwrapped = _emoticon_comma_unwrap(cm.group(0))
+        if unwrapped is not None and unwrapped != cm.group(0):
+            abs_s = body_start + cm.start()
+            abs_e = body_start + cm.end()
+            return ts_text[:abs_s] + unwrapped + ts_text[abs_e:], True
+    return ts_text, False
+
+
+def repair(project_root: str) -> Tuple[List[str], List[str]]:
+    """Repair trainer_see.c FldEff_*Icon functions left in a C89-illegal
+    state by the pre-2026-05-18 emoticon patcher.  Idempotent — a no-op once
+    every function is in the comma-expression form.
+
+    Returns ``(changed_function_names, messages)``.
+    """
+    ts_path = os.path.join(project_root, "src", "trainer_see.c")
+    if not os.path.isfile(ts_path):
+        return [], []
+    ts = _read(ts_path)
+    before = ts
+    changed: List[str] = []
+    for fn in FLDEFF_FUNCTIONS:
+        ts, did = _patch_fldeff_body(ts, fn)
+        if did:
+            changed.append(fn)
+    if ts != before:
+        _write(ts_path, ts)
+        return changed, [
+            f"trainer_see.c: repaired {len(changed)} emoticon FldEff_*Icon "
+            f"function(s) (C89 statement-before-declaration)"
+        ]
+    return [], []
 
 
 # Extern declaration so trainer_see.c can call LoadObjectEventPalette

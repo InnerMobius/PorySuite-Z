@@ -1674,13 +1674,61 @@ class UnifiedMainWindow(QMainWindow):
     # ── Phase 3: Cross-editor navigation handlers ─────────────────────────
 
     def _on_jump_to_event_editor(self, trainer_const: str):
-        """Switch to Event Editor when 'Set up battle script' is clicked."""
+        """Jump to EVENTide for a trainer ('Set up battle script' button).
+
+        If the trainer is already wired to a map — an NPC there runs a
+        trainerbattle for it — that map is opened in EVENTide and the NPC is
+        selected.  If the trainer isn't on any map yet, EVENTide simply opens
+        so the user can place it.
+
+        The earlier version only switched to the EVENTide page and never
+        loaded anything, so the button "did nothing".
+        """
+        import re
         self._switch_to_page('events')
-        self.log_message(
-            f'Switched to Event Editor. Open a map and add a '
-            f'trainerbattle_single command for {trainer_const}.')
-        self.statusBar().showMessage(
-            f'Add a trainerbattle_single for {trainer_const} to an NPC.', 8000)
+        ev = self._eventide_window
+        eet = getattr(ev, 'event_editor_tab', None) if ev else None
+        if eet is None:
+            return
+
+        # Find the map whose scripts.inc wires this exact trainer constant.
+        root = getattr(eet, '_root_dir', None)
+        map_name = ''
+        if root:
+            maps_dir = os.path.join(str(root), 'data', 'maps')
+            const_re = re.compile(r'\b' + re.escape(trainer_const) + r'\b')
+            if os.path.isdir(maps_dir):
+                for name in sorted(os.listdir(maps_dir)):
+                    sp = os.path.join(maps_dir, name, 'scripts.inc')
+                    if not os.path.isfile(sp):
+                        continue
+                    try:
+                        with open(sp, encoding='utf-8',
+                                  errors='replace') as f:
+                            content = f.read()
+                    except OSError:
+                        continue
+                    if const_re.search(content):
+                        map_name = name
+                        break
+
+        if map_name:
+            # open_map_and_select loads the map, then walks every NPC's
+            # command tree for a trainerbattle referencing this constant and
+            # selects that NPC.
+            eet.open_map_and_select(map_name, trainer_const=trainer_const)
+            self.log_message(
+                f'Opened {map_name} in EVENTide and selected the NPC that '
+                f'battles {trainer_const}.')
+            self.statusBar().showMessage(
+                f'{trainer_const}: NPC selected in {map_name}.', 8000)
+        else:
+            self.log_message(
+                f'Switched to EVENTide. {trainer_const} is not wired to a map '
+                f'yet — place it on an NPC and add a trainerbattle command.')
+            self.statusBar().showMessage(
+                f'{trainer_const} is not on a map yet — add a trainerbattle '
+                f'command to an NPC.', 8000)
 
     def _on_jump_to_trainer(self, trainer_const: str):
         """Switch to Trainers tab and select the given trainer."""

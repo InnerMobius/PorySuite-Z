@@ -1639,7 +1639,7 @@ class _TrainerDetailPanel(QWidget):
         self._no_dialogue_label = QLabel(
             "No battle dialogue found for this trainer.\n\n"
             "Dialogue is created when the trainer is wired to a battle script\n"
-            "on a map via the Event Editor. Use 'Set up battle script' below\n"
+            "on a map via EVENTide. Use 'Set up battle script' below\n"
             "to create one, or the text will appear here once the trainer\n"
             "is placed on a map with a trainerbattle command."
         )
@@ -1652,10 +1652,12 @@ class _TrainerDetailPanel(QWidget):
         layout.addWidget(self._dialogue_scroll, 1)
 
         # "Set up battle script" button
-        self._setup_battle_btn = QPushButton("Set up battle script in Event Editor")
+        self._setup_battle_btn = QPushButton("Set up battle script in EVENTide")
         self._setup_battle_btn.setToolTip(
-            "Jump to the Event Editor to wire this trainer to an NPC on a map.\n"
-            "Creates a trainerbattle_single command with this trainer's constant."
+            "Jump to EVENTide for this trainer.\n"
+            "If the trainer is already wired to a map, that map opens and the\n"
+            "NPC running its battle is selected.  If not, EVENTide opens so you\n"
+            "can place the trainer on an NPC and add a trainerbattle command."
         )
         self._setup_battle_btn.clicked.connect(self.setup_battle_requested.emit)
         layout.addWidget(self._setup_battle_btn)
@@ -2195,11 +2197,26 @@ class _TrainerDetailPanel(QWidget):
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _populate_class_combo(self):
+        # Capture the current selection BEFORE clear().  clear() + addItem()
+        # silently drops the combo to index 0 — the class that sorts first
+        # alphabetically (e.g. "AQUA ADMIN").  This method is called LIVE by
+        # apply_class_name() every time a class is renamed in the sibling
+        # Trainer Classes tab; if a trainer is open in the panel at that
+        # moment, losing the selection means the next collect() — on save or
+        # on switching trainers — reads index 0 and writes the WRONG class
+        # into that trainer's data.  That silent class-corruption is exactly
+        # the "trainers keep changing class" bug.  Restore the selection so
+        # collect() always reads the trainer's real class.
+        prev = self._class_cb.currentData()
         self._class_cb.blockSignals(True)
         self._class_cb.clear()
         for const, display in sorted(self._class_names.items(), key=lambda kv: kv[1]):
             self._class_cb.addItem(f"{display}  ({const})", const)
         self._class_cb.blockSignals(False)
+        # set_const re-adds the constant if the rebuilt list lacks it, so
+        # currentData() round-trips even for an unknown/custom class.
+        if prev:
+            self._class_cb.set_const(prev)
 
     def _populate_pic_combo(self):
         self._pic_cb.blockSignals(True)

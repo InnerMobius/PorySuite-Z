@@ -1895,8 +1895,87 @@ class PokemonTrainers(pokemon_data.PokemonTrainers):
             text = re.sub(r'\b' + re.escape(old) + r'\b', new, text)
         return text
 
+    def _defined_trainer_classes(self) -> set[str]:
+        """The set of TRAINER_CLASS_* constants the project actually
+        defines, read from include/constants/trainers.h."""
+        path = self._full(os.path.join("include", "constants", "trainers.h"))
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return set(
+                    re.findall(r"#define\s+(TRAINER_CLASS_\w+)", f.read()))
+        except OSError:
+            return set()
+
+    def _trainer_class_rename_map(self) -> dict[str, str]:
+        """{old_class: new_class} from the project's recorded rename
+        history (src/data/rename_history.json) — lets a class be followed
+        through one or more renames to its current name."""
+        path = self._full(os.path.join("src", "data", "rename_history.json"))
+        out: dict[str, str] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                hist = json.load(f)
+            for rec in hist.get("trainer_classes", []):
+                old, new = rec.get("old"), rec.get("new")
+                if old and new:
+                    out[old] = new
+        except (OSError, ValueError):
+            pass
+        return out
+
+    @staticmethod
+    def _resolve_trainer_class(cls: str, defined: set[str],
+                               renames: dict[str, str]) -> str:
+        """Follow ``cls`` through the rename history until it lands on a
+        currently-defined TRAINER_CLASS_*; fall back to the always-defined
+        TRAINER_CLASS_NONE when it cannot be resolved."""
+        seen: set[str] = set()
+        cur = cls
+        while cur not in defined and cur in renames and cur not in seen:
+            seen.add(cur)
+            cur = renames[cur]
+        return cur if cur in defined else "TRAINER_CLASS_NONE"
+
+    def _reconcile_trainer_classes(self) -> None:
+        """Repair any trainer whose ``.trainerClass`` points at a
+        TRAINER_CLASS_* constant the project no longer defines.
+
+        PorySuite must NEVER write a trainers.h that names an undefined
+        class — that is an instant, total build break (the compiler
+        rejects the whole of data.c).  A class goes missing when it is
+        renamed or deleted while trainers still point at the old name.
+        This runs on every save, before any file is written, so the
+        trainer data self-heals: a dead class is followed through the
+        recorded rename history to its current name when a rename is on
+        file (e.g. BEAUTY -> GERUDO), otherwise it falls back to
+        TRAINER_CLASS_NONE.
+        """
+        defined = self._defined_trainer_classes()
+        if not defined:
+            # Without the constants file we cannot validate — never
+            # guess, just leave the data untouched.
+            return
+        renames = self._trainer_class_rename_map()
+        fixed: list[str] = []
+        for const, info in self.data.items():
+            cls = str(info.get("trainerClass", "")).strip()
+            if cls and cls not in defined:
+                new_cls = self._resolve_trainer_class(cls, defined, renames)
+                info["trainerClass"] = new_cls
+                fixed.append(f"{const}: {cls} -> {new_cls}")
+        if fixed:
+            logger.warning(
+                "Trainer-class reconciliation repaired %d trainer(s) "
+                "pointing at an undefined class: %s",
+                len(fixed), "; ".join(fixed),
+            )
+
     @override
     def parse_to_c_code(self):
+        # Repair dangling trainer-class references before anything is
+        # written — guarantees the generated trainers.h never names an
+        # undefined TRAINER_CLASS_* constant (an instant build break).
+        self._reconcile_trainer_classes()
         super().parse_to_c_code()
 
         # 1. Write the trainer struct file
@@ -2647,42 +2726,6 @@ class PokemonMoves(pokemon_data.PokemonMoves):
                     self._log_missing_header(rel_egg)
         except Exception:
             pass
-
-    def plan_writebacks(self) -> dict[str, list[str]]:
-        """Return a preview mapping of headers to species that would be updated.
-
-        Keys are relative header paths; values are a list of species constants.
-        """
-        self._resolve_header_paths()
-        result: dict[str, set[str]] = {}
-        missing: set[str] = set()
-        sm = self.data.get("species_moves") or {}
-
-        def _maybe_collect(file_key: str, species: str) -> None:
-            rel_path, exists = self._header_for_key(file_key)
-            rel_norm = os.path.normpath(rel_path)
-            rel_display = rel_norm.replace('\\', '/')
-            if exists:
-                result.setdefault(rel_display, set()).add(species)
-            else:
-                missing.add(rel_display)
-
-        for sp, entries in sm.items():
-            kinds = {e.get("method") for e in entries}
-            if "LEVEL" in kinds:
-                _maybe_collect("LVL_SETS_H", sp)
-                _maybe_collect("LVL_PTRS_H", sp)
-            if ("TM" in kinds) or ("HM" in kinds):
-                _maybe_collect("TMHM_SETS_H", sp)
-            if "TUTOR" in kinds:
-                _maybe_collect("TUTOR_SETS_H", sp)
-            if "EGG" in kinds:
-                _maybe_collect("EGG_MOVES_H", sp)
-
-        for rel_path in sorted(missing):
-            self._log_missing_header(rel_path)
-
-        return {k: sorted(v) for k, v in result.items()}
 
 
 class Pokedex(pokemon_data.Pokedex):

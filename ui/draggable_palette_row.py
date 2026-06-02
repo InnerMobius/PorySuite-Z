@@ -27,10 +27,8 @@ The widget itself does NOT remap any image pixels.  Callers wire:
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint
-from PyQt6.QtGui import (
-    QColor, QDrag, QFont, QMouseEvent, QPainter, QPixmap,
-)
+from PyQt6.QtCore import Qt, pyqtSignal, QPoint
+from PyQt6.QtGui import QColor, QFont, QMouseEvent, QPainter
 from PyQt6.QtWidgets import (
     QColorDialog, QHBoxLayout, QLabel, QMenu, QWidget,
 )
@@ -46,7 +44,6 @@ class DragSwatch(QLabel):
     to promote to the transparent slot ("Index as Background")."""
 
     color_changed = pyqtSignal(int, tuple)   # (index, (r,g,b))
-    drop_received = pyqtSignal(int, int)     # (from_index, to_index)
     set_as_bg_requested = pyqtSignal(int)    # (index) — right-click menu
 
     def __init__(self, index: int, parent=None):
@@ -61,8 +58,8 @@ class DragSwatch(QLabel):
         # engine whenever any ancestor widget has a stylesheet engaged —
         # even an empty one.  setStyleSheet on the widget itself always
         # wins, so we own the background regardless of parent state.
-        self.setAcceptDrops(True)
         self._drag_start: QPoint | None = None
+        self._dragging: bool = False
         self._refresh_tooltip()
         self._refresh()
 
@@ -118,35 +115,46 @@ class DragSwatch(QLabel):
             p.drawText(2, 13, "BG")
         p.end()
 
-    # click vs drag
+    # click vs drag.  Reordering uses a plain mouse grab — press, track
+    # the moves, act on release — NOT a QDrag / OS drag-and-drop
+    # operation.  QDrag relies on the platform drag protocol, which is
+    # unreliable here; a mouse-grab drag is just ordinary mouse events
+    # and works regardless of platform or remote-desktop quirks.
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_start = event.pos()
+            self._dragging = False
         super().mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
-            delta = event.pos() - self._drag_start
-            if delta.manhattanLength() < 5:
-                self._open_picker()
-        self._drag_start = None
-        super().mouseReleaseEvent(event)
-
     def mouseMoveEvent(self, event: QMouseEvent):
+        # While the left button is held this swatch keeps an implicit
+        # mouse grab, so move events keep arriving even once the cursor
+        # leaves the swatch.  Past the click threshold it's a drag.
         if self._drag_start is None:
             return
-        if (event.pos() - self._drag_start).manhattanLength() < 5:
-            return
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setText(str(self._index))
-        drag.setMimeData(mime)
-        pm = QPixmap(SWATCH_SZ, SWATCH_SZ)
-        pm.fill(QColor(*self._color))
-        drag.setPixmap(pm)
-        drag.setHotSpot(QPoint(SWATCH_SZ // 2, SWATCH_SZ // 2))
+        if not self._dragging:
+            if (event.pos() - self._drag_start).manhattanLength() < 5:
+                return
+            self._dragging = True
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._drag_start is not None):
+            if self._dragging:
+                # Drag release — hand the drop point to the parent row,
+                # which works out which slot the cursor landed on.
+                row = self.parentWidget()
+                if isinstance(row, DraggablePaletteRow):
+                    row.finish_drag(
+                        self._index, self.mapToGlobal(event.pos()))
+            elif (event.pos() - self._drag_start).manhattanLength() < 5:
+                # In-place click — open the colour picker.
+                self._open_picker()
         self._drag_start = None
-        drag.exec(Qt.DropAction.MoveAction)
+        self._dragging = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        super().mouseReleaseEvent(event)
 
     def _open_picker(self):
         r, g, b = self._color
@@ -237,20 +245,6 @@ class DragSwatch(QLabel):
         )
         menu.exec(event.globalPos())
 
-    # drop target
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasText():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        try:
-            src = int(event.mimeData().text())
-        except (ValueError, TypeError):
-            return
-        if src != self._index:
-            self.drop_received.emit(src, self._index)
-        event.acceptProposedAction()
-
 
 class DraggablePaletteRow(QWidget):
     """Row of DragSwatch widgets — supports drag-reorder.
@@ -271,7 +265,6 @@ class DraggablePaletteRow(QWidget):
         for i in range(n):
             s = DragSwatch(i)
             s.color_changed.connect(self._on_color_changed)
-            s.drop_received.connect(self._on_drop)
             s.set_as_bg_requested.connect(self._on_set_as_bg)
             self._swatches.append(s)
             self._layout.addWidget(s)
@@ -291,8 +284,28 @@ class DraggablePaletteRow(QWidget):
     def _on_color_changed(self, idx: int, color: tuple):
         self.colors_changed.emit()
 
-    def _on_drop(self, src: int, dst: int):
-        self.palette_reordered.emit(src, dst)
+    def finish_drag(self, src_index: int, global_pos) -> None:
+        """A swatch finished a mouse-grab drag at ``global_pos``.  Work
+        out which slot the cursor landed on and emit
+        ``palette_reordered``.  Called directly by the dragged
+        ``DragSwatch`` on mouse release — no QDrag involved."""
+        local = self.mapFromGlobal(global_pos)
+        child = self.childAt(local)
+        dst: int | None = None
+        if isinstance(child, DragSwatch):
+            dst = child.index
+        elif self._swatches:
+            # Released in a gap between swatches or past the row — snap
+            # to the swatch whose horizontal centre is nearest the drop.
+            x = local.x()
+            best_d: int | None = None
+            for sw in self._swatches:
+                cx = sw.x() + sw.width() // 2
+                d = abs(cx - x)
+                if best_d is None or d < best_d:
+                    best_d, dst = d, sw.index
+        if dst is not None and dst != src_index:
+            self.palette_reordered.emit(src_index, dst)
 
     def _on_set_as_bg(self, slot: int):
         self.swatch_set_as_bg.emit(slot)

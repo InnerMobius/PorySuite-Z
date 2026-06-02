@@ -600,10 +600,55 @@ def _restore_script_line(
 # ════════════════════════════════════════════════════════════════════════════
 
 # State file recording auto-discovered refactors that have been applied.
-# Lives in the project root.  Lets `remove()` reverse what `apply()` did
-# without having to re-scan (which wouldn't work — by the time we're
-# reversing, the paletteTag values are no longer TAG_NONE).
-_AUTO_STATE_REL = os.path.join("porysuite", "field_effect_auto_refactors.json")
+# Lives inside PorySuite-Z's own per-project cache directory, NOT inside
+# the user's pokefirered repo — keeps tool state out of the game source
+# tree (Hands Off pokefirered rule + the project's garbage-free contract).
+# `remove()` needs this to reverse exactly what `apply()` did without
+# re-scanning (which wouldn't work — by reversal time, the paletteTag
+# values are no longer TAG_NONE).
+_AUTO_STATE_FILENAME = "field_effect_auto_refactors.json"
+
+
+def _auto_state_path(project_root: str) -> str:
+    """Return the absolute path to the auto-state JSON for this project.
+
+    Uses `core.app_info.get_cache_dir`, which namespaces by a hash of
+    the project's absolute path so multiple projects don't collide.
+    """
+    from core.app_info import get_cache_dir
+    return os.path.join(get_cache_dir(project_root), _AUTO_STATE_FILENAME)
+
+
+def _migrate_legacy_state(project_root: str) -> None:
+    """Earlier 0.1.13b builds wrote the state file to `<project_root>/
+    porysuite/field_effect_auto_refactors.json` inside the user's game
+    repo.  If that legacy location still has data, move it to the
+    proper cache dir before subsequent operations, and remove the
+    intrusive `porysuite/` directory from the game source tree.
+    Idempotent.
+    """
+    legacy_dir = os.path.join(project_root, "porysuite")
+    legacy_file = os.path.join(legacy_dir, _AUTO_STATE_FILENAME)
+    if not os.path.isfile(legacy_file):
+        return
+    new_path = _auto_state_path(project_root)
+    try:
+        if not os.path.isfile(new_path):
+            os.makedirs(os.path.dirname(new_path), exist_ok=True)
+            with open(legacy_file, encoding="utf-8") as src:
+                data = src.read()
+            with open(new_path, "w", encoding="utf-8") as dst:
+                dst.write(data)
+        os.remove(legacy_file)
+    except OSError:
+        return
+    # Best-effort: also remove the now-empty legacy dir.  Leave alone
+    # if anything else is in there.
+    try:
+        if not os.listdir(legacy_dir):
+            os.rmdir(legacy_dir)
+    except OSError:
+        pass
 
 
 # Reserved tag values we must never allocate to a new fldeff palette.
@@ -891,6 +936,156 @@ def _find_palettenum_override_block(
     return window[: m.start()], m.group(0)
 
 
+def _comma_wrap_create_line(line: str, palette_symbol: str) -> Optional[str]:
+    """Rewrite a ``<lhs>CreateSprite*(<args>);`` line so the create call is
+    preceded by a ``LoadSpritePalette(...)`` via the comma operator:
+
+        <lhs>(LoadSpritePalette(&pal), CreateSprite*(<args>));
+
+    This is C89-legal whether the line is a declaration
+    (``u8 spriteId = CreateSprite(...)``) or a plain statement
+    (``spriteId = CreateSprite(...)``) — the comma expression is just the
+    initialiser / right-hand side, so a declaration stays a declaration and a
+    statement stays a statement.  ``agbcc`` rejects a ``LoadSpritePalette(...)``
+    *statement* placed above a declaration; folding the load into the call
+    expression sidesteps that entirely.
+
+    Returns the rewritten line, or ``None`` if ``line`` isn't shaped as a
+    single ``... CreateSprite*(...);`` line, or is already wrapped (caller
+    then skips the C edit).
+    """
+    idx = line.find("CreateSprite")
+    if idx < 0:
+        return None
+    prefix = line[:idx]
+    rest = line[idx:]
+    stripped = rest.rstrip()
+    if not stripped.endswith(";"):
+        return None
+    trailing = rest[len(stripped):]          # trailing whitespace, if any
+    call_expr = stripped[:-1]                # the `CreateSprite*(...)` call
+    if "LoadSpritePalette" in prefix or "LoadSpritePalette" in call_expr:
+        return None                          # already wrapped — leave alone
+    return (f"{prefix}(LoadSpritePalette(&{palette_symbol}), "
+            f"{call_expr});{trailing}")
+
+
+def _enclosing_function_open(text: str, anchor_line: str) -> Optional[str]:
+    """Return the ``<signature>\\n{\\n`` text of the function enclosing
+    ``anchor_line``, or ``None``.  Used to anchor a function-scope ``extern``
+    declaration injection.  Relies on the pokefirered style of a function body
+    opening with ``{`` alone on its own line."""
+    idx = text.find(anchor_line)
+    if idx < 0:
+        return None
+    brace = text.rfind("\n{\n", 0, idx)
+    if brace < 0:
+        return None
+    sig_start = text.rfind("\n", 0, brace) + 1
+    return text[sig_start:brace + 3]         # signature line + "\n{\n"
+
+
+def _repair_legacy_c_palette_loads(
+    project_root: str,
+) -> Tuple[List[str], List[str]]:
+    """Repair C functions mangled by the pre-2026-05-18 c_edit mechanism.
+
+    That mechanism prepended, directly above each ``CreateSprite*`` line::
+
+        extern const struct SpritePalette gSpritePalette_FldEff_<X>;
+        LoadSpritePalette(&gSpritePalette_FldEff_<X>);
+
+    Two defects: the ``LoadSpritePalette(...)`` *statement* is illegal in C89
+    when the create line below it is a declaration (``u8 spriteId =
+    CreateSprite(...)``) — ``agbcc`` rejects it outright — and the pair was
+    re-injected on every run, duplicating itself.
+
+    This converts every affected function to the C89-legal comma-expression
+    form: duplicate ``extern`` declarations collapse to one, the standalone
+    ``LoadSpritePalette`` statement(s) are removed, and the load is folded
+    into the ``CreateSprite`` call via the comma operator.  Idempotent — a
+    file with no standalone ``LoadSpritePalette(&gSpritePalette_FldEff_*)``
+    line is left untouched.
+
+    Returns ``(changed_files, messages)``.
+    """
+    changed: List[str] = []
+    messages: List[str] = []
+
+    standalone_load = re.compile(
+        r"^[ \t]*LoadSpritePalette\(&(gSpritePalette_FldEff_\w+)\);[ \t]*$",
+        re.MULTILINE,
+    )
+    standalone_load_nl = re.compile(
+        r"^[ \t]*LoadSpritePalette\(&gSpritePalette_FldEff_\w+\);[ \t]*\n",
+        re.MULTILINE,
+    )
+    create_after = re.compile(
+        r"^[^\n]*CreateSprite[A-Za-z_]*\s*\([^\n]*$", re.MULTILINE,
+    )
+    dup_extern = re.compile(
+        r"(^[ \t]*extern const struct SpritePalette "
+        r"gSpritePalette_FldEff_\w+;[ \t]*\n)\1",
+        re.MULTILINE,
+    )
+
+    src_root = os.path.join(project_root, "src")
+    if not os.path.isdir(src_root):
+        return changed, messages
+
+    for dirpath, _, filenames in os.walk(src_root):
+        for fn in filenames:
+            if not fn.endswith(".c"):
+                continue
+            abs_path = os.path.join(dirpath, fn)
+            try:
+                text = _read(abs_path)
+            except OSError:
+                continue
+            if not standalone_load.search(text):
+                continue                     # no legacy mangle in this file
+
+            rel = os.path.relpath(abs_path, project_root).replace("\\", "/")
+
+            # 1. Pair each standalone LoadSpritePalette with the CreateSprite
+            #    line it was injected above (the next such line).
+            pairs: List[Tuple[str, str]] = []
+            for m in standalone_load.finditer(text):
+                sym = m.group(1)
+                cm = create_after.search(text, m.end())
+                if cm:
+                    pairs.append((cm.group(0), sym))
+
+            # 2. Strip every standalone LoadSpritePalette statement line.
+            new_text = standalone_load_nl.sub("", text)
+
+            # 3. Collapse runs of duplicate `extern` declarations to one.
+            while True:
+                collapsed = dup_extern.sub(r"\1", new_text, count=1)
+                if collapsed == new_text:
+                    break
+                new_text = collapsed
+
+            # 4. Fold each load into its CreateSprite call as a comma
+            #    expression.  Steps 2-3 only removed *other* lines, so the
+            #    create line text is unchanged and still findable.
+            for create_line, sym in pairs:
+                if create_line not in new_text:
+                    continue                 # already wrapped this pass
+                wrapped = _comma_wrap_create_line(create_line, sym)
+                if wrapped and wrapped != create_line:
+                    new_text = new_text.replace(create_line, wrapped, 1)
+
+            if new_text != text:
+                _write(abs_path, new_text)
+                changed.append(rel)
+                messages.append(
+                    f"{rel}: repaired legacy field-effect palette loads "
+                    f"(C89 statement-before-declaration)")
+
+    return changed, messages
+
+
 class _FldeffTagAllocator:
     """Assigns unique FLDEFF_PAL_TAG_FLDEFF_* values from the 0x1302+ range.
 
@@ -1018,18 +1213,44 @@ def _discover_auto_refactors(project_root: str) -> List[Dict]:
 
         fldeffobj = template_to_fldeffobj.get(meta["template_symbol"])
         if fldeffobj:
+            sym = refactor["palette_symbol"]
             for rel_file, line in _find_c_create_sites(project_root, fldeffobj):
-                # Preserve the original indentation in the injected
-                # LoadSpritePalette line so the patched code stays
-                # idiomatic when read by humans.
-                indent_match = re.match(r"^([ \t]*)", line)
-                indent = indent_match.group(1) if indent_match else ""
+                # Fold the palette load into the CreateSprite call via the
+                # comma operator — `(LoadSpritePalette(&pal),
+                # CreateSprite(...))`.  This is C89-legal whether the create
+                # line is a declaration (`u8 spriteId = CreateSprite(...)`)
+                # or a plain statement.  The old approach prepended a
+                # standalone `LoadSpritePalette(...)` statement above the
+                # create line, which agbcc rejects when that line is a
+                # declaration (a statement may not precede a declaration in
+                # C89) — and it duplicated on every re-run.
+                patched_line = _comma_wrap_create_line(line, sym)
+                if patched_line is None:
+                    # Unexpected line shape (or already wrapped) — skip the
+                    # C edit rather than emit something that may not build.
+                    continue
 
-                load_block = (
-                    f"{indent}extern const struct SpritePalette "
-                    f"{refactor['palette_symbol']};\n"
-                    f"{indent}LoadSpritePalette(&{refactor['palette_symbol']});\n"
-                )
+                # The `gSpritePalette_FldEff_*` symbol is not visible in the
+                # call site's .c file via any header, so a function-scope
+                # `extern` declaration is injected at the top of the
+                # enclosing function — a declaration, always legal there.
+                try:
+                    file_text = _read(os.path.join(project_root, rel_file))
+                except OSError:
+                    file_text = ""
+                func_open = _enclosing_function_open(file_text, line)
+                if func_open:
+                    indent = (re.match(r"^([ \t]*)", line).group(1)
+                              or "    ")
+                    refactor["c_edits"].append({
+                        "file": rel_file,
+                        "vanilla": func_open,
+                        "patched": (
+                            func_open
+                            + f"{indent}extern const struct SpritePalette "
+                              f"{sym};\n"
+                        ),
+                    })
 
                 # Look for a hardcoded `sprite->oam.paletteNum = 0;`
                 # override in the next ~20 lines.  Vanilla
@@ -1038,8 +1259,8 @@ def _discover_auto_refactors(project_root: str) -> List[Dict]:
                 # CreateSprite call, which defeats the whole refactor —
                 # the template-tag-resolved slot gets overwritten with
                 # slot 0.  When found, bundle the strip into the SAME
-                # c_edit as the load injection so both call sites
-                # patch correctly even when their override lines are
+                # c_edit as the call rewrite so both call sites patch
+                # correctly even when their override lines are
                 # byte-identical (a separate per-site c_edit would
                 # short-circuit on `patched in text` after the first
                 # site's strip lands).
@@ -1055,28 +1276,18 @@ def _discover_auto_refactors(project_root: str) -> List[Dict]:
                         f"{override_indent}// {override_body}"
                         f"  // DOWP: stripped — template tag resolves slot"
                     )
-                    # Single c_edit covering both the load injection and
-                    # the override strip.  Vanilla = create line +
-                    # intervening text + override; patched = load
-                    # injection + create line + intervening text +
-                    # commented override.  The intervening block is
-                    # what makes this string unique per call site, so
-                    # multiple sites in the same file all patch
-                    # correctly.
                     refactor["c_edits"].append({
                         "file": rel_file,
                         "vanilla": line + intervening + override_line,
                         "patched": (
-                            load_block + line + intervening + commented
+                            patched_line + intervening + commented
                         ),
                     })
                 else:
-                    # No override to strip — just inject the load call
-                    # ahead of the create line.
                     refactor["c_edits"].append({
                         "file": rel_file,
                         "vanilla": line,
-                        "patched": load_block + line,
+                        "patched": patched_line,
                     })
 
         refactors.append(refactor)
@@ -1086,11 +1297,12 @@ def _discover_auto_refactors(project_root: str) -> List[Dict]:
 
 def _save_auto_state(project_root: str, auto_refactors: List[Dict]) -> None:
     """Persist the list of auto-discovered refactors so `remove()` can
-    reverse them later.  Written under `porysuite/` so the user's
-    `.gitignore` (which we configure to ignore that directory) keeps it
-    out of commits.
+    reverse them later.  Written to PorySuite-Z's per-project cache
+    directory (NOT inside the user's pokefirered repo) so tool state
+    never lands in the game source tree.
     """
-    state_path = os.path.join(project_root, _AUTO_STATE_REL)
+    _migrate_legacy_state(project_root)
+    state_path = _auto_state_path(project_root)
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
     import json
     with open(state_path, "w", encoding="utf-8") as f:
@@ -1101,7 +1313,8 @@ def _load_auto_state(project_root: str) -> List[Dict]:
     """Read the previously-saved auto-discovered refactors.  Returns
     an empty list if no state file exists.
     """
-    state_path = os.path.join(project_root, _AUTO_STATE_REL)
+    _migrate_legacy_state(project_root)
+    state_path = _auto_state_path(project_root)
     if not os.path.isfile(state_path):
         return []
     import json
@@ -1116,7 +1329,8 @@ def _clear_auto_state(project_root: str) -> None:
     """Delete the saved auto-refactor state file (used during full DOWP
     disable so a future re-enable rediscovers from scratch).
     """
-    state_path = os.path.join(project_root, _AUTO_STATE_REL)
+    _migrate_legacy_state(project_root)
+    state_path = _auto_state_path(project_root)
     try:
         os.remove(state_path)
     except OSError:
@@ -1133,6 +1347,18 @@ def apply(project_root: str) -> Tuple[bool, List[str], List[str]]:
     """
     applied: List[str] = []
     failed: List[str] = []
+
+    # Repair any C functions left in a C89-illegal state by the pre-fix
+    # c_edit mechanism (standalone LoadSpritePalette statement above a
+    # declaration, plus re-run duplication).  Done first, so discovery and
+    # the apply loop below start from clean, buildable source.
+    try:
+        repaired_files, repair_msgs = _repair_legacy_c_palette_loads(
+            project_root)
+        applied.extend(repair_msgs)
+    except Exception as exc:
+        failed.append(
+            f"legacy c_edit repair failed: {type(exc).__name__}: {exc}")
 
     # Auto-discovery pass.  Synthesise a refactor entry for every
     # un-tagged field-effect template the user's project contains, then

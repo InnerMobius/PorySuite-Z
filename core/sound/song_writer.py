@@ -94,6 +94,22 @@ def _raw_tempo(value: int, tempo_base: int) -> int:
 # Track writer
 # ---------------------------------------------------------------------------
 
+# Control commands that the UI (piano-roll sidebar, inline header
+# editors) lets the user mutate via `cmd.value`.  These MUST be
+# regenerated from `cmd.value` on save — using the stale `cmd.raw_line`
+# defeats the user's edit and produces a .s file that disagrees with
+# the .mid (which always reads `cmd.value`).  The bug pattern: user
+# changes VOICE 53 → 0 in the piano roll sidebar; save writes .mid
+# with program 0 but .s with VOICE 53 (raw_line wins); next build's
+# mid2agb regenerates .s from .mid → ROM has program 0 / VOICE 0 / ...
+# actually that part works.  But the disagreement leaves the .s on
+# disk wrong, and any subsequent operation that reads the .s (Sound
+# Editor reopens, manual inspection, etc.) sees the stale value.
+_REGENERATE_FROM_VALUE = {
+    'VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR', 'TEMPO',
+}
+
+
 def _write_track(
     track: Track,
     song: SongData,
@@ -141,6 +157,16 @@ def _write_track_raw(track: Track, song: SongData) -> list[str]:
     """Write a track using raw_line strings for structural fidelity.
 
     Falls back to generating commands for any command without a raw_line.
+
+    EXCEPTION: editable control commands (`_REGENERATE_FROM_VALUE` below)
+    are ALWAYS regenerated from `cmd.value`, even when a raw_line is
+    present.  The piano roll's instrument/volume/pan/etc. handlers
+    update `cmd.value` in place but leave `cmd.raw_line` stale — without
+    this carve-out, a user changing VOICE from 53 to 0 in the sidebar
+    sees the .s emit the old "VOICE , 53" raw_line on save, undoing
+    their change.  The .mid (which always reads `cmd.value`) ends up
+    correct, so the two files disagree.  Forcing regeneration here
+    keeps them in sync.
     """
     lines = []
     last_note_dur = None
@@ -150,8 +176,17 @@ def _write_track_raw(track: Track, song: SongData) -> list[str]:
     ticks_per_measure = 96  # 4 beats * 24 ticks
 
     for cmd in track.commands:
-        if cmd.raw_line:
+        if cmd.raw_line and cmd.cmd not in _REGENERATE_FROM_VALUE:
             lines.append(cmd.raw_line.rstrip())
+            continue
+        if cmd.cmd in _REGENERATE_FROM_VALUE:
+            # Use the dedicated TEMPO formatter when applicable; everything
+            # else flows through _format_control which handles the rest.
+            if cmd.cmd == 'TEMPO' and cmd.value is not None:
+                raw_t = _raw_tempo(cmd.value, song.tempo_base)
+                lines.append(f'\t.byte\tTEMPO , {raw_t}*{song.label}_tbs/2')
+            else:
+                lines.extend(_format_control(cmd, song))
             continue
 
         # Generate the command from parsed data
@@ -256,7 +291,9 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
     for cmd in setup_cmds:
         if cmd.cmd == 'KEYSH':
             continue  # Already written
-        if cmd.raw_line:
+        # Editable controls regenerate from cmd.value regardless of
+        # raw_line — see comment on _REGENERATE_FROM_VALUE above.
+        if cmd.raw_line and cmd.cmd not in _REGENERATE_FROM_VALUE:
             lines.append(cmd.raw_line.rstrip())
         elif cmd.cmd == 'TEMPO':
             raw_t = _raw_tempo(cmd.value or 120, song.tempo_base)
@@ -330,7 +367,9 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
             # Skip redundant control commands (same value as last emitted)
             if cmd.value is not None and _last_control.get(cmd.cmd) == cmd.value:
                 continue
-            if cmd.raw_line:
+            # Editable controls regenerate from cmd.value — see comment
+            # on _REGENERATE_FROM_VALUE above for the bug rationale.
+            if cmd.raw_line and cmd.cmd not in _REGENERATE_FROM_VALUE:
                 lines.append(cmd.raw_line.rstrip())
             else:
                 lines.extend(_format_control(cmd, song))
@@ -498,6 +537,7 @@ def notes_to_track_commands(
     loop_end_tick: Optional[int] = None,
     loop_label: Optional[str] = None,
     original_commands: Optional[list[TrackCommand]] = None,
+    tempo: Optional[int] = None,
 ) -> list[TrackCommand]:
     """Convert piano roll note dicts to a flat list of TrackCommands.
 
@@ -512,6 +552,13 @@ def notes_to_track_commands(
     MOD, BEND, TEMPO, etc.) are preserved at their original tick positions.
     Structural commands (PATT/GOTO/PEND/LABEL) from the original are also
     preserved.
+
+    If tempo is provided, the tick-0 TEMPO command is rebuilt from that
+    live value instead of reused from original_commands — necessary
+    because original_commands is a snapshot that doesn't reflect BPM
+    edits made after the song was opened.  Only takes effect when the
+    original track actually had a tick-0 TEMPO; never adds a spurious
+    TEMPO to a track that didn't have one.
 
     notes: list of dicts with keys: tick, pitch, duration, velocity, track
     """
@@ -572,7 +619,20 @@ def notes_to_track_commands(
     commands.append(tick0_controls.pop('KEYSH', TrackCommand(
         cmd='KEYSH', tick=0, value=0)))
     if 'TEMPO' in tick0_controls:
-        commands.append(tick0_controls.pop('TEMPO'))
+        orig_tempo = tick0_controls.pop('TEMPO')
+        if tempo is not None:
+            # Caller supplied the live TEMPO value (reflects the user's
+            # BPM-slider edit).  `original_commands` is a snapshot taken
+            # at piano-roll-open time, so its TEMPO command still holds
+            # the pre-edit value AND a stale raw_line — reusing it would
+            # silently revert the user's BPM change on save.  Emit a
+            # fresh TrackCommand with the live value (no raw_line) so
+            # the writer regenerates the TEMPO line from it.
+            commands.append(TrackCommand(cmd='TEMPO', tick=0, value=tempo))
+        else:
+            # No live value supplied — keep the original (callers that
+            # don't track tempo, e.g. non-piano-roll save paths).
+            commands.append(orig_tempo)
     # Discard any original VOICE/VOL/PAN at tick 0 — use the caller's
     # values instead (these reflect the user's current sidebar settings)
     tick0_controls.pop('VOICE', None)
