@@ -398,17 +398,22 @@ def _extract_sprite_callback_bodies(texts: List[str]) -> Dict[str, str]:
 
 def _classify_callback_body(body: str) -> str:
     """Heuristic motion archetype from a sprite callback's C body."""
-    # Utility/controller sprites (palette fades, mon-movers) mark themselves
-    # invisible UNCONDITIONALLY, at the function-body level.  A *visible*
-    # sprite that merely hides at the END of its animation sets invisible
-    # deep inside a conditional (e.g. AnimGhostStatusSprite fades then hides)
-    # — that must NOT be treated as invisible, or it never renders.  Use the
-    # brace-nesting depth at the assignment to tell them apart.
-    idx = body.find("invisible = TRUE")
-    if idx != -1:
-        depth = body[:idx].count("{") - body[:idx].count("}")
-        if depth <= 1:                       # set at the top level → utility
-            return MOTION_INVISIBLE
+    # Utility/controller sprites (palette fades, mon-movers) mark THEMSELVES
+    # invisible UNCONDITIONALLY, at the function-body level.  Two traps to
+    # avoid:
+    #   * ``gSprites[...mon...].invisible = TRUE`` hides the MON, not this
+    #     sprite — common in "mon becomes an orb" moves (AnimFlyBallUp), where
+    #     the effect sprite is very much visible.  Only ``sprite->invisible``
+    #     (the sprite hiding itself) counts.
+    #   * A visible sprite that hides at the END of its animation sets it deep
+    #     inside a conditional (AnimGhostStatusSprite) — gated by brace depth.
+    for token in ("sprite->invisible = TRUE", "sprite->invisible=TRUE"):
+        idx = body.find(token)
+        if idx != -1:
+            depth = body[:idx].count("{") - body[:idx].count("}")
+            if depth <= 1:                   # top-level self-hide → utility
+                return MOTION_INVISIBLE
+            break
     attacker_init = "InitSpritePosToAnimAttacker" in body
     target_init = "InitSpritePosToAnimTarget" in body
     # Does it set up a translation that ends on the target?
