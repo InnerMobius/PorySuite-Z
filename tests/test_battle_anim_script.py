@@ -392,6 +392,33 @@ def test_resolve_timeline_follows_goto_tail_jump():
     assert not any(c.args == ["SE_NEVER"] for c in tl)
 
 
+def test_find_anim_branches_and_choice():
+    text = (
+        "Move_CURSEISH:\n"
+        "\tchoosetwoturnanim GhostVer, StatsVer\n"
+        "GhostVer:\n"
+        "\tcreatesprite gNail, ANIM_ATTACKER, 2\n"
+        "\tend\n"
+        "StatsVer:\n"
+        "\tcreatevisualtask AnimTask_Sway, 2\n"
+        "\tend\n"
+    )
+    scripts = mod.parse_scripts_text(text)
+    branches = mod.find_anim_branches(scripts, "Move_CURSEISH")
+    assert branches == ["GhostVer", "StatsVer"]
+    # Default (choice 0) → ghost branch has the createsprite.
+    tl0 = mod.resolve_timeline(scripts, "Move_CURSEISH", branch_choice=0)
+    assert any(c.name == "createsprite" for c in tl0)
+    assert not any(c.name == "createvisualtask" for c in tl0)
+    # Choice 1 → stats branch has the visual task instead.
+    tl1 = mod.resolve_timeline(scripts, "Move_CURSEISH", branch_choice=1)
+    assert any(c.name == "createvisualtask" for c in tl1)
+    assert not any(c.name == "createsprite" for c in tl1)
+    # A non-branching move yields no variants.
+    plain = mod.parse_scripts_text("Move_X:\n\tdelay 5\n\tend\n")
+    assert mod.find_anim_branches(plain, "Move_X") == []
+
+
 def test_resolve_timeline_follows_choosetwoturnanim_first_branch():
     text = (
         "Move_CURSEISH:\n"

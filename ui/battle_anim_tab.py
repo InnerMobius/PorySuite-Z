@@ -67,6 +67,7 @@ from core.battle_anim_data import (
     BattleAnimSprite)
 from core.battle_anim_script import (
     parse_move_anim_table, parse_anim_scripts, resolve_timeline,
+    find_anim_branches,
     parse_move_names, move_display_name, parse_sound_effects,
     rewrite_script_command, format_command,
     insert_script_command, delete_script_command, move_script_command,
@@ -240,6 +241,7 @@ class BattleAnimTab(QWidget):
         self._species_name_override: Dict[str, str] = {}    # slug -> project display name
         self._cur_timeline: list = []                       # resolved Commands of selected move
         self._dirty_moves: set = set()                      # labels with unsaved edits (amber)
+        self._branch_choice: int = 0                        # choosetwoturnanim variant index
 
         # Composite-preview / layer-scrubber state (Move Animations tab).
         self._layer_frames: List[QPixmap] = []              # frames of selected layer sprite
@@ -418,6 +420,19 @@ class BattleAnimTab(QWidget):
         self._tl_header.setWordWrap(True)
         self._tl_header.setStyleSheet("color: #aaa; font-size: 11px;")
         tv.addWidget(self._tl_header)
+
+        # ── Variant picker (choosetwoturnanim — e.g. Curse Ghost vs Stats) ──
+        self._variant_row = QWidget()
+        _vr = QHBoxLayout(self._variant_row)
+        _vr.setContentsMargins(0, 0, 0, 0)
+        _vr.addWidget(QLabel("Variant:"))
+        self._variant_combo = QComboBox()
+        self._variant_combo.wheelEvent = lambda e: e.ignore()
+        self._variant_combo.currentIndexChanged.connect(self._on_variant_changed)
+        _vr.addWidget(self._variant_combo, 1)
+        _vr.addStretch(1)
+        self._variant_row.setVisible(False)
+        tv.addWidget(self._variant_row)
 
         # ── Edit toolbar: add / edit / delete / reorder commands ──
         edit_row = QHBoxLayout()
@@ -629,6 +644,9 @@ class BattleAnimTab(QWidget):
         self._frames = []
         self._frame_idx = 0
         self._move_current = None
+        self._branch_choice = 0
+        if hasattr(self, "_variant_row"):
+            self._variant_row.setVisible(False)
 
         # Parse model.
         try:
@@ -1205,7 +1223,32 @@ class BattleAnimTab(QWidget):
             return
         self._stop_play_move()
         self._move_current = label
+        self._branch_choice = 0          # reset variant on move change
+        self._refresh_variant_combo(label)
         self._populate_timeline(label)
+
+    def _refresh_variant_combo(self, label: str):
+        """Show a variant picker when the move branches via
+        choosetwoturnanim (e.g. Curse's Ghost vs Stats version)."""
+        branches = find_anim_branches(self._scripts, label)
+        self._variant_combo.blockSignals(True)
+        self._variant_combo.clear()
+        if len(branches) >= 2:
+            for i, target in enumerate(branches):
+                self._variant_combo.addItem(f"{i + 1}: {target}", i)
+            self._variant_combo.setCurrentIndex(
+                min(self._branch_choice, len(branches) - 1))
+            self._variant_row.setVisible(True)
+        else:
+            self._variant_row.setVisible(False)
+        self._variant_combo.blockSignals(False)
+
+    def _on_variant_changed(self, idx: int):
+        if idx < 0 or not self._move_current:
+            return
+        self._branch_choice = idx
+        self._stop_play_move()
+        self._populate_timeline(self._move_current)
 
     def _populate_timeline(self, label: str, select_own_idx: Optional[int] = None):
         """Resolve the move's script into a flat timeline and render it as
@@ -1218,7 +1261,8 @@ class BattleAnimTab(QWidget):
         on what the user just changed)."""
         self._timeline.blockSignals(True)
         self._timeline.clear()
-        timeline = resolve_timeline(self._scripts, label, inline_calls=True)
+        timeline = resolve_timeline(self._scripts, label, inline_calls=True,
+                                    branch_choice=self._branch_choice)
         self._cur_timeline = timeline
         name = move_display_name(label, self._move_names)
         n_sound = sum(1 for c in timeline if c.kind == KIND_SOUND)

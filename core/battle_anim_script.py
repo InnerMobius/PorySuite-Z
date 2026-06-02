@@ -548,9 +548,27 @@ def format_command(name: str, args: List[str]) -> str:
     return name
 
 
+def find_anim_branches(scripts: Dict[str, List[Command]],
+                       label: str) -> List[str]:
+    """Return the branch target labels of the FIRST ``choosetwoturnanim`` in
+    a move's resolved path, or ``[]`` if it doesn't branch.
+
+    ``choosetwoturnanim A, B`` is how a move shows a different animation
+    depending on the user (e.g. Curse → ``CurseGhost`` for Ghost-types vs
+    ``CurseStats`` for everyone else, which is why Slowking's Curse looks
+    different).  The UI uses this to offer a variant picker.
+    """
+    timeline = resolve_timeline(scripts, label)
+    for cmd in timeline:
+        if cmd.name == "choosetwoturnanim" and len(cmd.args) >= 2:
+            return list(cmd.args)
+    return []
+
+
 def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                      inline_calls: bool = True,
-                     max_depth: int = 6) -> List[Command]:
+                     max_depth: int = 6,
+                     branch_choice: int = 0) -> List[Command]:
     """Flatten a script into a linear timeline.
 
     Top-level commands of ``label`` in order.  When ``inline_calls`` is set
@@ -595,8 +613,9 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 _walk(cmd.args[0], depth + 1, seen2)
                 return  # tail-jump: nothing after a goto runs
             elif cmd.name == "choosetwoturnanim" and cmd.args:
-                _walk(cmd.args[0], depth + 1, seen2)
-                return  # follow the first (representative) branch
+                pick = cmd.args[min(branch_choice, len(cmd.args) - 1)]
+                _walk(pick, depth + 1, seen2)
+                return  # follow the chosen branch (default = first)
 
     _walk(label, 0, frozenset())
     return out
