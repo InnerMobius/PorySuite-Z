@@ -228,6 +228,8 @@ class BattleAnimTab(QWidget):
         self._play_wait = 0        # ticks remaining on the current delay
         self._play_tick = 0
         self._play_layers: list = []   # [tag, cx, cy, subpri, frame_idx]
+        self._play_frame_cache: Dict[str, List[QPixmap]] = {}  # pre-baked at start
+        self._play_direction = "player"  # "player" = player attacks; "enemy" = enemy attacks
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(16)   # ~60 fps, so delays read game-speed
         self._play_timer.timeout.connect(self._play_step)
@@ -291,6 +293,23 @@ class BattleAnimTab(QWidget):
         from ui.graphics_tab_widget import BattleScenePreview
         self._move_preview = BattleScenePreview(self._res_dir)
         pv.addWidget(self._move_preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        # Direction toggle — battle anims are played from BOTH sides:
+        # "Player attacks" = ANIM_ATTACKER at back/player position, ANIM_TARGET at front/enemy.
+        # "Enemy attacks"  = ANIM_ATTACKER at front/enemy position, ANIM_TARGET at back/player.
+        dir_row = QHBoxLayout()
+        from PyQt6.QtWidgets import QButtonGroup, QRadioButton
+        self._dir_player_rb = QRadioButton("Player attacks ▶")
+        self._dir_enemy_rb  = QRadioButton("◀ Enemy attacks")
+        self._dir_player_rb.setChecked(True)
+        self._dir_group = QButtonGroup(self)
+        self._dir_group.addButton(self._dir_player_rb, 0)
+        self._dir_group.addButton(self._dir_enemy_rb,  1)
+        self._dir_player_rb.toggled.connect(lambda _: self._on_direction_changed())
+        dir_row.addStretch(1)
+        dir_row.addWidget(self._dir_player_rb)
+        dir_row.addWidget(self._dir_enemy_rb)
+        dir_row.addStretch(1)
+        pv.addLayout(dir_row)
         self._move_prev_lbl = QLabel("Select a move")
         self._move_prev_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._move_prev_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
@@ -1194,8 +1213,12 @@ class BattleAnimTab(QWidget):
 
     def _on_timeline_row_changed(self, row: int):
         """Selection moved: refresh edit-button enablement, the layered
-        composite (spawns through this row) and the frame scrubber."""
+        composite (spawns through this row) and the frame scrubber.
+        Suppressed during whole-move playback — the player drives the row
+        cursor itself and triggers its own composite rendering."""
         self._update_edit_buttons()
+        if self._playing:
+            return   # playback owns the cursor; don't fight it
         # Load the selected row's sprite into the frame scrubber, if it's a
         # sprite-spawn (createsprite) or gfx-load row.
         tag = ""
@@ -1459,18 +1482,38 @@ class BattleAnimTab(QWidget):
             self._start_play_move()
 
     def _start_play_move(self):
-        """Begin the whole-move animation playback sequence."""
+        """Begin the whole-move animation playback sequence.
+
+        Pre-bakes all sprite frame lists so the render loop never hits disk.
+        Stops the layer-scrubber timer so it doesn't fight the playback timer.
+        """
         timeline = self._cur_timeline
         if not timeline:
             return
+        # Stop anything that might conflict.
+        self._layer_timer.stop()
+        self._layer_play.setText("▶")
+        # Pre-bake frame pixmaps for every createsprite tag in this timeline.
+        self._play_frame_cache = {}
+        for cmd in timeline:
+            if cmd.name == "createsprite":
+                cs = parse_createsprite(cmd)
+                if cs:
+                    tag = self._template_tags.get(cs.template, "")
+                    if tag and tag not in self._play_frame_cache:
+                        sprite = self._sprites.get(tag)
+                        if sprite and sprite.png_exists:
+                            frames = self._slice_frames(
+                                sprite, self._palette_for(sprite))
+                            if frames:
+                                self._play_frame_cache[tag] = frames
         self._playing = True
         self._play_idx = 0
         self._play_wait = 0
         self._play_tick = 0
-        self._play_layers = []   # live list of [tag, cx, cy, subpri, frame_idx]
+        self._play_layers = []
         self._tl_play_move_btn.setText("⏹  Stop")
-        # Walk the timeline forward until the first non-instant event so the
-        # display shows something right away.
+        # Process the first batch of commands immediately.
         self._play_step()
         self._play_timer.start()
 
@@ -1490,38 +1533,50 @@ class BattleAnimTab(QWidget):
         row all fire the same tick) until hitting a ``delay N`` (which burns
         N ticks), ``end``/``return`` (stop), or the end of the timeline.
         Sounds fire through the SE callback.  Sprite layers accumulate; each
-        live layer's frame cycles every 8 ticks (~7.5 fps) for a rough cycle.
+        live layer's frame cycles every 4 ticks (~15 fps) using pre-baked
+        frames — no disk access during playback.
+        Wrapped in try/except so any Python error stops the timer cleanly
+        rather than crashing the whole app.
         """
+        try:
+            self._play_step_inner()
+        except Exception:
+            import traceback as _tb
+            _tb.print_exc()
+            self._stop_play_move()
+
+    def _play_step_inner(self):
         timeline = self._cur_timeline
         if not timeline:
             self._stop_play_move()
             return
 
-        # If we're mid-delay, count it down.
+        # Mid-delay: count down, cycle frames using the pre-baked cache.
         if self._play_wait > 0:
             self._play_wait -= 1
-            # Cycle each live layer's frames.
             self._play_tick += 1
-            if self._play_tick % 8 == 0:
+            if self._play_tick % 4 == 0:   # ~15 fps frame cycle
                 for L in self._play_layers:
-                    tag = L[0]
-                    sprite = self._sprites.get(tag)
-                    if sprite and sprite.png_exists:
-                        frames = self._slice_frames(
-                            sprite, self._palette_for(sprite))
-                        if len(frames) > 1:
-                            L[4] = (L[4] + 1) % len(frames)
+                    frames = self._play_frame_cache.get(L[0], [])
+                    if len(frames) > 1:
+                        L[4] = (L[4] + 1) % len(frames)
             self._render_play_composite()
             return
 
-        # Consume commands until we hit a delay or terminal.
+        # Consume commands greedily until delay / terminal.
         while self._play_idx < len(timeline):
             cmd = timeline[self._play_idx]
             self._play_idx += 1
 
-            # Highlight the current row in the timeline list.
-            if self._play_idx - 1 < self._timeline.count():
-                self._timeline.setCurrentRow(self._play_idx - 1)
+            # Advance the timeline cursor (signals are suppressed during
+            # playback so _on_timeline_row_changed won't fight us).
+            row = self._play_idx - 1
+            if row < self._timeline.count():
+                self._timeline.blockSignals(True)
+                self._timeline.setCurrentRow(row)
+                self._timeline.blockSignals(False)
+                # Scroll to keep cursor visible without triggering row-change.
+                self._timeline.scrollToItem(self._timeline.item(row))
 
             if cmd.name == "delay" and cmd.args:
                 try:
@@ -1533,6 +1588,7 @@ class BattleAnimTab(QWidget):
                 return
 
             if cmd.name in ("end", "return"):
+                self._render_play_composite()   # show final state
                 self._stop_play_move()
                 return
 
@@ -1540,7 +1596,7 @@ class BattleAnimTab(QWidget):
                 cs = parse_createsprite(cmd)
                 if cs:
                     tag = self._template_tags.get(cs.template, "")
-                    if tag:
+                    if tag and tag in self._play_frame_cache:
                         acx, acy = self._battler_anchor(cs.battler)
                         xoff = (self._int_or(cs.args[0])
                                 if len(cs.args) >= 1 else 0)
@@ -1554,13 +1610,15 @@ class BattleAnimTab(QWidget):
                 if _preview_sound_cb is not None:
                     _preview_sound_cb(cmd.args[0])
 
-        # Ran off the end without hitting `end` — stop.
+        # Fell off the end without end/return — stop.
+        self._render_play_composite()
         self._stop_play_move()
 
     def _render_play_composite(self):
         """Paint the current _play_layers state onto the battle preview.
+        Uses pre-baked frames from _play_frame_cache — no disk access.
         Layers are ordered by subpriority (higher value = drawn first = behind)."""
-        from PyQt6.QtGui import QPainter
+        from PyQt6.QtGui import QPainter as _QPainter
         if not self._play_layers:
             self._move_preview.set_anim_pixmap(None)
             return
@@ -1568,12 +1626,9 @@ class BattleAnimTab(QWidget):
         P = self._move_preview
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(canvas)
+        painter = _QPainter(canvas)
         for tag, cx, cy, _sp, fidx in layers:
-            sprite = self._sprites.get(tag)
-            if not sprite or not sprite.png_exists:
-                continue
-            frames = self._slice_frames(sprite, self._palette_for(sprite))
+            frames = self._play_frame_cache.get(tag, [])
             if not frames:
                 continue
             pix = frames[max(0, min(fidx, len(frames) - 1))]
@@ -1595,12 +1650,35 @@ class BattleAnimTab(QWidget):
         except (ValueError, TypeError):
             return default
 
+    def _on_direction_changed(self):
+        """Player/Enemy direction toggle: rebuild the composite + restart playback."""
+        self._play_direction = "player" if self._dir_player_rb.isChecked() else "enemy"
+        if self._playing:
+            # Restart so the pre-baked positions use the new direction.
+            self._stop_play_move()
+            self._start_play_move()
+        else:
+            self._update_move_composite()
+
     def _battler_anchor(self, battler: str) -> Tuple[int, int]:
-        """Frame-center for the given anim battler on the 240×160 canvas."""
+        """Frame-center for the given anim battler on the 240×160 canvas.
+
+        Battle animations run from BOTH sides — the same gBattleAnims_Moves
+        entry is used whether the player or the enemy is attacking.  The
+        engine picks attacker/target based on who owns the move at runtime.
+        The direction toggle lets the preview show both cases:
+
+          Player attacks  →  ANIM_ATTACKER = back/player  (72, 80)
+                             ANIM_TARGET   = front/enemy  (176, 40)
+          Enemy attacks   →  ANIM_ATTACKER = front/enemy  (176, 40)
+                             ANIM_TARGET   = back/player  (72, 80)
+        """
         P = self._move_preview
-        if (battler or "").strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER"):
-            return P.PLAYER_CX, P.PLAYER_CY
-        return P.ENEMY_CX, P.ENEMY_CY      # target / default
+        is_attacker = (battler or "").strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
+        if self._play_direction == "player":
+            return (P.PLAYER_CX, P.PLAYER_CY) if is_attacker else (P.ENEMY_CX, P.ENEMY_CY)
+        else:
+            return (P.ENEMY_CX, P.ENEMY_CY) if is_attacker else (P.PLAYER_CX, P.PLAYER_CY)
 
     def _first_frame_for_tag(self, tag: str) -> Optional[QPixmap]:
         sprite = self._sprites.get(tag)
