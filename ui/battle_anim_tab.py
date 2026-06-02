@@ -74,6 +74,9 @@ from core.battle_anim_script import (
     parse_createvisualtask, format_createvisualtask,
     KIND_SOUND, KIND_SPRITE, KIND_TASK, KIND_DELAY, KIND_GFX, KIND_CONTROL,
 )
+from core.battle_anim_vm import (
+    AnimSim, AnimContext, Battler, spawn as vm_spawn, is_ported as vm_is_ported,
+    SIDE_PLAYER, SIDE_OPPONENT)
 from core.sprite_render import load_sprite_pixmap
 from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_BATTLE_ANIM
 from core.overworld_palette_io import write_palette_pair
@@ -254,6 +257,8 @@ class BattleAnimTab(QWidget):
         self._play_tick = 0
         self._last_sound_tick = -100   # throttle rapid/overlapping sound previews
         self._play_layers: list = []   # [tag, cx, cy, subpri, frame_idx]
+        self._anim_sim = None          # core.battle_anim_vm.AnimSim during playback
+        self._wait_visual = False      # blocking on waitforvisualfinish?
         self._play_frame_cache: Dict[str, List[QPixmap]] = {}  # pre-baked at start
         self._play_direction = "player"  # "player" = player attacks; "enemy" = enemy attacks
         self._play_timer = QTimer(self)
@@ -1547,7 +1552,17 @@ class BattleAnimTab(QWidget):
         self._play_tick = 0
         self._last_sound_tick = -100   # reset throttle so replays play sound
         self._pending_task_wait = 0    # createvisualtask duration owed to waitforvisualfinish
+        self._wait_visual = False
         self._play_layers = []
+        # Build the per-frame simulator with direction-aware battlers.
+        P = self._move_preview
+        player = Battler(P.PLAYER_CX, P.PLAYER_CY, SIDE_PLAYER)
+        enemy = Battler(P.ENEMY_CX, P.ENEMY_CY, SIDE_OPPONENT)
+        if self._play_direction == "player":
+            ctx = AnimContext(attacker=player, target=enemy)
+        else:
+            ctx = AnimContext(attacker=enemy, target=player)
+        self._anim_sim = AnimSim(ctx)
         self._tl_play_move_btn.setText("⏹  Stop")
         # Process the first batch of commands immediately.
         self._play_step()
@@ -1559,6 +1574,8 @@ class BattleAnimTab(QWidget):
         self._play_timer.stop()
         self._playing = False
         self._play_layers = []
+        self._anim_sim = None
+        self._wait_visual = False
         self._tl_play_move_btn.setText("▶  Play Move")
         # Reset preview back to the static composite for the current row.
         # Guard against re-entrancy from the composite touching widgets.
@@ -1610,37 +1627,36 @@ class BattleAnimTab(QWidget):
 
     def _play_step_inner(self):
         timeline = self._cur_timeline
-        if not timeline:
+        if not timeline or self._anim_sim is None:
             self._stop_play_move()
             return
 
-        self._play_tick += 1   # global frame clock (drives motion + cycling)
-        # Retire sprites whose approximate lifetime has elapsed, so the scene
-        # is multi-step (the nail clears before the ghost appears) instead of
-        # accumulating every spawn to the end.  L[9] = death_tick.
-        if self._play_layers:
-            self._play_layers = [L for L in self._play_layers
-                                 if self._play_tick <= L[9]]
-        # Cycle each live layer's frames (~15 fps) using the pre-baked cache.
-        if self._play_tick % 4 == 0:
-            for L in self._play_layers:
-                frames = self._play_frame_cache.get(L[0], [])
-                if len(frames) > 1:
-                    L[5] = (L[5] + 1) % len(frames)   # L[5] = frame_idx
+        self._play_tick += 1            # global frame clock
+        self._anim_sim.step()           # advance every live sprite one frame
 
-        # Mid-delay: just keep rendering (sprites keep moving toward target).
+        # Mid fixed-delay: keep simulating + rendering.
         if self._play_wait > 0:
             self._play_wait -= 1
             self._render_play_composite()
             return
 
-        # Consume commands greedily until delay / terminal.
+        # waitforvisualfinish: block until the live sprites have finished
+        # (self-destructed) AND any owed visual-task time has elapsed.  This
+        # is the real multi-step gate — the ghost rises + fades here before
+        # the script continues, instead of `end` firing the same frame.
+        if self._wait_visual:
+            if self._anim_sim.active() or self._pending_task_wait > 0:
+                self._pending_task_wait = max(0, self._pending_task_wait - 1)
+                self._render_play_composite()
+                return
+            self._wait_visual = False
+
+        # Consume commands greedily until a delay / wait / terminal.
         while self._play_idx < len(timeline):
             cmd = timeline[self._play_idx]
             self._play_idx += 1
 
-            # Advance the timeline cursor (signals suppressed during playback
-            # so _on_timeline_row_changed won't fight us).
+            # Advance the timeline cursor (signals suppressed during playback).
             row = self._play_idx - 1
             if row < self._timeline.count():
                 self._timeline.blockSignals(True)
@@ -1662,41 +1678,20 @@ class BattleAnimTab(QWidget):
                 self._stop_play_move()
                 return
 
-            # waitforvisualfinish blocks until the live sprites + the most
-            # recent visual task would finish.  Without this it's a no-op and
-            # late sprites (e.g. the Curse ghost) spawn and vanish in one tick
-            # because `end` follows immediately — the scene must hold while
-            # they animate.  Approximated as the longest remaining lifetime.
             if cmd.name in ("waitforvisualfinish", "waitsound"):
-                wait = self._pending_task_wait
-                for L in self._play_layers:
-                    wait = max(wait, L[9] - self._play_tick)   # remaining life
-                self._pending_task_wait = 0
-                if wait > 0:
-                    self._play_wait = min(wait, 120)
-                    self._render_play_composite()
-                    return
-                continue
+                self._wait_visual = True
+                self._render_play_composite()
+                return
 
-            # Visual tasks aren't drawn yet (Phase 3), but their duration is
-            # owed to the next waitforvisualfinish so timing stays right.
+            # Visual tasks aren't simulated yet (Phase 3 will animate the mon
+            # sprites), but their duration is owed to the next
+            # waitforvisualfinish so the timing stays right.
             if cmd.name in ("createvisualtask", "createsoundtask"):
                 self._pending_task_wait = max(self._pending_task_wait, 24)
                 continue
 
             if cmd.name == "createsprite":
-                cs = parse_createsprite(cmd)
-                if cs:
-                    tag = self._template_tags.get(cs.template, "")
-                    if tag and tag in self._play_frame_cache:
-                        arch, start, end, dur, vis, flip = self._layer_geometry(cs)
-                        if vis:
-                            subpri = self._int_or(cs.subpriority)
-                            death = self._play_tick + self._layer_lifetime(arch, dur)
-                            # [tag,start,end,dur,spawn,frame_idx,arch,subpri,flip,death]
-                            self._play_layers.append(
-                                [tag, start, end, dur, self._play_tick, 0,
-                                 arch, subpri, flip, death])
+                self._spawn_play_sprite(cmd)
 
             if cmd.kind == KIND_SOUND and cmd.args:
                 self._fire_play_sound(cmd.args[0])
@@ -1704,6 +1699,31 @@ class BattleAnimTab(QWidget):
         # Fell off the end without end/return — stop.
         self._render_play_composite()
         self._stop_play_move()
+
+    def _spawn_play_sprite(self, cmd):
+        """Spawn a createsprite into the running simulation (faithful motion
+        via the VM; skips classified-invisible utility sprites)."""
+        cs = parse_createsprite(cmd)
+        if not cs:
+            return
+        tag = self._template_tags.get(cs.template, "")
+        if not tag or tag not in self._play_frame_cache:
+            return
+        # Skip known invisible utility sprites (palette fades, mon-movers).
+        if self._archetype_for_template(cs.template) == MOTION_INVISIBLE:
+            return
+        cb = self._tpl_callbacks.get(cs.template, "")
+        # Per-spawn args feed the VM init (only the init reads them).
+        self._anim_sim.ctx.args = [self._int_or(a) for a in cs.args]
+        on_attacker = cs.battler.strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
+        sprite = vm_spawn(cb, self._anim_sim.ctx, tag=tag,
+                          subpriority=self._int_or(cs.subpriority),
+                          fallback_battler_is_attacker=on_attacker)
+        if sprite is not None:
+            # H-flip: attacker-anchored sprites mirror when the attacker is on
+            # the player side (matches the engine's side-dependent HFLIP).
+            sprite.flip = on_attacker and (self._play_direction == "player")
+        self._anim_sim.add(sprite)
 
     @staticmethod
     def _apply_flip(pix: QPixmap, flip: bool) -> QPixmap:
@@ -1715,27 +1735,31 @@ class BattleAnimTab(QWidget):
         return pix.transformed(QTransform().scale(-1, 1))
 
     def _render_play_composite(self):
-        """Paint the current _play_layers onto the battle preview, each at
-        its interpolated position for the current tick.  Uses pre-baked
-        frames (no disk access).  Ordered by subpriority (lower on top)."""
+        """Paint the running simulation's live sprites onto the battle
+        preview at their real per-frame positions.  Uses pre-baked frames
+        (no disk access).  Ordered by subpriority (lower on top)."""
         from PyQt6.QtGui import QPainter as _QPainter
-        if not self._play_layers:
+        sim = self._anim_sim
+        if sim is None or not sim.sprites:
             self._move_preview.set_anim_pixmap(None)
             return
         P = self._move_preview
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
-        for L in sorted(self._play_layers, key=lambda L: -L[7]):  # subpri
-            tag, start, end, dur, spawn, fidx, arch, _sp, flip, _death = L
-            frames = self._play_frame_cache.get(tag, [])
+        for s in sorted(sim.sprites, key=lambda s: -s.subpriority):
+            if s.invisible:
+                continue
+            frames = self._play_frame_cache.get(s.tag, [])
             if not frames:
                 continue
-            pix = self._apply_flip(
-                frames[max(0, min(fidx, len(frames) - 1))], flip)
-            cx, cy = self._interp_pos(start, end, dur, self._play_tick - spawn, arch)
-            painter.drawPixmap(cx - pix.width() // 2,
-                               cy - pix.height() // 2, pix)
+            n = len(frames)
+            # Sprites that advance their own frame cursor (e.g. the nail) use
+            # it; others cycle gently with age.
+            idx = s.frame_advance if s.frame_advance else (s.age // 4)
+            pix = self._apply_flip(frames[idx % n], s.flip)
+            painter.drawPixmap(s.render_x - pix.width() // 2,
+                               s.render_y - pix.height() // 2, pix)
         painter.end()
         self._move_preview.set_anim_pixmap(canvas, P.CANVAS_W // 2,
                                            P.CANVAS_H // 2)
@@ -1839,30 +1863,6 @@ class BattleAnimTab(QWidget):
         anchor = atk if on_attacker else tgt
         pos = (anchor[0] + xdir * (arg(0) + ex), anchor[1] + arg(1) + ey)
         return (MOTION_UNKNOWN, pos, pos, 0, True, on_attacker and player_attacks)
-
-    def _interp_pos(self, start, end, dur, t, arch):
-        """Interpolated position at tick ``t`` into a moving layer's life
-        (linear, plus a parabolic rise for arc archetypes)."""
-        if dur <= 0 or start == end:
-            return start
-        import math
-        frac = max(0.0, min(1.0, t / dur))
-        x = start[0] + (end[0] - start[0]) * frac
-        y = start[1] + (end[1] - start[1]) * frac
-        if arch == MOTION_ARC_TO_TARGET:
-            y -= math.sin(math.pi * frac) * 24.0
-        return (int(round(x)), int(round(y)))
-
-    @staticmethod
-    def _layer_lifetime(arch: str, dur: int) -> int:
-        """Approximate how many ticks a spawned sprite lives before the
-        engine would destroy it.  Real sprites self-destroy in their
-        callbacks; we approximate so the composite is genuinely multi-step
-        (early sprites clear out before later ones appear) instead of every
-        sprite piling up to the end."""
-        if arch in (MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET):
-            return max(1, dur) + 12      # dies shortly after reaching target
-        return 60                        # static/on-mon/unknown: ~1s, then clears
 
     def _first_frame_for_tag(self, tag: str) -> Optional[QPixmap]:
         sprite = self._sprites.get(tag)
