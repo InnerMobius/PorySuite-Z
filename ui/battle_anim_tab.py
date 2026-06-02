@@ -270,6 +270,7 @@ class BattleAnimTab(QWidget):
         self._anim_sim = None          # core.battle_anim_vm.AnimSim during playback
         self._wait_visual = False      # blocking on waitforvisualfinish?
         self._play_frame_cache: Dict[str, List[QPixmap]] = {}  # pre-baked at start
+        self._play_flip_cache: Dict[str, List[QPixmap]] = {}   # H-flipped frames, baked once
         self._play_direction = "player"  # "player" = player attacks; "enemy" = enemy attacks
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(33)   # ~30 fps render (Remote-Desktop friendly)
@@ -1617,6 +1618,7 @@ class BattleAnimTab(QWidget):
         self._layer_play.setText("▶")
         # Pre-bake frame pixmaps for every createsprite tag in this timeline.
         self._play_frame_cache = {}
+        self._play_flip_cache = {}
         for cmd in timeline:
             if cmd.name == "createsprite":
                 cs = parse_createsprite(cmd)
@@ -1794,6 +1796,11 @@ class BattleAnimTab(QWidget):
     def _spawn_play_sprite(self, cmd):
         """Spawn a createsprite into the running simulation (faithful motion
         via the VM; skips classified-invisible utility sprites)."""
+        # Defensive cap: never let a runaway script pile up unbounded sprites
+        # (memory / paint pressure → crash risk).  60 is far above any real
+        # move's on-screen count.
+        if self._anim_sim is not None and len(self._anim_sim.sprites) >= 60:
+            return
         cs = parse_createsprite(cmd)
         if not cs:
             return
@@ -1850,17 +1857,39 @@ class BattleAnimTab(QWidget):
 
     @staticmethod
     def _apply_flip(pix: QPixmap, flip: bool) -> QPixmap:
-        """Return a horizontally-mirrored copy when ``flip`` (side-dependent
-        ST_OAM_HFLIP), else the pixmap unchanged."""
-        if not flip:
+        """Horizontally mirror a pixmap when ``flip``.  Used by the static
+        composite (not a hot loop); playback uses the flip cache instead."""
+        if not flip or pix is None or pix.isNull():
             return pix
         from PyQt6.QtGui import QTransform
         return pix.transformed(QTransform().scale(-1, 1))
 
+    def _play_frame_pix(self, tag: str, idx: int, flip: bool):
+        """Return the cached (optionally H-flipped) frame pixmap for a tag.
+
+        Flipped frames are baked ONCE per tag and cached — re-creating ~25
+        ``transformed()`` pixmaps every frame churns GPU/RAM (a real crash +
+        jitter risk over Remote Desktop)."""
+        frames = self._play_frame_cache.get(tag)
+        if not frames:
+            return None
+        idx = max(0, min(idx, len(frames) - 1))
+        if not flip:
+            return frames[idx]
+        fc = self._play_flip_cache.get(tag)
+        if fc is None:
+            from PyQt6.QtGui import QTransform
+            tr = QTransform().scale(-1, 1)
+            fc = [f.transformed(tr) for f in frames]
+            self._play_flip_cache[tag] = fc
+        return fc[idx]
+
     def _render_play_composite(self):
         """Paint the running simulation's live sprites onto the battle
-        preview at their real per-frame positions.  Uses pre-baked frames
-        (no disk access).  Ordered by subpriority (lower on top)."""
+        preview at their real per-frame positions.  Uses pre-baked (and
+        flip-cached) frames — no disk access, no per-frame pixmap churn.
+        Each sprite draw is guarded so one bad frame can't abort the paint.
+        Ordered by subpriority (lower on top)."""
         from PyQt6.QtGui import QPainter as _QPainter
         sim = self._anim_sim
         if sim is None or not sim.sprites:
@@ -1870,20 +1899,23 @@ class BattleAnimTab(QWidget):
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
-        for s in sorted(sim.sprites, key=lambda s: -s.subpriority):
-            if s.invisible:
-                continue
-            frames = self._play_frame_cache.get(s.tag, [])
-            if not frames:
-                continue
-            n = len(frames)
-            # Sprites that advance their own frame cursor (e.g. the nail) use
-            # it; others cycle gently with age.
-            idx = s.frame_advance if s.frame_advance else (s.age // 4)
-            pix = self._apply_flip(frames[idx % n], s.flip)
-            painter.drawPixmap(s.render_x - pix.width() // 2,
-                               s.render_y - pix.height() // 2, pix)
-        painter.end()
+        try:
+            for s in sorted(sim.sprites, key=lambda s: -s.subpriority):
+                if s.invisible:
+                    continue
+                frames = self._play_frame_cache.get(s.tag)
+                if not frames:
+                    continue
+                # Sprites that advance their own frame cursor (e.g. the nail)
+                # use it; others cycle gently with age.
+                idx = s.frame_advance if s.frame_advance else (s.age // 4)
+                pix = self._play_frame_pix(s.tag, idx % len(frames), s.flip)
+                if pix is None or pix.isNull():
+                    continue
+                painter.drawPixmap(int(s.render_x - pix.width() // 2),
+                                   int(s.render_y - pix.height() // 2), pix)
+        finally:
+            painter.end()
         self._move_preview.set_anim_pixmap(canvas, P.CANVAS_W // 2,
                                            P.CANVAS_H // 2)
 
@@ -1990,11 +2022,14 @@ class BattleAnimTab(QWidget):
             return (arch, tgt, tgt, 0, True, False)
         if arch == MOTION_AT_ATTACKER:      # raw attacker coord, no arg offset
             return (arch, atk, atk, 0, True, player_attacks)
-        # UNKNOWN → static at the createsprite's declared battler (best guess).
-        on_attacker = cs.battler.strip() in ("ANIM_ATTACKER", "ANIM_ATK_PARTNER")
-        anchor = atk if on_attacker else tgt
-        pos = (anchor[0] + xdir * (arg(0) + ex), anchor[1] + arg(1) + ey)
-        return (MOTION_UNKNOWN, pos, pos, 0, True, on_attacker and player_attacks)
+        # UNKNOWN → the engine auto-creates battle-anim sprites at the TARGET
+        # centre; a callback that doesn't reposition (or only does
+        # ``sprite->x += arg``, like AnimBite) leaves them there.  So default
+        # to the TARGET, NOT the createsprite's declared anim_battler (that
+        # arg controls binding/subpriority, not the spawn point).  This is why
+        # e.g. Bite's teeth belong on the victim, not the biter.
+        pos = (tgt[0] + xdir * (arg(0) + ex), tgt[1] + arg(1) + ey)
+        return (MOTION_UNKNOWN, pos, pos, 0, True, False)
 
     def _first_frame_for_tag(self, tag: str) -> Optional[QPixmap]:
         sprite = self._sprites.get(tag)
