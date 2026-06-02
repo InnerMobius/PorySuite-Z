@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import logging
+import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
@@ -270,8 +271,10 @@ class BattleAnimTab(QWidget):
         self._play_frame_cache: Dict[str, List[QPixmap]] = {}  # pre-baked at start
         self._play_direction = "player"  # "player" = player attacks; "enemy" = enemy attacks
         self._play_timer = QTimer(self)
-        self._play_timer.setInterval(16)   # ~60 fps, so delays read game-speed
+        self._play_timer.setInterval(33)   # ~30 fps render (Remote-Desktop friendly)
         self._play_timer.timeout.connect(self._play_step)
+        self._play_last_ms = 0.0           # wall-clock anchor for real-time pacing
+        self._visual_wait = 0              # frames spent in a waitforvisualfinish
 
         # Frame-cycle preview state.
         self._frames: List[QPixmap] = []
@@ -1623,6 +1626,8 @@ class BattleAnimTab(QWidget):
         self._last_sound_tick = -100   # reset throttle so replays play sound
         self._pending_task_wait = 0    # createvisualtask duration owed to waitforvisualfinish
         self._wait_visual = False
+        self._visual_wait = 0
+        self._play_last_ms = time.monotonic() * 1000.0
         self._play_layers = []
         # Build the per-frame simulator with direction-aware battlers.
         P = self._move_preview
@@ -1661,19 +1666,31 @@ class BattleAnimTab(QWidget):
         super().hideEvent(ev)
 
     def _play_step(self):
-        """Advance one 60-fps tick of the animation playback.
+        """Timer handler: advance the sim by the REAL wall-clock elapsed time
+        (so playback runs at true GBA speed even when rendering can't keep up
+        — e.g. over Chrome Remote Desktop — instead of dragging), then render
+        ONCE.  Decoupling sim-time from render-rate is what kills the "slow +
+        jittery" feel: the timeline advances on the clock, the scene repaints
+        at a steady ~30 fps.
 
-        Re-entrancy guarded (the sound callback can pump the Qt event loop,
-        which would otherwise let the timer fire this slot again mid-tick and
-        corrupt the layer list — a likely live-only crash).  Wrapped in
-        try/except with a logged traceback so a Python error stops the timer
-        cleanly instead of taking down the app.
+        Re-entrancy guarded (the sound callback can pump the Qt event loop).
         """
         if self._in_play_step:
             return
         self._in_play_step = True
         try:
-            self._play_step_inner()
+            now = time.monotonic() * 1000.0
+            elapsed = now - self._play_last_ms
+            self._play_last_ms = now
+            # GBA runs ~59.7 fps (16.74 ms/frame).  Advance that many frames,
+            # clamped to 4 so a stall (GC / RDP hitch) can't fast-forward wildly.
+            frames = max(1, min(4, int(round(elapsed / 16.74))))
+            for _ in range(frames):
+                if not self._playing:
+                    break
+                self._advance_frame()
+            if self._playing:
+                self._render_play_composite()
         except Exception:
             _log.exception("play_step crashed at idx=%s tick=%s",
                            getattr(self, "_play_idx", "?"),
@@ -1695,38 +1712,38 @@ class BattleAnimTab(QWidget):
         except Exception:
             _log.exception("sound preview failed for %s", se)
 
-    def _play_step_inner(self):
+    def _advance_frame(self):
+        """Advance exactly ONE GBA frame of playback (no rendering — the timer
+        handler renders once after advancing all the frames owed this tick)."""
         timeline = self._cur_timeline
         if not timeline or self._anim_sim is None:
             self._stop_play_move()
             return
 
-        self._play_tick += 1            # global frame clock
-        self._anim_sim.step()           # advance every live sprite one frame
+        self._play_tick += 1
+        self._anim_sim.step()           # move/age every live sprite one frame
 
-        # Mid fixed-delay: keep simulating + rendering.
+        # Mid fixed-delay: just keep simulating.
         if self._play_wait > 0:
             self._play_wait -= 1
-            self._render_play_composite()
             return
 
-        # waitforvisualfinish: block until the live sprites have finished
-        # (self-destructed) AND any owed visual-task time has elapsed.  This
-        # is the real multi-step gate — the ghost rises + fades here before
-        # the script continues, instead of `end` firing the same frame.
+        # waitforvisualfinish: hold until the live sprites finish (self-
+        # destruct) + any owed visual-task time — the multi-step gate.  Capped
+        # so a long-lived fallback sprite can't stall playback for seconds.
         if self._wait_visual:
-            if self._anim_sim.active() or self._pending_task_wait > 0:
+            self._visual_wait += 1
+            still_busy = self._anim_sim.active() or self._pending_task_wait > 0
+            if still_busy and self._visual_wait < 45:
                 self._pending_task_wait = max(0, self._pending_task_wait - 1)
-                self._render_play_composite()
                 return
             self._wait_visual = False
 
-        # Consume commands greedily until a delay / wait / terminal.
+        # Consume commands until the next delay / wait / terminal.
         while self._play_idx < len(timeline):
             cmd = timeline[self._play_idx]
             self._play_idx += 1
 
-            # Advance the timeline cursor (signals suppressed during playback).
             row = self._play_idx - 1
             if row < self._timeline.count():
                 self._timeline.blockSignals(True)
@@ -1740,22 +1757,17 @@ class BattleAnimTab(QWidget):
                 except ValueError:
                     n = 1
                 self._play_wait = max(1, n)
-                self._render_play_composite()
                 return
 
             if cmd.name in ("end", "return"):
-                self._render_play_composite()   # show final state
                 self._stop_play_move()
                 return
 
             if cmd.name in ("waitforvisualfinish", "waitsound"):
                 self._wait_visual = True
-                self._render_play_composite()
+                self._visual_wait = 0
                 return
 
-            # Visual tasks aren't simulated yet (Phase 3 will animate the mon
-            # sprites), but their duration is owed to the next
-            # waitforvisualfinish so the timing stays right.
             if cmd.name in ("createvisualtask", "createsoundtask"):
                 self._pending_task_wait = max(self._pending_task_wait, 24)
                 continue
@@ -1767,7 +1779,6 @@ class BattleAnimTab(QWidget):
                 self._fire_play_sound(cmd.args[0])
 
         # Fell off the end without end/return — stop.
-        self._render_play_composite()
         self._stop_play_move()
 
     def _spawn_play_sprite(self, cmd):
@@ -1948,7 +1959,12 @@ class BattleAnimTab(QWidget):
         if arch in (MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET):
             start = (atk[0] + xdir * (arg(0) + ex), atk[1] + arg(1) + ey)
             end = (tgt[0] + xdir * arg(2), tgt[1] + arg(3))
-            return (arch, start, end, max(1, arg(4)), True, player_attacks)
+            # arg4 is the travel duration when the callback follows the
+            # standard layout; many projectiles (Bullet Seed: "20, 0") omit
+            # it, so default to a real travel time instead of 1 frame —
+            # otherwise the sprite teleports to the target and flickers.
+            dur = arg(4) if arg(4) > 1 else 24
+            return (arch, start, end, dur, True, player_attacks)
         if arch == MOTION_ON_MON_POS:
             on_attacker = (arg(2) == 0)
             anchor = atk if on_attacker else tgt
