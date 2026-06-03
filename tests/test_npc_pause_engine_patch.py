@@ -314,6 +314,41 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
             "pause-step block was stacked across re-runs",
         )
 
+    def test_pause_is_gated_on_preventstep_for_cutscenes(self):
+        # FREEZE FIX: the LADX pause must NOT fire during a locked/scripted
+        # sequence. NpcTakeStep is the same step path a scripted applymovement
+        # uses, so an un-gated pause stalls a cutscene NPC's walk forever and
+        # hangs waitmovement (Bill's Sea Cottage teleporter freeze).
+        _write_synthetic_field_player(self.tmp)
+        patch.ensure_npc_pause_engine_support(self.tmp)
+        with open(
+            os.path.join(self.tmp, "src", "event_object_movement.c"),
+            encoding="utf-8",
+        ) as f:
+            text = f.read()
+        self.assertIn("if (!gPlayerAvatar.preventStep)", text)
+
+    def test_outdated_pause_block_is_upgraded_in_place(self):
+        # A project that already had the OLD un-gated block must be upgraded
+        # to the gated version on re-run (self-healing), not left frozen.
+        _write_synthetic_field_player(self.tmp)
+        patch.ensure_npc_pause_engine_support(self.tmp)
+        path = os.path.join(self.tmp, "src", "event_object_movement.c")
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        # Simulate an older install: remove the gate guard but keep the fences.
+        old = text.replace("if (!gPlayerAvatar.preventStep)", "if (1) /*old*/")
+        self.assertNotEqual(old, text)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(old)
+        ok, msgs = patch.ensure_npc_pause_engine_support(self.tmp)
+        self.assertTrue(ok)
+        with open(path, encoding="utf-8") as f:
+            text2 = f.read()
+        self.assertIn("if (!gPlayerAvatar.preventStep)", text2)
+        self.assertEqual(text2.count("PORYSUITE-NPCPAUSE pause-step begin"), 1)
+        self.assertTrue(any("upgraded" in m for m in msgs))
+
     def test_vanilla_project_with_no_field_player_file_skips_patch(self):
         # Absolute vanilla case: no field_player_avatar.c at all
         # (extremely cut-down test project).  Installer must succeed

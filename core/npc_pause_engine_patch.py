@@ -161,28 +161,39 @@ _PAUSE_BLOCK = (
     "    // stopped the frame the player moves out of the way.  The player-side\n"
     "    // FreeStepNpcX/YBlocked (field_player_avatar.c) handles the reverse\n"
     "    // direction (player walking INTO a moving NPC).\n"
+    "    //\n"
+    "    // GATE (gPlayerAvatar.preventStep): only pause during FREE-ROAM.  During\n"
+    "    // a locked/scripted sequence (lockall/lock sets preventStep) the player\n"
+    "    // cannot move, so this feature is both pointless and HARMFUL: NpcTakeStep\n"
+    "    // is the same step path a scripted `applymovement` uses, so pausing here\n"
+    "    // stalls a cutscene NPC's scripted walk forever -- `waitmovement` never\n"
+    "    // returns and the game freezes (e.g. Bill's Sea Cottage teleporter, where\n"
+    "    // the locked player stands on the NPC's exit path).\n"
     "    {\n"
-    "        s16 playerTileX = (gPlayerAvatar.pixelX + 8) >> 4;\n"
-    "        s16 playerTileY = (gPlayerAvatar.pixelY + 8) >> 4;\n"
-    "        u8  selfSprIdx  = (u8)(sprite - gSprites);\n"
     "        bool8 paused = FALSE;\n"
-    "        u8  i;\n"
-    "        for (i = 0; i < OBJECT_EVENTS_COUNT; i++)\n"
+    "        if (!gPlayerAvatar.preventStep)\n"
     "        {\n"
-    "            struct ObjectEvent *npcObj = &gObjectEvents[i];\n"
-    "            if (npcObj->active && !npcObj->isPlayer && npcObj->spriteId == selfSprIdx)\n"
+    "            s16 playerTileX = (gPlayerAvatar.pixelX + 8) >> 4;\n"
+    "            s16 playerTileY = (gPlayerAvatar.pixelY + 8) >> 4;\n"
+    "            u8  selfSprIdx  = (u8)(sprite - gSprites);\n"
+    "            u8  i;\n"
+    "            for (i = 0; i < OBJECT_EVENTS_COUNT; i++)\n"
     "            {\n"
-    "                if (playerTileX == npcObj->currentCoords.x\n"
-    "                 && playerTileY == npcObj->currentCoords.y)\n"
+    "                struct ObjectEvent *npcObj = &gObjectEvents[i];\n"
+    "                if (npcObj->active && !npcObj->isPlayer && npcObj->spriteId == selfSprIdx)\n"
     "                {\n"
-    "                    paused = TRUE;\n"
+    "                    if (playerTileX == npcObj->currentCoords.x\n"
+    "                     && playerTileY == npcObj->currentCoords.y)\n"
+    "                    {\n"
+    "                        paused = TRUE;\n"
+    "                    }\n"
+    "                    else if (gObjectEventFootprints[npcObj->graphicsId] != NULL\n"
+    "                          && ObjectEventFootprintHitsTile(npcObj, playerTileX, playerTileY))\n"
+    "                    {\n"
+    "                        paused = TRUE;\n"
+    "                    }\n"
+    "                    break;\n"
     "                }\n"
-    "                else if (gObjectEventFootprints[npcObj->graphicsId] != NULL\n"
-    "                      && ObjectEventFootprintHitsTile(npcObj, playerTileX, playerTileY))\n"
-    "                {\n"
-    "                    paused = TRUE;\n"
-    "                }\n"
-    "                break;\n"
     "            }\n"
     "        }\n"
     "        if (paused)\n"
@@ -474,7 +485,22 @@ def _patch_npctakestep(project_root: str) -> str:
         text = f.read()
 
     if _INSTALL_SENTINEL in text:
-        return ""  # already installed
+        # Already installed — but it may be an OLDER version of the block.
+        # Replace the sentinel-fenced region with the current _PAUSE_BLOCK so
+        # re-running UPGRADES it (self-healing). This is how the cutscene-freeze
+        # fix — the gPlayerAvatar.preventStep gate — reaches projects that
+        # already had the un-gated block installed.
+        import re as _re
+        _fence = _re.compile(
+            r"[ \t]*// PORYSUITE-NPCPAUSE pause-step begin.*?"
+            r"// PORYSUITE-NPCPAUSE pause-step end[ \t]*\n[ \t]*\n",
+            _re.DOTALL)
+        new_text, n = _fence.subn(lambda _m: _PAUSE_BLOCK, text, count=1)
+        if n and new_text != text:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new_text)
+            return f"upgraded NpcTakeStep pause block in {_MOVEMENT_C_REL}"
+        return ""  # already current
 
     if _LEGACY_STEP213_BLOCK in text:
         # Replace the user's legacy hand-edit with the sentinel-fenced
