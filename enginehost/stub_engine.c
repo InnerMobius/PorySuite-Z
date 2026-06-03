@@ -53,11 +53,17 @@ u32 gTransformedPersonalities[MAX_BATTLERS_COUNT];
 u8 gEffectBattler;
 u8 gHealthboxSpriteIds[MAX_BATTLERS_COUNT];
 
-/* Per-species coord tables (GetBattlerSpriteCoord reads .y_offset). Zeroed for
- * now → coords default to the base sBattlerCoords; the driver can fill in real
- * per-species values via the API. NUM_SPECIES sizing keeps indexing in-bounds. */
-const struct MonCoords gMonFrontPicCoords[NUM_SPECIES + 1];
-const struct MonCoords gMonBackPicCoords[NUM_SPECIES + 1];
+/* Per-species coord tables. The .size byte (width:4 hi, height:4 lo, ×8) drives
+ * GetBattlerSpriteCoordAttr's LEFT/RIGHT/TOP/BOTTOM = X±width/2, Y±height/2.
+ * Zeroed → every edge collapses to the mon's centre, so effects positioned by
+ * the mon's bounding box (Foresight's magnifier scanning the target, Metronome's
+ * finger beside the head, many others) barely move. Default every species to a
+ * full 64×64 box (size 0x88) so those bounds spread correctly. y_offset stays 0
+ * so it doesn't shift the base coords. */
+const struct MonCoords gMonFrontPicCoords[NUM_SPECIES + 1] = {
+    [0 ... NUM_SPECIES] = { .size = 0x88, .y_offset = 0 } };
+const struct MonCoords gMonBackPicCoords[NUM_SPECIES + 1] = {
+    [0 ... NUM_SPECIES] = { .size = 0x88, .y_offset = 0 } };
 const u8 gEnemyMonElevation[NUM_SPECIES] = {0};
 
 /* Tables we never traverse in the motion path (we drive createsprite via API,
