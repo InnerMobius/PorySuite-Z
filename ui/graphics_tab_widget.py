@@ -409,6 +409,14 @@ class BattleScenePreview(QWidget):
         # rotation (use the fx scale/offset path). Pivots at the feet.
         self._front_aff = None
         self._back_aff = None
+        # Mon CLONES (Double Team after-images, Quick Attack trail, Minimize, the
+        # MetallicShine copy). Each is the ATTACKER's mon pic drawn faded at an
+        # OFFSET from the mon's base — through the SAME planting path as the real
+        # mon (incl. _back_y_off), so the hip cut stays hidden behind the textbox
+        # exactly as it is for the mon. List of (off_x, off_y, hflip, vflip) in
+        # canvas px relative to the mon's base centre. Empty = none.
+        self._front_clones: list = []
+        self._back_clones: list = []
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -573,13 +581,31 @@ class BattleScenePreview(QWidget):
             self._back_aff = aff
         self.update()
 
+    def set_mon_clones(self, which: str, clones: list) -> None:
+        """Set the attacker's mon CLONES (Double Team after-images etc.).
+        ``clones`` is a list of (off_x, off_y, hflip, vflip) offsets in canvas
+        px from the mon's base centre; drawn faded through the SAME planted path
+        as the real mon, so the hip cut hides behind the textbox identically.
+        ``which`` is the attacker side ("back"/"front"). [] clears."""
+        clones = list(clones)
+        if which == "front":
+            if clones == self._front_clones:
+                return
+            self._front_clones = clones
+        else:
+            if clones == self._back_clones:
+                return
+            self._back_clones = clones
+        self.update()
+
     def reset_mon_transforms(self) -> None:
         """Restore both mons to their untransformed, visible draw (end of play)."""
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
                    or self._back_fx != (0, 0, 1.0, 1.0)
                    or not self._front_visible or not self._back_visible
                    or self._front_sink is not None or self._back_sink is not None
-                   or self._front_aff is not None or self._back_aff is not None)
+                   or self._front_aff is not None or self._back_aff is not None
+                   or self._front_clones or self._back_clones)
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
         self._front_visible = True
@@ -588,6 +614,8 @@ class BattleScenePreview(QWidget):
         self._back_sink = None
         self._front_aff = None
         self._back_aff = None
+        self._front_clones = []
+        self._back_clones = []
         if changed:
             self.update()
 
@@ -711,6 +739,35 @@ class BattleScenePreview(QWidget):
             sx = (self.ENEMY_CX - sw // 2) * s
             sy = (self.ENEMY_CY + 29 - sh // 2) * s
             p.drawPixmap(sx, sy, sw * s, sh * s, self._shadow)
+
+        # Mon CLONES (Double Team after-images, Quick Attack trail, Minimize,
+        # MetallicShine copy) — faded, BEHIND the mons and UNDER the textbox,
+        # drawn through the SAME planted path as the real mon (same base centre +
+        # y_offset) so the back sprite's hip cut stays hidden exactly as it does
+        # for the mon. Each offset is relative to the mon's base, in canvas px.
+        if self._back_clones or self._front_clones:
+            from PyQt6.QtGui import QTransform as _QT
+
+            def _draw_clones(pix, base_cx, base_cy, clones):
+                if pix is None or pix.isNull():
+                    return
+                cw, ch = pix.width(), pix.height()
+                for off_x, off_y, hf, vf in clones:
+                    cp = pix
+                    if hf or vf:
+                        cp = pix.transformed(_QT().scale(-1 if hf else 1,
+                                                         -1 if vf else 1))
+                    fl = base_cx - cw // 2 + off_x
+                    ft = base_cy - ch // 2 + off_y
+                    p.drawPixmap(fl * s, ft * s, cw * s, ch * s, cp)
+
+            p.setOpacity(0.45)
+            _draw_clones(self._back_pix, self.PLAYER_CX,
+                         self.PLAYER_CY + self._back_y_off, self._back_clones)
+            _draw_clones(self._front_pix, self.ENEMY_CX,
+                         self.ENEMY_CY + self._front_y_off - self._enemy_elevation,
+                         self._front_clones)
+            p.setOpacity(1.0)
 
         # Enemy (front) sprite — pokefirered draws the 64x64 frame
         # CENTERED on sBattlerCoords, plus y_offset pushes it DOWN,

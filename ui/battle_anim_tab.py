@@ -1987,33 +1987,26 @@ class BattleAnimTab(QWidget):
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)
 
+        # Mon CLONES (Double Team after-images, Quick Attack trail, Minimize,
+        # MetallicShine copy): the engine flags copies of the attacker's mon
+        # (isClone). They must be drawn through the SAME planted mon path as the
+        # real mon (set_mon_clones) — NOT centred on the effect canvas, which
+        # ignores the mon's _y_off seating and lifts the back sprite's hip cut
+        # into view. Offset each clone from the mon's engine BASE so the preview
+        # maps it exactly like the mon: engine (72,80)/(176,40) ≡ the mon's
+        # drawn centre (matches driver.c engine_reset), motion maps 1:1.
+        atk_side = "back" if self._play_direction == "player" else "front"
+        base_x, base_y = (72, 80) if atk_side == "back" else (176, 40)
+        P.set_mon_clones(atk_side, [
+            (s["x"] + s["x2"] - base_x, s["y"] + s["y2"] - base_y,
+             bool(s["hFlip"]), bool(s["vFlip"]))
+            for s in frame if s.get("isClone") and not s.get("invisible")])
+
         # Effect sprites → canvas (lower subpriority drawn on top).
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
         try:
-            # Mon CLONES (Double Team after-images, …): the engine flags copies
-            # of the attacker's mon that carry no gfx of their own (isClone).
-            # Draw the attacker's mon pic at each clone's coords, faded — they're
-            # palette-blended toward black in-game. Same GBA-coord canvas the
-            # effect sprites use, so a clone aligns with the real mon's position.
-            clones = [s for s in frame if s.get("isClone")]
-            if clones:
-                cpix = getattr(P, "_back_pix" if self._play_direction == "player"
-                               else "_front_pix", None)
-                if cpix is not None and not cpix.isNull():
-                    painter.setOpacity(0.45)
-                    for s in clones:
-                        pix = cpix
-                        if s["hFlip"] or s["vFlip"]:
-                            from PyQt6.QtGui import QTransform as _QT
-                            pix = pix.transformed(_QT().scale(
-                                -1 if s["hFlip"] else 1,
-                                -1 if s["vFlip"] else 1))
-                        rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
-                        painter.drawPixmap(int(rx - pix.width() // 2),
-                                           int(ry - pix.height() // 2), pix)
-                    painter.setOpacity(1.0)
             # Effect sprites: script-created (host template index) OR TASK-
             # spawned (no index, but a real ANIM_TAG_* tileTag — Hail, Sandstorm).
             effects = [s for s in frame
