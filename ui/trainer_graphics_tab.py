@@ -190,14 +190,27 @@ class _AddTrainerPicDialog(QDialog):
         self.setMinimumWidth(520)
         self._project_root = project_root
         self._png_path = ""
+        # Populated when the user picks a non-indexed PNG and runs it
+        # through the manual indexer. When set, the caller writes this
+        # remapped QImage to a temp PNG and passes THAT to the registry
+        # (instead of copying the original RGB source — which the
+        # registry would reject for not being indexed). Both fields are
+        # None when the picked PNG was already in project format.
+        self._remapped_img: Optional[QImage] = None
+        self._remapped_palette: Optional[List[Color]] = None
 
         outer = QVBoxLayout(self)
         outer.setSpacing(10)
 
         intro = QLabel(
-            "Register a new trainer pic by picking an indexed PNG. The\n"
-            "PNG, palette, INCBIN entries, table rows, and constant define\n"
-            "are all wired up automatically — no hand-editing of C source.")
+            "Register a new trainer pic by picking a PNG. If the PNG is\n"
+            "already indexed with ≤16 colours it's used as-is; if it's\n"
+            "RGB or has too many colours the manual palette picker opens\n"
+            "so you can choose / order 16 colours and the image is\n"
+            "remapped to them — same flow the Overworld editor uses.\n"
+            "The PNG, palette, INCBIN entries, table rows, and constant\n"
+            "define are then all wired up automatically — no hand-editing\n"
+            "of C source.")
         intro.setStyleSheet("color: #aaa; font-size: 11px;")
         intro.setWordWrap(True)
         outer.addWidget(intro)
@@ -293,19 +306,42 @@ class _AddTrainerPicDialog(QDialog):
         if not path:
             return
 
-        # Validate it's indexed before accepting.
         img = QImage(path)
         if img.isNull():
             QMessageBox.warning(
                 self, "Invalid PNG", f"Could not load:\n{path}")
             return
-        if img.format() != QImage.Format.Format_Indexed8:
-            QMessageBox.warning(
-                self, "Not Indexed",
-                "The PNG must be 8-bit indexed (palette mode) with up to "
-                "16 colours.\nOpen it in GIMP → Image → Mode → Indexed "
-                "with 16 colours, then export and try again.")
-            return
+
+        # Reset any prior remap state — picking a new file invalidates it.
+        self._remapped_img = None
+        self._remapped_palette = None
+
+        # An indexed PNG with ≤16 distinct colour-table entries is
+        # already in project format → accept as-is. Anything else (RGB,
+        # RGBA, or indexed with too many colours) routes through the
+        # shared manual palette picker so the user can choose / order
+        # the 16 GBA colours and the source is remapped to them. Same
+        # flow the Overworld editor uses for its "Import Manually…"
+        # button — no PNG is rejected outright.
+        ct = (img.colorTable()
+              if img.format() == QImage.Format.Format_Indexed8 else [])
+        if (img.format() == QImage.Format.Format_Indexed8
+                and ct and len(set(ct)) <= 16):
+            pass  # Indexed-and-small — accept the original path directly.
+        else:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
+            )
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self,
+            )
+            if result is None:
+                # User cancelled the picker — don't accept the PNG,
+                # leave the dialog fields untouched.
+                return
+            palette, remapped = result
+            self._remapped_img = remapped
+            self._remapped_palette = list(palette)
 
         self._png_path = path
         self._png_edit.setText(path)
@@ -329,6 +365,15 @@ class _AddTrainerPicDialog(QDialog):
             "base_name": self._base_edit.text().strip(),
             "coord_size": self._size_spin.value(),
             "coord_y_offset": self._yoff_spin.value(),
+            # When the user picked a non-indexed PNG and ran it through
+            # the manual indexer, the dialog stashes the remapped QImage
+            # + chosen palette here. The Add handler writes the QImage
+            # to a temp PNG (via export_indexed_png) and passes THAT
+            # to the registry — preserving the user's manual slot order
+            # in the on-disk file. Both fields are None for the common
+            # case where the source PNG was already project-format.
+            "remapped_img": self._remapped_img,
+            "remapped_palette": self._remapped_palette,
         }
 
 
@@ -997,16 +1042,56 @@ class TrainerGraphicsTab(QWidget):
                 "Base filename cannot be empty.")
             return
 
+        # When the dialog routed the source PNG through the manual
+        # indexer, write the remapped indexed QImage to a temp PNG and
+        # hand THAT to the registry. Otherwise the registry would copy
+        # the user's original RGB / over-16-colour source and the on-disk
+        # PNG wouldn't match the palette + slot order they just picked.
+        # We clean up the temp file once the registry call returns,
+        # whether it succeeded or not — the registry has already done
+        # its own copy by then.
+        import tempfile
         from core.trainer_pic_registry import add_trainer_pic
-        result = add_trainer_pic(
-            project_root=self._project_root,
-            source_png_path=v["png_path"],
-            constant=v["constant"],
-            symbol=v["symbol"],
-            base_name=v["base_name"],
-            coord_size=v["coord_size"],
-            coord_y_offset=v["coord_y_offset"],
-        )
+        source_png_for_registry = v["png_path"]
+        temp_png_to_cleanup = ""
+        if v["remapped_img"] is not None and v["remapped_palette"]:
+            fd, temp_path = tempfile.mkstemp(
+                suffix=".png", prefix="porysuite_trainer_add_")
+            os.close(fd)
+            ok = export_indexed_png(
+                v["remapped_img"], v["remapped_palette"], temp_path,
+                transparent_index=0,
+            )
+            if not ok:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                QMessageBox.critical(
+                    self, "Add Trainer Pic Failed",
+                    "Could not save the remapped image to a temporary "
+                    "file. Disk full or the temp folder is read-only?")
+                return
+            source_png_for_registry = temp_path
+            temp_png_to_cleanup = temp_path
+
+        try:
+            result = add_trainer_pic(
+                project_root=self._project_root,
+                source_png_path=source_png_for_registry,
+                constant=v["constant"],
+                symbol=v["symbol"],
+                base_name=v["base_name"],
+                coord_size=v["coord_size"],
+                coord_y_offset=v["coord_y_offset"],
+            )
+        finally:
+            if temp_png_to_cleanup:
+                try:
+                    os.remove(temp_png_to_cleanup)
+                except OSError:
+                    pass  # Best-effort cleanup — temp dir gets swept anyway.
+
         if not result.success:
             QMessageBox.critical(
                 self, "Add Trainer Pic Failed", result.error)

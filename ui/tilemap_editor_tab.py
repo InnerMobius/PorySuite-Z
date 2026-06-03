@@ -977,16 +977,22 @@ class TilemapEditorTab(QWidget):
         self._btn_autofix.clicked.connect(self._on_autofix_palettes)
         tb.addWidget(self._btn_autofix)
 
-        self._btn_apply_pal = QPushButton("Apply Palette to PNG…")
+        self._btn_apply_pal = QPushButton("Bake Palette into External PNG…")
         self._btn_apply_pal.setToolTip(
-            "Take an external PNG (e.g. the original artwork you made "
-            "this tilemap from) and bake the editor's current palette "
-            "into its color table. If the PNG is already indexed, "
-            "pixel indices are kept exactly — only the color table "
-            "changes, so your art stays pixel-perfect. If it's RGB, "
-            "pixels are remapped to the nearest colour in the current "
-            "palette (lossy). Resulting PNG opens in GIMP with the "
-            "right colours."
+            "NOTE: To save palette edits for the CURRENT tilemap, just "
+            "press 'Save' — palette changes are written back to the "
+            ".pal file(s) and baked into the tile sheet PNG automatically.\n\n"
+            "This button is for a DIFFERENT workflow: take an unrelated "
+            "external PNG (e.g. the original artwork you made this "
+            "tilemap from) and bake the editor's current palette into "
+            "its color table, then save as a new PNG.\n\n"
+            "Step 1 opens a file picker so you can choose which external "
+            "PNG to recolour. Step 2 asks where to save the recoloured "
+            "copy (the original is never modified).\n\n"
+            "If the PNG is already indexed, pixel indices are kept "
+            "exactly — only the color table changes, so pixel-art stays "
+            "pixel-perfect. If it's RGB, pixels are remapped to the "
+            "nearest colour in the current palette (lossy)."
         )
         self._btn_apply_pal.setEnabled(False)
         self._btn_apply_pal.clicked.connect(self._on_apply_palette_to_png)
@@ -1688,7 +1694,7 @@ class TilemapEditorTab(QWidget):
         """
         if not self._palettes or self._palettes.palette_count() == 0:
             QMessageBox.warning(
-                self, "Apply Palette to PNG",
+                self, "Bake Palette into External PNG",
                 "No palette loaded — open a tilemap first or import a "
                 ".pal so there's a palette to apply.")
             return
@@ -1713,9 +1719,14 @@ class TilemapEditorTab(QWidget):
         out_pal = list(flat[:n_colors])
 
         # Pick source PNG.
+        # NOTE: the system "Open" button on the dialog is misleading —
+        # we're not loading a palette FROM the PNG, we're choosing which
+        # external PNG to RECOLOUR with the editor's current palette.
+        # The dialog title spells this out so users don't think they're
+        # picking a source-of-truth.
         start_dir = self._last_open_dir or self._project_dir or ""
         src_path, _ = QFileDialog.getOpenFileName(
-            self, "Apply palette to which PNG?",
+            self, "Step 1 of 2 — Choose external PNG to recolour with current palette",
             start_dir,
             "PNG Images (*.png);;All files (*)",
         )
@@ -1726,7 +1737,7 @@ class TilemapEditorTab(QWidget):
         src = QImage(src_path)
         if src.isNull():
             QMessageBox.warning(
-                self, "Apply Palette to PNG",
+                self, "Bake Palette into External PNG",
                 f"Couldn't read the PNG:\n{src_path}")
             return
 
@@ -1743,7 +1754,7 @@ class TilemapEditorTab(QWidget):
                 indexed = remap_to_palette(src, out_pal, dither=False)
             except Exception as exc:
                 QMessageBox.warning(
-                    self, "Apply Palette to PNG",
+                    self, "Bake Palette into External PNG",
                     f"Remap failed:\n{exc}")
                 return
             mode_label = "pixels remapped to nearest palette colour"
@@ -1754,7 +1765,7 @@ class TilemapEditorTab(QWidget):
         base, ext = _os.path.splitext(src_path)
         suggest = f"{base}_palette.png"
         dst_path, _ = QFileDialog.getSaveFileName(
-            self, "Save with current palette as…",
+            self, "Step 2 of 2 — Save recoloured PNG as…",
             suggest,
             "PNG Images (*.png);;All files (*)",
         )
@@ -1768,18 +1779,19 @@ class TilemapEditorTab(QWidget):
                                     transparent_index=-1)
         except Exception as exc:
             QMessageBox.warning(
-                self, "Apply Palette to PNG", f"Save failed:\n{exc}")
+                self, "Bake Palette into External PNG",
+                f"Save failed:\n{exc}")
             return
         if not ok:
             QMessageBox.warning(
-                self, "Apply Palette to PNG",
+                self, "Bake Palette into External PNG",
                 "Save refused — the resulting image wasn't indexed. "
                 "This is a safety check (RGB PNGs break the gbagfx "
                 "build step).")
             return
 
         QMessageBox.information(
-            self, "Apply Palette to PNG",
+            self, "Bake Palette into External PNG",
             f"Wrote <code>{_os.path.basename(dst_path)}</code> "
             f"with {len(out_pal)} colour entries.<br>"
             f"<small>{mode_label}</small><br><br>"
