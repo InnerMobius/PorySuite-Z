@@ -1841,19 +1841,20 @@ class BattleAnimTab(QWidget):
             # Mon hide (Dig / Fly disappear).
             P.set_mon_visible(which, not s["invisible"])
             if s["affineMode"] != 0:
-                # A mon affine should be a CLEAN SCALE (grow / shrink / squeeze),
-                # never rotation/shear. A broken GrowAndShrink matrix (8-vs-6 cmd
-                # stride) has nonzero mB/mC or wild components AND a garbage
-                # y-offset — that's the Bulk Up "freak out and appear low". Reject
-                # anything that isn't a sane pure scale; keep the mon put.
-                mA, mB, mC, mD = s["mA"], s["mB"], s["mC"], s["mD"]
-                if (mB != 0 or mC != 0
-                        or not (32 <= abs(mA) <= 2048)
-                        or not (32 <= abs(mD) <= 2048)):
-                    P.set_mon_transform(which, 0, 0, 1.0, 1.0)
-                    continue
-                P.set_mon_transform(which, s["x2"], s["y2"],
-                                    256.0 / abs(mA), 256.0 / abs(mD))
+                # GrowAndShrink's scale data is wobbly in this project (its affine
+                # cmd table is read with an 8-byte stride but the struct is 6
+                # bytes). Rejecting it killed the grow entirely; applying it raw
+                # let the mon explode + jump to centre. Middle ground: apply the
+                # scale CLAMPED to a sane range so the mon visibly stretches
+                # without exploding, and clamp the displacement so it doesn't jump
+                # to centre. Clean scales (Bind's squeeze) pass through unchanged.
+                mA = s["mA"] or 256
+                mD = s["mD"] or 256
+                sx = max(0.4, min(2.5, 256.0 / abs(mA)))
+                sy = max(0.4, min(2.5, 256.0 / abs(mD)))
+                dx = max(-20, min(20, s["x2"]))
+                dy = max(-20, min(20, s["y2"]))
+                P.set_mon_transform(which, dx, dy, sx, sy)
             else:
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)
