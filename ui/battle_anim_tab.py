@@ -278,6 +278,7 @@ class BattleAnimTab(QWidget):
         self._play_wait = 0        # ticks remaining on the current delay
         self._play_tick = 0
         self._last_sound_tick = -100   # throttle rapid/overlapping sound previews
+        self._last_sound_se = ""       # last SE fired (suppress immediate repeats)
         self._play_layers: list = []   # [tag, cx, cy, subpri, frame_idx]
         self._anim_sim = None          # core.battle_anim_vm.AnimSim during playback
         self._wait_visual = False      # blocking on waitforvisualfinish?
@@ -1648,6 +1649,7 @@ class BattleAnimTab(QWidget):
         self._play_wait = 0
         self._play_tick = 0
         self._last_sound_tick = -100   # reset throttle so replays play sound
+        self._last_sound_se = ""
         self._pending_task_wait = 0    # createvisualtask duration owed to waitforvisualfinish
         self._wait_visual = False
         self._visual_wait = 0
@@ -1668,7 +1670,13 @@ class BattleAnimTab(QWidget):
         self._play_timer.start()
 
     def _stop_play_move(self):
-        """Stop playback and reset the button label."""
+        """Stop playback and CLEAR the effect overlay.
+
+        When a move's animation ends, the scene must return to just the mons
+        (like in-game) — not freeze on the last frame with every sprite still
+        on screen.  The static through-row composite is only for manual
+        inspection (it reappears when the user clicks a timeline row); it must
+        NOT be the end-of-playback state."""
         was_playing = self._playing
         self._play_timer.stop()
         self._playing = False
@@ -1676,12 +1684,11 @@ class BattleAnimTab(QWidget):
         self._anim_sim = None
         self._wait_visual = False
         self._tl_play_move_btn.setText("▶  Play Move")
-        # Reset preview back to the static composite for the current row.
-        # Guard against re-entrancy from the composite touching widgets.
         if was_playing:
             _log.debug("playback stopped at idx=%s tick=%s",
                        self._play_idx, self._play_tick)
-        self._update_move_composite()
+        # Clear the effect sprites; the mons (front/back pixmaps) stay.
+        self._move_preview.set_anim_pixmap(None)
 
     def hideEvent(self, ev):
         """Stop the playback timer whenever the tab is hidden (project
@@ -1724,13 +1731,21 @@ class BattleAnimTab(QWidget):
             self._in_play_step = False
 
     def _fire_play_sound(self, se: str):
-        """Fire a timeline sound during playback, throttled + guarded so a
-        burst of sounds can't overwhelm / crash the audio backend."""
+        """Fire a timeline sound during playback, HARD-throttled so a beam of
+        repeated effects (Bubble Beam fires SE_M_BUBBLE ~24×) can't flood the
+        Sound Editor's audio backend — the cause of the heavy lag (and a
+        likely contributor to hard crashes).  We rate-limit overall AND
+        suppress immediate repeats of the same effect; the preview only needs
+        to convey the sound, not replay it for every particle."""
         if _preview_sound_cb is None or not se:
             return
-        if self._play_tick - self._last_sound_tick < 3:
-            return   # throttle overlapping previews (~20/sec max)
-        self._last_sound_tick = self._play_tick
+        now = self._play_tick
+        if now - self._last_sound_tick < 10:
+            return                              # global rate cap (~6/sec)
+        if se == self._last_sound_se and now - self._last_sound_tick < 40:
+            return                              # don't re-trigger the same SE
+        self._last_sound_tick = now
+        self._last_sound_se = se
         try:
             _preview_sound_cb(se)
         except Exception:
@@ -2023,11 +2038,18 @@ class BattleAnimTab(QWidget):
             return (arch, (0, 0), (0, 0), 0, False, False)
         if arch in (MOTION_LINEAR_TO_TARGET, MOTION_ARC_TO_TARGET):
             start = (atk[0] + xdir * (arg(0) + ex), atk[1] + arg(1) + ey)
-            end = (tgt[0] + xdir * arg(2), tgt[1] + arg(3))
-            # arg4 is the travel duration when the callback follows the
-            # standard layout; many projectiles (Bullet Seed: "20, 0") omit
-            # it, so default to a real travel time instead of 1 frame —
-            # otherwise the sprite teleports to the target and flickers.
+            # arg2/arg3 are the end offset ONLY when the callback follows the
+            # standard layout (small values, like Ember's -16/24).  Some
+            # callbacks put a SPEED or duration there (Confuse Ray bounce:
+            # arg2=288), which would fling the sprite off-screen — a value
+            # too big to be a pixel offset isn't one, so treat it as the
+            # plain target.  Keeps real offsets, fixes the rest.
+            e2 = arg(2) if abs(arg(2)) <= 48 else 0
+            e3 = arg(3) if abs(arg(3)) <= 48 else 0
+            end = (tgt[0] + xdir * e2, tgt[1] + e3)
+            # arg4 is the travel duration when present; projectiles that omit
+            # it (Bullet Seed: "20, 0") default to a real travel time instead
+            # of 1 frame — else the sprite teleports to the target + flickers.
             dur = arg(4) if arg(4) > 1 else 24
             return (arch, start, end, dur, True, player_attacks)
         if arch == MOTION_ON_MON_POS:
