@@ -699,6 +699,10 @@ class BattleAnimTab(QWidget):
             get_audio_player().set_project_root(project_root)
         except Exception:
             pass
+        # Numeric ANIM_TAG_* value → name, so TASK-spawned sprites (Hail,
+        # Sandstorm, …) — which carry only the numeric tileTag, no host template
+        # index — can be mapped to their gfx and rendered.
+        self._tag_by_value = self._parse_tag_values(project_root)
 
         # In-memory reset.
         self._palettes.clear()
@@ -1986,13 +1990,21 @@ class BattleAnimTab(QWidget):
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
         try:
+            # Effect sprites: script-created (host template index) OR TASK-
+            # spawned (no index, but a real ANIM_TAG_* tileTag — Hail, Sandstorm).
             effects = [s for s in frame
-                       if s.get("isMon", -1) == -1 and s.get("templateIndex", -1) >= 0]
+                       if s.get("isMon", -1) == -1
+                       and (s.get("templateIndex", -1) >= 0
+                            or s.get("tileTag", -1) >= 10000)]
             for s in sorted(effects, key=lambda s: -s["subpriority"]):
                 if s["invisible"]:
                     continue
-                name = eng.template_name(s["templateIndex"]) if eng else None
+                ti = s.get("templateIndex", -1)
+                name = eng.template_name(ti) if (eng and ti >= 0) else None
                 tag = self._template_tags.get(name, "") if name else ""
+                if not tag:                       # task-spawned → map by tileTag
+                    tag = getattr(self, "_tag_by_value", {}).get(
+                        s.get("tileTag", -1), "")
                 frames = self._play_frame_cache.get(tag)
                 if frames:
                     fw, fh = self._frame_sizes.get(tag, (0, 0))
@@ -2753,6 +2765,25 @@ class BattleAnimTab(QWidget):
     def _mon_const(slug: str) -> str:
         """Folder slug → SPECIES_ const (charizard → SPECIES_CHARIZARD)."""
         return ("SPECIES_" + slug.replace("-", "_").upper()) if slug else ""
+
+    @staticmethod
+    def _parse_tag_values(root: str) -> Dict[int, str]:
+        """{numeric ANIM_TAG_* value: name} from constants/battle_anim.h, so a
+        sprite's runtime tileTag (a number) maps back to a gfx tag name."""
+        out: Dict[int, str] = {}
+        try:
+            import re
+            p = os.path.join(root, "include", "constants", "battle_anim.h")
+            txt = open(p, encoding="utf-8", errors="replace").read()
+            m = re.search(r"#define\s+ANIM_SPRITES_START\s+(\d+)", txt)
+            base = int(m.group(1)) if m else 10000
+            for mm in re.finditer(
+                    r"#define\s+(ANIM_TAG_\w+)\s*\(\s*ANIM_SPRITES_START\s*\+\s*(\d+)\s*\)",
+                    txt):
+                out[base + int(mm.group(2))] = mm.group(1)
+        except Exception:
+            pass
+        return out
 
     def _cry_species_const(self, target: bool = False) -> str:
         """SPECIES_ const of the mon whose cry a cry-move should play. The

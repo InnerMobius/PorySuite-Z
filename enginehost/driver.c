@@ -53,6 +53,9 @@ struct Snap {
     int invisible;
     int templateIndex;   /* host index, or -1 */
     int isMon;           /* battler index if a mon sprite, else -1 */
+    int tileTag;         /* sprite->template->tileTag (ANIM_TAG_*), or -1 —
+                          * lets the renderer map TASK-spawned sprites (Hail,
+                          * Sandstorm, …) to their gfx even with no host index. */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
@@ -194,6 +197,7 @@ int engine_snapshot(void)
         o->invisible = s->invisible;
         o->templateIndex = sSpriteTpl[i];
         o->isMon = sIsMonSprite(i);
+        o->tileTag = s->template ? (int)s->template->tileTag : -1;
     }
     return n;
 }
