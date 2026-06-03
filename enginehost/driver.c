@@ -56,6 +56,10 @@ struct Snap {
     int tileTag;         /* sprite->template->tileTag (ANIM_TAG_*), or -1 —
                           * lets the renderer map TASK-spawned sprites (Hail,
                           * Sandstorm, …) to their gfx even with no host index. */
+    int isClone;         /* 1 if this is a CloneBattlerSpriteWithBlend copy of a
+                          * mon (Double Team after-images, …): same dummy mon
+                          * template but NOT a battler holder, so the renderer
+                          * draws the attacker's mon pic here, faded. */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
@@ -65,6 +69,14 @@ void engine_reset(int attackerIsPlayer)
     int i;
     ResetSpriteData();
     ResetTasks();
+    /* Initialize the sprite-palette allocator. AllocSpritePalette finds a free
+     * slot by scanning sSpritePaletteTags for TAG_NONE (0xFFFF); on fresh BSS
+     * that table is all 0x0000, so NO slot reads as free and it returns 0xFF —
+     * then OBJ_PLTT_ID(0xFF) indexes far past gPlttBuffer and the write TRAPS.
+     * Any move that dynamically allocates a sprite palette (Double Team's
+     * after-images, etc.) hit this. FreeAllSpritePalettes sets every slot to
+     * TAG_NONE so allocation works. Project-agnostic engine fix. */
+    FreeAllSpritePalettes();
     for (i = 0; i < MAX_SPRITES; i++)
         sSpriteTpl[i] = -1;
     for (i = 0; i < ANIM_ARGS_COUNT; i++)
@@ -223,6 +235,9 @@ int engine_snapshot(void)
         o->templateIndex = sSpriteTpl[i];
         o->isMon = sIsMonSprite(i);
         o->tileTag = s->template ? (int)s->template->tileTag : -1;
+        /* A clone is a copy of the mon's dummy template that is NOT one of the
+         * two battler holders (CloneBattlerSpriteWithBlend → Double Team etc.). */
+        o->isClone = (s->template == &sMonTemplate && o->isMon < 0) ? 1 : 0;
     }
     return n;
 }
