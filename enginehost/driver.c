@@ -212,6 +212,14 @@ int engine_bg_scroll(void)
     return ((gBattle_BG1_X & 0xFFFF) << 16) | (gBattle_BG1_Y & 0xFFFF);
 }
 
+/* BG2 scroll — the attacker's mon-on-BG layer for a player-side Dig-style sink
+ * uses BG2 (priority rank 2); the enemy side uses BG1 above. Packed (x<<16)|y. */
+__attribute__((export_name("engine_bg2_scroll")))
+int engine_bg2_scroll(void)
+{
+    return ((gBattle_BG2_X & 0xFFFF) << 16) | (gBattle_BG2_Y & 0xFFFF);
+}
+
 /* Diagnostic: how this build lays out the affine-anim cmd struct, vs the <<3
  * (8-byte) stride RunAffineAnimFromTaskData assumes. */
 extern int HostStubAffSizeof(void);   /* sizeof in stub_engine.c's TU (the wrap) */

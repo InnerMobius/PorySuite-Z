@@ -398,6 +398,12 @@ class BattleScenePreview(QWidget):
         # drawn normally. The Pokemon Graphics tab never sets these.
         self._front_visible = True
         self._back_visible = True
+        # Mon "sink" (Dig burrow): the engine hides the mon sprite and wiggles a
+        # BG layer it was copied onto. None = no sink; otherwise the number of
+        # pixels to descend, drawn clipped at the ground (feet) line so the mon
+        # bobs down into the hole. Overrides visibility while active.
+        self._front_sink = None
+        self._back_sink = None
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -528,17 +534,49 @@ class BattleScenePreview(QWidget):
             self._back_visible = visible
         self.update()
 
+    def set_mon_sink(self, which: str, descent) -> None:
+        """Dig burrow: ``descent`` pixels to drop the mon, drawn clipped at the
+        ground (feet) line so it bobs down into the hole. ``None`` clears the
+        sink. Active sink overrides normal visibility."""
+        descent = None if descent is None else int(descent)
+        if which == "front":
+            if self._front_sink == descent:
+                return
+            self._front_sink = descent
+        else:
+            if self._back_sink == descent:
+                return
+            self._back_sink = descent
+        self.update()
+
     def reset_mon_transforms(self) -> None:
         """Restore both mons to their untransformed, visible draw (end of play)."""
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
                    or self._back_fx != (0, 0, 1.0, 1.0)
-                   or not self._front_visible or not self._back_visible)
+                   or not self._front_visible or not self._back_visible
+                   or self._front_sink is not None or self._back_sink is not None)
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
         self._front_visible = True
         self._back_visible = True
+        self._front_sink = None
+        self._back_sink = None
         if changed:
             self.update()
+
+    def _paint_mon_sink(self, p, pix, frame_left, frame_top, descent, s) -> None:
+        """Draw a mon descending by ``descent`` px, clipped at its ground (feet)
+        line, so it sinks into the hole (Dig). The part below the feet line is
+        hidden (in the hole); as descent grows the mon vanishes head-last."""
+        if pix is None or pix.isNull():
+            return
+        abr = self._art_bottom_row(pix)
+        ground = frame_top + abr + 1          # canvas y of the feet line
+        p.save()
+        p.setClipRect(0, 0, self.CANVAS_W * s, int(round(ground * s)))
+        p.drawPixmap(frame_left * s, (frame_top + descent) * s,
+                     pix.width() * s, pix.height() * s, pix)
+        p.restore()
 
     def set_anim_pixmap(self, pix: Optional[QPixmap],
                         cx: Optional[int] = None,
@@ -621,24 +659,32 @@ class BattleScenePreview(QWidget):
         # Enemy (front) sprite — pokefirered draws the 64x64 frame
         # CENTERED on sBattlerCoords, plus y_offset pushes it DOWN,
         # minus enemy elevation pushes it UP.
-        if self._front_visible and self._front_pix and not self._front_pix.isNull():
+        if self._front_pix and not self._front_pix.isNull():
             fw = self._front_pix.width()
             fh = self._front_pix.height()
             frame_top = (self.ENEMY_CY - fh // 2
                          + self._front_y_off - self._enemy_elevation)
             frame_left = self.ENEMY_CX - fw // 2
-            self._draw_mon(p, self._front_pix, frame_left, frame_top,
-                           fw, fh, self._front_fx, s)
+            if self._front_sink is not None:
+                self._paint_mon_sink(p, self._front_pix, frame_left, frame_top,
+                                     self._front_sink, s)
+            elif self._front_visible:
+                self._draw_mon(p, self._front_pix, frame_left, frame_top,
+                               fw, fh, self._front_fx, s)
 
         # Player (back) sprite — same frame-center rule, back y_offset
         # pushes DOWN.
-        if self._back_visible and self._back_pix and not self._back_pix.isNull():
+        if self._back_pix and not self._back_pix.isNull():
             bw = self._back_pix.width()
             bh = self._back_pix.height()
             frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off)
             frame_left = self.PLAYER_CX - bw // 2
-            self._draw_mon(p, self._back_pix, frame_left, frame_top,
-                           bw, bh, self._back_fx, s)
+            if self._back_sink is not None:
+                self._paint_mon_sink(p, self._back_pix, frame_left, frame_top,
+                                     self._back_sink, s)
+            elif self._back_visible:
+                self._draw_mon(p, self._back_pix, frame_left, frame_top,
+                               bw, bh, self._back_fx, s)
 
         # Battle-animation sprite overlay (Battle Anims tab) — frame
         # CENTERED on (_anim_cx, _anim_cy), above the mons, below the

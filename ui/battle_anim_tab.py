@@ -1817,6 +1817,30 @@ class BattleAnimTab(QWidget):
         inv, ok = oam.inverted()
         return inv if ok else None
 
+    def _mon_sink_descent(self, which, invisible):
+        """Pixels the attacker mon should descend this frame for a Dig-style
+        burrow, or None. The mon must be the ATTACKER and currently hidden, and
+        its BG layer (player→BG2, enemy→BG1, per GetBattlerSpriteBGPriorityRank)
+        must be scrolled negative — that's the engine wiggling the mon-on-BG down
+        into the hole. descent = -BGy (BGy goes negative as the mon sinks)."""
+        if not invisible:
+            return None
+        if self._play_direction == "player":
+            if which != "back":
+                return None
+            scroll = getattr(self, "_engine_bg2scroll", None)
+        else:
+            if which != "front":
+                return None
+            scroll = getattr(self, "_engine_bgscroll", None)
+        idx = self._engine_idx
+        if scroll and 0 <= idx < len(scroll):
+            y = scroll[idx][1]
+            ys = y - 65536 if y >= 32768 else y     # signed
+            if ys < 0:
+                return -ys                           # descend downward
+        return None
+
     def _render_engine_frame(self, frame):
         """Draw one engine OAM snapshot into the preview: transform the mons
         (shake / sway / squeeze / lunge) and composite the effect sprites at
@@ -1838,8 +1862,17 @@ class BattleAnimTab(QWidget):
             which = mon_side.get(s.get("isMon", -1))
             if which is None:
                 continue
-            # Mon hide (Dig / Fly disappear).
-            P.set_mon_visible(which, not s["invisible"])
+            # Dig-style burrow: the engine HIDES the attacker's mon sprite and
+            # wiggles a BG layer the mon was copied onto (monbg + DigDownMovement)
+            # — so a plain hide loses the sink. If this is the attacker and its
+            # BG layer is scrolling, render the mon descending into the hole.
+            sink = self._mon_sink_descent(which, bool(s["invisible"]))
+            if sink is not None:
+                P.set_mon_sink(which, sink)
+            else:
+                P.set_mon_sink(which, None)
+                # Mon hide (Dig / Fly disappear).
+                P.set_mon_visible(which, not s["invisible"])
             if s["affineMode"] != 0:
                 # Mon affine = a clean scale (grow / shrink / squeeze). The host
                 # engine now reads the affine-cmd table correctly (ABI-correct
@@ -1957,6 +1990,7 @@ class BattleAnimTab(QWidget):
             self._engine_sounds = []
             self._engine_sound_ptr = 0
             self._engine_bgscroll = []
+            self._engine_bg2scroll = []
             bg_id = self._detect_move_bg(timeline)
             self._engine_bg_pix = self._load_bg_pixmap(bg_id) if bg_id else None
             try:
@@ -1964,7 +1998,8 @@ class BattleAnimTab(QWidget):
                 self._engine_frames = engine.play_timeline(
                     ops, attacker_is_player=(self._play_direction == "player"),
                     sounds_out=self._engine_sounds,
-                    bgscroll_out=self._engine_bgscroll)
+                    bgscroll_out=self._engine_bgscroll,
+                    bg2scroll_out=self._engine_bg2scroll)
             except Exception:
                 _log.exception("engine play_timeline failed; falling back to VM")
                 self._engine_frames = []

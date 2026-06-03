@@ -151,7 +151,8 @@ class AnimEngine:
     def play_timeline(self, ops: List[dict], attacker_is_player: bool = True,
                       max_frames: int = 600, wait_cap: int = 240,
                       sounds_out: Optional[list] = None,
-                      bgscroll_out: Optional[list] = None) -> List[List[dict]]:
+                      bgscroll_out: Optional[list] = None,
+                      bg2scroll_out: Optional[list] = None) -> List[List[dict]]:
         """Run a whole move and return one OAM snapshot per GBA frame.
 
         ``ops`` is the move's resolved commands as plain dicts (the tab builds
@@ -196,6 +197,12 @@ class AnimEngine:
                         bgscroll_out.append(((v >> 16) & 0xFFFF, v & 0xFFFF))
                     except Exception:
                         bgscroll_out.append((0, 0))
+                if bg2scroll_out is not None and not dead[0]:
+                    try:
+                        v = ex["engine_bg2_scroll"](store)
+                        bg2scroll_out.append(((v >> 16) & 0xFFFF, v & 0xFFFF))
+                    except Exception:
+                        bg2scroll_out.append((0, 0))
 
         def _busy():
             r = _safe(ex["engine_busy"])
