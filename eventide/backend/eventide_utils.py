@@ -353,7 +353,14 @@ def write_text_inc(texts: dict, path: Path):
             escaped = text.replace("\n\n", "\\p").replace("\n", "\\n")
             escaped = escaped.replace('"', '\\"')
             lines.append(f"{label}::\n")
-            lines.append(f"    .string \"{escaped}\"\n\n")
+            # Emit ONE .string per display line (split after each \n / \p), to
+            # match pokefirered's own formatting. Writing the whole block as a
+            # single collapsed .string reformatted EVERY label, so a one-label
+            # edit churned the entire map's text.inc in git (spurious diffs).
+            segs = re.findall(r'.*?\\[np]|.+', escaped) or [escaped]
+            for seg in segs:
+                lines.append(f"    .string \"{seg}\"\n")
+            lines.append("\n")
     with path.open('w', encoding='utf-8', newline='\n') as fh:
         fh.writelines(lines)
 
