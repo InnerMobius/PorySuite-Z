@@ -246,6 +246,46 @@ def test_confusion_duck_orbits_and_destroys():
     assert not s.alive          # gone after ~90 frames
 
 
+def test_sleep_letter_z_rises_and_drifts_then_dies():
+    # Status_Sleep: gSleepLetterZSpriteTemplate args = [4, -10, 16, 0, 0]
+    ctx = _ctx(args=[4, -10, 16, 0, 0])
+    s = vm.spawn("AnimSleepLetterZ", ctx, tag="ANIM_TAG_LETTER_Z")
+    assert s is not None
+    ys, xs = [], []
+    for _ in range(60):
+        if not s.alive:
+            break
+        s.step(ctx)
+        ys.append(s.render_y)
+        xs.append(s.render_x)
+    # Floated up (later y well above the start) and drifted sideways.
+    assert ys[-1] < ys[0] - 5, (ys[0], ys[-1])
+    assert max(xs) - min(xs) >= 3, xs
+    for _ in range(20):
+        if not s.alive:
+            break
+        s.step(ctx)
+    assert not s.alive          # fades after ~60 frames
+
+
+def test_flying_sand_crescent_streams_across_and_dies():
+    # Sandstorm: args = [y=10, xspeed=2304, yspeed=96, side=0]
+    ctx = _ctx(args=[10, 2304, 96, 0])
+    s = vm.spawn("AnimFlyingSandCrescent", ctx, tag="ANIM_TAG_FLYING_DIRT")
+    assert s is not None
+    # Starts OFF-SCREEN to the left (not parked on the mon's face).
+    assert s.x == -64, s.x
+    xs = [s.render_x]
+    for _ in range(60):
+        if not s.alive:
+            break
+        s.step(ctx)
+        xs.append(s.render_x)
+    # Travelled rightward across the whole screen, then destroyed off-screen.
+    assert xs[-1] > xs[0] + 200, (xs[0], xs[-1])
+    assert not s.alive
+
+
 def test_gba_cos():
     assert vm.gba_cos(0, 8) == 8          # cos(0) = 1 → +amplitude
     assert vm.gba_cos(64, 8) == 0         # cos(90°) = 0

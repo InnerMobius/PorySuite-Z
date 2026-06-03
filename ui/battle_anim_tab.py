@@ -82,6 +82,9 @@ from core.battle_anim_vm import (
     new_sprite as vm_new_sprite, setup_static as vm_setup_static,
     setup_linear as vm_setup_linear, setup_arc as vm_setup_arc,
     SIDE_PLAYER, SIDE_OPPONENT)
+from core.battle_anim_tasks import (
+    MonTaskSim, TaskCtx, ATTACKER as TASK_ATTACKER, TARGET as TASK_TARGET,
+    is_mon_task, is_mon_mover_template)
 from core.sprite_render import load_sprite_pixmap
 from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_BATTLE_ANIM
 from core.overworld_palette_io import write_palette_pair
@@ -286,6 +289,7 @@ class BattleAnimTab(QWidget):
         self._last_sound_se = ""       # last SE fired (suppress immediate repeats)
         self._play_layers: list = []   # [tag, cx, cy, subpri, frame_idx]
         self._anim_sim = None          # core.battle_anim_vm.AnimSim during playback
+        self._mon_task_sim = None      # core.battle_anim_tasks.MonTaskSim (mon shake/sway/squeeze)
         self._wait_visual = False      # blocking on waitforvisualfinish?
         self._play_frame_cache: Dict[str, List[QPixmap]] = {}  # pre-baked at start
         self._play_flip_cache: Dict[str, List[QPixmap]] = {}   # H-flipped frames, baked once
@@ -1723,9 +1727,14 @@ class BattleAnimTab(QWidget):
         enemy = Battler(P.ENEMY_CX, P.ENEMY_CY, SIDE_OPPONENT)
         if self._play_direction == "player":
             ctx = AnimContext(attacker=player, target=enemy)
+            task_ctx = TaskCtx(attacker_side=SIDE_PLAYER, target_side=SIDE_OPPONENT)
         else:
             ctx = AnimContext(attacker=enemy, target=player)
+            task_ctx = TaskCtx(attacker_side=SIDE_OPPONENT, target_side=SIDE_PLAYER)
         self._anim_sim = AnimSim(ctx)
+        # Mon-acting tasks (shake / sway / squeeze) transform the drawn mons.
+        self._mon_task_sim = MonTaskSim(task_ctx)
+        self._move_preview.reset_mon_transforms()
         self._tl_play_move_btn.setText("⏹  Stop")
         # Process the first batch of commands immediately.
         self._play_step()
@@ -1744,7 +1753,9 @@ class BattleAnimTab(QWidget):
         self._playing = False
         self._play_layers = []
         self._anim_sim = None
+        self._mon_task_sim = None
         self._wait_visual = False
+        self._move_preview.reset_mon_transforms()   # mons back to normal
         self._tl_play_move_btn.setText("▶  Play Move")
         if was_playing:
             _log.debug("PLAY END '%s': stopped idx=%s tick=%s peak-sprites-drawn=%s",
@@ -1824,6 +1835,8 @@ class BattleAnimTab(QWidget):
 
         self._play_tick += 1
         self._anim_sim.step()           # move/age every live sprite one frame
+        if self._mon_task_sim is not None:
+            self._mon_task_sim.step()   # advance mon shake/sway/squeeze tasks
 
         # Mid fixed-delay: just keep simulating.
         if self._play_wait > 0:
@@ -1839,7 +1852,9 @@ class BattleAnimTab(QWidget):
         # frames, so they don't hold it long regardless.
         if self._wait_visual:
             self._visual_wait += 1
-            still_busy = self._anim_sim.active() or self._pending_task_wait > 0
+            still_busy = (self._anim_sim.active() or self._pending_task_wait > 0
+                          or (self._mon_task_sim is not None
+                              and self._mon_task_sim.active()))
             if still_busy and self._visual_wait < 120:
                 self._pending_task_wait = max(0, self._pending_task_wait - 1)
                 return
@@ -1884,6 +1899,7 @@ class BattleAnimTab(QWidget):
                 return
 
             if cmd.name in ("createvisualtask", "createsoundtask"):
+                self._spawn_play_task(cmd)
                 self._pending_task_wait = max(self._pending_task_wait, 16)
                 continue
 
@@ -1896,6 +1912,46 @@ class BattleAnimTab(QWidget):
         # Fell off the end without end/return — stop.
         self._stop_play_move()
 
+    def _spawn_play_task(self, cmd):
+        """Spawn a ``createvisualtask`` into the mon-task sim if it's a modelled
+        mon-acting task (shake / sway / squeeze).  Non-mon tasks (palette
+        blends, BG scrolls, gfx loaders, sprite spawners) are ignored — they
+        either don't move a mon or their sprites come via ``createsprite``."""
+        if self._mon_task_sim is None:
+            return
+        vt = parse_createvisualtask(cmd)
+        if not vt or not is_mon_task(vt.addr):
+            return
+        args = [self._int_or(a) for a in vt.args]
+        self._mon_task_sim.spawn(vt.addr, args)
+        _log.debug("mon-task spawn: %s args=%s", vt.addr, args)
+
+    def _push_mon_transforms(self):
+        """Map the mon-task sim's per-battler transforms onto the preview's
+        front/back mons (direction-aware), and reset any mon with no active
+        task.  Called once per rendered tick."""
+        P = self._move_preview
+        if self._mon_task_sim is None:
+            P.reset_mon_transforms()
+            return
+        xf = self._mon_task_sim.transforms()
+        # attacker → its side's widget; target → the other.
+        if self._play_direction == "player":
+            side = {TASK_ATTACKER: "back", TASK_TARGET: "front"}
+        else:
+            side = {TASK_ATTACKER: "front", TASK_TARGET: "back"}
+        applied = {"front": False, "back": False}
+        for battler, fx in xf.items():
+            which = side.get(battler)
+            if which is None:
+                continue
+            P.set_mon_transform(which, fx.dx, fx.dy, fx.sx, fx.sy)
+            applied[which] = True
+        if not applied["front"]:
+            P.set_mon_transform("front", 0, 0, 1.0, 1.0)
+        if not applied["back"]:
+            P.set_mon_transform("back", 0, 0, 1.0, 1.0)
+
     def _spawn_play_sprite(self, cmd):
         """Spawn a createsprite into the running simulation (faithful motion
         via the VM; skips classified-invisible utility sprites)."""
@@ -1906,6 +1962,13 @@ class BattleAnimTab(QWidget):
             return
         cs = parse_createsprite(cmd)
         if not cs:
+            return
+        # Mon-mover dummy sprites (lunge / dip) move the MON, not a visible
+        # sprite — route them to the mon-task sim instead of spawning a sprite.
+        if is_mon_mover_template(cs.template) and self._mon_task_sim is not None:
+            args = [self._int_or(a) for a in cs.args]
+            self._mon_task_sim.spawn_mover(cs.template, args)
+            _log.debug("mon-mover spawn: %s args=%s", cs.template, args)
             return
         tag = self._template_tags.get(cs.template, "")
         if not tag:
@@ -2001,6 +2064,9 @@ class BattleAnimTab(QWidget):
         Each sprite draw is guarded so one bad frame can't abort the paint.
         Ordered by subpriority (lower on top)."""
         from PyQt6.QtGui import QPainter as _QPainter
+        # Mon-acting tasks (shake / sway / squeeze) transform the drawn mons,
+        # independent of whether any anim sprites exist (Bind has none).
+        self._push_mon_transforms()
         sim = self._anim_sim
         if sim is None or not sim.sprites:
             self._move_preview.set_anim_pixmap(None)

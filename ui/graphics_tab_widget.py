@@ -384,6 +384,13 @@ class BattleScenePreview(QWidget):
         self._enemy_elevation = 0
         self._show_shadow = True
 
+        # Per-mon transform (pixel offset + scale) for battle-anim mon-tasks
+        # (shake / sway / squeeze).  Identity by default — the Pokemon
+        # Graphics tab never touches these, so its rendering is unchanged.
+        # (dx, dy, sx, sy): offset in canvas px, scale as a display multiplier.
+        self._front_fx = (0, 0, 1.0, 1.0)
+        self._back_fx = (0, 0, 1.0, 1.0)
+
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
         # behaviour is unchanged).  Drawn frame-CENTERED on
@@ -435,6 +442,32 @@ class BattleScenePreview(QWidget):
         self._show_shadow = bool(show)
         self.update()
 
+    def set_mon_transform(self, which: str, dx: int = 0, dy: int = 0,
+                          sx: float = 1.0, sy: float = 1.0) -> None:
+        """Set a per-mon transform used by the Battle Anims tab to reproduce
+        mon-acting tasks (shake / sway / squeeze).  ``which`` is "front"
+        (enemy) or "back" (player).  Identity (0, 0, 1, 1) restores the
+        normal draw.  No-op repaint avoidance: only updates on change."""
+        fx = (int(dx), int(dy), float(sx), float(sy))
+        if which == "front":
+            if fx == self._front_fx:
+                return
+            self._front_fx = fx
+        else:
+            if fx == self._back_fx:
+                return
+            self._back_fx = fx
+        self.update()
+
+    def reset_mon_transforms(self) -> None:
+        """Restore both mons to their untransformed draw (end of playback)."""
+        changed = (self._front_fx != (0, 0, 1.0, 1.0)
+                   or self._back_fx != (0, 0, 1.0, 1.0))
+        self._front_fx = (0, 0, 1.0, 1.0)
+        self._back_fx = (0, 0, 1.0, 1.0)
+        if changed:
+            self.update()
+
     def set_anim_pixmap(self, pix: Optional[QPixmap],
                         cx: Optional[int] = None,
                         cy: Optional[int] = None) -> None:
@@ -447,6 +480,29 @@ class BattleScenePreview(QWidget):
         if cy is not None:
             self._anim_cy = int(cy)
         self.update()
+
+    @staticmethod
+    def _draw_mon(p, pix, frame_left, frame_top, fw, fh, fx, s):
+        """Draw a mon frame, applying a per-mon transform (offset + scale).
+
+        The identity transform (0, 0, 1, 1) takes the EXACT original draw path
+        so the Pokemon Graphics tab (which never sets a transform) is
+        pixel-identical.  A non-identity transform scales the frame about its
+        CENTER (the GBA OAM affine center) and shifts it by (dx, dy), matching
+        ``AnimTask_ScaleMonAndRestore`` / ``ShakeMon`` / ``SwayMon``."""
+        dx, dy, sx, sy = fx
+        if dx == 0 and dy == 0 and sx == 1.0 and sy == 1.0:
+            p.drawPixmap(frame_left * s, frame_top * s, fw * s, fh * s, pix)
+            return
+        # Scale about the frame centre, then offset.
+        cx = frame_left + fw / 2.0 + dx
+        cy = frame_top + fh / 2.0 + dy
+        new_w = fw * sx
+        new_h = fh * sy
+        left = (cx - new_w / 2.0) * s
+        top = (cy - new_h / 2.0) * s
+        p.drawPixmap(int(round(left)), int(round(top)),
+                     int(round(new_w * s)), int(round(new_h * s)), pix)
 
     # -- paint ---------------------------------------------------------------
     def paintEvent(self, event) -> None:
@@ -484,8 +540,8 @@ class BattleScenePreview(QWidget):
             frame_top = (self.ENEMY_CY - fh // 2
                          + self._front_y_off - self._enemy_elevation)
             frame_left = self.ENEMY_CX - fw // 2
-            p.drawPixmap(frame_left * s, frame_top * s,
-                         fw * s, fh * s, self._front_pix)
+            self._draw_mon(p, self._front_pix, frame_left, frame_top,
+                           fw, fh, self._front_fx, s)
 
         # Player (back) sprite — same frame-center rule, back y_offset
         # pushes DOWN.
@@ -494,8 +550,8 @@ class BattleScenePreview(QWidget):
             bh = self._back_pix.height()
             frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off)
             frame_left = self.PLAYER_CX - bw // 2
-            p.drawPixmap(frame_left * s, frame_top * s,
-                         bw * s, bh * s, self._back_pix)
+            self._draw_mon(p, self._back_pix, frame_left, frame_top,
+                           bw, bh, self._back_fx, s)
 
         # Battle-animation sprite overlay (Battle Anims tab) — frame
         # CENTERED on (_anim_cx, _anim_cy), above the mons, below the

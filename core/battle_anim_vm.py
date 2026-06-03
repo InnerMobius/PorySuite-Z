@@ -370,6 +370,68 @@ def _cb_confusion_duck_step(s: Sprite, ctx: AnimContext) -> None:
         s.alive = False
 
 
+def _cb_sleep_letter_z(s: Sprite, ctx: AnimContext) -> None:
+    """AnimSleepLetterZ: a "Z" spawned at the sleeping mon that floats up and
+    drifts to the side, accelerating, then fades after ~60 frames.  Player
+    side drifts right; enemy side drifts left (and the Z is mirrored)."""
+    s.x = ctx.attacker.x
+    s.y = ctx.attacker.y
+    if ctx.attacker.side == SIDE_PLAYER:
+        s.x += ctx.arg(0)
+        s.y += ctx.arg(1)
+        s.data[3] = 1
+    else:
+        s.x -= ctx.arg(0)
+        s.y += ctx.arg(1)
+        s.data[3] = -1
+        s.flip = True
+    s.callback = _cb_sleep_letter_z_step
+    s.callback(s, ctx)
+
+
+def _cb_sleep_letter_z_step(s: Sprite, ctx: AnimContext) -> None:
+    s.y2 = -(s.data[0] // 0x28)          # rises (data[0] grows → faster)
+    s.x2 = int(s.data[4] / 10)           # drifts sideways (C truncates toward 0)
+    s.data[4] += s.data[3] * 2
+    s.data[0] += s.data[1]
+    s.data[1] += 1
+    if s.data[1] > 60:
+        s.alive = False
+
+
+def _cb_flying_sand_crescent(s: Sprite, ctx: AnimContext) -> None:
+    """AnimFlyingSandCrescent (Sandstorm): a wide crescent of dirt that starts
+    off one side of the screen and streams across.  Without this it froze on
+    the mon as a static block.  arg0 = y, arg1 = x-speed (subpixel), arg2 =
+    y-speed, arg3 = side-relative start."""
+    if ctx.arg(3) != 0 and ctx.attacker.side != SIDE_PLAYER:
+        s.x = 304
+        s.data[1] = -ctx.arg(1)
+        s.data[5] = 1
+        s.flip = True
+    else:
+        s.x = -64
+        s.data[1] = ctx.arg(1)
+    s.y = ctx.arg(0)
+    s.data[2] = ctx.arg(2)
+    s.callback = _cb_flying_sand_crescent_step
+    s.callback(s, ctx)
+
+
+def _cb_flying_sand_crescent_step(s: Sprite, ctx: AnimContext) -> None:
+    s.data[3] += s.data[1]
+    s.data[4] += s.data[2]
+    s.x2 += s.data[3] >> 8
+    s.y2 += s.data[4] >> 8
+    s.data[3] &= 0xFF
+    s.data[4] &= 0xFF
+    if s.data[5] == 0:
+        if s.x + s.x2 > 240 + 32:
+            s.alive = False
+    elif s.x + s.x2 < -32:
+        s.alive = False
+
+
 # Registry: callback symbol → ported init function.
 CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "TranslateAnimSpriteToTargetMonLocation": _cb_translate_to_target,
@@ -380,6 +442,8 @@ CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "AnimBite": _cb_bite,
     "AnimConfuseRayBallSpiral": _cb_confuse_spiral,
     "AnimConfusionDuck": _cb_confusion_duck,
+    "AnimSleepLetterZ": _cb_sleep_letter_z,
+    "AnimFlyingSandCrescent": _cb_flying_sand_crescent,
 }
 
 
