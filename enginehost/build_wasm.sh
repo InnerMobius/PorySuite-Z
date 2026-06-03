@@ -30,7 +30,16 @@ python enginehost/gen_tables.py "$PROJ" "$OUT"
 SRC_PATHS=$(ls "$PROJ"/src/battle_anim*.c "$PROJ"/src/sprite.c "$PROJ"/src/task.c "$PROJ"/src/trig.c "$PROJ"/src/util.c)
 for path in $SRC_PATHS; do
   f=$(basename "$path" .c)
-  "$CLANG" -c $CFLAGS $PRE $INC "$path" -o "$OUT/$f.o"
+  EXTRA=""
+  # The project's RunAffineAnimFromTaskData hardcodes an 8-byte affine-cmd
+  # stride (`data[7] << 3`) — an agbcc-ABI assumption that reads garbage on
+  # clang's 6-byte union (Bulk Up etc.). Compile its definition under a renamed
+  # symbol so it's unused; stub_engine.c supplies an ABI-correct one that all
+  # callers link against. (--wrap fails to redirect at -O1.)
+  if [ "$f" = "battle_anim_mons" ]; then
+    EXTRA="-DRunAffineAnimFromTaskData=RunAffineAnimFromTaskData_ORIG"
+  fi
+  "$CLANG" -c $CFLAGS $EXTRA $PRE $INC "$path" -o "$OUT/$f.o"
 done
 for s in stub_engine stub_gfx_data driver; do
   "$CLANG" -c $CFLAGS $PRE $INC "enginehost/$s.c" -o "$OUT/$s.o"
@@ -41,7 +50,7 @@ done
 EXP="-Wl,--export=engine_reset,--export=engine_set_arg,--export=engine_create_sprite,\
 --export=engine_create_task,--export=engine_step,--export=engine_busy,\
 --export=engine_snapshot,--export=engine_snapshot_addr,--export=engine_snap_stride,\
---export=engine_bg_scroll"
+--export=engine_bg_scroll,--export=engine_dbg"
 "$CLANG" --target=wasm32-wasi -mexec-model=reactor $EXP "$OUT"/*.o -lm \
   -o "$OUT/anim_engine_reactor.wasm"
 

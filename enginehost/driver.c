@@ -206,6 +206,30 @@ int engine_bg_scroll(void)
     return ((gBattle_BG1_X & 0xFFFF) << 16) | (gBattle_BG1_Y & 0xFFFF);
 }
 
+/* Diagnostic: how this build lays out the affine-anim cmd struct, vs the <<3
+ * (8-byte) stride RunAffineAnimFromTaskData assumes. */
+extern int HostStubAffSizeof(void);   /* sizeof in stub_engine.c's TU (the wrap) */
+__attribute__((export_name("engine_dbg")))
+int engine_dbg(int what)
+{
+    static const union AffineAnimCmd probe[] = {
+        AFFINEANIMCMD_FRAME(-4, -5, 0, 12),
+        AFFINEANIMCMD_FRAME(0, 0, 0, 24),
+    };
+    if (what == 0) return (int)sizeof(union AffineAnimCmd);
+    if (what == 1) return (int)sizeof(struct AffineAnimFrameCmd);
+    if (what == 2) return (int)_Alignof(union AffineAnimCmd);
+    if (what == 3) return (int)((const char *)&probe[1] - (const char *)&probe[0]);
+    if (what == 4) return HostStubAffSizeof();
+    if (what == 5) {   /* read probe[1] via typed ptr: expect xScale=0,yScale=0,dur=24 */
+        const union AffineAnimCmd *c = &probe[0] + 1;
+        return ((c->frame.xScale & 0xFF))
+             | ((c->frame.yScale & 0xFF) << 8)
+             | ((c->frame.duration & 0xFF) << 16);
+    }
+    return 0;
+}
+
 __attribute__((export_name("engine_snap_stride")))
 int engine_snap_stride(void)
 {

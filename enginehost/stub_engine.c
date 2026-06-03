@@ -279,3 +279,89 @@ void FreeBallGfx(u8 b) { (void)b; }
 void LoadBallGfx(u8 b) { (void)b; }
 void SpriteCB_PlayerThrowInit(struct Sprite *s) { (void)s; }
 void SpriteCB_SetInvisible(struct Sprite *s) { if (s) s->invisible = TRUE; }
+
+/* --- ABI-correct RunAffineAnimFromTaskData ---------------------------------
+ * The decomp indexes the affine-anim command table with a HARDCODED 8-byte
+ * stride: `LoadPointerFromVars(...) + (task->data[7] << 3)`. That matches the
+ * GBA toolchain, which rounds `union AffineAnimCmd` up to 8 bytes; clang/wasm
+ * packs the same union to 6 bytes, so the index lands mid-struct and every
+ * GrowAndShrink-family move (Bulk Up, Swords Dance, Harden, ...) reads garbage
+ * scale data. The fault is ABI-specific, not in the game data — so we DON'T
+ * touch the project's source. Instead we reimplement this one function VERBATIM
+ * except the index uses TYPED pointer arithmetic, which strides by the real
+ * sizeof on whatever ABI we compile for. The build compiles the project's copy
+ * under the renamed symbol RunAffineAnimFromTaskData_ORIG (unused), so every
+ * caller (effects_2/3, psychic) links against THIS definition instead. (We use
+ * a compile-time rename, not -Wl,--wrap: at -O1 wasm-ld's --wrap fails to
+ * redirect these calls.) */
+bool8 RunAffineAnimFromTaskData(struct Task *task)
+{
+    const union AffineAnimCmd *cmd =
+        (const union AffineAnimCmd *)LoadPointerFromVars(task->data[13], task->data[14])
+        + task->data[7];
+    switch (cmd->type)
+    {
+    default:
+        if (!cmd->frame.duration)
+        {
+            task->data[10] = cmd->frame.xScale;
+            task->data[11] = cmd->frame.yScale;
+            task->data[12] = cmd->frame.rotation;
+            ++task->data[7];
+            ++cmd;
+        }
+        task->data[10] += cmd->frame.xScale;
+        task->data[11] += cmd->frame.yScale;
+        task->data[12] += cmd->frame.rotation;
+        SetSpriteRotScale(task->data[15], task->data[10], task->data[11], task->data[12]);
+        SetBattlerSpriteYOffsetFromYScale(task->data[15]);
+        if (++task->data[8] >= cmd->frame.duration)
+        {
+            task->data[8] = 0;
+            ++task->data[7];
+        }
+        break;
+    case AFFINEANIMCMDTYPE_JUMP:
+        task->data[7] = cmd->jump.target;
+        break;
+    case AFFINEANIMCMDTYPE_LOOP:
+        if (cmd->loop.count)
+        {
+            if (task->data[9])
+            {
+                if (!--task->data[9])
+                {
+                    ++task->data[7];
+                    break;
+                }
+            }
+            else
+            {
+                task->data[9] = cmd->loop.count;
+            }
+            if (!task->data[7])
+                break;
+            while (TRUE)
+            {
+                --task->data[7];
+                --cmd;
+                if (cmd->type == AFFINEANIMCMDTYPE_LOOP)
+                {
+                    ++task->data[7];
+                    return TRUE;
+                }
+                if (!task->data[7])
+                    return TRUE;
+            }
+        }
+        ++task->data[7];
+        break;
+    case AFFINEANIMCMDTYPE_END:
+        gSprites[task->data[15]].y2 = 0;
+        ResetSpriteRotScale(task->data[15]);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+int HostStubAffSizeof(void) { return (int)sizeof(union AffineAnimCmd); }

@@ -1841,20 +1841,15 @@ class BattleAnimTab(QWidget):
             # Mon hide (Dig / Fly disappear).
             P.set_mon_visible(which, not s["invisible"])
             if s["affineMode"] != 0:
-                # GrowAndShrink's scale data is wobbly in this project (its affine
-                # cmd table is read with an 8-byte stride but the struct is 6
-                # bytes). Rejecting it killed the grow entirely; applying it raw
-                # let the mon explode + jump to centre. Middle ground: apply the
-                # scale CLAMPED to a sane range so the mon visibly stretches
-                # without exploding, and clamp the displacement so it doesn't jump
-                # to centre. Clean scales (Bind's squeeze) pass through unchanged.
+                # Mon affine = a clean scale (grow / shrink / squeeze). The host
+                # engine now reads the affine-cmd table correctly (ABI-correct
+                # RunAffineAnimFromTaskData), so GrowAndShrink (Bulk Up, Swords
+                # Dance, ...) and ScaleMon (Bind) give real scale data — apply it
+                # directly with the engine's grounding y-offset.
                 mA = s["mA"] or 256
                 mD = s["mD"] or 256
-                sx = max(0.4, min(2.5, 256.0 / abs(mA)))
-                sy = max(0.4, min(2.5, 256.0 / abs(mD)))
-                dx = max(-20, min(20, s["x2"]))
-                dy = max(-20, min(20, s["y2"]))
-                P.set_mon_transform(which, dx, dy, sx, sy)
+                P.set_mon_transform(which, s["x2"], s["y2"],
+                                    256.0 / abs(mA), 256.0 / abs(mD))
             else:
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)
