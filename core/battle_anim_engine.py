@@ -149,7 +149,8 @@ class AnimEngine:
 
     # -- whole-move player ---------------------------------------------------
     def play_timeline(self, ops: List[dict], attacker_is_player: bool = True,
-                      max_frames: int = 600, wait_cap: int = 240) -> List[List[dict]]:
+                      max_frames: int = 600, wait_cap: int = 240,
+                      sounds_out: Optional[list] = None) -> List[List[dict]]:
         """Run a whole move and return one OAM snapshot per GBA frame.
 
         ``ops`` is the move's resolved commands as plain dicts (the tab builds
@@ -248,6 +249,9 @@ class AnimEngine:
                     if dead[0] or len(frames) >= max_frames:
                         break
                     _step()
+            elif k == "sound":
+                if sounds_out is not None and op.get("se"):
+                    sounds_out.append((len(frames), op["se"]))  # fires at this frame
             elif k in ("waitforvisualfinish", "waitsound"):
                 _run_until_idle(wait_cap)
             elif k in ("end", "return"):

@@ -306,6 +306,8 @@ class BattleAnimTab(QWidget):
         self._engine_play = False          # this playback is engine-driven
         self._engine_frames: list = []     # precomputed per-frame OAM snapshots
         self._engine_idx = 0               # current frame in _engine_frames
+        self._engine_sounds: list = []     # [(frame_idx, SE)] schedule for playback
+        self._engine_sound_ptr = 0         # next un-fired sound in _engine_sounds
 
         # Frame-cycle preview state.
         self._frames: List[QPixmap] = []
@@ -1723,6 +1725,9 @@ class BattleAnimTab(QWidget):
             elif c.name == "delay":
                 ops.append({"op": "delay",
                             "frames": self._int_or(c.args[0]) if c.args else 1})
+            elif getattr(c, "kind", None) == KIND_SOUND and c.args:
+                # Sound effect at this point in the timeline (playsewithpan etc).
+                ops.append({"op": "sound", "se": c.args[0]})
             elif c.name in ("waitforvisualfinish", "waitsound"):
                 ops.append({"op": "waitforvisualfinish"})
             elif c.name in ("end", "return"):
@@ -1885,10 +1890,13 @@ class BattleAnimTab(QWidget):
             except Exception:
                 pass
         if engine is not None:
+            self._engine_sounds = []
+            self._engine_sound_ptr = 0
             try:
                 ops = self._build_engine_ops(timeline)
                 self._engine_frames = engine.play_timeline(
-                    ops, attacker_is_player=(self._play_direction == "player"))
+                    ops, attacker_is_player=(self._play_direction == "player"),
+                    sounds_out=self._engine_sounds)
             except Exception:
                 _log.exception("engine play_timeline failed; falling back to VM")
                 self._engine_frames = []
@@ -1977,6 +1985,12 @@ class BattleAnimTab(QWidget):
                 if self._engine_idx == 0:
                     self._render_engine_frame(self._engine_frames[0])
                 self._engine_idx += frames
+                self._play_tick = self._engine_idx   # drive _fire_play_sound's throttle
+                # Fire any sounds scheduled up to the current frame.
+                while (self._engine_sound_ptr < len(self._engine_sounds)
+                       and self._engine_sounds[self._engine_sound_ptr][0] <= self._engine_idx):
+                    self._fire_play_sound(self._engine_sounds[self._engine_sound_ptr][1])
+                    self._engine_sound_ptr += 1
                 if self._engine_idx >= len(self._engine_frames):
                     self._stop_play_move()     # done — clears overlay (no freeze)
                 else:
