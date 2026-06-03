@@ -691,6 +691,14 @@ class BattleAnimTab(QWidget):
         self._grid_refresh_timer.stop()
         self._frame_timer.stop()
         self._project_root = project_root
+        # Cry moves play the selected mon's cry from sound/.../cries/<slug>.wav —
+        # make sure the shared cry player knows this project (the Pokemon tab
+        # sets it too, but the user may reach Battle Anims first).
+        try:
+            from ui.audio_player import get_audio_player
+            get_audio_player().set_project_root(project_root)
+        except Exception:
+            pass
 
         # In-memory reset.
         self._palettes.clear()
@@ -1954,19 +1962,21 @@ class BattleAnimTab(QWidget):
                 # Mon hide (Dig / Fly disappear).
                 P.set_mon_visible(which, not s["invisible"])
             if s["affineMode"] != 0:
-                # Mon affine = a clean scale (grow / shrink / squeeze). The host
-                # engine now reads the affine-cmd table correctly (ABI-correct
-                # RunAffineAnimFromTaskData), so GrowAndShrink (Bulk Up, Swords
-                # Dance, ...) and ScaleMon (Bind) give real scale data. Use
-                # ground=True so the mon scales up from its FEET (art bottom)
-                # rather than the frame centre — otherwise the grow lifts the
-                # sprite off the textbox and exposes its hard "hip" cut edge.
-                # (ground replaces the engine's grounding y2; x2 still applies.)
                 mA = s["mA"] or 256
                 mD = s["mD"] or 256
-                P.set_mon_transform(which, s["x2"], 0,
-                                    256.0 / abs(mA), 256.0 / abs(mD),
-                                    ground=True)
+                if s["mB"] == 0 and s["mC"] == 0:
+                    # Pure scale (grow / shrink / squeeze): Bulk Up, Bind, … Use
+                    # ground=True so the mon scales up from its FEET (art bottom)
+                    # rather than the frame centre — otherwise the grow lifts the
+                    # sprite off the textbox and exposes its hard "hip" cut edge.
+                    P.set_mon_transform(which, s["x2"], 0,
+                                        256.0 / abs(mA), 256.0 / abs(mD),
+                                        ground=True)
+                else:
+                    # Rotation (Horn Drill's bow TILT, …): scale-only can't show a
+                    # tilt, so render the full OAM matrix pivoted at the feet.
+                    P.set_mon_affine(which, s["mA"], s["mB"], s["mC"], s["mD"],
+                                     s["x2"])
             else:
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)

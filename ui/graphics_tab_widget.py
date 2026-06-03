@@ -404,6 +404,11 @@ class BattleScenePreview(QWidget):
         # bobs down into the hole. Overrides visibility while active.
         self._front_sink = None
         self._back_sink = None
+        # Full OAM affine matrix (mA,mB,mC,mD,dx) for a mon that ROTATES (Horn
+        # Drill's bow tilt, etc.) — scale-only can't show a tilt. None = no
+        # rotation (use the fx scale/offset path). Pivots at the feet.
+        self._front_aff = None
+        self._back_aff = None
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -549,20 +554,64 @@ class BattleScenePreview(QWidget):
             self._back_sink = descent
         self.update()
 
+    def set_mon_affine(self, which: str, mA: int, mB: int, mC: int, mD: int,
+                       dx: int = 0) -> None:
+        """Render a mon through its FULL OAM affine matrix (rotation + scale),
+        pivoted at the feet — for a mon that TILTS (Horn Drill's bow) which a
+        scale-only transform can't show. None clears it."""
+        aff = None if mA is None else (int(mA), int(mB), int(mC), int(mD), int(dx))
+        if which == "front":
+            if aff == self._front_aff:
+                return
+            self._front_aff = aff
+        else:
+            if aff == self._back_aff:
+                return
+            self._back_aff = aff
+        self.update()
+
     def reset_mon_transforms(self) -> None:
         """Restore both mons to their untransformed, visible draw (end of play)."""
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
                    or self._back_fx != (0, 0, 1.0, 1.0)
                    or not self._front_visible or not self._back_visible
-                   or self._front_sink is not None or self._back_sink is not None)
+                   or self._front_sink is not None or self._back_sink is not None
+                   or self._front_aff is not None or self._back_aff is not None)
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
         self._front_visible = True
         self._back_visible = True
         self._front_sink = None
         self._back_sink = None
+        self._front_aff = None
+        self._back_aff = None
         if changed:
             self.update()
+
+    def _paint_mon_affine(self, p, pix, frame_left, frame_top, fw, fh, aff, s):
+        """Draw a mon through its OAM affine matrix, pivoting at the feet (art
+        bottom centre) so a bow/tilt rotates about the ground, not the centre.
+        The OAM matrix maps screen→texture, so we draw with its inverse."""
+        from PyQt6.QtGui import QTransform
+        mA, mB, mC, mD, dx = aff
+        if any(abs(v) > 4096 for v in (mA, mB, mC, mD)):
+            p.drawPixmap(frame_left * s, frame_top * s, fw * s, fh * s, pix)
+            return
+        oam = QTransform(mA / 256.0, mC / 256.0, mB / 256.0, mD / 256.0, 0.0, 0.0)
+        inv, ok = oam.inverted()
+        if not ok:
+            p.drawPixmap(frame_left * s, frame_top * s, fw * s, fh * s, pix)
+            return
+        abr = self._art_bottom_row(pix)
+        feet_x = (frame_left + fw / 2.0 + dx) * s
+        feet_y = (frame_top + abr) * s
+        p.save()
+        p.translate(feet_x, feet_y)
+        p.setTransform(inv, True)
+        p.translate(-feet_x, -feet_y)
+        p.drawPixmap(int((frame_left + dx) * s), int(frame_top * s),
+                     int(fw * s), int(fh * s), pix)
+        p.restore()
 
     def _paint_mon_sink(self, p, pix, frame_left, frame_top, descent, s) -> None:
         """Draw a mon descending by ``descent`` px, clipped at its ground (feet)
@@ -668,6 +717,9 @@ class BattleScenePreview(QWidget):
             if self._front_sink is not None:
                 self._paint_mon_sink(p, self._front_pix, frame_left, frame_top,
                                      self._front_sink, s)
+            elif self._front_aff is not None:
+                self._paint_mon_affine(p, self._front_pix, frame_left, frame_top,
+                                       fw, fh, self._front_aff, s)
             elif self._front_visible:
                 self._draw_mon(p, self._front_pix, frame_left, frame_top,
                                fw, fh, self._front_fx, s)
@@ -682,6 +734,9 @@ class BattleScenePreview(QWidget):
             if self._back_sink is not None:
                 self._paint_mon_sink(p, self._back_pix, frame_left, frame_top,
                                      self._back_sink, s)
+            elif self._back_aff is not None:
+                self._paint_mon_affine(p, self._back_pix, frame_left, frame_top,
+                                       bw, bh, self._back_aff, s)
             elif self._back_visible:
                 self._draw_mon(p, self._back_pix, frame_left, frame_top,
                                bw, bh, self._back_fx, s)
