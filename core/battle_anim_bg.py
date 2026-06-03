@@ -83,6 +83,28 @@ _TASK_BG = {
         "image": "backgrounds/sandstorm_brew.4bpp",
         "pal": "sprites/flying_dirt.gbapal",
         "tmap": "backgrounds/sandstorm_brew.bin"},
+    # Haze + Mist Ball reuse the WEATHER fog tiles + default weather palette
+    # (under graphics/weather/, NOT battle_anims/ — hence the ../weather paths)
+    # with the battle-anim fog tilemap. Scrolls horizontally (BG1_X -= 1/frame).
+    "AnimTask_HazeScrollingFog": {
+        "image": "../weather/fog_horizontal.4bpp",
+        "pal": "../weather/default.gbapal",
+        "tmap": "backgrounds/fog.bin"},
+    "AnimTask_MistBallFog": {
+        "image": "../weather/fog_horizontal.4bpp",
+        "pal": "../weather/default.gbapal",
+        "tmap": "backgrounds/fog.bin"},
+    # Scary Face: a big face BG with a side-specific tilemap (player/opponent).
+    "AnimTask_ScaryFace": {
+        "image": "backgrounds/scary_face.4bpp",
+        "pal": "backgrounds/scary_face.gbapal",
+        "tmap_player": "backgrounds/scary_face_player.bin",
+        "tmap_opponent": "backgrounds/scary_face_opponent.bin"},
+    # Attract: the hearts background.
+    "AnimTask_HeartsBackground": {
+        "image": "backgrounds/attract.4bpp",
+        "pal": "backgrounds/attract.gbapal",
+        "tmap": "backgrounds/attract.bin"},
 }
 
 
