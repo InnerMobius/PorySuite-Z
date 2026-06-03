@@ -204,6 +204,31 @@ def test_bite_teeth_close_then_destroy_and_lower_jaw_flips():
     assert s2.y == lo.target.y + 32          # starts below target
 
 
+def test_confuse_ray_spiral_circles_and_destroys():
+    ctx = _ctx(args=[0, -16])
+    s = vm.spawn("AnimConfuseRayBallSpiral", ctx, tag="ANIM_TAG_YELLOW_BALL")
+    assert s is not None
+    xs = []
+    for _ in range(40):
+        if not s.alive:
+            break
+        s.step(ctx)
+        xs.append(s.render_x)
+    # x oscillates around the target by ~±32 (Sin) → wide spread = circling.
+    assert max(xs) - min(xs) > 30, xs
+    # Runs out after 61 frames.
+    for _ in range(80):
+        if not s.alive:
+            break
+        s.step(ctx)
+    assert not s.alive
+
+
+def test_gba_cos():
+    assert vm.gba_cos(0, 8) == 8          # cos(0) = 1 → +amplitude
+    assert vm.gba_cos(64, 8) == 0         # cos(90°) = 0
+
+
 def test_animsim_steps_and_prunes():
     ctx = _ctx()
     sim = vm.AnimSim(ctx)

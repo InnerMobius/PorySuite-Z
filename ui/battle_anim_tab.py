@@ -1892,8 +1892,6 @@ class BattleAnimTab(QWidget):
                 # H-flip: attacker-anchored sprites mirror when the attacker
                 # is on the player side (engine's side-dependent HFLIP).
                 sprite.flip = on_attacker and (self._play_direction == "player")
-            _log.debug("spawn OK: %s tag=%s cb=%s pos=(%s,%s) ported=%s",
-                       cs.template, tag, cb, sprite.x, sprite.y, vm_is_ported(cb))
             self._anim_sim.add(sprite)
 
     @staticmethod

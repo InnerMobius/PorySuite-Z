@@ -40,6 +40,11 @@ def gba_sin(index: int, amplitude: int) -> int:
     return int(round(amplitude * math.sin((index & 0xFF) * math.pi / 128.0)))
 
 
+def gba_cos(index: int, amplitude: int) -> int:
+    """pokefirered ``Cos(index, amplitude)`` — cosine = sine shifted 90°."""
+    return gba_sin(index + 64, amplitude)
+
+
 @dataclass
 class Battler:
     x: int
@@ -318,6 +323,29 @@ def _cb_bite_step2(s: Sprite, ctx: AnimContext) -> None:
         s.alive = False
 
 
+def _cb_confuse_spiral(s: Sprite, ctx: AnimContext) -> None:
+    """AnimConfuseRayBallSpiral: a ball created at the target that spirals
+    around it (Sin/Cos) while rising — the circling "ducks" of Confuse Ray."""
+    s.x = ctx.target.x + ctx.arg(0)
+    s.y = ctx.target.y + ctx.arg(1)
+    s.data[0] = 0
+    s.data[2] = 0
+    s.data[7] = 0
+    s.callback = _cb_confuse_spiral_step
+    s.callback(s, ctx)        # the engine runs it immediately on spawn
+
+
+def _cb_confuse_spiral_step(s: Sprite, ctx: AnimContext) -> None:
+    s.x2 = gba_sin(s.data[0], 32)
+    s.y2 = gba_cos(s.data[0], 8)
+    s.data[0] = (s.data[0] + 19) & 0xFF
+    s.data[2] += 80
+    s.y2 += s.data[2] >> 8
+    s.data[7] += 1
+    if s.data[7] >= 61:
+        s.alive = False
+
+
 # Registry: callback symbol → ported init function.
 CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "TranslateAnimSpriteToTargetMonLocation": _cb_translate_to_target,
@@ -326,6 +354,7 @@ CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "AnimCurseNail": _cb_curse_nail,
     "AnimGhostStatusSprite": _cb_ghost_status,
     "AnimBite": _cb_bite,
+    "AnimConfuseRayBallSpiral": _cb_confuse_spiral,
 }
 
 
