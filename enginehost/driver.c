@@ -79,6 +79,21 @@ void engine_reset(int attackerIsPlayer)
     /* Player mon at (72,80), enemy at (176,40). Attacker = player or enemy. */
     gBattlerSpriteIds[0] = CreateSprite(&sMonTemplate, 72, 80, 10);
     gBattlerSpriteIds[1] = CreateSprite(&sMonTemplate, 176, 40, 10);
+
+    /* Reserve a DEDICATED OAM matrix slot per battler. A mon's affine (bow tilt,
+     * grow, squeeze) uses healthBoxesData[battler].matrixNum; without reserving
+     * it the slot stays 0 and an effect sprite's AllocOamMatrix grabs slot 0
+     * too, so the mon reads the EFFECT's matrix — e.g. Horn Drill's mon shrank
+     * to the hit-splat's 0.5x scale. data[0] = battlerId, which
+     * PrepareBattlerSpriteForRotScale reads to pick the slot. */
+    for (i = 0; i < 2; i++)
+    {
+        u8 slot = AllocOamMatrix();
+        gSprites[gBattlerSpriteIds[i]].data[0] = i;
+        gBattleSpritesDataPtr->healthBoxesData[i].matrixNum =
+            (slot != 0xFF) ? slot : i;
+    }
+
     if (attackerIsPlayer) { gBattleAnimAttacker = 0; gBattleAnimTarget = 1; }
     else                  { gBattleAnimAttacker = 1; gBattleAnimTarget = 0; }
 }
