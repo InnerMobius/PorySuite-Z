@@ -634,6 +634,12 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
     live in a different label).
     """
     out: List[Command] = []
+    # Labels in FILE order, so a label that ends WITHOUT a terminator can fall
+    # through to the next one (assembly semantics) — e.g. Move_HORN_DRILL ends on
+    # a createvisualtask and continues into HornDrillContinue: where the actual
+    # sprites are. Without this, only the first label's commands resolve.
+    _keys = list(scripts.keys())
+    _next = {_keys[i]: _keys[i + 1] for i in range(len(_keys) - 1)}
 
     def _walk(lbl: str, depth: int, seen: frozenset):
         if depth > max_depth or lbl in seen or lbl not in scripts:
@@ -659,6 +665,14 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 pick = cmd.args[min(branch_choice, len(cmd.args) - 1)]
                 _walk(pick, depth + 1, seen2)
                 return  # follow the chosen branch (default = first)
+        # Reached the end of this label with no end/return/goto/branch → the
+        # script falls through into the next label in file order (continuation
+        # labels like HornDrillContinue). depth+1 marks it read-only in the
+        # editor (it lives in a different label) while still driving playback.
+        if inline_calls:
+            nxt = _next.get(lbl)
+            if nxt:
+                _walk(nxt, depth + 1, seen2)
 
     _walk(label, 0, frozenset())
     return out
