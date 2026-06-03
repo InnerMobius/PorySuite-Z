@@ -1844,12 +1844,16 @@ class BattleAnimTab(QWidget):
                 # Mon affine = a clean scale (grow / shrink / squeeze). The host
                 # engine now reads the affine-cmd table correctly (ABI-correct
                 # RunAffineAnimFromTaskData), so GrowAndShrink (Bulk Up, Swords
-                # Dance, ...) and ScaleMon (Bind) give real scale data — apply it
-                # directly with the engine's grounding y-offset.
+                # Dance, ...) and ScaleMon (Bind) give real scale data. Use
+                # ground=True so the mon scales up from its FEET (art bottom)
+                # rather than the frame centre — otherwise the grow lifts the
+                # sprite off the textbox and exposes its hard "hip" cut edge.
+                # (ground replaces the engine's grounding y2; x2 still applies.)
                 mA = s["mA"] or 256
                 mD = s["mD"] or 256
-                P.set_mon_transform(which, s["x2"], s["y2"],
-                                    256.0 / abs(mA), 256.0 / abs(mD))
+                P.set_mon_transform(which, s["x2"], 0,
+                                    256.0 / abs(mA), 256.0 / abs(mD),
+                                    ground=True)
             else:
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)

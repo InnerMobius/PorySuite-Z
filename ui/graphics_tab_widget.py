@@ -390,6 +390,10 @@ class BattleScenePreview(QWidget):
         # (dx, dy, sx, sy): offset in canvas px, scale as a display multiplier.
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
+        # Cache of each mon pixmap's lowest opaque row (its "feet" line), keyed
+        # by pixmap cacheKey, so a grounded scale (Bulk Up etc.) plants the art
+        # bottom instead of lifting it off the textbox.
+        self._art_bottom_cache: dict = {}
         # Mon visibility (battle-anim mon-hide: Dig / Fly disappear). True =
         # drawn normally. The Pokemon Graphics tab never sets these.
         self._front_visible = True
@@ -452,12 +456,46 @@ class BattleScenePreview(QWidget):
         self._show_shadow = bool(show)
         self.update()
 
+    def _art_bottom_row(self, pix: Optional[QPixmap]) -> int:
+        """Lowest opaque pixel row of a mon pixmap (its visible "feet" line).
+        Cached by cacheKey. Falls back to the frame bottom if fully opaque."""
+        if pix is None or pix.isNull():
+            return 0
+        key = pix.cacheKey()
+        cached = self._art_bottom_cache.get(key)
+        if cached is not None:
+            return cached
+        img = pix.toImage()
+        h, w = img.height(), img.width()
+        bottom = h - 1
+        for y in range(h - 1, -1, -1):
+            if any(img.pixelColor(x, y).alpha() > 0 for x in range(w)):
+                bottom = y
+                break
+        self._art_bottom_cache[key] = bottom
+        return bottom
+
     def set_mon_transform(self, which: str, dx: int = 0, dy: int = 0,
-                          sx: float = 1.0, sy: float = 1.0) -> None:
+                          sx: float = 1.0, sy: float = 1.0,
+                          ground: bool = False) -> None:
         """Set a per-mon transform used by the Battle Anims tab to reproduce
         mon-acting tasks (shake / sway / squeeze).  ``which`` is "front"
         (enemy) or "back" (player).  Identity (0, 0, 1, 1) restores the
-        normal draw.  No-op repaint avoidance: only updates on change."""
+        normal draw.  No-op repaint avoidance: only updates on change.
+
+        ``ground=True`` (mon grow/shrink — Bulk Up, Minimize, ...) plants the
+        art's BOTTOM edge so the mon scales up from its feet instead of about
+        the frame centre.  Without it, scaling about the centre lifts the art
+        bottom off the textbox and exposes the back sprite's hard "hip" cut
+        edge.  ``dy`` is then computed from the art bottom (the engine's
+        grounding y-offset is replaced); ``dx`` still applies."""
+        pix = self._back_pix if which != "front" else self._front_pix
+        if ground and pix is not None and (sx != 1.0 or sy != 1.0):
+            abr = self._art_bottom_row(pix)
+            fh = pix.height()
+            # dy that keeps row `abr` fixed when scaling about the frame centre:
+            #   dy = (1 - sy) * (abr - fh/2)
+            dy = int(round((1.0 - sy) * (abr - fh / 2.0)))
         fx = (int(dx), int(dy), float(sx), float(sy))
         if which == "front":
             if fx == self._front_fx:
