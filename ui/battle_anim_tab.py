@@ -1750,9 +1750,14 @@ class BattleAnimTab(QWidget):
         P = self._move_preview
         eng = self._anim_engine
 
-        # Mon transforms (direction-aware: attacker=0, target=1).
-        mon_side = ({0: "back", 1: "front"} if self._play_direction == "player"
-                    else {0: "front", 1: "back"})
+        # Mon transforms. The engine ALWAYS puts battler 0 at the back/player
+        # coords and battler 1 at the front/enemy coords (engine_reset fixes
+        # them there). The Player/Enemy toggle changes who ATTACKS (gBattleAnim
+        # Attacker/Target), not which sprite is where — so this mapping is fixed,
+        # NOT direction-dependent. (Swapping it by direction sent an attacker's
+        # shake to the wrong mon — e.g. the enemy's Destiny Bond shook the
+        # player.)
+        mon_side = {0: "back", 1: "front"}
         P.reset_mon_transforms()
         for s in frame:
             which = mon_side.get(s.get("isMon", -1))

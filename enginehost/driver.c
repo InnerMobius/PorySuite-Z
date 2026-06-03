@@ -172,7 +172,17 @@ int engine_snapshot(void)
             o->mA = m->a; o->mB = m->b; o->mC = m->c; o->mD = m->d;
         }
         else { o->mA = 256; o->mB = 0; o->mC = 0; o->mD = 256; }
-        o->hFlip = s->hFlip; o->vFlip = s->vFlip;
+        /* Flip: many callbacks flip by writing the bit straight into
+         * oam.matrixNum (ST_OAM_HFLIP/VFLIP) for NON-affine sprites, bypassing
+         * sprite->hFlip/vFlip. Read BOTH or facing is wrong for those (Curse
+         * nail, Foresight magnifier, ...). */
+        o->hFlip = s->hFlip;
+        o->vFlip = s->vFlip;
+        if (s->oam.affineMode == ST_OAM_AFFINE_OFF)
+        {
+            if (s->oam.matrixNum & ST_OAM_HFLIP) o->hFlip = 1;
+            if (s->oam.matrixNum & ST_OAM_VFLIP) o->vFlip = 1;
+        }
         o->priority = s->oam.priority; o->subpriority = s->subpriority;
         o->paletteNum = s->oam.paletteNum;
         o->invisible = s->invisible;
