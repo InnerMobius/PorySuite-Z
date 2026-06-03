@@ -160,9 +160,15 @@ int engine_snapshot(void)
         o = &sSnap[n++];
         o->id = i;
         o->x = s->x; o->y = s->y; o->x2 = s->x2; o->y2 = s->y2;
-        /* Frame-relative tile offset (raw tileNum is offset by the sheet base,
-         * which we never load). Python turns this into a PNG cell index. */
-        o->tileNum = (int)(u16)(s->oam.tileNum - s->sheetTileStart);
+        /* Frame-relative tile offset → Python turns this into a PNG cell index.
+         * OAM tileNum is a 10-bit field, so the offset is 10-bit too. We never
+         * load real VRAM, so sheetTileStart is often TAG_NONE (0xFFFF) for an
+         * un-loaded gfx tag; the anim system then bases oam.tileNum at
+         * (0xFFFF + frame) masked to 10 bits. Masking the difference to 0x3FF
+         * recovers the true frame offset in every case (loaded or not) — without
+         * it, a multi-part sprite like Dig's dirt mound mis-reads its left half
+         * (e.g. 1024 instead of 0) and both halves draw the same tile. */
+        o->tileNum = (int)((u16)(s->oam.tileNum - s->sheetTileStart) & 0x3FF);
         o->shape = s->oam.shape; o->size = s->oam.size;
         o->matrixNum = s->oam.matrixNum;
         o->affineMode = s->oam.affineMode;
