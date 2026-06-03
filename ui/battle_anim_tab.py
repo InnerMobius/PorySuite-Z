@@ -1742,6 +1742,25 @@ class BattleAnimTab(QWidget):
             return 1.0
         return 256.0 / a
 
+    @staticmethod
+    def _affine_transform(mA, mB, mC, mD):
+        """Full OAM affine matrix → a QTransform to draw the sprite with, so
+        flip (negative scale), scale, AND rotation all render faithfully (Bite's
+        flipped jaw, Crunch's rotated teeth, Fly's stretch). The OAM matrix maps
+        screen→texture, so we draw with its INVERSE. Returns None for identity
+        or a garbage matrix (residual GrowAndShrink: |component| huge) so a
+        broken affine can't explode the sprite."""
+        if mA == 256 and mB == 0 and mC == 0 and mD == 256:
+            return None                       # identity — draw as-is
+        if any(abs(v) > 4096 for v in (mA, mB, mC, mD)):
+            return None                       # garbage — ignore the affine
+        from PyQt6.QtGui import QTransform
+        # OAM (screen→texture): QTransform(m11,m12,m21,m22) maps (i,j)->
+        # ((mA i + mB j)/256, (mC i + mD j)/256). Drawing needs the inverse.
+        oam = QTransform(mA / 256.0, mC / 256.0, mB / 256.0, mD / 256.0, 0.0, 0.0)
+        inv, ok = oam.inverted()
+        return inv if ok else None
+
     def _render_engine_frame(self, frame):
         """Draw one engine OAM snapshot into the preview: transform the mons
         (shake / sway / squeeze / lunge) and composite the effect sprites at
@@ -1792,13 +1811,10 @@ class BattleAnimTab(QWidget):
                 pix = self._play_frame_pix(tag, fi, bool(s["hFlip"]), bool(s["vFlip"]))
                 if pix is None or pix.isNull():
                     continue
-                if s["affineMode"] != 0 and (s["mA"] != 256 or s["mD"] != 256):
-                    sx = self._oam_scale(s["mA"], True)
-                    sy = self._oam_scale(s["mD"], True)
-                    if sx != 1.0 or sy != 1.0:
-                        nw = max(1, int(round(pix.width() * sx)))
-                        nh = max(1, int(round(pix.height() * sy)))
-                        pix = pix.scaled(nw, nh)
+                if s["affineMode"] != 0:
+                    tf = self._affine_transform(s["mA"], s["mB"], s["mC"], s["mD"])
+                    if tf is not None:
+                        pix = pix.transformed(tf)   # flip + scale + rotation
                 rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
                 painter.drawPixmap(int(rx - pix.width() // 2),
                                    int(ry - pix.height() // 2), pix)
