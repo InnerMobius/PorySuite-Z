@@ -40,7 +40,8 @@ done
 # 3) link the reactor module (exported functions the Python driver calls).
 EXP="-Wl,--export=engine_reset,--export=engine_set_arg,--export=engine_create_sprite,\
 --export=engine_create_task,--export=engine_step,--export=engine_busy,\
---export=engine_snapshot,--export=engine_snapshot_addr,--export=engine_snap_stride"
+--export=engine_snapshot,--export=engine_snapshot_addr,--export=engine_snap_stride,\
+--export=engine_bg_scroll"
 "$CLANG" --target=wasm32-wasi -mexec-model=reactor $EXP "$OUT"/*.o -lm \
   -o "$OUT/anim_engine_reactor.wasm"
 

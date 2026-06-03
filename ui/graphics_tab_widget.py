@@ -402,6 +402,12 @@ class BattleScenePreview(QWidget):
         self._anim_pix: Optional[QPixmap] = None
         self._anim_cx = self.ENEMY_CX
         self._anim_cy = self.ENEMY_CY
+        # Battle-animation BACKGROUND (Surf/Cosmic/Sandstorm/...): a full-screen
+        # image drawn OVER the battle BG and BEHIND the mons, scrolled by
+        # (_anim_bg_x, _anim_bg_y). None = no anim background this move.
+        self._anim_bg: Optional[QPixmap] = None
+        self._anim_bg_x = 0
+        self._anim_bg_y = 0
 
         w = self.CANVAS_W * self.SCALE
         h = self.CANVAS_H * self.SCALE
@@ -461,6 +467,14 @@ class BattleScenePreview(QWidget):
             if fx == self._back_fx:
                 return
             self._back_fx = fx
+        self.update()
+
+    def set_anim_bg(self, pix: Optional[QPixmap], x: int = 0, y: int = 0) -> None:
+        """Set (or clear with None) the battle-animation background, scrolled to
+        (x, y). Drawn over the battle BG and behind the mons."""
+        self._anim_bg = pix
+        self._anim_bg_x = int(x)
+        self._anim_bg_y = int(y)
         self.update()
 
     def set_mon_visible(self, which: str, visible: bool) -> None:
@@ -537,6 +551,21 @@ class BattleScenePreview(QWidget):
             )
         else:
             p.fillRect(self.rect(), QColor(40, 40, 40))
+
+        # Battle-animation background (Surf/Cosmic/Sandstorm/...): drawn OVER
+        # the battle BG and BEHIND the mons, tiled with a scroll offset.
+        if self._anim_bg is not None and not self._anim_bg.isNull():
+            bw, bh = self._anim_bg.width(), self._anim_bg.height()
+            if bw > 0 and bh > 0:
+                ox = self._anim_bg_x % bw
+                oy = self._anim_bg_y % bh
+                yy = -oy
+                while yy < self.CANVAS_H:
+                    xx = -ox
+                    while xx < self.CANVAS_W:
+                        p.drawPixmap(xx * s, yy * s, bw * s, bh * s, self._anim_bg)
+                        xx += bw
+                    yy += bh
 
         # Shadow is created at (enemy_x, enemy_y + 29) per pokefirered
         # (src/battle_gfx_sfx_util.c :: LoadAndCreateEnemyShadowSprites).

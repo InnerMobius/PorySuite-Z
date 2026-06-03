@@ -308,6 +308,10 @@ class BattleAnimTab(QWidget):
         self._engine_idx = 0               # current frame in _engine_frames
         self._engine_sounds: list = []     # [(frame_idx, SE)] schedule for playback
         self._engine_sound_ptr = 0         # next un-fired sound in _engine_sounds
+        self._engine_bgscroll: list = []   # [(x,y)] BG scroll per frame
+        self._engine_bg_pix = None         # assembled anim-BG QPixmap for this move
+        self._bg_id_map = None             # BG id -> (img,pal,tilemap) paths (lazy)
+        self._bg_pix_cache: dict = {}      # BG id -> assembled QPixmap (cache)
 
         # Frame-cycle preview state.
         self._frames: List[QPixmap] = []
@@ -1734,6 +1738,43 @@ class BattleAnimTab(QWidget):
                 ops.append({"op": "end"})
         return ops
 
+    def _detect_move_bg(self, timeline):
+        """The move's animation background id (BG_COSMIC, …) from its first
+        fadetobg / changebg / fadetobgfromset, or None."""
+        for c in timeline:
+            if c.name in ("fadetobg", "changebg", "fadetobgfromset") and c.args:
+                return c.args[0].strip()
+        return None
+
+    def _load_bg_pixmap(self, bg_id: str):
+        """Assemble (and cache) the background image for a BG id."""
+        if bg_id in self._bg_pix_cache:
+            return self._bg_pix_cache[bg_id]
+        pix = None
+        try:
+            from core.battle_anim_bg import parse_bg_map, assemble_bg
+            if self._bg_id_map is None:
+                self._bg_id_map = parse_bg_map(self._project_root or "")
+            files = self._bg_id_map.get(bg_id)
+            if files:
+                pix = assemble_bg(*files)
+        except Exception:
+            _log.exception("anim BG assemble failed for %s", bg_id)
+            pix = None
+        self._bg_pix_cache[bg_id] = pix
+        return pix
+
+    def _set_engine_bg(self, idx: int):
+        """Push the anim background (scrolled to this frame) to the preview."""
+        if self._engine_bg_pix is None:
+            self._move_preview.set_anim_bg(None)
+            return
+        if 0 <= idx < len(self._engine_bgscroll):
+            sx, sy = self._engine_bgscroll[idx]
+        else:
+            sx, sy = 0, 0
+        self._move_preview.set_anim_bg(self._engine_bg_pix, sx, sy)
+
     @staticmethod
     def _oam_scale(m, affine):
         """Display scale from an OAM matrix component (256 = 1.0×). If the value
@@ -1892,11 +1933,15 @@ class BattleAnimTab(QWidget):
         if engine is not None:
             self._engine_sounds = []
             self._engine_sound_ptr = 0
+            self._engine_bgscroll = []
+            bg_id = self._detect_move_bg(timeline)
+            self._engine_bg_pix = self._load_bg_pixmap(bg_id) if bg_id else None
             try:
                 ops = self._build_engine_ops(timeline)
                 self._engine_frames = engine.play_timeline(
                     ops, attacker_is_player=(self._play_direction == "player"),
-                    sounds_out=self._engine_sounds)
+                    sounds_out=self._engine_sounds,
+                    bgscroll_out=self._engine_bgscroll)
             except Exception:
                 _log.exception("engine play_timeline failed; falling back to VM")
                 self._engine_frames = []
@@ -1941,6 +1986,8 @@ class BattleAnimTab(QWidget):
         self._playing = False
         self._engine_play = False
         self._engine_frames = []
+        self._engine_bg_pix = None
+        self._move_preview.set_anim_bg(None)   # clear the anim background
         self._play_layers = []
         self._anim_sim = None
         self._mon_task_sim = None
@@ -1984,6 +2031,7 @@ class BattleAnimTab(QWidget):
                 # Engine playback: step through the precomputed OAM frames.
                 if self._engine_idx == 0:
                     self._render_engine_frame(self._engine_frames[0])
+                    self._set_engine_bg(0)
                 self._engine_idx += frames
                 self._play_tick = self._engine_idx   # drive _fire_play_sound's throttle
                 # Fire any sounds scheduled up to the current frame.
@@ -1995,6 +2043,7 @@ class BattleAnimTab(QWidget):
                     self._stop_play_move()     # done — clears overlay (no freeze)
                 else:
                     self._render_engine_frame(self._engine_frames[self._engine_idx])
+                    self._set_engine_bg(self._engine_idx)
                 return
             for _ in range(frames):
                 if not self._playing:

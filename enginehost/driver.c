@@ -198,6 +198,14 @@ int engine_snapshot_addr(void)
     return (int)(intptr_t)&sSnap[0];
 }
 
+/* BG1 scroll (the layer fadetobg / sliding-bg / surf-wave tasks drive), packed
+ * as (x<<16)|y for the preview to scroll the animation background by. */
+__attribute__((export_name("engine_bg_scroll")))
+int engine_bg_scroll(void)
+{
+    return ((gBattle_BG1_X & 0xFFFF) << 16) | (gBattle_BG1_Y & 0xFFFF);
+}
+
 __attribute__((export_name("engine_snap_stride")))
 int engine_snap_stride(void)
 {
