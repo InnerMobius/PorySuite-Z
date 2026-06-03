@@ -66,8 +66,16 @@ class AnimEngine:
         self._linker = wasmtime.Linker(self._engine)
         self._linker.define_wasi()
         names = json.load(open(self.names_path, encoding="utf-8"))
-        self._tpl_index: Dict[str, int] = {n: i for i, n in enumerate(names["templates"])}
-        self._task_index: Dict[str, int] = {n: i for i, n in enumerate(names["tasks"])}
+        self._tpl_names: List[str] = list(names["templates"])
+        self._task_names: List[str] = list(names["tasks"])
+        self._tpl_index: Dict[str, int] = {n: i for i, n in enumerate(self._tpl_names)}
+        self._task_index: Dict[str, int] = {n: i for i, n in enumerate(self._task_names)}
+
+    def template_name(self, index: int) -> Optional[str]:
+        """Reverse of the name->index map (snapshot gives templateIndex)."""
+        if 0 <= index < len(self._tpl_names):
+            return self._tpl_names[index]
+        return None
 
     # -- capability queries --------------------------------------------------
     def has_template(self, name: str) -> bool:
@@ -132,3 +140,61 @@ class AnimEngine:
 
     def snapshot(self, store, ex) -> List[dict]:
         return self._snapshot(store, ex)
+
+    # -- whole-move player ---------------------------------------------------
+    def play_timeline(self, ops: List[dict], attacker_is_player: bool = True,
+                      max_frames: int = 600, wait_cap: int = 240) -> List[List[dict]]:
+        """Run a whole move and return one OAM snapshot per GBA frame.
+
+        ``ops`` is the move's resolved commands as plain dicts (the tab builds
+        these from its parsed timeline):
+          {"op":"createsprite","template":str,"battler":int,"subpriority":int,"args":[int]}
+          {"op":"createvisualtask","func":str,"args":[int]}
+          {"op":"delay","frames":int}
+          {"op":"waitforvisualfinish"}  /  {"op":"end"}
+
+        Commands execute until a delay/wait (same frame, like the engine's script
+        interpreter); each engine step yields one frame. After the timeline, any
+        still-living sprites/tasks are drained so the move plays out fully (the
+        engine self-destructs them) — no abrupt cut at ``end``.
+        """
+        store, ex = self.open(attacker_is_player)
+        frames: List[List[dict]] = []
+
+        def _step():
+            ex["engine_step"](store)
+            frames.append(self._snapshot(store, ex))
+
+        def _busy():
+            return ex["engine_busy"](store)
+
+        for op in ops:
+            if len(frames) >= max_frames:
+                break
+            k = op.get("op")
+            if k == "createsprite":
+                self.create_sprite(store, ex, op["template"],
+                                   int(op.get("battler", 1)),
+                                   int(op.get("subpriority", 3)),
+                                   op.get("args", []))
+            elif k == "createvisualtask":
+                self.create_task(store, ex, op["func"], op.get("args", []))
+            elif k == "delay":
+                for _ in range(max(1, int(op.get("frames", 1)))):
+                    if len(frames) >= max_frames:
+                        break
+                    _step()
+            elif k in ("waitforvisualfinish", "waitsound"):
+                guard = 0
+                while _busy() and len(frames) < max_frames and guard < wait_cap:
+                    _step(); guard += 1
+            elif k in ("end", "return"):
+                break
+            # sounds / gfx loads / blends: no effect on motion, ignored
+        # drain remaining live sprites + tasks
+        guard = 0
+        while _busy() and len(frames) < max_frames and guard < wait_cap:
+            _step(); guard += 1
+        if not frames:                       # move with no delays — show spawn frame
+            frames.append(self._snapshot(store, ex))
+        return frames

@@ -132,6 +132,21 @@ static int sIsMonSprite(int id)
     return -1;
 }
 
+/* "Still animating?" — active EFFECT sprites (not the mon holders) + active
+ * tasks. The timeline player uses this for waitforvisualfinish / end-drain. */
+__attribute__((export_name("engine_busy")))
+int engine_busy(void)
+{
+    int i, n = 0;
+    for (i = 0; i < MAX_SPRITES; i++)
+        if (gSprites[i].inUse && sIsMonSprite(i) < 0)
+            n++;
+    for (i = 0; i < NUM_TASKS; i++)
+        if (gTasks[i].isActive)
+            n++;
+    return n;
+}
+
 __attribute__((export_name("engine_snapshot")))
 int engine_snapshot(void)
 {
@@ -145,7 +160,9 @@ int engine_snapshot(void)
         o = &sSnap[n++];
         o->id = i;
         o->x = s->x; o->y = s->y; o->x2 = s->x2; o->y2 = s->y2;
-        o->tileNum = s->oam.tileNum;
+        /* Frame-relative tile offset (raw tileNum is offset by the sheet base,
+         * which we never load). Python turns this into a PNG cell index. */
+        o->tileNum = (int)(u16)(s->oam.tileNum - s->sheetTileStart);
         o->shape = s->oam.shape; o->size = s->oam.size;
         o->matrixNum = s->oam.matrixNum;
         o->affineMode = s->oam.affineMode;

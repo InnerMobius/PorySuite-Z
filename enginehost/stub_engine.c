@@ -172,7 +172,27 @@ void HostSeedRng(u32 seed) { sRng = seed; }
 void *AllocZeroed(u32 size) { void *p = calloc(1, size ? size : 1); return p; }
 void Free(void *pointer)    { free(pointer); }
 
-u32 GetMonData2(struct Pokemon *mon, s32 field) { (void)mon; (void)field; return 0; }
+/* Report a live, valid mon so IsBattlerSpritePresent() returns TRUE — otherwise
+ * mon-acting tasks (ShakeMon, the lunge) abort with SPRITE_NONE and the target
+ * never reacts. Real party data isn't needed for motion; sane fields suffice. */
+u32 GetMonData2(struct Pokemon *mon, s32 field)
+{
+    (void)mon;
+    switch (field)
+    {
+    case 57: /* MON_DATA_HP      */
+    case 58: /* MON_DATA_MAX_HP  */
+        return 100;
+    case 56: /* MON_DATA_LEVEL   */
+        return 50;
+    case 11: /* MON_DATA_SPECIES */
+    case 12: /* MON_DATA_SPECIES2 */
+    case 65: /* MON_DATA_SPECIES_OR_EGG */
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 /* ───────────────────────── no-op stubs (cosmetic to motion) ─────── */
 
