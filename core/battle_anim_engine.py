@@ -191,23 +191,53 @@ class AnimEngine:
         Some sprite callbacks hit a wasm memory fault under the host's stubbed
         state (e.g. a latent sign-extension in the game's address-reconstruction
         that only bites at certain wasm addresses). A trap poisons the whole wasm
-        instance, so the rest of the move would be lost. Instead of giving up, we
-        BAN the sprite/task that trapped and REPLAY the move without it — so every
-        other sprite still animates. Project-agnostic: no hardcoded move list.
+        instance, so the rest of the move would be lost. We BAN the sprite/task
+        that trapped and REPLAY without it, then KEEP THE BEST run — the one with
+        the most VISIBLE effect-sprite content. That way a move whose trapping
+        sprite is incidental (Metal Claw's shake) keeps the banned replay (with
+        its claw slash), while a move whose trapping sprite IS the visual (Hyper
+        Beam's orb) keeps the partial pre-trap run (with its orbs) rather than an
+        empty banned one. Project-agnostic: no hardcoded move list.
         """
         banned: set = set()
-        frames: List[List[dict]] = []
+        best = None   # (score, frames, sounds, bg, bg2)
         for _attempt in range(8):
-            for lst in (sounds_out, bgscroll_out, bg2scroll_out):
-                if lst is not None:
-                    del lst[:]                    # clear partial data from a retry
+            s_tmp, b_tmp, b2_tmp = [], [], []
             frames, trapped = self._play_once(
                 ops, attacker_is_player, max_frames, wait_cap,
-                sounds_out, bgscroll_out, bg2scroll_out, banned)
+                s_tmp if sounds_out is not None else None,
+                b_tmp if bgscroll_out is not None else None,
+                b2_tmp if bg2scroll_out is not None else None,
+                banned)
+            score = self._content_score(frames)
+            if best is None or score > best[0]:
+                best = (score, frames, s_tmp, b_tmp, b2_tmp)
             if trapped is None:
                 break
             banned.add(trapped)                   # skip the trapping item, replay
-        return frames
+        if best is None:
+            best = (0, [], [], [], [])
+        if sounds_out is not None:
+            sounds_out[:] = best[2]
+        if bgscroll_out is not None:
+            bgscroll_out[:] = best[3]
+        if bg2scroll_out is not None:
+            bg2scroll_out[:] = best[4]
+        return best[1]
+
+    @staticmethod
+    def _content_score(frames):
+        """Visible effect-sprite content of a run: count non-mon, VISIBLE,
+        renderable sprite instances across all frames. Used to keep the better
+        of a partial (pre-trap) run vs a banned replay."""
+        n = 0
+        for fr in frames:
+            for s in fr:
+                if (s.get("isMon", -1) == -1 and not s.get("invisible", 0)
+                        and (s.get("templateIndex", -1) >= 0
+                             or s.get("tileTag", -1) >= 10000)):
+                    n += 1
+        return n
 
     def _play_once(self, ops, attacker_is_player, max_frames, wait_cap,
                    sounds_out, bgscroll_out, bg2scroll_out, banned):
