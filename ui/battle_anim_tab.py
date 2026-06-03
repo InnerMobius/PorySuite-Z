@@ -1644,6 +1644,11 @@ class BattleAnimTab(QWidget):
                                 sprite, self._palette_for(sprite))
                             if frames:
                                 self._play_frame_cache[tag] = frames
+        _log.debug("PLAY '%s': %d createsprite rows, frame-cache tags=%s",
+                   self._move_current,
+                   sum(1 for c in timeline if c.name == "createsprite"),
+                   list(self._play_frame_cache))
+        self._play_peak_drawn = 0
         self._playing = True
         self._play_idx = 0
         self._play_wait = 0
@@ -1685,8 +1690,9 @@ class BattleAnimTab(QWidget):
         self._wait_visual = False
         self._tl_play_move_btn.setText("▶  Play Move")
         if was_playing:
-            _log.debug("playback stopped at idx=%s tick=%s",
-                       self._play_idx, self._play_tick)
+            _log.debug("PLAY END '%s': stopped idx=%s tick=%s peak-sprites-drawn=%s",
+                       self._move_current, self._play_idx, self._play_tick,
+                       getattr(self, "_play_peak_drawn", 0))
         # Clear the effect sprites; the mons (front/back pixmaps) stay.
         self._move_preview.set_anim_pixmap(None)
 
@@ -1832,10 +1838,16 @@ class BattleAnimTab(QWidget):
         if not cs:
             return
         tag = self._template_tags.get(cs.template, "")
-        if not tag or tag not in self._play_frame_cache:
+        if not tag:
+            _log.debug("spawn SKIP: %s has no ANIM_TAG", cs.template)
+            return
+        if tag not in self._play_frame_cache:
+            _log.debug("spawn SKIP: %s tag=%s NOT in frame cache (no png?)",
+                       cs.template, tag)
             return
         # Skip known invisible utility sprites (palette fades, mon-movers).
         if self._archetype_for_template(cs.template) == MOTION_INVISIBLE:
+            _log.debug("spawn SKIP: %s is INVISIBLE archetype", cs.template)
             return
         cb = self._tpl_callbacks.get(cs.template, "")
         # Per-spawn args feed the VM init (only the init reads them).
@@ -1880,6 +1892,8 @@ class BattleAnimTab(QWidget):
                 # H-flip: attacker-anchored sprites mirror when the attacker
                 # is on the player side (engine's side-dependent HFLIP).
                 sprite.flip = on_attacker and (self._play_direction == "player")
+            _log.debug("spawn OK: %s tag=%s cb=%s pos=(%s,%s) ported=%s",
+                       cs.template, tag, cb, sprite.x, sprite.y, vm_is_ported(cb))
             self._anim_sim.add(sprite)
 
     @staticmethod
@@ -1927,6 +1941,7 @@ class BattleAnimTab(QWidget):
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
         painter = _QPainter(canvas)
+        drawn = 0
         try:
             for s in sorted(sim.sprites, key=lambda s: -s.subpriority):
                 if s.invisible:
@@ -1943,8 +1958,11 @@ class BattleAnimTab(QWidget):
                     continue
                 painter.drawPixmap(int(s.render_x - pix.width() // 2),
                                    int(s.render_y - pix.height() // 2), pix)
+                drawn += 1
         finally:
             painter.end()
+        if drawn > getattr(self, "_play_peak_drawn", 0):
+            self._play_peak_drawn = drawn
         self._move_preview.set_anim_pixmap(canvas, P.CANVAS_W // 2,
                                            P.CANVAS_H // 2)
 
