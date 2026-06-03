@@ -299,6 +299,12 @@ class BattleAnimTab(QWidget):
         self._play_timer.timeout.connect(self._play_step)
         self._play_last_ms = 0.0           # wall-clock anchor for real-time pacing
         self._visual_wait = 0              # frames spent in a waitforvisualfinish
+        # Native engine playback (the real game animation code via WASM).
+        self._anim_engine = None           # core.battle_anim_engine.AnimEngine (lazy)
+        self._anim_engine_failed = False   # tried + unavailable (don't retry every play)
+        self._engine_play = False          # this playback is engine-driven
+        self._engine_frames: list = []     # precomputed per-frame OAM snapshots
+        self._engine_idx = 0               # current frame in _engine_frames
 
         # Frame-cycle preview state.
         self._frames: List[QPixmap] = []
@@ -1678,6 +1684,106 @@ class BattleAnimTab(QWidget):
         else:
             self._start_play_move()
 
+    def _get_anim_engine(self):
+        """Lazily load the native animation engine (real game code via WASM).
+        Returns None if wasmtime / the artifact isn't installed (the VM path
+        then takes over, and P53 will surface a Setup prompt)."""
+        if self._anim_engine is not None:
+            return self._anim_engine
+        if self._anim_engine_failed:
+            return None
+        try:
+            from core.battle_anim_engine import AnimEngine
+            self._anim_engine = AnimEngine()
+            _log.debug("native anim engine loaded")
+            return self._anim_engine
+        except Exception as e:
+            _log.warning("native anim engine unavailable (%s) — using VM fallback", e)
+            self._anim_engine_failed = True
+            return None
+
+    def _build_engine_ops(self, timeline) -> list:
+        """Convert the resolved timeline into the engine's op list (the same
+        commands the game's script interpreter would run)."""
+        ops = []
+        for c in timeline:
+            if c.name == "createsprite":
+                cs = parse_createsprite(c)
+                if cs:
+                    ops.append({"op": "createsprite", "template": cs.template,
+                                "battler": self._int_or(cs.battler),
+                                "subpriority": self._int_or(cs.subpriority),
+                                "args": [self._int_or(a) for a in cs.args]})
+            elif c.name == "createvisualtask":
+                vt = parse_createvisualtask(c)
+                if vt:
+                    ops.append({"op": "createvisualtask", "func": vt.addr,
+                                "args": [self._int_or(a) for a in vt.args]})
+            elif c.name == "delay":
+                ops.append({"op": "delay",
+                            "frames": self._int_or(c.args[0]) if c.args else 1})
+            elif c.name in ("waitforvisualfinish", "waitsound"):
+                ops.append({"op": "waitforvisualfinish"})
+            elif c.name in ("end", "return"):
+                ops.append({"op": "end"})
+        return ops
+
+    def _render_engine_frame(self, frame):
+        """Draw one engine OAM snapshot into the preview: transform the mons
+        (shake / sway / squeeze / lunge) and composite the effect sprites at
+        their real per-frame positions/frames/flip/scale."""
+        from PyQt6.QtGui import QPainter as _QPainter
+        P = self._move_preview
+        eng = self._anim_engine
+
+        # Mon transforms (direction-aware: attacker=0, target=1).
+        mon_side = ({0: "back", 1: "front"} if self._play_direction == "player"
+                    else {0: "front", 1: "back"})
+        P.reset_mon_transforms()
+        for s in frame:
+            which = mon_side.get(s.get("isMon", -1))
+            if which is None:
+                continue
+            aff = s["affineMode"] != 0
+            sx = 256.0 / s["mA"] if (aff and s["mA"]) else 1.0
+            sy = 256.0 / s["mD"] if (aff and s["mD"]) else 1.0
+            P.set_mon_transform(which, s["x2"], s["y2"], sx, sy)
+
+        # Effect sprites → canvas (lower subpriority drawn on top).
+        canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
+        canvas.fill(QColor(0, 0, 0, 0))
+        painter = _QPainter(canvas)
+        try:
+            effects = [s for s in frame
+                       if s.get("isMon", -1) == -1 and s.get("templateIndex", -1) >= 0]
+            for s in sorted(effects, key=lambda s: -s["subpriority"]):
+                if s["invisible"]:
+                    continue
+                name = eng.template_name(s["templateIndex"]) if eng else None
+                tag = self._template_tags.get(name, "") if name else ""
+                frames = self._play_frame_cache.get(tag)
+                if not frames:
+                    continue
+                fw, fh = self._frame_sizes.get(tag, (0, 0))
+                tpf = max(1, (fw // 8) * (fh // 8)) if (fw and fh) else 1
+                fi = s["tileNum"] // tpf
+                fi = max(0, min(fi, len(frames) - 1))
+                pix = self._play_frame_pix(tag, fi, bool(s["hFlip"]), bool(s["vFlip"]))
+                if pix is None or pix.isNull():
+                    continue
+                if s["affineMode"] != 0 and (s["mA"] != 256 or s["mD"] != 256):
+                    sx = 256.0 / s["mA"] if s["mA"] else 1.0
+                    sy = 256.0 / s["mD"] if s["mD"] else 1.0
+                    nw = max(1, int(round(pix.width() * sx)))
+                    nh = max(1, int(round(pix.height() * sy)))
+                    pix = pix.scaled(nw, nh)
+                rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
+                painter.drawPixmap(int(rx - pix.width() // 2),
+                                   int(ry - pix.height() // 2), pix)
+        finally:
+            painter.end()
+        P.set_anim_pixmap(canvas, P.CANVAS_W // 2, P.CANVAS_H // 2)
+
     def _start_play_move(self):
         """Begin the whole-move animation playback sequence.
 
@@ -1721,6 +1827,29 @@ class BattleAnimTab(QWidget):
         self._visual_wait = 0
         self._play_last_ms = time.monotonic() * 1000.0
         self._play_layers = []
+        self._engine_play = False
+
+        # PREFERRED PATH: run the real game animation code (native engine via
+        # WASM) and render its per-frame output. Falls back to the approximate
+        # VM below only if the engine isn't installed.
+        engine = self._get_anim_engine()
+        if engine is not None:
+            try:
+                ops = self._build_engine_ops(timeline)
+                self._engine_frames = engine.play_timeline(
+                    ops, attacker_is_player=(self._play_direction == "player"))
+            except Exception:
+                _log.exception("engine play_timeline failed; falling back to VM")
+                self._engine_frames = []
+            if self._engine_frames:
+                self._engine_play = True
+                self._engine_idx = 0
+                self._move_preview.reset_mon_transforms()
+                self._tl_play_move_btn.setText("⏹  Stop")
+                self._play_step()              # render frame 0
+                self._play_timer.start()
+                return
+
         # Build the per-frame simulator with direction-aware battlers.
         P = self._move_preview
         player = Battler(P.PLAYER_CX, P.PLAYER_CY, SIDE_PLAYER)
@@ -1751,6 +1880,8 @@ class BattleAnimTab(QWidget):
         was_playing = self._playing
         self._play_timer.stop()
         self._playing = False
+        self._engine_play = False
+        self._engine_frames = []
         self._play_layers = []
         self._anim_sim = None
         self._mon_task_sim = None
@@ -1790,6 +1921,16 @@ class BattleAnimTab(QWidget):
             # GBA runs ~59.7 fps (16.74 ms/frame).  Advance that many frames,
             # clamped to 4 so a stall (GC / RDP hitch) can't fast-forward wildly.
             frames = max(1, min(4, int(round(elapsed / 16.74))))
+            if self._engine_play:
+                # Engine playback: step through the precomputed OAM frames.
+                if self._engine_idx == 0:
+                    self._render_engine_frame(self._engine_frames[0])
+                self._engine_idx += frames
+                if self._engine_idx >= len(self._engine_frames):
+                    self._stop_play_move()     # done — clears overlay (no freeze)
+                else:
+                    self._render_engine_frame(self._engine_frames[self._engine_idx])
+                return
             for _ in range(frames):
                 if not self._playing:
                     break
