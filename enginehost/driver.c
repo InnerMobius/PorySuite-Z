@@ -110,16 +110,26 @@ void engine_set_arg(int i, int value)
 __attribute__((export_name("engine_create_sprite")))
 int engine_create_sprite(int tplIndex, int battler, int subpriority)
 {
-    u8 id;
-    int coordBattler = (battler == 0) ? gBattleAnimAttacker : gBattleAnimTarget;
+    u8 id, b;
+    int off, sub;
     if (tplIndex < 0 || tplIndex >= gHostTemplateCount)
         return -1;
-    (void)coordBattler;
+    /* Decode the createsprite subpriority_offset EXACTLY like Cmd_createsprite:
+     * the script's 0..127 value is BIASED — >=64 → +(v-64), else → -v — then
+     * added to the battler's base subpriority and clamped to >=3. Passing the
+     * raw offset inverted layering: Metronome's offsets 11/12 decode to -11/-12,
+     * so the finger (more negative = front) is correctly on top of the cloud. */
+    off = subpriority & 0x7F;
+    off = (off >= 64) ? (off - 64) : -off;
+    b = (battler == 1) ? gBattleAnimTarget : gBattleAnimAttacker;
+    sub = (int)GetBattlerSpriteSubpriority(b) + off;
+    if (sub < 3)
+        sub = 3;
     id = CreateSpriteAndAnimate(
         gHostTemplates[tplIndex],
         GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_X_2),
         GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_Y_PIC_OFFSET),
-        (u8)subpriority);
+        (u8)sub);
     if (id < MAX_SPRITES)
         sSpriteTpl[id] = tplIndex;
     return id;
