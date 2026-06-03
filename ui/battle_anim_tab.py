@@ -1739,29 +1739,39 @@ class BattleAnimTab(QWidget):
         return ops
 
     def _detect_move_bg(self, timeline):
-        """The move's animation background id (BG_COSMIC, …) from its first
-        fadetobg / changebg / fadetobgfromset, or None."""
+        """The move's animation background id from its first fadetobg / changebg /
+        fadetobgfromset, or a "task:<fn>" id for a BG-loading task (Surf). None
+        if the move has no background."""
+        from core.battle_anim_bg import task_loads_bg
         for c in timeline:
             if c.name in ("fadetobg", "changebg", "fadetobgfromset") and c.args:
                 return c.args[0].strip()
+            if c.name == "createvisualtask" and c.args and task_loads_bg(c.args[0]):
+                return "task:" + c.args[0]
         return None
 
     def _load_bg_pixmap(self, bg_id: str):
         """Assemble (and cache) the background image for a BG id."""
-        if bg_id in self._bg_pix_cache:
-            return self._bg_pix_cache[bg_id]
+        # Task-loaded BGs (Surf) depend on attack direction — cache per direction.
+        cache_key = bg_id + ("|" + self._play_direction if bg_id.startswith("task:") else "")
+        if cache_key in self._bg_pix_cache:
+            return self._bg_pix_cache[cache_key]
         pix = None
         try:
-            from core.battle_anim_bg import parse_bg_map, assemble_bg
-            if self._bg_id_map is None:
-                self._bg_id_map = parse_bg_map(self._project_root or "")
-            files = self._bg_id_map.get(bg_id)
-            if files:
-                pix = assemble_bg(*files)
+            from core.battle_anim_bg import parse_bg_map, assemble_bg, assemble_task_bg
+            if bg_id.startswith("task:"):
+                pix = assemble_task_bg(self._project_root or "", bg_id[5:],
+                                       player_attacks=(self._play_direction == "player"))
+            else:
+                if self._bg_id_map is None:
+                    self._bg_id_map = parse_bg_map(self._project_root or "")
+                files = self._bg_id_map.get(bg_id)
+                if files:
+                    pix = assemble_bg(*files)
         except Exception:
             _log.exception("anim BG assemble failed for %s", bg_id)
             pix = None
-        self._bg_pix_cache[bg_id] = pix
+        self._bg_pix_cache[cache_key] = pix
         return pix
 
     def _set_engine_bg(self, idx: int):
@@ -1830,10 +1840,23 @@ class BattleAnimTab(QWidget):
                 continue
             # Mon hide (Dig / Fly disappear).
             P.set_mon_visible(which, not s["invisible"])
-            aff = s["affineMode"] != 0
-            sx = self._oam_scale(s["mA"], aff)
-            sy = self._oam_scale(s["mD"], aff)
-            P.set_mon_transform(which, s["x2"], s["y2"], sx, sy)
+            if s["affineMode"] != 0:
+                # A mon affine should be a CLEAN SCALE (grow / shrink / squeeze),
+                # never rotation/shear. A broken GrowAndShrink matrix (8-vs-6 cmd
+                # stride) has nonzero mB/mC or wild components AND a garbage
+                # y-offset — that's the Bulk Up "freak out and appear low". Reject
+                # anything that isn't a sane pure scale; keep the mon put.
+                mA, mB, mC, mD = s["mA"], s["mB"], s["mC"], s["mD"]
+                if (mB != 0 or mC != 0
+                        or not (32 <= abs(mA) <= 2048)
+                        or not (32 <= abs(mD) <= 2048)):
+                    P.set_mon_transform(which, 0, 0, 1.0, 1.0)
+                    continue
+                P.set_mon_transform(which, s["x2"], s["y2"],
+                                    256.0 / abs(mA), 256.0 / abs(mD))
+            else:
+                # Non-affine: shake / sway / lunge offset (no scale).
+                P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)
 
         # Effect sprites → canvas (lower subpriority drawn on top).
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)

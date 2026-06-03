@@ -68,6 +68,33 @@ def parse_bg_map(project_root: str) -> Dict[str, Tuple[str, str, str]]:
     return out
 
 
+# Backgrounds loaded by a TASK (not fadetobg): map the task → its files under
+# graphics/battle_anims/backgrounds/ (side picks the tilemap). e.g. Surf.
+_TASK_BG = {
+    "AnimTask_CreateSurfWave": {
+        "image": "water", "pal": "water",
+        "tmap_player": "water_player", "tmap_opponent": "water_opponent"},
+}
+
+
+def task_loads_bg(task: str) -> bool:
+    return task in _TASK_BG
+
+
+def assemble_task_bg(project_root: str, task: str,
+                     player_attacks: bool = True) -> Optional[QPixmap]:
+    """Assemble a task-loaded background (e.g. Surf's water), picking the
+    player/opponent tilemap by who's attacking."""
+    info = _TASK_BG.get(task)
+    if not info:
+        return None
+    base = os.path.join(project_root, "graphics", "battle_anims", "backgrounds")
+    tmap = info["tmap_player"] if player_attacks else info["tmap_opponent"]
+    return assemble_bg(os.path.join(base, info["image"] + ".4bpp"),
+                       os.path.join(base, info["pal"] + ".gbapal"),
+                       os.path.join(base, tmap + ".bin"))
+
+
 def _read_palette(path: str):
     raw = open(path, "rb").read()
     pal = []
