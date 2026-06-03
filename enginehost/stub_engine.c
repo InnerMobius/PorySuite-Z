@@ -169,8 +169,34 @@ static u32 sRng = 0x12345678;
 u16 Random(void) { sRng = sRng * 1103515245 + 24013; return (u16)(sRng >> 16); }
 void HostSeedRng(u32 seed) { sRng = seed; }
 
-void *AllocZeroed(u32 size) { void *p = calloc(1, size ? size : 1); return p; }
-void Free(void *pointer)    { free(pointer); }
+/* Arena allocator. wasi-libc's malloc/calloc spins forever under this reactor
+ * module's heap setup (a calloc(0x2000) burned 400M wasm instructions and never
+ * returned — it hung the whole app on any move that allocates: Heal Bell's
+ * music-note palettes, Transform/Sketch's extra mon sprite, Ghost, ...). The
+ * anim code only needs small, transient scratch buffers (multiUseBuffer is
+ * alloc'd, used within one task, and freed), so a bump arena is sufficient and
+ * can't loop. Each play is a fresh wasm instance, so sArena/sTop reset to 0
+ * (BSS) per move; within a play we bump and wrap (live buffers are few and
+ * short-lived). Free is a no-op — buffers are reclaimed in bulk per instance. */
+static u8 sArena[512 * 1024];
+static u32 sArenaTop;
+void *AllocZeroed(u32 size)
+{
+    u32 n = (size + 7u) & ~7u;
+    if (n == 0)
+        n = 8;
+    if (n > sizeof(sArena))
+        n = sizeof(sArena);
+    if (sArenaTop + n > sizeof(sArena))
+        sArenaTop = 0;                 /* transient scratch: wrap the arena */
+    {
+        u8 *p = &sArena[sArenaTop];
+        sArenaTop += n;
+        memset(p, 0, n);
+        return p;
+    }
+}
+void Free(void *pointer) { (void)pointer; }
 
 /* Report a live, valid mon so IsBattlerSpritePresent() returns TRUE — otherwise
  * mon-acting tasks (ShakeMon, the lunge) abort with SPRITE_NONE and the target
