@@ -555,11 +555,14 @@ class BattleScenePreview(QWidget):
         self.update()
 
     def set_mon_affine(self, which: str, mA: int, mB: int, mC: int, mD: int,
-                       dx: int = 0) -> None:
+                       dx: int = 0, dy: int = 0) -> None:
         """Render a mon through its FULL OAM affine matrix (rotation + scale),
-        pivoted at the feet — for a mon that TILTS (Horn Drill's bow) which a
-        scale-only transform can't show. None clears it."""
-        aff = None if mA is None else (int(mA), int(mB), int(mC), int(mD), int(dx))
+        pivoted at the sprite CENTRE (as the GBA does) with the engine's
+        (dx, dy) offset — for a mon that TILTS (Horn Drill's bow). dy is the
+        engine's SetBattlerSpriteYOffsetFromRotation grounding offset (downward),
+        which hinges the mon and tilts it DOWN under the textbox. None clears."""
+        aff = (None if mA is None
+               else (int(mA), int(mB), int(mC), int(mD), int(dx), int(dy)))
         if which == "front":
             if aff == self._front_aff:
                 return
@@ -589,11 +592,14 @@ class BattleScenePreview(QWidget):
             self.update()
 
     def _paint_mon_affine(self, p, pix, frame_left, frame_top, fw, fh, aff, s):
-        """Draw a mon through its OAM affine matrix, pivoting at the feet (art
-        bottom centre) so a bow/tilt rotates about the ground, not the centre.
-        The OAM matrix maps screen→texture, so we draw with its inverse."""
+        """Draw a mon through its OAM affine matrix, pivoting at the sprite
+        CENTRE (exactly as GBA OAM affine does) with the engine's (dx, dy)
+        offset. dy is SetBattlerSpriteYOffsetFromRotation's grounding push
+        (downward), so a bow tilt hinges + tilts the mon DOWN — under the
+        textbox, which is drawn on top and covers it — instead of lifting the
+        hip. The OAM matrix maps screen→texture, so we draw with its inverse."""
         from PyQt6.QtGui import QTransform
-        mA, mB, mC, mD, dx = aff
+        mA, mB, mC, mD, dx, dy = aff
         if any(abs(v) > 4096 for v in (mA, mB, mC, mD)):
             p.drawPixmap(frame_left * s, frame_top * s, fw * s, fh * s, pix)
             return
@@ -602,14 +608,15 @@ class BattleScenePreview(QWidget):
         if not ok:
             p.drawPixmap(frame_left * s, frame_top * s, fw * s, fh * s, pix)
             return
-        abr = self._art_bottom_row(pix)
-        feet_x = (frame_left + fw / 2.0 + dx) * s
-        feet_y = (frame_top + abr) * s
+        draw_left = frame_left + dx
+        draw_top = frame_top + dy
+        cx = (draw_left + fw / 2.0) * s
+        cy = (draw_top + fh / 2.0) * s
         p.save()
-        p.translate(feet_x, feet_y)
+        p.translate(cx, cy)
         p.setTransform(inv, True)
-        p.translate(-feet_x, -feet_y)
-        p.drawPixmap(int((frame_left + dx) * s), int(frame_top * s),
+        p.translate(-cx, -cy)
+        p.drawPixmap(int(draw_left * s), int(draw_top * s),
                      int(fw * s), int(fh * s), pix)
         p.restore()
 

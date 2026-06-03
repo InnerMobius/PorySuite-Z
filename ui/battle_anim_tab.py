@@ -1977,10 +1977,12 @@ class BattleAnimTab(QWidget):
                                         256.0 / abs(mA), 256.0 / abs(mD),
                                         ground=True)
                 else:
-                    # Rotation (Horn Drill's bow TILT, …): scale-only can't show a
-                    # tilt, so render the full OAM matrix pivoted at the feet.
+                    # Rotation (Horn Drill's bow TILT, …): render the full OAM
+                    # matrix pivoted at the sprite centre, WITH the engine's y2
+                    # (SetBattlerSpriteYOffsetFromRotation) so the mon hinges and
+                    # tilts DOWN under the textbox — never lifting the hip.
                     P.set_mon_affine(which, s["mA"], s["mB"], s["mC"], s["mD"],
-                                     s["x2"])
+                                     s["x2"], s["y2"])
             else:
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)
