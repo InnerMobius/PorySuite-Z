@@ -1729,6 +1729,19 @@ class BattleAnimTab(QWidget):
                 ops.append({"op": "end"})
         return ops
 
+    @staticmethod
+    def _oam_scale(m, affine):
+        """Display scale from an OAM matrix component (256 = 1.0×). If the value
+        is out of a sane range, IGNORE the affine (return 1.0) — a broken affine
+        anim (e.g. residual GrowAndShrink garbage) must never explode a sprite to
+        an absurd size. Bound: ~0.125×..8× (|m| in 32..2048)."""
+        if not affine or not m:
+            return 1.0
+        a = abs(m)
+        if a < 32 or a > 2048:
+            return 1.0
+        return 256.0 / a
+
     def _render_engine_frame(self, frame):
         """Draw one engine OAM snapshot into the preview: transform the mons
         (shake / sway / squeeze / lunge) and composite the effect sprites at
@@ -1745,9 +1758,11 @@ class BattleAnimTab(QWidget):
             which = mon_side.get(s.get("isMon", -1))
             if which is None:
                 continue
+            # Mon hide (Dig / Fly disappear).
+            P.set_mon_visible(which, not s["invisible"])
             aff = s["affineMode"] != 0
-            sx = 256.0 / s["mA"] if (aff and s["mA"]) else 1.0
-            sy = 256.0 / s["mD"] if (aff and s["mD"]) else 1.0
+            sx = self._oam_scale(s["mA"], aff)
+            sy = self._oam_scale(s["mD"], aff)
             P.set_mon_transform(which, s["x2"], s["y2"], sx, sy)
 
         # Effect sprites → canvas (lower subpriority drawn on top).
@@ -1773,11 +1788,12 @@ class BattleAnimTab(QWidget):
                 if pix is None or pix.isNull():
                     continue
                 if s["affineMode"] != 0 and (s["mA"] != 256 or s["mD"] != 256):
-                    sx = 256.0 / s["mA"] if s["mA"] else 1.0
-                    sy = 256.0 / s["mD"] if s["mD"] else 1.0
-                    nw = max(1, int(round(pix.width() * sx)))
-                    nh = max(1, int(round(pix.height() * sy)))
-                    pix = pix.scaled(nw, nh)
+                    sx = self._oam_scale(s["mA"], True)
+                    sy = self._oam_scale(s["mD"], True)
+                    if sx != 1.0 or sy != 1.0:
+                        nw = max(1, int(round(pix.width() * sx)))
+                        nh = max(1, int(round(pix.height() * sy)))
+                        pix = pix.scaled(nw, nh)
                 rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
                 painter.drawPixmap(int(rx - pix.width() // 2),
                                    int(ry - pix.height() // 2), pix)

@@ -13,7 +13,11 @@ CLANG="$(ls /c/GBA/tools/wasi-sdk-*/bin/clang.exe 2>/dev/null | sort -V | tail -
 
 INC="-I $PROJ/include -I $PROJ/gflib -I $PROJ/include/gba"
 PRE="-include enginehost/host_pre.h"
-CFLAGS="--target=wasm32-wasi -O1 -std=gnu11 -w \
+# -DUBFIX: enable the decomp's own undefined-behaviour guards (notably the
+# guarded SAFE_DIV). On real GBA hardware divide-by-zero returns garbage without
+# trapping; wasm TRAPS on it (e.g. AnimTask_GrowAndShrink -> SAFE_DIV by a 0
+# y-scale matrix). UBFIX makes those divides return 0 instead of trapping.
+CFLAGS="--target=wasm32-wasi -O1 -std=gnu11 -w -DUBFIX \
   -Wno-implicit-function-declaration -Wno-implicit-int -Wno-incompatible-pointer-types \
   -Wno-int-conversion -Wno-int-to-pointer-cast -Wno-pointer-to-int-cast"
 

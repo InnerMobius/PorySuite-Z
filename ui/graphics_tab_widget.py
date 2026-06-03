@@ -390,6 +390,10 @@ class BattleScenePreview(QWidget):
         # (dx, dy, sx, sy): offset in canvas px, scale as a display multiplier.
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
+        # Mon visibility (battle-anim mon-hide: Dig / Fly disappear). True =
+        # drawn normally. The Pokemon Graphics tab never sets these.
+        self._front_visible = True
+        self._back_visible = True
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -459,12 +463,28 @@ class BattleScenePreview(QWidget):
             self._back_fx = fx
         self.update()
 
+    def set_mon_visible(self, which: str, visible: bool) -> None:
+        """Show/hide a mon (battle-anim mon-hide for Dig / Fly)."""
+        visible = bool(visible)
+        if which == "front":
+            if self._front_visible == visible:
+                return
+            self._front_visible = visible
+        else:
+            if self._back_visible == visible:
+                return
+            self._back_visible = visible
+        self.update()
+
     def reset_mon_transforms(self) -> None:
-        """Restore both mons to their untransformed draw (end of playback)."""
+        """Restore both mons to their untransformed, visible draw (end of play)."""
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
-                   or self._back_fx != (0, 0, 1.0, 1.0))
+                   or self._back_fx != (0, 0, 1.0, 1.0)
+                   or not self._front_visible or not self._back_visible)
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
+        self._front_visible = True
+        self._back_visible = True
         if changed:
             self.update()
 
@@ -534,7 +554,7 @@ class BattleScenePreview(QWidget):
         # Enemy (front) sprite — pokefirered draws the 64x64 frame
         # CENTERED on sBattlerCoords, plus y_offset pushes it DOWN,
         # minus enemy elevation pushes it UP.
-        if self._front_pix and not self._front_pix.isNull():
+        if self._front_visible and self._front_pix and not self._front_pix.isNull():
             fw = self._front_pix.width()
             fh = self._front_pix.height()
             frame_top = (self.ENEMY_CY - fh // 2
@@ -545,7 +565,7 @@ class BattleScenePreview(QWidget):
 
         # Player (back) sprite — same frame-center rule, back y_offset
         # pushes DOWN.
-        if self._back_pix and not self._back_pix.isNull():
+        if self._back_visible and self._back_pix and not self._back_pix.isNull():
             bw = self._back_pix.width()
             bh = self._back_pix.height()
             frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off)

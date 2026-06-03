@@ -166,41 +166,98 @@ class AnimEngine:
         """
         store, ex = self.open(attacker_is_player)
         frames: List[List[dict]] = []
+        dead = [False]   # set when a wasm trap (UB in some move) halts the engine
+
+        def _safe(fn, *a):
+            """Call a wasm export; on a trap (e.g. divide-by-zero from residual
+            UB in some move) stop the move cleanly instead of crashing the tab."""
+            if dead[0]:
+                return None
+            try:
+                return fn(store, *a)
+            except Exception:
+                dead[0] = True
+                return None
 
         def _step():
-            ex["engine_step"](store)
-            frames.append(self._snapshot(store, ex))
+            if dead[0]:
+                return
+            _safe(ex["engine_step"])
+            if not dead[0]:
+                try:
+                    frames.append(self._snapshot(store, ex))
+                except Exception:
+                    dead[0] = True
 
         def _busy():
-            return ex["engine_busy"](store)
+            r = _safe(ex["engine_busy"])
+            return 0 if r is None else r
+
+        def _sig(fr):
+            # Visual signature of a frame: every sprite's render pos / frame /
+            # flip / scale / visibility. Identical sig across frames == nothing
+            # is moving.
+            return tuple(
+                (s["id"], s["x"] + s["x2"], s["y"] + s["y2"], s["tileNum"],
+                 s["hFlip"], s["vFlip"], s["invisible"], s["mA"], s["mD"])
+                for s in fr)
+
+        _SETTLED = 30   # frames of zero visual change == animation has settled
+
+        def _run_until_idle(cap):
+            # Step until the engine reports idle, OR the scene stops changing
+            # (a non-terminating task — e.g. GrowAndShrink — left a static
+            # picture), OR a frame cap. Without the settle check those moves
+            # would spin to max_frames and "play" for many empty seconds.
+            same, last = 0, None
+            n = 0
+            while len(frames) < max_frames and n < cap:
+                if not _busy() or dead[0]:
+                    break
+                _step()
+                if dead[0]:
+                    break
+                sig = _sig(frames[-1]) if frames else None
+                if sig == last:
+                    same += 1
+                    if same >= _SETTLED:
+                        break
+                else:
+                    same, last = 0, sig
+                n += 1
 
         for op in ops:
-            if len(frames) >= max_frames:
+            if dead[0] or len(frames) >= max_frames:
                 break
             k = op.get("op")
             if k == "createsprite":
-                self.create_sprite(store, ex, op["template"],
-                                   int(op.get("battler", 1)),
-                                   int(op.get("subpriority", 3)),
-                                   op.get("args", []))
+                idx = self._tpl_index.get(op["template"])
+                if idx is not None:
+                    for i, v in enumerate(op.get("args", [])[:8]):
+                        _safe(ex["engine_set_arg"], i, int(v))
+                    _safe(ex["engine_create_sprite"], idx,
+                          int(op.get("battler", 1)), int(op.get("subpriority", 3)))
             elif k == "createvisualtask":
-                self.create_task(store, ex, op["func"], op.get("args", []))
+                idx = self._task_index.get(op["func"])
+                if idx is not None:
+                    for i, v in enumerate(op.get("args", [])[:8]):
+                        _safe(ex["engine_set_arg"], i, int(v))
+                    _safe(ex["engine_create_task"], idx)
             elif k == "delay":
                 for _ in range(max(1, int(op.get("frames", 1)))):
-                    if len(frames) >= max_frames:
+                    if dead[0] or len(frames) >= max_frames:
                         break
                     _step()
             elif k in ("waitforvisualfinish", "waitsound"):
-                guard = 0
-                while _busy() and len(frames) < max_frames and guard < wait_cap:
-                    _step(); guard += 1
+                _run_until_idle(wait_cap)
             elif k in ("end", "return"):
                 break
             # sounds / gfx loads / blends: no effect on motion, ignored
         # drain remaining live sprites + tasks
-        guard = 0
-        while _busy() and len(frames) < max_frames and guard < wait_cap:
-            _step(); guard += 1
-        if not frames:                       # move with no delays — show spawn frame
-            frames.append(self._snapshot(store, ex))
+        _run_until_idle(wait_cap)
+        if not frames and not dead[0]:       # move with no delays — show spawn frame
+            try:
+                frames.append(self._snapshot(store, ex))
+            except Exception:
+                pass
         return frames
