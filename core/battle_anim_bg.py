@@ -68,12 +68,21 @@ def parse_bg_map(project_root: str) -> Dict[str, Tuple[str, str, str]]:
     return out
 
 
-# Backgrounds loaded by a TASK (not fadetobg): map the task → its files under
-# graphics/battle_anims/backgrounds/ (side picks the tilemap). e.g. Surf.
+# Backgrounds loaded by a TASK (not fadetobg). Paths are relative to
+# graphics/battle_anims/ so a palette can live under sprites/ (Sandstorm reuses
+# the FlyingDirt SPRITE palette) while tiles+tilemap live under backgrounds/.
+# tmap_player/tmap_opponent = side-specific (Surf); tmap = single (Sandstorm).
 _TASK_BG = {
     "AnimTask_CreateSurfWave": {
-        "image": "water", "pal": "water",
-        "tmap_player": "water_player", "tmap_opponent": "water_opponent"},
+        "image": "backgrounds/water.4bpp", "pal": "backgrounds/water.gbapal",
+        "tmap_player": "backgrounds/water_player.bin",
+        "tmap_opponent": "backgrounds/water_opponent.bin"},
+    # Sandstorm + Heat Wave both call AnimTask_LoadSandstormBackground:
+    # sandstorm_brew tiles+tilemap + the flying_dirt sprite palette.
+    "AnimTask_LoadSandstormBackground": {
+        "image": "backgrounds/sandstorm_brew.4bpp",
+        "pal": "sprites/flying_dirt.gbapal",
+        "tmap": "backgrounds/sandstorm_brew.bin"},
 }
 
 
@@ -83,16 +92,19 @@ def task_loads_bg(task: str) -> bool:
 
 def assemble_task_bg(project_root: str, task: str,
                      player_attacks: bool = True) -> Optional[QPixmap]:
-    """Assemble a task-loaded background (e.g. Surf's water), picking the
-    player/opponent tilemap by who's attacking."""
+    """Assemble a task-loaded background (Surf's water, Sandstorm's dust),
+    picking the player/opponent tilemap by who's attacking when side-specific."""
     info = _TASK_BG.get(task)
     if not info:
         return None
-    base = os.path.join(project_root, "graphics", "battle_anims", "backgrounds")
-    tmap = info["tmap_player"] if player_attacks else info["tmap_opponent"]
-    return assemble_bg(os.path.join(base, info["image"] + ".4bpp"),
-                       os.path.join(base, info["pal"] + ".gbapal"),
-                       os.path.join(base, tmap + ".bin"))
+    root = os.path.join(project_root, "graphics", "battle_anims")
+
+    def _p(rel):
+        return os.path.join(root, *rel.split("/"))
+
+    tmap = info.get("tmap") or (info["tmap_player"] if player_attacks
+                                else info["tmap_opponent"])
+    return assemble_bg(_p(info["image"]), _p(info["pal"]), _p(tmap))
 
 
 def _read_palette(path: str):
