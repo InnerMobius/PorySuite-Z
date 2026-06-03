@@ -346,6 +346,30 @@ def _cb_confuse_spiral_step(s: Sprite, ctx: AnimContext) -> None:
         s.alive = False
 
 
+def _cb_confusion_duck(s: Sprite, ctx: AnimContext) -> None:
+    """AnimConfusionDuck: a duck created above the target that orbits it in
+    an ellipse (Cos x30 / Sin x10).  The status animation spawns five at
+    evenly-spaced start angles, giving the ring of circling confusion ducks."""
+    s.x = ctx.target.x + ctx.arg(0)
+    s.y = ctx.target.y + ctx.arg(1)
+    s.data[0] = ctx.arg(2)            # start angle (0/51/102/153/204 for the 5)
+    s.data[1] = (-ctx.arg(3) if ctx.attacker.side != SIDE_PLAYER
+                 else ctx.arg(3))     # angular velocity
+    s.data[2] = 0
+    s.data[3] = max(1, ctx.arg(4))    # frames to live
+    s.callback = _cb_confusion_duck_step
+    s.callback(s, ctx)
+
+
+def _cb_confusion_duck_step(s: Sprite, ctx: AnimContext) -> None:
+    s.x2 = gba_cos(s.data[0], 30)
+    s.y2 = gba_sin(s.data[0], 10)
+    s.data[0] = (s.data[0] + s.data[1]) & 0xFF
+    s.data[2] += 1
+    if s.data[2] >= s.data[3]:
+        s.alive = False
+
+
 # Registry: callback symbol → ported init function.
 CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "TranslateAnimSpriteToTargetMonLocation": _cb_translate_to_target,
@@ -355,6 +379,7 @@ CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "AnimGhostStatusSprite": _cb_ghost_status,
     "AnimBite": _cb_bite,
     "AnimConfuseRayBallSpiral": _cb_confuse_spiral,
+    "AnimConfusionDuck": _cb_confusion_duck,
 }
 
 

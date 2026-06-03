@@ -224,6 +224,28 @@ def test_confuse_ray_spiral_circles_and_destroys():
     assert not s.alive
 
 
+def test_confusion_duck_orbits_and_destroys():
+    # One of the 5 ducks (start angle 102), 90-frame life.
+    ctx = _ctx(args=[0, -15, 102, 3, 90])
+    s = vm.spawn("AnimConfusionDuck", ctx, tag="ANIM_TAG_DUCK")
+    assert s is not None and s.y == ctx.target.y - 15
+    xs, ys = [], []
+    for _ in range(60):
+        if not s.alive:
+            break
+        s.step(ctx)
+        xs.append(s.render_x)
+        ys.append(s.render_y)
+    # Orbits an ellipse: wide x (Cos×30), shorter y (Sin×10).
+    assert max(xs) - min(xs) > 40, xs
+    assert max(ys) - min(ys) > 8, ys
+    for _ in range(60):
+        if not s.alive:
+            break
+        s.step(ctx)
+    assert not s.alive          # gone after ~90 frames
+
+
 def test_gba_cos():
     assert vm.gba_cos(0, 8) == 8          # cos(0) = 1 → +amplitude
     assert vm.gba_cos(64, 8) == 0         # cos(90°) = 0

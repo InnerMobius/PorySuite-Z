@@ -241,6 +241,49 @@ def parse_move_anim_table(root: str) -> List[str]:
     return re.findall(r"\.4byte\s+(\w+)", body)
 
 
+def _pretty_anim_name(token: str) -> str:
+    """``B_ANIM_STATUS_CONFUSION`` → ``Confusion``; ``General_StatsChange``
+    → ``Stats Change`` — a readable label for a non-move animation."""
+    s = token.strip()
+    for pre in ("B_ANIM_STATUS_", "B_ANIM_", "Status_", "General_", "Special_"):
+        if s.startswith(pre):
+            s = s[len(pre):]
+            break
+    # split snake_case and CamelCase into words
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", s)
+    words = [w for w in s.replace("_", " ").split() if w]
+    return " ".join(w.capitalize() for w in words) if words else token
+
+
+def parse_named_anim_table(root: str, table_label: str) -> List[tuple]:
+    """Parse a non-move animation table (``gBattleAnims_StatusConditions``,
+    ``gBattleAnims_General``, ``gBattleAnims_Special``) into ordered
+    ``[(display_name, script_label)]``.
+
+    Each entry is ``.4byte ScriptLabel  @ B_ANIM_*`` — the comment gives the
+    readable name (falls back to the label).  Returns ``[]`` when the table
+    or file is absent.
+    """
+    path = os.path.join(root, _SCRIPTS_REL)
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return []
+    m = re.search(re.escape(table_label) +
+                  r"::\s*\n((?:[ \t]*\.4byte\s+\w+[^\n]*\n|[ \t]*\n)+)", text)
+    if not m:
+        return []
+    out: List[tuple] = []
+    for label, comment in re.findall(
+            r"\.4byte\s+(\w+)[ \t]*(?:@[ \t]*(\S+))?", m.group(1)):
+        name = _pretty_anim_name(comment if comment else label)
+        out.append((name, label))
+    return out
+
+
 def move_label_to_name(label: str) -> str:
     """``Move_THUNDER_PUNCH`` -> ``Thunder Punch`` (fallback display name
     when the project's own move names aren't available)."""

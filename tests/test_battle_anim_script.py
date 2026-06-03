@@ -392,6 +392,32 @@ def test_resolve_timeline_follows_goto_tail_jump():
     assert not any(c.args == ["SE_NEVER"] for c in tl)
 
 
+def test_parse_named_anim_table(tmp_path):
+    text = (
+        "gBattleAnims_StatusConditions::\n"
+        "\t.4byte Status_Poison        @ B_ANIM_STATUS_PSN\n"
+        "\t.4byte Status_Confusion     @ B_ANIM_STATUS_CONFUSION\n"
+        "\n"
+        "\t.align 2\n"
+        "Status_Poison:\n\tend\n"
+    )
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "battle_anim_scripts.s").write_text(text, encoding="utf-8")
+    entries = mod.parse_named_anim_table(str(tmp_path),
+                                         "gBattleAnims_StatusConditions")
+    assert entries == [("Psn", "Status_Poison"),
+                       ("Confusion", "Status_Confusion")]
+    # Absent table → empty.
+    assert mod.parse_named_anim_table(str(tmp_path), "gBattleAnims_Nope") == []
+
+
+def test_pretty_anim_name():
+    assert mod._pretty_anim_name("B_ANIM_STATUS_CONFUSION") == "Confusion"
+    assert mod._pretty_anim_name("B_ANIM_STATS_CHANGE") == "Stats Change"
+    assert mod._pretty_anim_name("General_SubstituteFade") == "Substitute Fade"
+
+
 def test_find_anim_branches_and_choice():
     text = (
         "Move_CURSEISH:\n"

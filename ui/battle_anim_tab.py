@@ -69,7 +69,7 @@ from core.battle_anim_data import (
     BattleAnimSprite)
 from core.battle_anim_script import (
     parse_move_anim_table, parse_anim_scripts, resolve_timeline,
-    find_anim_branches,
+    find_anim_branches, parse_named_anim_table,
     parse_move_names, move_display_name, parse_sound_effects,
     rewrite_script_command, format_command,
     insert_script_command, delete_script_command, move_script_command,
@@ -259,6 +259,11 @@ class BattleAnimTab(QWidget):
         self._cur_timeline: list = []                       # resolved Commands of selected move
         self._dirty_moves: set = set()                      # labels with unsaved edits (amber)
         self._branch_choice: int = 0                        # choosetwoturnanim variant index
+        # Non-move animation tables (status conditions, general, special) —
+        # {category: [(display_name, script_label)]}.  "Moves" is built from
+        # the move table + gMoveNames separately.
+        self._anim_tables: Dict[str, list] = {}
+        self._anim_entries: list = []                       # current category's (display, label) entries
 
         # Composite-preview / layer-scrubber state (Move Animations tab).
         self._layer_frames: List[QPixmap] = []              # frames of selected layer sprite
@@ -327,12 +332,24 @@ class BattleAnimTab(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         pl.addWidget(splitter, 1)
 
-        # ── LEFT: searchable move list ──
+        # ── LEFT: animation category + searchable list ──
         left = QWidget()
         lv = QVBoxLayout(left)
         lv.setContentsMargins(0, 0, 0, 0)
+        # Category: move animations vs the non-move tables (status conditions,
+        # general effects, special) — all live in data/battle_anim_scripts.s.
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("Show:"))
+        self._anim_cat_combo = QComboBox()
+        self._anim_cat_combo.addItems(
+            ["Moves", "Status Conditions", "General", "Special"])
+        self._anim_cat_combo.wheelEvent = lambda e: e.ignore()
+        self._anim_cat_combo.currentIndexChanged.connect(
+            lambda _i: self._on_anim_category_changed())
+        cat_row.addWidget(self._anim_cat_combo, 1)
+        lv.addLayout(cat_row)
         self._move_search = QLineEdit()
-        self._move_search.setPlaceholderText("Search moves…")
+        self._move_search.setPlaceholderText("Search…")
         self._move_search.textChanged.connect(lambda _t: self._rebuild_move_list())
         lv.addWidget(self._move_search)
         self._move_count_lbl = QLabel("")
@@ -703,6 +720,14 @@ class BattleAnimTab(QWidget):
         self._cur_timeline = []
         try:
             self._move_table = parse_move_anim_table(project_root)
+            self._anim_tables = {
+                "Status Conditions": parse_named_anim_table(
+                    project_root, "gBattleAnims_StatusConditions"),
+                "General": parse_named_anim_table(
+                    project_root, "gBattleAnims_General"),
+                "Special": parse_named_anim_table(
+                    project_root, "gBattleAnims_Special"),
+            }
             self._scripts = parse_anim_scripts(project_root)
             self._move_names = parse_move_names(project_root)
             self._sound_effects = parse_sound_effects(project_root)
@@ -725,6 +750,7 @@ class BattleAnimTab(QWidget):
             self._template_tags = {}
             self._tpl_callbacks = {}
             self._callback_arch = {}
+            self._anim_tables = {}
 
         # Visual reset of the detail/right panel.
         self._pal_frame.setStyleSheet("")
@@ -773,6 +799,12 @@ class BattleAnimTab(QWidget):
             "spawns, delays, and visual effects in play order.")
         self._timeline.clear()
         self._update_edit_buttons()
+        # Reset category to Moves on (re)load, then build the entry list.
+        if hasattr(self, "_anim_cat_combo"):
+            self._anim_cat_combo.blockSignals(True)
+            self._anim_cat_combo.setCurrentIndex(0)
+            self._anim_cat_combo.blockSignals(False)
+        self._refresh_anim_entries()
         self._rebuild_move_list()
         # Reference mons: self-resolve from the project's graphics/pokemon
         # tree on every load / F5 (no host wiring needed), then push to the
@@ -1209,32 +1241,57 @@ class BattleAnimTab(QWidget):
 
     # ── Move Animations (timeline viewer) ────────────────────────────
 
+    def _refresh_anim_entries(self):
+        """Build ``self._anim_entries`` = ``[(display_name, script_label)]``
+        for the currently-selected category (Moves / Status / General /
+        Special), keeping only entries that have a parsed script."""
+        cat = (self._anim_cat_combo.currentText()
+               if hasattr(self, "_anim_cat_combo") else "Moves")
+        entries = []
+        if cat == "Moves":
+            for label in self._move_table:
+                if label in self._scripts:
+                    entries.append(
+                        (move_display_name(label, self._move_names), label))
+        else:
+            for name, label in self._anim_tables.get(cat, []):
+                if label in self._scripts:
+                    entries.append((name, label))
+        # Moves read best alphabetical; the small named tables keep their
+        # source order (poison, confusion, burn… — meaningful grouping).
+        if cat == "Moves":
+            entries.sort(key=lambda e: (e[0].lower(), e[1]))
+        self._anim_entries = entries
+
+    def _on_anim_category_changed(self):
+        self._stop_play_move()
+        self._move_current = None
+        self._branch_choice = 0
+        self._refresh_anim_entries()
+        self._rebuild_move_list()
+        self._timeline.clear()
+        self._update_edit_buttons()
+
     def _rebuild_move_list(self):
-        """Populate the move list (alphabetical by display name), filtered
-        to moves that actually have a parsed animation script."""
+        """Populate the list for the current category, filtered by search."""
         self._move_list.blockSignals(True)
         self._move_list.clear()
         needle = self._move_search.text().strip().lower()
-        rows = []
-        for idx, label in enumerate(self._move_table):
-            if label not in self._scripts:
-                continue
-            name = move_display_name(label, self._move_names)
+        for name, label in self._anim_entries:
             if needle and needle not in name.lower() and needle not in label.lower():
                 continue
-            rows.append((name, label, idx))
-        rows.sort(key=lambda r: (r[0].lower(), r[1]))
-        for name, label, idx in rows:
             item = QListWidgetItem(name)
             item.setData(Qt.ItemDataRole.UserRole, label)
-            item.setToolTip(f"{label}   (move #{idx})")
-            # Per-item amber for moves with unsaved timeline edits (Pattern A).
+            item.setToolTip(label)
+            # Per-item amber for entries with unsaved timeline edits (Pattern A).
             if label in self._dirty_moves:
                 item.setBackground(QColor("#3d2e00"))
             self._move_list.addItem(item)
             if label == self._move_current:
                 self._move_list.setCurrentItem(item)
-        self._move_count_lbl.setText(f"{len(rows)} moves")
+        shown = self._move_list.count()
+        cat = self._anim_cat_combo.currentText() if hasattr(self, "_anim_cat_combo") else ""
+        self._move_count_lbl.setText(f"{shown} {cat.lower() or 'entries'}")
         self._move_list.blockSignals(False)
 
     def _mark_move_dirty(self, label: str):
@@ -1809,7 +1866,16 @@ class BattleAnimTab(QWidget):
                 return
 
             if cmd.name in ("end", "return"):
-                self._stop_play_move()
+                # `end` ends the SCRIPT, but sprites already on screen keep
+                # living + animating until they self-destruct (the engine
+                # doesn't yank them).  Many scripts end with sprites still
+                # alive (Status_Confusion's 5 ducks live 90 frames after the
+                # `end`).  So don't clear instantly — drain to the end of the
+                # timeline and let the live sprites finish (the fall-through
+                # stop fires once the sim is idle).
+                self._play_idx = len(timeline)
+                self._wait_visual = True
+                self._visual_wait = 0
                 return
 
             if cmd.name in ("waitforvisualfinish", "waitsound"):
