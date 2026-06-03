@@ -67,7 +67,18 @@ class AnimEngine:
             raise EngineUnavailable("engine artifact missing: %s" % self.wasm_path)
         import wasmtime
         self._wt = wasmtime
-        self._engine = wasmtime.Engine()
+        # Enable fuel so a runaway task (an animation that loops forever under
+        # the host's stubbed conditions — e.g. a palette-wait that never
+        # satisfies) TRAPS instead of hanging the whole app. We refuel before
+        # each engine call; a single call that burns the per-call budget traps.
+        cfg = wasmtime.Config()
+        self._fuel = False
+        try:
+            cfg.consume_fuel = True
+            self._fuel = True
+        except Exception:
+            pass
+        self._engine = wasmtime.Engine(cfg)
         self._module = wasmtime.Module.from_file(self._engine, self.wasm_path)
         self._linker = wasmtime.Linker(self._engine)
         self._linker.define_wasi()
@@ -90,11 +101,31 @@ class AnimEngine:
     def has_task(self, name: str) -> bool:
         return name in self._task_index
 
+    # Per-call instruction budget. A normal engine_step costs ~1.8k (empty) to a
+    # few hundred-k (busy) instructions; 100M is a >100x margin over any real
+    # step, yet an infinite loop burns it in a fraction of a second and traps.
+    _CALL_FUEL = 100_000_000
+    _INIT_FUEL = 2_000_000_000   # instantiate + _initialize + setup
+
+    def _refuel(self, store):
+        """Reset the per-call fuel budget so the next engine call can't run away
+        and hang the app (it traps on exhaustion instead)."""
+        if self._fuel:
+            try:
+                store.set_fuel(self._CALL_FUEL)
+            except Exception:
+                pass
+
     # -- low-level instance --------------------------------------------------
     def _new_instance(self):
         wt = self._wt
         store = wt.Store(self._engine)
         store.set_wasi(wt.WasiConfig())
+        if self._fuel:
+            try:
+                store.set_fuel(self._INIT_FUEL)
+            except Exception:
+                self._fuel = False
         inst = self._linker.instantiate(store, self._module)
         ex = inst.exports(store)
         init = ex.get("_initialize")
@@ -172,10 +203,14 @@ class AnimEngine:
         dead = [False]   # set when a wasm trap (UB in some move) halts the engine
 
         def _safe(fn, *a):
-            """Call a wasm export; on a trap (e.g. divide-by-zero from residual
-            UB in some move) stop the move cleanly instead of crashing the tab."""
+            """Call a wasm export; on a trap (divide-by-zero UB, OR fuel
+            exhaustion from a task that loops forever under the host's stubbed
+            conditions) stop the move cleanly instead of hanging/crashing the
+            tab. Refuel first so a runaway call traps in a fraction of a second
+            instead of freezing the app."""
             if dead[0]:
                 return None
+            self._refuel(store)
             try:
                 return fn(store, *a)
             except Exception:
