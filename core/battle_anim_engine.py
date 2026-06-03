@@ -37,8 +37,14 @@ _SNAP = struct.Struct("<%di" % len(_SNAP_FIELDS))
 
 
 def _default_paths():
+    """Prefer the bundled, shipped engine (enginehost/dist/); fall back to the
+    local dev build (enginehost/buildwasm/) when working on the engine itself."""
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(os.path.join(here, ".."))
+    dist = os.path.join(root, "enginehost", "dist")
+    if os.path.exists(os.path.join(dist, "anim_engine.wasm")):
+        return (os.path.join(dist, "anim_engine.wasm"),
+                os.path.join(dist, "names.json"))
     base = os.path.join(root, "enginehost", "buildwasm")
     return (os.path.join(base, "anim_engine_reactor.wasm"),
             os.path.join(base, "names.json"))

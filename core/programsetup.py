@@ -889,6 +889,15 @@ DEPS = [
         "install_label": "pip install",
         "install_fn": lambda: _pip_install("mido>=1.3"),
     },
+    {
+        "category": "App / Editor",
+        "name": "wasmtime",
+        "description": "WebAssembly runtime — runs the real battle-animation engine so the Battle Anims preview plays moves correctly. Without it the preview falls back to an approximate view.",
+        "platform": None,
+        "check": lambda: _pkg_installed("wasmtime"),
+        "install_label": "pip install",
+        "install_fn": lambda: _pip_install("wasmtime>=20"),
+    },
     # ── category: Git ──────────────────────────────────────
     {
         "category": "Git",
@@ -985,6 +994,28 @@ DEPS = [
         "install_fn": _install_agbcc,
     },
 ]
+
+
+def missing_required_pip_deps():
+    """Names of REQUIRED pip packages that aren't importable.
+
+    Used at launch so a NEW dependency added in an update (e.g. wasmtime for the
+    battle-animation engine) re-opens Program Setup automatically, instead of
+    silently trusting the old 'setup complete' marker. Only non-optional pip
+    deps are checked (find_spec is reliable); toolchains/optional items aren't,
+    so a missing one never forces Setup open."""
+    missing = []
+    for dep in DEPS:
+        if dep.get("optional"):
+            continue
+        if dep.get("install_label") != "pip install":
+            continue
+        try:
+            if not dep["check"]():
+                missing.append(dep["name"])
+        except Exception:
+            pass
+    return missing
 
 
 # ──────────────────────────────────────────────────────────────

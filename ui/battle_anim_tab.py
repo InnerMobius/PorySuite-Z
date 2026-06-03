@@ -302,6 +302,7 @@ class BattleAnimTab(QWidget):
         # Native engine playback (the real game animation code via WASM).
         self._anim_engine = None           # core.battle_anim_engine.AnimEngine (lazy)
         self._anim_engine_failed = False   # tried + unavailable (don't retry every play)
+        self._engine_warned = False        # showed the "engine not installed" hint once
         self._engine_play = False          # this playback is engine-driven
         self._engine_frames: list = []     # precomputed per-frame OAM snapshots
         self._engine_idx = 0               # current frame in _engine_frames
@@ -1833,6 +1834,19 @@ class BattleAnimTab(QWidget):
         # WASM) and render its per-frame output. Falls back to the approximate
         # VM below only if the engine isn't installed.
         engine = self._get_anim_engine()
+        if engine is None and not self._engine_warned:
+            self._engine_warned = True
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.information(
+                    self, "Animation engine not installed",
+                    "The battle-animation preview plays best with the 'wasmtime' "
+                    "package, which runs the game's real animation engine.\n\n"
+                    "Open Program Setup (Help → Program Setup) and install it to "
+                    "see moves animate correctly. For now, an approximate preview "
+                    "is shown.")
+            except Exception:
+                pass
         if engine is not None:
             try:
                 ops = self._build_engine_ops(timeline)

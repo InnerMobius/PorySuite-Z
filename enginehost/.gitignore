@@ -7,3 +7,8 @@ buildwasm/
 *.wasm
 stub_gfx_data.c
 _main.c
+
+# ...but DO ship the prebuilt engine the app loads at runtime.
+!dist/
+!dist/anim_engine.wasm
+!dist/names.json

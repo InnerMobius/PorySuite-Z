@@ -37,7 +37,8 @@ from app_info import APP_NAME, AUTHOR, VERSION, get_data_dir
 from loadingproject import LoadingProject
 from mainwindow import MainWindow
 from projectselector import ProjectSelector
-from programsetup import ProgramSetup, get_setup_complete_path
+from programsetup import (
+    ProgramSetup, get_setup_complete_path, missing_required_pip_deps)
 
 
 class App:
@@ -110,9 +111,16 @@ class App:
             with open(projects_file, "w") as f:
                 json.dump(projects_data, f)
 
-        # Check if the required toolchain has been set up
+        # Check if the required toolchain has been set up. Also re-verify the
+        # required pip packages every launch: if an update added a new one
+        # (e.g. wasmtime for the battle-anim engine), re-open Setup so the user
+        # is prompted to install it — don't just trust the old "complete" marker.
         setup_path = get_setup_complete_path()
-        if not os.path.exists(setup_path):
+        try:
+            _missing = missing_required_pip_deps()
+        except Exception:
+            _missing = []
+        if not os.path.exists(setup_path) or _missing:
             setup_dialog = ProgramSetup()
             try:
                 # Make sure the setup dialog is visible and focused, even when
