@@ -90,6 +90,18 @@ from ui.palette_utils import read_jasc_pal, clamp_to_gba
 
 Color = Tuple[int, int, int]
 
+# Battler-selector constants passed as createsprite/task args (their real
+# engine values).  Callbacks branch on these (e.g. arg2 == 0 → attacker), so
+# parsing them as their values — not 0 — is essential for correct anchoring.
+_ANIM_ARG_CONSTS = {
+    "ANIM_ATTACKER": 0,
+    "ANIM_TARGET": 1,
+    "ANIM_ATK_PARTNER": 2,
+    "ANIM_DEF_PARTNER": 3,
+    "TRUE": 1,
+    "FALSE": 0,
+}
+
 _DIRTY_SS = "QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; margin-top: 6px; padding-top: 10px; }"
 _CARD_W, _CARD_H = 76, 80
 
@@ -1746,7 +1758,7 @@ class BattleAnimTab(QWidget):
         if self._wait_visual:
             self._visual_wait += 1
             still_busy = self._anim_sim.active() or self._pending_task_wait > 0
-            if still_busy and self._visual_wait < 45:
+            if still_busy and self._visual_wait < 30:
                 self._pending_task_wait = max(0, self._pending_task_wait - 1)
                 return
             self._wait_visual = False
@@ -1781,7 +1793,7 @@ class BattleAnimTab(QWidget):
                 return
 
             if cmd.name in ("createvisualtask", "createsoundtask"):
-                self._pending_task_wait = max(self._pending_task_wait, 24)
+                self._pending_task_wait = max(self._pending_task_wait, 16)
                 continue
 
             if cmd.name == "createsprite":
@@ -1844,9 +1856,9 @@ class BattleAnimTab(QWidget):
                     else:
                         vm_setup_linear(sprite, end, dur)
                 else:
-                    vm_setup_static(sprite, 60)
+                    vm_setup_static(sprite, 30)
             else:
-                vm_setup_static(sprite, 60)   # static/at-mon/on-mon/unknown
+                vm_setup_static(sprite, 30)   # static/at-mon/on-mon/unknown
             sprite.flip = flip
         if sprite is not None:
             if vm_is_ported(cb):
@@ -1864,24 +1876,25 @@ class BattleAnimTab(QWidget):
         from PyQt6.QtGui import QTransform
         return pix.transformed(QTransform().scale(-1, 1))
 
-    def _play_frame_pix(self, tag: str, idx: int, flip: bool):
-        """Return the cached (optionally H-flipped) frame pixmap for a tag.
-
-        Flipped frames are baked ONCE per tag and cached — re-creating ~25
-        ``transformed()`` pixmaps every frame churns GPU/RAM (a real crash +
-        jitter risk over Remote Desktop)."""
+    def _play_frame_pix(self, tag: str, idx: int, hflip: bool, vflip: bool):
+        """Return the cached frame pixmap for a tag, mirrored horizontally
+        and/or vertically as requested.  Each (tag, hflip, vflip) variant is
+        baked ONCE and cached — re-creating ~25 ``transformed()`` pixmaps
+        every frame churns GPU/RAM (a real crash + jitter risk over Remote
+        Desktop)."""
         frames = self._play_frame_cache.get(tag)
         if not frames:
             return None
         idx = max(0, min(idx, len(frames) - 1))
-        if not flip:
+        if not hflip and not vflip:
             return frames[idx]
-        fc = self._play_flip_cache.get(tag)
+        key = (tag, hflip, vflip)
+        fc = self._play_flip_cache.get(key)
         if fc is None:
             from PyQt6.QtGui import QTransform
-            tr = QTransform().scale(-1, 1)
+            tr = QTransform().scale(-1 if hflip else 1, -1 if vflip else 1)
             fc = [f.transformed(tr) for f in frames]
-            self._play_flip_cache[tag] = fc
+            self._play_flip_cache[key] = fc
         return fc[idx]
 
     def _render_play_composite(self):
@@ -1909,7 +1922,8 @@ class BattleAnimTab(QWidget):
                 # Sprites that advance their own frame cursor (e.g. the nail)
                 # use it; others cycle gently with age.
                 idx = s.frame_advance if s.frame_advance else (s.age // 4)
-                pix = self._play_frame_pix(s.tag, idx % len(frames), s.flip)
+                pix = self._play_frame_pix(s.tag, idx % len(frames),
+                                           s.flip, s.flip_v)
                 if pix is None or pix.isNull():
                     continue
                 painter.drawPixmap(int(s.render_x - pix.width() // 2),
@@ -1923,11 +1937,20 @@ class BattleAnimTab(QWidget):
 
     @staticmethod
     def _int_or(s, default=0):
-        """Parse a C-style int literal (incl. negatives / 0x), else default
-        (used for best-effort x/y/subpriority — many args are constants we
-        can't evaluate without the engine)."""
+        """Parse a C-style int literal (incl. negatives / 0x), or a known
+        anim constant, else default.
+
+        Battler-selector args are passed as constants, not numbers
+        (``ANIM_TARGET`` etc.), and several callbacks branch on them (e.g.
+        AnimHitSplatBasic: arg2 == 0 → attacker, else target).  Mapping them
+        to their real engine values is why Bite's hit-splat lands on the
+        victim instead of the attacker."""
+        raw = str(s).strip()
+        const = _ANIM_ARG_CONSTS.get(raw)
+        if const is not None:
+            return const
         try:
-            return int(str(s).strip(), 0)
+            return int(raw, 0)
         except (ValueError, TypeError):
             return default
 

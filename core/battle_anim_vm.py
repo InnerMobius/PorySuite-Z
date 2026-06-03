@@ -65,7 +65,7 @@ class Sprite:
 
     __slots__ = ("x", "y", "x2", "y2", "data", "tile", "invisible", "alive",
                  "callback", "callback6", "tag", "subpriority", "age",
-                 "frame_advance", "flip", "_ctx")
+                 "frame_advance", "flip", "flip_v", "_ctx")
 
     def __init__(self, tag: str = "", subpriority: int = 0):
         self.x = 0
@@ -83,6 +83,7 @@ class Sprite:
         self.age = 0             # frames lived (for fallback lifetime + frame cycle)
         self.frame_advance = 0   # how many sheet-frames the sprite has advanced
         self.flip = False        # horizontal flip (set by the renderer's side rule)
+        self.flip_v = False      # vertical flip (affine-anim flip, e.g. Bite's lower jaw)
 
     @property
     def render_x(self) -> int:
@@ -280,6 +281,43 @@ def _cb_ghost_status_step(s: Sprite, ctx: AnimContext) -> None:
         s.alive = False
 
 
+def _cb_bite(s: Sprite, ctx: AnimContext) -> None:
+    """AnimBite (Bite / Crunch fangs): a tooth auto-created at the target,
+    offset above/below it, that closes toward the centre over arg5 frames
+    then opens back and destroys.  arg2 selects the affine anim — a non-zero
+    index is the vertically-flipped LOWER jaw."""
+    s.x = ctx.target.x + ctx.arg(0)
+    s.y = ctx.target.y + ctx.arg(1)
+    s.flip_v = (ctx.arg(2) != 0)      # affine index 4 → flipped bottom jaw
+    s.data[0] = ctx.arg(3)            # x velocity (fixed-point)
+    s.data[1] = ctx.arg(4)            # y velocity (fixed-point)
+    s.data[2] = max(1, ctx.arg(5))    # half-duration (close, then open)
+    s.data[3] = 0
+    s.data[4] = 0                     # x accumulator
+    s.data[5] = 0                     # y accumulator
+    s.callback = _cb_bite_step1
+
+
+def _cb_bite_step1(s: Sprite, ctx: AnimContext) -> None:
+    s.data[4] += s.data[0]
+    s.data[5] += s.data[1]
+    s.x2 = s.data[4] >> 8
+    s.y2 = s.data[5] >> 8
+    s.data[3] += 1
+    if s.data[3] >= s.data[2]:
+        s.callback = _cb_bite_step2
+
+
+def _cb_bite_step2(s: Sprite, ctx: AnimContext) -> None:
+    s.data[4] -= s.data[0]
+    s.data[5] -= s.data[1]
+    s.x2 = s.data[4] >> 8
+    s.y2 = s.data[5] >> 8
+    s.data[3] -= 1
+    if s.data[3] <= 0:
+        s.alive = False
+
+
 # Registry: callback symbol → ported init function.
 CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "TranslateAnimSpriteToTargetMonLocation": _cb_translate_to_target,
@@ -287,6 +325,7 @@ CALLBACKS: Dict[str, Callable[[Sprite, AnimContext], None]] = {
     "AnimHitSplatBasic": _cb_on_mon_pos,
     "AnimCurseNail": _cb_curse_nail,
     "AnimGhostStatusSprite": _cb_ghost_status,
+    "AnimBite": _cb_bite,
 }
 
 

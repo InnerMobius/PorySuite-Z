@@ -180,6 +180,30 @@ def test_setup_static_holds_then_destroys():
     assert not s.alive
 
 
+def test_bite_teeth_close_then_destroy_and_lower_jaw_flips():
+    # Upper fang: starts above the target (arg1=-32), closes toward centre.
+    up = _ctx(args=[0, -32, 0, 0, 819, 10])
+    s = vm.spawn("AnimBite", up, tag="ANIM_TAG_SHARP_TEETH")
+    assert s.flip_v is False
+    assert s.y == up.target.y - 32          # starts above target
+    ys = []
+    for _ in range(10):
+        s.step(up)
+        ys.append(s.render_y)
+    assert ys[-1] > ys[0]                    # moved DOWN toward centre (closing)
+    # Then it opens back and self-destructs.
+    for _ in range(20):
+        if not s.alive:
+            break
+        s.step(up)
+    assert not s.alive
+    # Lower fang: arg2 != 0 → vertically flipped.
+    lo = _ctx(args=[0, 32, 4, 0, -819, 10])
+    s2 = vm.spawn("AnimBite", lo, tag="ANIM_TAG_SHARP_TEETH")
+    assert s2.flip_v is True
+    assert s2.y == lo.target.y + 32          # starts below target
+
+
 def test_animsim_steps_and_prunes():
     ctx = _ctx()
     sim = vm.AnimSim(ctx)
