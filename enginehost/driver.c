@@ -1,0 +1,178 @@
+/* driver.c — exported-function interface for the headless animation engine
+ * (WASM reactor module). Python (via wasmtime) drives a whole move:
+ *
+ *   engine_reset(attackerIsPlayer)
+ *   engine_set_arg(i, value)              // gBattleAnimArgs before a create
+ *   engine_create_sprite(tplIndex, battler, subpriority)   -> spriteId
+ *   engine_create_task(taskIndex)         -> taskId
+ *   engine_step()                         // one GBA frame
+ *   engine_snapshot()                     -> count of active sprites
+ *   engine_snapshot_addr()                -> address of the snapshot buffer
+ *
+ * Python reads the snapshot array straight out of wasm linear memory. The
+ * engine computes MOTION only; pixels are drawn in Qt from the project's PNGs.
+ *
+ * Template/task indices come from names.json (gen_tables.py), so any template
+ * the project defines is addressable.
+ */
+
+#include "global.h"
+#include "gflib.h"
+#include "sprite.h"
+#include "task.h"
+#include "battle_anim.h"
+#include "constants/battle_anim.h"
+
+extern const struct SpriteTemplate *const gHostTemplates[];
+extern const int gHostTemplateCount;
+typedef void (*HostTaskFn)(u8);
+extern HostTaskFn const gHostTasks[];
+extern const int gHostTaskCount;
+
+extern u8 gBattleAnimAttacker, gBattleAnimTarget;
+extern s16 gBattleAnimArgs[];
+
+/* Position-holder template for the two mon sprites (non-TAG_NONE so CreateSprite
+ * doesn't deref a null image table). Python draws the real mon. */
+static const struct SpriteTemplate sMonTemplate = {
+    .tileTag = 0, .paletteTag = 0, .oam = &gDummyOamData,
+    .anims = gDummySpriteAnimTable, .images = NULL,
+    .affineAnims = gDummySpriteAffineAnimTable, .callback = SpriteCallbackDummy,
+};
+
+/* Which host-template index each sprite came from (-1 = mon / internal). */
+static int sSpriteTpl[MAX_SPRITES];
+
+struct Snap {
+    int id;
+    int x, y, x2, y2;
+    int tileNum, shape, size;
+    int matrixNum, mA, mB, mC, mD;
+    int hFlip, vFlip, affineMode;
+    int priority, subpriority, paletteNum;
+    int invisible;
+    int templateIndex;   /* host index, or -1 */
+    int isMon;           /* battler index if a mon sprite, else -1 */
+};
+static struct Snap sSnap[MAX_SPRITES];
+
+__attribute__((export_name("engine_reset")))
+void engine_reset(int attackerIsPlayer)
+{
+    int i;
+    ResetSpriteData();
+    ResetTasks();
+    for (i = 0; i < MAX_SPRITES; i++)
+        sSpriteTpl[i] = -1;
+    for (i = 0; i < ANIM_ARGS_COUNT; i++)
+        gBattleAnimArgs[i] = 0;
+
+    gBattleTypeFlags = 0;
+    gBattlersCount = 2;
+    gBattlerPositions[0] = 0; gBattlerPositions[1] = 1;
+    gBattlerPositions[2] = 2; gBattlerPositions[3] = 3;
+    gBattlerPartyIndexes[0] = 0; gBattlerPartyIndexes[1] = 0;
+
+    /* Player mon at (72,80), enemy at (176,40). Attacker = player or enemy. */
+    gBattlerSpriteIds[0] = CreateSprite(&sMonTemplate, 72, 80, 10);
+    gBattlerSpriteIds[1] = CreateSprite(&sMonTemplate, 176, 40, 10);
+    if (attackerIsPlayer) { gBattleAnimAttacker = 0; gBattleAnimTarget = 1; }
+    else                  { gBattleAnimAttacker = 1; gBattleAnimTarget = 0; }
+}
+
+__attribute__((export_name("engine_set_arg")))
+void engine_set_arg(int i, int value)
+{
+    if (i >= 0 && i < ANIM_ARGS_COUNT)
+        gBattleAnimArgs[i] = (s16)value;
+}
+
+/* Mirrors Cmd_createsprite: position at the target's coords, run the template's
+ * callback every frame. battler selects attacker/target subpriority anchor. */
+__attribute__((export_name("engine_create_sprite")))
+int engine_create_sprite(int tplIndex, int battler, int subpriority)
+{
+    u8 id;
+    int coordBattler = (battler == 0) ? gBattleAnimAttacker : gBattleAnimTarget;
+    if (tplIndex < 0 || tplIndex >= gHostTemplateCount)
+        return -1;
+    (void)coordBattler;
+    id = CreateSpriteAndAnimate(
+        gHostTemplates[tplIndex],
+        GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_X_2),
+        GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_Y_PIC_OFFSET),
+        (u8)subpriority);
+    if (id < MAX_SPRITES)
+        sSpriteTpl[id] = tplIndex;
+    return id;
+}
+
+__attribute__((export_name("engine_create_task")))
+int engine_create_task(int taskIndex)
+{
+    u8 tid;
+    if (taskIndex < 0 || taskIndex >= gHostTaskCount)
+        return -1;
+    tid = CreateTask(gHostTasks[taskIndex], 5);
+    gHostTasks[taskIndex](tid);   /* engine calls the task once on creation */
+    return tid;
+}
+
+__attribute__((export_name("engine_step")))
+void engine_step(void)
+{
+    AnimateSprites();
+    RunTasks();
+}
+
+static int sIsMonSprite(int id)
+{
+    if (id == gBattlerSpriteIds[0]) return 0;
+    if (id == gBattlerSpriteIds[1]) return 1;
+    return -1;
+}
+
+__attribute__((export_name("engine_snapshot")))
+int engine_snapshot(void)
+{
+    int i, n = 0;
+    for (i = 0; i < MAX_SPRITES; i++)
+    {
+        struct Sprite *s = &gSprites[i];
+        struct Snap *o;
+        if (!s->inUse)
+            continue;
+        o = &sSnap[n++];
+        o->id = i;
+        o->x = s->x; o->y = s->y; o->x2 = s->x2; o->y2 = s->y2;
+        o->tileNum = s->oam.tileNum;
+        o->shape = s->oam.shape; o->size = s->oam.size;
+        o->matrixNum = s->oam.matrixNum;
+        o->affineMode = s->oam.affineMode;
+        if (s->oam.affineMode != ST_OAM_AFFINE_OFF)
+        {
+            struct OamMatrix *m = &gOamMatrices[s->oam.matrixNum];
+            o->mA = m->a; o->mB = m->b; o->mC = m->c; o->mD = m->d;
+        }
+        else { o->mA = 256; o->mB = 0; o->mC = 0; o->mD = 256; }
+        o->hFlip = s->hFlip; o->vFlip = s->vFlip;
+        o->priority = s->oam.priority; o->subpriority = s->subpriority;
+        o->paletteNum = s->oam.paletteNum;
+        o->invisible = s->invisible;
+        o->templateIndex = sSpriteTpl[i];
+        o->isMon = sIsMonSprite(i);
+    }
+    return n;
+}
+
+__attribute__((export_name("engine_snapshot_addr")))
+int engine_snapshot_addr(void)
+{
+    return (int)(intptr_t)&sSnap[0];
+}
+
+__attribute__((export_name("engine_snap_stride")))
+int engine_snap_stride(void)
+{
+    return (int)sizeof(struct Snap);
+}

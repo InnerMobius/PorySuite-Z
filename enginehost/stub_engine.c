@@ -235,5 +235,27 @@ u8 ScanlineEffect_InitWave(u8 a, u8 b, u8 c, u8 d, u8 e, u8 f, bool8 g) { (void)
 void ScanlineEffect_SetParams(struct ScanlineEffectParams p) { (void)p; }
 void ScanlineEffect_Stop(void) {}
 
-u8 SmokescreenImpact(s16 x, s16 y, u8 a) { (void)x;(void)y;(void)a; return 0; }
+/* SmokescreenImpact is real (battle_anim_smokescreen.c is compiled). */
 void UpdatePlayerPosInThrowAnim(struct Sprite *s) { (void)s; }
+
+/* ── extra symbols pulled in by smokescreen / special (ball throw, level-up) ── */
+u8 gBattleCommunication[BATTLE_COMMUNICATION_ENTRIES_COUNT];
+bool8 gDoingBattleAnim;
+u16 gLastUsedItem;
+static struct SaveBlock2 sSaveBlock2;
+struct SaveBlock2 *gSaveBlock2Ptr = &sSaveBlock2;
+const u32 gSmokescreenImpactPalette[8] = {0};
+const u32 gSmokescreenImpactTiles[8] = {0};
+const u32 gUnusedLevelupAnimationGfx[8] = {0};
+const u32 gUnusedLevelupAnimationTilemap[8] = {0};
+/* Ball templates (catch animation only) — dummy but with a valid OAM + dummy
+ * callback so a stray ball sprite can't deref NULL. */
+const struct SpriteTemplate gBallSpriteTemplates[16];
+
+const u32 gBattleAnimSpriteGfx_Particles[] = {0};
+void m4aMPlayAllStop(void) {}
+void ClearBehindSubstituteBit(u8 b) { (void)b; }
+void FreeBallGfx(u8 b) { (void)b; }
+void LoadBallGfx(u8 b) { (void)b; }
+void SpriteCB_PlayerThrowInit(struct Sprite *s) { (void)s; }
+void SpriteCB_SetInvisible(struct Sprite *s) { if (s) s->invisible = TRUE; }
