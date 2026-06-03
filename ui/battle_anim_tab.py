@@ -50,7 +50,7 @@ if not _log.handlers:
         pass
 
 from PyQt6.QtCore import Qt, QObject, QEvent, QTimer, QSize, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPixmap
+from PyQt6.QtGui import QColor, QImage, QPixmap, qRgb, qRgba
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QGroupBox, QScrollArea, QGridLayout, QFrame, QSplitter, QSizePolicy,
@@ -1841,6 +1841,77 @@ class BattleAnimTab(QWidget):
                 return -ys                           # descend downward
         return None
 
+    # (shape, size) → (width_tiles, height_tiles). GBA OAM dimensions.
+    _OAM_TILE_DIMS = {
+        (0, 0): (1, 1), (0, 1): (2, 2), (0, 2): (4, 4), (0, 3): (8, 8),  # square
+        (1, 0): (2, 1), (1, 1): (4, 1), (1, 2): (4, 2), (1, 3): (8, 4),  # wide
+        (2, 0): (1, 2), (2, 1): (1, 4), (2, 2): (2, 4), (2, 3): (4, 8),  # tall
+    }
+
+    def _tiles_path_for(self, sprite):
+        """The combined ``.4bpp`` tile sheet for a sprite whose PNG source is
+        SPLIT into numbered per-frame files (ice_crystals_0.png, _1.png, … with
+        no single ice_crystals.png). The .4bpp is the authoritative combined
+        sheet the engine indexes by tile, so we render straight from it. Returns
+        "" when there's no usable .4bpp."""
+        if not sprite or not sprite.png_path or not sprite.png_path.endswith(".png"):
+            return ""
+        cand = sprite.png_path[:-4] + ".4bpp"
+        return cand if os.path.isfile(cand) else ""
+
+    def _render_4bpp_frame(self, sprite, palette, tile_num, shape, size,
+                           hflip, vflip):
+        """Render one OAM frame straight from the combined ``.4bpp`` tile stream
+        (for split-PNG sprites: ice, spark, mud_sand, …). ``tile_num`` is the
+        frame's start tile (the engine's frame-relative tileNum); the OAM
+        (shape,size) gives the frame's tile dimensions. Slot 0 is transparent.
+        Cached per (tag, tile, shape, size, flip)."""
+        key = (sprite.tag, int(tile_num), int(shape), int(size),
+               bool(hflip), bool(vflip))
+        cached = self._tiles_frame_cache.get(key)
+        if cached is not None:
+            return cached or None
+        data = self._tiles_bytes_cache.get(sprite.tag)
+        if data is None:
+            path = self._tiles_path_for(sprite)
+            try:
+                data = open(path, "rb").read() if path else b""
+            except Exception:
+                data = b""
+            self._tiles_bytes_cache[sprite.tag] = data
+        Wt, Ht = self._OAM_TILE_DIMS.get((int(shape), int(size)), (1, 1))
+        ntiles = len(data) // 32
+        if ntiles == 0:
+            self._tiles_frame_cache[key] = False
+            return None
+        img = QImage(Wt * 8, Ht * 8, QImage.Format.Format_Indexed8)
+        ctab = [qRgb(c[0], c[1], c[2]) for c in (palette or [])[:16]]
+        while len(ctab) < 16:
+            ctab.append(qRgb(0, 0, 0))
+        ctab[0] = qRgba(0, 0, 0, 0)            # slot 0 = transparent
+        img.setColorTable(ctab)
+        img.fill(0)
+        for ty in range(Ht):
+            for tx in range(Wt):
+                ti = tile_num + ty * Wt + tx
+                if ti < 0 or ti >= ntiles:
+                    continue
+                base = ti * 32
+                for py in range(8):
+                    row = base + py * 4
+                    for px in range(8):
+                        b = data[row + (px >> 1)]
+                        pix = (b >> 4) if (px & 1) else (b & 0xF)
+                        if pix:
+                            img.setPixel(tx * 8 + px, ty * 8 + py, pix)
+        pm = QPixmap.fromImage(img)
+        if hflip or vflip:
+            from PyQt6.QtGui import QTransform
+            pm = pm.transformed(QTransform().scale(-1 if hflip else 1,
+                                                   -1 if vflip else 1))
+        self._tiles_frame_cache[key] = pm
+        return pm
+
     def _render_engine_frame(self, frame):
         """Draw one engine OAM snapshot into the preview: transform the mons
         (shake / sway / squeeze / lunge) and composite the effect sprites at
@@ -1904,13 +1975,25 @@ class BattleAnimTab(QWidget):
                 name = eng.template_name(s["templateIndex"]) if eng else None
                 tag = self._template_tags.get(name, "") if name else ""
                 frames = self._play_frame_cache.get(tag)
-                if not frames:
-                    continue
-                fw, fh = self._frame_sizes.get(tag, (0, 0))
-                tpf = max(1, (fw // 8) * (fh // 8)) if (fw and fh) else 1
-                fi = s["tileNum"] // tpf
-                fi = max(0, min(fi, len(frames) - 1))
-                pix = self._play_frame_pix(tag, fi, bool(s["hFlip"]), bool(s["vFlip"]))
+                if frames:
+                    fw, fh = self._frame_sizes.get(tag, (0, 0))
+                    tpf = max(1, (fw // 8) * (fh // 8)) if (fw and fh) else 1
+                    fi = s["tileNum"] // tpf
+                    fi = max(0, min(fi, len(frames) - 1))
+                    pix = self._play_frame_pix(tag, fi, bool(s["hFlip"]),
+                                               bool(s["vFlip"]))
+                else:
+                    # No PNG sheet — render from the combined .4bpp tile stream.
+                    # (Sprites whose PNG source is split into numbered frame
+                    # files: ice_crystals, ice_cube, spark, mud_sand, flower —
+                    # so Ice Beam / Ice Punch / Hail / Spark draw at all.)
+                    sprite = self._sprites.get(tag)
+                    if sprite is None:
+                        continue
+                    pal = self._palettes.get(tag) or self._palette_for(sprite)
+                    pix = self._render_4bpp_frame(
+                        sprite, pal, s["tileNum"], s["shape"], s["size"],
+                        bool(s["hFlip"]), bool(s["vFlip"]))
                 if pix is None or pix.isNull():
                     continue
                 if s["affineMode"] != 0:
@@ -1939,6 +2022,8 @@ class BattleAnimTab(QWidget):
         # Pre-bake frame pixmaps for every createsprite tag in this timeline.
         self._play_frame_cache = {}
         self._play_flip_cache = {}
+        self._tiles_frame_cache = {}   # .4bpp-rendered frames (split-PNG sprites)
+        self._tiles_bytes_cache = {}   # raw .4bpp bytes per tag
         for cmd in timeline:
             if cmd.name == "createsprite":
                 cs = parse_createsprite(cmd)
