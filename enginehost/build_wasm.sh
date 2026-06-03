@@ -39,6 +39,14 @@ for path in $SRC_PATHS; do
   if [ "$f" = "battle_anim_mons" ]; then
     EXTRA="-DRunAffineAnimFromTaskData=RunAffineAnimFromTaskData_ORIG"
   fi
+  # MoveBattlerSpriteToBG copies a mon onto a BG layer via hardware-address VRAM
+  # fills (BG_SCREEN_ADDR/BG_PLTT) that fault under wasm — trapping the wall moves
+  # (Barrier/Light Screen/Reflect/Mirror Coat/Magic Coat) + dark moves. It's
+  # cosmetic (the wall sprite is the real visual), so rename its definition and
+  # let stub_engine.c supply a no-op; the mon stays a sprite + the wall draws.
+  if [ "$f" = "battle_anim" ]; then
+    EXTRA="-DMoveBattlerSpriteToBG=MoveBattlerSpriteToBG_ORIG"
+  fi
   "$CLANG" -c $CFLAGS $EXTRA $PRE $INC "$path" -o "$OUT/$f.o"
 done
 for s in stub_engine stub_gfx_data driver; do

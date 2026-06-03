@@ -312,6 +312,17 @@ void LoadBallGfx(u8 b) { (void)b; }
 void SpriteCB_PlayerThrowInit(struct Sprite *s) { (void)s; }
 void SpriteCB_SetInvisible(struct Sprite *s) { if (s) s->invisible = TRUE; }
 
+/* No-op MoveBattlerSpriteToBG (the project's copy is renamed _ORIG via the build
+ * -D). The real one copies a mon onto a BG layer through hardware-address VRAM
+ * fills that fault under wasm, trapping the wall moves (Barrier/Light Screen/
+ * Reflect/Mirror Coat/Magic Coat) + dark moves. It's cosmetic — leaving the mon
+ * as a sprite + drawing the wall over it is fine for the preview. */
+void MoveBattlerSpriteToBG(u8 battlerId, u8 toBG_2)
+{
+    (void)battlerId;
+    (void)toBG_2;
+}
+
 /* --- ABI-correct RunAffineAnimFromTaskData ---------------------------------
  * The decomp indexes the affine-anim command table with a HARDCODED 8-byte
  * stride: `LoadPointerFromVars(...) + (task->data[7] << 3)`. That matches the
