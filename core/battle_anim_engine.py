@@ -185,23 +185,39 @@ class AnimEngine:
                       sounds_out: Optional[list] = None,
                       bgscroll_out: Optional[list] = None,
                       bg2scroll_out: Optional[list] = None) -> List[List[dict]]:
-        """Run a whole move and return one OAM snapshot per GBA frame.
+        """Run a whole move and return one OAM snapshot per GBA frame, RESILIENT
+        to a single sprite/task whose creation traps the host engine.
 
-        ``ops`` is the move's resolved commands as plain dicts (the tab builds
-        these from its parsed timeline):
-          {"op":"createsprite","template":str,"battler":int,"subpriority":int,"args":[int]}
-          {"op":"createvisualtask","func":str,"args":[int]}
-          {"op":"delay","frames":int}
-          {"op":"waitforvisualfinish"}  /  {"op":"end"}
-
-        Commands execute until a delay/wait (same frame, like the engine's script
-        interpreter); each engine step yields one frame. After the timeline, any
-        still-living sprites/tasks are drained so the move plays out fully (the
-        engine self-destructs them) — no abrupt cut at ``end``.
+        Some sprite callbacks hit a wasm memory fault under the host's stubbed
+        state (e.g. a latent sign-extension in the game's address-reconstruction
+        that only bites at certain wasm addresses). A trap poisons the whole wasm
+        instance, so the rest of the move would be lost. Instead of giving up, we
+        BAN the sprite/task that trapped and REPLAY the move without it — so every
+        other sprite still animates. Project-agnostic: no hardcoded move list.
         """
+        banned: set = set()
+        frames: List[List[dict]] = []
+        for _attempt in range(8):
+            for lst in (sounds_out, bgscroll_out, bg2scroll_out):
+                if lst is not None:
+                    del lst[:]                    # clear partial data from a retry
+            frames, trapped = self._play_once(
+                ops, attacker_is_player, max_frames, wait_cap,
+                sounds_out, bgscroll_out, bg2scroll_out, banned)
+            if trapped is None:
+                break
+            banned.add(trapped)                   # skip the trapping item, replay
+        return frames
+
+    def _play_once(self, ops, attacker_is_player, max_frames, wait_cap,
+                   sounds_out, bgscroll_out, bg2scroll_out, banned):
+        """One playthrough. Returns (frames, trapped_item): trapped_item is the
+        template/func name whose CREATION trapped (so the caller can ban + replay)
+        or None if the run finished without a creation trap."""
         store, ex = self.open(attacker_is_player)
         frames: List[List[dict]] = []
         dead = [False]   # set when a wasm trap (UB in some move) halts the engine
+        trapped_on = [None]   # template/func being created when a trap hit
 
         def _safe(fn, *a):
             """Call a wasm export; on a trap (divide-by-zero UB, OR fuel
@@ -282,18 +298,26 @@ class AnimEngine:
                 break
             k = op.get("op")
             if k == "createsprite":
-                idx = self._tpl_index.get(op["template"])
-                if idx is not None:
+                tpl = op["template"]
+                idx = self._tpl_index.get(tpl)
+                if idx is not None and tpl not in banned:
                     for i, v in enumerate(op.get("args", [])[:8]):
                         _safe(ex["engine_set_arg"], i, int(v))
                     _safe(ex["engine_create_sprite"], idx,
                           int(op.get("battler", 1)), int(op.get("subpriority", 3)))
+                    if dead[0]:                   # its creation trapped → ban + replay
+                        trapped_on[0] = tpl
+                        break
             elif k == "createvisualtask":
-                idx = self._task_index.get(op["func"])
-                if idx is not None:
+                fn = op["func"]
+                idx = self._task_index.get(fn)
+                if idx is not None and fn not in banned:
                     for i, v in enumerate(op.get("args", [])[:8]):
                         _safe(ex["engine_set_arg"], i, int(v))
                     _safe(ex["engine_create_task"], idx)
+                    if dead[0]:
+                        trapped_on[0] = fn
+                        break
             elif k == "delay":
                 for _ in range(max(1, int(op.get("frames", 1)))):
                     if dead[0] or len(frames) >= max_frames:
@@ -314,4 +338,4 @@ class AnimEngine:
                 frames.append(self._snapshot(store, ex))
             except Exception:
                 pass
-        return frames
+        return frames, trapped_on[0]

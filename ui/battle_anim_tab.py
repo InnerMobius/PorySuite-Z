@@ -1996,7 +1996,13 @@ class BattleAnimTab(QWidget):
                        if s.get("isMon", -1) == -1
                        and (s.get("templateIndex", -1) >= 0
                             or s.get("tileTag", -1) >= 10000)]
-            for s in sorted(effects, key=lambda s: -s["subpriority"]):
+            # Draw order = the GBA's: sort key is (oam.priority<<8 | subpriority);
+            # a LOWER key is drawn IN FRONT. So draw highest-key first (behind),
+            # lowest-key last (on top). Including oam.priority (not just
+            # subpriority) is what fixes cross-priority layering.
+            for s in sorted(effects, key=lambda s:
+                            -(((s.get("priority", 0) & 3) << 8)
+                              | (s.get("subpriority", 0) & 0xFF))):
                 if s["invisible"]:
                     continue
                 ti = s.get("templateIndex", -1)
@@ -2077,6 +2083,8 @@ class BattleAnimTab(QWidget):
         self._play_wait = 0
         self._play_tick = 0
         self._last_sound_tick = -100   # reset throttle so replays play sound
+        self._last_cry_tick = -100     # reset per move, else the 2nd+ cry move
+                                       # is wrongly suppressed (one cry, then dead)
         self._last_sound_se = ""
         self._pending_task_wait = 0    # createvisualtask duration owed to waitforvisualfinish
         self._wait_visual = False
