@@ -1774,12 +1774,16 @@ class BattleAnimTab(QWidget):
             return
 
         # waitforvisualfinish: hold until the live sprites finish (self-
-        # destruct) + any owed visual-task time — the multi-step gate.  Capped
-        # so a long-lived fallback sprite can't stall playback for seconds.
+        # destruct) + any owed visual-task time — the multi-step gate.  The
+        # cap is only a safety net against a sprite that never dies; it must
+        # be GENEROUS or it truncates real animations (the Confuse Ray spiral
+        # runs 61 frames — a 30-frame cap cut it off at half a circle, then
+        # `end` cleared the scene).  Static fallbacks self-destruct at ~30
+        # frames, so they don't hold it long regardless.
         if self._wait_visual:
             self._visual_wait += 1
             still_busy = self._anim_sim.active() or self._pending_task_wait > 0
-            if still_busy and self._visual_wait < 30:
+            if still_busy and self._visual_wait < 120:
                 self._pending_task_wait = max(0, self._pending_task_wait - 1)
                 return
             self._wait_visual = False
