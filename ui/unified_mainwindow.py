@@ -946,6 +946,15 @@ class UnifiedMainWindow(QMainWindow):
             if hasattr(self, '_sound_editor'):
                 _ba_mod._preview_sound_cb = self._sound_preview_song
                 _ba_mod._stop_sound_cb = self._sound_stop_preview
+            # Cry moves (Growl / Howl / Hyper Voice …) play the selected mon's
+            # cry in the preview — reuse the Pokemon tab's cry player.
+            def _play_cry(species_const):
+                try:
+                    from ui.audio_player import get_audio_player
+                    return get_audio_player().play_cry(species_const)
+                except Exception:
+                    return False
+            _ba_mod._preview_cry_cb = _play_cry
         except Exception:
             pass
 

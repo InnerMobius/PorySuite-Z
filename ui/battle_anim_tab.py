@@ -124,6 +124,7 @@ _KIND_DEFAULT = ("·", "#777777")           # · default
 # same module-callback pattern EVENTide's playse ▶ button uses).  Left
 # None in standalone contexts (the ▶ button then no-ops gracefully).
 _preview_sound_cb = None   # Callable[[str], bool]  — constant -> play it
+_preview_cry_cb = None     # Callable[[str], bool]  — SPECIES_ const -> play cry
 _stop_sound_cb = None      # Callable[[], None]      — stop any preview
 
 # Item role holding the SE_* constant on any sound row (used by the
@@ -1724,8 +1725,16 @@ class BattleAnimTab(QWidget):
             elif c.name == "createvisualtask":
                 vt = parse_createvisualtask(c)
                 if vt:
+                    args = [self._int_or(a) for a in vt.args]
                     ops.append({"op": "createvisualtask", "func": vt.addr,
-                                "args": [self._int_or(a) for a in vt.args]})
+                                "args": args})
+                    # A cry sound task (Growl/Roar = PlayDoubleCry, Howl =
+                    # PlayCryWithEcho, Metal Sound = PlayCryHighPitch, …):
+                    # schedule the selected mon's cry. Every cry move plays the
+                    # ATTACKER's cry, so play that.
+                    if (vt.addr.startswith("SoundTask_Play")
+                            and "Cry" in vt.addr):
+                        ops.append({"op": "sound", "se": "__CRY__"})
             elif c.name == "delay":
                 ops.append({"op": "delay",
                             "frames": self._int_or(c.args[0]) if c.args else 1})
@@ -2209,7 +2218,25 @@ class BattleAnimTab(QWidget):
         likely contributor to hard crashes).  We rate-limit overall AND
         suppress immediate repeats of the same effect; the preview only needs
         to convey the sound, not replay it for every particle."""
-        if _preview_sound_cb is None or not se:
+        if not se:
+            return
+        # Cry events (Growl / Howl / Hyper Voice / …) → play the SELECTED mon's
+        # cry, like the Pokemon tab. "__CRY__" = attacker, "__CRY__T" = target.
+        if se.startswith("__CRY__"):
+            if _preview_cry_cb is None:
+                return
+            now = self._play_tick
+            if now - getattr(self, "_last_cry_tick", -100) < 30:
+                return                          # one cry, not per-particle
+            self._last_cry_tick = now
+            sp = self._cry_species_const(target=se.endswith("T"))
+            if sp:
+                try:
+                    _preview_cry_cb(sp)
+                except Exception:
+                    _log.exception("cry preview failed for %s", sp)
+            return
+        if _preview_sound_cb is None:
             return
         now = self._play_tick
         if now - self._last_sound_tick < 10:
@@ -2716,6 +2743,19 @@ class BattleAnimTab(QWidget):
     def _mon_const(slug: str) -> str:
         """Folder slug → SPECIES_ const (charizard → SPECIES_CHARIZARD)."""
         return ("SPECIES_" + slug.replace("-", "_").upper()) if slug else ""
+
+    def _cry_species_const(self, target: bool = False) -> str:
+        """SPECIES_ const of the mon whose cry a cry-move should play. The
+        attacker by default (Growl / Howl / Hyper Voice are the user's cry);
+        ``target=True`` for the target's side. Honours the Player/Enemy attack
+        direction + the reference-mon dropdowns."""
+        if not hasattr(self, "_ref_player_combo"):
+            return ""
+        player_attacks = (self._play_direction == "player")
+        use_player = player_attacks ^ target   # attacker side, flipped for target
+        combo = self._ref_player_combo if use_player else self._ref_enemy_combo
+        slug = combo.currentData()
+        return self._mon_const(slug) if slug else ""
 
     def _apply_ref_mons(self):
         """Push the chosen reference mons onto the battle-scene preview
