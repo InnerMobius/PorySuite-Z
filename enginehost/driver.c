@@ -35,6 +35,7 @@ extern u8 gHostPalBlendCoeff[32];     /* per-slot tint strength (stub_engine.c) 
 extern u16 gHostPalBlendColor[32];    /* per-slot tint colour (BGR555) */
 extern u8 gHostBldEva;                /* BLDALPHA top-layer coefficient 0..16 */
 void HostResetPalBlend(void);
+u8 UpdatePaletteFade(void);           /* software fade step (stub_engine.c) */
 
 /* Position-holder template for the two mon sprites (non-TAG_NONE so CreateSprite
  * doesn't deref a null image table). Python draws the real mon. */
@@ -182,6 +183,7 @@ void engine_step(void)
 {
     AnimateSprites();
     RunTasks();
+    UpdatePaletteFade();   /* ramp any software fade-to/from-colour this frame */
 }
 
 static int sIsMonSprite(int id)

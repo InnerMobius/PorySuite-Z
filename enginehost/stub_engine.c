@@ -260,6 +260,7 @@ void HostResetPalBlend(void)
     int i;
     for (i = 0; i < 32; i++) { gHostPalBlendCoeff[i] = 0; gHostPalBlendColor[i] = 0; }
     gHostBldEva = 16;   /* opaque until a setalpha/fade changes it */
+    gPaletteFade.active = 0;   /* no software fade in progress */
 }
 
 void BlendPalette(u16 palOffset, u16 numEntries, u8 coeff, u16 blendColor)
@@ -295,7 +296,67 @@ void FillPalette(u16 v, u16 o, u16 n) { (void)v;(void)o;(void)n; }
 void TintPlttBuffer(u32 a, s8 r, s8 g, s8 b) { (void)a;(void)r;(void)g;(void)b; }
 void InvertPlttBuffer(u32 a) { (void)a; }
 void UnfadePlttBuffer(u32 a) { (void)a; }
-bool8 BeginNormalPaletteFade(u32 a, s8 b, u8 c, u8 d, u16 e) { (void)a;(void)b;(void)c;(void)d;(void)e; return FALSE; }
+/* Software palette fade — BeginNormalPaletteFade fades the selected palette
+ * slots from startY to targetY toward blendColor over time (FadeScreenToWhite,
+ * Moonlight's end fade, fade-from-black intros). Faithful to palette.c: it sets
+ * up gPaletteFade; UpdatePaletteFade (run each engine_step) ramps the coefficient
+ * and records the per-slot blend via BlendPalette. Non-fade moves never set
+ * gPaletteFade.active, so UpdatePaletteFade is a no-op for them. */
+bool8 BeginNormalPaletteFade(u32 selectedPalettes, s8 delay, u8 startY,
+                             u8 targetY, u16 blendColor)
+{
+    if (gPaletteFade.active)
+        return FALSE;
+    gPaletteFade.deltaY = 2;
+    if (delay < 0) { gPaletteFade.deltaY += (delay * -1); delay = 0; }
+    gPaletteFade_selectedPalettes = selectedPalettes;
+    gPaletteFade.delayCounter = delay;
+    gPaletteFade_delay = delay;
+    gPaletteFade.y = startY;
+    gPaletteFade.targetY = targetY;
+    gPaletteFade.blendColor = blendColor;
+    gPaletteFade.active = TRUE;
+    gPaletteFade.mode = 0;   /* NORMAL_FADE (local enum in palette.c) */
+    gPaletteFade.yDec = (startY < targetY) ? FALSE : TRUE;
+    UpdatePaletteFade();
+    return TRUE;
+}
+
+u8 UpdatePaletteFade(void)
+{
+    u32 sel;
+    u16 off;
+    if (!gPaletteFade.active || gPaletteFade.mode != 0)   /* 0 = NORMAL_FADE */
+        return 0;
+    if (gPaletteFade.delayCounter < gPaletteFade_delay) {
+        gPaletteFade.delayCounter++;
+        return 2;
+    }
+    gPaletteFade.delayCounter = 0;
+    sel = gPaletteFade_selectedPalettes;
+    off = 0;
+    while (sel) {
+        if (sel & 1)
+            BlendPalette(off, 16, gPaletteFade.y, gPaletteFade.blendColor);
+        sel >>= 1;
+        off += 16;
+    }
+    if (gPaletteFade.y == gPaletteFade.targetY) {
+        gPaletteFade_selectedPalettes = 0;
+        gPaletteFade.active = FALSE;
+    } else {
+        s8 v = gPaletteFade.y;
+        if (!gPaletteFade.yDec) {
+            v += gPaletteFade.deltaY;
+            if (v > (s8)gPaletteFade.targetY) v = gPaletteFade.targetY;
+        } else {
+            v -= gPaletteFade.deltaY;
+            if (v < (s8)gPaletteFade.targetY) v = gPaletteFade.targetY;
+        }
+        gPaletteFade.y = v;
+    }
+    return 1;
+}
 void BeginHardwarePaletteFade(u8 a, u8 b, u8 c, u8 d, u8 e) { (void)a;(void)b;(void)c;(void)d;(void)e; }
 void PaletteStruct_ResetById(u16 id) { (void)id; }
 
