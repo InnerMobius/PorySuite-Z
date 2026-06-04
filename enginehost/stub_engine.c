@@ -233,8 +233,51 @@ void SetGpuRegBits(u8 r, u16 m) { (void)r; (void)m; }
 void ClearGpuRegBits(u8 r, u16 m) { (void)r; (void)m; }
 u16  GetGpuReg(u8 r) { (void)r; return 0; }
 
-void BlendPalette(u16 a, u16 b, u8 c, u16 d) { (void)a;(void)b;(void)c;(void)d; }
-void BlendPalettes(u32 a, u8 b, u16 c) { (void)a;(void)b;(void)c; }
+/* ── Per-palette-slot blend recording ─────────────────────────────────────
+ * The host has no loaded palette DATA (no VRAM/gfx), so the real palette buffer
+ * is meaningless. But every tint/flash/fade the game does funnels through these
+ * blend calls as "blend palette slot N toward COLOR by COEFF/16". We RECORD that
+ * per slot (32 slots: 0-15 BG, 16-31 OBJ). engine_snapshot stamps each sprite/mon
+ * with its slot's (coeff,color); the Python renderer applies the SAME per-channel
+ * blend math (out = base + ((target-base)*coeff>>4)) to the project's real palette.
+ * So Double Team's dark blend, status tints, MetallicShine, BlendColorCycle, etc.
+ * all tint correctly without the engine ever holding a real palette. */
+u8  gHostPalBlendCoeff[32];   /* 0 = no tint, else 1..16 */
+u16 gHostPalBlendColor[32];   /* BGR555 target */
+
+void HostResetPalBlend(void)
+{
+    int i;
+    for (i = 0; i < 32; i++) { gHostPalBlendCoeff[i] = 0; gHostPalBlendColor[i] = 0; }
+}
+
+void BlendPalette(u16 palOffset, u16 numEntries, u8 coeff, u16 blendColor)
+{
+    /* Record for every 16-colour slot this range touches. */
+    u16 first = palOffset >> 4;
+    u16 last  = numEntries ? ((palOffset + numEntries - 1) >> 4) : first;
+    u16 s;
+    for (s = first; s <= last && s < 32; s++) {
+        gHostPalBlendCoeff[s] = (coeff > 16) ? 16 : coeff;
+        gHostPalBlendColor[s] = blendColor;
+    }
+}
+
+void BlendPalettes(u32 selectedPalettes, u8 coeff, u16 color)
+{
+    u16 s;
+    for (s = 0; s < 32; s++)
+        if (selectedPalettes & (1u << s)) {
+            gHostPalBlendCoeff[s] = (coeff > 16) ? 16 : coeff;
+            gHostPalBlendColor[s] = color;
+        }
+}
+
+void BlendPalettesUnfaded(u32 selectedPalettes, u8 coeff, u16 color)
+{
+    BlendPalettes(selectedPalettes, coeff, color);
+}
+
 void LoadPalette(const void *s, u16 o, u16 n) { (void)s;(void)o;(void)n; }
 void LoadCompressedPalette(const u32 *s, u16 o, u16 n) { (void)s;(void)o;(void)n; }
 void FillPalette(u16 v, u16 o, u16 n) { (void)v;(void)o;(void)n; }

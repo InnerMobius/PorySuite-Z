@@ -31,6 +31,9 @@ extern const int gHostTaskCount;
 
 extern u8 gBattleAnimAttacker, gBattleAnimTarget;
 extern s16 gBattleAnimArgs[];
+extern u8 gHostPalBlendCoeff[32];     /* per-slot tint strength (stub_engine.c) */
+extern u16 gHostPalBlendColor[32];    /* per-slot tint colour (BGR555) */
+void HostResetPalBlend(void);
 
 /* Position-holder template for the two mon sprites (non-TAG_NONE so CreateSprite
  * doesn't deref a null image table). Python draws the real mon. */
@@ -60,6 +63,9 @@ struct Snap {
                           * mon (Double Team after-images, …): same dummy mon
                           * template but NOT a battler holder, so the renderer
                           * draws the attacker's mon pic here, faded. */
+    int blendCoeff;      /* palette-blend strength 0..16 for this sprite's slot
+                          * (BlendPalette/BlendPalettes/fade). 0 = no tint. */
+    int blendColor;      /* BGR555 colour the slot is blended toward. */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
@@ -77,6 +83,7 @@ void engine_reset(int attackerIsPlayer)
      * after-images, etc.) hit this. FreeAllSpritePalettes sets every slot to
      * TAG_NONE so allocation works. Project-agnostic engine fix. */
     FreeAllSpritePalettes();
+    HostResetPalBlend();   /* clear per-slot tint state from the previous move */
     for (i = 0; i < MAX_SPRITES; i++)
         sSpriteTpl[i] = -1;
     for (i = 0; i < ANIM_ARGS_COUNT; i++)
@@ -101,7 +108,15 @@ void engine_reset(int attackerIsPlayer)
     for (i = 0; i < 2; i++)
     {
         u8 slot = AllocOamMatrix();
+        /* Give each battler mon a DISTINCT, reserved OBJ palette slot. The dummy
+         * mon template leaves both at the same paletteNum, so a per-mon palette
+         * blend (AnimTask_BlendMonInAndOut → Foresight's white flash on just the
+         * TARGET) recorded against one slot wrongly tinted BOTH mons. Reserving a
+         * unique slot per battler (and marking it used so effect sprites don't
+         * grab it) isolates per-mon tints. */
+        u8 pal = AllocSpritePalette(0xFFF0 + i);
         gSprites[gBattlerSpriteIds[i]].data[0] = i;
+        gSprites[gBattlerSpriteIds[i]].oam.paletteNum = (pal != 0xFF) ? pal : i;
         gBattleSpritesDataPtr->healthBoxesData[i].matrixNum =
             (slot != 0xFF) ? slot : i;
     }
@@ -238,6 +253,12 @@ int engine_snapshot(void)
         /* A clone is a copy of the mon's dummy template that is NOT one of the
          * two battler holders (CloneBattlerSpriteWithBlend → Double Team etc.). */
         o->isClone = (s->template == &sMonTemplate && o->isMon < 0) ? 1 : 0;
+        /* Tint recorded for this sprite's OBJ palette slot (16 + paletteNum). */
+        {
+            int slot = 16 + (s->oam.paletteNum & 0xF);
+            o->blendCoeff = gHostPalBlendCoeff[slot];
+            o->blendColor = gHostPalBlendColor[slot];
+        }
     }
     return n;
 }

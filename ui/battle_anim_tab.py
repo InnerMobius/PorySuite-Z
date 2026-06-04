@@ -703,6 +703,9 @@ class BattleAnimTab(QWidget):
         # Sandstorm, …) — which carry only the numeric tileTag, no host template
         # index — can be mapped to their gfx and rendered.
         self._tag_by_value = self._parse_tag_values(project_root)
+        # RGB_* / RGB(r,g,b) colour constants the blend/fade tasks take as args
+        # (RGB_WHITE flash, RGB_BLACK dark blend, …) so tints get the right hue.
+        self._rgb_consts = self._parse_rgb_consts(project_root)
 
         # In-memory reset.
         self._palettes.clear()
@@ -1733,11 +1736,11 @@ class BattleAnimTab(QWidget):
                     ops.append({"op": "createsprite", "template": cs.template,
                                 "battler": self._int_or(cs.battler),
                                 "subpriority": self._int_or(cs.subpriority),
-                                "args": [self._int_or(a) for a in cs.args]})
+                                "args": [self._arg_val(a) for a in cs.args]})
             elif c.name == "createvisualtask":
                 vt = parse_createvisualtask(c)
                 if vt:
-                    args = [self._int_or(a) for a in vt.args]
+                    args = [self._arg_val(a) for a in vt.args]
                     ops.append({"op": "createvisualtask", "func": vt.addr,
                                 "args": args})
                     # A cry sound task (Growl/Roar = PlayDoubleCry, Howl =
@@ -1954,6 +1957,8 @@ class BattleAnimTab(QWidget):
             which = mon_side.get(s.get("isMon", -1))
             if which is None:
                 continue
+            # Palette tint on the mon (hit flash, status tint, fade-to-colour).
+            P.set_mon_tint(which, s.get("blendCoeff", 0), s.get("blendColor", 0))
             # Dig-style burrow: the engine HIDES the attacker's mon sprite and
             # wiggles a BG layer the mon was copied onto (monbg + DigDownMovement)
             # — so a plain hide loses the sink. If this is the attacker and its
@@ -1999,7 +2004,8 @@ class BattleAnimTab(QWidget):
         base_x, base_y = (72, 80) if atk_side == "back" else (176, 40)
         P.set_mon_clones(atk_side, [
             (s["x"] + s["x2"] - base_x, s["y"] + s["y2"] - base_y,
-             bool(s["hFlip"]), bool(s["vFlip"]))
+             bool(s["hFlip"]), bool(s["vFlip"]),
+             s.get("blendCoeff", 0), s.get("blendColor", 0))
             for s in frame if s.get("isClone") and not s.get("invisible")])
 
         # Effect sprites → canvas (lower subpriority drawn on top).
@@ -2054,6 +2060,11 @@ class BattleAnimTab(QWidget):
                     tf = self._affine_transform(s["mA"], s["mB"], s["mC"], s["mD"])
                     if tf is not None:
                         pix = pix.transformed(tf)   # flip + scale + rotation
+                # Palette tint the engine recorded for this sprite's slot
+                # (status flash, BlendColorCycle, fade-to-colour, …).
+                cf = s.get("blendCoeff", 0)
+                if cf > 0:
+                    pix = P.tint_pixmap(pix, cf, s.get("blendColor", 0))
                 rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
                 painter.drawPixmap(int(rx - pix.width() // 2),
                                    int(ry - pix.height() // 2), pix)
@@ -2592,6 +2603,54 @@ class BattleAnimTab(QWidget):
             return int(raw, 0)
         except (ValueError, TypeError):
             return default
+
+    @staticmethod
+    def _parse_rgb_consts(root):
+        """{RGB_* name: BGR555 value} parsed from the project's
+        include/constants/rgb.h, plus inline RGB(r,g,b) support. Anim scripts
+        pass colours to the blend/fade tasks as these constants (RGB_WHITE for
+        a white flash, RGB_BLACK for a dark blend, RGB(13,31,12) for a green
+        tint, …); without resolving them the tint colour comes through as 0
+        (black) and every flash looks like a fade-to-black. Project-agnostic."""
+        import os
+        import re
+        consts = {"RGB_ALPHA": 1 << 15}
+        p = os.path.join(root, "include", "constants", "rgb.h")
+        if not os.path.isfile(p):
+            return consts
+        try:
+            text = open(p, encoding="utf-8", errors="replace").read()
+        except OSError:
+            return consts
+        for m in re.finditer(r'#define\s+(RGB_\w+)\s+(.+)', text):
+            name, expr = m.group(1), m.group(2).strip()
+            mm = re.match(r'RGB\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', expr)
+            if mm:
+                r, g, b = (int(x) for x in mm.groups())
+                consts[name] = (r | (g << 5) | (b << 10)) & 0xFFFF
+                continue
+            toks = re.findall(r'RGB_\w+', expr)   # e.g. (RGB_WHITE | RGB_ALPHA)
+            if toks and all(t in consts for t in toks):
+                v = 0
+                for t in toks:
+                    v |= consts[t]
+                consts[name] = v & 0xFFFF
+        return consts
+
+    def _arg_val(self, raw):
+        """Resolve an anim-script arg to its numeric value, including colour
+        constants the blend/fade tasks use: named RGB_* and inline RGB(r,g,b).
+        Falls back to _int_or (numeric / battler-selector constants)."""
+        import re
+        s = str(raw).strip()
+        m = re.match(r'RGB\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', s)
+        if m:
+            r, g, b = (int(x) for x in m.groups())
+            return (r | (g << 5) | (b << 10)) & 0xFFFF
+        rgb = getattr(self, "_rgb_consts", None)
+        if rgb and s in rgb:
+            return rgb[s]
+        return self._int_or(s)
 
     def _on_direction_changed(self):
         """Player/Enemy direction toggle: rebuild the composite + restart playback."""

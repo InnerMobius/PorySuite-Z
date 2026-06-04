@@ -32,7 +32,7 @@ _SNAP_FIELDS = (
     "id", "x", "y", "x2", "y2", "tileNum", "shape", "size",
     "matrixNum", "mA", "mB", "mC", "mD", "hFlip", "vFlip", "affineMode",
     "priority", "subpriority", "paletteNum", "invisible", "templateIndex", "isMon",
-    "tileTag", "isClone",
+    "tileTag", "isClone", "blendCoeff", "blendColor",
 )
 _SNAP = struct.Struct("<%di" % len(_SNAP_FIELDS))
 

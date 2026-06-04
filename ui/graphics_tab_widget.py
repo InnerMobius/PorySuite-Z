@@ -417,6 +417,11 @@ class BattleScenePreview(QWidget):
         # canvas px relative to the mon's base centre. Empty = none.
         self._front_clones: list = []
         self._back_clones: list = []
+        # Per-mon palette tint (coeff 0..16, BGR555 colour) the engine recorded
+        # for the mon's palette slot — hit flashes, status tints, fade-to-colour.
+        # (0, 0) = no tint. Applied to the mon pixmap before drawing.
+        self._front_tint = (0, 0)
+        self._back_tint = (0, 0)
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -598,6 +603,20 @@ class BattleScenePreview(QWidget):
             self._back_clones = clones
         self.update()
 
+    def set_mon_tint(self, which: str, coeff: int, color: int) -> None:
+        """Set a mon's palette tint (coeff 0..16 toward BGR555 color) — hit
+        flash, status tint, fade-to-colour. (0, 0) clears."""
+        t = (int(coeff), int(color))
+        if which == "front":
+            if t == self._front_tint:
+                return
+            self._front_tint = t
+        else:
+            if t == self._back_tint:
+                return
+            self._back_tint = t
+        self.update()
+
     def reset_mon_transforms(self) -> None:
         """Restore both mons to their untransformed, visible draw (end of play)."""
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
@@ -605,7 +624,8 @@ class BattleScenePreview(QWidget):
                    or not self._front_visible or not self._back_visible
                    or self._front_sink is not None or self._back_sink is not None
                    or self._front_aff is not None or self._back_aff is not None
-                   or self._front_clones or self._back_clones)
+                   or self._front_clones or self._back_clones
+                   or self._front_tint != (0, 0) or self._back_tint != (0, 0))
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
         self._front_visible = True
@@ -616,6 +636,8 @@ class BattleScenePreview(QWidget):
         self._back_aff = None
         self._front_clones = []
         self._back_clones = []
+        self._front_tint = (0, 0)
+        self._back_tint = (0, 0)
         if changed:
             self.update()
 
@@ -674,6 +696,35 @@ class BattleScenePreview(QWidget):
         if cy is not None:
             self._anim_cy = int(cy)
         self.update()
+
+    @staticmethod
+    def _bgr555_rgb(c):
+        """BGR555 (the GBA palette word) → (r, g, b) 8-bit, 5→8 bit expanded."""
+        r = (c & 31) << 3
+        g = ((c >> 5) & 31) << 3
+        b = ((c >> 10) & 31) << 3
+        return (r | r >> 5, g | g >> 5, b | b >> 5)
+
+    @staticmethod
+    def tint_pixmap(pix, coeff, color):
+        """Return a copy of ``pix`` palette-blended toward BGR555 ``color`` by
+        ``coeff``/16 — the exact BlendPalette result (out = base*(1-k) + color*k),
+        applied ONLY to opaque pixels (SourceAtop leaves transparency untouched).
+        ``coeff`` 0 (or a null pix) returns the original. Used for every tint the
+        engine records: status flashes, BlendColorCycle, MetallicShine, the dark
+        Double-Team blend, fade-to-colour, etc."""
+        if coeff <= 0 or pix is None or pix.isNull():
+            return pix
+        a = min(16, coeff) / 16.0
+        r, g, b = BattleScenePreview._bgr555_rgb(color & 0x7FFF)
+        out = QPixmap(pix.size())
+        out.fill(QColor(0, 0, 0, 0))
+        p = QPainter(out)
+        p.drawPixmap(0, 0, pix)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceAtop)
+        p.fillRect(out.rect(), QColor(r, g, b, int(round(a * 255))))
+        p.end()
+        return out
 
     @staticmethod
     def _draw_mon(p, pix, frame_left, frame_top, fw, fh, fx, s):
@@ -752,11 +803,13 @@ class BattleScenePreview(QWidget):
                 if pix is None or pix.isNull():
                     return
                 cw, ch = pix.width(), pix.height()
-                for off_x, off_y, hf, vf in clones:
+                for off_x, off_y, hf, vf, cf, col in clones:
                     cp = pix
+                    if cf > 0:               # the clone's own palette blend
+                        cp = self.tint_pixmap(cp, cf, col)   # (Double Team → black)
                     if hf or vf:
-                        cp = pix.transformed(_QT().scale(-1 if hf else 1,
-                                                         -1 if vf else 1))
+                        cp = cp.transformed(_QT().scale(-1 if hf else 1,
+                                                        -1 if vf else 1))
                     fl = base_cx - cw // 2 + off_x
                     ft = base_cy - ch // 2 + off_y
                     p.drawPixmap(fl * s, ft * s, cw * s, ch * s, cp)
@@ -773,36 +826,38 @@ class BattleScenePreview(QWidget):
         # CENTERED on sBattlerCoords, plus y_offset pushes it DOWN,
         # minus enemy elevation pushes it UP.
         if self._front_pix and not self._front_pix.isNull():
-            fw = self._front_pix.width()
-            fh = self._front_pix.height()
+            fpix = self.tint_pixmap(self._front_pix, *self._front_tint)
+            fw = fpix.width()
+            fh = fpix.height()
             frame_top = (self.ENEMY_CY - fh // 2
                          + self._front_y_off - self._enemy_elevation)
             frame_left = self.ENEMY_CX - fw // 2
             if self._front_sink is not None:
-                self._paint_mon_sink(p, self._front_pix, frame_left, frame_top,
+                self._paint_mon_sink(p, fpix, frame_left, frame_top,
                                      self._front_sink, s)
             elif self._front_aff is not None:
-                self._paint_mon_affine(p, self._front_pix, frame_left, frame_top,
+                self._paint_mon_affine(p, fpix, frame_left, frame_top,
                                        fw, fh, self._front_aff, s)
             elif self._front_visible:
-                self._draw_mon(p, self._front_pix, frame_left, frame_top,
+                self._draw_mon(p, fpix, frame_left, frame_top,
                                fw, fh, self._front_fx, s)
 
         # Player (back) sprite — same frame-center rule, back y_offset
         # pushes DOWN.
         if self._back_pix and not self._back_pix.isNull():
-            bw = self._back_pix.width()
-            bh = self._back_pix.height()
+            bpix = self.tint_pixmap(self._back_pix, *self._back_tint)
+            bw = bpix.width()
+            bh = bpix.height()
             frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off)
             frame_left = self.PLAYER_CX - bw // 2
             if self._back_sink is not None:
-                self._paint_mon_sink(p, self._back_pix, frame_left, frame_top,
+                self._paint_mon_sink(p, bpix, frame_left, frame_top,
                                      self._back_sink, s)
             elif self._back_aff is not None:
-                self._paint_mon_affine(p, self._back_pix, frame_left, frame_top,
+                self._paint_mon_affine(p, bpix, frame_left, frame_top,
                                        bw, bh, self._back_aff, s)
             elif self._back_visible:
-                self._draw_mon(p, self._back_pix, frame_left, frame_top,
+                self._draw_mon(p, bpix, frame_left, frame_top,
                                bw, bh, self._back_fx, s)
 
         # Battle-animation sprite overlay (Battle Anims tab) — frame
