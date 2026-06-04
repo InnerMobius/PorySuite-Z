@@ -228,7 +228,17 @@ u32 GetMonData2(struct Pokemon *mon, s32 field)
 
 /* ───────────────────────── no-op stubs (cosmetic to motion) ─────── */
 
-void SetGpuReg(u8 r, u16 v) { (void)r; (void)v; }
+/* BLDALPHA top-layer (sprite/mon) blend coefficient, 0..16. A sprite whose OAM
+ * objMode is ST_OAM_OBJ_BLEND is alpha-blended at this/16 — the engine's
+ * `setalpha` opcode + every fade-to/from-invisible writes it. Default 16 =
+ * opaque. Recorded here because SetGpuReg is otherwise a no-op. */
+u8 gHostBldEva = 16;
+
+void SetGpuReg(u8 r, u16 v)
+{
+    if (r == 0x52)               /* REG_OFFSET_BLDALPHA: low 5 bits = EVA */
+        gHostBldEva = (v & 0x1F);
+}
 void SetGpuRegBits(u8 r, u16 m) { (void)r; (void)m; }
 void ClearGpuRegBits(u8 r, u16 m) { (void)r; (void)m; }
 u16  GetGpuReg(u8 r) { (void)r; return 0; }
@@ -249,6 +259,7 @@ void HostResetPalBlend(void)
 {
     int i;
     for (i = 0; i < 32; i++) { gHostPalBlendCoeff[i] = 0; gHostPalBlendColor[i] = 0; }
+    gHostBldEva = 16;   /* opaque until a setalpha/fade changes it */
 }
 
 void BlendPalette(u16 palOffset, u16 numEntries, u8 coeff, u16 blendColor)

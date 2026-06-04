@@ -422,6 +422,11 @@ class BattleScenePreview(QWidget):
         # (0, 0) = no tint. Applied to the mon pixmap before drawing.
         self._front_tint = (0, 0)
         self._back_tint = (0, 0)
+        # Per-mon alpha (0..16) — BLDALPHA when the mon is in blend mode
+        # (fade-to/from-invisible: Teleport, Substitute swap, ghost moves). 16 =
+        # opaque. Drawn at alpha/16.
+        self._front_alpha = 16
+        self._back_alpha = 16
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -617,6 +622,20 @@ class BattleScenePreview(QWidget):
             self._back_tint = t
         self.update()
 
+    def set_mon_alpha(self, which: str, alpha: int) -> None:
+        """Set a mon's opacity (0..16) — BLDALPHA fade-to/from-invisible. 16 =
+        opaque."""
+        a = max(0, min(16, int(alpha)))
+        if which == "front":
+            if a == self._front_alpha:
+                return
+            self._front_alpha = a
+        else:
+            if a == self._back_alpha:
+                return
+            self._back_alpha = a
+        self.update()
+
     def reset_mon_transforms(self) -> None:
         """Restore both mons to their untransformed, visible draw (end of play)."""
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
@@ -625,7 +644,8 @@ class BattleScenePreview(QWidget):
                    or self._front_sink is not None or self._back_sink is not None
                    or self._front_aff is not None or self._back_aff is not None
                    or self._front_clones or self._back_clones
-                   or self._front_tint != (0, 0) or self._back_tint != (0, 0))
+                   or self._front_tint != (0, 0) or self._back_tint != (0, 0)
+                   or self._front_alpha != 16 or self._back_alpha != 16)
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
         self._front_visible = True
@@ -638,6 +658,8 @@ class BattleScenePreview(QWidget):
         self._back_clones = []
         self._front_tint = (0, 0)
         self._back_tint = (0, 0)
+        self._front_alpha = 16
+        self._back_alpha = 16
         if changed:
             self.update()
 
@@ -803,7 +825,7 @@ class BattleScenePreview(QWidget):
                 if pix is None or pix.isNull():
                     return
                 cw, ch = pix.width(), pix.height()
-                for off_x, off_y, hf, vf, cf, col in clones:
+                for off_x, off_y, hf, vf, cf, col, al in clones:
                     cp = pix
                     if cf > 0:               # the clone's own palette blend
                         cp = self.tint_pixmap(cp, cf, col)   # (Double Team → black)
@@ -812,9 +834,11 @@ class BattleScenePreview(QWidget):
                                                         -1 if vf else 1))
                     fl = base_cx - cw // 2 + off_x
                     ft = base_cy - ch // 2 + off_y
+                    # The clone's real alpha (its OAM blend mode + BLDALPHA);
+                    # Double Team's setalpha 12,8 → ~0.75, not a flat guess.
+                    p.setOpacity(max(0.05, min(1.0, al / 16.0)))
                     p.drawPixmap(fl * s, ft * s, cw * s, ch * s, cp)
 
-            p.setOpacity(0.45)
             _draw_clones(self._back_pix, self.PLAYER_CX,
                          self.PLAYER_CY + self._back_y_off, self._back_clones)
             _draw_clones(self._front_pix, self.ENEMY_CX,
@@ -832,6 +856,8 @@ class BattleScenePreview(QWidget):
             frame_top = (self.ENEMY_CY - fh // 2
                          + self._front_y_off - self._enemy_elevation)
             frame_left = self.ENEMY_CX - fw // 2
+            if self._front_alpha < 16:
+                p.setOpacity(self._front_alpha / 16.0)
             if self._front_sink is not None:
                 self._paint_mon_sink(p, fpix, frame_left, frame_top,
                                      self._front_sink, s)
@@ -841,6 +867,8 @@ class BattleScenePreview(QWidget):
             elif self._front_visible:
                 self._draw_mon(p, fpix, frame_left, frame_top,
                                fw, fh, self._front_fx, s)
+            if self._front_alpha < 16:
+                p.setOpacity(1.0)
 
         # Player (back) sprite — same frame-center rule, back y_offset
         # pushes DOWN.
@@ -850,6 +878,8 @@ class BattleScenePreview(QWidget):
             bh = bpix.height()
             frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off)
             frame_left = self.PLAYER_CX - bw // 2
+            if self._back_alpha < 16:
+                p.setOpacity(self._back_alpha / 16.0)
             if self._back_sink is not None:
                 self._paint_mon_sink(p, bpix, frame_left, frame_top,
                                      self._back_sink, s)
@@ -859,6 +889,8 @@ class BattleScenePreview(QWidget):
             elif self._back_visible:
                 self._draw_mon(p, bpix, frame_left, frame_top,
                                bw, bh, self._back_fx, s)
+            if self._back_alpha < 16:
+                p.setOpacity(1.0)
 
         # Battle-animation sprite overlay (Battle Anims tab) — frame
         # CENTERED on (_anim_cx, _anim_cy), above the mons, below the

@@ -33,6 +33,7 @@ extern u8 gBattleAnimAttacker, gBattleAnimTarget;
 extern s16 gBattleAnimArgs[];
 extern u8 gHostPalBlendCoeff[32];     /* per-slot tint strength (stub_engine.c) */
 extern u16 gHostPalBlendColor[32];    /* per-slot tint colour (BGR555) */
+extern u8 gHostBldEva;                /* BLDALPHA top-layer coefficient 0..16 */
 void HostResetPalBlend(void);
 
 /* Position-holder template for the two mon sprites (non-TAG_NONE so CreateSprite
@@ -66,6 +67,9 @@ struct Snap {
     int blendCoeff;      /* palette-blend strength 0..16 for this sprite's slot
                           * (BlendPalette/BlendPalettes/fade). 0 = no tint. */
     int blendColor;      /* BGR555 colour the slot is blended toward. */
+    int alpha;           /* 0..16 opacity: BLDALPHA EVA when this sprite's OAM
+                          * objMode is BLEND (setalpha, fade-to/from-invisible),
+                          * else 16 (opaque). */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
@@ -259,6 +263,8 @@ int engine_snapshot(void)
             o->blendCoeff = gHostPalBlendCoeff[slot];
             o->blendColor = gHostPalBlendColor[slot];
         }
+        /* Alpha: blend-mode sprites (objMode 1) are drawn at BLDALPHA EVA/16. */
+        o->alpha = (s->oam.objMode == 1) ? gHostBldEva : 16;
     }
     return n;
 }

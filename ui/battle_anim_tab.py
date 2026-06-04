@@ -1959,6 +1959,8 @@ class BattleAnimTab(QWidget):
                 continue
             # Palette tint on the mon (hit flash, status tint, fade-to-colour).
             P.set_mon_tint(which, s.get("blendCoeff", 0), s.get("blendColor", 0))
+            # Alpha fade on the mon (fade-to/from-invisible: Teleport, …).
+            P.set_mon_alpha(which, s.get("alpha", 16))
             # Dig-style burrow: the engine HIDES the attacker's mon sprite and
             # wiggles a BG layer the mon was copied onto (monbg + DigDownMovement)
             # — so a plain hide loses the sink. If this is the attacker and its
@@ -2005,7 +2007,7 @@ class BattleAnimTab(QWidget):
         P.set_mon_clones(atk_side, [
             (s["x"] + s["x2"] - base_x, s["y"] + s["y2"] - base_y,
              bool(s["hFlip"]), bool(s["vFlip"]),
-             s.get("blendCoeff", 0), s.get("blendColor", 0))
+             s.get("blendCoeff", 0), s.get("blendColor", 0), s.get("alpha", 16))
             for s in frame if s.get("isClone") and not s.get("invisible")])
 
         # Effect sprites → canvas (lower subpriority drawn on top).
@@ -2066,8 +2068,15 @@ class BattleAnimTab(QWidget):
                 if cf > 0:
                     pix = P.tint_pixmap(pix, cf, s.get("blendColor", 0))
                 rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
+                # Alpha blend (setalpha / fade): blend-mode sprites are drawn
+                # semi-transparent at the engine's BLDALPHA coefficient.
+                a = s.get("alpha", 16)
+                if a < 16:
+                    painter.setOpacity(max(0.0, a / 16.0))
                 painter.drawPixmap(int(rx - pix.width() // 2),
                                    int(ry - pix.height() // 2), pix)
+                if a < 16:
+                    painter.setOpacity(1.0)
         finally:
             painter.end()
         P.set_anim_pixmap(canvas, P.CANVAS_W // 2, P.CANVAS_H // 2)
