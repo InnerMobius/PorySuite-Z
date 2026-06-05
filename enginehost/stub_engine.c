@@ -445,8 +445,9 @@ void SpriteCB_SetInvisible(struct Sprite *s) { if (s) s->invisible = TRUE; }
 /* No-op MoveBattlerSpriteToBG (the project's copy is renamed _ORIG via the build
  * -D). The real one copies a mon onto a BG layer through hardware-address VRAM
  * fills that fault under wasm, trapping the wall moves (Barrier/Light Screen/
- * Reflect/Mirror Coat/Magic Coat) + dark moves. It's cosmetic — leaving the mon
- * as a sprite + drawing the wall over it is fine for the preview. */
+ * Reflect/Mirror Coat/Magic Coat) + dark moves. The "moved to BG" mon is handled
+ * render-side instead: the tab flags monbg battlers bgFrozen and draws them
+ * full-size + untransformed (so Mimic's frozen target doesn't shrink). */
 void MoveBattlerSpriteToBG(u8 battlerId, u8 toBG_2)
 {
     (void)battlerId;

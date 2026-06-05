@@ -1958,6 +1958,14 @@ class BattleAnimTab(QWidget):
             which = mon_side.get(s.get("isMon", -1))
             if which is None:
                 continue
+            # monbg-frozen battler: it's a static full-size BG copy in-game, so
+            # render it normal + visible and IGNORE the hidden original's
+            # transforms (Mimic's shrink, Memento's shadow move, …). reset_mon_
+            # transforms() at the top already set identity, so just force visible
+            # and skip the per-frame transform/tint/alpha below.
+            if s.get("isMon") in getattr(self, "_bg_frozen", ()):
+                P.set_mon_visible(which, True)
+                continue
             # Palette tint on the mon (hit flash, status tint, fade-to-colour).
             P.set_mon_tint(which, s.get("blendCoeff", 0), s.get("blendColor", 0))
             # Alpha fade on the mon (fade-to/from-invisible: Teleport, …).
@@ -2114,6 +2122,23 @@ class BattleAnimTab(QWidget):
         timeline = self._cur_timeline
         if not timeline:
             return
+        # Battlers copied to a BG layer by `monbg` are rendered as a STATIC
+        # full-size copy in-game (the real sprite is hidden + can be moved/scaled
+        # by tasks WITHOUT changing what you see). The host can't render a real
+        # BG copy, so flag those battlers "frozen": the render draws them
+        # full-size + untransformed. Without this, a task that scales the frozen
+        # mon (Mimic's AnimTask_ShrinkTargetCopy, which the game runs on the
+        # hidden sprite) visibly SHRINKS the mon — the user's Mimic complaint.
+        atk_b = 0 if self._play_direction == "player" else 1
+        tgt_b = 1 - atk_b
+        self._bg_frozen = set()
+        for _c in timeline:
+            if _c.name.startswith("monbg") and _c.args:
+                sel = str(_c.args[0]).upper()
+                if "ATK" in sel or "ATTACKER" in sel:
+                    self._bg_frozen.add(atk_b)
+                elif "DEF" in sel or "TARGET" in sel:
+                    self._bg_frozen.add(tgt_b)
         # Stop anything that might conflict.
         self._layer_timer.stop()
         self._layer_play.setText("▶")
