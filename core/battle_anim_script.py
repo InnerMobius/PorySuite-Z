@@ -152,6 +152,35 @@ class Command:
 _LABEL_RE = re.compile(r"^(\w+):\s*$")
 
 
+def _split_args(s: str) -> List[str]:
+    """Split a comma-separated opcode arg list, but NOT on commas INSIDE
+    parentheses — so RGB(24, 6, 23) (and any macro with internal commas) stays
+    a single arg. A naive split breaks it into "RGB(24", "6", "23)", which both
+    mis-counts the args AND loses the colour (it resolves to 0 = black), so e.g.
+    Poison Tail's MetallicShine tinted the user BLACK instead of purple."""
+    out: List[str] = []
+    depth = 0
+    cur: List[str] = []
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            a = "".join(cur).strip()
+            if a:
+                out.append(a)
+            cur = []
+        else:
+            cur.append(ch)
+    a = "".join(cur).strip()
+    if a:
+        out.append(a)
+    return out
+
+
 def _parse_command_line(line: str) -> Optional[Command]:
     """Parse one indented opcode line into a Command, or None for a
     non-command line (blank, comment, directive)."""
@@ -166,7 +195,7 @@ def _parse_command_line(line: str) -> Optional[Command]:
     name = parts[0]
     args: List[str] = []
     if len(parts) > 1:
-        args = [a.strip() for a in parts[1].split(",") if a.strip()]
+        args = _split_args(parts[1])
     kind = classify_opcode(name)
     target = args[0] if (name == "call" and args) else ""
     return Command(name=name, args=args, kind=kind, raw=s, call_target=target)
