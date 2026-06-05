@@ -82,6 +82,7 @@ class SoundEditorTab(QWidget):
         self._se_pcm_cache: dict = {}
         self._se_players: list = []
         self._se_rendering: set = set()   # constants whose bg render is in flight
+        self._se_lock = threading.Lock()  # serializes bg sample-load/parse/render
 
         self._build_ui()
         self._playback_timer = QTimer(self)
@@ -1554,54 +1555,49 @@ class SoundEditorTab(QWidget):
     # ═════════════════════════════════════════════════════════════════════════
 
     def prepare_se(self, constant: str) -> None:
-        """Warm the SE PCM cache. Setup (song parse + sample load) runs on the
-        calling (UI) thread — quick + matches preview_song_by_constant — but the
-        SLOW M4A render runs on a BACKGROUND thread, so it NEVER blocks/crashes
-        the UI (a long render on the UI thread froze the app). The Battle Anims
-        tab calls this at play-start for each sound the move fires; already-cached
-        or in-flight constants are skipped."""
+        """Warm the SE PCM cache ENTIRELY on a BACKGROUND thread — sample load,
+        song parse, AND the M4A render — so NOTHING heavy ever runs on the UI
+        thread (the one-time sample load and the synth render each blocked/froze
+        the app there). The Battle Anims tab calls this at play-start for each
+        sound the move fires; already-cached or in-flight constants are skipped.
+        No Qt/UI is touched off the main thread."""
         if (not constant or constant in self._se_pcm_cache
                 or constant in self._se_rendering):
             return
-        # --- setup on the UI thread (parse + samples), like the song preview ---
-        try:
-            if not (self._song_table and self._voicegroup_data):
-                return
-            entry = self._song_table.by_constant(constant)
-            if not entry:
-                self._se_pcm_cache[constant] = None
-                return
-            song = self._all_songs.get(entry.label)
-            if not song:
-                from core.sound.song_parser import parse_song_file
-                import os
-                s_path = os.path.join(self._project_root, 'sound', 'songs',
-                                      'midi', entry.label + '.s')
-                if os.path.isfile(s_path):
-                    song = parse_song_file(s_path)
-                    self._all_songs[entry.label] = song
-            if not song or not self._check_audio_deps():
-                self._se_pcm_cache[constant] = None
-                return
-            self._ensure_samples_loaded()
-            if not self._sample_data:
-                self._se_pcm_cache[constant] = None
-                return
-        except Exception:
-            _log.exception("SE setup failed for %s", constant)
-            self._se_pcm_cache[constant] = None
+        if not (self._song_table and self._voicegroup_data and self._project_root):
             return
-        # --- render on a background thread (the slow M4A synth) ---
         self._se_rendering.add(constant)
-        vg, samples = self._voicegroup_data, self._sample_data
 
         def _bg():
             pcm = None
             try:
-                from core.sound.track_renderer import render_song
-                pcm = render_song(song, vg, samples, loop_count=1)
+                with self._se_lock:   # serialize: one sample-load/parse/render at a time
+                    # Samples (file I/O + decode — NON-UI; skip the instruments-tab
+                    # share that _ensure_samples_loaded does, which touches widgets).
+                    if not self._samples_loaded:
+                        from core.sound.sample_loader import load_sample_data
+                        self._sample_data = load_sample_data(
+                            self._project_root, load_pcm=True)
+                        self._samples_loaded = True
+                    if self._sample_data:
+                        entry = self._song_table.by_constant(constant)
+                        if entry:
+                            song = self._all_songs.get(entry.label)
+                            if not song:
+                                from core.sound.song_parser import parse_song_file
+                                import os
+                                s_path = os.path.join(
+                                    self._project_root, 'sound', 'songs',
+                                    'midi', entry.label + '.s')
+                                if os.path.isfile(s_path):
+                                    song = parse_song_file(s_path)
+                                    self._all_songs[entry.label] = song
+                            if song:
+                                from core.sound.track_renderer import render_song
+                                pcm = render_song(song, self._voicegroup_data,
+                                                  self._sample_data, loop_count=1)
             except Exception:
-                _log.exception("SE render failed for %s", constant)
+                _log.exception("SE bg prepare failed for %s", constant)
                 pcm = None
             self._se_pcm_cache[constant] = pcm
             self._se_rendering.discard(constant)
