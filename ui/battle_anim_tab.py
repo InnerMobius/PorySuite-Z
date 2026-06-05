@@ -124,6 +124,7 @@ _KIND_DEFAULT = ("·", "#777777")           # · default
 # same module-callback pattern EVENTide's playse ▶ button uses).  Left
 # None in standalone contexts (the ▶ button then no-ops gracefully).
 _preview_sound_cb = None   # Callable[[str], bool]  — constant -> play it
+_preview_sound_prepare_cb = None  # Callable[[str], None] — warm the SE PCM cache
 _preview_cry_cb = None     # Callable[[str], bool]  — SPECIES_ const -> play cry
 _stop_sound_cb = None      # Callable[[], None]      — stop any preview
 
@@ -2187,6 +2188,17 @@ class BattleAnimTab(QWidget):
             except Exception:
                 _log.exception("engine play_timeline failed; falling back to VM")
                 self._engine_frames = []
+            # Pre-warm the SE PCM cache for every distinct sound this move fires,
+            # so each plays INSTANTLY at its frame (in sync) instead of trailing
+            # behind a per-call M4A render. Cached across moves/replays, so this
+            # only costs anything the first time a given SE is seen.
+            if _preview_sound_prepare_cb is not None:
+                for _se in {s for _f, s in self._engine_sounds
+                            if s and not s.startswith("__CRY__")}:
+                    try:
+                        _preview_sound_prepare_cb(_se)
+                    except Exception:
+                        pass
             if self._engine_frames:
                 self._engine_play = True
                 self._engine_idx = 0

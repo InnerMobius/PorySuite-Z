@@ -75,6 +75,12 @@ class SoundEditorTab(QWidget):
         self._is_rendering = False
         self._dirty_songs: set[str] = set()
         self._loading_song = False
+        # Fast SE preview for the Battle Anims tab: rendered PCM cached by
+        # constant (render once, then instant) + a small pool of overlapping
+        # players, so a move's sound effects fire IN SYNC with the animation
+        # instead of trailing behind the per-call M4A render.
+        self._se_pcm_cache: dict = {}
+        self._se_players: list = []
 
         self._build_ui()
         self._playback_timer = QTimer(self)
@@ -1545,6 +1551,75 @@ class SoundEditorTab(QWidget):
     # ═════════════════════════════════════════════════════════════════════════
     # Public API — cross-editor integration
     # ═════════════════════════════════════════════════════════════════════════
+
+    def _render_se_pcm(self, constant: str):
+        """Render an SE/song to PCM ONCE and cache it by constant. Returns the
+        PCM (float32 array) or None. The render is the slow part (M4A synth);
+        caching makes every later play instant — the fix for battle-anim sounds
+        trailing behind the animation."""
+        if constant in self._se_pcm_cache:
+            return self._se_pcm_cache[constant]
+        pcm = None
+        try:
+            if self._song_table and self._voicegroup_data:
+                entry = self._song_table.by_constant(constant)
+                if entry:
+                    song = self._all_songs.get(entry.label)
+                    if not song:
+                        from core.sound.song_parser import parse_song_file
+                        import os
+                        s_path = os.path.join(self._project_root, 'sound',
+                                              'songs', 'midi', entry.label + '.s')
+                        if os.path.isfile(s_path):
+                            song = parse_song_file(s_path)
+                            self._all_songs[entry.label] = song
+                    if song and self._check_audio_deps():
+                        self._ensure_samples_loaded()
+                        if self._sample_data:
+                            from core.sound.track_renderer import render_song
+                            pcm = render_song(song, self._voicegroup_data,
+                                              self._sample_data, loop_count=1)
+        except Exception:
+            _log.exception("SE pre-render failed for %s", constant)
+            pcm = None
+        self._se_pcm_cache[constant] = pcm   # cache None too (don't retry forever)
+        return pcm
+
+    def prepare_se(self, constant: str) -> None:
+        """Warm the SE PCM cache. The Battle Anims tab calls this at play-start
+        for each sound the move will fire, so playback has no render hitch."""
+        try:
+            self._render_se_pcm(constant)
+        except Exception:
+            pass
+
+    def play_se_fast(self, constant: str) -> bool:
+        """Play an SE INSTANTLY for the Battle Anims preview: from the cached
+        PCM, on a FRESH overlapping player — no per-call M4A render latency, and
+        it doesn't cut off other sounds (unlike preview_song_by_constant). Falls
+        back to rendering once if the cache isn't warm yet."""
+        pcm = self._render_se_pcm(constant)
+        if pcm is None or len(pcm) == 0:
+            return False
+        try:
+            from core.sound.audio_engine import AudioPlayer
+            from core.sound.track_renderer import OUTPUT_SAMPLE_RATE
+            from PyQt6.QtCore import QSettings
+            mono = QSettings("PorySuite", "PorySuiteZ").value(
+                "sound/output_mode", "Stereo") == "Mono"
+            pl = AudioPlayer()
+            pl.volume = (self._vol_slider.value() / 100.0
+                         if hasattr(self, "_vol_slider") else 0.8)
+            pl.play(pcm, OUTPUT_SAMPLE_RATE, mono=mono)
+            # Keep only still-playing players (capped) so overlapping SEs aren't
+            # garbage-collected mid-sound, but the pool can't grow unbounded.
+            self._se_players = [p for p in self._se_players
+                                if getattr(p, "is_playing", False)][-7:]
+            self._se_players.append(pl)
+            return True
+        except Exception:
+            _log.exception("fast SE play failed for %s", constant)
+            return False
 
     def preview_song_by_constant(self, constant: str) -> bool:
         """Play a song by its MUS_*/SE_* constant name **without switching tabs**.

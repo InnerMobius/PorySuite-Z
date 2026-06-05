@@ -944,7 +944,11 @@ class UnifiedMainWindow(QMainWindow):
         try:
             import ui.battle_anim_tab as _ba_mod
             if hasattr(self, '_sound_editor'):
-                _ba_mod._preview_sound_cb = self._sound_preview_song
+                # Battle Anims plays SEs through the FAST path (cached PCM +
+                # overlapping players) so a move's sounds stay in sync with the
+                # animation instead of trailing the per-call M4A render.
+                _ba_mod._preview_sound_cb = self._sound_editor.play_se_fast
+                _ba_mod._preview_sound_prepare_cb = self._sound_editor.prepare_se
                 _ba_mod._stop_sound_cb = self._sound_stop_preview
             # Cry moves (Growl / Howl / Hyper Voice …) play the selected mon's
             # cry in the preview — reuse the Pokemon tab's cry player.
