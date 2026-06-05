@@ -163,13 +163,33 @@ int engine_create_sprite(int tplIndex, int battler, int subpriority)
     sub = (int)GetBattlerSpriteSubpriority(b) + off;
     if (sub < 3)
         sub = 3;
+    /* Register the template's palette tag BEFORE creating the sprite. The GBA's
+     * loadspritegfx + LoadSpritePalette do this; the host stubs gfx loading, so
+     * IndexOfSpritePaletteTag(tag) would return 0xFF and a callback that indexes
+     * the palette buffer by it (AnimProtect: gPlttBufferFaded[OBJ_PLTT_ID(0xFF)
+     * +i]) reads far out of bounds and TRAPS. It must be done BEFORE create:
+     * CreateSpriteAndAnimate runs the sprite's INIT callback immediately (that's
+     * where AnimProtect reads the tag), so a post-create registration is too
+     * late. A registered slot keeps the index valid; the renderer still draws
+     * the project palette. */
+    {
+        const struct SpriteTemplate *tpl = gHostTemplates[tplIndex];
+        if (tpl->paletteTag != TAG_NONE
+                && IndexOfSpritePaletteTag(tpl->paletteTag) == 0xFF)
+            AllocSpritePalette(tpl->paletteTag);
+    }
     id = CreateSpriteAndAnimate(
         gHostTemplates[tplIndex],
         GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_X_2),
         GetBattlerSpriteCoord(gBattleAnimTarget, BATTLER_COORD_Y_PIC_OFFSET),
         (u8)sub);
     if (id < MAX_SPRITES)
+    {
+        u8 pal = IndexOfSpritePaletteTag(gHostTemplates[tplIndex]->paletteTag);
         sSpriteTpl[id] = tplIndex;
+        if (pal != 0xFF)
+            gSprites[id].oam.paletteNum = pal;
+    }
     return id;
 }
 
