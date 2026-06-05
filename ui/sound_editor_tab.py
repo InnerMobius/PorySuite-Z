@@ -80,7 +80,7 @@ class SoundEditorTab(QWidget):
         # players, so a move's sound effects fire IN SYNC with the animation
         # instead of trailing behind the per-call M4A render.
         self._se_pcm_cache: dict = {}
-        self._se_players: list = []
+        self._se_player = None            # ONE reused player (one stream at a time)
         self._se_rendering: set = set()   # constants whose bg render is in flight
         self._se_lock = threading.Lock()  # serializes bg sample-load/parse/render
 
@@ -1607,9 +1607,11 @@ class SoundEditorTab(QWidget):
     def play_se_fast(self, constant: str) -> bool:
         """Play an SE for the Battle Anims preview from the CACHED PCM (instant,
         in sync). If it isn't cached yet, kick a background render and skip this
-        fire (it'll be ready next time) — NEVER render on the UI thread. Plays on
-        a small bounded pool of players so simultaneous SEs can overlap without
-        the stream count growing unbounded."""
+        fire (it'll be ready next time) — NEVER render on the UI thread. Uses ONE
+        reused player (the previous SE is stopped, then the new one plays) — the
+        proven single-stream pattern. A pool of concurrent sounddevice streams
+        on rapid loopsewithpan fires risked a native crash; the preview only
+        needs to convey the sound, not layer it."""
         pcm = self._se_pcm_cache.get(constant)
         if pcm is None:
             self.prepare_se(constant)   # not ready (or never tried) → warm it
@@ -1622,19 +1624,12 @@ class SoundEditorTab(QWidget):
             from PyQt6.QtCore import QSettings
             mono = QSettings("PorySuite", "PorySuiteZ").value(
                 "sound/output_mode", "Stereo") == "Mono"
-            # Bounded pool: drop finished players; stop the oldest if at capacity.
-            self._se_players = [p for p in self._se_players
-                                if getattr(p, "is_playing", False)]
-            while len(self._se_players) >= 4:
-                try:
-                    self._se_players.pop(0).stop()
-                except Exception:
-                    pass
-            pl = AudioPlayer()
-            pl.volume = (self._vol_slider.value() / 100.0
-                         if hasattr(self, "_vol_slider") else 0.8)
-            pl.play(pcm, OUTPUT_SAMPLE_RATE, mono=mono)
-            self._se_players.append(pl)
+            if self._se_player is None:
+                self._se_player = AudioPlayer()
+            self._se_player.volume = (self._vol_slider.value() / 100.0
+                                      if hasattr(self, "_vol_slider") else 0.8)
+            # play() stops the previous stream first, so only one is ever open.
+            self._se_player.play(pcm, OUTPUT_SAMPLE_RATE, mono=mono)
             return True
         except Exception:
             _log.exception("fast SE play failed for %s", constant)
