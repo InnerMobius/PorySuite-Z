@@ -694,6 +694,17 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 pick = cmd.args[min(branch_choice, len(cmd.args) - 1)]
                 _walk(pick, depth + 1, seen2)
                 return  # follow the chosen branch (default = first)
+            elif (cmd.name.startswith("jump") and cmd.args
+                  and cmd.args[-1] in scripts):
+                # Conditional jump (jumpargeq / jumpret* / jumpifmoveturn …): the
+                # branch TARGET (its last arg, a label) holds a variant's real
+                # animation — Magnitude's power tiers, Return's friendship tiers,
+                # etc. We can't evaluate the runtime condition statically, so we
+                # follow the FIRST branch as a representative animation (like
+                # choosetwoturnanim). Without this, a branch-based move resolves
+                # to just its selector task + end → NO animation.
+                _walk(cmd.args[-1], depth + 1, seen2)
+                return
         # Reached the end of this label with no end/return/goto/branch → the
         # script falls through into the next label in file order (continuation
         # labels like HornDrillContinue). depth+1 marks it read-only in the
