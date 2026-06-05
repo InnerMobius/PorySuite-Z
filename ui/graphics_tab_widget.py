@@ -427,6 +427,10 @@ class BattleScenePreview(QWidget):
         # opaque. Drawn at alpha/16.
         self._front_alpha = 16
         self._back_alpha = 16
+        # Per-mon greyscale (SetGreyscaleOrOriginalPalette — Perish Song). The
+        # mon's palette is averaged to grey; False = normal colour.
+        self._front_gray = False
+        self._back_gray = False
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -636,6 +640,19 @@ class BattleScenePreview(QWidget):
             self._back_alpha = a
         self.update()
 
+    def set_mon_gray(self, which: str, gray: bool) -> None:
+        """Greyscale a mon (SetGreyscaleOrOriginalPalette — Perish Song)."""
+        gray = bool(gray)
+        if which == "front":
+            if gray == self._front_gray:
+                return
+            self._front_gray = gray
+        else:
+            if gray == self._back_gray:
+                return
+            self._back_gray = gray
+        self.update()
+
     def reset_mon_transforms(self) -> None:
         """Restore both mons to their untransformed, visible draw (end of play)."""
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
@@ -645,7 +662,8 @@ class BattleScenePreview(QWidget):
                    or self._front_aff is not None or self._back_aff is not None
                    or self._front_clones or self._back_clones
                    or self._front_tint != (0, 0) or self._back_tint != (0, 0)
-                   or self._front_alpha != 16 or self._back_alpha != 16)
+                   or self._front_alpha != 16 or self._back_alpha != 16
+                   or self._front_gray or self._back_gray)
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
         self._front_visible = True
@@ -660,6 +678,8 @@ class BattleScenePreview(QWidget):
         self._back_tint = (0, 0)
         self._front_alpha = 16
         self._back_alpha = 16
+        self._front_gray = False
+        self._back_gray = False
         if changed:
             self.update()
 
@@ -748,6 +768,34 @@ class BattleScenePreview(QWidget):
         p.end()
         return out
 
+    _gray_cache: dict = {}
+
+    @staticmethod
+    def gray_pixmap(pix):
+        """Desaturate a pixmap to greyscale (the GBA average (r+g+b)/3),
+        preserving alpha — for SetGreyscaleOrOriginalPalette (Perish Song greys
+        the music notes + the mons as they flip). Cached by pixmap content, so
+        a greyed mon held for 100 frames is computed once."""
+        if pix is None or pix.isNull():
+            return pix
+        key = pix.cacheKey()
+        cached = BattleScenePreview._gray_cache.get(key)
+        if cached is not None:
+            return cached
+        img = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                if c.alpha() == 0:
+                    continue
+                avg = (c.red() + c.green() + c.blue()) // 3
+                img.setPixelColor(x, y, QColor(avg, avg, avg, c.alpha()))
+        out = QPixmap.fromImage(img)
+        if len(BattleScenePreview._gray_cache) > 128:
+            BattleScenePreview._gray_cache.clear()
+        BattleScenePreview._gray_cache[key] = out
+        return out
+
     @staticmethod
     def _draw_mon(p, pix, frame_left, frame_top, fw, fh, fx, s):
         """Draw a mon frame, applying a per-mon transform (offset + scale).
@@ -825,10 +873,12 @@ class BattleScenePreview(QWidget):
                 if pix is None or pix.isNull():
                     return
                 cw, ch = pix.width(), pix.height()
-                for off_x, off_y, hf, vf, cf, col, al in clones:
+                for off_x, off_y, hf, vf, cf, col, al, gr in clones:
                     cp = pix
                     if cf > 0:               # the clone's own palette blend
                         cp = self.tint_pixmap(cp, cf, col)   # (Double Team → black)
+                    if gr:                   # greyscaled clone
+                        cp = self.gray_pixmap(cp)
                     if hf or vf:
                         cp = cp.transformed(_QT().scale(-1 if hf else 1,
                                                         -1 if vf else 1))
@@ -851,6 +901,8 @@ class BattleScenePreview(QWidget):
         # minus enemy elevation pushes it UP.
         if self._front_pix and not self._front_pix.isNull():
             fpix = self.tint_pixmap(self._front_pix, *self._front_tint)
+            if self._front_gray:
+                fpix = self.gray_pixmap(fpix)
             fw = fpix.width()
             fh = fpix.height()
             frame_top = (self.ENEMY_CY - fh // 2
@@ -874,6 +926,8 @@ class BattleScenePreview(QWidget):
         # pushes DOWN.
         if self._back_pix and not self._back_pix.isNull():
             bpix = self.tint_pixmap(self._back_pix, *self._back_tint)
+            if self._back_gray:
+                bpix = self.gray_pixmap(bpix)
             bw = bpix.width()
             bh = bpix.height()
             frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off)

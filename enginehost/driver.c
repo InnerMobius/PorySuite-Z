@@ -33,6 +33,7 @@ extern u8 gBattleAnimAttacker, gBattleAnimTarget;
 extern s16 gBattleAnimArgs[];
 extern u8 gHostPalBlendCoeff[32];     /* per-slot tint strength (stub_engine.c) */
 extern u16 gHostPalBlendColor[32];    /* per-slot tint colour (BGR555) */
+extern u8 gHostPalGray[32];           /* per-slot greyscale flag (stub_engine.c) */
 extern u8 gHostBldEva;                /* BLDALPHA top-layer coefficient 0..16 */
 void HostResetPalBlend(void);
 u8 UpdatePaletteFade(void);           /* software fade step (stub_engine.c) */
@@ -71,6 +72,11 @@ struct Snap {
     int alpha;           /* 0..16 opacity: BLDALPHA EVA when this sprite's OAM
                           * objMode is BLEND (setalpha, fade-to/from-invisible),
                           * else 16 (opaque). */
+    int objMode;         /* OAM obj mode: 0 normal, 1 blend, 2 WINDOW. A WINDOW
+                          * sprite is a mask (MetallicShine's invisible mon copy),
+                          * NOT drawn — the renderer skips it. */
+    int gray;            /* 1 if this sprite's palette slot was greyscaled
+                          * (SetGreyscaleOrOriginalPalette — Perish Song). */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
@@ -264,9 +270,11 @@ int engine_snapshot(void)
             int slot = 16 + (s->oam.paletteNum & 0xF);
             o->blendCoeff = gHostPalBlendCoeff[slot];
             o->blendColor = gHostPalBlendColor[slot];
+            o->gray = gHostPalGray[slot];
         }
         /* Alpha: blend-mode sprites (objMode 1) are drawn at BLDALPHA EVA/16. */
         o->alpha = (s->oam.objMode == 1) ? gHostBldEva : 16;
+        o->objMode = s->oam.objMode;
     }
     return n;
 }

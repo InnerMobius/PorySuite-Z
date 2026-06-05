@@ -37,7 +37,11 @@ for path in $SRC_PATHS; do
   # symbol so it's unused; stub_engine.c supplies an ABI-correct one that all
   # callers link against. (--wrap fails to redirect at -O1.)
   if [ "$f" = "battle_anim_mons" ]; then
-    EXTRA="-DRunAffineAnimFromTaskData=RunAffineAnimFromTaskData_ORIG"
+    # Also rename SetGreyscaleOrOriginalPalette: the real one greyscales the
+    # palette buffer (empty in the host); stub_engine.c supplies a version that
+    # RECORDS a per-slot grey flag so the renderer can desaturate (Perish Song).
+    EXTRA="-DRunAffineAnimFromTaskData=RunAffineAnimFromTaskData_ORIG \
+      -DSetGreyscaleOrOriginalPalette=SetGreyscaleOrOriginalPalette_ORIG"
   fi
   # MoveBattlerSpriteToBG copies a mon onto a BG layer via hardware-address VRAM
   # fills (BG_SCREEN_ADDR/BG_PLTT) that fault under wasm — trapping the wall moves

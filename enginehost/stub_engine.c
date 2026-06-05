@@ -254,13 +254,28 @@ u16  GetGpuReg(u8 r) { (void)r; return 0; }
  * all tint correctly without the engine ever holding a real palette. */
 u8  gHostPalBlendCoeff[32];   /* 0 = no tint, else 1..16 */
 u16 gHostPalBlendColor[32];   /* BGR555 target */
+u8  gHostPalGray[32];         /* 1 = slot greyscaled (Perish Song et al.) */
 
 void HostResetPalBlend(void)
 {
     int i;
-    for (i = 0; i < 32; i++) { gHostPalBlendCoeff[i] = 0; gHostPalBlendColor[i] = 0; }
+    for (i = 0; i < 32; i++) {
+        gHostPalBlendCoeff[i] = 0; gHostPalBlendColor[i] = 0; gHostPalGray[i] = 0;
+    }
     gHostBldEva = 16;   /* opaque until a setalpha/fade changes it */
     gPaletteFade.active = 0;   /* no software fade in progress */
+}
+
+/* Record a per-slot greyscale flag. The real one (battle_anim_mons.c) averages
+ * the palette in gPlttBufferUnfaded/Faded — which the host never populates, so
+ * it does nothing. The build renames the project copy (-D…=_ORIG) so callers
+ * (Perish Song's AnimTask_SetGrayscaleOrOriginalPal, etc.) link this; the
+ * renderer desaturates any sprite/mon whose slot is flagged. paletteNum is the
+ * full slot (caller passes oam.paletteNum + 16). */
+void SetGreyscaleOrOriginalPalette(u16 paletteNum, bool8 restoreOriginalColor)
+{
+    if (paletteNum < 32)
+        gHostPalGray[paletteNum] = restoreOriginalColor ? 0 : 1;
 }
 
 void BlendPalette(u16 palOffset, u16 numEntries, u8 coeff, u16 blendColor)

@@ -1961,6 +1961,8 @@ class BattleAnimTab(QWidget):
             P.set_mon_tint(which, s.get("blendCoeff", 0), s.get("blendColor", 0))
             # Alpha fade on the mon (fade-to/from-invisible: Teleport, …).
             P.set_mon_alpha(which, s.get("alpha", 16))
+            # Greyscale (Perish Song greys the mons as the notes flip).
+            P.set_mon_gray(which, bool(s.get("gray", 0)))
             # Dig-style burrow: the engine HIDES the attacker's mon sprite and
             # wiggles a BG layer the mon was copied onto (monbg + DigDownMovement)
             # — so a plain hide loses the sink. If this is the attacker and its
@@ -1994,21 +1996,39 @@ class BattleAnimTab(QWidget):
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)
 
-        # Mon CLONES (Double Team after-images, Quick Attack trail, Minimize,
-        # MetallicShine copy): the engine flags copies of the attacker's mon
-        # (isClone). They must be drawn through the SAME planted mon path as the
-        # real mon (set_mon_clones) — NOT centred on the effect canvas, which
-        # ignores the mon's _y_off seating and lifts the back sprite's hip cut
-        # into view. Offset each clone from the mon's engine BASE so the preview
-        # maps it exactly like the mon: engine (72,80)/(176,40) ≡ the mon's
-        # drawn centre (matches driver.c engine_reset), motion maps 1:1.
-        atk_side = "back" if self._play_direction == "player" else "front"
-        base_x, base_y = (72, 80) if atk_side == "back" else (176, 40)
-        P.set_mon_clones(atk_side, [
-            (s["x"] + s["x2"] - base_x, s["y"] + s["y2"] - base_y,
-             bool(s["hFlip"]), bool(s["vFlip"]),
-             s.get("blendCoeff", 0), s.get("blendColor", 0), s.get("alpha", 16))
-            for s in frame if s.get("isClone") and not s.get("invisible")])
+        # Mon CLONES: each is a copy of a SPECIFIC battler — NOT always the
+        # attacker. Odor Sleuth clones the TARGET (the wiggling silhouette over
+        # the defender). The clone's source battler is the one whose reserved
+        # palette slot it carries (0 = player/back, 1 = enemy/front; engine_reset
+        # gives each a distinct slot), else the nearest battler by position.
+        # Render with THAT battler's sprite, offset from its base so the seating
+        # (hip behind the textbox) matches. SKIP objMode==2 (WINDOW) sprites:
+        # those are masks (MetallicShine's invisible mon copy), never drawn.
+        BASES = {0: (72, 80), 1: (176, 40)}
+        mon_pos = {s["isMon"]: (s["x"] + s["x2"], s["y"] + s["y2"])
+                   for s in frame if s.get("isMon", -1) in (0, 1)}
+        clone_lists = {0: [], 1: []}
+        for s in frame:
+            if (not s.get("isClone") or s.get("invisible")
+                    or s.get("objMode") == 2):
+                continue
+            pal = s.get("paletteNum", 0)
+            if pal in (0, 1):
+                src = pal
+            elif mon_pos:
+                cx, cy = s["x"] + s["x2"], s["y"] + s["y2"]
+                src = min(mon_pos, key=lambda b: (cx - mon_pos[b][0]) ** 2
+                          + (cy - mon_pos[b][1]) ** 2)
+            else:
+                src = 0
+            bx, by = BASES[src]
+            clone_lists[src].append(
+                (s["x"] + s["x2"] - bx, s["y"] + s["y2"] - by,
+                 bool(s["hFlip"]), bool(s["vFlip"]),
+                 s.get("blendCoeff", 0), s.get("blendColor", 0),
+                 s.get("alpha", 16), bool(s.get("gray", 0))))
+        P.set_mon_clones("back", clone_lists[0])
+        P.set_mon_clones("front", clone_lists[1])
 
         # Effect sprites → canvas (lower subpriority drawn on top).
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
@@ -2019,6 +2039,7 @@ class BattleAnimTab(QWidget):
             # spawned (no index, but a real ANIM_TAG_* tileTag — Hail, Sandstorm).
             effects = [s for s in frame
                        if s.get("isMon", -1) == -1
+                       and s.get("objMode") != 2          # WINDOW mask, not drawn
                        and (s.get("templateIndex", -1) >= 0
                             or s.get("tileTag", -1) >= 10000)]
             # Draw order = the GBA's: sort key is (oam.priority<<8 | subpriority);
@@ -2067,6 +2088,8 @@ class BattleAnimTab(QWidget):
                 cf = s.get("blendCoeff", 0)
                 if cf > 0:
                     pix = P.tint_pixmap(pix, cf, s.get("blendColor", 0))
+                if s.get("gray"):
+                    pix = P.gray_pixmap(pix)   # Perish Song greys the notes
                 rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
                 # Alpha blend (setalpha / fade): blend-mode sprites are drawn
                 # semi-transparent at the engine's BLDALPHA coefficient.
