@@ -148,31 +148,63 @@ def _task_body(project_root: str, task: str) -> str:
                        errors="replace").read()
         except OSError:
             continue
-        m = sig.search(txt)
-        if not m:
-            continue
-        i = txt.find("{", m.end())
-        if i < 0:
-            continue
-        depth = 0
-        for j in range(i, len(txt)):
-            if txt[j] == "{":
-                depth += 1
-            elif txt[j] == "}":
-                depth -= 1
-                if depth == 0:
-                    return txt[i:j + 1]
-        return txt[i:]
+        for m in sig.finditer(txt):
+            i = txt.find("{", m.end())
+            if i < 0:
+                continue
+            # Skip a forward DECLARATION (`void NAME(...);`) — its `)` is followed
+            # by `;` before any `{`. Only the DEFINITION (`) {`) has the body.
+            semi = txt.find(";", m.end())
+            if 0 <= semi < i:
+                continue
+            depth = 0
+            for j in range(i, len(txt)):
+                if txt[j] == "{":
+                    depth += 1
+                elif txt[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return txt[i:j + 1]
+            return txt[i:]
     return ""
+
+
+def _task_body_chain(project_root: str, task: str, max_depth: int = 6) -> str:
+    """The task's body PLUS the bodies of its state-machine steps — functions it
+    assigns to ``gTasks[taskId].func`` or calls directly as ``X(taskId)`` — all
+    concatenated. Lets BG detection see a load done in a LATER step: Stats Change
+    loads its arrow mask in ``StatsChangeAnimation_Step2``, reached via
+    ``AnimTask_StatsChange`` → ``InitStatsChangeAnimation`` → ``…_Step1`` →
+    ``…_Step2``. Bounded + cycle-guarded; only follows functions that have a
+    battle-anim body. Harmless for non-nested tasks (their loads are at depth 0)."""
+    seen: set = set()
+    parts: List[str] = []
+
+    def _walk(fn: str, depth: int):
+        if depth > max_depth or fn in seen:
+            return
+        seen.add(fn)
+        body = _task_body(project_root, fn)
+        if not body:
+            return
+        parts.append(body)
+        for nxt in re.findall(r'\.func\s*=\s*([A-Za-z_]\w*)', body):
+            _walk(nxt, depth + 1)
+        for nxt in re.findall(r'\b([A-Za-z_]\w*)\s*\(\s*taskId\s*\)', body):
+            _walk(nxt, depth + 1)
+
+    _walk(task, 0)
+    return "\n".join(parts)
 
 
 def _parse_task_bg(project_root: str, task: str) -> Optional[dict]:
     """{image, pal, tmap / tmap_player / tmap_opponent} of the SYMBOLS a task
-    loads, or None if it loads no BG. Driven entirely by the task's source body."""
+    loads, or None if it loads no BG. Driven entirely by the task's source body
+    (and its state-machine steps — see ``_task_body_chain``)."""
     key = (project_root, task)
     if key in _taskbg_cache:
         return _taskbg_cache[key]
-    body = _task_body(project_root, task)
+    body = _task_body_chain(project_root, task)
     res = None
     if body:
         imgs = _LOAD_GFX.findall(body)

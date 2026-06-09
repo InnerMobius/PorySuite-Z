@@ -112,11 +112,14 @@ struct Snap {
     int addlMonBattler;  /* the battler whose species the addl sprite represents
                           * (what the engine passed), or -1. */
     int addlMonBackpic;  /* isBackpic the engine requested (informational). */
+    int subspriteCount;  /* number of subsprite pieces (SetSubspriteTables — the
+                          * frozen ice cube is 4 pieces). >0 → the renderer queries
+                          * engine_subsprites(id) and assembles all pieces. */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
 __attribute__((export_name("engine_reset")))
-void engine_reset(int attackerIsPlayer)
+void engine_reset(int attackerIsPlayer, int singleBattler)
 {
     int i;
     ResetSpriteData();
@@ -170,6 +173,13 @@ void engine_reset(int attackerIsPlayer)
 
     if (attackerIsPlayer) { gBattleAnimAttacker = 0; gBattleAnimTarget = 1; }
     else                  { gBattleAnimAttacker = 1; gBattleAnimTarget = 0; }
+    /* Status-condition anims (the non-move "Status Conditions" table) are launched
+     * by LaunchStatusAnimation, which sets gBattleAnimAttacker = gBattleAnimTarget
+     * = the AFFECTED battler — a single mon, not attacker-vs-target. Without this
+     * the burn/freeze/etc. effects (which use ANIM_TARGET / ANIM_DEF_PARTNER)
+     * landed on the OTHER mon. Moves and General/Special keep attacker != target. */
+    if (singleBattler)
+        gBattleAnimTarget = gBattleAnimAttacker;
     /* The real engine sets gBattleAnimAttacker = gBattlerAttacker when a move anim
      * launches (battle_anim.c). Mirror it: anim sprites that read the BATTLE-engine
      * globals directly (Superpower orb/fireball via gBattlerAttacker, the
@@ -178,6 +188,15 @@ void engine_reset(int attackerIsPlayer)
      * Player/Enemy direction toggle. Keep them in lockstep. */
     gBattlerAttacker = gBattleAnimAttacker;
     gBattlerTarget   = gBattleAnimTarget;
+
+    /* AnimTask_StatsChange (General_StatsChange) reads which stat + direction from
+     * gBattleSpritesDataPtr->animationData->animArg — a RUNTIME value the battle
+     * engine sets, not the script. The preview has no stat context, so the default
+     * 0 misses every switch case and the task self-destructs (blank). Default to a
+     * representative "Attack +1" (STAT_ANIM_PLUS1 = 15) so the arrows render. The
+     * animation itself is still parsed dynamically from the project. */
+    if (gBattleSpritesDataPtr && gBattleSpritesDataPtr->animationData)
+        gBattleSpritesDataPtr->animationData->animArg = 15;  /* STAT_ANIM_PLUS1 */
 }
 
 __attribute__((export_name("engine_set_arg")))
@@ -355,8 +374,55 @@ int engine_snapshot(void)
             o->addlMonBattler = amb;
             o->addlMonBackpic = ambp;
         }
+        /* Subsprite piece count (ice cube etc.) — see engine_subsprites. */
+        o->subspriteCount = 0;
+        if (s->subspriteTables && s->subspriteMode != SUBSPRITES_OFF) {
+            const struct SubspriteTable *st =
+                &s->subspriteTables[s->subspriteTableNum];
+            if (st && st->subsprites)
+                o->subspriteCount = st->subspriteCount;
+        }
     }
     return n;
+}
+
+/* Subsprite pieces of a sprite (a multi-OAM sprite like the frozen ice cube):
+ * fills sSubBuf with {x, y, shape, size, tileOffset} per piece and returns the
+ * count. The renderer assembles each piece from the sprite's gfx (tileNum +
+ * tileOffset, the piece's shape/size) at the piece's offset from the sprite
+ * centre — the GBA AddSubspritesToOamBuffer layout. */
+static int sSubBuf[256 * 5];
+__attribute__((export_name("engine_subsprites")))
+int engine_subsprites(int spriteIdx)
+{
+    struct Sprite *s;
+    const struct SubspriteTable *st;
+    int k, cnt;
+    if (spriteIdx < 0 || spriteIdx >= MAX_SPRITES)
+        return 0;
+    s = &gSprites[spriteIdx];
+    if (!s->subspriteTables || s->subspriteMode == SUBSPRITES_OFF)
+        return 0;
+    st = &s->subspriteTables[s->subspriteTableNum];
+    if (!st || !st->subsprites)
+        return 0;
+    cnt = st->subspriteCount;
+    if (cnt > 256) cnt = 256;
+    for (k = 0; k < cnt; k++) {
+        const struct Subsprite *sp = &st->subsprites[k];
+        sSubBuf[k * 5 + 0] = (int)(s8)sp->x;
+        sSubBuf[k * 5 + 1] = (int)(s8)sp->y;
+        sSubBuf[k * 5 + 2] = sp->shape;
+        sSubBuf[k * 5 + 3] = sp->size;
+        sSubBuf[k * 5 + 4] = sp->tileOffset;
+    }
+    return cnt;
+}
+
+__attribute__((export_name("engine_subsprites_addr")))
+int engine_subsprites_addr(void)
+{
+    return (int)(intptr_t)&sSubBuf[0];
 }
 
 __attribute__((export_name("engine_snapshot_addr")))

@@ -447,6 +447,8 @@ class BattleScenePreview(QWidget):
         self._back_override = None
         self._bg_shake = (0, 0)         # battle-scene offset px (terrain/screen shake)
         self._mon_shake = (0, 0)        # both-mon offset px (sprite-layer gSpriteCoordOffset shake)
+        self._mwin = None               # (pix, which, sx, sy, alpha): a scrolling BG
+        #   clipped to a mon's silhouette + drawn IN FRONT (Stats Change arrows — the GBA OBJ-window)
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -743,6 +745,16 @@ class BattleScenePreview(QWidget):
         steady (matching the GBA). (0,0) = steady."""
         self._mon_shake = (int(dx), int(dy))
 
+    def set_mon_window_bg(self, pix=None, which: str = "back", sx: int = 0,
+                          sy: int = 0, alpha: float = 0.65) -> None:
+        """Draw a scrolling BG (``pix``) CLIPPED to mon ``which``'s silhouette and
+        IN FRONT of it — the GBA OBJ-window effect (Stats Change fills the mon
+        with scrolling up/down arrows, masked by an invisible mon-copy window).
+        ``sx``/``sy`` scroll the pattern; ``alpha`` is the blend. None clears."""
+        self._mwin = ((pix, which, int(sx), int(sy), float(alpha))
+                      if pix is not None and not pix.isNull() else None)
+        self.update()
+
     @staticmethod
     def _mosaic_pixmap(pix, level):
         """GBA MOSAIC: each (level+1)x(level+1) block shows one source pixel —
@@ -765,6 +777,7 @@ class BattleScenePreview(QWidget):
         self._front_override = self._back_override = None
         self._bg_shake = (0, 0)
         self._mon_shake = (0, 0)
+        self._mwin = None
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
                    or self._back_fx != (0, 0, 1.0, 1.0)
                    or not self._front_visible or not self._back_visible
@@ -1190,6 +1203,48 @@ class BattleScenePreview(QWidget):
                                bw, bh, self._back_fx, s)
             if self._back_alpha < 16:
                 p.setOpacity(1.0)
+
+        # Mon-windowed scrolling BG (Stats Change arrows): composite the scrolling
+        # pattern INTO the affected mon's silhouette and draw it IN FRONT — the GBA
+        # OBJ-window effect (an invisible mon-copy window masks the BG to the mon).
+        if self._mwin is not None:
+            bgpix, which, wsx, wsy, walpha = self._mwin
+            if which == "front":
+                mon = self._front_override or self._front_pix
+                mcx = self.ENEMY_CX + self._mon_shake[0]
+                mcy = (self.ENEMY_CY + self._front_y_off
+                       - self._enemy_elevation + self._mon_shake[1])
+            else:
+                mon = self._back_override or self._back_pix
+                mcx = self.PLAYER_CX + self._mon_shake[0]
+                mcy = self.PLAYER_CY + self._back_y_off + self._mon_shake[1]
+            if (mon is not None and not mon.isNull()
+                    and not bgpix.isNull()):
+                mw, mh = mon.width(), mon.height()
+                bw2, bh2 = bgpix.width(), bgpix.height()
+                if mw > 0 and mh > 0 and bw2 > 0 and bh2 > 0:
+                    result = QPixmap(mw, mh)
+                    result.fill(Qt.GlobalColor.transparent)
+                    rp = QPainter(result)
+                    oy = wsy % bh2
+                    ox = wsx % bw2
+                    yy = -oy
+                    while yy < mh:
+                        xx = -ox
+                        while xx < mw:
+                            rp.drawPixmap(xx, yy, bgpix)
+                            xx += bw2
+                        yy += bh2
+                    # Keep the arrows ONLY where the mon is opaque (the OBJ-window).
+                    rp.setCompositionMode(
+                        QPainter.CompositionMode.CompositionMode_DestinationIn)
+                    rp.drawPixmap(0, 0, mon)
+                    rp.end()
+                    fl = (mcx - mw // 2) * s
+                    ft = (mcy - mh // 2) * s
+                    p.setOpacity(max(0.1, min(1.0, walpha)))
+                    p.drawPixmap(int(fl), int(ft), mw * s, mh * s, result)
+                    p.setOpacity(1.0)
 
         # Memento / Role Play SOUL SHADOW — a black silhouette of the mon copied
         # to a BG layer (priority 2, drawn in FRONT of the battler sprites the

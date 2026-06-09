@@ -57,6 +57,17 @@ for path in $SRC_PATHS; do
   if [ "$f" = "battle_anim" ]; then
     EXTRA="-DMoveBattlerSpriteToBG=MoveBattlerSpriteToBG_ORIG"
   fi
+  # The headless engine never loads sprite SHEETS (loadspritegfx is a no-op), so
+  # GetSpriteTileStartByTag returns 0xFFFF (not-found) for every tag. Anims that
+  # HIDE a sprite when its sheet is "missing" — e.g. Status_Freeze's ice cube does
+  # `if (GetSpriteTileStartByTag(ANIM_TAG_ICE_CUBE) == 0xFFFF) invisible = TRUE` —
+  # then render NOTHING. Rename sprite.c's real one; stub_engine.c supplies a host
+  # version that reports a valid tile start so those visibility guards pass (the
+  # renderer draws the sprite from the project PNG by tag, so zeroed tiles are
+  # harmless). sprite.c's own callers still use the real _ORIG.
+  if [ "$f" = "sprite" ]; then
+    EXTRA="-DGetSpriteTileStartByTag=GetSpriteTileStartByTag_ORIG"
+  fi
   "$CLANG" -c $CFLAGS $EXTRA $PRE $INC "$path" -o "$OUT/$f.o"
 done
 for s in stub_engine stub_gfx_data driver; do
@@ -72,7 +83,7 @@ EXP="-Wl,--export=engine_reset,--export=engine_set_arg,--export=engine_create_sp
 --export=engine_scanline_addr,--export=engine_scanline_state,--export=engine_win0h,\
 --export=engine_pltt_addr,--export=engine_bg_pltt_index,--export=engine_bg_screen_size,\
 --export=engine_monbg,--export=engine_mon_fx,--export=engine_bg3_scroll,\
---export=engine_coord_offset"
+--export=engine_coord_offset,--export=engine_subsprites,--export=engine_subsprites_addr"
 "$CLANG" --target=wasm32-wasi -mexec-model=reactor $EXP "$OUT"/*.o -lm \
   -o "$OUT/anim_engine_reactor.wasm"
 

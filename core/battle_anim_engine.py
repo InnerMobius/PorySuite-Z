@@ -34,6 +34,7 @@ _SNAP_FIELDS = (
     "priority", "subpriority", "paletteNum", "invisible", "templateIndex", "isMon",
     "tileTag", "isClone", "blendCoeff", "blendColor", "alpha", "objMode", "gray",
     "bgCopy", "bgCopyBaseY", "addlMon", "addlMonBattler", "addlMonBackpic",
+    "subspriteCount",
 )
 _SNAP = struct.Struct("<%di" % len(_SNAP_FIELDS))
 
@@ -183,16 +184,39 @@ class AnimEngine:
         mem = ex["memory"]
         raw = mem.read(store, addr, addr + n * stride)
         out = []
+        sub_addr = None
         for i in range(n):
             vals = _SNAP.unpack_from(raw, i * stride)
-            out.append(dict(zip(_SNAP_FIELDS, vals)))
+            d = dict(zip(_SNAP_FIELDS, vals))
+            # Multi-OAM sprite (e.g. the frozen ice cube = 4 pieces): pull each
+            # piece (x, y, shape, size, tileOffset) so the renderer can assemble
+            # the whole sprite instead of just the main 64x64 piece.
+            if d.get("subspriteCount", 0) > 0:
+                try:
+                    cnt = ex["engine_subsprites"](store, d["id"])
+                    if cnt > 0:
+                        if sub_addr is None:
+                            sub_addr = ex["engine_subsprites_addr"](store)
+                        sraw = mem.read(store, sub_addr, sub_addr + cnt * 5 * 4)
+                        flat = struct.unpack("<%di" % (cnt * 5), sraw)
+                        d["subsprites"] = [tuple(flat[k * 5:k * 5 + 5])
+                                           for k in range(cnt)]
+                except Exception:
+                    pass
+            out.append(d)
         return out
 
     # -- low-level driving (used by tests + the timeline player) -------------
-    def open(self, attacker_is_player: bool = True):
-        """Return a live (store, exports) session with the scene reset."""
+    def open(self, attacker_is_player: bool = True, single_battler: bool = False):
+        """Return a live (store, exports) session with the scene reset.
+
+        ``single_battler`` mirrors the game's LaunchStatusAnimation, which sets the
+        anim attacker AND target to the SAME (affected) battler — used for the
+        Status Conditions table so burn/freeze/etc. land on the selected mon, not
+        the opposite one. Moves and General/Special keep attacker != target."""
         store, ex = self._new_instance()
-        ex["engine_reset"](store, 1 if attacker_is_player else 0)
+        ex["engine_reset"](store, 1 if attacker_is_player else 0,
+                           1 if single_battler else 0)
         return store, ex
 
     def create_sprite(self, store, ex, template: str, battler: int,
@@ -231,7 +255,8 @@ class AnimEngine:
                       bg_pal_out: Optional[list] = None,
                       bg_pal_slot: Optional[int] = None,
                       monfx_out: Optional[list] = None,
-                      coord_offset_out: Optional[list] = None) -> List[List[dict]]:
+                      coord_offset_out: Optional[list] = None,
+                      single_battler: bool = False) -> List[List[dict]]:
         """Run a whole move and return one OAM snapshot per GBA frame, RESILIENT
         to a single sprite/task whose creation traps the host engine.
 
@@ -264,7 +289,8 @@ class AnimEngine:
                 banned,
                 mf_tmp if monfx_out is not None else None,
                 b3_tmp if bg3scroll_out is not None else None,
-                co_tmp if coord_offset_out is not None else None)
+                co_tmp if coord_offset_out is not None else None,
+                single_battler)
             score = self._content_score(frames)
             if best is None or score > best[0]:
                 best = (score, frames, s_tmp, b_tmp, b2_tmp, sh_tmp, bp_tmp,
@@ -309,11 +335,11 @@ class AnimEngine:
     def _play_once(self, ops, attacker_is_player, max_frames, wait_cap,
                    sounds_out, bgscroll_out, bg2scroll_out, shadow_out,
                    bg_palette, bg_pal_out, bg_pal_slot, banned, monfx_out=None,
-                   bg3scroll_out=None, coord_offset_out=None):
+                   bg3scroll_out=None, coord_offset_out=None, single_battler=False):
         """One playthrough. Returns (frames, trapped_item): trapped_item is the
         template/func name whose CREATION trapped (so the caller can ban + replay)
         or None if the run finished without a creation trap."""
-        store, ex = self.open(attacker_is_player)
+        store, ex = self.open(attacker_is_player, single_battler)
         frames: List[List[dict]] = []
         dead = [False]   # set when a wasm trap (UB in some move) halts the engine
         trapped_on = [None]   # template/func being created when a trap hit

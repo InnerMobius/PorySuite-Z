@@ -622,6 +622,23 @@ void MoveBattlerSpriteToBG(u8 battlerId, u8 toBG_2)
     gHostMonBgBaseY[battlerId] = baseY;
 }
 
+/* --- GetSpriteTileStartByTag (sheet-load visibility guard) ------------------
+ * The headless engine never loads sprite SHEETS (loadspritegfx is a no-op), so
+ * sprite.c's real GetSpriteTileStartByTag (renamed _ORIG in the build) returns
+ * 0xFFFF (not-found) for every animation tag. Several anims HIDE a sprite when
+ * its sheet is "missing" — e.g. Status_Freeze's AnimTask_FrozenIceCube does
+ * `if (GetSpriteTileStartByTag(ANIM_TAG_ICE_CUBE) == 0xFFFF) invisible = TRUE`,
+ * which blanked Freeze entirely. This host version reports a valid tile start so
+ * those visibility guards pass; the renderer draws the sprite from the project
+ * PNG by tag, so the zeroed tiles never matter. (If a tag IS ever loaded, the
+ * real start flows through unchanged.) */
+extern u16 GetSpriteTileStartByTag_ORIG(u16 tag);
+u16 GetSpriteTileStartByTag(u16 tag)
+{
+    u16 r = GetSpriteTileStartByTag_ORIG(tag);
+    return (r == 0xFFFF) ? 0 : r;
+}
+
 /* --- ABI-correct RunAffineAnimFromTaskData ---------------------------------
  * The decomp indexes the affine-anim command table with a HARDCODED 8-byte
  * stride: `LoadPointerFromVars(...) + (task->data[7] << 3)`. That matches the

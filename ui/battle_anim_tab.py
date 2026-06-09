@@ -2002,6 +2002,7 @@ class BattleAnimTab(QWidget):
         """Push the anim background (scrolled to this frame) to the preview."""
         if self._engine_bg_pix is None:
             self._move_preview.set_anim_bg(None)
+            self._move_preview.set_mon_window_bg(None)
             return
         scroll = self._anim_bg_scroll_layer()
         if 0 <= idx < len(scroll):
@@ -2027,8 +2028,24 @@ class BattleAnimTab(QWidget):
                     if len(self._bg_pal_pixcache) < 64:
                         self._bg_pal_pixcache[key] = rp
                 pix = rp
-        self._move_preview.set_anim_bg(pix, sx, sy, self._bg_distort_for(idx),
-                                       self._bg_alpha_for(idx))
+        # Mon-windowed BG (Stats Change arrows): an OBJ-window sprite (objMode==2)
+        # this frame means the BG is clipped to a mon (an invisible mon-copy
+        # window), not full-screen. Composite it INTO that mon instead — pick the
+        # side from the window sprite's position.
+        P = self._move_preview
+        frame = (self._engine_frames[idx]
+                 if 0 <= idx < len(getattr(self, "_engine_frames", []) or []) else [])
+        ow = next((s for s in frame if s.get("objMode", 0) == 2), None)
+        if ow is not None:
+            owx = ow.get("x", 0) + ow.get("x2", 0)
+            which = ("back" if abs(owx - P.PLAYER_CX) <= abs(owx - P.ENEMY_CX)
+                     else "front")
+            P.set_anim_bg(None)
+            P.set_mon_window_bg(pix, which, sx, sy)
+        else:
+            P.set_mon_window_bg(None)
+            P.set_anim_bg(pix, sx, sy, self._bg_distort_for(idx),
+                          self._bg_alpha_for(idx))
 
     @staticmethod
     def _oam_scale(m, affine):
@@ -2462,6 +2479,18 @@ class BattleAnimTab(QWidget):
                 # Non-affine: shake / sway / lunge offset (no scale).
                 P.set_mon_transform(which, s["x2"], s["y2"], 1.0, 1.0)
 
+        # Level-up flash: in-game this flashes ONLY the healthbox palette, which
+        # the move preview has no healthbox to show. Represent it as a light-cyan
+        # pulse (the game's RGB(20,27,31)) on the leveling mon (the focus side) so
+        # the animation isn't blank. Overrides the mon's engine tint (0 here).
+        if getattr(self, "_levelup_flash", False):
+            n = max(1, len(getattr(self, "_engine_frames", []) or []))
+            prog = self._engine_idx / n
+            coeff = int(round(14 * (1.0 - abs(2.0 * prog - 1.0))))   # 0→14→0
+            if coeff > 0:
+                lvl_which = "back" if self._play_direction == "player" else "front"
+                P.set_mon_tint(lvl_which, coeff, 0x7F74)   # RGB(20,27,31) light cyan
+
         # Mon CLONES: each is a copy of a SPECIFIC battler — NOT always the
         # attacker. Odor Sleuth clones the TARGET (the wiggling silhouette over
         # the defender). The clone's source battler is the one whose reserved
@@ -2540,6 +2569,41 @@ class BattleAnimTab(QWidget):
                     if not tag:                       # task-spawned → map by tileTag
                         tag = getattr(self, "_tag_by_value", {}).get(
                             s.get("tileTag", -1), "")
+                    # Multi-OAM SUBSPRITE (frozen ice cube = 4 pieces): assemble
+                    # every piece from the sprite's .4bpp at (tileNum + tileOffset)
+                    # with the piece's own shape/size, placed at the piece's offset
+                    # from the sprite CENTRE — the GBA AddSubspritesToOamBuffer
+                    # layout (baseX = centre; piece OAM x = baseX + subsprite.x).
+                    subs = s.get("subsprites")
+                    if subs and tag:
+                        sprite = self._sprites.get(tag)
+                        if sprite is not None:
+                            pal = (self._palettes.get(tag)
+                                   or self._palette_for(sprite))
+                            rx, ry = s["x"] + s["x2"], s["y"] + s["y2"]
+                            cf = s.get("blendCoeff", 0)
+                            col = s.get("blendColor", 0)
+                            gray = bool(s.get("gray"))
+                            hf, vf = bool(s["hFlip"]), bool(s["vFlip"])
+                            a = s.get("alpha", 16)
+                            if a < 16:
+                                painter.setOpacity(max(0.0, a / 16.0))
+                            for (px, py, pshape, psize, ptile) in subs:
+                                ppix = self._render_4bpp_frame(
+                                    sprite, pal, s["tileNum"] + ptile,
+                                    pshape, psize, hf, vf)
+                                if ppix is None or ppix.isNull():
+                                    continue
+                                if cf > 0:
+                                    ppix = P.tint_pixmap(ppix, cf, col)
+                                if gray:
+                                    ppix = P.gray_pixmap(ppix)
+                                qx = (rx - px - ppix.width()) if hf else (rx + px)
+                                qy = (ry - py - ppix.height()) if vf else (ry + py)
+                                painter.drawPixmap(int(qx), int(qy), ppix)
+                            if a < 16:
+                                painter.setOpacity(1.0)
+                        continue
                     frames = self._play_frame_cache.get(tag)
                     if frames:
                         fw, fh = self._frame_sizes.get(tag, (0, 0))
@@ -2596,6 +2660,12 @@ class BattleAnimTab(QWidget):
         timeline = self._cur_timeline
         if not timeline:
             return
+        # Level-up: the move flashes only the healthbox palette (no scene/mon
+        # visual). Detect it so the renderer can pulse a representative light-cyan
+        # flash on the leveling mon (the preview has no healthbox to flash).
+        self._levelup_flash = any(
+            c.name == "createvisualtask" and c.args and "LevelUp" in str(c.args[0])
+            for c in timeline)
         # Battlers copied to a BG layer by `monbg` are rendered as a STATIC
         # full-size copy in-game (the real sprite is hidden + can be moved/scaled
         # by tasks WITHOUT changing what you see). The host can't render a real
@@ -2707,7 +2777,13 @@ class BattleAnimTab(QWidget):
                                 if bg_raw_pal is not None else None),
                     bg_pal_slot=bg_pal_slot,
                     monfx_out=self._engine_monfx,
-                    coord_offset_out=self._engine_coordoff)
+                    coord_offset_out=self._engine_coordoff,
+                    # Status-condition anims target a SINGLE battler (the affected
+                    # mon = attacker = target, per LaunchStatusAnimation), so their
+                    # effects land on the selected mon, not the opposite one.
+                    single_battler=(getattr(self, "_anim_cat_combo", None) is not None
+                                    and self._anim_cat_combo.currentText()
+                                    == "Status Conditions"))
             except Exception:
                 _log.exception("engine play_timeline failed; falling back to VM")
                 self._engine_frames = []

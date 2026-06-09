@@ -691,11 +691,27 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 break
         return False
 
+    def _rest_has_content(cmds, start: int) -> bool:
+        """Do the commands AFTER index ``start`` (the fall-through of a
+        conditional jump) lead to real animation — a ``goto`` (to a main line) or
+        a ``create*`` (inline sprites/tasks) BEFORE hitting end/return? Used to
+        tell a SKIP jump (Castform: jump-to-skip, then `goto` the morph → fall
+        through) from a VARIANT-DISPATCH jump (Safari Reaction: a row of jumps
+        ending in bare `end`, no main line → follow the target). Other jumps and
+        waits/sounds in between don't count as content."""
+        for c in cmds[start:]:
+            if c.name in ("end", "return"):
+                return False
+            if c.name == "goto" or c.name.startswith("create"):
+                return True
+        return False
+
     def _walk(lbl: str, depth: int, seen: frozenset):
         if depth > max_depth or lbl in seen or lbl not in scripts:
             return
         seen2 = seen | {lbl}
-        for cmd in scripts[lbl]:
+        _cmds = scripts[lbl]
+        for ci, cmd in enumerate(_cmds):
             c = Command(name=cmd.name, args=list(cmd.args), kind=cmd.kind,
                         raw=cmd.raw, depth=depth, call_target=cmd.call_target)
             if cmd.name == "return":
@@ -724,18 +740,30 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                     pick = cmd.args[1]
                 _walk(pick, depth + 1, seen2)
                 return  # follow the chosen branch
+            elif (cmd.name.startswith("jumparg")
+                  and cmd.args and cmd.args[-1] in scripts):
+                # ARG-based conditional jump (jumpargeq …): the branch TARGET (its
+                # last arg, a label) holds a VARIANT's real animation — Magnitude's
+                # power tiers, Return's friendship tiers. We can't evaluate the
+                # runtime arg, so follow it as a representative variant; without
+                # this the move resolves to just its selector task + end.
+                _walk(cmd.args[-1], depth + 1, seen2)
+                return
             elif (cmd.name.startswith("jump") and cmd.name != "jumpifcontest"
                   and cmd.args and cmd.args[-1] in scripts):
-                # Conditional jump (jumpargeq / jumpret* / jumpifmoveturn …): the
-                # branch TARGET (its last arg, a label) holds a variant's real
-                # animation — Magnitude's power tiers, Return's friendship tiers,
-                # etc. We can't evaluate the runtime condition statically, so we
-                # follow the FIRST branch as a representative animation (like
-                # choosetwoturnanim). Without this, a branch-based move resolves
-                # to just its selector task + end → NO animation.
-                # EXCEPT jumpifcontest: the preview is never a contest, so we take
-                # the NON-contest path (fall through) — else Sky Attack would load
-                # the BG_SKY_CONTESTS variant instead of BG_SKY.
+                # Return-value / turn conditional jump (jumpret* / jumpreteq /
+                # jumpifmoveturn). Two shapes, told apart by whether the
+                # fall-through has real content:
+                #   • SKIP-then-main (Castform: `jumpreteq TRUE, <skip>` then
+                #     `goto <morph>`) → fall-through HAS content → FALL THROUGH so
+                #     the main line runs (don't follow the skip).
+                #   • VARIANT-DISPATCH (Safari Reaction: a row of `jumpreteq
+                #     <type>, <variant>` ending in bare `end`) → fall-through has
+                #     NO content → FOLLOW the first target as a representative.
+                # jumpifcontest is excluded above: the preview is never a contest,
+                # so it always falls through (the non-contest path).
+                if _rest_has_content(_cmds, ci + 1):
+                    continue
                 _walk(cmd.args[-1], depth + 1, seen2)
                 return
         # Reached the end of this label with no end/return/goto/branch → the
