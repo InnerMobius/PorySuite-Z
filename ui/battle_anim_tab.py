@@ -123,8 +123,10 @@ _KIND_DEFAULT = ("·", "#777777")           # · default
 # sound edit dialog can audition an SE_* through the Sound Editor (the
 # same module-callback pattern EVENTide's playse ▶ button uses).  Left
 # None in standalone contexts (the ▶ button then no-ops gracefully).
-_preview_sound_cb = None   # Callable[[str], bool]  — constant -> play it
+_preview_sound_cb = None   # Callable[[str], bool]  — cache-only play (move playback)
 _preview_sound_prepare_cb = None  # Callable[[str], None] — warm the SE PCM cache
+_preview_sound_ondemand_cb = None  # Callable[[str], bool] — render+play on demand
+                                   # (the timeline ▶ Sound button; EVENTide-style)
 _preview_cry_cb = None     # Callable[[str], bool]  — SPECIES_ const -> play cry
 _stop_sound_cb = None      # Callable[[], None]      — stop any preview
 
@@ -311,6 +313,10 @@ class BattleAnimTab(QWidget):
         self._engine_sounds: list = []     # [(frame_idx, SE)] schedule for playback
         self._engine_sound_ptr = 0         # next un-fired sound in _engine_sounds
         self._engine_bgscroll: list = []   # [(x,y)] BG scroll per frame
+        self._engine_shadow: list = []     # per-frame Memento soul-shadow state
+        self._engine_bgpal: list = []      # per-frame live BG palette (engine-animated)
+        self._bg_indexed = None            # indexed anim-BG QImage (for re-colour)
+        self._bg_pal_pixcache: dict = {}   # palette-state -> recoloured QPixmap
         self._engine_bg_pix = None         # assembled anim-BG QPixmap for this move
         self._bg_id_map = None             # BG id -> (img,pal,tilemap) paths (lazy)
         self._bg_pix_cache: dict = {}      # BG id -> assembled QPixmap (cache)
@@ -692,6 +698,10 @@ class BattleAnimTab(QWidget):
         self._grid_refresh_timer.stop()
         self._frame_timer.stop()
         self._project_root = project_root
+        self._macro_sigs = None        # re-parse opcode signatures for this project
+        self._argconst_cache = None    # re-parse arg #define constants for this project
+        from core.battle_anim_bg import clear_caches as _clear_bg_caches
+        _clear_bg_caches()             # re-read BG task bodies + INCBINs from disk
         # Cry moves play the selected mon's cry from sound/.../cries/<slug>.wav —
         # make sure the shared cry player knows this project (the Pokemon tab
         # sets it too, but the user may reach Battle Anims first).
@@ -707,6 +717,13 @@ class BattleAnimTab(QWidget):
         # RGB_* / RGB(r,g,b) colour constants the blend/fade tasks take as args
         # (RGB_WHITE flash, RGB_BLACK dark blend, …) so tints get the right hue.
         self._rgb_consts = self._parse_rgb_consts(project_root)
+        # Battler-selector consts (ANIM_ATTACKER=0 …) from the project's header,
+        # overriding the engine-default fallback so _int_or resolves them even if
+        # a project renumbers them. (ANIM_TAG_* are expressions, not picked up.)
+        try:
+            _ANIM_ARG_CONSTS.update(self._parse_anim_arg_consts(project_root))
+        except Exception:
+            pass
 
         # In-memory reset.
         self._palettes.clear()
@@ -1429,6 +1446,24 @@ class BattleAnimTab(QWidget):
         self._timeline.blockSignals(False)
         has_timeline = bool(self._timeline.count())
         self._tl_play_move_btn.setEnabled(has_timeline)
+        # Re-enable the ▶ Sound preview now the launcher's callback is wired:
+        # load()'s one-time enable check ran BEFORE setup_pages wired
+        # _preview_sound_cb, so the button was stuck disabled. + PRE-WARM this
+        # move's SEs (render is async + slow) so they play in-sync on the FIRST
+        # playback — else the first play is silent and the wrong (already-cached)
+        # SE can fire (Reflect had no sound, Role Play played a stale 'crunch'
+        # instead of its DETECT 'ting').
+        _have_se = (_preview_sound_cb is not None
+                    or _preview_sound_ondemand_cb is not None)
+        self._tl_play_btn.setEnabled(_have_se)
+        self._tl_stop_btn.setEnabled(_have_se)
+        if _preview_sound_prepare_cb is not None:
+            for _c in timeline:
+                if getattr(_c, "kind", None) == KIND_SOUND and _c.args:
+                    try:
+                        _preview_sound_prepare_cb(_c.args[0])
+                    except Exception:
+                        pass
         if has_timeline:
             self._timeline.setCurrentRow(
                 min(select_row, self._timeline.count() - 1))
@@ -1530,7 +1565,14 @@ class BattleAnimTab(QWidget):
         if own_idx >= len(cmds):
             return
         cmd = cmds[own_idx]
-        new_cmd = self._command_editor_dialog(label, cmd)
+        # Sound commands open the fielded sound editor directly (every arg as a
+        # labelled widget + a ▶ preview button), not the generic type-chooser —
+        # which dumps any sound that isn't exactly playse/playsewithpan into a
+        # raw-text box (the "loopsewithpan SE_M_MIST, …" the user hit).
+        if cmd.kind == KIND_SOUND:
+            new_cmd = self._edit_sound_dialog(cmd)
+        else:
+            new_cmd = self._command_editor_dialog(label, cmd)
         if new_cmd is None or new_cmd == cmd.raw:
             return
         new_text = rewrite_script_command(
@@ -1580,8 +1622,11 @@ class BattleAnimTab(QWidget):
             self._move_prev_lbl.setText(
                 "Select a 🔊 sound row, then press Preview.")
             return
-        if _preview_sound_cb is not None:
-            _preview_sound_cb(se)
+        # On-demand audition (renders if not cached, then plays) — a manual click
+        # must not be silently dropped like the rapid in-sync move playback.
+        cb = _preview_sound_ondemand_cb or _preview_sound_cb
+        if cb is not None:
+            cb(se)
 
     def _on_timeline_double_click(self, item: QListWidgetItem):
         """Double-click a depth-0 row → open the command editor."""
@@ -1615,54 +1660,123 @@ class BattleAnimTab(QWidget):
             return None
         return format_command(cmd.name, [str(spin.value())])
 
+    def _parse_macro_signatures(self) -> Dict[str, List[str]]:
+        """{opcode: [param, …]} parsed from the project's battle-anim macro
+        files, so the command editor can label each argument with its real
+        source name (loopsewithpan → se, pan, wait, times). Project-agnostic —
+        any custom opcode a project adds is picked up automatically."""
+        out: Dict[str, List[str]] = {}
+        if not self._project_root:
+            return out
+        import re
+        for rel in ("asm/macros/battle_anim_script.inc",
+                    "asm/macros/battle_anim.inc"):
+            p = os.path.join(self._project_root, rel)
+            if not os.path.isfile(p):
+                continue
+            try:
+                txt = open(p, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            for m in re.finditer(r"^\s*\.macro\s+(\w+)\s*(.*)$", txt, re.MULTILINE):
+                name = m.group(1)
+                if name in out:
+                    continue   # first definition wins (the _script.inc file)
+                params = []
+                for raw in m.group(2).split(","):
+                    raw = raw.strip()
+                    if not raw or raw.startswith("@"):
+                        continue
+                    pn = re.split(r"[:=]", raw)[0].strip()   # drop :req/:vararg/=def
+                    if pn:
+                        params.append(pn)
+                out[name] = params
+        return out
+
+    def _macro_arg_names(self, op: str, nargs: int) -> List[str]:
+        """Real macro parameter names for ``op`` padded to ``nargs`` (extra
+        args fall back to arg1..argN)."""
+        sigs = getattr(self, "_macro_sigs", None)
+        if sigs is None:
+            sigs = self._macro_sigs = self._parse_macro_signatures()
+        names = list(sigs.get(op, []))
+        while len(names) < nargs:
+            names.append(f"arg{len(names) + 1}")
+        return names
+
     def _edit_sound_dialog(self, cmd) -> Optional[str]:
+        """Field-ize a sound command: EVERY argument becomes a labelled widget
+        named by the opcode's real macro parameter (se / pan / wait / times /
+        currentPan / …), with a ▶ preview + ⏹ stop on the sound field. Works for
+        any sound opcode — playse, playsewithpan, panse, loopsewithpan,
+        waitplaysewithpan, or a project's own — not just the two old special
+        cases that left everything else as a raw string."""
         dlg = QDialog(self)
-        dlg.setWindowTitle("Edit Sound")
+        dlg.setWindowTitle(f"Edit Sound — {cmd.name}")
         form = QFormLayout(dlg)
-        se_combo = QComboBox()
-        se_combo.setEditable(True)   # editable = type-to-search
-        se_combo.addItems(self._sound_effects or [])
-        cur_se = cmd.args[0] if cmd.args else ""
-        if cur_se:
-            i = se_combo.findText(cur_se)
-            if i >= 0:
-                se_combo.setCurrentIndex(i)
+        names = self._macro_arg_names(cmd.name, len(cmd.args))
+        getters = []                       # one value-getter per argument, in order
+        for i, val in enumerate(cmd.args):
+            pname = names[i] if i < len(names) else f"arg{i + 1}"
+            low = pname.lower()
+            label = (pname[:1].upper() + pname[1:]) + ":"
+            if i == 0 or low in ("se", "song", "sound", "id"):
+                # Sound effect picker + audition buttons.
+                se_combo = QComboBox()
+                se_combo.setEditable(True)            # type-to-search
+                se_combo.addItems(self._sound_effects or [])
+                se_combo.wheelEvent = lambda e: e.ignore()   # RDP scroll safety
+                ci = se_combo.findText(val)
+                se_combo.setCurrentIndex(ci) if ci >= 0 else se_combo.setEditText(val)
+                row = QHBoxLayout()
+                row.addWidget(se_combo, 1)
+                btn_play = QPushButton("▶")
+                btn_play.setFixedWidth(30)
+                btn_play.setToolTip("Preview this sound effect")
+                btn_play.clicked.connect(
+                    lambda _=False, c=se_combo: (
+                        (_preview_sound_ondemand_cb or _preview_sound_cb)
+                        and (_preview_sound_ondemand_cb or _preview_sound_cb)(
+                            c.currentText().strip())))
+                btn_stop = QPushButton("⏹")
+                btn_stop.setFixedWidth(30)
+                btn_stop.setToolTip("Stop preview")
+                btn_stop.clicked.connect(
+                    lambda _=False: _stop_sound_cb and _stop_sound_cb())
+                if _preview_sound_cb is None and _preview_sound_ondemand_cb is None:
+                    btn_play.setEnabled(False)
+                    btn_play.setToolTip("Sound preview unavailable "
+                                        "(Sound Editor not loaded)")
+                    btn_stop.setEnabled(False)
+                row.addWidget(btn_play)
+                row.addWidget(btn_stop)
+                holder = QWidget()
+                holder.setLayout(row)
+                form.addRow(label, holder)
+                getters.append(lambda c=se_combo: c.currentText().strip())
+            elif "pan" in low:
+                # Pan position (SOUND_PAN_*) — editable so step amounts work too.
+                pan_combo = QComboBox()
+                pan_combo.setEditable(True)
+                pan_combo.addItems(["SOUND_PAN_TARGET", "SOUND_PAN_ATTACKER", "0"])
+                pan_combo.wheelEvent = lambda e: e.ignore()
+                pi = pan_combo.findText(val)
+                pan_combo.setCurrentIndex(pi) if pi >= 0 else pan_combo.setEditText(val)
+                form.addRow(label, pan_combo)
+                getters.append(lambda c=pan_combo: c.currentText().strip())
+            elif self._int_or(val, None) is not None:
+                # Numeric arg (wait / times / delay / count …) → spinbox.
+                sp = QSpinBox()
+                sp.setRange(-32768, 65535)
+                sp.setValue(self._int_or(val, 0))
+                sp.wheelEvent = lambda e: e.ignore()
+                form.addRow(label, sp)
+                getters.append(lambda w=sp: str(w.value()))
             else:
-                se_combo.setEditText(cur_se)
-        # Sound row + ▶ preview / ⏹ stop buttons (audition through the
-        # Sound Editor, just like EVENTide's playse picker).
-        se_row = QHBoxLayout()
-        se_row.addWidget(se_combo, 1)
-        btn_play = QPushButton("▶")
-        btn_play.setFixedWidth(30)
-        btn_play.setToolTip("Preview this sound effect")
-        btn_play.clicked.connect(
-            lambda: _preview_sound_cb and _preview_sound_cb(
-                se_combo.currentText().strip()))
-        btn_stop = QPushButton("⏹")
-        btn_stop.setFixedWidth(30)
-        btn_stop.setToolTip("Stop preview")
-        btn_stop.clicked.connect(lambda: _stop_sound_cb and _stop_sound_cb())
-        if _preview_sound_cb is None:
-            btn_play.setEnabled(False)
-            btn_play.setToolTip("Sound preview unavailable (Sound Editor not loaded)")
-            btn_stop.setEnabled(False)
-        se_row.addWidget(btn_play)
-        se_row.addWidget(btn_stop)
-        form.addRow("Sound:", se_row)
-        # Pan field only when the opcode carries a pan arg.
-        pan_combo = None
-        if len(cmd.args) > 1:
-            pan_combo = QComboBox()
-            pan_combo.setEditable(True)
-            pan_combo.addItems(["SOUND_PAN_TARGET", "SOUND_PAN_ATTACKER", "0"])
-            cur_pan = cmd.args[1]
-            j = pan_combo.findText(cur_pan)
-            if j >= 0:
-                pan_combo.setCurrentIndex(j)
-            else:
-                pan_combo.setEditText(cur_pan)
-            form.addRow("Pan:", pan_combo)
+                # Anything else (a symbol the macro takes) → free text.
+                le = QLineEdit(val)
+                form.addRow(label, le)
+                getters.append(lambda w=le: w.text().strip())
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(dlg.accept)
@@ -1670,13 +1784,9 @@ class BattleAnimTab(QWidget):
         form.addRow(bb)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
-        new_se = se_combo.currentText().strip()
-        if not new_se:
+        new_args = [g() for g in getters]
+        if not new_args or not new_args[0]:
             return None
-        new_args = list(cmd.args)
-        new_args[0] = new_se
-        if pan_combo is not None and len(new_args) > 1:
-            new_args[1] = pan_combo.currentText().strip() or new_args[1]
         return format_command(cmd.name, new_args)
 
     def _read_scripts_text(self, project_root: str) -> str:
@@ -1751,12 +1861,25 @@ class BattleAnimTab(QWidget):
                     if (vt.addr.startswith("SoundTask_Play")
                             and "Cry" in vt.addr):
                         ops.append({"op": "sound", "se": "__CRY__"})
+            elif c.name in ("monbg", "monbg_static") and c.args:
+                # Copy a battler's mon to a BG layer (Acid Armor / Dragon Dance /
+                # Mimic / wall moves). The engine sets gBattle_BGn_X + bgCopy so a
+                # per-scanline mon-warp has the right base.
+                _m = {"ANIM_ATTACKER": 0, "ANIM_TARGET": 1,
+                      "ANIM_ATK_PARTNER": 2, "ANIM_DEF_PARTNER": 3}
+                ops.append({"op": "monbg",
+                            "arg": _m.get(str(c.args[0]).strip(), 0)})
             elif c.name == "delay":
                 ops.append({"op": "delay",
                             "frames": self._int_or(c.args[0]) if c.args else 1})
             elif getattr(c, "kind", None) == KIND_SOUND and c.args:
                 # Sound effect at this point in the timeline (playsewithpan etc).
                 ops.append({"op": "sound", "se": c.args[0]})
+                # waitplaysewithpan / waitplayse also WAIT (last arg = frames)
+                # before the script continues — emit that delay so timing holds.
+                if c.name.startswith("waitplayse") and len(c.args) >= 2:
+                    ops.append({"op": "delay",
+                                "frames": max(1, self._int_or(c.args[-1], 1))})
             elif c.name in ("waitforvisualfinish", "waitsound"):
                 ops.append({"op": "waitforvisualfinish"})
             elif c.name in ("end", "return"):
@@ -1768,17 +1891,43 @@ class BattleAnimTab(QWidget):
         fadetobgfromset, or a "task:<fn>" id for a BG-loading task (Surf). None
         if the move has no background."""
         from core.battle_anim_bg import task_loads_bg
+        root = self._project_root or ""
         for c in timeline:
             if c.name in ("fadetobg", "changebg", "fadetobgfromset") and c.args:
                 return c.args[0].strip()
-            if c.name == "createvisualtask" and c.args and task_loads_bg(c.args[0]):
+            if (c.name == "createvisualtask" and c.args
+                    and task_loads_bg(root, c.args[0])):
                 return "task:" + c.args[0]
         return None
 
-    def _load_bg_pixmap(self, bg_id: str):
-        """Assemble (and cache) the background image for a BG id."""
-        # Task-loaded BGs (Surf) depend on attack direction — cache per direction.
-        cache_key = bg_id + ("|" + self._play_direction if bg_id.startswith("task:") else "")
+    def _bg_palette_and_slot(self, bg_id: str):
+        """A BG's raw BGR555 palette + the GBA palette slot its tilemap references
+        (Surf=8, psychic=2). The palette is loaded into the engine at that slot so
+        the move's OWN task animates it (water flow, psychic cycle, custom task) and
+        we read it back. Works for task + fadetobg BGs. Size-independent → runs
+        before playback. (None, None) if unavailable."""
+        try:
+            from core.battle_anim_bg import (parse_bg_map, bg_files,
+                                              read_palette_bgr555, tilemap_palette_slot)
+            if self._bg_id_map is None:
+                self._bg_id_map = parse_bg_map(self._project_root or "")
+            _img, pal_p, tmap_p = bg_files(
+                self._project_root or "", bg_id, self._bg_id_map,
+                player_attacks=(self._play_direction == "player"))
+            if not pal_p:
+                return None, None
+            return read_palette_bgr555(pal_p), tilemap_palette_slot(tmap_p)
+        except Exception:
+            _log.exception("bg palette/slot failed for %s", bg_id)
+            return None, None
+
+    def _load_bg_pixmap(self, bg_id: str, screen_size: int = -1):
+        """Assemble (and cache) the background image for a BG id, laying out the
+        tilemap screenblocks per the engine's ``screen_size`` (Surf = wide 512px)."""
+        # Task-loaded BGs (Surf) depend on attack direction + size — cache on both.
+        cache_key = "%s|%d%s" % (
+            bg_id, screen_size,
+            "|" + self._play_direction if bg_id.startswith("task:") else "")
         if cache_key in self._bg_pix_cache:
             return self._bg_pix_cache[cache_key]
         pix = None
@@ -1786,29 +1935,100 @@ class BattleAnimTab(QWidget):
             from core.battle_anim_bg import parse_bg_map, assemble_bg, assemble_task_bg
             if bg_id.startswith("task:"):
                 pix = assemble_task_bg(self._project_root or "", bg_id[5:],
-                                       player_attacks=(self._play_direction == "player"))
+                                       player_attacks=(self._play_direction == "player"),
+                                       screen_size=screen_size)
             else:
                 if self._bg_id_map is None:
                     self._bg_id_map = parse_bg_map(self._project_root or "")
                 files = self._bg_id_map.get(bg_id)
                 if files:
-                    pix = assemble_bg(*files)
+                    pix = assemble_bg(*files, screen_size=screen_size)
         except Exception:
             _log.exception("anim BG assemble failed for %s", bg_id)
             pix = None
         self._bg_pix_cache[cache_key] = pix
         return pix
 
+    def _load_bg_indexed_any(self, bg_id: str, screen_size: int = -1):
+        """A BG (task or fadetobg) as an indexed QImage, laid out per the engine's
+        ``screen_size`` screenblock layout. Re-coloured per frame with the engine's
+        live (animated) palette. None if unavailable. Index 0 is transparent (the
+        sky/scene shows through)."""
+        try:
+            from core.battle_anim_bg import (parse_bg_map, bg_files,
+                                             assemble_bg_indexed)
+            if self._bg_id_map is None:
+                self._bg_id_map = parse_bg_map(self._project_root or "")
+            files = bg_files(self._project_root or "", bg_id, self._bg_id_map,
+                             player_attacks=(self._play_direction == "player"))
+            if not files[0]:
+                return None
+            img, _pal, _slot = assemble_bg_indexed(*files, screen_size=screen_size)
+            return img
+        except Exception:
+            _log.exception("indexed BG assemble failed for %s", bg_id)
+            return None
+
+    def _anim_bg_scroll_layer(self):
+        """The per-frame (x,y) scroll list the anim background actually RIDES — the
+        BG layer that MOVES most across the move (Surf rides BG1; Seismic Toss /
+        Cosmic Power ride BG3 via AnimTask_MoveSeismicTossBg / the cosmic task;
+        palette-only bgs like psychic move on no layer → fall back to BG1's static
+        value). Engine-driven: picks the animating layer, no per-move/layer table.
+        Cached per play."""
+        cached = getattr(self, "_anim_bg_layer_cache", None)
+        if cached is not None:
+            return cached
+        def _sgn(v):
+            return v - 65536 if v >= 32768 else v
+        def _range(lst):
+            if not lst:
+                return 0
+            xs = [_sgn(x) for x, _ in lst]
+            ys = [_sgn(y) for _, y in lst]
+            return (max(xs) - min(xs)) + (max(ys) - min(ys))
+        b1 = self._engine_bgscroll
+        b3 = getattr(self, "_engine_bg3scroll", [])
+        b2 = getattr(self, "_engine_bg2scroll", [])
+        best, best_rng = b1, 0
+        for lst in (b1, b2, b3):
+            r = _range(lst)
+            if r > best_rng:
+                best, best_rng = lst, r
+        self._anim_bg_layer_cache = best
+        return best
+
     def _set_engine_bg(self, idx: int):
         """Push the anim background (scrolled to this frame) to the preview."""
         if self._engine_bg_pix is None:
             self._move_preview.set_anim_bg(None)
             return
-        if 0 <= idx < len(self._engine_bgscroll):
-            sx, sy = self._engine_bgscroll[idx]
+        scroll = self._anim_bg_scroll_layer()
+        if 0 <= idx < len(scroll):
+            sx, sy = scroll[idx]
         else:
             sx, sy = 0, 0
-        self._move_preview.set_anim_bg(self._engine_bg_pix, sx, sy)
+        pix = self._engine_bg_pix
+        # Re-colour the indexed BG with the engine's LIVE palette this frame —
+        # whatever the move's tasks did to it (psychic swirl, white-flash, a custom
+        # task). Cached by palette state (a rotation only cycles ~11 states).
+        if self._bg_indexed is not None and 0 <= idx < len(self._engine_bgpal):
+            live = self._engine_bgpal[idx]
+            if live:
+                key = tuple(live)
+                rp = self._bg_pal_pixcache.get(key)
+                if rp is None:
+                    from core.battle_anim_bg import bgr555_to_qrgb
+                    im = QImage(self._bg_indexed)        # COW; setColorTable detaches
+                    ct = [bgr555_to_qrgb(c) for c in live]
+                    ct[0] = qRgba(0, 0, 0, 0)            # GBA BG index 0 = transparent
+                    im.setColorTable(ct)
+                    rp = QPixmap.fromImage(im)
+                    if len(self._bg_pal_pixcache) < 64:
+                        self._bg_pal_pixcache[key] = rp
+                pix = rp
+        self._move_preview.set_anim_bg(pix, sx, sy, self._bg_distort_for(idx),
+                                       self._bg_alpha_for(idx))
 
     @staticmethod
     def _oam_scale(m, affine):
@@ -1937,6 +2157,194 @@ class BattleAnimTab(QWidget):
         self._tiles_frame_cache[key] = pm
         return pm
 
+    def _shadow_for_mon(self, s):
+        """Return the Memento/Role Play soul-shadow dict for mon snapshot ``s``
+        if it was copied to a BG layer AND a scanline stretch is currently
+        running on THAT layer, else None. The per-frame global stretch state
+        (buffer/alpha/window/layer) lives in self._engine_shadow[idx]; the mon's
+        BG layer + base scroll come from its own snapshot. Matching layer to
+        bgCopy keeps Memento's two sequential shadows (attacker then target, on
+        opposite BG layers) from leaking onto the idle mon."""
+        if s.get("bgCopy", 0) <= 0:
+            return None
+        shadows = getattr(self, "_engine_shadow", None)
+        idx = self._engine_idx
+        if not shadows or not (0 <= idx < len(shadows)):
+            return None
+        sd = shadows[idx]
+        if not sd or sd.get("state", 0) == 0:
+            return None
+        if sd.get("axis", 0) != 2:          # mon soul-shadow is the VERTICAL stretch
+            return None                      # (axis 1 = horizontal BG warp, not a mon)
+        if sd.get("layer", 0) != s.get("bgCopy", 0):
+            return None
+        return {"baseY": s.get("bgCopyBaseY", 0), "buf": sd.get("buf"),
+                "eva": sd.get("eva", 16), "win0h": sd.get("win0h", (0, 240))}
+
+    def _bg_distort_for(self, idx):
+        """Per-scanline horizontal HOFS offsets for the anim background if a
+        HORIZONTAL scanline distortion is active this frame (Extrasensory's
+        psychic-BG warp), else None. The engine's per-row REG_BGnHOFS buffer is
+        absolute (it already includes any base scroll), so each u16 is converted
+        to signed and handed straight to the preview as that row's offset."""
+        shadows = getattr(self, "_engine_shadow", None)
+        if not shadows or not (0 <= idx < len(shadows)):
+            return None
+        sd = shadows[idx]
+        if not sd or sd.get("state", 0) == 0 or sd.get("axis") != 1:
+            return None
+        buf = sd.get("buf")
+        if not buf:
+            return None
+        return [(v - 65536 if v >= 32768 else v) for v in buf]
+
+    def _bg_alpha_for(self, idx):
+        """Per-scanline alpha (0..16) for the anim BG if a BLDALPHA scanline effect
+        is active this frame (Surf's wave: a rising band of per-row opacity over
+        the scene), else None. The engine's per-row buffer holds
+        BLDALPHA_BLEND(eva,evb); the low 5 bits (eva) are the water's opacity that
+        row — engine-computed, so the wave shape/timing is the real one."""
+        shadows = getattr(self, "_engine_shadow", None)
+        if not shadows or not (0 <= idx < len(shadows)):
+            return None
+        sd = shadows[idx]
+        if not sd or sd.get("state", 0) == 0 or sd.get("axis") != 3:
+            return None
+        buf = sd.get("buf")
+        if not buf:
+            return None
+        return [b & 0x1F for b in buf]
+
+    def _distort_for_mon(self, s):
+        """Per-screen-row X offsets for a mon copied to a BG layer + HORIZONTALLY
+        warped per scanline (Acid Armor melt, Dragon Dance waver), else None. The
+        mon's own pixels — the VERTICAL-axis path is Memento's black shadow. Gated
+        on this mon's bgCopy layer matching the active HOFS scanline effect."""
+        mon = s.get("isMon", -1)
+        if mon < 0:
+            return None
+        # On a BG layer via the engine's task path (bgCopy — Memento family) OR the
+        # script's monbg opcode (Acid Armor / Dragon Dance — the op-runner doesn't
+        # call MoveBattlerSpriteToBG for the opcode, so _bg_frozen catches it).
+        bg = s.get("bgCopy", 0)
+        if not (bg or mon in getattr(self, "_bg_frozen", ())):
+            return None
+        shadows = getattr(self, "_engine_shadow", None)
+        idx = self._engine_idx
+        if not shadows or not (0 <= idx < len(shadows)):
+            return None
+        sd = shadows[idx]
+        if not sd or sd.get("state", 0) == 0 or sd.get("axis") != 1:
+            return None
+        if bg and sd.get("layer") != bg:    # match layer only when we know it
+            return None
+        buf = sd.get("buf")
+        if not buf:
+            return None
+        wide = sd.get("wide", 0)
+        n = len(buf)
+        def hofs(r):
+            i = r * 2 if wide else r        # 32-bit interleaves HOFS,VOFS per row
+            return buf[i] if i < n else 0
+        def _sgn(v):
+            v &= 0xFFFF
+            return v - 65536 if v >= 32768 else v
+        raws = [_sgn(hofs(r)) for r in range(160)]
+
+        # Acid Armor melt (AnimTask_AcidArmor): the engine shoves every scanline
+        # ABOVE the mon to bgX+240 — off-screen — and writes only small wavy
+        # offsets (bgX + var3 + sine) across the mon's OWN band, while the rows
+        # BELOW the band sit at rest (== the true bgX). Those +240 sentinels used
+        # to trip the global skip below, so the whole melt got dropped (no visual).
+        # Detect that signature by the >150px row span. BASE = the active layer's
+        # live BG scroll — the value the SHOWN rows sit at. The off-screen sentinel
+        # rows are base + ~240 (skip → None); the mon's own band is base + the
+        # effect's per-row shift (Acid Armor's melt wave) or exactly base (Sketch's
+        # reveal = shown rows at offset 0). Using the LAYER SCROLL (not "at-rest
+        # rows below the band") is what makes Sketch correct: its reveal writes
+        # ONLY the band, leaving out-of-band rows at 0 — so an at-rest-row base
+        # mis-shifted every shown row by bgX (the "wrong locations" the user saw).
+        if max(raws) - min(raws) > 150:
+            lyr = sd.get("layer", 1)
+            scroll = (self._engine_bgscroll if lyr == 1
+                      else self._engine_bg2scroll if lyr == 2
+                      else getattr(self, "_engine_bg3scroll", []))
+            if 0 <= idx < len(scroll):
+                base = _sgn(scroll[idx][0])
+            else:
+                rest = sorted(raws[152:160])
+                base = rest[len(rest) // 2] if rest else min(raws)
+            return [None if (v - base) > 120 else max(-80, min(80, v - base))
+                    for v in raws]
+
+        # Dragon Dance waver (no sentinels): base off the LIVE BG scroll the warp
+        # task reads each frame (the band is bgX + a small offset).
+        scroll = (self._engine_bgscroll if sd.get("layer") == 1
+                  else self._engine_bg2scroll)
+        base = scroll[idx][0] if 0 <= idx < len(scroll) else hofs(0)
+        out = []
+        for r in range(160):
+            d = (hofs(r) - base) & 0xFFFF
+            out.append(d - 65536 if d >= 32768 else d)
+        # Sanity: a waver shifts rows by a handful of px. A huge offset means the
+        # base is wrong for this effect; skip rather than smear the mon off-screen.
+        if max((abs(v) for v in out), default=0) > 96:
+            return None
+        return out
+
+    def _addl_mon_pixmap(self, battler):
+        """WHITE silhouette pixmap of the reference mon an engine additional-mon
+        sprite stands for (Role Play etc.), or None. ``battler`` is the engine's
+        recorded battler — 1 = enemy-side (its FRONT / player-facing pic), 0 =
+        player-side (its BACK pic) — i.e. the mon in its ON-SCREEN orientation. The
+        engine FillPalette-whites this sprite, so it's pre-tinted white here.
+        Position/scale/alpha come from the engine snapshot, not this helper. Cached
+        per play; NO task-name match."""
+        if battler not in (0, 1):
+            return None
+        cache = getattr(self, "_addl_sil_cache", None)
+        if cache is None:
+            cache = self._addl_sil_cache = {}
+        if battler in cache:
+            return cache[battler]
+        if battler == 1:
+            slug = (self._ref_enemy_combo.currentData()
+                    if hasattr(self, "_ref_enemy_combo") else None)
+            orient = "front"
+        else:
+            slug = (self._ref_player_combo.currentData()
+                    if hasattr(self, "_ref_player_combo") else None)
+            orient = "back"
+        pix = self._ref_mon_pixmap(slug, orient) if slug else None
+        if pix is not None and not pix.isNull():
+            res = self._move_preview.tint_pixmap(pix, 16, 0x7FFF)   # FillPalette white
+        else:
+            res = None
+        cache[battler] = res
+        return res
+
+    def _transform_target_pix(self, which):
+        """The species a Transform-ing mon morphs INTO: the OTHER battler's species
+        drawn in the morphing mon's OWN (``which``) orientation — full colour (the
+        engine swaps the real pic, no tint). ``which`` 'back' = the player mon
+        morphs into the enemy species (back view); 'front' = vice versa. Cached per
+        play. None if that reference mon isn't available."""
+        cache = getattr(self, "_xform_pix_cache", None)
+        if cache is None:
+            cache = self._xform_pix_cache = {}
+        if which in cache:
+            return cache[which]
+        if which == "back":
+            slug = (self._ref_enemy_combo.currentData()
+                    if hasattr(self, "_ref_enemy_combo") else None)
+        else:
+            slug = (self._ref_player_combo.currentData()
+                    if hasattr(self, "_ref_player_combo") else None)
+        pix = self._ref_mon_pixmap(slug, which) if slug else None
+        res = pix if (pix is not None and not pix.isNull()) else None
+        cache[which] = res
+        return res
+
     def _render_engine_frame(self, frame):
         """Draw one engine OAM snapshot into the preview: transform the mons
         (shake / sway / squeeze / lunge) and composite the effect sprites at
@@ -1954,10 +2362,46 @@ class BattleAnimTab(QWidget):
         # player.)
         mon_side = {0: "back", 1: "front"}
         P.reset_mon_transforms()
+        # Terrain/screen SHAKE: AnimShakeMonOrBattleTerrain oscillates BG3's scroll
+        # (Rock Throw / Magnitude / Earthquake-likes). Offset the battle scene by
+        # the engine's live BG3 scroll (signed; base 0) — the rumble, engine-driven.
+        # ONLY when there's no anim background: a fadetobg bg (Seismic Toss, Cosmic
+        # Power) RIDES BG3 itself, so its BG3 scroll drives the bg in _set_engine_bg,
+        # not the scene shake (which would double-move the covered scene).
+        _b3 = getattr(self, "_engine_bg3scroll", None)
+        if self._engine_bg_pix is None and _b3 and 0 <= self._engine_idx < len(_b3):
+            _bx, _by = _b3[self._engine_idx]
+            _sdx = _bx - 65536 if _bx >= 32768 else _bx
+            _sdy = _by - 65536 if _by >= 32768 else _by
+            P.set_bg_shake(-_sdx, -_sdy)
+        else:
+            P.set_bg_shake(0, 0)
+        # Sprite-layer screen SHAKE: AnimShakeMonOrBattleTerrain (Metal Claw,
+        # Dragon Claw, …) jitters gSpriteCoordOffset, which the GBA adds to every
+        # coordOffset-enabled OAM sprite (the battler mons). Offset both mons by
+        # the engine's live coord offset (signed; added to the OAM position, so
+        # applied directly — not negated like a BG-scroll viewport).
+        _co = getattr(self, "_engine_coordoff", None)
+        if _co and 0 <= self._engine_idx < len(_co):
+            _cx, _cy = _co[self._engine_idx]
+            _mdx = _cx - 65536 if _cx >= 32768 else _cx
+            _mdy = _cy - 65536 if _cy >= 32768 else _cy
+            P.set_mon_shake(_mdx, _mdy)
+        else:
+            P.set_mon_shake(0, 0)
         for s in frame:
             which = mon_side.get(s.get("isMon", -1))
             if which is None:
                 continue
+            # Memento / Role Play soul shadow: if this mon was copied to a BG
+            # layer with an active scanline stretch, hand the preview the stretch
+            # state so it draws the black silhouette ghost. None clears it. Set
+            # BEFORE the _bg_frozen continue so a monbg'd shadow mon still gets it.
+            P.set_mon_shadow(which, self._shadow_for_mon(s))
+            # Mon copied to BG + horizontally warped per-scanline (Acid Armor melt,
+            # Dragon Dance waver). Set BEFORE the _bg_frozen continue so a monbg'd
+            # mon renders the warp instead of a static full-size copy.
+            P.set_mon_distort(which, self._distort_for_mon(s))
             # monbg-frozen battler: it's a static full-size BG copy in-game, so
             # render it normal + visible and IGNORE the hidden original's
             # transforms (Mimic's shrink, Memento's shadow move, …). reset_mon_
@@ -1965,6 +2409,19 @@ class BattleAnimTab(QWidget):
             # and skip the per-frame transform/tint/alpha below.
             if s.get("isMon") in getattr(self, "_bg_frozen", ()):
                 P.set_mon_visible(which, True)
+                # Transform morph: the engine pixelates this monbg'd mon via MOSAIC
+                # (0-15) and swaps its pic to the target species at the mid-morph
+                # gfx swap — both read straight from the engine per frame, applied
+                # to the static BG copy. (mosaic 0 / not-swapped = no change, so
+                # Mimic / Memento / Acid Armor are unaffected.)
+                _mf = getattr(self, "_engine_monfx", None)
+                moz, swapped = ((_mf[self._engine_idx][0] & 0xF,
+                                 _mf[self._engine_idx][1])
+                                if _mf and 0 <= self._engine_idx < len(_mf)
+                                else (0, 0))
+                P.set_mon_mosaic(which, moz)
+                P.set_mon_override(
+                    which, self._transform_target_pix(which) if swapped else None)
                 continue
             # Palette tint on the mon (hit flash, status tint, fade-to-colour).
             P.set_mon_tint(which, s.get("blendCoeff", 0), s.get("blendColor", 0))
@@ -2039,6 +2496,12 @@ class BattleAnimTab(QWidget):
         P.set_mon_clones("back", clone_lists[0])
         P.set_mon_clones("front", clone_lists[1])
 
+        # Role Play's silhouette (and ANY additional-mon sprite) is drawn in the
+        # effect-sprite loop below, through the SAME engine-driven path as every
+        # other sprite — its real coords, affine matrix, and BLDALPHA all come
+        # straight from the snapshot; only the graphics (a white ref-mon) are
+        # substituted, because the host has no mon pixels.
+
         # Effect sprites → canvas (lower subpriority drawn on top).
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
@@ -2050,7 +2513,8 @@ class BattleAnimTab(QWidget):
                        if s.get("isMon", -1) == -1
                        and s.get("objMode") != 2          # WINDOW mask, not drawn
                        and (s.get("templateIndex", -1) >= 0
-                            or s.get("tileTag", -1) >= 10000)]
+                            or s.get("tileTag", -1) >= 10000
+                            or s.get("addlMon"))]          # Role Play silhouette etc.
             # Draw order = the GBA's: sort key is (oam.priority<<8 | subpriority);
             # a LOWER key is drawn IN FRONT. So draw highest-key first (behind),
             # lowest-key last (on top). Including oam.priority (not just
@@ -2060,34 +2524,44 @@ class BattleAnimTab(QWidget):
                               | (s.get("subpriority", 0) & 0xFF))):
                 if s["invisible"]:
                     continue
-                ti = s.get("templateIndex", -1)
-                name = eng.template_name(ti) if (eng and ti >= 0) else None
-                tag = self._template_tags.get(name, "") if name else ""
-                if not tag:                       # task-spawned → map by tileTag
-                    tag = getattr(self, "_tag_by_value", {}).get(
-                        s.get("tileTag", -1), "")
-                frames = self._play_frame_cache.get(tag)
-                if frames:
-                    fw, fh = self._frame_sizes.get(tag, (0, 0))
-                    tpf = max(1, (fw // 8) * (fh // 8)) if (fw and fh) else 1
-                    fi = s["tileNum"] // tpf
-                    fi = max(0, min(fi, len(frames) - 1))
-                    pix = self._play_frame_pix(tag, fi, bool(s["hFlip"]),
-                                               bool(s["vFlip"]))
-                else:
-                    # No PNG sheet — render from the combined .4bpp tile stream.
-                    # (Sprites whose PNG source is split into numbered frame
-                    # files: ice_crystals, ice_cube, spark, mud_sand, flower —
-                    # so Ice Beam / Ice Punch / Hail / Spark draw at all.)
-                    sprite = self._sprites.get(tag)
-                    if sprite is None:
+                if s.get("addlMon"):
+                    # Additional-mon sprite (Role Play silhouette): the host has no
+                    # mon pixels, so substitute the reference mon (already WHITE, the
+                    # engine FillPalette-whites it). Everything else — position,
+                    # affine scale, alpha — flows through the shared engine path
+                    # below, identical to any other sprite.
+                    pix = self._addl_mon_pixmap(s.get("addlMonBattler", -1))
+                    if pix is None:
                         continue
-                    pal = self._palettes.get(tag) or self._palette_for(sprite)
-                    pix = self._render_4bpp_frame(
-                        sprite, pal, s["tileNum"], s["shape"], s["size"],
-                        bool(s["hFlip"]), bool(s["vFlip"]))
-                if pix is None or pix.isNull():
-                    continue
+                else:
+                    ti = s.get("templateIndex", -1)
+                    name = eng.template_name(ti) if (eng and ti >= 0) else None
+                    tag = self._template_tags.get(name, "") if name else ""
+                    if not tag:                       # task-spawned → map by tileTag
+                        tag = getattr(self, "_tag_by_value", {}).get(
+                            s.get("tileTag", -1), "")
+                    frames = self._play_frame_cache.get(tag)
+                    if frames:
+                        fw, fh = self._frame_sizes.get(tag, (0, 0))
+                        tpf = max(1, (fw // 8) * (fh // 8)) if (fw and fh) else 1
+                        fi = s["tileNum"] // tpf
+                        fi = max(0, min(fi, len(frames) - 1))
+                        pix = self._play_frame_pix(tag, fi, bool(s["hFlip"]),
+                                                   bool(s["vFlip"]))
+                    else:
+                        # No PNG sheet — render from the combined .4bpp tile stream.
+                        # (Sprites whose PNG source is split into numbered frame
+                        # files: ice_crystals, ice_cube, spark, mud_sand, flower —
+                        # so Ice Beam / Ice Punch / Hail / Spark draw at all.)
+                        sprite = self._sprites.get(tag)
+                        if sprite is None:
+                            continue
+                        pal = self._palettes.get(tag) or self._palette_for(sprite)
+                        pix = self._render_4bpp_frame(
+                            sprite, pal, s["tileNum"], s["shape"], s["size"],
+                            bool(s["hFlip"]), bool(s["vFlip"]))
+                    if pix is None or pix.isNull():
+                        continue
                 if s["affineMode"] != 0:
                     tf = self._affine_transform(s["mA"], s["mB"], s["mC"], s["mD"])
                     if tf is not None:
@@ -2201,18 +2675,71 @@ class BattleAnimTab(QWidget):
             self._engine_sound_ptr = 0
             self._engine_bgscroll = []
             self._engine_bg2scroll = []
+            self._engine_bg3scroll = []     # BG3 scroll per frame — terrain shake / anim-bg ride
+            self._engine_coordoff = []      # gSpriteCoordOffset per frame — sprite-layer mon shake
+            self._anim_bg_layer_cache = None  # which BG layer the anim bg rides (picked per play)
+            self._engine_shadow = []
+            self._engine_monfx = []         # (mosaic 0-15, swapped) per frame — Transform
+            self._xform_pix_cache = {}      # morph-target pixmap per side, per play
             bg_id = self._detect_move_bg(timeline)
-            self._engine_bg_pix = self._load_bg_pixmap(bg_id) if bg_id else None
+            self._engine_bg_pix = None      # assembled AFTER play (BG size known)
+            self._bg_indexed = None
+            self._bg_pal_pixcache = {}
+            self._engine_bgpal = []
+            # Load the BG's real palette into the engine at the slot its tilemap
+            # uses (any BG — Surf, psychic, ...): the move's OWN task animates it
+            # (Surf water flow, psychic colour cycle, a project's custom task) and
+            # we read it back per frame — no per-move logic. The BG IMAGE is
+            # assembled AFTER play, once the engine reveals its SCREEN_SIZE.
+            bg_raw_pal, bg_pal_slot = (self._bg_palette_and_slot(bg_id)
+                                       if bg_id else (None, None))
             try:
                 ops = self._build_engine_ops(timeline)
                 self._engine_frames = engine.play_timeline(
                     ops, attacker_is_player=(self._play_direction == "player"),
                     sounds_out=self._engine_sounds,
                     bgscroll_out=self._engine_bgscroll,
-                    bg2scroll_out=self._engine_bg2scroll)
+                    bg2scroll_out=self._engine_bg2scroll,
+                    bg3scroll_out=self._engine_bg3scroll,
+                    shadow_out=self._engine_shadow,
+                    bg_palette=bg_raw_pal,
+                    bg_pal_out=(self._engine_bgpal
+                                if bg_raw_pal is not None else None),
+                    bg_pal_slot=bg_pal_slot,
+                    monfx_out=self._engine_monfx,
+                    coord_offset_out=self._engine_coordoff)
             except Exception:
                 _log.exception("engine play_timeline failed; falling back to VM")
                 self._engine_frames = []
+            # The engine has now revealed the anim-BG SCREEN_SIZE — assemble the
+            # background image with the correct screenblock layout (wide vs stacked).
+            _bgsz = getattr(engine, "_last_bg_screen_size", -1)
+            if bg_id:
+                self._bg_indexed = self._load_bg_indexed_any(bg_id, _bgsz)
+                self._engine_bg_pix = self._load_bg_pixmap(bg_id, _bgsz)
+            # Role Play (& any additional-mon-sprite move) is now driven entirely
+            # by the engine MARKER per frame in _render_engine_frame — no task-name
+            # match here. Just drop the per-play silhouette-pixmap cache so this
+            # move resolves the current reference mons.
+            self._addl_sil_cache = {}
+            # Diagnostic for the Memento soul-shadow: confirms the engine path
+            # ran, how many frames carry an active scanline stretch, and whether
+            # the mons (the silhouette source) are present in the preview.
+            try:
+                _sh = self._engine_shadow
+                _active = sum(1 for d in _sh if d and d.get("state"))
+                _lyrs = sorted({d.get("layer") for d in _sh if d and d.get("state")})
+                _bgc = sorted({s.get("bgCopy", 0) for fr in self._engine_frames
+                               for s in fr if s.get("isMon", -1) in (0, 1)
+                               and s.get("bgCopy", 0)})
+                _log.debug("ENGINE PLAY '%s' dir=%s: %d frames, shadow-active=%d "
+                           "layers=%s mon-bgCopy=%s back_pix=%s front_pix=%s",
+                           self._move_current, self._play_direction,
+                           len(self._engine_frames), _active, _lyrs, _bgc,
+                           self._move_preview._back_pix is not None,
+                           self._move_preview._front_pix is not None)
+            except Exception:
+                _log.exception("shadow diagnostic failed")
             # Pre-warm the SE PCM cache for every distinct sound this move fires,
             # so each plays INSTANTLY at its frame (in sync) instead of trailing
             # behind a per-call M4A render. Cached across moves/replays, so this
@@ -2674,6 +3201,25 @@ class BattleAnimTab(QWidget):
             return default
 
     @staticmethod
+    def _parse_anim_arg_consts(root):
+        """{ANIM_* selector: int} parsed from include/constants/battle_anim.h
+        (ANIM_ATTACKER=0, ANIM_TARGET=1, …) so battler-selector args resolve to
+        the PROJECT's real values rather than a baked-in table. Returns only the
+        plain-int ANIM_ defines (ANIM_TAG_* are expressions, skipped); merged
+        over the engine-default fallback by the caller."""
+        out = {}
+        try:
+            import re
+            p = os.path.join(root, "include", "constants", "battle_anim.h")
+            txt = open(p, encoding="utf-8", errors="replace").read()
+            for m in re.finditer(r"#define\s+(ANIM_\w+)\s+(\d+)\s*$",
+                                 txt, re.MULTILINE):
+                out[m.group(1)] = int(m.group(2))
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
     def _parse_rgb_consts(root):
         """{RGB_* name: BGR555 value} parsed from the project's
         include/constants/rgb.h, plus inline RGB(r,g,b) support. Anim scripts
@@ -2719,7 +3265,91 @@ class BattleAnimTab(QWidget):
         rgb = getattr(self, "_rgb_consts", None)
         if rgb and s in rgb:
             return rgb[s]
+        # ANIM_TAG_* gfx/palette tag → its numeric value. createsprite args carry
+        # these (e.g. Reflect's wall passes ANIM_TAG_BLUE_LIGHT_WALL); unresolved
+        # → 0 → IndexOfSpritePaletteTag returns 0xFF → an out-of-bounds palette
+        # access TRAPS the move partway (Reflect halted at ~14 frames).
+        if s.startswith("ANIM_TAG_"):
+            tv = getattr(self, "_tag_value_by_name", None)
+            if tv is None:
+                tv = {n: v for v, n in getattr(self, "_tag_by_value", {}).items()}
+                self._tag_value_by_name = tv
+            if s in tv:
+                return tv[s]
+        # Constant / arithmetic expression (e.g. `MAX_BATTLERS_COUNT + 1` → 5,
+        # which AnimTask_HorizontalShake needs to pick "shake terrain"). Resolves
+        # named #define constants then safely evaluates the arithmetic.
+        v = self._eval_arg_expr(s)
+        if v is not None:
+            return v
         return self._int_or(s)
+
+    def _arg_const_map(self):
+        """{NAME: int} of plain-integer #defines the anim scripts pass as args
+        (MAX_BATTLERS_COUNT, B_SIDE_*, ANIM_*, TRUE/FALSE, …) parsed from the
+        project's constant headers, over the battler-selector defaults. Cached."""
+        cm = getattr(self, "_argconst_cache", None)
+        if cm is not None:
+            return cm
+        import os, re
+        cm = dict(_ANIM_ARG_CONSTS)
+        root = self._project_root or ""
+        for rel in ("include/constants/battle.h",
+                    "include/constants/battle_anim.h"):
+            try:
+                txt = open(os.path.join(root, *rel.split("/")),
+                           encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            for mm in re.finditer(
+                    r'^\s*#define\s+([A-Z_][A-Z0-9_]*)\s+\(?\s*(-?\d+)\s*\)?\s*'
+                    r'(?:/[/*]|$)', txt, re.MULTILINE):
+                cm.setdefault(mm.group(1), int(mm.group(2)))
+        self._argconst_cache = cm
+        return cm
+
+    def _eval_arg_expr(self, s):
+        """Evaluate a constant / simple-arithmetic arg (`MAX_BATTLERS_COUNT + 1`
+        → 5) by substituting known #define constants then safely evaluating
+        +,-,*,/,%,<<,>>,|,&,(). Returns None when the string has an UNKNOWN
+        identifier (so plain numbers / battler-selector consts fall to _int_or)."""
+        import re, ast
+        cm = self._arg_const_map()
+        ids = re.findall(r'[A-Za-z_]\w*', s)
+        if ids and not all(i in cm for i in ids):
+            return None
+        expr = re.sub(r'[A-Za-z_]\w*',
+                      lambda m: str(cm.get(m.group(0), m.group(0))), s)
+        try:
+            return self._eval_ast(ast.parse(expr, mode="eval").body)
+        except Exception:
+            return None
+
+    @classmethod
+    def _eval_ast(cls, node):
+        """Safe integer arithmetic over an ast node (numbers + the operators a
+        battle-anim arg can use). Raises on anything else."""
+        import ast
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return int(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            v = cls._eval_ast(node.operand)
+            return v if isinstance(node.op, ast.UAdd) else -v
+        if isinstance(node, ast.BinOp):
+            a, b = cls._eval_ast(node.left), cls._eval_ast(node.right)
+            op = node.op
+            if isinstance(op, ast.Add): return a + b
+            if isinstance(op, ast.Sub): return a - b
+            if isinstance(op, ast.Mult): return a * b
+            if isinstance(op, ast.FloorDiv): return a // b
+            if isinstance(op, ast.Div): return int(a / b) if b else 0
+            if isinstance(op, ast.Mod): return a % b if b else 0
+            if isinstance(op, ast.LShift): return a << b
+            if isinstance(op, ast.RShift): return a >> b
+            if isinstance(op, ast.BitOr): return a | b
+            if isinstance(op, ast.BitAnd): return a & b
+            if isinstance(op, ast.BitXor): return a ^ b
+        raise ValueError("unsupported arg expression")
 
     def _on_direction_changed(self):
         """Player/Enemy direction toggle: rebuild the composite + restart playback."""
@@ -2882,16 +3512,26 @@ class BattleAnimTab(QWidget):
                 combo.addItem(name, slug)
             combo.setEnabled(bool(mons))
             combo.blockSignals(False)
-        # Restore the prior pick, else default both to the first real species
-        # so the user sees mons immediately (a concrete reference beats empty).
+        # Restore the prior pick; on a FRESH load (no prior) RANDOMIZE both to
+        # distinct species — seeing Abra every launch gets stale. (App Python may
+        # use random freely; combo index 0 is "(none)", 1..n are real species.)
+        import random
+        n = len(mons)
+        if n >= 1:
+            pick = random.sample(range(1, n + 1), min(2, n))
+            while len(pick) < 2:
+                pick.append(pick[0])
+            p_def, e_def = pick[0], pick[1]
+        else:
+            p_def = e_def = 0
+
         def _restore(combo, prev, default_idx):
             combo.blockSignals(True)
             idx = combo.findData(prev) if prev else -1
             combo.setCurrentIndex(idx if idx >= 0 else default_idx)
             combo.blockSignals(False)
-        default = 1 if len(mons) >= 1 else 0
-        _restore(self._ref_player_combo, prev_player, default)
-        _restore(self._ref_enemy_combo, prev_enemy, default)
+        _restore(self._ref_player_combo, prev_player, p_def)
+        _restore(self._ref_enemy_combo, prev_enemy, e_def)
         self._apply_ref_mons()
 
     def _ref_mon_pixmap(self, slug: str, view: str) -> Optional[QPixmap]:

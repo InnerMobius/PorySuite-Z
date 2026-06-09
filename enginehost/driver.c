@@ -22,6 +22,7 @@
 #include "task.h"
 #include "battle_anim.h"
 #include "constants/battle_anim.h"
+#include "palette.h"                  /* BG_PLTT_ID for the BG-palette read-out */
 
 extern const struct SpriteTemplate *const gHostTemplates[];
 extern const int gHostTemplateCount;
@@ -30,11 +31,32 @@ extern HostTaskFn const gHostTasks[];
 extern const int gHostTaskCount;
 
 extern u8 gBattleAnimAttacker, gBattleAnimTarget;
+extern u8 gBattlerAttacker, gBattlerTarget;   /* battle-engine attacker/target —
+    * some anim sprites read THESE directly (Superpower's orb/fireball, a dragon
+    * move, the SetAnim*ForEffect utility tasks) instead of gBattleAnim*. Must be
+    * kept = gBattleAnim* or those effects anchor to the default battler (player). */
 extern s16 gBattleAnimArgs[];
 extern u8 gHostPalBlendCoeff[32];     /* per-slot tint strength (stub_engine.c) */
 extern u16 gHostPalBlendColor[32];    /* per-slot tint colour (BGR555) */
 extern u8 gHostPalGray[32];           /* per-slot greyscale flag (stub_engine.c) */
 extern u8 gHostBldEva;                /* BLDALPHA top-layer coefficient 0..16 */
+extern u8 gHostMonBg[4];              /* per-battler BG-copy layer 0/1/2 (Memento) */
+extern s16 gHostMonBgBaseY[4];        /* base BGnVOFS at copy time (data[10]) */
+extern u16 gPlttBufferFaded[];        /* the displayed palette buffer (stub_engine.c) —
+    * battle-anim tasks animate the BG palette here directly (rotation, fades, …).
+    * The host never populates it, so the driver lets Python load the real BG
+    * palette in + read whatever the tasks did back out — engine-driven, dynamic. */
+extern u8 GetBattleBgPaletteNum(void);  /* compiled from battle_anim_mons.c (= 2) */
+extern signed char gHostAnimBgScreenSize;  /* SCREEN_SIZE the move set, or -1 */
+int HostScanlineSrcBufAddr(void);     /* &gScanlineEffectRegBuffers[srcBuffer][0] */
+int HostScanlineState(void);          /* gScanlineEffect.state (0 = no stretch) */
+int HostShadowLayer(void);            /* BG layer (1/2) the active stretch drives */
+int HostScanAxis(void);               /* 0 none, 1 HOFS (horizontal), 2 VOFS (vertical) */
+int HostScanWide(void);               /* 1 = 32-bit DMA (HOFS+VOFS interleaved) */
+int HostWin0H(void);                  /* gBattle_WIN0H: (left<<8)|right */
+int HostAddlMonInfo(int i, int *battler, int *backpic);  /* CreateAdditionalMon-
+                                       * SpriteForMoveAnim marker: 1 if sprite i is
+                                       * one, with the battler it represents. */
 void HostResetPalBlend(void);
 u8 UpdatePaletteFade(void);           /* software fade step (stub_engine.c) */
 
@@ -77,6 +99,19 @@ struct Snap {
                           * NOT drawn — the renderer skips it. */
     int gray;            /* 1 if this sprite's palette slot was greyscaled
                           * (SetGreyscaleOrOriginalPalette — Perish Song). */
+    int bgCopy;          /* mon copied to a BG layer: 0 none, 1 BG1, 2 BG2.
+                          * MoveBattlerSpriteToBG (Memento/Role Play soul shadow).
+                          * Only meaningful for mon sprites (isMon >= 0). */
+    int bgCopyBaseY;     /* base BGnVOFS captured at copy time — the neutral value
+                          * the per-scanline stretch buffer deviates from. */
+    int addlMon;         /* 1 if this is a CreateAdditionalMonSpriteForMoveAnim
+                          * placeholder (Role Play's silhouette, or ANY move that
+                          * summons a copy of a battler's pic). The renderer draws
+                          * addlMonBattler's reference mon here, white, at this
+                          * sprite's own transform/alpha — NO task-name match. */
+    int addlMonBattler;  /* the battler whose species the addl sprite represents
+                          * (what the engine passed), or -1. */
+    int addlMonBackpic;  /* isBackpic the engine requested (informational). */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
@@ -95,6 +130,7 @@ void engine_reset(int attackerIsPlayer)
      * TAG_NONE so allocation works. Project-agnostic engine fix. */
     FreeAllSpritePalettes();
     HostResetPalBlend();   /* clear per-slot tint state from the previous move */
+    gHostAnimBgScreenSize = -1;   /* the move's BG task re-sets this if it has a BG */
     for (i = 0; i < MAX_SPRITES; i++)
         sSpriteTpl[i] = -1;
     for (i = 0; i < ANIM_ARGS_COUNT; i++)
@@ -134,6 +170,14 @@ void engine_reset(int attackerIsPlayer)
 
     if (attackerIsPlayer) { gBattleAnimAttacker = 0; gBattleAnimTarget = 1; }
     else                  { gBattleAnimAttacker = 1; gBattleAnimTarget = 0; }
+    /* The real engine sets gBattleAnimAttacker = gBattlerAttacker when a move anim
+     * launches (battle_anim.c). Mirror it: anim sprites that read the BATTLE-engine
+     * globals directly (Superpower orb/fireball via gBattlerAttacker, the
+     * SetAnim*ForEffectAnims utility tasks that REASSIGN gBattleAnim* from gBattler*)
+     * would otherwise anchor to the default battler 0 (player) regardless of the
+     * Player/Enemy direction toggle. Keep them in lockstep. */
+    gBattlerAttacker = gBattleAnimAttacker;
+    gBattlerTarget   = gBattleAnimTarget;
 }
 
 __attribute__((export_name("engine_set_arg")))
@@ -295,6 +339,22 @@ int engine_snapshot(void)
         /* Alpha: blend-mode sprites (objMode 1) are drawn at BLDALPHA EVA/16. */
         o->alpha = (s->oam.objMode == 1) ? gHostBldEva : 16;
         o->objMode = s->oam.objMode;
+        /* BG-copy shadow (Memento): per-battler, only for mon sprites. */
+        if (o->isMon >= 0 && o->isMon < 4) {
+            o->bgCopy = gHostMonBg[o->isMon];
+            o->bgCopyBaseY = gHostMonBgBaseY[o->isMon];
+        } else {
+            o->bgCopy = 0; o->bgCopyBaseY = 0;
+        }
+        /* Additional-mon sprite (Role Play silhouette & friends): the renderer
+         * substitutes the reference mon — driven by the engine MARKER, not a
+         * task name, so a renamed/duplicated move works identically. */
+        {
+            int amb = -1, ambp = 0;
+            o->addlMon = HostAddlMonInfo(i, &amb, &ambp);
+            o->addlMonBattler = amb;
+            o->addlMonBackpic = ambp;
+        }
     }
     return n;
 }
@@ -319,6 +379,106 @@ __attribute__((export_name("engine_bg2_scroll")))
 int engine_bg2_scroll(void)
 {
     return ((gBattle_BG2_X & 0xFFFF) << 16) | (gBattle_BG2_Y & 0xFFFF);
+}
+
+/* BG3 scroll — the battle-terrain layer the screen/terrain-SHAKE sprite
+ * (AnimShakeMonOrBattleTerrain: Rock Throw, Magnitude, Earthquake-likes)
+ * oscillates around its base. Packed (x<<16)|y; the renderer offsets the battle
+ * scene by it for the rumble. */
+extern u16 gBattle_BG3_X, gBattle_BG3_Y;
+__attribute__((export_name("engine_bg3_scroll")))
+int engine_bg3_scroll(void)
+{
+    return ((gBattle_BG3_X & 0xFFFF) << 16) | (gBattle_BG3_Y & 0xFFFF);
+}
+
+/* The GBA SPRITE-layer screen shake (gSpriteCoordOffsetX/Y), driven by
+ * AnimShakeMonOrBattleTerrain — Metal Claw, Dragon Claw, … It jitters every
+ * coordOffset-enabled OAM sprite (the battler mons); the renderer offsets the
+ * mons by it. Packed signed (x<<16)|y. host_pre.h 64K-aligns these globals so
+ * the shake task's split-pointer rebuild stays exact (no sign-extension trap). */
+extern short gSpriteCoordOffsetX, gSpriteCoordOffsetY;
+__attribute__((export_name("engine_coord_offset")))
+int engine_coord_offset(void)
+{
+    return ((gSpriteCoordOffsetX & 0xFFFF) << 16) | (gSpriteCoordOffsetY & 0xFFFF);
+}
+
+/* ── Memento soul-shadow read-outs ──────────────────────────────────────────
+ * The shadow tasks (running in-engine) fill a per-scanline BG-VOFS buffer that
+ * stretches the blackened mon copy, narrow it with WIN0, and fade it via
+ * BLDALPHA. None of that is hardware-rendered here, so we expose the computed
+ * state and let the Python renderer reconstruct the ghost. */
+
+/* Address of the active per-scanline vertical-offset buffer (u16[160+]). For
+ * each screen row y, buf[y] is the BGnVOFS that row samples at; the deviation
+ * from the mon's base scroll (Snap.bgCopyBaseY) is that row's vertical shift. */
+__attribute__((export_name("engine_scanline_addr")))
+int engine_scanline_addr(void) { return HostScanlineSrcBufAddr(); }
+
+/* bits  0-7  = gScanlineEffect.state (0 = no stretch running → a bgCopy mon is a
+ *              plain monbg freeze, not a Memento shadow)
+ * bits  8-15 = BLDALPHA EVA (shadow opacity, 0..16)
+ * bits 16-17 = BG layer the active stretch drives (1/2) — the renderer draws the
+ *              shadow only for the mon whose bgCopy matches this layer.
+ * bits 18-19 = axis: 1 = horizontal (HOFS, psychic-BG warp), 2 = vertical (VOFS,
+ *              Memento soul-shadow). Lets the renderer pick H vs V distortion. */
+__attribute__((export_name("engine_scanline_state")))
+int engine_scanline_state(void) {
+    return (HostScanlineState() & 0xFF) | ((int)gHostBldEva << 8)
+         | ((HostShadowLayer() & 3) << 16) | ((HostScanAxis() & 3) << 18)
+         | ((HostScanWide() & 1) << 20);
+}
+
+/* WIN0 horizontal bounds (left<<8)|right — the shadow narrows this to a sliver
+ * as it finishes; the renderer clips the ghost to [left, right). */
+__attribute__((export_name("engine_win0h")))
+int engine_win0h(void) { return HostWin0H(); }
+
+/* Per-frame mon FX for the Transform morph: low byte = REG_OFFSET_MOSAIC BG level
+ * (0..15, pixelation), bit 8 = the species gfx swap happened (attacker pic is now
+ * the target's). The renderer pixelates + swaps the monbg'd mon accordingly. */
+extern u8 gHostMosaic;
+extern u8 gHostMonSwapped;
+__attribute__((export_name("engine_mon_fx")))
+int engine_mon_fx(void) { return (int)gHostMosaic | ((int)gHostMonSwapped << 8); }
+
+/* ── BG palette read-out (engine-driven background animation) ────────────────
+ * Address of gPlttBufferFaded[0] (the displayed palette buffer). Python writes
+ * the move's real BG palette into the BG slot before stepping, then reads it back
+ * each frame — so WHATEVER the move's tasks do to it (the psychic rotation, the
+ * white-flash, a fade, or a project's CUSTOM palette task) is reflected, with the
+ * engine driving the timing. No per-move logic in the renderer. */
+__attribute__((export_name("engine_pltt_addr")))
+int engine_pltt_addr(void) { return (int)(intptr_t)&gPlttBufferFaded[0]; }
+
+/* The u16 index in gPlttBufferFaded where the anim BG palette lives — slot
+ * GetBattleBgPaletteNum() (the engine's own choice, not hardcoded here). */
+__attribute__((export_name("engine_bg_pltt_index")))
+int engine_bg_pltt_index(void) { return BG_PLTT_ID(GetBattleBgPaletteNum()); }
+
+/* The anim BG's GBA SCREEN_SIZE the move set (0=256x256, 1=512x256, 2=256x512,
+ * 3=512x512), or -1 if unset. The renderer lays out the tilemap's screenblocks
+ * by this (a 2-screenblock map is side-by-side at size 1, stacked at size 2). */
+__attribute__((export_name("engine_bg_screen_size")))
+int engine_bg_screen_size(void) { return gHostAnimBgScreenSize; }
+
+/* Process the `monbg` script opcode (the op-runner handles only a subset, so this
+ * never ran — Acid Armor / Dragon Dance copy the mon to a BG layer via monbg, and
+ * without it MoveBattlerSpriteToBG was never called, leaving gBattle_BGn_X garbage
+ * → the per-scanline mon-warp had a wrong base). Replicates Cmd_monbg: map the
+ * anim-arg to a battler + pick the BG layer from its position + copy it. */
+extern void MoveBattlerSpriteToBG(u8 battlerId, u8 toBG_2);
+__attribute__((export_name("engine_monbg")))
+void engine_monbg(int animArg) {
+    u8 battlerId, position, toBG2;
+    /* ANIM_ATTACKER(0)/ANIM_ATK_PARTNER(2) → attacker; ANIM_TARGET(1)/DEF_PARTNER(3) → target */
+    battlerId = (animArg == 0 || animArg == 2) ? gBattleAnimAttacker : gBattleAnimTarget;
+    if (battlerId >= 4) return;
+    position = gBattlerPositions[battlerId];
+    /* B_POSITION_OPPONENT_LEFT(1) / B_POSITION_PLAYER_RIGHT(3) → BG1, else BG2 */
+    toBG2 = (position == 1 || position == 3) ? 0 : 1;
+    MoveBattlerSpriteToBG(battlerId, toBG2);
 }
 
 /* Diagnostic: how this build lays out the affine-anim cmd struct, vs the <<3

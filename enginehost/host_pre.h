@@ -34,4 +34,16 @@
 #define INCBIN_S16 INCBIN
 #define INCBIN_S32 INCBIN
 
+/* 64K-align the sprite coord-offset globals (the GBA screen/terrain SHAKE that
+ * Metal Claw / Dragon Claw / etc. drive). AnimShakeMonOrBattleTerrain stores
+ * &gSpriteCoordOffset split across two s16 sprite-data fields and rebuilds it as
+ * data[6] | (data[7] << 16); if the address's low half has bit 15 set it
+ * sign-extends to a bogus 0xFFFFxxxx pointer (the same trap class fixed for
+ * gBattle_BG3_X/Y). Forcing 64K alignment makes the low half 0 so the rebuild is
+ * exact and the shake reads/writes the REAL global. This force-include is seen
+ * before sprite.c's definition, so the definition inherits the alignment; every
+ * other file just references the now-aligned symbol. (s16 == signed short.) */
+extern short gSpriteCoordOffsetX __attribute__((aligned(0x10000)));
+extern short gSpriteCoordOffsetY __attribute__((aligned(0x10000)));
+
 #endif /* PORYSUITE_HOST_PRE_H */

@@ -27,12 +27,13 @@ class EngineUnavailable(RuntimeError):
     """Raised when the wasm runtime or the engine artifact is missing."""
 
 
-# struct Snap in enginehost/driver.c — 22 int32 fields, in this exact order.
+# struct Snap in enginehost/driver.c — int32 fields, in this exact order.
 _SNAP_FIELDS = (
     "id", "x", "y", "x2", "y2", "tileNum", "shape", "size",
     "matrixNum", "mA", "mB", "mC", "mD", "hFlip", "vFlip", "affineMode",
     "priority", "subpriority", "paletteNum", "invisible", "templateIndex", "isMon",
     "tileTag", "isClone", "blendCoeff", "blendColor", "alpha", "objMode", "gray",
+    "bgCopy", "bgCopyBaseY", "addlMon", "addlMonBattler", "addlMonBackpic",
 )
 _SNAP = struct.Struct("<%di" % len(_SNAP_FIELDS))
 
@@ -107,6 +108,17 @@ class AnimEngine:
     # step, yet an infinite loop burns it in a fraction of a second and traps.
     _CALL_FUEL = 100_000_000
     _INIT_FUEL = 2_000_000_000   # instantiate + _initialize + setup
+    # Linear-memory size to grow each instance to (in 64KB pages). The GBA's
+    # absolute hardware addresses (VRAM 0x06xxxxxx, OAM 0x07xxxxxx) and any
+    # garbage pointer a not-loaded sprite sheet produces must land in-bounds so
+    # the real game code runs to completion instead of trapping. wasmtime maps
+    # pages lazily, so the cost is only what's actually touched.
+    _MEM_TARGET_PAGES = 0x100000000 // 65536  # full 4GB — covers any 32-bit address,
+    #   incl. sign-extended 0xFFFFxxxx pointers (AnimShakeMonOrBattleTerrain rebuilds
+    #   &gSpriteCoordOffset via data[6]|(data[7]<<16); a bit-15-set low half sign-
+    #   extends to 0xFFFFxxxx, which is OOB unless the whole 32-bit space is mapped).
+    _debug_traps = False        # test hook: capture wasm trap strings into _trap_log
+    _trap_log: list = []
 
     def _refuel(self, store):
         """Reset the per-call fuel budget so the next engine call can't run away
@@ -129,6 +141,34 @@ class AnimEngine:
                 self._fuel = False
         inst = self._linker.instantiate(store, self._module)
         ex = inst.exports(store)
+        # Grow linear memory to cover the GBA absolute address space (VRAM
+        # 0x06xxxxxx, OAM 0x07xxxxxx, palette/IO). The headless engine never
+        # renders to VRAM, but the REAL game code still WRITES there — a sprite
+        # whose tile sheet isn't loaded gets sheetTileStart = 0xFFFF and its tile
+        # copy targets OBJ_VRAM0 + 0xFFFF*32 (~0x06210000). With the default
+        # ~832KB memory that address is out of bounds and TRAPS, so the engine
+        # bans the sprite (Sludge / Spark / Hyper Beam lose their projectile).
+        # Growing makes those writes land in harmless zeroed memory so the real
+        # code runs to completion. wasmtime maps the pages lazily, so the cost is
+        # only the few pages actually touched.
+        try:
+            mem = ex["memory"]
+            _PAGE = 65536
+            # Try the full ~4GB; if a machine's wasmtime caps lower, fall back to
+            # 1GB then 128MB so we still get the largest window that works (a grow
+            # that exceeds the cap raises WITHOUT growing, so step down).
+            for _target in (self._MEM_TARGET_PAGES,
+                            0x40000000 // _PAGE, 0x08000000 // _PAGE):
+                _have = mem.size(store)
+                if _have >= _target:
+                    break
+                try:
+                    mem.grow(store, _target - _have)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
         init = ex.get("_initialize")
         if init is not None:
             init(store)
@@ -184,7 +224,14 @@ class AnimEngine:
                       max_frames: int = 600, wait_cap: int = 240,
                       sounds_out: Optional[list] = None,
                       bgscroll_out: Optional[list] = None,
-                      bg2scroll_out: Optional[list] = None) -> List[List[dict]]:
+                      bg2scroll_out: Optional[list] = None,
+                      bg3scroll_out: Optional[list] = None,
+                      shadow_out: Optional[list] = None,
+                      bg_palette: Optional[list] = None,
+                      bg_pal_out: Optional[list] = None,
+                      bg_pal_slot: Optional[int] = None,
+                      monfx_out: Optional[list] = None,
+                      coord_offset_out: Optional[list] = None) -> List[List[dict]]:
         """Run a whole move and return one OAM snapshot per GBA frame, RESILIENT
         to a single sprite/task whose creation traps the host engine.
 
@@ -200,29 +247,49 @@ class AnimEngine:
         empty banned one. Project-agnostic: no hardcoded move list.
         """
         banned: set = set()
-        best = None   # (score, frames, sounds, bg, bg2)
+        self._last_bg_screen_size = -1   # engine reveals the anim-BG SCREEN_SIZE
+        best = None   # (score, frames, sounds, bg, bg2, shadow, bgpal, monfx, bg3, coordoff)
         for _attempt in range(8):
-            s_tmp, b_tmp, b2_tmp = [], [], []
+            s_tmp, b_tmp, b2_tmp, sh_tmp, bp_tmp, mf_tmp, b3_tmp, co_tmp = \
+                [], [], [], [], [], [], [], []
             frames, trapped = self._play_once(
                 ops, attacker_is_player, max_frames, wait_cap,
                 s_tmp if sounds_out is not None else None,
                 b_tmp if bgscroll_out is not None else None,
                 b2_tmp if bg2scroll_out is not None else None,
-                banned)
+                sh_tmp if shadow_out is not None else None,
+                bg_palette,
+                bp_tmp if bg_pal_out is not None else None,
+                bg_pal_slot,
+                banned,
+                mf_tmp if monfx_out is not None else None,
+                b3_tmp if bg3scroll_out is not None else None,
+                co_tmp if coord_offset_out is not None else None)
             score = self._content_score(frames)
             if best is None or score > best[0]:
-                best = (score, frames, s_tmp, b_tmp, b2_tmp)
+                best = (score, frames, s_tmp, b_tmp, b2_tmp, sh_tmp, bp_tmp,
+                        mf_tmp, b3_tmp, co_tmp)
             if trapped is None:
                 break
             banned.add(trapped)                   # skip the trapping item, replay
         if best is None:
-            best = (0, [], [], [], [])
+            best = (0, [], [], [], [], [], [], [], [], [])
         if sounds_out is not None:
             sounds_out[:] = best[2]
         if bgscroll_out is not None:
             bgscroll_out[:] = best[3]
         if bg2scroll_out is not None:
             bg2scroll_out[:] = best[4]
+        if bg_pal_out is not None:
+            bg_pal_out[:] = best[6]
+        if shadow_out is not None:
+            shadow_out[:] = best[5]
+        if monfx_out is not None:
+            monfx_out[:] = best[7]
+        if bg3scroll_out is not None:
+            bg3scroll_out[:] = best[8]
+        if coord_offset_out is not None:
+            coord_offset_out[:] = best[9]
         return best[1]
 
     @staticmethod
@@ -240,7 +307,9 @@ class AnimEngine:
         return n
 
     def _play_once(self, ops, attacker_is_player, max_frames, wait_cap,
-                   sounds_out, bgscroll_out, bg2scroll_out, banned):
+                   sounds_out, bgscroll_out, bg2scroll_out, shadow_out,
+                   bg_palette, bg_pal_out, bg_pal_slot, banned, monfx_out=None,
+                   bg3scroll_out=None, coord_offset_out=None):
         """One playthrough. Returns (frames, trapped_item): trapped_item is the
         template/func name whose CREATION trapped (so the caller can ban + replay)
         or None if the run finished without a creation trap."""
@@ -248,6 +317,27 @@ class AnimEngine:
         frames: List[List[dict]] = []
         dead = [False]   # set when a wasm trap (UB in some move) halts the engine
         trapped_on = [None]   # template/func being created when a trap hit
+        # Engine-driven BG palette: write the move's real BG palette into the
+        # displayed buffer at the engine's own BG slot, so the move's OWN tasks
+        # (psychic rotation, white-flash, a project's custom palette task) animate
+        # it. We read it back each frame — whatever the engine did is reflected,
+        # with no per-move logic in the renderer.
+        bg_pal_addr = bg_pal_idx = None
+        if bg_palette is not None or bg_pal_out is not None:
+            try:
+                bg_pal_addr = ex["engine_pltt_addr"](store)
+                # The slot the BG's tilemap references (Surf=8, psychic=2) — the
+                # slot the move's task actually animates. Fall back to the engine's
+                # default BG palette slot only if the caller didn't supply one.
+                bg_pal_idx = (bg_pal_slot * 16 if bg_pal_slot is not None
+                              else ex["engine_bg_pltt_index"](store))
+                if bg_palette:
+                    vals = [int(c) & 0xFFFF for c in bg_palette[:16]]
+                    ex["memory"].write(
+                        store, struct.pack("<%dH" % len(vals), *vals),
+                        bg_pal_addr + bg_pal_idx * 2)
+            except Exception:
+                bg_pal_addr = bg_pal_idx = None
 
         def _safe(fn, *a):
             """Call a wasm export; on a trap (divide-by-zero UB, OR fuel
@@ -260,8 +350,13 @@ class AnimEngine:
             self._refuel(store)
             try:
                 return fn(store, *a)
-            except Exception:
+            except Exception as e:
                 dead[0] = True
+                if self._debug_traps:
+                    try:
+                        self._trap_log.append(str(e))
+                    except Exception:
+                        pass
                 return None
 
         def _step():
@@ -285,6 +380,63 @@ class AnimEngine:
                         bg2scroll_out.append(((v >> 16) & 0xFFFF, v & 0xFFFF))
                     except Exception:
                         bg2scroll_out.append((0, 0))
+                if bg3scroll_out is not None and not dead[0]:
+                    try:
+                        v = ex["engine_bg3_scroll"](store)
+                        bg3scroll_out.append(((v >> 16) & 0xFFFF, v & 0xFFFF))
+                    except Exception:
+                        bg3scroll_out.append((0, 0))
+                if coord_offset_out is not None and not dead[0]:
+                    # gSpriteCoordOffsetX/Y — the GBA sprite-layer screen shake
+                    # (Metal Claw / Dragon Claw impact). The renderer jitters the
+                    # battler mons by it.
+                    try:
+                        v = ex["engine_coord_offset"](store)
+                        coord_offset_out.append(((v >> 16) & 0xFFFF, v & 0xFFFF))
+                    except Exception:
+                        coord_offset_out.append((0, 0))
+                if shadow_out is not None and not dead[0]:
+                    # Memento soul-shadow: per-frame scanline-effect state. Only
+                    # read the 160-row stretch buffer when a stretch is running
+                    # (state != 0) — otherwise it's a cheap {state:0} placeholder
+                    # so frame indices stay aligned with `frames`.
+                    try:
+                        st = ex["engine_scanline_state"](store)
+                        state, eva = st & 0xFF, (st >> 8) & 0xFF
+                        lyr, axis = (st >> 16) & 3, (st >> 18) & 3
+                        wide = (st >> 20) & 1
+                        if state:
+                            w = ex["engine_win0h"](store)
+                            addr = ex["engine_scanline_addr"](store)
+                            # 320 u16: a 32-bit DMA (Acid Armor) interleaves
+                            # HOFS,VOFS per row, so HOFS for row i is buf[2i].
+                            raw = ex["memory"].read(store, addr, addr + 320 * 2)
+                            buf = list(struct.unpack("<320H", raw))
+                            shadow_out.append({
+                                "state": state, "eva": eva, "layer": lyr, "axis": axis,
+                                "wide": wide,
+                                "win0h": ((w >> 8) & 0xFF, w & 0xFF), "buf": buf})
+                        else:
+                            shadow_out.append({"state": 0, "eva": eva})
+                    except Exception:
+                        shadow_out.append({"state": 0})
+                if (bg_pal_out is not None and bg_pal_addr is not None
+                        and not dead[0]):
+                    # The live BG palette (slot from engine_bg_pltt_index), as the
+                    # move's tasks left it this frame — 16 BGR555 u16.
+                    try:
+                        a = bg_pal_addr + bg_pal_idx * 2
+                        raw = ex["memory"].read(store, a, a + 32)
+                        bg_pal_out.append(list(struct.unpack("<16H", raw)))
+                    except Exception:
+                        bg_pal_out.append(None)
+                if monfx_out is not None and not dead[0]:
+                    # Transform morph: (mosaic 0-15 pixelation, species-swapped flag).
+                    try:
+                        mf = ex["engine_mon_fx"](store)
+                        monfx_out.append((mf & 0xFF, (mf >> 8) & 1))
+                    except Exception:
+                        monfx_out.append((0, 0))
 
         def _busy():
             r = _safe(ex["engine_busy"])
@@ -327,7 +479,14 @@ class AnimEngine:
             if dead[0] or len(frames) >= max_frames:
                 break
             k = op.get("op")
-            if k == "createsprite":
+            if k == "monbg":
+                # Copy a battler's mon to a BG layer (sets gBattle_BGn_X + bgCopy so
+                # a per-scanline mon-warp has the right base — Acid Armor etc.).
+                try:
+                    ex["engine_monbg"](store, int(op.get("arg", 0)))
+                except Exception:
+                    pass
+            elif k == "createsprite":
                 tpl = op["template"]
                 idx = self._tpl_index.get(tpl)
                 if idx is not None and tpl not in banned:
@@ -368,4 +527,13 @@ class AnimEngine:
                 frames.append(self._snapshot(store, ex))
             except Exception:
                 pass
+        # The move's BG-setup task (if any) has set the anim-BG SCREEN_SIZE; read
+        # it so the caller assembles the tilemap's screenblocks with the right
+        # layout (a wide 512-px BG like Surf, not a stacked 256-px one).
+        try:
+            sz = ex["engine_bg_screen_size"](store)
+            if sz is not None and sz >= 0:
+                self._last_bg_screen_size = sz
+        except Exception:
+            pass
         return frames, trapped_on[0]

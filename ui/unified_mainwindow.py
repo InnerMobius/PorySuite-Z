@@ -244,7 +244,19 @@ class UnifiedMainWindow(QMainWindow):
             btn = self._make_page_button(icon_name, tooltip)
             tb.addWidget(btn)
 
-        _add_separator(tb)
+        # ── SECOND ROW ───────────────────────────────────────────────────────
+        # The single row overflowed (icons clipped behind the ">>" extension) on a
+        # non-maximized window. Split the nav across two rows: addToolBarBreak()
+        # drops the next toolbar onto its own line below the first. Row 1 is the
+        # PorySuite data editors; row 2 is EVENTide + tools + settings + Play.
+        self.addToolBarBreak()
+        tb2 = QToolBar("Main Toolbar Row 2")
+        tb2.setMovable(False)
+        tb2.setIconSize(QSize(32, 32))
+        tb2.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        tb2.setStyleSheet(tb.styleSheet())
+        self.addToolBar(tb2)
+        self._toolbar2 = tb2
 
         # ── EVENTide map/script editor pages ─────────────────────────────────
         eventide_pages = [
@@ -255,15 +267,15 @@ class UnifiedMainWindow(QMainWindow):
         ]
         for icon_name, tooltip in eventide_pages:
             btn = self._make_page_button(icon_name, tooltip)
-            tb.addWidget(btn)
+            tb2.addWidget(btn)
 
-        _add_separator(tb)
+        _add_separator(tb2)
 
         # ── Tilemap Editor ───────────────────────────────────────────────────
         btn = self._make_page_button("tilesets", "Tilemap Editor")
-        tb.addWidget(btn)
+        tb2.addWidget(btn)
 
-        _add_separator(tb)
+        _add_separator(tb2)
 
         # ── Settings / Info pages ────────────────────────────────────────────
         settings_pages = [
@@ -273,16 +285,16 @@ class UnifiedMainWindow(QMainWindow):
         ]
         for icon_name, tooltip in settings_pages:
             btn = self._make_page_button(icon_name, tooltip)
-            tb.addWidget(btn)
+            tb2.addWidget(btn)
 
-        _add_separator(tb)
+        _add_separator(tb2)
 
         # ── Play button (last in line) ──────────────────────────────────────
         self._play_action = QAction(_icon("play"), "Play", self)
         self._play_action.setShortcut("F9")
         self._play_action.setToolTip("Launch ROM in emulator (F9)")
         self._play_action.triggered.connect(self._on_play)
-        tb.addAction(self._play_action)
+        tb2.addAction(self._play_action)
 
         # ── Keyboard shortcut to jump to Sound Editor ──────────────────────
         _sound_shortcut = QShortcut(QKeySequence("F8"), self)
@@ -949,6 +961,10 @@ class UnifiedMainWindow(QMainWindow):
                 # animation instead of trailing the per-call M4A render.
                 _ba_mod._preview_sound_cb = self._sound_editor.play_se_fast
                 _ba_mod._preview_sound_prepare_cb = self._sound_editor.prepare_se
+                # On-demand audition for the timeline's ▶ Sound button (renders +
+                # plays even when not pre-cached); play_se_fast stays for the rapid
+                # in-sync move playback.
+                _ba_mod._preview_sound_ondemand_cb = self._sound_editor.play_se_ondemand
                 _ba_mod._stop_sound_cb = self._sound_stop_preview
             # Cry moves (Growl / Howl / Hyper Voice …) play the selected mon's
             # cry in the preview — reuse the Pokemon tab's cry player.

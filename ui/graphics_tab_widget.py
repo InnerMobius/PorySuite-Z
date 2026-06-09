@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRegularExpression
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRegularExpression, QRect
 from PyQt6.QtGui import (
     QColor, QPainter, QPixmap, QImage, QMouseEvent,
     QRegularExpressionValidator,
@@ -431,6 +431,22 @@ class BattleScenePreview(QWidget):
         # mon's palette is averaged to grey; False = normal colour.
         self._front_gray = False
         self._back_gray = False
+        # Per-mon BG-copy SOUL SHADOW (Memento / Role Play). The engine copies the
+        # mon onto a BG layer, blackens it, and stretches it via a per-scanline
+        # vertical-offset buffer while a WIN0 clip narrows it to a vanishing
+        # sliver. None = no shadow; otherwise a dict:
+        #   {"baseY": int, "buf": [160 ints], "eva": 0..16, "win0h": (L, R)}
+        # Drawn as a black silhouette of the mon, per-scanline-remapped from buf.
+        self._front_shadow = None
+        self._back_shadow = None
+        self._front_distort = None     # per-scanline H warp of the mon (Acid Armor)
+        self._back_distort = None      # Dragon Dance waver, etc.
+        self._front_mosaic = 0         # MOSAIC pixelation level 0-15 (Transform)
+        self._back_mosaic = 0
+        self._front_override = None     # swap the mon's pic (Transform morph target)
+        self._back_override = None
+        self._bg_shake = (0, 0)         # battle-scene offset px (terrain/screen shake)
+        self._mon_shake = (0, 0)        # both-mon offset px (sprite-layer gSpriteCoordOffset shake)
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -445,6 +461,17 @@ class BattleScenePreview(QWidget):
         self._anim_bg: Optional[QPixmap] = None
         self._anim_bg_x = 0
         self._anim_bg_y = 0
+        # Per-scanline HORIZONTAL warp of the anim background (Extrasensory's
+        # psychic-BG distortion: the engine writes a per-row REG_BGnHOFS sine via
+        # the scanline buffer). None = no warp (flat tiled scroll); else a list of
+        # CANVAS_H absolute per-row HOFS values — each row is drawn shifted by its
+        # own value, producing the wavy distortion.
+        self._anim_bg_distort = None
+        # Per-scanline ALPHA of the anim background (Surf's wave: the engine writes
+        # a per-row BLDALPHA; the water is drawn at each row's eva/16 opacity, so a
+        # rising band is opaque water and the rest is transparent — the scene shows
+        # through). None = fully opaque; else a list of CANVAS_H eva values (0..16).
+        self._anim_bg_alpha = None
 
         w = self.CANVAS_W * self.SCALE
         h = self.CANVAS_H * self.SCALE
@@ -540,12 +567,20 @@ class BattleScenePreview(QWidget):
             self._back_fx = fx
         self.update()
 
-    def set_anim_bg(self, pix: Optional[QPixmap], x: int = 0, y: int = 0) -> None:
+    def set_anim_bg(self, pix: Optional[QPixmap], x: int = 0, y: int = 0,
+                    distort=None, alpha=None) -> None:
         """Set (or clear with None) the battle-animation background, scrolled to
-        (x, y). Drawn over the battle BG and behind the mons."""
+        (x, y). Drawn over the battle BG and behind the mons. ``distort`` is an
+        optional list of CANVAS_H per-row HOFS values (Extrasensory's psychic-BG
+        warp); ``alpha`` is an optional list of CANVAS_H per-row eva values 0..16
+        (Surf's wave — each row drawn at eva/16 opacity, transparent rows let the
+        scene show). When either is set the BG is drawn per-scanline; otherwise the
+        flat tiled scroll runs."""
         self._anim_bg = pix
         self._anim_bg_x = int(x)
         self._anim_bg_y = int(y)
+        self._anim_bg_distort = list(distort) if distort else None
+        self._anim_bg_alpha = list(alpha) if alpha else None
         self.update()
 
     def set_mon_visible(self, which: str, visible: bool) -> None:
@@ -653,8 +688,83 @@ class BattleScenePreview(QWidget):
             self._back_gray = gray
         self.update()
 
+    def set_mon_shadow(self, which: str, shadow) -> None:
+        """Set a mon's Memento soul-shadow (or None to clear). ``shadow`` is a
+        dict {"baseY", "buf" (160 ints), "eva" (0..16), "win0h" (L, R)} from the
+        engine's scanline-stretch state."""
+        if which == "front":
+            if shadow == self._front_shadow:
+                return
+            self._front_shadow = shadow
+        else:
+            if shadow == self._back_shadow:
+                return
+            self._back_shadow = shadow
+        self.update()
+
+    def set_mon_distort(self, which: str, offsets) -> None:
+        """A mon copied to a BG layer + horizontally warped per-scanline (Acid
+        Armor melt, Dragon Dance waver): ``offsets`` is a list of per-screen-row X
+        shifts (or None to clear). The mon's OWN pixels, NOT a black shadow."""
+        if which == "front":
+            self._front_distort = offsets
+        else:
+            self._back_distort = offsets
+        self.update()
+
+    def set_mon_mosaic(self, which: str, level: int) -> None:
+        """MOSAIC pixelation level (0-15) for a mon — the engine's REG_OFFSET_MOSAIC
+        during a Transform morph. 0 = sharp."""
+        level = max(0, min(15, int(level)))
+        if which == "front":
+            self._front_mosaic = level
+        else:
+            self._back_mosaic = level
+
+    def set_mon_override(self, which: str, pix) -> None:
+        """Swap a mon's drawn pic (Transform's mid-morph species change). None =
+        the mon's own pic."""
+        ok = pix if (pix is not None and not pix.isNull()) else None
+        if which == "front":
+            self._front_override = ok
+        else:
+            self._back_override = ok
+
+    def set_bg_shake(self, dx: int, dy: int) -> None:
+        """Offset the battle scene by (dx, dy) px — the terrain/screen shake
+        (BG3 scroll from AnimShakeMonOrBattleTerrain). (0,0) = steady."""
+        self._bg_shake = (int(dx), int(dy))
+
+    def set_mon_shake(self, dx: int, dy: int) -> None:
+        """Offset BOTH battler mons by (dx, dy) px — the sprite-layer screen shake
+        (gSpriteCoordOffset from AnimShakeMonOrBattleTerrain — Metal Claw / Dragon
+        Claw impact). In-game this jitters every coordOffset-enabled OAM sprite,
+        which is the battler mons; effect sprites are not enabled, so they hold
+        steady (matching the GBA). (0,0) = steady."""
+        self._mon_shake = (int(dx), int(dy))
+
+    @staticmethod
+    def _mosaic_pixmap(pix, level):
+        """GBA MOSAIC: each (level+1)x(level+1) block shows one source pixel —
+        downscale then nearest-neighbour upscale back to the original size."""
+        if level <= 0 or pix is None or pix.isNull():
+            return pix
+        f = level + 1
+        w, h = pix.width(), pix.height()
+        small = pix.scaled(max(1, w // f), max(1, h // f),
+                           Qt.AspectRatioMode.IgnoreAspectRatio,
+                           Qt.TransformationMode.FastTransformation)
+        return small.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                            Qt.TransformationMode.FastTransformation)
+
     def reset_mon_transforms(self) -> None:
         """Restore both mons to their untransformed, visible draw (end of play)."""
+        self._front_distort = None
+        self._back_distort = None
+        self._front_mosaic = self._back_mosaic = 0
+        self._front_override = self._back_override = None
+        self._bg_shake = (0, 0)
+        self._mon_shake = (0, 0)
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
                    or self._back_fx != (0, 0, 1.0, 1.0)
                    or not self._front_visible or not self._back_visible
@@ -663,7 +773,8 @@ class BattleScenePreview(QWidget):
                    or self._front_clones or self._back_clones
                    or self._front_tint != (0, 0) or self._back_tint != (0, 0)
                    or self._front_alpha != 16 or self._back_alpha != 16
-                   or self._front_gray or self._back_gray)
+                   or self._front_gray or self._back_gray
+                   or self._front_shadow is not None or self._back_shadow is not None)
         self._front_fx = (0, 0, 1.0, 1.0)
         self._back_fx = (0, 0, 1.0, 1.0)
         self._front_visible = True
@@ -680,6 +791,8 @@ class BattleScenePreview(QWidget):
         self._back_alpha = 16
         self._front_gray = False
         self._back_gray = False
+        self._front_shadow = None
+        self._back_shadow = None
         if changed:
             self.update()
 
@@ -796,6 +909,93 @@ class BattleScenePreview(QWidget):
         BattleScenePreview._gray_cache[key] = out
         return out
 
+    _silhouette_cache: dict = {}
+
+    @staticmethod
+    def _silhouette_image(pix):
+        """Return a QImage of ``pix`` with every opaque pixel forced to BLACK
+        (alpha shape preserved) — the FillPalette(RGB_BLACK) silhouette the
+        Memento / Role Play shadow tasks paint onto the BG-copied mon. Cached by
+        pixmap content."""
+        if pix is None or pix.isNull():
+            return None
+        key = pix.cacheKey()
+        cached = BattleScenePreview._silhouette_cache.get(key)
+        if cached is not None:
+            return cached
+        src = pix.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        out = QImage(src.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        out.fill(0)
+        qp = QPainter(out)
+        qp.drawImage(0, 0, src)
+        qp.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceAtop)
+        qp.fillRect(out.rect(), QColor(0, 0, 0, 255))
+        qp.end()
+        if len(BattleScenePreview._silhouette_cache) > 64:
+            BattleScenePreview._silhouette_cache.clear()
+        BattleScenePreview._silhouette_cache[key] = out
+        return out
+
+    def _paint_mon_distort(self, p, pix, frame_left, frame_top, fw, fh, offsets, s):
+        """Draw a mon copied to a BG layer + HORIZONTALLY warped per scanline
+        (Acid Armor melt, Dragon Dance waver): each screen row of the mon is drawn
+        shifted by ``offsets[screen_row]``. The mon's own pixels (not a black
+        shadow — that's the vertical Memento path)."""
+        n = len(offsets)
+        for ry in range(fh):
+            sy = frame_top + ry
+            off = offsets[sy] if 0 <= sy < n else 0
+            if off is None:        # this scanline melted off-screen (Acid Armor)
+                continue
+            p.drawPixmap((frame_left + int(off)) * s, sy * s, fw * s, s,
+                         pix, 0, ry, fw, 1)
+
+    def _paint_mon_shadow(self, p, pix, frame_left, frame_top, fw, fh, shadow, s):
+        """Draw the Memento soul-shadow: a black silhouette of the mon, vertically
+        remapped per the engine's per-scanline VOFS buffer (the upward stretch),
+        horizontally clipped to the WIN0 bounds (the narrowing sliver), at
+        BLDALPHA-EVA opacity.
+
+        For each GBA screen row y the BG copy shows mon content shifted by
+        delta = (signed)buf[y] - baseY; at delta 0 the shadow exactly overlays the
+        mon, so the source frame row is (y - frame_top) + delta. Rows whose source
+        lands outside [0, fh) draw nothing — that covers the scanline ramp regions
+        (which map to a constant off-frame row) and everything above/below the
+        stretch, so the silhouette tapers to a streak off the top of the mon."""
+        sil = self._silhouette_image(pix)
+        if sil is None:
+            return
+        buf = shadow.get("buf") or []
+        if len(buf) < self.CANVAS_H:
+            return
+        baseY = int(shadow.get("baseY", 0))
+        L, R = shadow.get("win0h", (0, self.CANVAS_W))
+        L = max(0, min(self.CANVAS_W, int(L)))
+        R = max(0, min(self.CANVAS_W, int(R)))
+        if R <= L:
+            return                       # WIN0 collapsed → shadow has vanished
+        eva = max(0, min(16, int(shadow.get("eva", 16))))
+        if eva <= 0:
+            return
+        shimg = QImage(self.CANVAS_W, self.CANVAS_H,
+                       QImage.Format.Format_ARGB32_Premultiplied)
+        shimg.fill(0)
+        qp = QPainter(shimg)
+        qp.setClipRect(L, 0, R - L, self.CANVAS_H)   # WIN0 horizontal clip
+        for y in range(self.CANVAS_H):
+            v = buf[y]
+            if v >= 0x8000:
+                v -= 0x10000                          # u16 → signed VOFS
+            src_row = (y - frame_top) + (v - baseY)
+            if 0 <= src_row < fh:
+                qp.drawImage(QRect(frame_left, y, fw, 1),
+                             sil, QRect(0, src_row, fw, 1))
+        qp.end()
+        p.setOpacity(eva / 16.0)
+        p.drawImage(QRect(0, 0, self.CANVAS_W * s, self.CANVAS_H * s),
+                    shimg, QRect(0, 0, self.CANVAS_W, self.CANVAS_H))
+        p.setOpacity(1.0)
+
     @staticmethod
     def _draw_mon(p, pix, frame_left, frame_top, fw, fh, fx, s):
         """Draw a mon frame, applying a per-mon transform (offset + scale).
@@ -825,11 +1025,17 @@ class BattleScenePreview(QWidget):
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
         s = self.SCALE
 
-        # Background
+        # Background — offset by the terrain/screen shake (BG3 scroll). Drawn a few
+        # px oversized + shifted so the shake never exposes a gap at the edges.
         if self._bg and not self._bg.isNull():
-            p.drawPixmap(
-                0, 0, self.CANVAS_W * s, self.CANVAS_H * s, self._bg
-            )
+            shx, shy = self._bg_shake
+            if shx or shy:
+                pad = 10
+                p.drawPixmap(int((shx - pad) * s), int((shy - pad) * s),
+                             (self.CANVAS_W + 2 * pad) * s,
+                             (self.CANVAS_H + 2 * pad) * s, self._bg)
+            else:
+                p.drawPixmap(0, 0, self.CANVAS_W * s, self.CANVAS_H * s, self._bg)
         else:
             p.fillRect(self.rect(), QColor(40, 40, 40))
 
@@ -838,15 +1044,38 @@ class BattleScenePreview(QWidget):
         if self._anim_bg is not None and not self._anim_bg.isNull():
             bw, bh = self._anim_bg.width(), self._anim_bg.height()
             if bw > 0 and bh > 0:
-                ox = self._anim_bg_x % bw
                 oy = self._anim_bg_y % bh
-                yy = -oy
-                while yy < self.CANVAS_H:
-                    xx = -ox
-                    while xx < self.CANVAS_W:
-                        p.drawPixmap(xx * s, yy * s, bw * s, bh * s, self._anim_bg)
-                        xx += bw
-                    yy += bh
+                dist = self._anim_bg_distort
+                alpha = self._anim_bg_alpha
+                if dist is not None or alpha is not None:
+                    # Per-scanline path: each screen row drawn as a 1px strip with
+                    # its own horizontal offset (Extrasensory warp = dist[y]; else
+                    # the flat scroll) and its own opacity (Surf wave = alpha[y]/16;
+                    # transparent rows are skipped so the scene shows through).
+                    for yy in range(self.CANVAS_H):
+                        if alpha is not None:
+                            a = (alpha[yy] / 16.0) if yy < len(alpha) else 0.0
+                            if a <= 0.0:
+                                continue                 # transparent row → scene
+                            p.setOpacity(min(1.0, a))
+                        src_y = (yy + self._anim_bg_y) % bh
+                        ox = ((int(dist[yy]) if (dist and yy < len(dist))
+                               else self._anim_bg_x)) % bw
+                        xx = -ox
+                        while xx < self.CANVAS_W:
+                            p.drawPixmap(xx * s, yy * s, bw * s, s,
+                                         self._anim_bg, 0, src_y, bw, 1)
+                            xx += bw
+                    p.setOpacity(1.0)
+                else:
+                    ox = self._anim_bg_x % bw
+                    yy = -oy
+                    while yy < self.CANVAS_H:
+                        xx = -ox
+                        while xx < self.CANVAS_W:
+                            p.drawPixmap(xx * s, yy * s, bw * s, bh * s, self._anim_bg)
+                            xx += bw
+                        yy += bh
 
         # Shadow is created at (enemy_x, enemy_y + 29) per pokefirered
         # (src/battle_gfx_sfx_util.c :: LoadAndCreateEnemyShadowSprites).
@@ -900,14 +1129,19 @@ class BattleScenePreview(QWidget):
         # CENTERED on sBattlerCoords, plus y_offset pushes it DOWN,
         # minus enemy elevation pushes it UP.
         if self._front_pix and not self._front_pix.isNull():
-            fpix = self.tint_pixmap(self._front_pix, *self._front_tint)
+            _fbase = (self._front_override if self._front_override is not None
+                      else self._front_pix)   # Transform morph swaps the pic
+            fpix = self.tint_pixmap(_fbase, *self._front_tint)
             if self._front_gray:
                 fpix = self.gray_pixmap(fpix)
+            if self._front_mosaic > 0:         # Transform MOSAIC pixelation
+                fpix = self._mosaic_pixmap(fpix, self._front_mosaic)
             fw = fpix.width()
             fh = fpix.height()
             frame_top = (self.ENEMY_CY - fh // 2
-                         + self._front_y_off - self._enemy_elevation)
-            frame_left = self.ENEMY_CX - fw // 2
+                         + self._front_y_off - self._enemy_elevation
+                         + self._mon_shake[1])
+            frame_left = self.ENEMY_CX - fw // 2 + self._mon_shake[0]
             if self._front_alpha < 16:
                 p.setOpacity(self._front_alpha / 16.0)
             if self._front_sink is not None:
@@ -916,6 +1150,9 @@ class BattleScenePreview(QWidget):
             elif self._front_aff is not None:
                 self._paint_mon_affine(p, fpix, frame_left, frame_top,
                                        fw, fh, self._front_aff, s)
+            elif self._front_distort is not None:
+                self._paint_mon_distort(p, fpix, frame_left, frame_top,
+                                        fw, fh, self._front_distort, s)
             elif self._front_visible:
                 self._draw_mon(p, fpix, frame_left, frame_top,
                                fw, fh, self._front_fx, s)
@@ -925,13 +1162,18 @@ class BattleScenePreview(QWidget):
         # Player (back) sprite — same frame-center rule, back y_offset
         # pushes DOWN.
         if self._back_pix and not self._back_pix.isNull():
-            bpix = self.tint_pixmap(self._back_pix, *self._back_tint)
+            _bbase = (self._back_override if self._back_override is not None
+                      else self._back_pix)   # Transform morph swaps the pic
+            bpix = self.tint_pixmap(_bbase, *self._back_tint)
             if self._back_gray:
                 bpix = self.gray_pixmap(bpix)
+            if self._back_mosaic > 0:          # Transform MOSAIC pixelation
+                bpix = self._mosaic_pixmap(bpix, self._back_mosaic)
             bw = bpix.width()
             bh = bpix.height()
-            frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off)
-            frame_left = self.PLAYER_CX - bw // 2
+            frame_top = (self.PLAYER_CY - bh // 2 + self._back_y_off
+                         + self._mon_shake[1])
+            frame_left = self.PLAYER_CX - bw // 2 + self._mon_shake[0]
             if self._back_alpha < 16:
                 p.setOpacity(self._back_alpha / 16.0)
             if self._back_sink is not None:
@@ -940,11 +1182,37 @@ class BattleScenePreview(QWidget):
             elif self._back_aff is not None:
                 self._paint_mon_affine(p, bpix, frame_left, frame_top,
                                        bw, bh, self._back_aff, s)
+            elif self._back_distort is not None:
+                self._paint_mon_distort(p, bpix, frame_left, frame_top,
+                                        bw, bh, self._back_distort, s)
             elif self._back_visible:
                 self._draw_mon(p, bpix, frame_left, frame_top,
                                bw, bh, self._back_fx, s)
             if self._back_alpha < 16:
                 p.setOpacity(1.0)
+
+        # Memento / Role Play SOUL SHADOW — a black silhouette of the mon copied
+        # to a BG layer (priority 2, drawn in FRONT of the battler sprites the
+        # shadow task pushed to priority 3), stretched upward by the scanline
+        # buffer and clipped to a narrowing WIN0 sliver. After the mons, under
+        # the textbox. Frame box matches each mon's draw box exactly.
+        if (self._front_shadow is not None
+                and self._front_pix and not self._front_pix.isNull()):
+            fw = self._front_pix.width()
+            fh = self._front_pix.height()
+            ft = (self.ENEMY_CY - fh // 2
+                  + self._front_y_off - self._enemy_elevation)
+            fl = self.ENEMY_CX - fw // 2
+            self._paint_mon_shadow(p, self._front_pix, fl, ft, fw, fh,
+                                   self._front_shadow, s)
+        if (self._back_shadow is not None
+                and self._back_pix and not self._back_pix.isNull()):
+            bw = self._back_pix.width()
+            bh = self._back_pix.height()
+            bt = self.PLAYER_CY - bh // 2 + self._back_y_off
+            bl = self.PLAYER_CX - bw // 2
+            self._paint_mon_shadow(p, self._back_pix, bl, bt, bw, bh,
+                                   self._back_shadow, s)
 
         # Battle-animation sprite overlay (Battle Anims tab) — frame
         # CENTERED on (_anim_cx, _anim_cy), above the mons, below the

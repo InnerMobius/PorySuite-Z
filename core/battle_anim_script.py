@@ -95,7 +95,10 @@ def classify_opcode(name: str) -> str:
     """Return the KIND_* bucket for a battle-anim opcode."""
     if name in _EXACT_KIND:
         return _EXACT_KIND[name]
-    if name.startswith(("playse", "loopse", "panse")):
+    # waitplayse / waitplaysewithpan PLAY a sound (then wait) — they were missed
+    # by the playse/loopse/panse prefixes, so moves whose only SE is a
+    # waitplayse* (Reflect = SE_M_REFLECT, Role Play's DETECT "ting") were silent.
+    if name.startswith(("playse", "loopse", "panse", "waitplayse")):
         return KIND_SOUND
     if name.startswith("createsprite"):
         return KIND_SPRITE
@@ -670,6 +673,24 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
     _keys = list(scripts.keys())
     _next = {_keys[i]: _keys[i + 1] for i in range(len(_keys) - 1)}
 
+    def _has_bg(lbl: str, seen: frozenset) -> bool:
+        """Does this branch (following its calls/gotos) load a battle BACKGROUND?
+        Lets choosetwoturnanim prefer the branch that shows a bg (Sky Attack's
+        unleash = SetSkyBg; its setup has none)."""
+        if lbl in seen or lbl not in scripts:
+            return False
+        seen2 = seen | {lbl}
+        for cmd in scripts[lbl]:
+            if cmd.name in ("fadetobg", "changebg", "fadetobgfromset"):
+                return True
+            if cmd.name == "call" and cmd.call_target and _has_bg(cmd.call_target, seen2):
+                return True
+            if cmd.name == "goto" and cmd.args and _has_bg(cmd.args[0], seen2):
+                return True
+            if cmd.name in ("end", "return"):
+                break
+        return False
+
     def _walk(lbl: str, depth: int, seen: frozenset):
         if depth > max_depth or lbl in seen or lbl not in scripts:
             return
@@ -692,10 +713,19 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 return  # tail-jump: nothing after a goto runs
             elif cmd.name == "choosetwoturnanim" and cmd.args:
                 pick = cmd.args[min(branch_choice, len(cmd.args) - 1)]
+                # Prefer the branch that shows an animated BACKGROUND: for a two-
+                # turn move the 2nd branch is the unleash (Sky Attack's dive over
+                # the sliding SetSkyBg), the 1st is the charge with no bg. A move
+                # preview should show the bg branch. Moves whose branches both lack
+                # a bg (Dig, Fly, …) keep the default first branch.
+                if (branch_choice == 0 and len(cmd.args) >= 2
+                        and _has_bg(cmd.args[1], frozenset())
+                        and not _has_bg(cmd.args[0], frozenset())):
+                    pick = cmd.args[1]
                 _walk(pick, depth + 1, seen2)
-                return  # follow the chosen branch (default = first)
-            elif (cmd.name.startswith("jump") and cmd.args
-                  and cmd.args[-1] in scripts):
+                return  # follow the chosen branch
+            elif (cmd.name.startswith("jump") and cmd.name != "jumpifcontest"
+                  and cmd.args and cmd.args[-1] in scripts):
                 # Conditional jump (jumpargeq / jumpret* / jumpifmoveturn …): the
                 # branch TARGET (its last arg, a label) holds a variant's real
                 # animation — Magnitude's power tiers, Return's friendship tiers,
@@ -703,6 +733,9 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 # follow the FIRST branch as a representative animation (like
                 # choosetwoturnanim). Without this, a branch-based move resolves
                 # to just its selector task + end → NO animation.
+                # EXCEPT jumpifcontest: the preview is never a contest, so we take
+                # the NON-contest path (fall through) — else Sky Attack would load
+                # the BG_SKY_CONTESTS variant instead of BG_SKY.
                 _walk(cmd.args[-1], depth + 1, seen2)
                 return
         # Reached the end of this label with no end/return/goto/branch → the

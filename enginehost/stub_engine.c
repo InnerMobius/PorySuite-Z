@@ -99,7 +99,15 @@ struct BattleSpriteData *gBattleSpritesDataPtr = &sBattleSpritesData;
  * the driver reads them out for BG moves. */
 u16 gBattle_BG1_X, gBattle_BG1_Y;
 u16 gBattle_BG2_X, gBattle_BG2_Y;
-u16 gBattle_BG3_X, gBattle_BG3_Y;
+/* 64K-aligned so their wasm addresses have a ZERO low half (bit 15 clear).
+ * AnimShakeMonOrBattleTerrain (Rock Throw / Magnitude / Earthquake-likes) stores
+ * &gBattle_BG3_X split across two s16 sprite-data fields and rebuilds it as
+ * data[6] | (data[7] << 16) — a GBA-era trick. If the address's low half has bit
+ * 15 set, the s16 data[6] sign-extends to a bad pointer and the deref FAULTS, so
+ * the shake sprite traps and gets banned. Forcing the low half to 0 dodges the
+ * sign-extension so the screen/terrain-shake actually runs. */
+u16 __attribute__((aligned(0x10000))) gBattle_BG3_X;
+u16 __attribute__((aligned(0x10000))) gBattle_BG3_Y;
 u16 gBattle_WIN0H, gBattle_WIN0V, gBattle_WIN1H, gBattle_WIN1V;
 
 struct MusicPlayerInfo gMPlayInfo_BGM;
@@ -234,10 +242,47 @@ u32 GetMonData2(struct Pokemon *mon, s32 field)
  * opaque. Recorded here because SetGpuReg is otherwise a no-op. */
 u8 gHostBldEva = 16;
 
+/* ── BG-mon-copy state (Memento / Role Play "soul shadow") ───────────────────
+ * MoveBattlerSpriteToBG copies a battler's mon onto a BG layer; the shadow tasks
+ * then blacken it (FillPalette RGB_BLACK), stretch it via a per-scanline VOFS
+ * buffer, and clip it with WIN0. The real VRAM copy faults under wasm, so we
+ * record only what the renderer needs to rebuild the ghost: which BG layer each
+ * battler was copied to (0 none / 1 BG1 / 2 BG2) and the base vertical scroll
+ * captured at copy time (= the AnimTask data[10] the scanline stretch deviates
+ * from). The scanline buffer + WIN0 + BLDALPHA are all computed by the tasks
+ * running in-engine and read out via driver exports. */
+u8  gHostMonBg[4];        /* per-battler: 0 none, 1 BG1, 2 BG2 */
+s16 gHostMonBgBaseY[4];   /* base BGnVOFS at copy time (data[10]) */
+u8  gHostShadowLayer;     /* BG layer (1/2) the ACTIVE scanline stretch drives —
+                           * recorded from ScanlineEffect_SetParams' dmaDest so
+                           * the renderer ties the current stretch to the one mon
+                           * on that layer. Memento runs two shadows in sequence
+                           * (attacker then target, on opposite layers); without
+                           * this the idle mon would render the other's buffer. */
+u8  gHostScanAxis;        /* axis of the active scanline effect: 0 none, 1 = HOFS
+                           * (horizontal per-row warp — Extrasensory's psychic-BG
+                           * distortion), 2 = VOFS (vertical — Memento's soul-
+                           * shadow stretch). Lets the renderer pick H vs V. */
+u8  gHostScanWide;        /* 1 = the scanline DMA is 32-bit (HOFS+VOFS interleaved
+                           * per row — Acid Armor); 0 = 16-bit (one value per row
+                           * — Dragon Dance, Extrasensory). The renderer reads
+                           * buf[2*row] for HOFS when wide, buf[row] when not. */
+
+/* REG_OFFSET_MOSAIC BG level (low byte: bits 0-3 H, 4-7 V). Transform's morph
+ * (AnimTask_TransformMon) ramps this 0->15 to pixelate the mon, swaps its pic to
+ * the target, then ramps back 15->0. The renderer pixelates the monbg'd mon by
+ * this amount. */
+u8 gHostMosaic = 0;
+/* Set when HandleSpeciesGfxDataChange runs — Transform's mid-morph gfx swap: the
+ * attacker's pic becomes the target's. The renderer swaps the displayed mon. */
+u8 gHostMonSwapped = 0;
+
 void SetGpuReg(u8 r, u16 v)
 {
     if (r == 0x52)               /* REG_OFFSET_BLDALPHA: low 5 bits = EVA */
         gHostBldEva = (v & 0x1F);
+    else if (r == 0x4c)          /* REG_OFFSET_MOSAIC: low byte = BG mosaic (H|V<<4) */
+        gHostMosaic = (v & 0xFF);
 }
 void SetGpuRegBits(u8 r, u16 m) { (void)r; (void)m; }
 void ClearGpuRegBits(u8 r, u16 m) { (void)r; (void)m; }
@@ -264,6 +309,14 @@ void HostResetPalBlend(void)
     }
     gHostBldEva = 16;   /* opaque until a setalpha/fade changes it */
     gPaletteFade.active = 0;   /* no software fade in progress */
+    for (i = 0; i < 4; i++) { gHostMonBg[i] = 0; gHostMonBgBaseY[i] = 0; }
+    gScanlineEffect.state = 0;   /* no shadow scanline stretch in progress */
+    gScanlineEffect.srcBuffer = 0;
+    gHostShadowLayer = 0;
+    gHostScanAxis = 0;
+    gHostScanWide = 0;
+    gHostMosaic = 0;        /* no mosaic pixelation in progress (Transform) */
+    gHostMonSwapped = 0;    /* attacker's pic not yet morphed to the target's */
 }
 
 /* Record a per-slot greyscale flag. The real one (battle_anim_mons.c) averages
@@ -396,14 +449,79 @@ void CopyToBgTilemapBufferRect_ChangePalette(u8 a, const void *s, u8 x, u8 y, u8
 void CopyBattlerSpriteToBg(s32 a, u8 x, u8 y, u8 pos, u8 pal, u8 *td, u16 *mp, u16 to) { (void)a;(void)x;(void)y;(void)pos;(void)pal;(void)td;(void)mp;(void)to; }
 void DrawMainBattleBackground(void) {}
 s32 GetAnimBgAttribute(u8 a, u8 b) { (void)a;(void)b; return 0; }
-void SetAnimBgAttribute(u8 a, u8 b, u8 c) { (void)a;(void)b;(void)c; }
+/* Capture the anim BG's SCREEN_SIZE (attributeId 0 = BG_ANIM_SCREEN_SIZE) the
+ * move sets. The renderer needs it to lay out the tilemap's screenblocks: a
+ * 2-screenblock map is 512x256 (side-by-side) for size 1 vs 256x512 (stacked)
+ * for size 2. Read out via engine_bg_screen_size — no hardcoded per-move width. */
+s8 gHostAnimBgScreenSize = -1;   /* -1 = unset (assume linear 256-wide) */
+void SetAnimBgAttribute(u8 bgId, u8 attributeId, u8 value)
+{
+    (void)bgId;
+    if (attributeId == 0)        /* BG_ANIM_SCREEN_SIZE */
+        gHostAnimBgScreenSize = (s8)value;
+}
 
 void LoadSpecialPokePic(const struct CompressedSpriteSheet *s, void *d, s32 sp, u32 p, bool8 f) { (void)s;(void)d;(void)sp;(void)p;(void)f; }
 void LoadSpecialPokePic_DontHandleDeoxys(const struct CompressedSpriteSheet *s, void *d, s32 sp, u32 p, bool8 f) { (void)s;(void)d;(void)sp;(void)p;(void)f; }
+
+/* Host CreateAdditionalMonSpriteForMoveAnim (the project copy is renamed _ORIG by
+ * the build -D). The real one loads a mon's pic into VRAM via hardware DMA, which
+ * faults under wasm — that trapped Role Play's silhouette task so it got banned +
+ * never ran. We just create a PLACEHOLDER sprite at the requested position so the
+ * task RUNS (sets objMode BLEND, ramps BLDALPHA, scales it). The renderer draws
+ * the target mon's actual pic onto the silhouette, keyed to the engine's eva fade.
+ * The placeholder carries no gfx (tileTag 0) so the renderer skips it directly. */
+/* The placeholder MUST match the engine's real mon-pic OAM: 64x64 + AFFINE_NORMAL.
+ * The animation's scale step (Role Play's Step2) does `oam.affineMode |= DOUBLE_MASK`
+ * then TrySetSpriteRotScale, which only writes the matrix when `affineMode & 1`.
+ * A dummy OFF(0) OAM becomes ERASE(2) (bit 0 clear) → the scale is silently
+ * dropped (matrix stuck at identity, sprite never resizes). NORMAL(1) becomes
+ * DOUBLE(3) → the real squash matrix is written + captured in the snapshot. */
+static const struct OamData sHostMonPicOam = {
+    .affineMode = ST_OAM_AFFINE_NORMAL,
+    .objMode = ST_OAM_OBJ_NORMAL,
+    .shape = ST_OAM_SQUARE,
+    .size = 3,                 /* 64x64 */
+};
+static const struct SpriteTemplate sHostMonPicTemplate = {
+    .tileTag = 0, .paletteTag = 0, .oam = &sHostMonPicOam,
+    .anims = gDummySpriteAnimTable, .images = NULL,
+    .affineAnims = gDummySpriteAffineAnimTable, .callback = SpriteCallbackDummy,
+};
+/* Which battler each additional-mon placeholder represents, keyed by sprite id —
+ * so the renderer can substitute that battler's reference pic with NO task-name
+ * match (a renamed/duplicated Role Play works identically). */
+static u8 sAddlMonBattler[MAX_SPRITES];
+static u8 sAddlMonBackpic[MAX_SPRITES];
+u8 CreateAdditionalMonSpriteForMoveAnim(u16 species, bool8 isBackpic, u8 templateId,
+        s16 x, s16 y, u8 subpriority, u32 personality, u32 trainerId,
+        u32 battlerId, bool32 ignoreDeoxys)
+{
+    (void)species; (void)templateId; (void)personality;
+    (void)trainerId; (void)ignoreDeoxys;
+    u8 id = CreateSprite(&sHostMonPicTemplate, x, y, subpriority);
+    if (id < MAX_SPRITES)
+    {
+        sAddlMonBattler[id] = (u8)battlerId;
+        sAddlMonBackpic[id] = (u8)isBackpic;
+    }
+    return id;
+}
+/* 1 if sprite i is an additional-mon placeholder (created via the dedicated
+ * template above), filling the battler it stands in for + the requested pic
+ * orientation. The template identity is the marker — no name/tag heuristic. */
+int HostAddlMonInfo(int i, int *battler, int *backpic)
+{
+    if (i < 0 || i >= MAX_SPRITES || gSprites[i].template != &sHostMonPicTemplate)
+        return 0;
+    if (battler) *battler = (int)sAddlMonBattler[i];
+    if (backpic) *backpic = (int)sAddlMonBackpic[i];
+    return 1;
+}
 static const u32 sDummyPal[8] = {0};
 const u32 *GetMonSpritePalFromSpeciesAndPersonality(u16 s, u32 o, u32 p) { (void)s;(void)o;(void)p; return sDummyPal; }
 bool8 ShouldIgnoreDeoxysForm(u8 a, u8 b) { (void)a;(void)b; return FALSE; }
-void HandleSpeciesGfxDataChange(u8 a, u8 b, u8 c) { (void)a;(void)b;(void)c; }
+void HandleSpeciesGfxDataChange(u8 a, u8 b, u8 c) { (void)a;(void)b;(void)c; gHostMonSwapped = 1; }
 void LoadBattleMonGfxAndAnimate(u8 a, bool8 b, u8 c) { (void)a;(void)b;(void)c; }
 u8 UpdateMonIconFrame(struct Sprite *s) { (void)s; return 0; }
 void SetBattlerShadowSpriteCallback(u8 a, u16 b) { (void)a;(void)b; }
@@ -414,7 +532,40 @@ bool8 LoadCompressedSpriteSheetUsingHeap(const struct CompressedSpriteSheet *s) 
 bool8 LoadCompressedSpritePaletteUsingHeap(const struct CompressedSpritePalette *s) { (void)s; return FALSE; }
 
 u8 ScanlineEffect_InitWave(u8 a, u8 b, u8 c, u8 d, u8 e, u8 f, bool8 g) { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g; return 0; }
-void ScanlineEffect_SetParams(struct ScanlineEffectParams p) { (void)p; }
+/* The host can't run the per-HBlank DMA, but DoMementoShadowEffect still fills
+ * gScanlineEffectRegBuffers every frame; the renderer reads that buffer to
+ * reconstruct the vertical stretch. We mark the effect ACTIVE here (and pin
+ * srcBuffer 0, the buffer DoMementoShadowEffect indexes) so the renderer can
+ * tell a Memento-style shadow (scanline stretch running) from a plain monbg
+ * freeze (Mimic, no scanline). */
+void ScanlineEffect_SetParams(struct ScanlineEffectParams p)
+{
+    gScanlineEffect.state = 1;
+    gScanlineEffect.srcBuffer = 0;
+    gHostScanWide = (p.dmaControl == (u32)SCANLINE_EFFECT_DMACNT_32BIT) ? 1 : 0;
+    /* dmaDest is &REG_BGnHOFS/VOFS — the BG layer + axis this effect scrolls per
+     * scanline. Never dereferenced; compared as a constant. VOFS = vertical
+     * (Memento soul-shadow stretch); HOFS = horizontal (Extrasensory psychic-BG
+     * warp). The renderer uses (layer, axis) to apply the right distortion. */
+    if (p.dmaDest == (volatile void *)REG_ADDR_BG1VOFS)      { gHostShadowLayer = 1; gHostScanAxis = 2; }
+    else if (p.dmaDest == (volatile void *)REG_ADDR_BG2VOFS) { gHostShadowLayer = 2; gHostScanAxis = 2; }
+    else if (p.dmaDest == (volatile void *)REG_ADDR_BG1HOFS) { gHostShadowLayer = 1; gHostScanAxis = 1; }
+    else if (p.dmaDest == (volatile void *)REG_ADDR_BG2HOFS) { gHostShadowLayer = 2; gHostScanAxis = 1; }
+    /* Per-scanline BLDALPHA (Surf's wave: a rising band of per-row alpha over the
+     * scene). The buffer holds BLDALPHA_BLEND(eva,evb) per row; the renderer draws
+     * the anim BG at each row's eva/16 opacity. */
+    else if (p.dmaDest == (volatile void *)REG_ADDR_BLDALPHA) { gHostShadowLayer = 0; gHostScanAxis = 3; }
+    else                                                     { gHostShadowLayer = 0; gHostScanAxis = 0; }
+}
+
+/* Read-outs for the driver's shadow exports (kept here where the globals + the
+ * ScanlineEffect struct live, so driver.c needs no struct layout). */
+int HostScanlineSrcBufAddr(void) { return (int)(intptr_t)&gScanlineEffectRegBuffers[gScanlineEffect.srcBuffer & 1][0]; }
+int HostScanlineState(void)      { return gScanlineEffect.state; }
+int HostShadowLayer(void)        { return gHostShadowLayer; }
+int HostScanAxis(void)           { return gHostScanAxis; }
+int HostScanWide(void)           { return gHostScanWide; }
+int HostWin0H(void)              { return gBattle_WIN0H; }
 void ScanlineEffect_Stop(void) {}
 
 /* SmokescreenImpact is real (battle_anim_smokescreen.c is compiled). */
@@ -450,8 +601,25 @@ void SpriteCB_SetInvisible(struct Sprite *s) { if (s) s->invisible = TRUE; }
  * full-size + untransformed (so Mimic's frozen target doesn't shrink). */
 void MoveBattlerSpriteToBG(u8 battlerId, u8 toBG_2)
 {
-    (void)battlerId;
-    (void)toBG_2;
+    /* The real copy does hardware VRAM fills that fault under wasm. We DON'T copy
+     * tiles — the renderer draws the mon's pic as the ghost. But we DO replicate
+     * the scroll-register math, because the shadow tasks read gBattle_BGn_Y right
+     * after this (as data[10], the neutral scanline value), and we record which
+     * BG layer + that base scroll so the renderer can place the ghost. We do NOT
+     * touch sprite->invisible: the real code hides the sprite then
+     * AnimTask_InitMementoShadow re-shows it; leaving it visible avoids hiding
+     * mons in untested monbg callers — the shadow draws as an ADDITIONAL ghost. */
+    u8 sid;
+    s16 baseX, baseY;
+    if (battlerId >= 4)
+        return;
+    sid = gBattlerSpriteIds[battlerId];
+    baseX = (s16)(-(gSprites[sid].x + gSprites[sid].x2) + 0x20);
+    baseY = (s16)(-(gSprites[sid].y + gSprites[sid].y2) + 0x20);
+    if (!toBG_2) { gBattle_BG1_X = baseX; gBattle_BG1_Y = baseY; }
+    else         { gBattle_BG2_X = baseX; gBattle_BG2_Y = baseY; }
+    gHostMonBg[battlerId] = toBG_2 ? 2 : 1;
+    gHostMonBgBaseY[battlerId] = baseY;
 }
 
 /* --- ABI-correct RunAffineAnimFromTaskData ---------------------------------

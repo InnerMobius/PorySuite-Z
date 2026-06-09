@@ -2,7 +2,7 @@ import os
 
 APP_NAME = "PorySuite"
 APP_DISPLAY_NAME = "PorySuite-Z"
-VERSION = "0.1.15b"
+VERSION = "0.1.2b"
 AUTHOR = "InnerMobius"
 
 # Root directory of the application (where app.py / app_info.py live)

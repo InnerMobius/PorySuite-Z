@@ -57,6 +57,9 @@ class SoundEditorTab(QWidget):
     # Signal emitted from render thread to safely trigger playback on main thread
     _render_done = pyqtSignal()
     _render_failed = pyqtSignal(str)
+    # Emitted (from the prepare_se bg thread) when an SE's PCM is cached, so an
+    # on-demand audition can play it on the UI thread the moment it's ready.
+    _se_ready = pyqtSignal(str)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -83,6 +86,8 @@ class SoundEditorTab(QWidget):
         self._se_player = None            # ONE reused player (one stream at a time)
         self._se_rendering: set = set()   # constants whose bg render is in flight
         self._se_lock = threading.Lock()  # serializes bg sample-load/parse/render
+        self._se_pending_play = None      # SE to auto-play once its render lands
+        self._se_ready.connect(self._on_se_ready)
 
         self._build_ui()
         self._playback_timer = QTimer(self)
@@ -1601,8 +1606,31 @@ class SoundEditorTab(QWidget):
                 pcm = None
             self._se_pcm_cache[constant] = pcm
             self._se_rendering.discard(constant)
+            # Tell the UI thread it's ready (an on-demand audition may be waiting).
+            self._se_ready.emit(constant)
 
         threading.Thread(target=_bg, daemon=True).start()
+
+    def _on_se_ready(self, constant: str) -> None:
+        """An SE finished rendering (UI thread). If an on-demand audition was
+        waiting for it, play it now."""
+        if constant and constant == self._se_pending_play:
+            self._se_pending_play = None
+            self.play_se_fast(constant)
+
+    def play_se_ondemand(self, constant: str) -> bool:
+        """Audition an SE on demand (the timeline's ▶ Sound button / EVENTide-style
+        playback): play instantly if cached, else render in the background and play
+        it the moment it's ready. Render NEVER runs on the UI thread. Returns True
+        if it played immediately. Unlike play_se_fast (cache-only, for the rapid
+        move playback), this one does NOT drop the first, uncached fire."""
+        if not constant:
+            return False
+        if self.play_se_fast(constant):     # cached → played now
+            self._se_pending_play = None
+            return True
+        self._se_pending_play = constant    # not cached: play_se_fast kicked the
+        return False                        # render; _on_se_ready plays it when done
 
     def play_se_fast(self, constant: str) -> bool:
         """Play an SE for the Battle Anims preview from the CACHED PCM (instant,
