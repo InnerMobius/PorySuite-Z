@@ -52,6 +52,7 @@ class TrackRow(QFrame):
     solo_toggled = pyqtSignal(int, bool)   # track_index, soloed
     volume_changed = pyqtSignal(int, int)  # track_index, volume (0-127)
     pan_changed = pyqtSignal(int, int)     # track_index, pan (0-127, 64=center)
+    modulation_changed = pyqtSignal(int, int)  # track_index, modulation depth (0-127, 0=off)
     instrument_changed = pyqtSignal(int, int)  # track_index, new voice slot
     selected = pyqtSignal(int)             # track_index — user clicked this row
 
@@ -180,6 +181,33 @@ class TrackRow(QFrame):
         pan_row.addWidget(self._pan_label)
         layout.addLayout(pan_row)
 
+        # ── Row 6: Vibrato (modulation / MOD) slider ──
+        # Imported MIDIs often carry a leftover modulation depth that makes the
+        # track wobble regardless of the instrument. This exposes M4A's MOD so
+        # the user can turn it down (0 = no vibrato).
+        mod_row = QHBoxLayout()
+        mod_row.addWidget(QLabel("Vib"))
+        mod_row.itemAt(0).widget().setStyleSheet("font-size: 9px; color: #888;")
+        self._mod_slider = QSlider(Qt.Orientation.Horizontal)
+        install_scroll_guard(self._mod_slider)
+        self._mod_slider.setRange(0, 127)
+        self._mod_slider.setValue(track_info.get('modulation', 0))
+        self._mod_slider.setFixedHeight(16)
+        self._mod_slider.setToolTip(
+            "Vibrato / modulation depth (M4A MOD). 0 = off.\n"
+            "Imported MIDIs often leave this on, which makes the track wobble\n"
+            "no matter the instrument — drag to 0 to remove it.")
+        self._mod_slider.valueChanged.connect(
+            lambda v: self.modulation_changed.emit(self._index, v))
+        mod_row.addWidget(self._mod_slider, 1)
+        self._mod_label = QLabel(str(track_info.get('modulation', 0)))
+        self._mod_label.setFixedWidth(24)
+        self._mod_label.setStyleSheet("font-size: 9px; color: #888;")
+        self._mod_slider.valueChanged.connect(
+            lambda v: self._mod_label.setText(str(v)))
+        mod_row.addWidget(self._mod_label)
+        layout.addLayout(mod_row)
+
     def _pan_text(self, v: int) -> str:
         if v < 60:
             return f"L{64 - v}"
@@ -257,6 +285,7 @@ class TrackSidebar(QWidget):
     track_soloed = pyqtSignal(int, bool)
     track_volume = pyqtSignal(int, int)
     track_pan = pyqtSignal(int, int)
+    track_modulation = pyqtSignal(int, int)  # track_index, modulation depth (0-127)
     track_instrument = pyqtSignal(int, int)  # track_index, voice slot
     track_added = pyqtSignal()
     track_removed = pyqtSignal(int)          # track index
@@ -446,6 +475,7 @@ class TrackSidebar(QWidget):
             row.solo_toggled.connect(self.track_soloed.emit)
             row.volume_changed.connect(self.track_volume.emit)
             row.pan_changed.connect(self.track_pan.emit)
+            row.modulation_changed.connect(self.track_modulation.emit)
             row.instrument_changed.connect(self.track_instrument.emit)
             # Insert before the stretch
             self._scroll_layout.insertWidget(
@@ -568,6 +598,7 @@ def extract_track_infos(song_data, vg_data=None) -> list[dict]:
             'instrument_name': '',
             'volume': 100,
             'pan': 64,
+            'modulation': 0,
             'note_count': 0,
         }
 
@@ -577,6 +608,7 @@ def extract_track_infos(song_data, vg_data=None) -> list[dict]:
         got_voice = False
         got_vol = False
         got_pan = False
+        got_mod = False
         for cmd in track.commands:
             if cmd.cmd == 'VOICE' and cmd.value is not None and not got_voice:
                 info['instrument'] = cmd.value
@@ -587,8 +619,11 @@ def extract_track_infos(song_data, vg_data=None) -> list[dict]:
             elif cmd.cmd == 'PAN' and cmd.value is not None and not got_pan:
                 info['pan'] = cmd.value
                 got_pan = True
+            elif cmd.cmd == 'MOD' and cmd.value is not None and not got_mod:
+                info['modulation'] = cmd.value
+                got_mod = True
             # Stop scanning once we have all setup values
-            if got_voice and got_vol and got_pan:
+            if got_voice and got_vol and got_pan and got_mod:
                 break
 
         # Count all notes (including TIE-based sustained notes)

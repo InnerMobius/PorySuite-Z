@@ -449,6 +449,9 @@ class BattleScenePreview(QWidget):
         self._mon_shake = (0, 0)        # both-mon offset px (sprite-layer gSpriteCoordOffset shake)
         self._mwin = None               # (pix, which, sx, sy, alpha): a scrolling BG
         #   clipped to a mon's silhouette + drawn IN FRONT (Stats Change arrows — the GBA OBJ-window)
+        self._screen_tint = None        # (rgb, coeff 1..16): full-screen tint/brighten
+        self._screen_invert = False     # full-screen colour inversion (InvertScreenColor)
+        #   overlay — Morning Sun's white flash, Eruption's red tint (engine scene blend)
 
         # Optional battle-animation sprite overlay (used by the Battle
         # Anims tab; the Pokemon Graphics tab leaves this None so its
@@ -755,6 +758,30 @@ class BattleScenePreview(QWidget):
                       if pix is not None and not pix.isNull() else None)
         self.update()
 
+    def set_screen_tint(self, color_bgr555: int = 0, coeff: int = 0) -> None:
+        """Full-screen tint/brighten OVERLAY drawn over the whole scene — the
+        engine's dominant scene palette blend (Morning Sun's white flash that
+        brightens the screen, Eruption's red tint). ``coeff`` 0 clears."""
+        c = max(0, min(16, int(coeff)))
+        if c <= 0:
+            self._screen_tint = None
+        else:
+            v = int(color_bgr555) & 0xFFFF
+            r = (v & 31) << 3
+            g = ((v >> 5) & 31) << 3
+            b = ((v >> 10) & 31) << 3
+            self._screen_tint = ((r | r >> 5, g | g >> 5, b | b >> 5), c)
+        self.update()
+
+    def set_screen_invert(self, on: bool) -> None:
+        """Full-screen colour INVERSION (AnimTask_InvertScreenColor → InvertPlttBuffer)
+        — a true negative-colour flash. Rendered as a white difference-blend so it
+        inverts the actual scene instead of faking a tint colour."""
+        on = bool(on)
+        if getattr(self, "_screen_invert", False) != on:
+            self._screen_invert = on
+            self.update()
+
     @staticmethod
     def _mosaic_pixmap(pix, level):
         """GBA MOSAIC: each (level+1)x(level+1) block shows one source pixel —
@@ -778,6 +805,8 @@ class BattleScenePreview(QWidget):
         self._bg_shake = (0, 0)
         self._mon_shake = (0, 0)
         self._mwin = None
+        self._screen_tint = None
+        self._screen_invert = False
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
                    or self._back_fx != (0, 0, 1.0, 1.0)
                    or not self._front_visible or not self._back_visible
@@ -1280,6 +1309,23 @@ class BattleScenePreview(QWidget):
             ax = (self._anim_cx - aw // 2) * s
             ay = (self._anim_cy - ah // 2) * s
             p.drawPixmap(ax, ay, aw * s, ah * s, self._anim_pix)
+
+        # Full-screen tint/brighten OVERLAY over the whole SCENE — Morning Sun's
+        # white flash that brightens the screen, Eruption's red tint. Drawn over
+        # the bg + mons + effect sprites but UNDER the textbox (so the message
+        # stays readable). Alpha = the engine's blend coefficient.
+        if self._screen_tint is not None:
+            (_tr, _tg, _tb), _tc = self._screen_tint
+            p.fillRect(0, 0, self.CANVAS_W * s, self.CANVAS_H * s,
+                       QColor(_tr, _tg, _tb, int(255 * _tc / 16)))
+
+        # Full-screen colour INVERSION (InvertScreenColor) — a white difference-blend
+        # negates the scene's colours (true inversion, not a fake tint). Over the
+        # scene, under the textbox, same as the tint.
+        if getattr(self, "_screen_invert", False):
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Difference)
+            p.fillRect(0, 0, self.CANVAS_W * s, self.CANVAS_H * s, QColor(255, 255, 255))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
         # Textbox overlay at the bottom
         if self._textbox and not self._textbox.isNull():

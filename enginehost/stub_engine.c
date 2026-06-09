@@ -242,6 +242,13 @@ u32 GetMonData2(struct Pokemon *mon, s32 field)
  * opaque. Recorded here because SetGpuReg is otherwise a no-op. */
 u8 gHostBldEva = 16;
 
+/* BLDCNT (REG_OFFSET_BLDCNT): bits 0-5 = TGT1 (top blend layer: bit0 BG0 … bit3
+ * BG3, bit4 OBJ, bit5 BD), bits 6-7 = effect (1 = alpha blend). Morning Sun makes
+ * BG1 the blend top and ramps EVA to fade the light-beam BG in/out — so the
+ * renderer must know the anim BG is itself a blend target to alpha-fade it (the
+ * engine already fades blend-mode SPRITES, but not a blended BG layer). */
+u16 gHostBldCnt = 0;
+
 /* ── BG-mon-copy state (Memento / Role Play "soul shadow") ───────────────────
  * MoveBattlerSpriteToBG copies a battler's mon onto a BG layer; the shadow tasks
  * then blacken it (FillPalette RGB_BLACK), stretch it via a per-scanline VOFS
@@ -281,6 +288,8 @@ void SetGpuReg(u8 r, u16 v)
 {
     if (r == 0x52)               /* REG_OFFSET_BLDALPHA: low 5 bits = EVA */
         gHostBldEva = (v & 0x1F);
+    else if (r == 0x50)          /* REG_OFFSET_BLDCNT: TGT1 (bits 0-5) + effect (6-7) */
+        gHostBldCnt = v;
     else if (r == 0x4c)          /* REG_OFFSET_MOSAIC: low byte = BG mosaic (H|V<<4) */
         gHostMosaic = (v & 0xFF);
 }

@@ -256,6 +256,8 @@ class AnimEngine:
                       bg_pal_slot: Optional[int] = None,
                       monfx_out: Optional[list] = None,
                       coord_offset_out: Optional[list] = None,
+                      screenblend_out: Optional[list] = None,
+                      bg_blend_out: Optional[list] = None,
                       single_battler: bool = False) -> List[List[dict]]:
         """Run a whole move and return one OAM snapshot per GBA frame, RESILIENT
         to a single sprite/task whose creation traps the host engine.
@@ -275,8 +277,8 @@ class AnimEngine:
         self._last_bg_screen_size = -1   # engine reveals the anim-BG SCREEN_SIZE
         best = None   # (score, frames, sounds, bg, bg2, shadow, bgpal, monfx, bg3, coordoff)
         for _attempt in range(8):
-            s_tmp, b_tmp, b2_tmp, sh_tmp, bp_tmp, mf_tmp, b3_tmp, co_tmp = \
-                [], [], [], [], [], [], [], []
+            s_tmp, b_tmp, b2_tmp, sh_tmp, bp_tmp, mf_tmp, b3_tmp, co_tmp, sb_tmp, bb_tmp = \
+                [], [], [], [], [], [], [], [], [], []
             frames, trapped = self._play_once(
                 ops, attacker_is_player, max_frames, wait_cap,
                 s_tmp if sounds_out is not None else None,
@@ -290,16 +292,18 @@ class AnimEngine:
                 mf_tmp if monfx_out is not None else None,
                 b3_tmp if bg3scroll_out is not None else None,
                 co_tmp if coord_offset_out is not None else None,
+                sb_tmp if screenblend_out is not None else None,
+                bb_tmp if bg_blend_out is not None else None,
                 single_battler)
             score = self._content_score(frames)
             if best is None or score > best[0]:
                 best = (score, frames, s_tmp, b_tmp, b2_tmp, sh_tmp, bp_tmp,
-                        mf_tmp, b3_tmp, co_tmp)
+                        mf_tmp, b3_tmp, co_tmp, sb_tmp, bb_tmp)
             if trapped is None:
                 break
             banned.add(trapped)                   # skip the trapping item, replay
         if best is None:
-            best = (0, [], [], [], [], [], [], [], [], [])
+            best = (0, [], [], [], [], [], [], [], [], [], [], [])
         if sounds_out is not None:
             sounds_out[:] = best[2]
         if bgscroll_out is not None:
@@ -316,6 +320,10 @@ class AnimEngine:
             bg3scroll_out[:] = best[8]
         if coord_offset_out is not None:
             coord_offset_out[:] = best[9]
+        if screenblend_out is not None:
+            screenblend_out[:] = best[10]
+        if bg_blend_out is not None:
+            bg_blend_out[:] = best[11]
         return best[1]
 
     @staticmethod
@@ -335,7 +343,8 @@ class AnimEngine:
     def _play_once(self, ops, attacker_is_player, max_frames, wait_cap,
                    sounds_out, bgscroll_out, bg2scroll_out, shadow_out,
                    bg_palette, bg_pal_out, bg_pal_slot, banned, monfx_out=None,
-                   bg3scroll_out=None, coord_offset_out=None, single_battler=False):
+                   bg3scroll_out=None, coord_offset_out=None,
+                   screenblend_out=None, bg_blend_out=None, single_battler=False):
         """One playthrough. Returns (frames, trapped_item): trapped_item is the
         template/func name whose CREATION trapped (so the caller can ban + replay)
         or None if the run finished without a creation trap."""
@@ -421,6 +430,23 @@ class AnimEngine:
                         coord_offset_out.append(((v >> 16) & 0xFFFF, v & 0xFFFF))
                     except Exception:
                         coord_offset_out.append((0, 0))
+                if screenblend_out is not None and not dead[0]:
+                    # Screen-wide tint/brighten overlay (Morning Sun's white flash,
+                    # Eruption's red tint): the dominant palette blend across the
+                    # scene slots, packed (coeff<<24)|BGR555. 0 = no screen flash.
+                    try:
+                        screenblend_out.append(ex["engine_screen_blend"](store))
+                    except Exception:
+                        screenblend_out.append(0)
+                if bg_blend_out is not None and not dead[0]:
+                    # BG-layer alpha-blend state: Morning Sun's light-beam BG fades
+                    # via BLDALPHA EVA while BG1 is the blend top layer. Packed
+                    # (EVA) | (BLDCNT TGT1 mask << 8) | (effect << 16) — lets the
+                    # renderer alpha-fade a blended anim BG, not just BLEND sprites.
+                    try:
+                        bg_blend_out.append(ex["engine_bg_blend"](store))
+                    except Exception:
+                        bg_blend_out.append(0)
                 if shadow_out is not None and not dead[0]:
                     # Memento soul-shadow: per-frame scanline-effect state. Only
                     # read the 160-row stretch buffer when a stretch is running
@@ -468,14 +494,53 @@ class AnimEngine:
             r = _safe(ex["engine_busy"])
             return 0 if r is None else r
 
+        _had_effect_sprite = [False]
+        _sprite_age = {}            # sprite id -> frame index first seen (this play)
+
         def _sig(fr):
-            # Visual signature of a frame: every sprite's render pos / frame /
-            # flip / scale / visibility. Identical sig across frames == nothing
-            # is moving.
-            return tuple(
-                (s["id"], s["x"] + s["x2"], s["y"] + s["y2"], s["tileNum"],
-                 s["hFlip"], s["vFlip"], s["invisible"], s["mA"], s["mD"])
-                for s in fr)
+            # Visual signature of a frame: each VISIBLE, ON-SCREEN sprite's render
+            # pos / frame / flip / scale. Identical sig across frames == settled.
+            # Excludes: invisible sprites; sprites drifted off-screen (Bubble's risen
+            # bubbles / flown-off projectiles — gone visually, their OAM drift must
+            # not pin the cap); and effect sprites still alive after ~2.5s, which are
+            # stuck crawlers whose callback never self-destructed (Bubble's lingering
+            # pop bubble) — their slow creep otherwise runs the move to the 600 cap.
+            fidx = len(frames)
+            rows = []
+            for s in fr:
+                if s["invisible"]:
+                    continue
+                x = s["x"] + s["x2"]
+                y = s["y"] + s["y2"]
+                if not (-32 <= x <= 272 and -32 <= y <= 192):
+                    continue
+                sid = s["id"]
+                _sprite_age.setdefault(sid, fidx)
+                if s.get("isMon", -1) == -1 and (fidx - _sprite_age[sid]) > 150:
+                    continue
+                rows.append((sid, x, y, s["tileNum"],
+                             s["hFlip"], s["vFlip"], s["mA"], s["mD"]))
+            sprites = tuple(rows)
+            # Once a move has shown an EFFECT sprite (drill, beam, …), the SPRITE
+            # settle governs — residual BG wiggle after the sprites stop must not
+            # keep it spinning to the cap (Horn Drill blew up to 600 frames).
+            if any(s.get("isMon", -1) == -1 and not s.get("invisible")
+                   and s.get("objMode", 0) != 2 for s in fr):
+                _had_effect_sprite[0] = True
+            if _had_effect_sprite[0]:
+                return (sprites, ())
+            # PURE-BG move (Surf's sweeping wave = BG scroll + scanline, NO effect
+            # sprites): fold the BG state into the signature so it isn't judged
+            # "settled" while the wave is still sweeping — otherwise it gets cut
+            # before the recede/fade ("ends too soon, no fade").
+            bg = []
+            for _lst in (bgscroll_out, bg2scroll_out, bg3scroll_out):
+                if _lst:
+                    bg.append(_lst[-1])
+            if shadow_out and shadow_out[-1]:
+                _sd = shadow_out[-1]
+                bg.append((_sd.get("state", 0), _sd.get("axis", 0)))
+            return (sprites, tuple(bg))
 
         _SETTLED = 30   # frames of zero visual change == animation has settled
 

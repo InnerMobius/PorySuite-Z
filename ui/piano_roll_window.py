@@ -210,6 +210,7 @@ class PianoRollWindow(QMainWindow):
         self._track_sidebar.track_instrument.connect(self._on_track_instrument)
         self._track_sidebar.track_volume.connect(self._on_track_volume)
         self._track_sidebar.track_pan.connect(self._on_track_pan)
+        self._track_sidebar.track_modulation.connect(self._on_track_modulation)
         self._track_sidebar.track_added.connect(self._on_add_track)
         self._track_sidebar.track_removed.connect(self._on_remove_track)
         self._track_sidebar.track_duplicated.connect(self._on_duplicate_track)
@@ -749,6 +750,33 @@ class PianoRollWindow(QMainWindow):
                 self._sequencer.set_track_instrument(track_index, voice_slot)
             self._mark_dirty()
 
+    def _on_track_modulation(self, track_index: int, depth: int):
+        """User changed a track's vibrato/modulation (MOD) slider.
+
+        Imported MIDIs often carry a leftover MOD depth that makes the track
+        wobble regardless of the instrument. Set EVERY MOD event on the track to
+        the slider value (0 = remove the vibrato) — like the volume slider,
+        bumping all of them so a mid-track modulation envelope can't reintroduce
+        the wobble. Only ADD a MOD event when depth > 0 (no point writing MOD 0
+        into a track that never modulated).
+        """
+        if not (0 <= track_index < len(self._song.tracks)):
+            return
+        track = self._song.tracks[track_index]
+        found_any = False
+        for cmd in track.commands:
+            if cmd.cmd == 'MOD':
+                cmd.value = depth
+                found_any = True
+        if not found_any and depth > 0:
+            from core.sound.song_parser import TrackCommand
+            track.commands.insert(0, TrackCommand(
+                cmd='MOD', tick=0, value=depth, raw_line=''))
+        if self._sequencer is not None and hasattr(
+                self._sequencer, 'set_track_modulation'):
+            self._sequencer.set_track_modulation(track_index, depth)
+        self._mark_dirty()
+
     def _on_track_volume(self, track_index: int, volume: int):
         """User changed a track's volume slider."""
         if self._sequencer is not None:
@@ -1021,6 +1049,7 @@ class PianoRollWindow(QMainWindow):
             voice = ts.voice if ts else 0
             volume = ts.volume if ts else 100
             pan = ts.pan if ts else 64
+            modulation = ts.modulation if ts else 0
 
             # Use the ORIGINAL commands from when the song was loaded,
             # not the current (potentially already-synced) commands.
@@ -1106,6 +1135,7 @@ class PianoRollWindow(QMainWindow):
                 loop_label=track_loop_label,
                 original_commands=orig_cmds,
                 tempo=live_tempo,
+                modulation=modulation,
             )
 
     def has_unsaved_changes(self) -> bool:

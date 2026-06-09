@@ -37,6 +37,8 @@ import os
 import re
 from typing import List, Optional, Tuple
 
+from core.tilemap_data import write_pal_from_gbapal
+
 # Tag namespace map (cross-referenced with BUGS.md's reserved-tag list):
 #   0x1100–0x111F   vanilla OBJ_EVENT_PAL_TAG_*
 #   0x1120–0x11FE   engine-refactor reserved (EMOTICONS lives here)
@@ -511,6 +513,12 @@ def apply(project_root: str) -> Tuple[bool, List[str], List[str]]:
     gbapal_path = os.path.join(project_root, GBAPAL_REL)
     if _bake_gbapal_from_png(png_path, gbapal_path):
         applied.append(f"Baked {GBAPAL_REL} from emoticons.png")
+        # Also write the committable JASC .pal source. The .gbapal is a git-
+        # ignored build artefact; without a .pal the palette is dropped on a
+        # fresh clone and the build breaks. The build regenerates the .gbapal.
+        pal_rel = os.path.splitext(GBAPAL_REL)[0] + ".pal"
+        if write_pal_from_gbapal(gbapal_path, os.path.splitext(gbapal_path)[0] + ".pal"):
+            applied.append(f"Wrote {pal_rel} source")
     else:
         failed.append(
             "Could not bake emoticons.gbapal — PNG missing or not indexed"

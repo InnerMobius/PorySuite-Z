@@ -673,24 +673,6 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
     _keys = list(scripts.keys())
     _next = {_keys[i]: _keys[i + 1] for i in range(len(_keys) - 1)}
 
-    def _has_bg(lbl: str, seen: frozenset) -> bool:
-        """Does this branch (following its calls/gotos) load a battle BACKGROUND?
-        Lets choosetwoturnanim prefer the branch that shows a bg (Sky Attack's
-        unleash = SetSkyBg; its setup has none)."""
-        if lbl in seen or lbl not in scripts:
-            return False
-        seen2 = seen | {lbl}
-        for cmd in scripts[lbl]:
-            if cmd.name in ("fadetobg", "changebg", "fadetobgfromset"):
-                return True
-            if cmd.name == "call" and cmd.call_target and _has_bg(cmd.call_target, seen2):
-                return True
-            if cmd.name == "goto" and cmd.args and _has_bg(cmd.args[0], seen2):
-                return True
-            if cmd.name in ("end", "return"):
-                break
-        return False
-
     def _rest_has_content(cmds, start: int) -> bool:
         """Do the commands AFTER index ``start`` (the fall-through of a
         conditional jump) lead to real animation — a ``goto`` (to a main line) or
@@ -728,16 +710,12 @@ def resolve_timeline(scripts: Dict[str, List[Command]], label: str,
                 _walk(cmd.args[0], depth + 1, seen2)
                 return  # tail-jump: nothing after a goto runs
             elif cmd.name == "choosetwoturnanim" and cmd.args:
+                # Two-turn move: arg[0] is the SETUP (turn 1 — Sky Attack's
+                # charge), arg[1] the UNLEASH (turn 2 — the dive over the sliding
+                # sky bg). The variant picker drives branch_choice, so each shows
+                # its OWN animation; do NOT override the user's pick (that made
+                # setup render as unleash). branch_choice=0 → setup, 1 → unleash.
                 pick = cmd.args[min(branch_choice, len(cmd.args) - 1)]
-                # Prefer the branch that shows an animated BACKGROUND: for a two-
-                # turn move the 2nd branch is the unleash (Sky Attack's dive over
-                # the sliding SetSkyBg), the 1st is the charge with no bg. A move
-                # preview should show the bg branch. Moves whose branches both lack
-                # a bg (Dig, Fly, …) keep the default first branch.
-                if (branch_choice == 0 and len(cmd.args) >= 2
-                        and _has_bg(cmd.args[1], frozenset())
-                        and not _has_bg(cmd.args[0], frozenset())):
-                    pick = cmd.args[1]
                 _walk(pick, depth + 1, seen2)
                 return  # follow the chosen branch
             elif (cmd.name.startswith("jumparg")

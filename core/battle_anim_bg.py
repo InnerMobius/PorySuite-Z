@@ -200,8 +200,20 @@ def _task_body_chain(project_root: str, task: str, max_depth: int = 6) -> str:
 def _parse_task_bg(project_root: str, task: str) -> Optional[dict]:
     """{image, pal, tmap / tmap_player / tmap_opponent} of the SYMBOLS a task
     loads, or None if it loads no BG. Driven entirely by the task's source body
-    (and its state-machine steps — see ``_task_body_chain``)."""
-    key = (project_root, task)
+    (and its state-machine steps — see ``_task_body_chain``).
+
+    A ``task@N`` suffix selects the Nth palette the task loads — for a task whose
+    palette is chosen by ``gBattleAnimArgs[0]`` (``AnimTask_CreateSurfWave``: arg0=0
+    → Surf blue = pal 0, arg0=1 → Muddy Water brown = pal 1). N is clamped to the
+    palettes actually present, so it's a no-op for single-palette tasks."""
+    pal_idx = 0
+    if "@" in task:
+        task, _, _pi = task.partition("@")
+        try:
+            pal_idx = max(0, int(_pi))
+        except ValueError:
+            pal_idx = 0
+    key = (project_root, task, pal_idx)
     if key in _taskbg_cache:
         return _taskbg_cache[key]
     body = _task_body_chain(project_root, task)
@@ -211,7 +223,8 @@ def _parse_task_bg(project_root: str, task: str) -> Optional[dict]:
         tmaps = [t for t in _LOAD_TMAP.findall(body) if "Contest" not in t]
         pals = _LOAD_PAL.findall(body)
         if imgs and tmaps:
-            res = {"image": imgs[0], "pal": pals[0] if pals else None}
+            res = {"image": imgs[0],
+                   "pal": pals[min(pal_idx, len(pals) - 1)] if pals else None}
             tp = next((t for t in tmaps if "Player" in t), None)
             to = next((t for t in tmaps if "Opponent" in t), None)
             if tp or to:

@@ -386,6 +386,36 @@ int engine_snapshot(void)
     return n;
 }
 
+/* Screen-wide tint/brighten OVERLAY: the (color, coeff) shared by the MOST
+ * palette slots — a full-screen flash that the per-sprite tints don't cover.
+ * AnimTask_BlendBattleAnimPal ("blend all") whites the scene for Morning Sun;
+ * Eruption's BlendPalette reds the scene. Both blend the BG/scene palettes (NOT
+ * the mons), so they show up as many slots sharing one (coeff,color). A
+ * per-sprite tint touches only 1-2 slots, so require >=4 slots to treat it as a
+ * SCREEN flash. Returns (coeff<<24)|(BGR555 color), or 0 if none. */
+__attribute__((export_name("engine_screen_blend")))
+int engine_screen_blend(void)
+{
+    extern u8 gHostPalBlendCoeff[32];
+    extern u16 gHostPalBlendColor[32];
+    /* The screen flash blends the SCENE/backdrop palettes, which live in the BG
+     * palette slots (0..15). Per-sprite tints (hit flash, status) are OBJ slots
+     * (16..31), so scanning BG slots only keeps a per-sprite tint from triggering
+     * a full-screen overlay. A BG-palette CYCLE (Psychic's swirl) rotates colours
+     * rather than calling BlendPalette, so it sets no blend coeff and is ignored.
+     * Take the strongest BG-slot blend = the scene flash colour. */
+    int i, bestCol = 0, bestCoeff = 0;
+    for (i = 0; i < 16; i++) {
+        if (gHostPalBlendCoeff[i] > bestCoeff) {
+            bestCoeff = gHostPalBlendCoeff[i];
+            bestCol = gHostPalBlendColor[i];
+        }
+    }
+    if (bestCoeff <= 0)
+        return 0;
+    return ((bestCoeff & 0xFF) << 24) | (bestCol & 0xFFFF);
+}
+
 /* Subsprite pieces of a sprite (a multi-OAM sprite like the frozen ice cube):
  * fills sSubBuf with {x, y, shape, size, tileOffset} per piece and returns the
  * count. The renderer assembles each piece from the sprite's gfx (tileNum +
@@ -468,6 +498,23 @@ __attribute__((export_name("engine_coord_offset")))
 int engine_coord_offset(void)
 {
     return ((gSpriteCoordOffsetX & 0xFFFF) << 16) | (gSpriteCoordOffsetY & 0xFFFF);
+}
+
+/* BG-layer alpha-blend state, for fading a BLENDED background. Morning Sun's light
+ * beam is BG1 made the blend top layer (BLDCNT_TGT1_BG1 | BLDCNT_EFFECT_BLEND);
+ * the task ramps BLDALPHA EVA 0->12->0 to fade the beam in and out. The engine
+ * already fades blend-mode SPRITES, but a blended BG layer is rendered opaque — so
+ * expose the state and let the renderer alpha-fade the anim BG:
+ *   bits  0-4  = BLDALPHA EVA (0..16); blended BG opacity = EVA/16
+ *   bits  8-13 = BLDCNT TGT1 mask (bit0 BG0 .. bit3 BG3, bit4 OBJ, bit5 BD)
+ *   bits 16-17 = BLDCNT effect (1 = alpha blend) */
+__attribute__((export_name("engine_bg_blend")))
+int engine_bg_blend(void)
+{
+    extern u8 gHostBldEva;
+    extern u16 gHostBldCnt;
+    return (gHostBldEva & 0x1F) | ((gHostBldCnt & 0x3F) << 8)
+         | (((gHostBldCnt >> 6) & 3) << 16);
 }
 
 /* ── Memento soul-shadow read-outs ──────────────────────────────────────────

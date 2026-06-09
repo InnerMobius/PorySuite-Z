@@ -299,7 +299,12 @@ class BattleAnimTab(QWidget):
         self._play_flip_cache: Dict[str, List[QPixmap]] = {}   # H-flipped frames, baked once
         self._play_direction = "player"  # "player" = player attacks; "enemy" = enemy attacks
         self._play_timer = QTimer(self)
-        self._play_timer.setInterval(33)   # ~30 fps render (Remote-Desktop friendly)
+        # 60 fps render. _play_step advances sim-frames by ELAPSED TIME (not 1/tick),
+        # so playback stays true GBA speed even if a tick runs long; rendering every
+        # frame (not every 2nd) removes the choppy "half-speed" look of 60fps content
+        # shown at 30fps. Compositing is ~0.06 ms/frame and Qt coalesces paints, so
+        # this can't over-saturate Remote Desktop (it just paints as fast as RDP allows).
+        self._play_timer.setInterval(16)
         self._play_timer.timeout.connect(self._play_step)
         self._play_last_ms = 0.0           # wall-clock anchor for real-time pacing
         self._visual_wait = 0              # frames spent in a waitforvisualfinish
@@ -1085,9 +1090,14 @@ class BattleAnimTab(QWidget):
         if w <= 0 or h <= 0:
             return []
         # EXACT frame size from the sprite template's OAM, when resolved —
-        # slice the sheet into a row-major grid of fw×fh frames.
+        # slice the sheet into a row-major grid of fw×fh frames. The sheet height
+        # need NOT be an exact multiple of fh: some sheets carry a few px of
+        # padding past the last full frame (warm_rock.png is 32x168 = five 32x32
+        # frames + 8px). Slice every FULL frame that fits and ignore the remainder
+        # — requiring exact divisibility dumped the whole strip into one frame
+        # (Eruption's "garbage" rock).
         fw, fh = self._frame_sizes.get(sprite.tag, (0, 0))
-        if fw > 0 and fh > 0 and w % fw == 0 and h % fh == 0:
+        if fw > 0 and fh > 0 and w >= fw and h >= fh:
             cols, rows = w // fw, h // fh
             if cols * rows >= 1:
                 return [sheet.copy(c * fw, r * fh, fw, fh)
@@ -1854,13 +1864,20 @@ class BattleAnimTab(QWidget):
                     args = [self._arg_val(a) for a in vt.args]
                     ops.append({"op": "createvisualtask", "func": vt.addr,
                                 "args": args})
-                    # A cry sound task (Growl/Roar = PlayDoubleCry, Howl =
-                    # PlayCryWithEcho, Metal Sound = PlayCryHighPitch, …):
-                    # schedule the selected mon's cry. Every cry move plays the
-                    # ATTACKER's cry, so play that.
-                    if (vt.addr.startswith("SoundTask_Play")
-                            and "Cry" in vt.addr):
-                        ops.append({"op": "sound", "se": "__CRY__"})
+                    # Sound tasks (createvisualtask SoundTask_*) have no VISUAL in
+                    # the engine, but several still matter to the preview:
+                    #   • cry play (PlayDoubleCry / PlayCryHighPitch / …) → play the
+                    #     selected mon's cry (every cry move plays the ATTACKER's).
+                    #   • WaitForCry → the script PAUSES for the cry to finish; emit a
+                    #     representative delay so the animation's timing holds.
+                    #   • PlaySE#WithPanning → play that SE (its arg0).
+                    if vt.addr.startswith("SoundTask_"):
+                        if "WaitForCry" in vt.addr:
+                            ops.append({"op": "delay", "frames": 40})
+                        elif "Cry" in vt.addr:
+                            ops.append({"op": "sound", "se": "__CRY__"})
+                        elif "PlaySE" in vt.addr and vt.args:
+                            ops.append({"op": "sound", "se": str(vt.args[0])})
             elif c.name in ("monbg", "monbg_static") and c.args:
                 # Copy a battler's mon to a BG layer (Acid Armor / Dragon Dance /
                 # Mimic / wall moves). The engine sets gBattle_BGn_X + bgCopy so a
@@ -1875,11 +1892,14 @@ class BattleAnimTab(QWidget):
             elif getattr(c, "kind", None) == KIND_SOUND and c.args:
                 # Sound effect at this point in the timeline (playsewithpan etc).
                 ops.append({"op": "sound", "se": c.args[0]})
-                # waitplaysewithpan / waitplayse also WAIT (last arg = frames)
-                # before the script continues — emit that delay so timing holds.
+                # waitplaysewithpan / waitplayse also pause the script. Its last arg
+                # is a wait-FOR-THE-SOUND max timeout (Bubble passes 100), NOT a
+                # literal 100-frame visual hold — taking it literally fires Bubble's
+                # bubbles ~1.7s apart (a snail-pace trickle instead of a fast stream).
+                # Clamp it to a brief sound-length wait so the timing matches the game.
                 if c.name.startswith("waitplayse") and len(c.args) >= 2:
                     ops.append({"op": "delay",
-                                "frames": max(1, self._int_or(c.args[-1], 1))})
+                                "frames": min(10, max(1, self._int_or(c.args[-1], 1)))})
             elif c.name in ("waitforvisualfinish", "waitsound"):
                 ops.append({"op": "waitforvisualfinish"})
             elif c.name in ("end", "return"):
@@ -1897,7 +1917,25 @@ class BattleAnimTab(QWidget):
                 return c.args[0].strip()
             if (c.name == "createvisualtask" and c.args
                     and task_loads_bg(root, c.args[0])):
-                return "task:" + c.args[0]
+                bg = "task:" + c.args[0]
+                # Tasks whose BG PALETTE is chosen by gBattleAnimArgs[0] — Surf
+                # (arg0=0 → blue) vs Muddy Water (arg0=1 → brown) share one task.
+                # Carry that index so the right palette loads (no-op for tasks
+                # with a single palette — the index is clamped downstream).
+                if len(c.args) > 2:
+                    a0 = str(c.args[2]).strip().upper()
+                    if a0 == "TRUE":
+                        idx = 1
+                    elif a0 in ("FALSE", ""):
+                        idx = 0
+                    else:
+                        try:
+                            idx = int(a0, 0)
+                        except ValueError:
+                            idx = 0
+                    if idx > 0:
+                        bg += "@%d" % idx
+                return bg
         return None
 
     def _bg_palette_and_slot(self, bg_id: str):
@@ -1969,6 +2007,208 @@ class BattleAnimTab(QWidget):
             _log.exception("indexed BG assemble failed for %s", bg_id)
             return None
 
+    _RGB555 = {
+        "RGB_BLACK": 0x0000, "RGB_WHITE": 0x7FFF, "RGB_RED": 0x001F,
+        "RGB_GREEN": 0x03E0, "RGB_BLUE": 0x7C00, "RGB_YELLOW": 0x03FF,
+        "RGB_MAGENTA": 0x7C1F, "RGB_CYAN": 0x7FE0, "RGB_WHITEALPHA": 0x7FFF,
+    }
+
+    def _arg_int(self, v, default=0):
+        s = str(v).strip().upper()
+        if s == "TRUE":
+            return 1
+        if s in ("FALSE", ""):
+            return 0
+        try:
+            return int(s, 0)
+        except ValueError:
+            return default
+
+    def _resolve_rgb555(self, v):
+        """A move-script colour arg → BGR555. Handles RGB_WHITE/RED/… constants,
+        RGB(r,g,b) literals, and raw numbers; defaults to white."""
+        s = str(v).strip()
+        if s in self._RGB555:
+            return self._RGB555[s]
+        import re as _re
+        m = _re.match(r'RGB\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', s)
+        if m:
+            r, g, b = int(m.group(1)) & 31, int(m.group(2)) & 31, int(m.group(3)) & 31
+            return r | (g << 5) | (b << 10)
+        try:
+            return int(s, 0) & 0xFFFF
+        except ValueError:
+            return 0x7FFF
+
+    def _blend_is_screen(self, sel):
+        """A palette-blend selector that includes the BACKGROUND (a whole-screen
+        flash, not just a mon tint)."""
+        s = str(sel)
+        if "F_PAL_BG" in s:
+            return True
+        try:
+            return bool(int(s, 0) & 1)        # numeric selector with the BG bit
+        except ValueError:
+            return False
+
+    def _blend_target(self, sel, is_exclude):
+        """Where a palette blend lands: 'screen' (BG-inclusive → full-screen
+        overlay), 'attacker'/'target'/'both' (a mon tint), or None. An *Exclude
+        blend hits everything EXCEPT sel — BG excluded → the mons, else screen."""
+        s = str(sel)
+        if s == "SCREEN":          # hardware fade — always whole-screen
+            return "screen"
+        bg = self._blend_is_screen(s)
+        if is_exclude:
+            return "both" if bg else "screen"
+        if bg:
+            return "screen"
+        if "F_PAL_BATTLERS" in s:
+            return "both"
+        if "F_PAL_ATTACKER" in s or "F_PAL_ATK_SIDE" in s:
+            return "attacker"
+        if "F_PAL_TARGET" in s or "F_PAL_DEF_SIDE" in s:
+            return "target"
+        return None
+
+    def _parse_blends(self, timeline):
+        """Every palette-blend invocation in the move, mapped to its engine frame:
+        (start_frame, rate, start_coeff, end_coeff, color, selector, cycle, exclude).
+        cycle=True for AnimTask_BlendColorCycle (oscillates sc↔ec — a pulse), False
+        for a one-way ramp (BlendBattleAnimPal / *PaletteBlendSprite)."""
+        out = []
+        frame = 0
+        for cmd in timeline:
+            nm = cmd.name
+            a = cmd.args or []
+            if nm == "delay" and a:
+                frame += max(1, self._arg_int(a[0], 1))
+            elif nm == "createvisualtask" and a:
+                fn = str(a[0])
+                if "BlendColorCycle" in fn and len(a) > 7:
+                    # FN, prio, selector, delay, count, startCoeff, endCoeff, color
+                    out.append((frame, abs(self._arg_int(a[3])), self._arg_int(a[5]),
+                                self._arg_int(a[6]), self._resolve_rgb555(a[7]),
+                                str(a[2]), True, "Exclude" in fn))
+                elif (any(b in fn for b in ("BlendBattleAnimPal", "BlendParticle",
+                                            "SetCamouflageBlend")) and len(a) > 6):
+                    # FN, prio, selector, rate, startCoeff, endCoeff, color
+                    out.append((frame, abs(self._arg_int(a[3])), self._arg_int(a[4]),
+                                self._arg_int(a[5]), self._resolve_rgb555(a[6]),
+                                str(a[2]), False, "Exclude" in fn))
+                elif "HardwarePaletteFade" in fn and len(a) > 6:
+                    # BeginHardwarePaletteFade: sel, delay, startY, targetY, color —
+                    # a whole-screen hardware fade (usually toward black).
+                    out.append((frame, abs(self._arg_int(a[3])), self._arg_int(a[4]),
+                                self._arg_int(a[5]), self._resolve_rgb555(a[6]),
+                                "SCREEN", False, False))
+            elif (nm == "createsprite" and a
+                  and "PaletteBlendSprite" in str(a[0]) and len(a) > 7):
+                # TPL, battler, subpri, selector, rate, startCoeff, endCoeff, color
+                out.append((frame, abs(self._arg_int(a[4])), self._arg_int(a[5]),
+                            self._arg_int(a[6]), self._resolve_rgb555(a[7]),
+                            str(a[3]), False, False))
+        return out
+
+    def _coeff_at(self, f, sf, rate, sc, ec, cycle):
+        """Blend coefficient at frame f, replaying the GBA stepper: one step every
+        (rate+1) frames. A ramp goes sc→ec then holds; a cycle oscillates sc↔ec."""
+        if f < sf:
+            return 0
+        step = max(1, rate + 1)
+        n = (f - sf) // step
+        if cycle and sc != ec:
+            amp = abs(ec - sc)
+            pos = n % (amp * 2)
+            up = pos if pos <= amp else (amp * 2 - pos)
+            return sc + (up if ec > sc else -up)
+        if ec == sc:
+            return ec
+        c = sc + (n if ec > sc else -n)
+        lo, hi = (sc, ec) if ec > sc else (ec, sc)
+        return max(lo, min(hi, c))
+
+    def _synthesize_screen_blend(self, timeline, n_frames):
+        """Per-frame full-screen tint/brighten OVERLAY from the move's BG-inclusive
+        palette blends — the headless engine can't apply them (selection needs
+        battle state it lacks), so replay the coeff ramp/cycle from the script
+        args. Morning Sun white, Eruption red, Explosion white-out, etc. Returns
+        [(coeff<<24)|BGR555 per frame], or [] if the move has no screen blend."""
+        if n_frames <= 0:
+            return []
+        out = [0] * n_frames
+        any_screen = False
+        seen = False        # has a prior screen blend established a flash this move?
+        for (sf, rate, sc, ec, col, sel, cycle, excl) in self._parse_blends(timeline):
+            if self._blend_target(sel, excl) != "screen":
+                continue
+            # A standalone fade-OUT (startCoeff > endCoeff) with no preceding flash
+            # is CLEARING a backdrop the preview doesn't paint (Curse's stretching
+            # black bg) — not a flash. Rendering it would black the scene then clear.
+            # Skip it. A real flash fades IN first (and its later fade-out follows).
+            if not cycle and sc > ec and not seen:
+                continue
+            seen = True
+            any_screen = True
+            for f in range(max(0, sf), n_frames):     # later blend overwrites earlier
+                c = self._coeff_at(f, sf, rate, sc, ec, cycle)
+                out[f] = (((c & 0xFF) << 24) | (col & 0xFFFF)) if c > 0 else 0
+        return out if any_screen else []
+
+    def _synthesize_mon_tints(self, timeline, n_frames):
+        """Per-frame MON tint/glow from the move's mon-targeted palette blends —
+        the per-sprite class the engine can't apply: Self-Destruct's red attacker
+        flash, Swords Dance / Growth / Outrage glows (BlendColorCycle), etc.
+        Returns (front_list, back_list) of (coeff<<24)|BGR555, or ([], []) if none."""
+        if n_frames <= 0:
+            return [], []
+        atk = "back" if self._play_direction == "player" else "front"
+        dfn = "front" if self._play_direction == "player" else "back"
+        front = [0] * n_frames
+        back = [0] * n_frames
+        lists = {"front": front, "back": back}
+        any_mon = False
+        for (sf, rate, sc, ec, col, sel, cycle, excl) in self._parse_blends(timeline):
+            sides = {"attacker": [atk], "target": [dfn],
+                     "both": ["front", "back"]}.get(self._blend_target(sel, excl))
+            if not sides:
+                continue
+            any_mon = True
+            for side in sides:
+                L = lists[side]
+                for f in range(max(0, sf), n_frames):
+                    c = self._coeff_at(f, sf, rate, sc, ec, cycle)
+                    L[f] = (((c & 0xFF) << 24) | (col & 0xFFFF)) if c > 0 else 0
+        return (front, back) if any_mon else ([], [])
+
+    def _synthesize_screen_invert(self, timeline, n_frames):
+        """Per-frame screen-inversion flag for AnimTask_InvertScreenColor. Each call
+        TOGGLES the inversion (it runs InvertPlttBuffer, which negates the current
+        palette), so the screen is inverted between an odd and the next even call.
+        Returns [bool per frame], or [] if the move never inverts."""
+        if n_frames <= 0:
+            return []
+        toggles = []
+        frame = 0
+        for cmd in timeline:
+            a = cmd.args or []
+            if cmd.name == "delay" and a:
+                frame += max(1, self._arg_int(a[0], 1))
+            elif (cmd.name == "createvisualtask" and a
+                  and "InvertScreenColor" in str(a[0])):
+                toggles.append(frame)
+        if not toggles:
+            return []
+        out = [False] * n_frames
+        state = False
+        ti = 0
+        for f in range(n_frames):
+            while ti < len(toggles) and toggles[ti] <= f:
+                state = not state
+                ti += 1
+            out[f] = state
+        return out
+
     def _anim_bg_scroll_layer(self):
         """The per-frame (x,y) scroll list the anim background actually RIDES — the
         BG layer that MOVES most across the move (Surf rides BG1; Seismic Toss /
@@ -2010,6 +2250,15 @@ class BattleAnimTab(QWidget):
         else:
             sx, sy = 0, 0
         pix = self._engine_bg_pix
+        # A NON-scrolling BG with a CONSTANT non-zero offset isn't scrolling — it's
+        # POSITIONED (the dark bg sets BG1_X = -(target mon x)+0x20 to align a mon
+        # copy we don't render). Tiling a screen-width (≤256) backdrop at that
+        # offset wraps it and shows a seam — Crunch's "split in 2". Draw it
+        # un-offset so the backdrop fills the screen seamlessly. Scrolling BGs
+        # (Surf's wave — offset varies) and wide BGs (>256) keep their scroll.
+        if (pix is not None and pix.width() <= 256 and scroll
+                and len(set(scroll)) == 1 and scroll[0] != (0, 0)):
+            sx, sy = 0, 0
         # Re-colour the indexed BG with the engine's LIVE palette this frame —
         # whatever the move's tasks did to it (psychic swirl, white-flash, a custom
         # task). Cached by palette state (a rotation only cycles ~11 states).
@@ -2036,12 +2285,21 @@ class BattleAnimTab(QWidget):
         frame = (self._engine_frames[idx]
                  if 0 <= idx < len(getattr(self, "_engine_frames", []) or []) else [])
         ow = next((s for s in frame if s.get("objMode", 0) == 2), None)
-        if ow is not None:
-            owx = ow.get("x", 0) + ow.get("x2", 0)
-            which = ("back" if abs(owx - P.PLAYER_CX) <= abs(owx - P.ENEMY_CX)
-                     else "front")
-            P.set_anim_bg(None)
-            P.set_mon_window_bg(pix, which, sx, sy)
+        if getattr(self, "_bg_is_windowed", False):
+            # A windowed BG (OBJ-window) is ONLY ever visible clipped to the mon —
+            # it must NEVER render full-screen (that tints the whole scene). Stats
+            # Change (static mon) gets the windowed clip on its window frames; the
+            # metallic-shine class (gleam riding a LUNGING mon) and any frame with
+            # no window get the BG dropped — the lunge + hit carry those moves.
+            if ow is not None and not getattr(self, "_bg_window_mon_moves", False):
+                owx = ow.get("x", 0) + ow.get("x2", 0)
+                which = ("back" if abs(owx - P.PLAYER_CX) <= abs(owx - P.ENEMY_CX)
+                         else "front")
+                P.set_anim_bg(None)
+                P.set_mon_window_bg(pix, which, sx, sy)
+            else:
+                P.set_anim_bg(None)
+                P.set_mon_window_bg(None)
         else:
             P.set_mon_window_bg(None)
             P.set_anim_bg(pix, sx, sy, self._bg_distort_for(idx),
@@ -2216,21 +2474,33 @@ class BattleAnimTab(QWidget):
         return [(v - 65536 if v >= 32768 else v) for v in buf]
 
     def _bg_alpha_for(self, idx):
-        """Per-scanline alpha (0..16) for the anim BG if a BLDALPHA scanline effect
-        is active this frame (Surf's wave: a rising band of per-row opacity over
-        the scene), else None. The engine's per-row buffer holds
-        BLDALPHA_BLEND(eva,evb); the low 5 bits (eva) are the water's opacity that
-        row — engine-computed, so the wave shape/timing is the real one."""
+        """Per-scanline alpha (0..16) for the anim BG. Two sources:
+        (1) a per-row BLDALPHA SCANLINE effect (Surf's wave — a rising band of
+            per-row opacity over the scene), and
+        (2) a UNIFORM BLDALPHA on a blended BG LAYER — Morning Sun's light-beam BG
+            is BG1 made the blend top (BLDCNT_TGT1_BG1 | EFFECT_BLEND) and its EVA
+            ramps 0→12→0, fading the beam in and out. The engine only fades blend-
+            mode SPRITES, so a blended BG would otherwise render opaque (no fade).
+        The scanline wave wins when active; else a uniform EVA<16 on a BG blend
+        target fades the whole anim BG at eva/16; else None (opaque)."""
+        # (1) Surf's per-scanline wave (engine-computed per-row eva).
         shadows = getattr(self, "_engine_shadow", None)
-        if not shadows or not (0 <= idx < len(shadows)):
-            return None
-        sd = shadows[idx]
-        if not sd or sd.get("state", 0) == 0 or sd.get("axis") != 3:
-            return None
-        buf = sd.get("buf")
-        if not buf:
-            return None
-        return [b & 0x1F for b in buf]
+        if shadows and 0 <= idx < len(shadows):
+            sd = shadows[idx]
+            if sd and sd.get("state", 0) != 0 and sd.get("axis") == 3:
+                buf = sd.get("buf")
+                if buf:
+                    return [b & 0x1F for b in buf]
+        # (2) Uniform BLDALPHA on a blended BG layer (the light-beam fade).
+        bb = getattr(self, "_engine_bgblend", None)
+        if bb and 0 <= idx < len(bb):
+            v = bb[idx]
+            eva = v & 0x1F
+            tgt1 = (v >> 8) & 0x3F          # bits 0-3 = BG0..BG3 as blend top layer
+            eff = (v >> 16) & 3             # 1 = alpha blend
+            if eff == 1 and (tgt1 & 0x0F) and eva < 16:
+                return [eva] * self._move_preview.CANVAS_H
+        return None
 
     def _distort_for_mon(self, s):
         """Per-screen-row X offsets for a mon copied to a BG layer + HORIZONTALLY
@@ -2406,6 +2676,19 @@ class BattleAnimTab(QWidget):
             P.set_mon_shake(_mdx, _mdy)
         else:
             P.set_mon_shake(0, 0)
+        # Screen-wide tint/brighten overlay: Morning Sun's white flash that
+        # brightens the whole screen, Eruption's red tint. The engine's dominant
+        # scene palette blend, packed (coeff<<24)|BGR555; 0 = none.
+        _sb = getattr(self, "_engine_screenblend", None)
+        if _sb and 0 <= self._engine_idx < len(_sb) and _sb[self._engine_idx]:
+            _v = _sb[self._engine_idx]
+            P.set_screen_tint(_v & 0xFFFF, (_v >> 24) & 0xFF)
+        else:
+            P.set_screen_tint(0, 0)
+        # Full-screen colour inversion (InvertScreenColor) — negative-colour flash.
+        _inv = getattr(self, "_invert_frames", None)
+        P.set_screen_invert(bool(_inv and 0 <= self._engine_idx < len(_inv)
+                                 and _inv[self._engine_idx]))
         for s in frame:
             which = mon_side.get(s.get("isMon", -1))
             if which is None:
@@ -2426,6 +2709,16 @@ class BattleAnimTab(QWidget):
             # and skip the per-frame transform/tint/alpha below.
             if s.get("isMon") in getattr(self, "_bg_frozen", ()):
                 P.set_mon_visible(which, True)
+                # If this monbg'd mon SHAKES (Confusion, Guillotine, Nightmare
+                # jitter the target — x2/y2 OSCILLATE about 0), apply the shake
+                # translation so the frozen copy shakes like the game. Detected by
+                # oscillation, NOT affine: Confusion shakes WHILE squeezing (affine
+                # set). Mimic's offset RAMPS monotonically (grounding its grow) — no
+                # oscillation, so it's not in the set and stays frozen. Scale is held
+                # at 1.0 either way (the frozen copy ignores affine).
+                if s.get("isMon") in getattr(self, "_bg_frozen_shaking", ()):
+                    P.set_mon_transform(which, s.get("x2", 0), s.get("y2", 0),
+                                        1.0, 1.0)
                 # Transform morph: the engine pixelates this monbg'd mon via MOSAIC
                 # (0-15) and swaps its pic to the target species at the mid-morph
                 # gfx swap — both read straight from the engine per frame, applied
@@ -2490,6 +2783,17 @@ class BattleAnimTab(QWidget):
             if coeff > 0:
                 lvl_which = "back" if self._play_direction == "player" else "front"
                 P.set_mon_tint(lvl_which, coeff, 0x7F74)   # RGB(20,27,31) light cyan
+
+        # Synthesized per-mon tint/glow: mon-targeted palette blends the headless
+        # engine can't apply (Self-Destruct's red attacker flash, Swords Dance /
+        # Growth / Outrage glows). Overrides the engine's mon tint (0 for these)
+        # only on frames the synthesis is active; other moves keep the engine tint.
+        _idx = self._engine_idx
+        for _side, _lst in (("front", getattr(self, "_mon_tint_front", [])),
+                            ("back", getattr(self, "_mon_tint_back", []))):
+            if _lst and 0 <= _idx < len(_lst) and _lst[_idx]:
+                _v = _lst[_idx]
+                P.set_mon_tint(_side, (_v >> 24) & 0xFF, _v & 0xFFFF)
 
         # Mon CLONES: each is a copy of a SPECIFIC battler — NOT always the
         # attacker. Odor Sleuth clones the TARGET (the wiggling silhouette over
@@ -2747,6 +3051,11 @@ class BattleAnimTab(QWidget):
             self._engine_bg2scroll = []
             self._engine_bg3scroll = []     # BG3 scroll per frame — terrain shake / anim-bg ride
             self._engine_coordoff = []      # gSpriteCoordOffset per frame — sprite-layer mon shake
+            self._engine_screenblend = []   # screen-wide tint/brighten per frame ((coeff<<24)|color)
+            self._engine_bgblend = []       # BG-layer alpha-blend per frame (eva|tgt1<<8|eff<<16)
+            self._mon_tint_front = []       # per-mon tint/glow per frame ((coeff<<24)|color)
+            self._mon_tint_back = []
+            self._invert_frames = []        # full-screen colour inversion per frame (bool)
             self._anim_bg_layer_cache = None  # which BG layer the anim bg rides (picked per play)
             self._engine_shadow = []
             self._engine_monfx = []         # (mosaic 0-15, swapped) per frame — Transform
@@ -2778,6 +3087,10 @@ class BattleAnimTab(QWidget):
                     bg_pal_slot=bg_pal_slot,
                     monfx_out=self._engine_monfx,
                     coord_offset_out=self._engine_coordoff,
+                    bg_blend_out=self._engine_bgblend,   # BG-layer fade (Morning Sun beam)
+                    # (engine per-slot screen-blend capture intentionally NOT taken —
+                    # the overlay is synthesized from the script args below, which
+                    # avoids mis-painting BG backdrops like Curse's black bg.)
                     # Status-condition anims target a SINGLE battler (the affected
                     # mon = attacker = target, per LaunchStatusAnimation), so their
                     # effects land on the selected mon, not the opposite one.
@@ -2793,6 +3106,78 @@ class BattleAnimTab(QWidget):
             if bg_id:
                 self._bg_indexed = self._load_bg_indexed_any(bg_id, _bgsz)
                 self._engine_bg_pix = self._load_bg_pixmap(bg_id, _bgsz)
+            # Windowed-BG (OBJ-window) effects come in two kinds. Stats Change clips
+            # a SCROLLING arrow mask to a STATIC mon — the windowed render is right.
+            # The metallic-shine class (Steel Wing, Poison Tail, Iron Tail, Metal
+            # Claw, Meteor Mash, …) clips a gleam to a LUNGING mon, which reads as a
+            # weird reflection riding the mon. Tell them apart DYNAMICALLY by whether
+            # the windowed mon moves: if it lunges, drop the gleam BG (the lunge +
+            # hit carry the move) rather than render the riding reflection.
+            self._bg_window_mon_moves = False
+            self._bg_is_windowed = False     # any OBJ-window frame → BG is clipped
+            _owx2 = []
+            for _f in self._engine_frames:
+                _ow = next((s for s in _f if s.get("objMode", 0) == 2), None)
+                if _ow is None:
+                    continue
+                self._bg_is_windowed = True
+                _owx = _ow["x"] + _ow["x2"]
+                _mons = [s for s in _f if s.get("isMon", -1) in (0, 1)]
+                if _mons:
+                    _m = min(_mons, key=lambda s: abs((s["x"] + s["x2"]) - _owx))
+                    _owx2.append((_m.get("x2", 0), _m.get("y2", 0)))
+            if _owx2:
+                _xr = max(a for a, _ in _owx2) - min(a for a, _ in _owx2)
+                _yr = max(b for _, b in _owx2) - min(b for _, b in _owx2)
+                self._bg_window_mon_moves = (_xr > 4 or _yr > 4)
+            # Which monbg-frozen mons actually SHAKE: their x2/y2 OSCILLATE (the
+            # jitter returns to base repeatedly — Confusion, Guillotine, Nightmare).
+            # A monbg'd mon that instead RAMPS monotonically (Mimic grounding its
+            # grow) is NOT shaking and stays a static frozen copy. The renderer
+            # applies the shake translation only to mons in this set.
+            self._bg_frozen_shaking = set()
+            for _b in getattr(self, "_bg_frozen", ()):
+                _seq = [(s.get("x2", 0), s.get("y2", 0))
+                        for _f in self._engine_frames for s in _f
+                        if s.get("isMon", -1) == _b]
+                _rev = 0
+                for _ax in (0, 1):
+                    _vals = [v[_ax] for v in _seq]
+                    _dp = 0
+                    for _i in range(1, len(_vals)):
+                        _d = _vals[_i] - _vals[_i - 1]
+                        if _d != 0:
+                            if _dp != 0 and (_d > 0) != (_dp > 0):
+                                _rev += 1
+                            _dp = _d
+                if _rev >= 3:                  # ≥3 direction reversals = a shake
+                    self._bg_frozen_shaking.add(_b)
+            # Screen-wide tint/brighten flash (Morning Sun white, Eruption red,
+            # Explosion white-out, …): SYNTHESIZE the per-frame overlay from the
+            # move's blend args. SYNTHESIS ONLY — do NOT fold in the engine's
+            # per-slot blend capture: it grabs BG-palette blends that are BACKDROPS
+            # behind the sprites (Curse's AnimTask_CurseStretchingBlackBg paints the
+            # background black), which as a full-screen overlay black out the whole
+            # scene and hide every sprite. The script-arg synthesis captures only the
+            # real FLASHES (the over-everything tints) and nothing else.
+            try:
+                self._engine_screenblend = self._synthesize_screen_blend(
+                    self._cur_timeline, len(self._engine_frames))
+            except Exception:
+                _log.exception("screen-blend synthesis failed")
+            # Per-mon tint/glow (Self-Destruct red flash, Swords Dance / Growth /
+            # Outrage glows) — same synthesis, applied to the front/back mon.
+            try:
+                self._mon_tint_front, self._mon_tint_back = self._synthesize_mon_tints(
+                    self._cur_timeline, len(self._engine_frames))
+            except Exception:
+                self._mon_tint_front, self._mon_tint_back = [], []
+            # Full-screen colour inversion (InvertScreenColor): negative-colour flash.
+            try:
+                self._invert_frames = self._synthesize_screen_invert(
+                    self._cur_timeline, len(self._engine_frames))
+            except Exception:
+                self._invert_frames = []
             # Role Play (& any additional-mon-sprite move) is now driven entirely
             # by the engine MARKER per frame in _render_engine_frame — no task-name
             # match here. Just drop the per-play silhouette-pixmap cache so this

@@ -46,7 +46,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from core.palette_bake_audit import read_png_color_table
-from core.tilemap_data import _write_gbapal_file
+from core.tilemap_data import _write_gbapal_file, write_pal_from_gbapal
 
 
 # ── Registry ──────────────────────────────────────────────────────────────
@@ -194,7 +194,13 @@ def _ensure_palette_data(project_root: str, refactor: Dict) -> bool:
     colors = colors[:16]
 
     gbapal_path = os.path.join(project_root, refactor["gbapal_path"])
-    return _write_gbapal_file(gbapal_path, colors)
+    if not _write_gbapal_file(gbapal_path, colors):
+        return False
+    # Also write the committable JASC .pal source. The .gbapal is a git-ignored
+    # build artefact; without a .pal source the palette is dropped on a fresh
+    # clone and the build breaks. The build regenerates the .gbapal from this.
+    write_pal_from_gbapal(gbapal_path, os.path.splitext(gbapal_path)[0] + ".pal")
+    return True
 
 
 def _add_tag_constant(project_root: str, tag_const: str, tag_value: int) -> Tuple[bool, str]:

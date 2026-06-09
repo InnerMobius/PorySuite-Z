@@ -83,7 +83,8 @@ EXP="-Wl,--export=engine_reset,--export=engine_set_arg,--export=engine_create_sp
 --export=engine_scanline_addr,--export=engine_scanline_state,--export=engine_win0h,\
 --export=engine_pltt_addr,--export=engine_bg_pltt_index,--export=engine_bg_screen_size,\
 --export=engine_monbg,--export=engine_mon_fx,--export=engine_bg3_scroll,\
---export=engine_coord_offset,--export=engine_subsprites,--export=engine_subsprites_addr"
+--export=engine_coord_offset,--export=engine_subsprites,--export=engine_subsprites_addr,\
+--export=engine_screen_blend,--export=engine_bg_blend"
 "$CLANG" --target=wasm32-wasi -mexec-model=reactor $EXP "$OUT"/*.o -lm \
   -o "$OUT/anim_engine_reactor.wasm"
 

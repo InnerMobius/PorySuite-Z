@@ -97,10 +97,36 @@ def song_to_midi(song: SongData) -> mido.MidiFile:
             pruned.append((t, us))
             last_tempo = us
 
+    # Loop markers go on the CONDUCTOR track, ONCE: mid2agb reads '[' (LoopBegin)
+    # and ']' (LoopEnd) here and applies the loop to EVERY instrument track. This
+    # is what makes the loop survive a git pull -- song_integrity renders the
+    # committed .mid from the (git-ignored) .s, and mid2agb rebuilds the loop on
+    # every machine. All tracks loop at the same point, so use track 0's loop:
+    # the LABEL a GOTO jumps back to is the loop start; that GOTO is the loop end.
+    loop_start = loop_end = None
+    if song.tracks:
+        _t0 = song.tracks[0]
+        _gt = {c.target_label for c in _t0.commands
+               if c.cmd == 'GOTO' and c.target_label}
+        for c in _t0.commands:
+            if c.cmd == 'LABEL' and c.target_label and c.target_label in _gt:
+                loop_start = int(c.tick) * _SCALE
+            elif c.cmd == 'GOTO':
+                loop_end = int(c.tick) * _SCALE
+
+    cond_events: list[tuple[int, mido.MetaMessage]] = [
+        (t, mido.MetaMessage('set_tempo', tempo=us, time=0)) for t, us in pruned]
+    if loop_start is not None and loop_end is not None:
+        cond_events.append(
+            (loop_start, mido.MetaMessage('marker', text='[', time=0)))
+        cond_events.append(
+            (loop_end, mido.MetaMessage('marker', text=']', time=0)))
+    cond_events.sort(key=lambda e: e[0])
+
     prev_tick = 0
-    for abs_tick, us in pruned:
-        delta = max(0, abs_tick - prev_tick)
-        conductor.append(mido.MetaMessage('set_tempo', tempo=us, time=delta))
+    for abs_tick, msg in cond_events:
+        msg.time = max(0, abs_tick - prev_tick)
+        conductor.append(msg)
         prev_tick = abs_tick
 
     conductor.append(mido.MetaMessage('end_of_track', time=0))

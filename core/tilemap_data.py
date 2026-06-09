@@ -369,6 +369,47 @@ def _write_gbapal_file(path: str, colors: List[Color]) -> bool:
         return False
 
 
+def write_pal_from_gbapal(gbapal_path: str, pal_path: str) -> bool:
+    """Write a committable JASC ``.pal`` source next to a baked ``.gbapal``.
+
+    ``.gbapal`` / ``.4bpp`` / ``.lz`` are git-ignored build artefacts (vanilla
+    pokefirered ignores them — they're regenerated from source on every build).
+    So a baked palette that ships ONLY as a ``.gbapal`` is dropped by git and
+    vanishes on a fresh clone, and the build dies with "Failed to open JASC-PAL
+    file" because there's no source to regenerate it from. Writing the ``.pal``
+    fixes that: git tracks the ``.pal``, and the build's ``%.gbapal: %.pal``
+    rule rebuilds the binary on any machine.
+
+    The ``.pal`` is derived FROM the just-written ``.gbapal`` so the pair is
+    always consistent. The 5-bit -> 8-bit channel expansion uses gbagfx's
+    ``(c * 255) // 31`` (NOT ``<< 3``) so the build's reverse conversion
+    reproduces the byte-identical binary — the round trip is lossless, so a
+    re-bake produces no spurious git diff. JASC uses CRLF line endings, matching
+    the vanilla ``.pal`` files (e.g. ``ash.pal``). Returns True on success.
+    """
+    try:
+        with open(gbapal_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return False
+    count = len(data) // 2
+    if count == 0:
+        return False
+    lines = ["JASC-PAL", "0100", str(count)]
+    for i in range(0, count * 2, 2):
+        val = data[i] | (data[i + 1] << 8)
+        r = ((val & 0x1F) * 255) // 31
+        g = (((val >> 5) & 0x1F) * 255) // 31
+        b = (((val >> 10) & 0x1F) * 255) // 31
+        lines.append(f"{r} {g} {b}")
+    try:
+        with open(pal_path, "w", newline="") as f:
+            f.write("".join(line + "\r\n" for line in lines))
+        return True
+    except OSError:
+        return False
+
+
 @dataclass
 class PaletteSet:
     """Up to 16 palettes of 16 colors each."""

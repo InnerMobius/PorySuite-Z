@@ -10,6 +10,7 @@ mid2agb-generated files.
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from core.sound.song_parser import SongData, Track, TrackCommand
@@ -538,6 +539,7 @@ def notes_to_track_commands(
     loop_label: Optional[str] = None,
     original_commands: Optional[list[TrackCommand]] = None,
     tempo: Optional[int] = None,
+    modulation: Optional[int] = None,
 ) -> list[TrackCommand]:
     """Convert piano roll note dicts to a flat list of TrackCommands.
 
@@ -642,8 +644,18 @@ def notes_to_track_commands(
     commands.append(TrackCommand(cmd='VOL', tick=0, value=volume))
     if pan != 64:
         commands.append(TrackCommand(cmd='PAN', tick=0, value=pan))
-    if 'MOD' in tick0_controls:
-        commands.append(tick0_controls.pop('MOD'))
+    # MOD (vibrato): like VOICE/VOL/PAN/TEMPO, prefer the caller's LIVE value
+    # (the sidebar Vib slider) over the stale open-time snapshot. Without this,
+    # dragging Vib to 0 was silently reverted on save -- the snapshot still held
+    # the original MOD. depth 0 = no vibrato, so we omit the command entirely.
+    if modulation is None:
+        # No live value supplied (non-piano-roll callers) -- keep the original.
+        if 'MOD' in tick0_controls:
+            commands.append(tick0_controls.pop('MOD'))
+    else:
+        tick0_controls.pop('MOD', None)
+        if modulation:
+            commands.append(TrackCommand(cmd='MOD', tick=0, value=modulation))
 
     # Remaining tick-0 controls
     for cmd in tick0_controls.values():
@@ -821,6 +833,72 @@ def notes_to_track_commands(
 # Full song writer
 # ---------------------------------------------------------------------------
 
+def _uniquify_colliding_labels(s_text: str, song_label: str) -> str:
+    """Make every section/loop label file-globally unique so the SAME friendly
+    name (e.g. 'intro') defined on multiple tracks doesn't trip the assembler's
+    "symbol `intro' is already defined" error.
+
+    GBA M4A labels are file-global. mid2agb's own loop labels are already
+    per-track-unique (``mus_x_1_B1``) and the piano-roll save path pre-prefixes
+    section labels, but a song whose model carries the user's bare friendly name
+    on every track (an 'intro' loop tag on each of N tracks) writes ``intro:`` N
+    times -> collision -> the song won't assemble. PorySuite's contract is that a
+    shared loop label is harmless; this is that guarantee, enforced in the
+    canonical writer so EVERY save path benefits regardless of whether a track
+    was emitted via the raw-line or the linear path.
+
+    Only labels DEFINED 2+ times are touched: within each track section (between
+    ``mus_song_<n>:`` headers, stopping at the ``mus_song:`` footer) a colliding
+    definition is renamed to ``mus_song_<n>_<name>`` and the ``.word <name>``
+    references in that same track are rewritten to match. Already-unique labels
+    (``mus_x_1_B1``, PATT subroutine targets), single-track labels, and the
+    footer track-pointer table are left exactly as-is, so it's a no-op for songs
+    that were already fine.
+    """
+    lines = s_text.split('\n')
+    label_def_re = re.compile(r'^(\w+):$')
+
+    # Pass 1: which labels are DEFINED more than once across the whole file?
+    counts: dict[str, int] = {}
+    for ln in lines:
+        m = label_def_re.match(ln.strip())
+        if m:
+            counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    colliding = {lbl for lbl, n in counts.items() if n > 1}
+    if not colliding:
+        return s_text
+
+    # Pass 2: per track section, rename colliding defs + their in-track refs.
+    track_hdr_re = re.compile(r'^(' + re.escape(song_label) + r'_\d+):$')
+    song_hdr_re = re.compile(r'^' + re.escape(song_label) + r':$')
+    word_ref_re = re.compile(r'^(\s*\.word\s+)(\w+)\s*$')
+
+    cur_track: Optional[str] = None
+    out: list[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        if song_hdr_re.match(stripped):
+            cur_track = None  # footer reached — the pointer table must not move
+            out.append(ln)
+            continue
+        mh = track_hdr_re.match(stripped)
+        if mh:
+            cur_track = mh.group(1)
+            out.append(ln)
+            continue
+        if cur_track is not None:
+            md = label_def_re.match(stripped)
+            if md and md.group(1) in colliding:
+                out.append(f'{cur_track}_{md.group(1)}:')
+                continue
+            mw = word_ref_re.match(ln)
+            if mw and mw.group(2) in colliding:
+                out.append(f'{mw.group(1)}{cur_track}_{mw.group(2)}')
+                continue
+        out.append(ln)
+    return '\n'.join(out)
+
+
 def write_song(song: SongData) -> str:
     """Convert a SongData object to a complete .s file string."""
     prefix = song.label
@@ -881,7 +959,10 @@ def write_song(song: SongData) -> str:
     lines.append('\t.end')
     lines.append('')
 
-    return '\n'.join(lines)
+    # Zeldamon 2026-06-09: guarantee file-global label uniqueness so a loop tag
+    # the user named the same on multiple tracks (e.g. 'intro') still assembles
+    # ("symbol already defined" otherwise). No-op for already-unique songs.
+    return _uniquify_colliding_labels('\n'.join(lines), prefix)
 
 
 def save_song_file(song: SongData, path: Optional[str] = None) -> str:

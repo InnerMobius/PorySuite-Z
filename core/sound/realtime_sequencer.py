@@ -91,6 +91,7 @@ class TrackPlayState:
     muted: bool = False
     bend: float = 0.0     # pitch bend in semitones (from BEND command)
     bend_range: int = 2   # BENDR: max semitones (default 2)
+    modulation: int = 0   # MOD: vibrato/modulation depth (0-127, 0=off)
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +624,10 @@ def extract_track_play_states(song_data) -> dict[int, TrackPlayState]:
         for cmd in track.commands:
             if cmd.cmd == 'PAN' and cmd.value is not None:
                 ts.pan = cmd.value
+                break
+        for cmd in track.commands:
+            if cmd.cmd == 'MOD' and cmd.value is not None:
+                ts.modulation = cmd.value
                 break
         states[i] = ts
     if song_data.key_shift:
