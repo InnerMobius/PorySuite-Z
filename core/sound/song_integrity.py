@@ -344,14 +344,22 @@ def _note_signature(mid) -> tuple:
 
 
 def _tempo_signature(mid) -> tuple:
-    """Sorted tuple of (abs_tick, tempo_us) for every set_tempo event."""
+    """Sorted tuple of (abs_tick, bpm) for every set_tempo event.
+
+    Uses ROUNDED bpm, NOT raw microseconds-per-beat. The original render
+    (mid2agb) and a fresh song_to_midi render can compute a tempo's µs one unit
+    apart purely from rounding — e.g. 545454 vs 545455 µs is the SAME 110 bpm —
+    and comparing raw µs would flag that as a 'divergence' and needlessly refresh
+    an unchanged song (spurious .mid churn). GBA tempos are integers, so a real
+    tempo change is >= 1 bpm and still trips this.
+    """
     out = []
     for track in mid.tracks:
         t = 0
         for msg in track:
             t += msg.time
             if msg.type == "set_tempo":
-                out.append((t, msg.tempo))
+                out.append((t, round(60_000_000 / msg.tempo)))
     return tuple(sorted(out))
 
 

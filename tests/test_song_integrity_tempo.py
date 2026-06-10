@@ -88,3 +88,19 @@ def test_unreadable_mid_is_conservative():
         notes_match, tempo_diverges = SI._compare_render_to_disk(rendered, p)
     assert notes_match is False
     assert tempo_diverges is False
+
+
+def test_tempo_microsecond_rounding_not_flagged():
+    """A 1-microsecond rounding difference is the SAME bpm and must NOT count as
+    a divergence — otherwise an unchanged song gets needlessly refreshed.
+    (mid2agb and song_to_midi round a tempo's microseconds one unit apart;
+    545454 vs 545455 us are both 110 bpm.)"""
+    notes = [(0, 60), (48, 62)]
+    rendered = _mk(notes, [(0, 545455)])   # 110 bpm (fresh render rounding)
+    on_disk = _mk(notes, [(0, 545454)])    # 110 bpm (original render rounding)
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "se.mid")
+        on_disk.save(p)
+        notes_match, tempo_diverges = SI._compare_render_to_disk(rendered, p)
+    assert notes_match is True
+    assert tempo_diverges is False   # same bpm -> NOT a divergence
