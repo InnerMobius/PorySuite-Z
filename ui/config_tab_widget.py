@@ -1,22 +1,26 @@
 """
 ui/config_tab_widget.py
-Build & Debug Configuration Editor
+Game Configuration Editor
 
-Edits two files in the loaded project:
+Edits the loaded project's new-game starting values, gameplay tweaks, and
+build/debug settings:
+  - src/new_game.c / src/player_pc.c / src/bike.c   (starting values + run-indoors)
   - config.mk             (VARIABLE := VALUE format)
   - include/config.h      (#define NAME VALUE / //#define NAME)
+
+Sections are ordered most-relevant-first: Game Content, Gameplay Tweaks, then
+the build/debug internals lower down.
 """
 from __future__ import annotations
 
 import os
 import re
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QScrollArea, QSizePolicy, QSpinBox,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QPushButton, QScrollArea, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
 
 
@@ -67,12 +71,21 @@ QCheckBox::indicator:checked {
     background-color: #1976d2;
     border-color: #1976d2;
 }
+QSpinBox {
+    background-color: #1e1e1e;
+    border: 1px solid #3a3a3a;
+    border-radius: 4px;
+    padding: 3px 6px;
+    color: #e0e0e0;
+    font-size: 12px;
+}
+QSpinBox:focus { border: 1px solid #1976d2; }
 """
 
 _NOTE_SS = "color: #888888; font-size: 10px; font-style: italic;"
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── file / config helpers ─────────────────────────────────────────────────────
 
 def _read_file(path: str) -> str:
     """Return file contents or empty string on error."""
@@ -109,7 +122,6 @@ def _parse_define_value(text: str, name: str) -> str | None:
     Return the value after #define NAME in config.h.
     Returns None if the define is commented out (//#define).
     """
-    # Active define
     m = re.search(r"^#define\s+" + re.escape(name) + r"(?:\s+(\S+))?\s*$",
                   text, re.MULTILINE)
     if m:
@@ -128,7 +140,6 @@ def _set_define_active(text: str, name: str, active: bool) -> str:
     if active:
         new_text, n = re.subn(commented_pat, r"\1", text, flags=re.MULTILINE)
         if n == 0:
-            # Was plain active or missing — ensure it's present and uncommented
             new_text2, n2 = re.subn(active_pat, r"\1", text, flags=re.MULTILINE)
             if n2 == 0:
                 new_text = text.rstrip("\n") + "\n#define " + name + "\n"
@@ -137,7 +148,6 @@ def _set_define_active(text: str, name: str, active: bool) -> str:
     else:
         new_text, n = re.subn(active_pat, r"//\1", text, flags=re.MULTILINE)
         if n == 0:
-            # Already commented or missing
             new_text = text
     return new_text
 
@@ -148,9 +158,138 @@ def _set_define_value(text: str, name: str, value: str) -> str:
     replacement = r"\1 " + value
     new_text, n = re.subn(pattern, replacement, text, flags=re.MULTILINE)
     if n == 0:
-        # Not present at all — add it
         new_text = text.rstrip("\n") + "\n#define " + name + " " + value + "\n"
     return new_text
+
+
+# ── small reusable widgets ──────────────────────────────────────────────────
+
+class _NoScrollComboBox(QComboBox):
+    """Combo box that ignores the mouse wheel while closed.
+
+    Project UX rule: scrolling the page must never silently change a dropdown
+    value (the user scrolls via remote desktop two-finger gestures). The popup,
+    once opened, scrolls normally because it's a separate widget.
+    """
+
+    def wheelEvent(self, e):  # noqa: N802
+        e.ignore()
+
+
+class _ItemRowDialog(QDialog):
+    """Pick an item constant + quantity for a starting-items list."""
+
+    def __init__(self, choices, item="ITEM_NONE", qty=1, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Starting Item")
+        self.setMinimumWidth(360)
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self._item = _NoScrollComboBox()
+        self._item.setEditable(True)
+        self._item.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._item.addItems(choices or ["ITEM_NONE"])
+        i = self._item.findText(item)
+        if i >= 0:
+            self._item.setCurrentIndex(i)
+        elif item:
+            self._item.setCurrentText(item)
+        form.addRow("Item:", self._item)
+        self._qty = QSpinBox()
+        self._qty.setRange(1, 999)
+        self._qty.setValue(max(1, int(qty)))
+        form.addRow("Quantity:", self._qty)
+        lay.addLayout(form)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+    def values(self):
+        return self._item.currentText().strip(), self._qty.value()
+
+
+class _ItemSlotEditor(QWidget):
+    """Compact add / edit / remove list of (ITEM_*, quantity) rows used for the
+    starting PC and bag contents."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: list[tuple[str, int]] = []
+        self._choices: list[str] = ["ITEM_NONE"]
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            "QListWidget{background:#1e1e1e;border:1px solid #3a3a3a;"
+            "border-radius:4px;color:#dddddd;font-size:11px;}")
+        self._list.setMaximumHeight(96)
+        self._list.itemDoubleClicked.connect(lambda *_: self._edit())
+        lay.addWidget(self._list, 1)
+        col = QVBoxLayout()
+        col.setSpacing(4)
+        for label, slot in (("Add", self._add), ("Edit", self._edit),
+                            ("Remove", self._remove)):
+            b = QPushButton(label)
+            b.setFixedWidth(72)
+            b.clicked.connect(slot)
+            col.addWidget(b)
+        col.addStretch(1)
+        lay.addLayout(col)
+
+    def set_choices(self, choices):
+        self._choices = list(choices) if choices else ["ITEM_NONE"]
+
+    def set_items(self, items):
+        self._items = [(str(c), int(q)) for c, q in (items or [])]
+        self._refresh()
+
+    def get_items(self):
+        return list(self._items)
+
+    def _refresh(self):
+        self._list.clear()
+        if not self._items:
+            it = QListWidgetItem("(empty)")
+            it.setForeground(Qt.GlobalColor.gray)
+            self._list.addItem(it)
+            return
+        for c, q in self._items:
+            self._list.addItem(f"{c}   ×{q}")
+
+    def _add(self):
+        dlg = _ItemRowDialog(self._choices, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            c, q = dlg.values()
+            if c and c != "ITEM_NONE":
+                self._items.append((c, q))
+                self._refresh()
+                self.changed.emit()
+
+    def _edit(self):
+        row = self._list.currentRow()
+        if not (0 <= row < len(self._items)):
+            return
+        c0, q0 = self._items[row]
+        dlg = _ItemRowDialog(self._choices, c0, q0, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            c, q = dlg.values()
+            if c and c != "ITEM_NONE":
+                self._items[row] = (c, q)
+                self._refresh()
+                self.changed.emit()
+
+    def _remove(self):
+        row = self._list.currentRow()
+        if 0 <= row < len(self._items):
+            del self._items[row]
+            self._refresh()
+            self.changed.emit()
 
 
 # ── main widget ───────────────────────────────────────────────────────────────
@@ -177,7 +316,6 @@ class ConfigTabWidget(QWidget):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
-        # Scroll area so the form still works if the window is small
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(scroll.Shape.NoFrame)
@@ -187,86 +325,195 @@ class ConfigTabWidget(QWidget):
         inner_layout.setSpacing(14)
 
         def _desc(text: str) -> QLabel:
-            """Small grey description label shown directly below a form row."""
             lbl = QLabel(text)
             lbl.setStyleSheet("color: #666666; font-size: 10px;")
             lbl.setWordWrap(True)
             return lbl
 
-        # ── Build Settings (config.mk) ────────────────────────────────────────
-        mk_group = QGroupBox("Build Settings  (config.mk)")
+        def _summary(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color: #8f8f8f; font-size: 11px;")
+            lbl.setWordWrap(True)
+            return lbl
+
+        # ════════ Game Content (new-game starting values) ════════
+        gc_group = QGroupBox("Game Content  (new game starting values)")
+        gc_group.setStyleSheet(_CARD_SS + _FIELD_SS)
+        gc = QVBoxLayout(gc_group)
+        gc.setContentsMargins(12, 16, 12, 12)
+        gc.setSpacing(6)
+        gc.addWidget(_summary(
+            "What a brand-new save starts with — money, where the player wakes "
+            "up, whether the National Dex is unlocked, and the items already in "
+            "their bag and PC. Written straight into the new-game init code."))
+        gc_form = QFormLayout()
+        gc_form.setSpacing(4)
+
+        self._money_spin = QSpinBox()
+        self._money_spin.setRange(0, 999999)
+        self._money_spin.setValue(3000)
+        self._money_spin.setGroupSeparatorShown(True)
+        gc_form.addRow("Starting Money:", self._money_spin)
+
+        loc_row = QHBoxLayout()
+        loc_row.setSpacing(6)
+        self._loc_map = _NoScrollComboBox()
+        self._loc_map.setMinimumWidth(220)
+        self._loc_x = QSpinBox()
+        self._loc_x.setRange(0, 255)
+        self._loc_x.setPrefix("X ")
+        self._loc_y = QSpinBox()
+        self._loc_y.setRange(0, 255)
+        self._loc_y.setPrefix("Y ")
+        loc_row.addWidget(self._loc_map, 1)
+        loc_row.addWidget(self._loc_x)
+        loc_row.addWidget(self._loc_y)
+        gc_form.addRow("Starting Location:", loc_row)
+        gc.addLayout(gc_form)
+        gc.addWidget(_desc(
+            "The map a new game begins on, plus the X/Y tile within it. "
+            "Pick the map from the list; set the tile with X and Y."))
+
+        self._dex_cb = QCheckBox("National Dex unlocked from the start")
+        gc.addWidget(self._dex_cb)
+
+        gc.addWidget(_desc(
+            "Starting PC items — what's waiting in the player's PC on a new game:"))
+        self._pc_items = _ItemSlotEditor()
+        gc.addWidget(self._pc_items)
+        gc.addWidget(_desc(
+            "Starting bag items — added to the bag on a new game "
+            "(vanilla starts empty):"))
+        self._bag_items = _ItemSlotEditor()
+        gc.addWidget(self._bag_items)
+        inner_layout.addWidget(gc_group)
+
+        # ════════ Gameplay Tweaks (engine patches) ════════
+        tw_group = QGroupBox("Gameplay Tweaks  (engine patches)")
+        tw_group.setStyleSheet(_CARD_SS + _FIELD_SS)
+        tw = QFormLayout(tw_group)
+        tw.setContentsMargins(12, 16, 12, 12)
+        tw.setSpacing(4)
+        tw.addRow("", _summary(
+            "Quality-of-life and balance changes applied by patching the engine. "
+            "Each is idempotent — saving the same value twice changes nothing."))
+
+        self._run_indoors_cb = QCheckBox("Allow running indoors")
+        tw.addRow("Running:", self._run_indoors_cb)
+        tw.addRow("", _desc(
+            "Lets the dash work inside buildings (vanilla blocks running on "
+            "indoor maps). Per-tile 'no running' spots like warps still apply."))
+
+        self._text_speed = _NoScrollComboBox()
+        for label, const in (("Slow", "OPTIONS_TEXT_SPEED_SLOW"),
+                             ("Mid", "OPTIONS_TEXT_SPEED_MID"),
+                             ("Fast", "OPTIONS_TEXT_SPEED_FAST")):
+            self._text_speed.addItem(label, const)
+        tw.addRow("Default Text Speed:", self._text_speed)
+        tw.addRow("", _desc(
+            "The text-speed a new save defaults to (players can still change it "
+            "in Options)."))
+
+        self._battle_style = _NoScrollComboBox()
+        for label, const in (("Shift", "OPTIONS_BATTLE_STYLE_SHIFT"),
+                             ("Set", "OPTIONS_BATTLE_STYLE_SET")):
+            self._battle_style.addItem(label, const)
+        tw.addRow("Default Battle Style:", self._battle_style)
+        tw.addRow("", _desc(
+            "SHIFT offers a free switch when the foe sends out a new Pokémon; "
+            "SET does not. The new-game default."))
+
+        self._prize_multiplier = QSpinBox()
+        self._prize_multiplier.setRange(0, 65535)
+        self._prize_multiplier.setValue(4)
+        tw.addRow("Trainer Prize Multiplier:", self._prize_multiplier)
+        tw.addRow("", _desc(
+            "Constant in the trainer prize formula "
+            "(prize = base × level × class × bonuses). Vanilla is 4; lower it "
+            "for small-currency economies. Writes a config.h macro and patches "
+            "the engine line once."))
+
+        self._gender_dialogue_cb = QCheckBox("Enable")
+        tw.addRow("Gender-Tinted Dialogue:", self._gender_dialogue_cb)
+        tw.addRow("", _desc(
+            "When on (vanilla), male NPC sprites speak in blue and female in "
+            "red; neutral/object sprites stay dark gray. When off, all dialogue "
+            "is dark gray. Explicit {COLOR} tokens in text always apply."))
+        inner_layout.addWidget(tw_group)
+
+        # ════════ Build & Compilation (config.mk) — moved lower ════════
+        mk_group = QGroupBox("Build & Compilation  (config.mk)")
         mk_group.setStyleSheet(_CARD_SS + _FIELD_SS)
         mk_form = QFormLayout(mk_group)
         mk_form.setContentsMargins(12, 16, 12, 12)
         mk_form.setSpacing(4)
+        mk_form.addRow("", _summary(
+            "How the ROM is compiled. You rarely need to touch these — the "
+            "defaults build a standard FireRed ROM."))
 
-        self._game_version = QComboBox()
+        self._game_version = _NoScrollComboBox()
         self._game_version.addItems(["FIRERED", "LEAFGREEN"])
         mk_form.addRow("Game Version:", self._game_version)
         mk_form.addRow("", _desc(
-            "Build as FireRed or LeafGreen. Affects the ROM title, game code (BPRE / BPGE), "
-            "and which version-specific maps and events are included."
-        ))
+            "Build as FireRed or LeafGreen. Affects the ROM title, game code "
+            "(BPRE / BPGE), and version-specific maps and events."))
 
-        self._game_revision = QComboBox()
+        self._game_revision = _NoScrollComboBox()
         self._game_revision.addItems(["0", "1"])
         mk_form.addRow("Game Revision:", self._game_revision)
         mk_form.addRow("", _desc(
-            "ROM revision: 0 = original launch release, 1 = bug-fix re-release. "
-            "Use 0 unless you specifically need the revision-1 binary."
-        ))
+            "ROM revision: 0 = original launch, 1 = bug-fix re-release. Use 0 "
+            "unless you specifically need the revision-1 binary."))
 
-        self._game_language = QComboBox()
+        self._game_language = _NoScrollComboBox()
         self._game_language.addItems(["ENGLISH"])
         mk_form.addRow("Game Language:", self._game_language)
-        mk_form.addRow("", _desc("Target language. Only ENGLISH is currently supported by pokefirered."))
+        mk_form.addRow("", _desc(
+            "Target language. Only ENGLISH is currently supported by pokefirered."))
 
         self._modern_cb = QCheckBox("Enable")
         mk_form.addRow("Modern Mode:", self._modern_cb)
         self._modern_note = QLabel(
             "Uses arm-none-eabi-gcc instead of agbcc. Enables modern C features, "
-            "BUGFIX, and UBFIX automatically. ROM will NOT match the original binary."
-        )
+            "BUGFIX, and UBFIX automatically. ROM will NOT match the original binary.")
         self._modern_note.setStyleSheet("color: #bb8800; font-size: 10px;")
         self._modern_note.setWordWrap(True)
         self._modern_note.setVisible(False)
         mk_form.addRow("", self._modern_note)
         mk_form.addRow("", _desc(
-            "Compiles with modern GCC instead of the original agbcc. Produces a larger "
-            "but more feature-rich ROM. Required for C++ and advanced optimisations."
-        ))
+            "Compiles with modern GCC instead of the original agbcc. Produces a "
+            "larger but more feature-rich ROM."))
 
         self._compare_cb = QCheckBox("Enable")
         mk_form.addRow("Compare Build:", self._compare_cb)
         mk_form.addRow("", _desc(
-            "Also builds an unmodified reference ROM alongside yours and compares the two. "
-            "Only useful for verifying that your changes differ exactly as expected."
-        ))
+            "Also builds an unmodified reference ROM and compares the two. Only "
+            "useful for verifying your changes differ exactly as expected."))
 
         self._keep_temps_cb = QCheckBox("Enable")
         mk_form.addRow("Keep Temps:", self._keep_temps_cb)
         mk_form.addRow("", _desc(
-            "Retains intermediate .i (preprocessed) and .s (assembly) files in the build "
-            "directory after compilation. Useful for debugging compiler output."
-        ))
-
+            "Retains intermediate .i / .s files after compilation. Developer "
+            "tool for debugging compiler output."))
         inner_layout.addWidget(mk_group)
 
-        # ── Debug Settings (include/config.h) ─────────────────────────────────
-        h_group = QGroupBox("Debug / Logging Settings  (include/config.h)")
+        # ════════ Debug & Logging (include/config.h) — lowest ════════
+        h_group = QGroupBox("Debug & Logging  (include/config.h)")
         h_group.setStyleSheet(_CARD_SS + _FIELD_SS)
         h_form = QFormLayout(h_group)
         h_form.setContentsMargins(12, 16, 12, 12)
         h_form.setSpacing(4)
+        h_form.addRow("", _summary(
+            "Developer logging options. Leave at the defaults unless you're "
+            "debugging on an emulator."))
 
         self._ndebug_cb = QCheckBox("Enable  (release mode — disables all debug output)")
         h_form.addRow("NDEBUG:", self._ndebug_cb)
         h_form.addRow("", _desc(
-            "When enabled, all debug logging is compiled out completely (no overhead). "
-            "Enable for final release builds. Disable when testing on an emulator."
-        ))
+            "When enabled, all debug logging is compiled out (no overhead). "
+            "Enable for final release builds; disable when testing on an emulator."))
 
-        self._log_handler = QComboBox()
+        self._log_handler = _NoScrollComboBox()
         self._log_handler.addItems([
             "LOG_HANDLER_AGB_PRINT",
             "LOG_HANDLER_NOCASH_PRINT",
@@ -274,12 +521,10 @@ class ConfigTabWidget(QWidget):
         ])
         h_form.addRow("Log Handler:", self._log_handler)
         h_form.addRow("", _desc(
-            "AGB_PRINT: hardware AGB Cartridge Printer (very rare).  "
-            "NOCASH_PRINT: no$gba debugger output.  "
-            "MGBA_PRINT: mGBA scripting console (recommended for most users)."
-        ))
+            "AGB_PRINT: hardware cartridge printer (rare). NOCASH_PRINT: no$gba. "
+            "MGBA_PRINT: mGBA console (recommended for most users)."))
 
-        self._pretty_print = QComboBox()
+        self._pretty_print = _NoScrollComboBox()
         self._pretty_print.addItems([
             "PRETTY_PRINT_OFF",
             "PRETTY_PRINT_MINI_PRINTF",
@@ -287,82 +532,9 @@ class ConfigTabWidget(QWidget):
         ])
         h_form.addRow("Pretty Print:", self._pretty_print)
         h_form.addRow("", _desc(
-            "Formatting library used for debug strings.  "
-            "OFF: raw strings only (smallest).  "
-            "MINI_PRINTF: lightweight custom printf.  "
-            "LIBC: full newlib printf (largest ROM, most features)."
-        ))
-
+            "Formatting library for debug strings. OFF: raw (smallest). "
+            "MINI_PRINTF: lightweight printf. LIBC: full newlib printf (largest)."))
         inner_layout.addWidget(h_group)
-
-        # ── Battle Economy (engine source patch) ──────────────────────────────
-        # Trainer prize formula: vanilla pokefirered hardcodes the
-        # multiplier as `4` in src/battle_script_commands.c. Different
-        # economies (e.g. small-number rupee currencies where 200 is a
-        # lot) need to scale this base multiplier without hand-editing
-        # the engine on every commit. The widget below saves to a
-        # project-defined macro, with a one-time idempotent rewrite of
-        # the engine source line so it reads from the macro.
-        eco_group = QGroupBox(
-            "Battle Economy  (include/config.h + engine patch)")
-        eco_group.setStyleSheet(_CARD_SS + _FIELD_SS)
-        eco_form = QFormLayout(eco_group)
-        eco_form.setContentsMargins(12, 16, 12, 12)
-        eco_form.setSpacing(4)
-
-        self._prize_multiplier = QSpinBox()
-        self._prize_multiplier.setRange(0, 65535)
-        self._prize_multiplier.setValue(4)  # vanilla default
-        eco_form.addRow("Trainer Prize Base Multiplier:",
-                        self._prize_multiplier)
-        eco_form.addRow("", _desc(
-            "The constant in the trainer prize formula:\n"
-            "    prize = base × level × class_multiplier × bonuses\n\n"
-            "Vanilla pokefirered uses 4. Lower it (e.g. 1) for "
-            "small-currency economies; raise it for inflation-heavy "
-            "settings. The change writes to a TRAINER_PRIZE_BASE_MULTIPLIER "
-            "macro in include/config.h and patches the engine line "
-            "once — re-saving with the same value writes nothing."
-        ))
-
-        inner_layout.addWidget(eco_group)
-
-        # ── Text & Dialogue (engine source patch) ─────────────────────────────
-        # Vanilla pokefirered auto-tints NPC dialogue based on the
-        # talked-to NPC's overworld graphic — male sprites get blue
-        # text, female sprites get red. The mapping lives in
-        # `sTextColorTable` and is applied at runtime by
-        # `AddTextPrinterDiffStyle`. Some projects don't want this
-        # behavior (uniform dialogue style, custom theming, etc.); the
-        # checkbox below patches the renderer to always use DARK_GRAY,
-        # disabling the gender tinting project-wide. Explicit {COLOR}
-        # tokens in text content still apply regardless.
-        text_group = QGroupBox(
-            "Text & Dialogue  (engine patch)")
-        text_group.setStyleSheet(_CARD_SS + _FIELD_SS)
-        text_form = QFormLayout(text_group)
-        text_form.setContentsMargins(12, 16, 12, 12)
-        text_form.setSpacing(4)
-
-        self._gender_dialogue_cb = QCheckBox("Enable")
-        text_form.addRow(
-            "Gender-Tinted NPC Dialogue:", self._gender_dialogue_cb)
-        text_form.addRow("", _desc(
-            "When enabled (vanilla), an NPC's overworld graphic ID "
-            "decides the dialogue tint at runtime — male sprites speak "
-            "in blue, female sprites in red, neutral / object / Pokemon "
-            "sprites stay dark gray.\n\n"
-            "When disabled, all dialogue renders dark gray regardless "
-            "of NPC graphic. Explicit {COLOR} tokens in text still apply.\n\n"
-            "Patches AddTextPrinterDiffStyle in src/new_menu_helpers.c "
-            "(idempotent — re-saving with the same value writes nothing).\n\n"
-            "The PorySuite-Z text editor uses this setting to preview "
-            "what dialogue will look like for the NPC you're editing: "
-            "with the toggle on, talking to a female NPC shows the "
-            "default text in red; with it off, in dark gray."
-        ))
-
-        inner_layout.addWidget(text_group)
 
         inner_layout.addStretch(1)
         scroll.setWidget(inner)
@@ -382,17 +554,24 @@ class ConfigTabWidget(QWidget):
         self._ndebug_cb.toggled.connect(self._on_ndebug_toggled)
         self._save_btn.clicked.connect(self.save)
 
-        for widget in (
+        for combo in (
             self._game_version, self._game_revision, self._game_language,
             self._log_handler, self._pretty_print,
+            self._loc_map, self._text_speed, self._battle_style,
         ):
-            widget.currentIndexChanged.connect(self._mark_dirty)
+            combo.currentIndexChanged.connect(self._mark_dirty)
 
-        for cb in (self._modern_cb, self._compare_cb, self._keep_temps_cb, self._ndebug_cb):
+        for cb in (self._modern_cb, self._compare_cb, self._keep_temps_cb,
+                   self._ndebug_cb, self._dex_cb, self._run_indoors_cb,
+                   self._gender_dialogue_cb):
             cb.toggled.connect(self._mark_dirty)
 
-        self._prize_multiplier.valueChanged.connect(self._mark_dirty)
-        self._gender_dialogue_cb.toggled.connect(self._mark_dirty)
+        for spin in (self._prize_multiplier, self._money_spin,
+                     self._loc_x, self._loc_y):
+            spin.valueChanged.connect(self._mark_dirty)
+
+        self._pc_items.changed.connect(self._mark_dirty)
+        self._bag_items.changed.connect(self._mark_dirty)
 
     # ── internal slots ────────────────────────────────────────────────────────
 
@@ -410,6 +589,13 @@ class ConfigTabWidget(QWidget):
             self._save_btn.setEnabled(True)
             self.modified.emit()
 
+    @staticmethod
+    def _set_combo_data(combo: QComboBox, data: str) -> None:
+        for i in range(combo.count()):
+            if combo.itemData(i) == data:
+                combo.setCurrentIndex(i)
+                return
+
     # ── public API ────────────────────────────────────────────────────────────
 
     def load(self, project_dir: str) -> None:
@@ -418,33 +604,30 @@ class ConfigTabWidget(QWidget):
         self._dirty = False
         self._save_btn.setEnabled(False)
 
-        mk_path = os.path.join(project_dir, "config.mk")
-        mk_text = _read_file(mk_path)
+        mk_text = _read_file(os.path.join(project_dir, "config.mk"))
+        h_text = _read_file(os.path.join(project_dir, "include", "config.h"))
 
-        h_path = os.path.join(project_dir, "include", "config.h")
-        h_text = _read_file(h_path)
-
-        # Block signals while populating to avoid spurious dirty marks
-        for widget in (
+        signal_widgets = (
             self._game_version, self._game_revision, self._game_language,
             self._log_handler, self._pretty_print,
             self._modern_cb, self._compare_cb, self._keep_temps_cb, self._ndebug_cb,
             self._prize_multiplier, self._gender_dialogue_cb,
-        ):
+            self._money_spin, self._loc_map, self._loc_x, self._loc_y,
+            self._dex_cb, self._run_indoors_cb, self._text_speed, self._battle_style,
+        )
+        for widget in signal_widgets:
             widget.blockSignals(True)
 
         try:
-            # config.mk dropdowns
             def _set_combo(combo: QComboBox, value: str) -> None:
                 idx = combo.findText(value)
                 if idx >= 0:
                     combo.setCurrentIndex(idx)
 
+            # config.mk
             _set_combo(self._game_version,  _parse_mk_value(mk_text, "GAME_VERSION"))
-            _set_combo(self._game_revision,  _parse_mk_value(mk_text, "GAME_REVISION"))
-            _set_combo(self._game_language,  _parse_mk_value(mk_text, "GAME_LANGUAGE"))
-
-            # config.mk checkboxes — value "1" means on, "0" off
+            _set_combo(self._game_revision, _parse_mk_value(mk_text, "GAME_REVISION"))
+            _set_combo(self._game_language, _parse_mk_value(mk_text, "GAME_LANGUAGE"))
             self._modern_cb.setChecked(_parse_mk_value(mk_text, "MODERN") == "1")
             self._compare_cb.setChecked(_parse_mk_value(mk_text, "COMPARE") == "1")
             self._keep_temps_cb.setChecked(_parse_mk_value(mk_text, "KEEP_TEMPS") == "1")
@@ -454,43 +637,66 @@ class ConfigTabWidget(QWidget):
             self._ndebug_cb.setChecked(ndebug_on)
             self._log_handler.setEnabled(not ndebug_on)
             self._pretty_print.setEnabled(not ndebug_on)
-
             log_val = _parse_define_value(h_text, "LOG_HANDLER")
             if log_val is not None:
                 _set_combo(self._log_handler, log_val)
-
             pp_val = _parse_define_value(h_text, "PRETTY_PRINT_HANDLER")
             if pp_val is not None:
                 _set_combo(self._pretty_print, pp_val)
 
-            # Battle economy: read the current TRAINER_PRIZE_BASE_MULTIPLIER
-            # macro value (defaults to 4 — the vanilla literal — when the
-            # macro hasn't been added yet).
+            # Battle economy
             try:
                 from core.battle_economy_patch import read_prize_multiplier
-                self._prize_multiplier.setValue(
-                    read_prize_multiplier(project_dir))
+                self._prize_multiplier.setValue(read_prize_multiplier(project_dir))
             except Exception:
                 self._prize_multiplier.setValue(4)
 
-            # Gender-tinted NPC dialogue: read whether the engine still
-            # has the vanilla AddTextPrinterDiffStyle (enabled) or
-            # PorySuite-Z's patched form (disabled).
+            # Gender-tinted dialogue
             try:
-                from core.text_coloring_patch import (
-                    read_gender_dialogue_enabled)
+                from core.text_coloring_patch import read_gender_dialogue_enabled
                 self._gender_dialogue_cb.setChecked(
                     read_gender_dialogue_enabled(project_dir))
             except Exception:
                 self._gender_dialogue_cb.setChecked(True)
 
+            # New-game content + run-indoors
+            try:
+                import core.new_game_config as ngc
+                maps = ngc.parse_map_constants(project_dir)
+                items = ngc.parse_item_constants(project_dir)
+                vals = ngc.read_all(project_dir)
+            except Exception:
+                maps, items, vals = [], ["ITEM_NONE"], {}
+
+            self._money_spin.setValue(int(vals.get("money", 3000)))
+
+            self._loc_map.clear()
+            if maps:
+                self._loc_map.addItems(maps)
+            mp, mx, my = vals.get(
+                "location", ("MAP_PALLET_TOWN_PLAYERS_HOUSE_2F", 6, 6))
+            idx = self._loc_map.findText(mp)
+            if idx < 0 and mp:
+                self._loc_map.insertItem(0, mp)
+                idx = 0
+            if idx >= 0:
+                self._loc_map.setCurrentIndex(idx)
+            self._loc_x.setValue(int(mx))
+            self._loc_y.setValue(int(my))
+
+            self._dex_cb.setChecked(bool(vals.get("national_dex", True)))
+            self._run_indoors_cb.setChecked(bool(vals.get("run_indoors", False)))
+            self._set_combo_data(
+                self._text_speed, vals.get("text_speed", "OPTIONS_TEXT_SPEED_MID"))
+            self._set_combo_data(
+                self._battle_style, vals.get("battle_style", "OPTIONS_BATTLE_STYLE_SHIFT"))
+            self._pc_items.set_choices(items)
+            self._pc_items.set_items(vals.get("pc_items", []))
+            self._bag_items.set_choices(items)
+            self._bag_items.set_items(vals.get("bag_items", []))
+
         finally:
-            for widget in (
-                self._game_version, self._game_revision, self._game_language,
-                self._log_handler, self._pretty_print,
-                self._modern_cb, self._compare_cb, self._keep_temps_cb, self._ndebug_cb,
-                self._prize_multiplier, self._gender_dialogue_cb,
-            ):
+            for widget in signal_widgets:
                 widget.blockSignals(False)
 
         self._modern_note.setVisible(self._modern_cb.isChecked())
@@ -499,7 +705,7 @@ class ConfigTabWidget(QWidget):
         return self._dirty
 
     def save(self) -> None:
-        """Write config.mk and include/config.h back to disk."""
+        """Write all config back to disk."""
         if not self._project_dir:
             return
 
@@ -509,13 +715,11 @@ class ConfigTabWidget(QWidget):
         if not mk_text and not os.path.isfile(mk_path):
             QMessageBox.warning(
                 self, "Config",
-                f"config.mk not found at:\n{mk_path}\n\nLoad a project first."
-            )
+                f"config.mk not found at:\n{mk_path}\n\nLoad a project first.")
             return
-
         mk_text = _set_mk_value(mk_text, "GAME_VERSION",  self._game_version.currentText())
-        mk_text = _set_mk_value(mk_text, "GAME_REVISION",  self._game_revision.currentText())
-        mk_text = _set_mk_value(mk_text, "GAME_LANGUAGE",  self._game_language.currentText())
+        mk_text = _set_mk_value(mk_text, "GAME_REVISION", self._game_revision.currentText())
+        mk_text = _set_mk_value(mk_text, "GAME_LANGUAGE", self._game_language.currentText())
         mk_text = _set_mk_value(mk_text, "MODERN",   "1" if self._modern_cb.isChecked() else "0")
         mk_text = _set_mk_value(mk_text, "COMPARE",  "1" if self._compare_cb.isChecked() else "0")
         mk_text = _set_mk_value(mk_text, "KEEP_TEMPS", "1" if self._keep_temps_cb.isChecked() else "0")
@@ -525,20 +729,15 @@ class ConfigTabWidget(QWidget):
         h_path = os.path.join(self._project_dir, "include", "config.h")
         h_text = _read_file(h_path)
         if not h_text and not os.path.isfile(h_path):
-            QMessageBox.warning(
-                self, "Config",
-                f"include/config.h not found at:\n{h_path}"
-            )
+            QMessageBox.warning(self, "Config",
+                                f"include/config.h not found at:\n{h_path}")
             return
-
         h_text = _set_define_active(h_text, "NDEBUG", self._ndebug_cb.isChecked())
         h_text = _set_define_value(h_text, "LOG_HANDLER", self._log_handler.currentText())
         h_text = _set_define_value(h_text, "PRETTY_PRINT_HANDLER", self._pretty_print.currentText())
         _write_file(h_path, h_text)
 
-        # ── Battle economy macro + engine source patch ───────────────────
-        # Has its own writer that uses byte-equality guards and is
-        # idempotent — re-saving with the same value writes nothing.
+        # ── Battle economy macro + engine patch ──────────────────────────────
         try:
             from core.battle_economy_patch import write_prize_multiplier
             ok, msg = write_prize_multiplier(
@@ -546,22 +745,42 @@ class ConfigTabWidget(QWidget):
             if not ok:
                 QMessageBox.warning(self, "Battle Economy Patch", msg)
         except Exception as exc:
-            QMessageBox.warning(
-                self, "Battle Economy Patch",
-                f"Failed to apply prize-multiplier patch:\n{exc}")
+            QMessageBox.warning(self, "Battle Economy Patch",
+                                f"Failed to apply prize-multiplier patch:\n{exc}")
 
-        # ── Gender-tinted NPC dialogue patch ────────────────────────────
+        # ── Gender-tinted dialogue patch ──────────────────────────────────────
         try:
-            from core.text_coloring_patch import (
-                write_gender_dialogue_enabled)
+            from core.text_coloring_patch import write_gender_dialogue_enabled
             ok, msg = write_gender_dialogue_enabled(
                 self._project_dir, self._gender_dialogue_cb.isChecked())
             if not ok:
                 QMessageBox.warning(self, "Text & Dialogue Patch", msg)
         except Exception as exc:
-            QMessageBox.warning(
-                self, "Text & Dialogue Patch",
-                f"Failed to apply NPC dialogue color patch:\n{exc}")
+            QMessageBox.warning(self, "Text & Dialogue Patch",
+                                f"Failed to apply NPC dialogue color patch:\n{exc}")
+
+        # ── New-game starting values + run-indoors ────────────────────────────
+        try:
+            import core.new_game_config as ngc
+            ngc.set_starting_money(self._project_dir, self._money_spin.value())
+            map_const = self._loc_map.currentText().strip()
+            if map_const:
+                ngc.set_start_location(
+                    self._project_dir, map_const,
+                    self._loc_x.value(), self._loc_y.value())
+            ngc.set_national_dex(self._project_dir, self._dex_cb.isChecked())
+            ngc.set_run_indoors(self._project_dir, self._run_indoors_cb.isChecked())
+            ts = self._text_speed.currentData()
+            if ts:
+                ngc.set_default_text_speed(self._project_dir, ts)
+            bs = self._battle_style.currentData()
+            if bs:
+                ngc.set_default_battle_style(self._project_dir, bs)
+            ngc.set_pc_items(self._project_dir, self._pc_items.get_items())
+            ngc.set_bag_items(self._project_dir, self._bag_items.get_items())
+        except Exception as exc:
+            QMessageBox.warning(self, "New Game Config",
+                                f"Failed to write starting values:\n{exc}")
 
         self._dirty = False
         self._save_btn.setEnabled(False)

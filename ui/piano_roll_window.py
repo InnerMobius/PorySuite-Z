@@ -200,6 +200,20 @@ class PianoRollWindow(QMainWindow):
         self._btn_save.clicked.connect(self._on_save)
         toolbar.addWidget(self._btn_save)
 
+        toolbar.addSeparator()
+
+        self._btn_flatten = QPushButton("Flatten")
+        self._btn_flatten.setFixedWidth(70)
+        self._btn_flatten.setToolTip(
+            "Show + remove HIDDEN mid-song dynamics.\n\n"
+            "Imported MIDIs carry volume / tempo / vibrato / pan envelopes that\n"
+            "the piano roll can't show — so notes can play quieter or the tempo\n"
+            "can shift partway with no way to see or edit it. Click to see exactly\n"
+            "what this song carries, then optionally flatten each parameter to its\n"
+            "starting value for a constant song. Notes are never touched.")
+        self._btn_flatten.clicked.connect(self._on_flatten_dynamics)
+        toolbar.addWidget(self._btn_flatten)
+
         # ── Main area: sidebar + piano roll ──
         main_area = QHBoxLayout()
 
@@ -996,6 +1010,70 @@ class PianoRollWindow(QMainWindow):
         self._edit_label.setText("Saved")
         self._status.showMessage(f"Saved to {path}", 5000)
         return path
+
+    def _on_flatten_dynamics(self):
+        """Show + remove HIDDEN mid-song dynamics (volume / tempo / vibrato /
+        pan / bend envelopes the piano roll can't display). Imported MIDIs
+        carry these, so a song can play quieter or shift tempo partway with no
+        visible cause. Flattening locks each parameter to its tick-0 starting
+        value; notes are never touched. Saves immediately."""
+        from PyQt6.QtWidgets import QMessageBox
+        from core.sound import dynamics as DYN
+
+        lines = []
+        total = 0
+        for i, tr in enumerate(self._song.tracks):
+            counts = DYN.count_track_dynamics(tr)
+            n = DYN.total_mid_song_events(counts)
+            total += n
+            if n:
+                lines.append(f"    Track {i + 1}:   {DYN.describe_dynamics(counts)}")
+
+        if total == 0:
+            QMessageBox.information(
+                self, "Flatten Dynamics",
+                "Good news — this song has no hidden mid-song volume, tempo, or "
+                "vibrato changes. Nothing to flatten; what you see is what plays.")
+            return
+
+        body = "\n".join(lines)
+        resp = QMessageBox.question(
+            self, "Flatten Dynamics",
+            "This song carries hidden mid-song changes the piano roll can't "
+            "show (imported MIDIs bring these in):\n\n"
+            f"{body}\n\n"
+            "Flatten them? Each parameter locks to its STARTING value, so the "
+            "song plays at a constant volume / tempo / vibrato — no surprise dips "
+            "or shifts. Your notes are untouched. This saves immediately; use git "
+            "to undo if needed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        # Flatten the live song AND the open-time snapshot the save rebuilds
+        # mid-song controls from — otherwise _sync_notes_to_song would re-add
+        # the envelope from the stale snapshot.
+        DYN.flatten_song_dynamics(self._song)
+        for i in list(self._original_track_commands.keys()):
+            self._original_track_commands[i] = [
+                c for c in self._original_track_commands[i]
+                if not (c.tick > 0 and c.cmd in DYN.DYNAMICS_CMDS)]
+
+        try:
+            self.save_to_disk()
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Flatten Dynamics",
+                f"Flattened in memory, but saving failed:\n{exc}\n\n"
+                "Use File → Save to write it.")
+            return
+
+        QMessageBox.information(
+            self, "Flatten Dynamics",
+            f"Removed {total} hidden mid-song change(s) and saved. The song now "
+            "plays at constant volume / tempo / vibrato, and the committed .mid "
+            "matches what you see.")
 
     def _sync_notes_to_song(self):
         """Push piano roll notes back into the song's track command lists.

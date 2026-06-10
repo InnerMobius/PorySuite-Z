@@ -88,14 +88,20 @@ _PLACEHOLDER_MAX_BYTES = 30
 class SongIntegrityReport:
     """Result of a single sweep pass.
 
-    `regenerated`: list of song labels whose .mid was regenerated from .s.
+    `regenerated`: list of song labels whose .mid was regenerated from .s
+        (the .mid was a placeholder / empty).
+    `refreshed_stale`: labels whose real-content .mid DIVERGED from the .s
+        (same notes, different tempo/metadata — a stale render) and was
+        re-rendered from the .s so the committed .mid matches the source.
     `skipped_no_s`: songs whose .s file is missing entirely.
     `skipped_empty_s`: .s exists but has 0 tracks — nothing to regenerate.
-    `skipped_real_mid`: .mid has real content > 30 bytes — left alone.
+    `skipped_real_mid`: .mid has real content that matches the .s, OR is an
+        external/DAW composition (different notes) — left alone.
     `errors`: (label, exception_str) for songs that hit a parse/render error.
     `timestamps_locked`: True if the final mtime backdate pass ran.
     """
     regenerated: list[str] = field(default_factory=list)
+    refreshed_stale: list[str] = field(default_factory=list)
     skipped_no_s: list[str] = field(default_factory=list)
     skipped_empty_s: list[str] = field(default_factory=list)
     skipped_real_mid: list[str] = field(default_factory=list)
@@ -106,6 +112,8 @@ class SongIntegrityReport:
         bits = []
         if self.regenerated:
             bits.append(f"{len(self.regenerated)} regenerated")
+        if self.refreshed_stale:
+            bits.append(f"{len(self.refreshed_stale)} stale-refreshed")
         if self.errors:
             bits.append(f"{len(self.errors)} errored")
         if not bits:
@@ -162,34 +170,8 @@ def run_sweep(
             report.skipped_no_s.append(label)
             continue
 
-        # Decide whether the existing .mid is a placeholder that should
-        # be regenerated, or real content we should leave alone.
-        needs_regen = True
-        if os.path.isfile(mid_path):
-            try:
-                size = os.path.getsize(mid_path)
-            except OSError:
-                size = 0
-            if size > _PLACEHOLDER_MAX_BYTES:
-                # Real-sized .mid — leave alone unless it parses to zero
-                # notes (a too-large-but-still-empty edge case).  Avoid
-                # importing mido at the top level so this module stays
-                # fast to import.
-                if _mid_has_audible_content(mid_path):
-                    report.skipped_real_mid.append(label)
-                    needs_regen = False
-
-        if not needs_regen:
-            # Track newest .s mtime for the final cfg lock pass.
-            try:
-                s_mt = os.stat(s_path).st_mtime
-                if s_mt > newest_s_mtime:
-                    newest_s_mtime = s_mt
-            except OSError:
-                pass
-            continue
-
-        # Parse the .s and check it has tracks worth regenerating.
+        # Parse the .s up front — it is the authoritative source, and we
+        # need it both to detect a stale .mid and to (re)render one.
         try:
             song = parse_song_file(s_path)
         except Exception as exc:
@@ -207,18 +189,72 @@ def run_sweep(
             report.skipped_empty_s.append(label)
             continue
 
-        # Regenerate the .mid from the .s.  write_midi_file is byte-
-        # equality guarded so this is a no-op if the .mid is already
-        # current — that's the idempotency property we want.
+        # Decide whether the .mid needs (re)rendering.
+        #
+        #   • Missing / placeholder .mid (<=30 bytes or no notes) -> render
+        #     it from the .s (the original protection).
+        #
+        #   • Real-content .mid -> it is EITHER our own render (possibly
+        #     STALE: an old render still carrying tempo/metadata the .s no
+        #     longer has — exactly the mid-song-tempo "phantom edit" bug) OR
+        #     a genuine external/DAW composition.  Distinguish by NOTE
+        #     content: render the .s in memory and compare note events.
+        #       - notes MATCH but tempo DIVERGES -> it's our render gone
+        #         stale; refresh it from the .s so the committed .mid stops
+        #         carrying phantom tempo (mid2agb rebuilds a clean .s on a
+        #         fresh clone).  Safe: identical notes => no music is lost.
+        #       - notes MATCH and tempo matches -> already correct; leave it.
+        #       - notes DIFFER -> external composition; never touch it.
+        is_stale = False
+        needs_regen = True
+        if os.path.isfile(mid_path):
+            try:
+                size = os.path.getsize(mid_path)
+            except OSError:
+                size = 0
+            if size > _PLACEHOLDER_MAX_BYTES and _mid_has_audible_content(mid_path):
+                try:
+                    rendered = song_to_midi(song)
+                    notes_match, tempo_diverges = _compare_render_to_disk(
+                        rendered, mid_path)
+                except Exception as exc:
+                    # Conservative on any comparison error: leave the .mid.
+                    notes_match, tempo_diverges = False, False
+                    _log.warning("Integrity sweep: divergence check failed "
+                                 "for %s: %s", label, exc)
+                if notes_match and tempo_diverges:
+                    is_stale = True
+                    needs_regen = True
+                    _log.info(
+                        "Integrity sweep: %s.mid diverged from .s (same notes, "
+                        "stale tempo) — refreshing to kill phantom tempo", label)
+                else:
+                    # Matches the .s, or is an external/DAW .mid — leave alone.
+                    report.skipped_real_mid.append(label)
+                    needs_regen = False
+
+        if not needs_regen:
+            # Track newest .s mtime for the final cfg lock pass.
+            try:
+                s_mt = os.stat(s_path).st_mtime
+                if s_mt > newest_s_mtime:
+                    newest_s_mtime = s_mt
+            except OSError:
+                pass
+            continue
+
+        # (Re)render the .mid from the .s.  write_midi_file is byte-equality
+        # guarded, so an already-current .mid is a no-op.
         try:
             wrote = write_midi_file(song, mid_path)
             if wrote:
-                report.regenerated.append(label)
+                if is_stale:
+                    report.refreshed_stale.append(label)
+                else:
+                    report.regenerated.append(label)
                 _log.info(
-                    "Integrity sweep: regenerated %s.mid from %s.s",
-                    label, label)
-            else:
-                report.errors.append((label, "write_midi_file returned False"))
+                    "Integrity sweep: wrote %s.mid from %s.s", label, label)
+            # wrote == False => already byte-identical; nothing to record.
         except Exception as exc:
             report.errors.append((label, f"render failed: {exc}"))
             _log.warning("Integrity sweep: render failed for %s: %s",
@@ -240,7 +276,7 @@ def run_sweep(
     now = time.time()
     far_past = now - 3600
 
-    for label in report.regenerated:
+    for label in report.regenerated + report.refreshed_stale:
         mid_path = os.path.join(midi_dir, label + ".mid")
         if os.path.isfile(mid_path):
             try:
@@ -291,3 +327,49 @@ def _mid_has_audible_content(mid_path: str) -> bool:
             if msg.type == "note_on" and getattr(msg, "velocity", 0) > 0:
                 return True
     return False
+
+
+def _note_signature(mid) -> tuple:
+    """Multiset (sorted tuple) of (abs_tick, note) for every note_on with
+    velocity > 0, across all tracks.  Identifies a song's musical content
+    independent of tempo / control metadata."""
+    out = []
+    for track in mid.tracks:
+        t = 0
+        for msg in track:
+            t += msg.time
+            if msg.type == "note_on" and getattr(msg, "velocity", 0) > 0:
+                out.append((t, msg.note))
+    return tuple(sorted(out))
+
+
+def _tempo_signature(mid) -> tuple:
+    """Sorted tuple of (abs_tick, tempo_us) for every set_tempo event."""
+    out = []
+    for track in mid.tracks:
+        t = 0
+        for msg in track:
+            t += msg.time
+            if msg.type == "set_tempo":
+                out.append((t, msg.tempo))
+    return tuple(sorted(out))
+
+
+def _compare_render_to_disk(rendered_mid, on_disk_path: str) -> tuple[bool, bool]:
+    """Compare an in-memory render of the .s against the on-disk .mid.
+
+    Returns (notes_match, tempo_diverges):
+      • notes_match   — identical note_on content (musically the same song).
+      • tempo_diverges — the set_tempo events differ (phantom / stale tempo).
+
+    On any load failure returns (False, False) so the caller leaves the .mid
+    untouched — we never trash a .mid we can't read.
+    """
+    try:
+        import mido
+        disk = mido.MidiFile(on_disk_path)
+    except Exception:
+        return (False, False)
+    notes_match = _note_signature(rendered_mid) == _note_signature(disk)
+    tempo_diverges = _tempo_signature(rendered_mid) != _tempo_signature(disk)
+    return (notes_match, tempo_diverges)

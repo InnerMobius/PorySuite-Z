@@ -250,6 +250,7 @@ from ui.trainer_class_editor import (
     write_facility_pic_mapping,
 )
 from ui.trainer_graphics_tab import TrainerGraphicsTab
+from ui.trainer_back_sprite_tab import TrainerBackSpriteTab
 from ui.overworld_graphics_tab import OverworldGraphicsTab
 from ui.battle_anim_tab import BattleAnimTab
 from ui.pokedex_detail_panel import PokedexDetailPanel
@@ -390,6 +391,9 @@ class MainWindow(QMainWindow):
         self.trainer_graphics_tab = TrainerGraphicsTab()
         self.trainer_graphics_tab.modified.connect(self._on_trainer_graphics_edited)
 
+        self.trainer_back_sprite_tab = TrainerBackSpriteTab()
+        self.trainer_back_sprite_tab.modified.connect(self._on_trainer_graphics_edited)
+
         # Tab switcher: Trainers / Trainer Classes / Graphics
         _TRAINER_TAB_SS = """
 QTabWidget::pane {
@@ -422,6 +426,7 @@ QTabBar::tab:hover:!selected {
         self._trainers_tab_switcher.addTab(self.trainers_editor, "Trainers")
         self._trainers_tab_switcher.addTab(self.trainer_class_editor, "Trainer Classes")
         self._trainers_tab_switcher.addTab(self.trainer_graphics_tab, "Graphics")
+        self._trainers_tab_switcher.addTab(self.trainer_back_sprite_tab, "Back Sprites")
         self.ui.tab_trainers_grid.addWidget(self._trainers_tab_switcher, 0, 0, 1, 1)
 
         # Initialize instance variables
@@ -9365,6 +9370,12 @@ QTabBar::tab:hover:!selected {
                 except Exception:
                     pass
 
+                # Load the trainer back-sprite tab (parses back pics itself).
+                try:
+                    self.trainer_back_sprite_tab.load(root)
+                except Exception:
+                    pass
+
                 # Also load the trainer class editor. Normally we skip reload
                 # when there are unsaved edits (protecting against non-refresh
                 # reloads clobbering the user's in-progress work) — but the
@@ -9461,6 +9472,20 @@ QTabBar::tab:hover:!selected {
 
     def _save_trainer_graphics(self):
         """Flush TrainerGraphicsTab palette edits to .pal files on disk."""
+        # Back sprites share this save trigger — flush them first, independent
+        # of whether the front-pic tab has unsaved edits (else the front's
+        # early-return below would skip the back-sprite save).
+        try:
+            if self.trainer_back_sprite_tab.has_unsaved_changes():
+                _bok, _berrs = self.trainer_back_sprite_tab.flush_to_disk()
+                if _berrs:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "_save_trainer_back_sprites errors: %s", _berrs)
+        except Exception as _bexc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "_save_trainer_back_sprites: %s", _bexc)
         if not self.trainer_graphics_tab.has_unsaved_changes():
             return
         try:
