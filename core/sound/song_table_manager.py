@@ -416,8 +416,11 @@ def rename_song(
         with open(old_s, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Replace the old label with the new one (assembly labels)
-        content = content.replace(old_label, new_label)
+        # Replace the old label with the new one (assembly labels) on word
+        # boundaries only — a bare substring replace would also corrupt labels
+        # that embed the name (e.g. renaming "mus_x" hitting "mus_x_intro").
+        import re as _re
+        content = _re.sub(r'\b' + _re.escape(old_label) + r'\b', new_label, content)
 
         # Write to new file (or same if name didn't change)
         with open(new_s, 'w', encoding='utf-8') as f:

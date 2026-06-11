@@ -111,6 +111,24 @@ _REGENERATE_FROM_VALUE = {
 }
 
 
+def _preserve_raw(cmd) -> bool:
+    """Emit ``cmd.raw_line`` verbatim instead of regenerating from ``cmd.value``?
+
+    True for any non-editable command that has a raw_line (structural fidelity),
+    AND for an editable control whose value is UNCHANGED since parse. The latter
+    stops a no-op save from drifting a scaled control's bytes — the parser
+    truncates ``VOL , 95*mvl/mxv`` to 74 and a naive regen rounds back to 94, so
+    the source silently changed 95 -> 94. Keeping the original line when the
+    value wasn't touched eliminates that phantom edit; an actually-edited control
+    (value != parsed_value) still regenerates from its new value.
+    """
+    if not cmd.raw_line:
+        return False
+    if cmd.cmd not in _REGENERATE_FROM_VALUE:
+        return True
+    return cmd.parsed_value is not None and cmd.value == cmd.parsed_value
+
+
 def _write_track(
     track: Track,
     song: SongData,
@@ -159,15 +177,14 @@ def _write_track_raw(track: Track, song: SongData) -> list[str]:
 
     Falls back to generating commands for any command without a raw_line.
 
-    EXCEPTION: editable control commands (`_REGENERATE_FROM_VALUE` below)
-    are ALWAYS regenerated from `cmd.value`, even when a raw_line is
-    present.  The piano roll's instrument/volume/pan/etc. handlers
-    update `cmd.value` in place but leave `cmd.raw_line` stale — without
-    this carve-out, a user changing VOICE from 53 to 0 in the sidebar
-    sees the .s emit the old "VOICE , 53" raw_line on save, undoing
-    their change.  The .mid (which always reads `cmd.value`) ends up
-    correct, so the two files disagree.  Forcing regeneration here
-    keeps them in sync.
+    Editable control commands (`_REGENERATE_FROM_VALUE` below) regenerate from
+    `cmd.value` ONLY when the value was actually edited.  The piano roll's
+    instrument/volume/pan/etc. handlers update `cmd.value` in place but leave
+    `cmd.raw_line` stale — so a user changing VOICE 53 -> 0 must re-emit from the
+    value, not the old "VOICE , 53" raw_line, or the .s and .mid disagree.  But
+    when the value is UNCHANGED, the raw_line is kept verbatim (see
+    `_preserve_raw`) so a no-op save doesn't drift a scaled control's bytes
+    (e.g. VOL 95*mvl/mxv -> 94*mvl/mxv from parse-truncate vs write-round).
     """
     lines = []
     last_note_dur = None
@@ -177,7 +194,9 @@ def _write_track_raw(track: Track, song: SongData) -> list[str]:
     ticks_per_measure = 96  # 4 beats * 24 ticks
 
     for cmd in track.commands:
-        if cmd.raw_line and cmd.cmd not in _REGENERATE_FROM_VALUE:
+        # Unchanged controls keep their exact source line; only an EDITED control
+        # regenerates from cmd.value (see _preserve_raw — avoids VOL/PAN drift).
+        if _preserve_raw(cmd):
             lines.append(cmd.raw_line.rstrip())
             continue
         if cmd.cmd in _REGENERATE_FROM_VALUE:
@@ -292,9 +311,9 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
     for cmd in setup_cmds:
         if cmd.cmd == 'KEYSH':
             continue  # Already written
-        # Editable controls regenerate from cmd.value regardless of
-        # raw_line — see comment on _REGENERATE_FROM_VALUE above.
-        if cmd.raw_line and cmd.cmd not in _REGENERATE_FROM_VALUE:
+        # Unchanged controls keep their exact source line; only an EDITED control
+        # regenerates from cmd.value (see _preserve_raw — avoids VOL/PAN drift).
+        if _preserve_raw(cmd):
             lines.append(cmd.raw_line.rstrip())
         elif cmd.cmd == 'TEMPO':
             raw_t = _raw_tempo(cmd.value or 120, song.tempo_base)
@@ -365,13 +384,14 @@ def _write_track_linear(track: Track, song: SongData) -> list[str]:
             lines.append('\t.byte\tFINE')
         elif cmd.cmd in ('VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR',
                           'LFOS', 'MODT', 'TUNE'):
-            # Skip redundant control commands (same value as last emitted)
-            if cmd.value is not None and _last_control.get(cmd.cmd) == cmd.value:
-                continue
-            # Editable controls regenerate from cmd.value — see comment
-            # on _REGENERATE_FROM_VALUE above for the bug rationale.
-            if cmd.raw_line and cmd.cmd not in _REGENERATE_FROM_VALUE:
+            # An UNCHANGED parsed control is emitted verbatim and never deduped
+            # away — dropping a real source line would dirty the .s on a no-op
+            # save. Only regenerated (newly-composed / edited) controls get the
+            # redundant-value skip.
+            if _preserve_raw(cmd):
                 lines.append(cmd.raw_line.rstrip())
+            elif cmd.value is not None and _last_control.get(cmd.cmd) == cmd.value:
+                continue  # redundant with the last emitted value — skip
             else:
                 lines.extend(_format_control(cmd, song))
             if cmd.value is not None:

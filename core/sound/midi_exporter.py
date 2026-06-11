@@ -116,7 +116,10 @@ def song_to_midi(song: SongData) -> mido.MidiFile:
 
     cond_events: list[tuple[int, mido.MetaMessage]] = [
         (t, mido.MetaMessage('set_tempo', tempo=us, time=0)) for t, us in pruned]
-    if loop_start is not None and loop_end is not None:
+    # Only emit loop markers for a valid forward span — a mis-paired GOTO/LABEL
+    # (start >= end) would put ']' before '[' and make mid2agb rebuild the wrong
+    # loop on a fresh clone. Bail rather than emit a broken loop.
+    if loop_start is not None and loop_end is not None and 0 <= loop_start < loop_end:
         cond_events.append(
             (loop_start, mido.MetaMessage('marker', text='[', time=0)))
         cond_events.append(

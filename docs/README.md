@@ -1,6 +1,6 @@
 # PorySuite-Z
 
-A unified PyQt6 editor for **pokefirered** decomp projects. Data editing (species, items, moves, trainers, abilities), event/script editing (NPCs, triggers, signs, map scripts), sound editing (songs, instruments, voicegroups, piano roll), overworld sprite editing, and Porymap integration — all in one window with an RPG Maker XP-style toolbar.
+A unified PyQt6 editor for **pokefirered** decomp projects. Data editing (species, items, moves, trainers, abilities), event/script editing (NPCs, triggers, signs, map scripts), sound editing (songs, instruments, voicegroups, piano roll), overworld sprite editing, battle-animation editing, and Porymap integration — all in one window with an RPG Maker XP-style toolbar.
 
 All edits are written back into the project's canonical `src/`, `include/`, and `data/` files so `make` builds stay stable.
 
@@ -47,7 +47,7 @@ The Project Selector keeps a recent-projects list — hover any entry for a path
 
 ## Editor Pages
 
-PorySuite-Z has 18 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
+PorySuite-Z has 19 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
 
 ### Pokemon
 
@@ -95,11 +95,12 @@ Searchable ability browser with detail panel:
 
 ### Trainers
 
-Three sub-tabs:
+Four sub-tabs:
 
 - **Trainers** -- Searchable trainer list grouped by trainer class. Detail editor includes: class, name, trainer pic (with visual preview), encounter music, AI flags, party type, and a full party editor with per-member level, species, held item, moves, and ability. VS Seeker rematch tier support with dynamic tier labels that refresh in-place when you edit a rematch party.
 - **Trainer Classes** -- Searchable class list with sprite thumbnails. Edit class display name (12-character limit), prize money multiplier, and default sprite (dropdown with thumbnails of all trainer pics). **Rename...** button writes the new `TRAINER_CLASS_*` constant across source files (opponents.h, trainers.h, battle_main.c, trainer_class_names.h, data/trainers.json, scripts, maps). Create new classes with a button that writes to three files. View battle info, encounter music, facility class mappings, and usage counts. Inline note under the class-level Trainer Pic explains it's scoped to Battle Tower / Trainer Tower / Union Room facility battles only.
 - **Graphics** -- Scrollable card grid of every trainer pic (thumbnail + name + `TRAINER_PIC_*` constant) with a live search filter, amber border on unsaved cards, and blue border on the selected card. Right panel has a 192x192 sprite preview, the same drag-to-reorder 16-swatch palette row used on Pokemon Graphics (drop on the leftmost slot to pick the transparent index — the sprite PNG is reindexed automatically on save), **Import PNG as Sprite...** (replaces pixels AND palette), **Import Palette from PNG**, **Import .pal File**, **Save Sprite as PNG**, **Save Palette as .pal**, and **Open Palettes Folder**. The **Add Trainer Pic** button takes a name and a PNG and registers a brand-new trainer pic across all four engine source files in one operation — the new constant is immediately available in the trainer detail panel and the trainer-class default-sprite dropdown without a restart. The body uses a draggable splitter so the grid and editor can be rebalanced, and both panels stay visible when the window isn't maximized.
+- **Back Sprites** -- Dedicated editor for trainer **back** sprites (the throwing pose shown when a trainer sends out a Pokemon). Same PNG-import and drag-to-reorder palette toolkit as the front Graphics tab, plus the animated throwing sequence previewed with a play button and frame scrubber. **Add Back Sprite** registers a brand-new back sprite (name + PNG) across the engine source files in one operation.
 
 ![Trainers](trainers.png)
 
@@ -125,6 +126,18 @@ Browse and edit the engine's in-world feedback sprites (exclamation marks, music
 
 ![Overworld GFX](overworld.png)
 
+### Battle Animations
+
+Editor for the GBA battle move/effect animations, with two sub-tabs:
+
+**Sprites:**
+- Browse every battle-animation sprite (the effect graphics moves draw — beams, orbs, impacts, status icons) in a searchable thumbnail grid.
+- Frame preview plus the same drag-to-reorder 16-swatch palette editor used across the app (drop on the leftmost slot to choose the transparent index; the sprite is reindexed on save). Import/export, amber dirty markers, and every edit routed through the shared sprite-palette bus so other tabs stay in sync.
+
+**Move Animations:**
+- Pick any move and see its animation **script timeline** -- the real `createsprite` / sound / `delay` / task / background opcodes the engine runs, decoded into a readable, **editable** list. Add, insert, delete, and reorder commands, with per-opcode edit dialogs (a sprite-picker for `createsprite`, a sound picker for SFX, generic fields for the rest).
+- **Frame-accurate preview** -- rather than approximating, PorySuite-Z runs the *actual* pokefirered battle-animation engine (compiled to WebAssembly and driven by the project's own sprite and palette data) and renders its OAM output frame by frame. A scrubber steps through the animation and the layered composite shows every active sprite at the selected frame. Covers move animations plus the status / general / special tables, on-mon effects (Dig, Fly, Bulk Up, Acid Armor's distortion, Role Play's silhouette), and full-screen background moves (Surf). If the WebAssembly runtime isn't installed the tab degrades gracefully -- the Setup Wizard offers to add it.
+
 ### Credits
 
 Visual credits editor. Edit the scrolling end credits text with line-by-line character limits and color coding, with a live in-game preview panel.
@@ -140,9 +153,11 @@ Full GBA M4A sound engine built in Python. Four sub-tabs:
 - **Songs** -- Browse, filter, and play all songs. Tempo, reverb, and master volume are editable directly on the songs list — no need to open the piano roll. Right-click context menu: Rename, Replace with .s File, Export .s File, Delete. Import MIDI and Import .s buttons. Shows "Build required" when `.s` files are missing (e.g. after a fresh git pull).
 - **Instruments** -- 144 unique instruments grouped by type (Samples, Square Waves, Prog. Waves, Noise, Keysplits). Editable ADSR with visual curve, base key, pan, duty cycle. 3-octave piano keyboard preview with hold-to-sustain. Sample management: export/import WAV (with rate/size picker), replace, delete with reference checking. Loop toggle and loop point editor with draggable waveform visualization. `.psinst` instrument preset export/import (zip with JSON manifest + sample data).
 - **Voicegroups** -- Browse all voicegroups with slot counts and song usage. Full 128-slot editor. Add, clone, delete. Generate GM button creates a General MIDI voicegroup mapped to real instruments (with drum kit support). Friendly label system with auto-label from song usage.
-- **Piano Roll** -- Full note editor with real-time GBA-accurate sequencer playback. Double-click to place notes, drag to move/resize, box selection, copy/paste, Ctrl+Z undo. Track sidebar with volume/pan/mute/solo per track. Song Structure panel showing sections, loops, and patterns. Snap grid (1/4, 1/8, 1/16, 1/32, free). Right-click note → Edit Note Properties (BEND/VOL/PAN control events). Scroll wheel = horizontal scroll, Ctrl+wheel = zoom, middle-click drag = zoom. Save writes .s file directly with round-trip fidelity.
+- **Piano Roll** -- Full note editor with real-time GBA-accurate sequencer playback. Double-click to place notes, drag to move/resize, box selection, copy/paste, Ctrl+Z undo. Track sidebar with volume/pan/mute/solo per track. Song Structure panel showing sections, loops, and patterns. Snap grid (1/4, 1/8, 1/16, 1/32, free). Right-click note → Edit Note Properties (BEND/VOL/PAN control events). Scroll wheel = horizontal scroll, Ctrl+wheel = zoom, middle-click drag = zoom. **Flatten Dynamics** lists and removes hidden mid-song control envelopes (the volume / tempo / vibrato dips a note-only roll can't show) so a song plays at a constant volume and tempo. Save writes .s file directly with round-trip fidelity.
 
 **MIDI Import Wizard** -- 5-page flow: file picker with track preview, voicegroup + settings, per-track instrument mapping (GM to VG slot with auto-match and named dropdowns), song structure sequencer (define sections, arrange play order, set loop point with presets), conversion + registration. Handles Type 0 MIDIs (auto-splits to per-channel tracks).
+
+The track step is **honest about GBA voice limits**. It analyzes the song's *peak simultaneous notes* (not just track count) and shows a live meter against the project's real PCM voice budget (read from the M4A SoundInfo), the 4 PSG channels, and the 16-track cap. Every track gets an import checkbox and a PCM/PSG voice assignment; duplicate instruments can be **merged** onto one track; chords can be flattened to the top note or split into voices (with the voice cost shown live); and a MIDI that exceeds the budget raises a blocking-but-acknowledgeable warning so you trim or offload to PSG rather than silently importing a song that plays with stolen voices. Unchecking and merging actually reshape the imported song, not just the meter.
 
 **Import .s File** -- Import songs from other projects. 3-page wizard with voicegroup compatibility check, automatic label rewrite, and registration.
 
@@ -312,8 +327,10 @@ ROM build diagnostics dashboard. Shows ROM size (progress bars for 16MB and 32MB
 
 Edit build configuration (`config.mk`) and game defines (`include/config.h`). Makefile variables and C preprocessor `#define` values are organized into collapsible section cards with toggle support.
 
-Beyond the standard build flags, the Config tab also exposes a few engine-level tunables that are otherwise buried in source:
+Beyond the standard build flags, the Config tab also exposes new-game setup and a few engine-level tunables that are otherwise buried in source:
 
+- **New Game setup** -- Starting money, starting location (map + X/Y coordinates), whether the National Dex is unlocked from the start, the player's starting bag items and PC items, and the default **Text Speed** and **Battle Style** -- written into `new_game.c` / `player_pc.c` so a fresh save begins exactly as configured.
+- **Run Indoors** -- Let the player run inside buildings (vanilla pokefirered disables it). Reversible.
 - **Trainer Prize Base Multiplier** -- changes the base scalar used for trainer prize money. Custom-economy projects no longer need to hand-edit `battle_main.c` (and don't risk a regression from a `git pull` resetting it).
 - **Gender-Tinted NPC Dialogue** -- vanilla pokefirered auto-tints NPC dialogue based on the talked-to NPC's overworld graphic (male sprites speak in blue, female sprites in red, neutral / object / Pokemon sprites stay dark gray). Toggle this off in projects that don't want the tint. The patch is idempotent and reversible — flipping it back on restores the canonical vanilla function.
 

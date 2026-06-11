@@ -166,7 +166,13 @@ def read_midi_info(midi_path: str) -> MidiFileInfo:
 
     info.time_sig_num = ts_num
     info.time_sig_den = ts_den
-    ticks_per_measure = mid.ticks_per_beat * ts_num * (4 // ts_den) if ts_den else mid.ticks_per_beat * 4
+    # ticks/measure = TPB * 4 * (num/den). Use real division so denominators
+    # other than 4 (6/8, 7/8, …) don't collapse to zero via integer floor and
+    # crash the measure count with a divide-by-zero.
+    if ts_den:
+        ticks_per_measure = max(1, round(mid.ticks_per_beat * 4 * ts_num / ts_den))
+    else:
+        ticks_per_measure = mid.ticks_per_beat * 4
     info.total_measures = max(1, -(-total_ticks // ticks_per_measure))  # ceiling division
 
     return info
@@ -329,6 +335,59 @@ def _deduplicate_simultaneous_notes(mid: mido.MidiFile) -> mido.MidiFile:
         out.tracks.append(mido.MidiTrack(clean))
 
     return out
+
+
+def process_midi_for_import(src_path, keep_channels, merge_map, out_path):
+    """Rewrite a MIDI to honour the import wizard's track selection, then return
+    `out_path`.
+
+    keep_channels: set of 1-based MIDI channels to import (others are dropped).
+    merge_map: {source_1based: target_1based} — the source channel's notes are
+        folded onto the target channel, so a merged duplicate group becomes one
+        M4A track. Global meta (tempo / time-sig) is kept on a conductor track.
+
+    mid2agb's per-channel dedupe (run later) flattens any overlap a merge
+    creates — M4A is monophonic per track — so a merged track costs one voice.
+    """
+    mid = mido.MidiFile(src_path)
+    keep0 = {c - 1 for c in keep_channels}
+    remap0 = {s - 1: t - 1 for s, t in (merge_map or {}).items()}
+    conductor: list = []
+    by_chan: dict[int, list] = {}
+    for track in mid.tracks:
+        t = 0
+        for msg in track:
+            t += msg.time
+            ch = getattr(msg, "channel", None)
+            if ch is None:
+                if msg.is_meta and msg.type != "end_of_track":
+                    conductor.append(msg.copy(time=t))
+                continue
+            if ch not in keep0:
+                continue
+            eff = remap0.get(ch, ch)
+            m2 = msg.copy(time=t)
+            try:
+                m2.channel = eff
+            except (AttributeError, ValueError):
+                pass
+            by_chan.setdefault(eff, []).append(m2)
+
+    out = mido.MidiFile(type=1, ticks_per_beat=mid.ticks_per_beat)
+    conductor.sort(key=lambda m: m.time)
+    _abs_to_delta(conductor)
+    if not any(m.type == "end_of_track" for m in conductor):
+        conductor.append(mido.MetaMessage("end_of_track", time=0))
+    out.tracks.append(mido.MidiTrack(conductor))
+    for ch in sorted(by_chan):
+        msgs = by_chan[ch]
+        msgs.sort(key=lambda m: m.time)
+        _abs_to_delta(msgs)
+        if not any(m.type == "end_of_track" for m in msgs):
+            msgs.append(mido.MetaMessage("end_of_track", time=0))
+        out.tracks.append(mido.MidiTrack(msgs))
+    out.save(out_path)
+    return out_path
 
 
 def run_mid2agb(

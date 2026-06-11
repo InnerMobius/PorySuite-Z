@@ -330,16 +330,21 @@ def _mid_has_audible_content(mid_path: str) -> bool:
 
 
 def _note_signature(mid) -> tuple:
-    """Multiset (sorted tuple) of (abs_tick, note) for every note_on with
-    velocity > 0, across all tracks.  Identifies a song's musical content
-    independent of tempo / control metadata."""
+    """Multiset (sorted tuple) of (abs_tick, note, channel) for every note_on
+    with velocity > 0, across all tracks.  Identifies a song's musical content
+    independent of tempo / control metadata.
+
+    Channel is part of the signature so two songs with identical notes but
+    different per-channel instrument routing are NOT judged the same song — the
+    sweep must never refresh (overwrite) a .mid whose notes are routed onto
+    different channels than our own render (e.g. a hand-made / DAW .mid)."""
     out = []
     for track in mid.tracks:
         t = 0
         for msg in track:
             t += msg.time
             if msg.type == "note_on" and getattr(msg, "velocity", 0) > 0:
-                out.append((t, msg.note))
+                out.append((t, msg.note, getattr(msg, "channel", -1)))
     return tuple(sorted(out))
 
 

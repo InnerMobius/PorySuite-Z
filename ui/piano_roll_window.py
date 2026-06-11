@@ -1216,9 +1216,6 @@ class PianoRollWindow(QMainWindow):
                 modulation=modulation,
             )
 
-    def has_unsaved_changes(self) -> bool:
-        return self._is_dirty
-
     def closeEvent(self, event):
         if self._is_dirty:
             box = QMessageBox(self)

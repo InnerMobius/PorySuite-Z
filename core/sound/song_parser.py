@@ -34,6 +34,15 @@ class TrackCommand:
     value: Optional[int] = None  # generic integer arg (VOICE number, VOL, etc.)
     target_label: Optional[str] = None  # for GOTO/PATT: the label reference
     raw_line: str = ''           # original source line for round-trip fidelity
+    parsed_value: Optional[int] = None  # value captured at parse time (see __post_init__)
+
+    def __post_init__(self):
+        # Snapshot the parse-time value. If the UI later edits `value`, this
+        # stays put — letting the writer emit the EXACT original `raw_line` for
+        # an UNCHANGED editable control (so VOL/PAN/etc. don't drift on a no-op
+        # save) and regenerate only when the value actually changed.
+        if self.parsed_value is None:
+            self.parsed_value = self.value
 
 
 @dataclass
@@ -650,5 +659,7 @@ def parse_all_songs(songs_dir: str) -> dict[str, SongData]:
                 if song.label:
                     results[song.label] = song
             except Exception as e:
-                print(f"Warning: failed to parse {filename}: {e}")
+                import logging
+                logging.getLogger("SoundEditor.SongParser").warning(
+                    "failed to parse %s: %s", filename, e)
     return results

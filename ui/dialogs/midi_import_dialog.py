@@ -513,20 +513,63 @@ class MidiImportDialog(QDialog):
         self._midi_summary.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(self._midi_summary)
 
-        tracks_group = QGroupBox("Tracks in this MIDI")
+        tracks_group = QGroupBox("Tracks  —  check the ones to import, and set each track's voice")
         tracks_layout = QVBoxLayout(tracks_group)
 
         self._track_tree = QTreeWidget()
-        self._track_tree.setHeaderLabels(["Ch", "Name", "Instrument", "Notes", "Range"])
+        self._track_tree.setHeaderLabels(
+            ["Import", "Ch", "Name", "Instrument", "Notes", "Poly", "Voice"])
         self._track_tree.setRootIsDecorated(False)
         self._track_tree.setAlternatingRowColors(True)
         header = self._track_tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in (0, 1, 4, 5, 6):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self._track_tree.itemChanged.connect(self._on_budget_changed)
         tracks_layout.addWidget(self._track_tree)
+
+        # ── Live voice-budget meter + chord handling ──
+        meter_row = QHBoxLayout()
+        self._meter_label = QLabel("")
+        self._meter_label.setTextFormat(Qt.TextFormat.RichText)
+        self._meter_label.setWordWrap(True)
+        meter_row.addWidget(self._meter_label, 1)
+        meter_row.addWidget(QLabel("Chords:"))
+        self._chord_combo = QComboBox()
+        self._chord_combo.addItems(["Flatten to top note", "Split into voices"])
+        self._chord_combo.setToolTip(
+            "Flatten: a chordal track plays one note at a time — one voice "
+            "(mid2agb's default).\n"
+            "Split: each chord note gets its own voice — truer, but uses more of "
+            "the voice budget.")
+        install_scroll_guard(self._chord_combo)
+        self._chord_combo.currentIndexChanged.connect(self._on_budget_changed)
+        meter_row.addWidget(self._chord_combo)
+        tracks_layout.addLayout(meter_row)
+
+        dup_row = QHBoxLayout()
+        self._dup_label = QLabel("")
+        self._dup_label.setStyleSheet("color: #d8a13a; font-size: 10px;")
+        self._dup_label.setWordWrap(True)
+        dup_row.addWidget(self._dup_label, 1)
+        self._merge_btn = QPushButton("Merge duplicates")
+        self._merge_btn.setEnabled(False)
+        self._merge_btn.setToolTip(
+            "Fold each duplicate-instrument group onto one track — frees track "
+            "slots, and lowers the peak wherever the copies overlap.")
+        self._merge_btn.clicked.connect(self._on_merge_duplicates)
+        dup_row.addWidget(self._merge_btn)
+        tracks_layout.addLayout(dup_row)
+
+        psg_note = QLabel(
+            "Voice = PCM or a PSG channel. PSG here plans the budget; to actually "
+            "play a part on PSG, give that track a square / wave / noise "
+            "instrument on the Mapping page.")
+        psg_note.setStyleSheet("color: #777; font-size: 9px;")
+        psg_note.setWordWrap(True)
+        tracks_layout.addWidget(psg_note)
+
         layout.addWidget(tracks_group, 1)
 
         name_group = QGroupBox("Song Name")
@@ -1325,6 +1368,8 @@ class MidiImportDialog(QDialog):
                 QMessageBox.warning(self, "No MIDI",
                                     "Please select a MIDI file first.")
                 return
+            if not self._voice_overflow_gate():
+                return
             self._stack.setCurrentIndex(_PAGE_SETTINGS)
             self._btn_back.setVisible(True)
             self._btn_next.setText("Next")
@@ -1392,19 +1437,69 @@ class MidiImportDialog(QDialog):
         )
 
         self._track_tree.clear()
-        note_names = ["C", "C#", "D", "D#", "E", "F",
-                      "F#", "G", "G#", "A", "A#", "B"]
-        for t in info.tracks:
-            lo = f"{note_names[t.note_min % 12]}{t.note_min // 12 - 1}" if t.note_count else "-"
-            hi = f"{note_names[t.note_max % 12]}{t.note_max // 12 - 1}" if t.note_count else "-"
-            item = QTreeWidgetItem([
-                str(t.channel), t.name, t.instrument_name,
-                str(t.note_count),
-                f"{lo} - {hi}" if t.note_count else "-",
-            ])
-            if t.is_drums:
-                item.setToolTip(2, "Drums channel (MIDI channel 10)")
-            self._track_tree.addTopLevelItem(item)
+        self._budget_rows = []
+        from core.sound.midi_polyphony import (
+            analyze_polyphony, find_duplicate_instruments, read_voice_limits)
+        try:
+            self._poly_report = analyze_polyphony(path)
+        except Exception:
+            self._poly_report = None
+        self._voice_limits = read_voice_limits(self._project_root)
+        dups = find_duplicate_instruments(info.tracks)
+        dup_channels = {ch for chs in dups.values() for ch in chs}
+        prog_name = {t.instrument_num: t.instrument_name for t in info.tracks}
+
+        self._budget_loading = True
+        try:
+            for t in info.tracks:
+                cp = (self._poly_report.per_channel.get(t.channel)
+                      if self._poly_report else None)
+                chord = cp.chord_peak if cp else 1
+                item = QTreeWidgetItem([
+                    "", str(t.channel), t.name, t.instrument_name,
+                    str(t.note_count), (f"{chord}-note" if chord > 1 else "mono"), "",
+                ])
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Checked)
+                if t.is_drums:
+                    item.setToolTip(3, "Drums (MIDI channel 10)")
+                if t.channel in dup_channels:
+                    item.setForeground(3, QColor("#d8a13a"))
+                    item.setToolTip(3, "Duplicate instrument — merge candidate")
+                if chord > 1:
+                    item.setForeground(5, QColor("#cc8"))
+                    item.setToolTip(5, f"{chord} notes sound at once on this track")
+                self._track_tree.addTopLevelItem(item)
+                combo = QComboBox()
+                combo.addItems(["PCM", "PSG square1", "PSG square2",
+                                "PSG wave", "PSG noise"])
+                combo.setToolTip(
+                    "Which voice this track uses. PCM = a sampled (DirectSound) "
+                    "voice; PSG = a hardware channel. Offloading a simple part to "
+                    "PSG frees a PCM voice (watch the budget below).")
+                install_scroll_guard(combo)
+                combo.currentIndexChanged.connect(self._on_budget_changed)
+                self._track_tree.setItemWidget(item, 6, combo)
+                self._budget_rows.append({
+                    "channel": t.channel, "cp": cp, "item": item,
+                    "combo": combo, "is_drums": t.is_drums, "chord": chord})
+        finally:
+            self._budget_loading = False
+
+        if dups:
+            bits = [f"{prog_name.get(p, 'prog ' + str(p))} ×{len(chs)} "
+                    f"(ch {', '.join(map(str, chs))})" for p, chs in dups.items()]
+            self._dup_label.setText(
+                "Duplicate instruments: " + ";  ".join(bits)
+                + "  — consider merging or dropping a copy to save voices.")
+        else:
+            self._dup_label.setText("")
+
+        self._dups = dups
+        self._merge_map = {}
+        self._merge_btn.setText("Merge duplicates")
+        self._merge_btn.setEnabled(bool(dups))
+        self._update_voice_meter()
 
         # Auto-suggest name
         base = os.path.splitext(os.path.basename(path))[0]
@@ -1433,6 +1528,158 @@ class MidiImportDialog(QDialog):
         else:
             self._name_status.setText(err)
             self._name_status.setStyleSheet("color: #c44; font-size: 10px;")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Voice budget
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _on_budget_changed(self, *args):
+        if getattr(self, "_budget_loading", False):
+            return
+        self._update_voice_meter()
+
+    def _voice_budget_state(self) -> dict:
+        from core.sound.midi_polyphony import combined_peak, PSG_CHANNELS
+        rows = getattr(self, "_budget_rows", [])
+        lim = getattr(self, "_voice_limits", None)
+        flatten = (self._chord_combo.currentIndex() == 0)
+        from core.sound.midi_polyphony import merge_polys
+        merge_map = getattr(self, "_merge_map", {}) or {}
+        pcm_polys, track_count, chordal_on_psg = [], 0, []
+        psg_use = {k: [] for k in PSG_CHANNELS}
+        # Group checked rows by their effective (merge-target) channel, so a
+        # merged duplicate group counts as one track with combined polyphony.
+        groups: dict = {}
+        for r in rows:
+            if r["item"].checkState(0) != Qt.CheckState.Checked:
+                continue
+            tgt = merge_map.get(r["channel"], r["channel"])
+            groups.setdefault(tgt, []).append(r)
+        for tgt, grp in groups.items():
+            polys = [r["cp"] for r in grp if r["cp"]]
+            eff = (merge_polys(polys, tgt) if len(polys) > 1
+                   else (polys[0] if polys else None))
+            chord = eff.chord_peak if eff else 1
+            split = (not flatten) and chord > 1
+            track_count += chord if split else 1
+            tgt_row = next((r for r in grp if r["channel"] == tgt), grp[0])
+            voice = tgt_row["combo"].currentText()
+            if voice == "PCM":
+                if eff:
+                    pcm_polys.append(eff)
+            else:
+                psg_use.setdefault(voice.replace("PSG ", ""), []).append(tgt)
+                if chord > 1:
+                    chordal_on_psg.append(tgt)
+        pcm_peak = combined_peak(pcm_polys, flatten=flatten)[0] if pcm_polys else 0
+        psg_conflicts = [k for k, v in psg_use.items() if len(v) > 1]
+        pcm_lim = lim.pcm if lim else 8
+        cap = lim.track_cap if lim else 16
+        over = (pcm_peak > pcm_lim or track_count > cap
+                or bool(psg_conflicts) or bool(chordal_on_psg))
+        return {"pcm_peak": pcm_peak, "pcm": pcm_lim, "track_count": track_count,
+                "cap": cap, "psg_use": psg_use, "psg_conflicts": psg_conflicts,
+                "chordal_on_psg": chordal_on_psg, "over": over}
+
+    def _update_voice_meter(self):
+        if not getattr(self, "_voice_limits", None):
+            return
+        from core.sound.midi_polyphony import PSG_CHANNELS
+        st = self._voice_budget_state()
+        peak = self._poly_report.overall_peak if self._poly_report else st["pcm_peak"]
+        beat = self._poly_report.peak_beat() if self._poly_report else 0
+        parts = [f"<b>Song peak:</b> {peak} notes at once (beat {beat})"]
+        pcm_ok = st["pcm_peak"] <= st["pcm"]
+        drop = max(0, st["pcm_peak"] - st["pcm"])
+        col = "#6c6" if pcm_ok else "#e55"
+        parts.append(
+            f"<span style='color:{col}'><b>PCM at peak:</b> {st['pcm_peak']} / "
+            f"{st['pcm']} {'OK' if pcm_ok else 'OVER'}"
+            f"{' — ' + str(drop) + ' dropped' if drop else ''}</span>")
+        tcol = "#6c6" if st["track_count"] <= st["cap"] else "#e55"
+        parts.append(f"<span style='color:{tcol}'><b>Tracks:</b> "
+                     f"{st['track_count']} / {st['cap']}</span>")
+        psg_bits = []
+        for k in PSG_CHANNELS:
+            used = st["psg_use"].get(k, [])
+            if used:
+                psg_bits.append(f"{k}:{len(used)}{' ⚠' if len(used) > 1 else ''}")
+        if psg_bits:
+            parts.append("<b>PSG:</b> " + " ".join(psg_bits))
+        self._meter_label.setText("&nbsp;&nbsp;&middot;&nbsp;&nbsp;".join(parts))
+
+    def _on_merge_duplicates(self):
+        """Toggle merging each duplicate-instrument group onto its lowest
+        channel — one M4A track per group. Updates the budget; merged-away rows
+        show '→ ch N' and their voice control is disabled."""
+        dups = getattr(self, "_dups", None)
+        if not dups:
+            return
+        merging = not bool(getattr(self, "_merge_map", None))
+        merge_map = {}
+        if merging:
+            for chs in dups.values():
+                tgt = min(chs)
+                for c in chs:
+                    if c != tgt:
+                        merge_map[c] = tgt
+        self._merge_map = merge_map
+        self._merge_btn.setText("Un-merge" if merging else "Merge duplicates")
+        self._budget_loading = True
+        try:
+            for r in self._budget_rows:
+                away = r["channel"] in merge_map
+                r["combo"].setEnabled(not away)
+                chord = r["chord"]
+                if away:
+                    r["item"].setText(5, f"→ ch {merge_map[r['channel']]}")
+                    r["item"].setToolTip(5, "merged into another track")
+                else:
+                    r["item"].setText(5, f"{chord}-note" if chord > 1 else "mono")
+                    r["item"].setToolTip(5, "")
+        finally:
+            self._budget_loading = False
+        self._update_voice_meter()
+
+    def _voice_overflow_gate(self) -> bool:
+        """If the selection overflows the GBA voice budget, show a blocking but
+        acknowledgeable warning. Returns True to proceed, False to stay put."""
+        if not getattr(self, "_voice_limits", None):
+            return True
+        st = self._voice_budget_state()
+        if not st["over"]:
+            return True
+        lines = []
+        if st["pcm_peak"] > st["pcm"]:
+            lines.append(
+                f"• Peaks at {st['pcm_peak']} simultaneous notes on PCM, but "
+                f"the GBA mixes only {st['pcm']} — about "
+                f"{st['pcm_peak'] - st['pcm']} will be dropped (voice-stealing).")
+        if st["track_count"] > st["cap"]:
+            lines.append(f"• {st['track_count']} tracks exceeds the "
+                         f"{st['cap']}-track per-song limit.")
+        if st["psg_conflicts"]:
+            lines.append("• Two tracks share one PSG channel ("
+                         + ", ".join(st["psg_conflicts"])
+                         + ") — only one can sound at a time.")
+        if st["chordal_on_psg"]:
+            lines.append("• A chordal track is on a PSG channel (ch "
+                         + ", ".join(map(str, st["chordal_on_psg"]))
+                         + ") — PSG is mono; its chords will be lost.")
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Over the GBA voice budget")
+        msg.setText("This song asks for more than the GBA can play faithfully:")
+        msg.setInformativeText(
+            "\n".join(lines)
+            + "\n\nUncheck or merge tracks, or move simple parts (bass, arps) to a "
+            "PSG channel, to fit. You can import anyway, but it will not sound "
+            "right — voices will be stolen.")
+        proceed = msg.addButton("Import anyway", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Go back & trim", QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(msg.buttons()[-1])
+        msg.exec()
+        return msg.clickedButton() is proceed
 
     # ═══════════════════════════════════════════════════════════════════════
     # Import execution
@@ -1483,9 +1730,30 @@ class MidiImportDialog(QDialog):
         self._result_text.setVisible(False)
         self._progress_bar.setRange(0, 0)
 
+        # Honour the per-track selection + merges from page 0: rewrite the MIDI
+        # to only the checked channels (with merged duplicate groups folded onto
+        # one track), so the imported .s matches what the budget meter showed.
+        # Unchanged selection (all checked, no merges) imports the file as-is.
+        import_path = self._midi_info.path
+        rows = getattr(self, "_budget_rows", [])
+        if rows:
+            keep = {r["channel"] for r in rows
+                    if r["item"].checkState(0) == Qt.CheckState.Checked}
+            merge_map = {s: t for s, t in (getattr(self, "_merge_map", {}) or {}).items()
+                         if s in keep and t in keep}
+            if keep and (len(keep) < len(rows) or merge_map):
+                try:
+                    import tempfile
+                    from core.sound.midi_importer import process_midi_for_import
+                    import_path = process_midi_for_import(
+                        self._midi_info.path, keep, merge_map,
+                        tempfile.mktemp(suffix=".mid"))
+                except Exception:
+                    import_path = self._midi_info.path
+
         self._worker = _ImportWorker(
             self._project_root,
-            self._midi_info.path,
+            import_path,
             constant,
             music_player,
             settings,
