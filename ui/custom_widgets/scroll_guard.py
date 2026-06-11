@@ -62,8 +62,15 @@ def install_scroll_guard(widget: QWidget) -> None:
     unfocused). Click the widget and pick a value explicitly — scroll
     never changes the value.
     """
+    global _guard
     widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-    widget.installEventFilter(_guard)
+    try:
+        widget.installEventFilter(_guard)
+    except RuntimeError:
+        # The shared guard's underlying C++ object was torn down (can happen
+        # across QApplication lifecycles, e.g. in tests). Recreate and retry.
+        _guard = _WheelGuard()
+        widget.installEventFilter(_guard)
 
 
 def install_scroll_guard_recursive(root: QWidget) -> None:

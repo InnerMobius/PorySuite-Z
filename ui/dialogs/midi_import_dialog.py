@@ -548,6 +548,14 @@ class MidiImportDialog(QDialog):
         meter_row.addWidget(self._chord_combo)
         tracks_layout.addLayout(meter_row)
 
+        # Live "what's wrong" line — spells out the over-budget / PSG problems
+        # right on the page (mirrors the Next gate) and goes green when it fits,
+        # so the issue isn't hidden until you click Next.
+        self._issues_label = QLabel("")
+        self._issues_label.setTextFormat(Qt.TextFormat.RichText)
+        self._issues_label.setWordWrap(True)
+        tracks_layout.addWidget(self._issues_label)
+
         dup_row = QHBoxLayout()
         self._dup_label = QLabel("")
         self._dup_label.setStyleSheet("color: #d8a13a; font-size: 10px;")
@@ -756,8 +764,17 @@ class MidiImportDialog(QDialog):
         # Get current voicegroup instruments
         vg_instruments = self._get_selected_vg_instruments()
 
+        # Only map the tracks the user KEPT on the budget/track step, and skip
+        # tracks merged onto another (their notes ride the target's mapping).
+        rows_exist = bool(getattr(self, "_budget_rows", None))
+        checked = {r["channel"] for r in getattr(self, "_budget_rows", [])
+                   if r["item"].checkState(0) == Qt.CheckState.Checked}
+        merge_map = getattr(self, "_merge_map", {}) or {}
+
         row = 1
         for t in self._midi_info.tracks:
+            if rows_exist and (t.channel not in checked or t.channel in merge_map):
+                continue
             # Channel label
             ch_label = QLabel(str(t.channel))
             ch_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1494,6 +1511,7 @@ class MidiImportDialog(QDialog):
                 + "  — consider merging or dropping a copy to save voices.")
         else:
             self._dup_label.setText("")
+        self._dup_hint_text = self._dup_label.text()
 
         self._dups = dups
         self._merge_map = {}
@@ -1608,6 +1626,30 @@ class MidiImportDialog(QDialog):
             parts.append("<b>PSG:</b> " + " ".join(psg_bits))
         self._meter_label.setText("&nbsp;&nbsp;&middot;&nbsp;&nbsp;".join(parts))
 
+        # Spell the problems out on the page (live) and tint the offending rows,
+        # so what's wrong stands out without opening the Next dialog.
+        lines = self._voice_overflow_lines(st)
+        if lines:
+            self._issues_label.setText(
+                "<span style='color:#e55'><b>⚠ Won't play correctly as-is:</b>"
+                "<br>" + "<br>".join(lines) + "</span>")
+        else:
+            self._issues_label.setText(
+                "<span style='color:#6c6'>✓ Fits the GBA voice budget.</span>")
+        problem_chs = set(st["chordal_on_psg"])
+        for slot, used in st["psg_use"].items():
+            if len(used) > 1:
+                problem_chs.update(used)
+        from PyQt6.QtGui import QBrush
+        warn = QBrush(QColor("#5a2020"))
+        for r in getattr(self, "_budget_rows", []):
+            problem = r["channel"] in problem_chs
+            for col in range(self._track_tree.columnCount()):
+                if problem:
+                    r["item"].setBackground(col, warn)
+                else:
+                    r["item"].setData(col, Qt.ItemDataRole.BackgroundRole, None)
+
     def _on_merge_duplicates(self):
         """Toggle merging each duplicate-instrument group onto its lowest
         channel — one M4A track per group. Updates the budget; merged-away rows
@@ -1617,9 +1659,16 @@ class MidiImportDialog(QDialog):
             return
         merging = not bool(getattr(self, "_merge_map", None))
         merge_map = {}
+        merged_chord = {}   # target channel -> chord_peak AFTER combining its copies
         if merging:
+            from core.sound.midi_polyphony import merge_polys
+            row_by_ch = {r["channel"]: r for r in self._budget_rows}
             for chs in dups.values():
                 tgt = min(chs)
+                polys = [row_by_ch[c]["cp"] for c in chs
+                         if row_by_ch.get(c) and row_by_ch[c]["cp"]]
+                if len(polys) > 1:
+                    merged_chord[tgt] = merge_polys(polys, tgt).chord_peak
                 for c in chs:
                     if c != tgt:
                         merge_map[c] = tgt
@@ -1630,16 +1679,65 @@ class MidiImportDialog(QDialog):
             for r in self._budget_rows:
                 away = r["channel"] in merge_map
                 r["combo"].setEnabled(not away)
-                chord = r["chord"]
                 if away:
                     r["item"].setText(5, f"→ ch {merge_map[r['channel']]}")
                     r["item"].setToolTip(5, "merged into another track")
                 else:
+                    # A merge TARGET shows its post-merge chord — the copies can
+                    # overlap, making the combined track chordal — so the Poly
+                    # column matches the budget and the chordal-on-PSG warning.
+                    chord = merged_chord.get(r["channel"], r["chord"])
                     r["item"].setText(5, f"{chord}-note" if chord > 1 else "mono")
-                    r["item"].setToolTip(5, "")
+                    r["item"].setToolTip(
+                        5, "chordal after merge — the copies overlap"
+                        if r["channel"] in merged_chord and chord > 1 else "")
         finally:
             self._budget_loading = False
         self._update_voice_meter()
+        if merging:
+            freed = sum(len(chs) - 1 for chs in dups.values())
+            st = self._voice_budget_state()
+            self._dup_label.setText(
+                f"Merged {len(dups)} duplicate pair(s) → freed {freed} track "
+                f"slot(s) (Tracks now {st['track_count']} / {st['cap']}). Merging "
+                f"frees track slots; the voice peak only drops where the copies "
+                f"actually overlap — to lower the peak, uncheck tracks or use PSG.")
+        else:
+            self._dup_label.setText(getattr(self, "_dup_hint_text", ""))
+
+    def _voice_overflow_lines(self, st) -> list:
+        """Human-readable reasons the selection is over budget, naming the actual
+        tracks (channel + instrument) and the concrete action to take."""
+        names = {t.channel: t.instrument_name
+                 for t in (self._midi_info.tracks if self._midi_info else [])}
+
+        def _lab(ch):
+            return f"ch {ch}" + (f" ({names[ch]})" if names.get(ch) else "")
+
+        lines = []
+        if st["pcm_peak"] > st["pcm"]:
+            lines.append(
+                f"• Peaks at {st['pcm_peak']} simultaneous notes on PCM, but the "
+                f"GBA mixes only {st['pcm']} — about {st['pcm_peak'] - st['pcm']} "
+                f"will be dropped (voice-stealing). Uncheck tracks or move parts "
+                f"to PSG.")
+        if st["track_count"] > st["cap"]:
+            lines.append(f"• {st['track_count']} tracks exceeds the "
+                         f"{st['cap']}-track per-song limit — uncheck or merge some.")
+        for slot in st["psg_conflicts"]:
+            shared = st["psg_use"].get(slot, [])
+            lines.append(
+                f"• PSG {slot} is assigned to {len(shared)} tracks ("
+                + ", ".join(_lab(c) for c in shared)
+                + ") — a PSG channel plays one track at a time. Move all but one "
+                "to a different PSG channel or back to PCM.")
+        if st["chordal_on_psg"]:
+            lines.append(
+                "• These tracks are chords on a mono PSG channel, so the chord "
+                "flattens to a single note: "
+                + ", ".join(_lab(c) for c in st["chordal_on_psg"])
+                + ". Keep them on PCM if the harmony matters.")
+        return lines
 
     def _voice_overflow_gate(self) -> bool:
         """If the selection overflows the GBA voice budget, show a blocking but
@@ -1649,23 +1747,7 @@ class MidiImportDialog(QDialog):
         st = self._voice_budget_state()
         if not st["over"]:
             return True
-        lines = []
-        if st["pcm_peak"] > st["pcm"]:
-            lines.append(
-                f"• Peaks at {st['pcm_peak']} simultaneous notes on PCM, but "
-                f"the GBA mixes only {st['pcm']} — about "
-                f"{st['pcm_peak'] - st['pcm']} will be dropped (voice-stealing).")
-        if st["track_count"] > st["cap"]:
-            lines.append(f"• {st['track_count']} tracks exceeds the "
-                         f"{st['cap']}-track per-song limit.")
-        if st["psg_conflicts"]:
-            lines.append("• Two tracks share one PSG channel ("
-                         + ", ".join(st["psg_conflicts"])
-                         + ") — only one can sound at a time.")
-        if st["chordal_on_psg"]:
-            lines.append("• A chordal track is on a PSG channel (ch "
-                         + ", ".join(map(str, st["chordal_on_psg"]))
-                         + ") — PSG is mono; its chords will be lost.")
+        lines = self._voice_overflow_lines(st)
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Icon.Warning)
         msg.setWindowTitle("Over the GBA voice budget")
