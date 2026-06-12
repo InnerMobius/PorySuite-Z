@@ -924,7 +924,7 @@ class TilemapEditorTab(QWidget):
             import traceback
             traceback.print_exc()
 
-        # -- Tab 3: Palette Baker --
+        # -- Tab 3: Palette Editor (edit .pal/.gbapal directly, or bake into PNGs) --
         # Re-bakes canonical .pal palettes into stale PNG color tables
         # across the project. Different from Image Indexer (which
         # converts non-indexed sources INTO indexed form picking a new
@@ -935,7 +935,7 @@ class TilemapEditorTab(QWidget):
         try:
             from ui.palette_baker_tab import PaletteBakerTab
             self._palette_baker = PaletteBakerTab()
-            self._tab_widget.addTab(self._palette_baker, "Palette Baker")
+            self._tab_widget.addTab(self._palette_baker, "Palette Editor")
         except Exception as e:
             print(f"[PaletteBaker] Failed to load: {e}")
             import traceback

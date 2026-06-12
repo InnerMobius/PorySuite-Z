@@ -256,25 +256,97 @@ class SoundCleanupDialog(QDialog):
         if not selected:
             return
 
+        import os
+        import shutil
+        from core.sound.sound_cleanup import (
+            delete_entries, voicegroup_song_references)
+
+        # ── Dry-run for voicegroup removals: show each one's song references.
+        #    A referenced voicegroup is NEVER removable. ──
+        vg_entries = [e for e in selected if e.category == "voicegroup"]
+        vg_summary = []
+        if vg_entries:
+            refs = voicegroup_song_references(self._project_root)
+            still_used = {e.label: sorted(refs.get(e.label, set()))
+                          for e in vg_entries if refs.get(e.label)}
+            if still_used:
+                QMessageBox.warning(
+                    self, "Voicegroups Still In Use",
+                    "These voicegroups are referenced by songs and cannot be "
+                    "removed — repoint or delete those songs first:\n\n"
+                    + "\n".join(f"  • {lbl}  ←  {', '.join(s[:4])}"
+                                + ("…" if len(s) > 4 else "")
+                                for lbl, s in still_used.items()))
+                return
+            vg_summary = [f"  • {e.label} — referenced by: none"
+                          for e in vg_entries]
+
         total_size = sum(e.size_bytes for e in selected)
+        detail = ("Voicegroups to remove (excised in place, undoable):\n"
+                  + "\n".join(vg_summary) + "\n\n") if vg_summary else ""
         reply = QMessageBox.question(
-            self, "Confirm Delete",
-            f"This will permanently delete {len(selected)} item(s) "
-            f"(~{_fmt_size(total_size)} of ROM space).\n\n"
-            f"This cannot be undone. Continue?",
+            self, "Confirm Cleanup",
+            detail + f"Delete {len(selected)} item(s) "
+            f"(~{_fmt_size(total_size)})?\n\nDeleted sample/song files can be "
+            f"restored with git; the .inc edits are undoable below.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        from core.sound.sound_cleanup import delete_entries
-        errors = delete_entries(selected, self._project_root)
+        # Back up the files this cleanup edits IN PLACE so the edits are undoable.
+        # (Deleted .bin/.s/.mid are regenerable by make or restorable via git.)
+        inc_entries = [e for e in selected if e.category == "inc_entry"]
+        backups = {}  # live path -> backup path
+        for has_entries, rel in ((vg_entries, "voice_groups.inc"),
+                                 (inc_entries, "direct_sound_data.inc")):
+            path = os.path.join(self._project_root, "sound", rel)
+            if has_entries and os.path.isfile(path):
+                try:
+                    bak = path + ".cleanup-bak"
+                    shutil.copy2(path, bak)
+                    backups[path] = bak
+                except OSError:
+                    pass
 
+        errors = delete_entries(selected, self._project_root)
         if errors:
             QMessageBox.warning(
                 self, "Some Deletions Failed",
-                "The following errors occurred:\n\n" + "\n".join(errors)
-            )
+                "The following errors occurred:\n\n" + "\n".join(errors))
+
+        # Offer undo for the in-place .inc edits.
+        if backups:
+            bits = []
+            if vg_entries:
+                bits.append(f"{len(vg_entries)} voicegroup block(s)")
+            if inc_entries:
+                bits.append(f"{len(inc_entries)} sample entr"
+                            f"{'ies' if len(inc_entries) != 1 else 'y'}")
+            undo = QMessageBox.question(
+                self, "Cleanup Done",
+                f"Removed {' and '.join(bits)} (edited in place).\n\nUndo these "
+                f"edits — restore {', '.join(os.path.basename(p) for p in backups)}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if undo == QMessageBox.StandardButton.Yes:
+                restored = []
+                for path, bak in backups.items():
+                    try:
+                        shutil.copy2(bak, path)
+                        restored.append(os.path.basename(path))
+                    except OSError as ex:
+                        QMessageBox.warning(self, "Undo Failed",
+                                            f"{os.path.basename(path)}: {ex}")
+                if restored:
+                    QMessageBox.information(
+                        self, "Undone", "Restored: " + ", ".join(restored))
+            for bak in backups.values():
+                try:
+                    os.remove(bak)
+                except OSError:
+                    pass
 
         # Rescan to reflect the deletions
         self._run_scan()

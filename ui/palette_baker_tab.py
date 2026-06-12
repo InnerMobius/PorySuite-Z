@@ -361,6 +361,12 @@ class PaletteBakerTab(QWidget):
         self._btn_load_png = QPushButton("Load PNG…")
         self._btn_load_png.clicked.connect(self._on_load_png_clicked)
         ctx_btns.addWidget(self._btn_load_png)
+        self._btn_open_pal = QPushButton("Open Palette File…")
+        self._btn_open_pal.setToolTip(
+            "Open a .pal or .gbapal directly to view + edit its colours, then "
+            "Save writes back to that file (no PNG needed).")
+        self._btn_open_pal.clicked.connect(self._on_open_palette_file)
+        ctx_btns.addWidget(self._btn_open_pal)
         self._btn_load_pal = QPushButton("Load Palette…")
         self._btn_load_pal.clicked.connect(self._on_load_pal_clicked)
         self._btn_load_pal.setEnabled(False)
@@ -388,12 +394,12 @@ class PaletteBakerTab(QWidget):
 
         # Page 0 — empty state.
         empty = QLabel(
-            "No PNG loaded.\n\n"
-            "Click <b>Load PNG…</b> above to begin. After a PNG is "
-            "loaded, click <b>Load Palette…</b> to pick the .pal or "
-            ".gbapal file you want to bake into it.\n\n"
-            "This tab rewrites the PNG's embedded colour table — "
-            "pixel indices are never changed.")
+            "Nothing loaded.\n\n"
+            "<b>Open Palette File…</b> — edit a .pal or .gbapal directly and "
+            "save the colours back to it.\n\n"
+            "<b>Load PNG…</b> — bake a palette into an indexed PNG's colour "
+            "table (then Load Palette… to pick the palette to apply; pixel "
+            "indices are never changed).")
         empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty.setWordWrap(True)
         empty.setStyleSheet("QLabel { color: #888; padding: 40px; }")
@@ -431,20 +437,20 @@ class PaletteBakerTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        # Side-by-side previews.
+        # Side-by-side previews (hidden in palette-file mode — no PNG).
         prev_row = QHBoxLayout()
         prev_row.setSpacing(8)
-        left_prev = QGroupBox("As baked (PNG's own color table)")
-        ll = QVBoxLayout(left_prev)
+        self._prev_left = QGroupBox("As baked (PNG's own color table)")
+        ll = QVBoxLayout(self._prev_left)
         self._preview_baked = _PreviewPane()
         ll.addWidget(self._preview_baked)
-        prev_row.addWidget(left_prev, 1)
+        prev_row.addWidget(self._prev_left, 1)
 
-        right_prev = QGroupBox("With palette to apply")
-        rl = QVBoxLayout(right_prev)
+        self._prev_right = QGroupBox("With palette to apply")
+        rl = QVBoxLayout(self._prev_right)
         self._preview_applied = _PreviewPane()
         rl.addWidget(self._preview_applied)
-        prev_row.addWidget(right_prev, 1)
+        prev_row.addWidget(self._prev_right, 1)
         layout.addLayout(prev_row, 1)
 
         # Status line.
@@ -453,13 +459,15 @@ class PaletteBakerTab(QWidget):
             "QLabel { color: #aaa; font-size: 11px; }")
         layout.addWidget(self._status_label)
 
-        # Currently-baked palette row (read-only).
-        layout.addWidget(QLabel("Currently baked:"))
+        # Currently-baked / on-disk palette row (read-only).
+        self._lbl_baked_row = QLabel("Currently baked:")
+        layout.addWidget(self._lbl_baked_row)
         self._row_baked = _SwatchRow(editable=False)
         layout.addWidget(self._row_baked)
 
         # Editable palette row.
-        layout.addWidget(QLabel("Palette to apply:"))
+        self._lbl_edit_row = QLabel("Palette to apply:")
+        layout.addWidget(self._lbl_edit_row)
         self._row_edit = _SwatchRow(editable=True)
         self._row_edit.color_edited.connect(self._on_swatch_edited)
         self._row_edit.set_as_bg_requested.connect(self._on_set_as_bg)
@@ -629,6 +637,64 @@ class PaletteBakerTab(QWidget):
             return None
         return colors or None
 
+    def _on_open_palette_file(self) -> None:
+        """Open a .pal / .gbapal directly for editing (no PNG). Save writes the
+        edited colours straight back to that file."""
+        if self._editor.is_dirty:
+            ret = QMessageBox.question(
+                self, "Discard edits?",
+                "You have unsaved palette edits. Discard them and open a "
+                "different palette file?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ret == QMessageBox.StandardButton.No:
+                return
+        start = (os.path.dirname(self._editor.pal_path)
+                 if self._editor.pal_path else (self._project_root or ""))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open palette file", start,
+            "Palette files (*.pal *.gbapal);;JASC palette (*.pal);;"
+            "GBA palette (*.gbapal);;All files (*)")
+        if not path:
+            return
+        pal = self._read_palette_file(path)
+        if pal is None:
+            QMessageBox.warning(self, "Palette Editor",
+                                f"Couldn't read a palette from\n{path}")
+            return
+        self._editor = _EditorState(
+            png_path="", pal_path=path, image=None,
+            baked=list(pal), edited=list(pal), is_dirty=False)
+        self._refresh_editor_views()
+        self._stack.setCurrentIndex(1)
+        self._btn_load_pal.setEnabled(False)    # no PNG to bake into
+        self._btn_pal_menu.setEnabled(True)      # export-as-.pal still works
+        self._btn_bake_others.setEnabled(True)   # can still bake into PNGs
+        self._btn_save.setEnabled(False)         # nothing edited yet
+        self._btn_revert.setEnabled(False)
+        self.modified.emit()
+
+    @staticmethod
+    def _write_palette_file(path: str, colors: List[Color]):
+        """Write a palette back to its .pal (JASC text) or .gbapal (binary
+        BGR555) file. Returns (ok, error_message)."""
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".gbapal":
+                import struct
+                data = bytearray()
+                for (r, g, b) in colors:
+                    v = ((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3)
+                    data += struct.pack("<H", v & 0x7FFF)
+                with open(path, "wb") as f:
+                    f.write(bytes(data))
+            else:
+                from ui.palette_utils import write_jasc_pal
+                write_jasc_pal(path, colors)
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
     def _on_export_pal_clicked(self) -> None:
         if not self._editor.edited:
             return
@@ -666,34 +732,41 @@ class PaletteBakerTab(QWidget):
     # ── View refresh ────────────────────────────────────────────────────────
 
     def _refresh_editor_views(self) -> None:
+        pal_mode = (not self._editor.png_path) and bool(self._editor.pal_path)
         # Source labels.
         if self._editor.png_path:
             rel_png = (
                 os.path.relpath(self._editor.png_path, self._project_root)
-                if self._project_root
-                else self._editor.png_path
-            )
+                if self._project_root else self._editor.png_path)
             self._lbl_png.setText(f"<b>{rel_png}</b>")
+        elif pal_mode:
+            self._lbl_png.setText(
+                "<i>(editing a palette file directly — no PNG)</i>")
         else:
             self._lbl_png.setText("(no PNG loaded)")
         if self._editor.pal_path:
             rel_pal = (
                 os.path.relpath(self._editor.pal_path, self._project_root)
-                if self._project_root
-                else self._editor.pal_path
-            )
-            self._lbl_pal.setText(f"Palette: {rel_pal}")
+                if self._project_root else self._editor.pal_path)
+            self._lbl_pal.setText(
+                f"<b>{rel_pal}</b>" if pal_mode else f"Palette: {rel_pal}")
         else:
             self._lbl_pal.setText(
                 "<i style='color:#888;'>(no palette loaded — "
                 "click Load Palette… to pick one)</i>"
             )
-        # Previews.
+        # Previews — hidden when editing a palette file directly (no image).
+        self._prev_left.setVisible(not pal_mode)
+        self._prev_right.setVisible(not pal_mode)
         self._preview_baked.set_image(self._editor.image)
         self._preview_baked.set_palette(self._editor.baked)
         self._preview_applied.set_image(self._editor.image)
         self._preview_applied.set_palette(self._editor.edited)
-        # Swatch rows.
+        # Swatch rows (relabelled in palette-file mode).
+        self._lbl_baked_row.setText(
+            "On disk:" if pal_mode else "Currently baked:")
+        self._lbl_edit_row.setText(
+            "Edit colours:" if pal_mode else "Palette to apply:")
         self._row_baked.set_colors(self._editor.baked)
         self._row_edit.set_colors(self._editor.edited)
         self._refresh_stale_view()
@@ -712,14 +785,20 @@ class PaletteBakerTab(QWidget):
             if differs:
                 diffs += 1
         self._row_edit.set_stale_mask(mask)
+        pal_mode = (not self._editor.png_path) and bool(self._editor.pal_path)
         if not self._editor.pal_path and not self._editor.is_dirty:
             self._status_label.setText(
                 "Load a palette to see what would change.")
         elif diffs == 0:
             self._status_label.setText(
-                "<span style='color:#7c7;'>● Matches</span> — "
-                "the loaded palette equals the baked colours; "
-                "saving would be a no-op."
+                "<span style='color:#7c7;'>● Matches</span> — the colours "
+                "equal what's on disk; saving would be a no-op."
+            )
+        elif pal_mode:
+            self._status_label.setText(
+                f"<span style='color:#ffb74d;'>● {diffs} of {n} slots "
+                "edited</span> — Save writes these colours back to the "
+                "palette file."
             )
         else:
             self._status_label.setText(
@@ -776,7 +855,26 @@ class PaletteBakerTab(QWidget):
     # ── Save (single) ───────────────────────────────────────────────────────
 
     def _on_save_clicked(self) -> None:
-        if not self._editor.png_path or not self._editor.edited:
+        if not self._editor.edited:
+            return
+        # Palette-file mode: write the colours back to the .pal / .gbapal.
+        if not self._editor.png_path and self._editor.pal_path:
+            ok, err = self._write_palette_file(
+                self._editor.pal_path, self._editor.edited)
+            if not ok:
+                QMessageBox.warning(
+                    self, "Palette Editor",
+                    f"Failed to write\n{self._editor.pal_path}\n\n{err}")
+                return
+            self._editor.baked = list(self._editor.edited)
+            self._editor.is_dirty = False
+            self._row_baked.set_colors(self._editor.baked)
+            self._refresh_stale_view()
+            self._update_dirty_buttons()
+            self.modified.emit()
+            return
+        # PNG-bake mode.
+        if not self._editor.png_path:
             return
         from core.palette_bake_audit import bake_palette_into_png
         ok = bake_palette_into_png(
@@ -784,7 +882,7 @@ class PaletteBakerTab(QWidget):
         )
         if not ok:
             QMessageBox.warning(
-                self, "Palette Baker",
+                self, "Palette Editor",
                 f"Failed to write\n{self._editor.png_path}")
             return
         # The PNG's baked palette is now the edited palette.
@@ -890,6 +988,19 @@ class PaletteBakerTab(QWidget):
         """
         if not self._editor.is_dirty:
             return 0, []
+        # Palette-file mode: write the .pal / .gbapal back.
+        if not self._editor.png_path and self._editor.pal_path:
+            ok, _err = self._write_palette_file(
+                self._editor.pal_path, self._editor.edited)
+            if ok:
+                self._editor.baked = list(self._editor.edited)
+                self._editor.is_dirty = False
+                self._row_baked.set_colors(self._editor.baked)
+                self._refresh_stale_view()
+                self._update_dirty_buttons()
+                return 1, []
+            return 0, [self._editor.pal_path]
+        # PNG-bake mode.
         from core.palette_bake_audit import bake_palette_into_png
         ok = bake_palette_into_png(
             self._editor.png_path, self._editor.edited)

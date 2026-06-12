@@ -876,8 +876,8 @@ def _remove_inc_entry(inc_path: str, label: str) -> None:
                 and lines[i + 1].strip() == f'{label}::'):
             # Skip .align, label, .incbin, and trailing blank
             i += 2  # skip .align and label
-            if i < len(lines) and '.incbin' in lines[i]:
-                i += 1  # skip .incbin
+            while i < len(lines) and '.incbin' in lines[i]:
+                i += 1  # skip every .incbin under this label (multi-part samples)
             # Skip trailing blank line
             if i < len(lines) and lines[i].strip() == '':
                 i += 1
