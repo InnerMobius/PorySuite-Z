@@ -85,7 +85,7 @@ from core.battle_anim_vm import (
 from core.battle_anim_tasks import (
     MonTaskSim, TaskCtx, ATTACKER as TASK_ATTACKER, TARGET as TASK_TARGET,
     is_mon_task, is_mon_mover_template)
-from core.sprite_render import load_sprite_pixmap
+from core.sprite_render import load_sprite_pixmap, mon_sheet_frame
 from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_BATTLE_ANIM
 from core.overworld_palette_io import write_palette_pair
 from ui.draggable_palette_row import DraggablePaletteRow
@@ -4010,7 +4010,12 @@ class BattleAnimTab(QWidget):
             return None
         try:
             pal = mon_palette(self._project_root, slug, d)
-            return load_sprite_pixmap(path, pal) if pal else QPixmap(path)
+            # load_sprite_pixmap handles the no-palette case via its own flat
+            # fallback (no raw QPixmap(path) here — sprite-pipeline rule), and
+            # we slice to frame 0 so multi-frame sheets (e.g. Deoxys) don't
+            # render stacked.
+            pix = load_sprite_pixmap(path, pal)
+            return mon_sheet_frame(pix, 0)
         except Exception:
             _log.exception("reference mon render failed: %s %s", slug, view)
             return None

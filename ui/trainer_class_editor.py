@@ -13,7 +13,7 @@ from typing import Optional
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QVBoxLayout, QWidget,
@@ -54,19 +54,9 @@ QGroupBox::title {
 }
 """
 
-# ── Battle music / terrain categories (from switch statements in C code) ─────
-
-# Classes that get special victory music (MUS_VICTORY_GYM_LEADER)
-_VICTORY_GYM_LEADER = {"TRAINER_CLASS_LEADER", "TRAINER_CLASS_CHAMPION"}
-
-# Battle BGM categories (from GetBattleBGM in pokemon.c)
-_BGM_CHAMPION = {"TRAINER_CLASS_CHAMPION"}
-_BGM_GYM_LEADER = {"TRAINER_CLASS_LEADER", "TRAINER_CLASS_ELITE_FOUR"}
-# Everything else gets MUS_VS_TRAINER
-
-# Battle terrain overrides (from GetBattleTerrainOverride in battle_bg.c)
-_TERRAIN_LEADER = {"TRAINER_CLASS_LEADER"}
-_TERRAIN_CHAMPION = {"TRAINER_CLASS_CHAMPION"}
+# Battle BGM / victory / terrain are no longer keyed on hardcoded class
+# constants — they're derived from the data-driven Class Role flags (see
+# core.trainer_class_flags_patch and _refresh_role_derived_labels).
 
 # Encounter music human-readable names
 _ENCOUNTER_MUSIC_LABELS = {
@@ -456,29 +446,6 @@ def add_new_trainer_class(
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def _get_battle_bgm(const: str) -> str:
-    """Return human-readable battle BGM for a trainer class constant."""
-    if const in _BGM_CHAMPION:
-        return "VS Champion"
-    if const in _BGM_GYM_LEADER:
-        return "VS Gym Leader"
-    return "VS Trainer"
-
-
-def _get_victory_music(const: str) -> str:
-    if const in _VICTORY_GYM_LEADER:
-        return "Gym Leader Victory"
-    return "Normal Victory"
-
-
-def _get_battle_terrain(const: str) -> str:
-    if const in _TERRAIN_LEADER:
-        return "Gym Leader Arena"
-    if const in _TERRAIN_CHAMPION:
-        return "Champion Arena"
-    return "Map Default"
-
-
 def _get_common_encounter_music(trainers: dict, class_const: str) -> str:
     """Find the most common encounter music among trainers of this class."""
     music_counts: Counter = Counter()
@@ -532,6 +499,19 @@ class TrainerClassEditor(QWidget):
         self._dirty_names: dict[str, str] = {}
         self._dirty_money: dict[str, int] = {}
         self._dirty_pics: dict[str, str] = {}  # class → new TRAINER_PIC
+        # class → MUS_* C constant.  Lives next to the other dirty dicts
+        # so the rest of the load/flush/clear_dirty plumbing follows the
+        # same shape as names/money/pics.
+        # Per-class behaviour ROLES (gym leader / Elite Four / champion /
+        # rival / team boss) as a flag bitfield.  These drive the engine's
+        # battle BGM, victory music, arena terrain, transition, Quest Log
+        # category, rival-name substitution and league-friendship — ALL of
+        # which vanilla hardcoded to specific class constants and which
+        # therefore broke whenever a class was renamed/reassigned.  Now
+        # data-driven via core.trainer_class_flags_patch.
+        self._dirty_roles: dict[str, int] = {}   # class -> flag bitfield
+        # Snapshot of the on-disk class→flagset, parsed once at load().
+        self._class_flags: dict[str, int] = {}
         self._loaded = False
         self._build()
         # Subscribe to the cross-tab palette bus so live Trainer Graphics
@@ -792,6 +772,47 @@ class TrainerClassEditor(QWidget):
 
         _info_ss = "color: #ccc; font-size: 11px;"
 
+        # ── Class Role (data-driven behaviour flags) ─────────────────────────
+        # Checking a role gives EVERY class with that role the matching engine
+        # behaviour — gym music + gym victory jingle + gym arena + special
+        # transition + "Defeated Gym Leader" Quest Log entry, etc.  Because
+        # the engine reads a flag (not a class name), renaming or adding a
+        # class never breaks any of it again.  Writes via
+        # core.trainer_class_flags_patch on save.
+        # (flag-key, checkbox label, tooltip)
+        self._ROLE_DEFS = [
+            ("gym_leader", "Gym Leader",
+             "Gym-leader battle music + victory jingle + gym arena background."),
+            ("elite_four", "Elite Four",
+             "Elite-Four battle music + named battle transition."),
+            ("champion",  "Champion",
+             "Champion music + victory jingle + champion arena + transition; "
+             "uses the rival name in battle text."),
+            ("rival",     "Rival",
+             "Battle text substitutes the player-chosen rival name."),
+            ("boss",      "Team Boss",
+             "Treated as a story boss for Quest Log categorisation."),
+        ]
+        self._role_checks: dict[str, QCheckBox] = {}
+        role_box = QWidget()
+        role_row = QHBoxLayout(role_box)
+        role_row.setContentsMargins(0, 0, 0, 0)
+        role_row.setSpacing(10)
+        for key, label, tip in self._ROLE_DEFS:
+            cb = QCheckBox(label)
+            cb.setToolTip(tip)
+            cb.toggled.connect(lambda _checked, k=key: self._on_role_toggled(k))
+            self._role_checks[key] = cb
+            role_row.addWidget(cb)
+        role_row.addStretch(1)
+        lbl_role = QLabel("Class Role:")
+        lbl_role.setStyleSheet(_fs)
+        battle_form.addRow(lbl_role, role_box)
+
+        # Battle BGM is now DERIVED from the role flags (champion role →
+        # champion theme; gym-leader / elite-four → gym-leader theme; else the
+        # generic trainer theme), shown read-only so the user sees the effect
+        # of the role choices.
         self._battle_bgm_lbl = QLabel()
         self._battle_bgm_lbl.setStyleSheet(_info_ss)
         lbl_bgm = QLabel("Battle BGM:")
@@ -818,9 +839,10 @@ class TrainerClassEditor(QWidget):
         battle_form.addRow(lbl_enc, self._enc_music_lbl)
 
         battle_note = QLabel(
-            "Battle BGM, victory music, and terrain are set by switch\n"
-            "statements in C code, not a data table. Encounter music\n"
-            "is per-trainer; this shows the most common for this class."
+            "Battle BGM, victory music, terrain, transition and Quest Log\n"
+            "category are driven by the Class Role flags above (data-driven —\n"
+            "rename or add classes freely). Encounter music is per-trainer;\n"
+            "this shows the most common for this class."
         )
         battle_note.setStyleSheet(
             "color: #555; font-size: 9px; font-style: italic;"
@@ -891,6 +913,17 @@ class TrainerClassEditor(QWidget):
         self._dirty_names.clear()
         self._dirty_money.clear()
         self._dirty_pics.clear()
+        self._dirty_roles.clear()
+        # Snapshot the on-disk class→flagset ONCE per project open.  This
+        # MERGES the generated flags table with auto-detection (so a fresh
+        # project — or a renamed gym-leader class the table doesn't list yet
+        # — shows the sensible auto-detected roles immediately).  The
+        # checkboxes read from this; the dirty dict shadows it.
+        try:
+            from core.trainer_class_flags_patch import get_flags
+            self._class_flags = get_flags(root)
+        except Exception:
+            self._class_flags = {}
         self._loaded = True
         self._count_lbl.setText(f"{len(self._classes)} classes")
         self._populate_pic_combo()
@@ -908,15 +941,80 @@ class TrainerClassEditor(QWidget):
             pass
 
     def flush(self) -> dict:
-        """Return pending edits as dict with names, money, and pics."""
+        """Return pending edits as dict with names, money, pics, and roles.
+
+        ``roles`` is the FULL merged class→flagset map (on-disk snapshot with
+        the user's pending toggles applied) so the patcher can regenerate the
+        whole flags table in one pass.
+        """
+        merged = dict(self._class_flags)
+        merged.update(self._dirty_roles)
         return {
             "names": dict(self._dirty_names),
             "money": dict(self._dirty_money),
             "pics": dict(self._dirty_pics),
+            "roles": merged if self._dirty_roles else {},
         }
 
     def has_edits(self) -> bool:
-        return bool(self._dirty_names) or bool(self._dirty_money) or bool(self._dirty_pics)
+        return (
+            bool(self._dirty_names) or bool(self._dirty_money)
+            or bool(self._dirty_pics) or bool(self._dirty_roles)
+        )
+
+    def _on_role_toggled(self, _key: str) -> None:
+        """A Class Role checkbox flipped for the current class.
+
+        Recomputes the class's flag bitfield from all five checkboxes and
+        stores it in ``_dirty_roles`` (or drops the entry when it matches
+        what's on disk, so a no-net-change save isn't marked dirty), then
+        derives the read-only Battle-BGM / Victory / Terrain labels and
+        emits ``changed``.
+        """
+        const = self._current_class
+        if not const or not self._loaded:
+            return
+        from core.trainer_class_flags_patch import FLAG_BITS
+        bits = 0
+        for key, _b, _m in FLAG_BITS:
+            cb = self._role_checks.get(key)
+            if cb is not None and cb.isChecked():
+                bits |= _b
+        on_disk = self._class_flags.get(const, 0)
+        if bits == on_disk:
+            self._dirty_roles.pop(const, None)
+        else:
+            self._dirty_roles[const] = bits
+        self._refresh_role_derived_labels(bits)
+        self.changed.emit()
+
+    def _refresh_role_derived_labels(self, bits: int) -> None:
+        """Mirror the engine gates: show the Battle BGM / Victory / Terrain
+        a class's role flags now produce, read-only."""
+        from core.trainer_class_flags_patch import FLAG_BITS
+        f = {k: b for k, b, _ in FLAG_BITS}
+        _hi = "color: #66bbff; font-size: 11px;"
+        _lo = "color: #ccc; font-size: 11px;"
+        if bits & f["champion"]:
+            bgm = "VS Champion"
+        elif bits & (f["gym_leader"] | f["elite_four"]):
+            bgm = "VS Gym Leader"
+        else:
+            bgm = "VS Trainer"
+        self._battle_bgm_lbl.setText(bgm)
+        self._battle_bgm_lbl.setStyleSheet(_lo if bgm == "VS Trainer" else _hi)
+        vic = ("Gym Leader Victory"
+               if bits & (f["gym_leader"] | f["champion"]) else "Normal Victory")
+        self._victory_music_lbl.setText(vic)
+        self._victory_music_lbl.setStyleSheet(_lo if vic == "Normal Victory" else _hi)
+        if bits & f["gym_leader"]:
+            ter = "Gym Leader Arena"
+        elif bits & f["champion"]:
+            ter = "Champion Arena"
+        else:
+            ter = "Map Default"
+        self._terrain_lbl.setText(ter)
+        self._terrain_lbl.setStyleSheet(_lo if ter == "Map Default" else _hi)
 
     def get_class_to_fac(self) -> dict[str, list[str]]:
         """Return the class→facility mapping (needed by pic writer)."""
@@ -930,9 +1028,12 @@ class TrainerClassEditor(QWidget):
             self._money[k] = v
         for k, v in self._dirty_pics.items():
             self._class_to_pic[k] = v
+        for k, v in self._dirty_roles.items():
+            self._class_flags[k] = v
         self._dirty_names.clear()
         self._dirty_money.clear()
         self._dirty_pics.clear()
+        self._dirty_roles.clear()
 
     # ── Pic combo ──────────────────────────────────────────────────────────
 
@@ -1040,33 +1141,24 @@ class TrainerClassEditor(QWidget):
         self._pic_cb.setCurrentIndex(max(idx, 0))
         self._update_sprite_preview(pic_const)
 
-        # ── Battle properties ────────────────────────────────────────────
-        self._battle_bgm_lbl.setText(_get_battle_bgm(const))
-        self._victory_music_lbl.setText(_get_victory_music(const))
-        self._terrain_lbl.setText(_get_battle_terrain(const))
+        # ── Class Role flags ─────────────────────────────────────────────
+        # Set the five role checkboxes from this class's flagset (pending
+        # edit first, else the on-disk/auto-detected snapshot).  Signals are
+        # blocked so re-selecting a class never registers as an edit.  Then
+        # derive the read-only Battle-BGM / Victory / Terrain labels.
+        from core.trainer_class_flags_patch import FLAG_BITS
+        bits = self._dirty_roles.get(const, self._class_flags.get(const, 0))
+        for key, b, _m in FLAG_BITS:
+            cb = self._role_checks.get(key)
+            if cb is None:
+                continue
+            cb.blockSignals(True)
+            cb.setChecked(bool(bits & b))
+            cb.blockSignals(False)
+        self._refresh_role_derived_labels(bits)
         self._enc_music_lbl.setText(
             _get_common_encounter_music(self._trainers, const)
         )
-
-        # Color-code special battle properties
-        if const in _BGM_CHAMPION:
-            self._battle_bgm_lbl.setStyleSheet("color: #ffcc00; font-size: 11px;")
-        elif const in _BGM_GYM_LEADER:
-            self._battle_bgm_lbl.setStyleSheet("color: #66bbff; font-size: 11px;")
-        else:
-            self._battle_bgm_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
-
-        if const in _VICTORY_GYM_LEADER:
-            self._victory_music_lbl.setStyleSheet(
-                "color: #66bbff; font-size: 11px;"
-            )
-        else:
-            self._victory_music_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
-
-        if const in _TERRAIN_LEADER or const in _TERRAIN_CHAMPION:
-            self._terrain_lbl.setStyleSheet("color: #66bbff; font-size: 11px;")
-        else:
-            self._terrain_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
 
         # ── Facility classes ─────────────────────────────────────────────
         facs = self._class_to_fac.get(const, [])

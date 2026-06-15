@@ -556,24 +556,6 @@ class SpeciesData(AbstractPokemonData, ABC):
         """
         pass
 
-    @abstractmethod
-    def parse_species_info(self, species_name: str, form_name: str = None) -> str:
-        """
-        Parses the species information.
-
-        This method should be implemented by subclasses.
-
-        Args:
-            species_name (str): The name of the species.
-            form_name (str, optional): The name of the form.
-
-        Returns:
-            str: The parsed species information.
-
-        """
-        pass
-
-
 class SpeciesGraphics(AbstractPokemonData, ABC):
     """
     A class representing the graphics data for a species of Pokemon.

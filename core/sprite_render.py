@@ -167,3 +167,41 @@ def load_sprite_pixmap(path: str,
         return pm
     except Exception:
         return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Mon sprite-sheet frame slicing
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# pokefirered front/back battle sheets are 64px wide and (64 * N)px tall — N
+# stacked 64x64 frames. Most species have N=1; a few (e.g. Deoxys) have 2. A
+# single still preview must show ONE frame, not the whole sheet drawn as one
+# tall sprite (the "stacked forms" bug). These helpers slice a vertical sheet
+# into its square frames. A sheet that is already a single square (height <=
+# width) is returned unchanged, so 1-frame mons are completely unaffected.
+
+
+def mon_sheet_frame_count(pix: Optional[QPixmap]) -> int:
+    """Number of stacked square frames in a vertical mon sheet (height // width)."""
+    if pix is None or pix.isNull():
+        return 0
+    w = pix.width()
+    if w <= 0:
+        return 0
+    return max(1, pix.height() // w)
+
+
+def mon_sheet_frame(pix: Optional[QPixmap], index: int = 0) -> Optional[QPixmap]:
+    """Return frame *index* (a width×width square) of a vertical mon sheet.
+
+    Returns *pix* unchanged when it isn't taller than wide (already a single
+    frame). *index* is clamped to the available frame range.
+    """
+    if pix is None or pix.isNull():
+        return pix
+    w = pix.width()
+    if w <= 0 or pix.height() <= w:
+        return pix
+    n = max(1, pix.height() // w)
+    i = max(0, min(int(index), n - 1))
+    return pix.copy(0, i * w, w, w)

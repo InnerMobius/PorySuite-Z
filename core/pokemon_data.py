@@ -156,7 +156,13 @@ class SpeciesData(pokemon_data.SpeciesData):
             if form is None:
                 value = self.data[species]["species_info"][key]
             else:
-                value = self.data[species]["forms"][form]["species_info"][key]
+                form_si = self.data[species]["forms"][form]["species_info"]
+                # A form inherits any field it doesn't override from its base.
+                # Extractor-relocated forms carry only their gSpeciesInfo stats,
+                # so graphics keys (frontPic/iconSprite/…) fall back to the base
+                # — share-graphics forms then show the base's sprite.
+                value = (form_si[key] if key in form_si
+                         else self.data[species]["species_info"][key])
 
             if isinstance(value, list) or isinstance(value, dict):
                 value = self.process_value(value)
@@ -308,134 +314,6 @@ class SpeciesData(pokemon_data.SpeciesData):
             )
 
         return key in species_info
-
-    @override
-    def parse_species_info(self, species_name, form_name=None):
-        """
-        Parses the species information for a given species and form.
-
-        Args:
-            species_name (str): The name of the species.
-            form_name (str, optional): The name of the form. Defaults to None.
-
-        Returns:
-            str: The formatted C code for the species information.
-        """
-
-        def get(key, index=None):
-            return self.get_species_info(species_name, key, form=form_name, index=index)
-
-        if form_name is not None:
-            species_constant = form_name
-        else:
-            species_constant = species_name
-
-        # Split the species description into lines and format them for C code
-        species_description = get("description").split("\n")
-        species_description = [f'{" " * 12}"{line}' for line in species_description]
-        species_description = (
-            "COMPOUND_STRING(\n" + '\\n"\n'.join(species_description) + '")'
-        )
-
-        # Get the evolution data and format it for C code
-        evolutions = get("evolutions")
-        if isinstance(evolutions, list):
-            evolutions = (
-                "EVOLUTION("
-                + (
-                    ", ".join(
-                        [
-                            f"{{ {evo['method']}, {evo['param']}, {evo['targetSpecies']} }}"
-                            for evo in evolutions
-                        ]
-                    )
-                )
-                + ")"
-            )
-        else:
-            evolutions = 0
-
-        code = f"""
-    [{species_constant}] =
-    {{
-        .baseHP = {get("baseHP")},
-        .baseAttack = {get("baseAttack")},
-        .baseDefense = {get("baseDefense")},
-        .baseSpeed = {get("baseSpeed")},
-        .baseSpAttack = {get("baseSpAttack")},
-        .baseSpDefense = {get("baseSpDefense")},
-        .types = {{ {get("types", 0)}, {get("types", 1)} }},
-        .catchRate = {get("catchRate")},
-        .expYield = {get("expYield")},
-        .evYield_HP = {get("evYield_HP")},
-        .evYield_Attack = {get("evYield_Attack")},
-        .evYield_Defense = {get("evYield_Defense")},
-        .evYield_Speed = {get("evYield_Speed")},
-        .evYield_SpAttack = {get("evYield_SpAttack")},
-        .evYield_SpDefense = {get("evYield_SpDefense")},
-        .itemCommon = {get("itemCommon")},
-        .itemRare = {get("itemRare")},
-        .genderRatio = {get("genderRatio")},
-        .eggCycles = {get("eggCycles")},
-        .friendship = {get("friendship")},
-        .growthRate = {get("growthRate")},
-        .eggGroups = {{ {get("eggGroups", 0)}, {get("eggGroups", 1)} }},
-        .abilities = {{ {get("abilities", 0)}, {get("abilities", 1)}, {get("abilities", 2)} }},
-        .safariZoneFleeRate = {get("safariZoneFleeRate")},
-        .categoryName = _("{get("categoryName")}"),
-        .speciesName = _("{get("speciesName")}"),
-        .cryId = {get("cryId")},
-        .natDexNum = {get("natDexNum")},
-        .height = {get("height")},
-        .weight = {get("weight")},
-        .pokemonScale = {get("pokemonScale")},
-        .pokemonOffset = {get("pokemonOffset")},
-        .trainerScale = {get("trainerScale")},
-        .trainerOffset = {get("trainerOffset")},
-        .description = {species_description},
-        .bodyColor = {get("bodyColor")},
-        .noFlip = {get("noFlip")},
-        .frontPic = {get("frontPic")}, .frontPicSize = MON_COORDS_SIZE({get("frontPicSize", 0)}, {get("frontPicSize", 1)}),
-        .frontPicFemale = {get("frontPicFemale")},
-        .frontPicSizeFemale = MON_COORDS_SIZE({get("frontPicSizeFemale", 0)}, {get("frontPicSizeFemale", 1)}),
-        .frontPicYOffset = {get("frontPicYOffset")},
-        .frontAnimFrames = {get("frontAnimFrames")},
-        .frontAnimId = {get("frontAnimId")},
-        .enemyMonElevation = {get("enemyMonElevation")},
-        .frontAnimDelay = {get("frontAnimDelay")},
-        .backPic = {get("backPic")}, .backPicSize = MON_COORDS_SIZE({get("backPicSize", 0)}, {get("backPicSize", 1)}),
-        .backPicFemale = {get("backPicFemale")},
-        .backPicSizeFemale = MON_COORDS_SIZE({get("backPicSizeFemale", 0)}, {get("backPicSizeFemale", 1)}),
-        .backPicYOffset = {get("backPicYOffset")},
-        .backAnimId = {get("backAnimId")},
-        .palette = {get("palette")}, .shinyPalette = {get("shinyPalette")},
-        .paletteFemale = {get("paletteFemale")}, .shinyPaletteFemale = {get("shinyPaletteFemale")},
-        .iconSprite = {get("iconSprite")},
-        .iconSpriteFemale = {get("iconSpriteFemale")},
-        .iconPalIndex = {get("iconPalIndex")},
-        .iconPalIndexFemale = {get("iconPalIndexFemale")},
-        .footprint = {get("footprint")},
-        .levelUpLearnset = {get("levelUpLearnset")}, .teachableLearnset = {get("teachableLearnset")},
-        .evolutions = {evolutions},
-        .formSpeciesIdTable = {get("formSpeciesIdTable")},
-        .formChangeTable = {get("formChangeTable")},
-        .isLegendary = {get("isLegendary")},
-        .isMythical = {get("isMythical")},
-        .isUltraBeast = {get("isUltraBeast")},
-        .isParadoxForm = {get("isParadoxForm")},
-        .isMegaEvolution = {get("isMegaEvolution")},
-        .isPrimalReversion = {get("isPrimalReversion")},
-        .isUltraBurst = {get("isUltraBurst")},
-        .isGigantamax = {get("isGigantamax")},
-        .isAlolanForm = {get("isAlolanForm")},
-        .isGalarianForm = {get("isGalarianForm")},
-        .isHisuianForm = {get("isHisuianForm")},
-        .isPaldeanForm = {get("isPaldeanForm")},
-        .cannotBeTraded = {get("cannotBeTraded")},
-        .allPerfectIVs = {get("allPerfectIVs")},
-    }},
-        """
-        return code
 
     @override
     def parse_to_c_code(self):
@@ -3173,6 +3051,11 @@ class PokemonDataManager(pokemon_data.PokemonDataManager):
 
         if image_name is None or not isinstance(image_name, str) or image_name not in getattr(sg, "data", {}):
             image_name = self._format_graphics_constant(form or species, key)
+            # A form shares its base's sprite sheet (it renders a FRAME of it).
+            # If the form has no graphics symbol of its own, resolve to the base
+            # species' symbol so the form shows the base's sheet.
+            if form and image_name not in getattr(sg, "data", {}):
+                image_name = self._format_graphics_constant(species, key)
 
         if isinstance(sg, object) and getattr(sg, "data", None) and image_name in sg.data:
             image_url = sg.data[image_name]["png"]
@@ -3189,15 +3072,18 @@ class PokemonDataManager(pokemon_data.PokemonDataManager):
             "footprint": "footprint.png",
         }
         filename = key_to_file.get(key)
-        base = (form or species) or ""
-        if base.startswith("SPECIES_"):
-            base = base[len("SPECIES_") :]
-        species_slug = base.lower()
-        if filename and species_slug:
-            fallback = os.path.join(self.project_info["dir"], "graphics", "pokemon", species_slug, filename)
-            ok = _readable(fallback, f"{species_slug}/{filename}")
-            if ok:
-                return ok
+        # Try the form's own folder first, then the base species' folder (a form
+        # shares the base's art unless it has its own).
+        for _cand in ([form, species] if form else [species]):
+            base = (_cand or "")
+            if base.startswith("SPECIES_"):
+                base = base[len("SPECIES_") :]
+            species_slug = base.lower()
+            if filename and species_slug:
+                fallback = os.path.join(self.project_info["dir"], "graphics", "pokemon", species_slug, filename)
+                ok = _readable(fallback, f"{species_slug}/{filename}")
+                if ok:
+                    return ok
 
         return None
 

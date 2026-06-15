@@ -17,6 +17,14 @@ collision footprint editor) is COMPLETE end-to-end as of 2026-05-21 — Phase
 the engine patcher).  Footprint authoring → save → rebuild → in-game collision
 + interaction is now a complete loop.**
 
+**Post-plan addition (2026-06-15) — in-place Frame Size editor.** Beyond the New
+Sprite flow, the detail panel now lets you RESIZE an EXISTING sprite's frame
+(W×H spinboxes + common-size quick-pick), with a live derived frame count,
+single-OAM-vs-composite classification, and a suggested anim table. Save routes
+through the same `replace_sprite_sheet` pipeline (rewrites GraphicsInfo + pic
+table + OAM/subsprite scaffolding + `spritesheet_rules.mk`). `ui/overworld_graphics_tab.py`.
+Staged for v0.1.28b.
+
 ---
 
 ## Vision

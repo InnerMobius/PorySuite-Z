@@ -2037,7 +2037,11 @@ class UnifiedMainWindow(QMainWindow):
     def _open_terminal(self):
         """Open a terminal in the project directory."""
         if self._porysuite_window:
-            self._porysuite_window.update_action()
+            # Call the handler directly. The old code called the generic
+            # update_action() dispatcher, which resolves the target from
+            # self.sender() — but there's no triggering action here, so it
+            # matched nothing and silently did nothing.
+            self._porysuite_window._open_terminal_in_project()
 
     def _open_settings(self):
         """Open the settings dialog."""

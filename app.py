@@ -54,6 +54,14 @@ class App:
         self.app = QApplication(sys.argv)
         self.app.setApplicationName("PorySuite-Z")
         self.app.setApplicationDisplayName("PorySuite-Z")
+        # Apply the saved appearance theme (Light / Dark / Automatic). Default
+        # is "auto" → follow the Windows app-mode setting. Done right after the
+        # QApplication exists so every window opens in the chosen scheme.
+        try:
+            from app_theme import apply_saved_theme
+            apply_saved_theme(self.app)
+        except Exception:
+            pass
         # After QApplication exists, capture Qt messages too
         try:
             crashlog.install_qt_message_handler()

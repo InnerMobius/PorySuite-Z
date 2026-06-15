@@ -1110,6 +1110,16 @@ class _PartySlotWidget(QWidget):
         self._items_list   = items_list
         self._moves_list   = moves_list
         self._icon_fn      = icon_fn   # Optional Callable[[str], QIcon]
+        # Source-of-truth for the four move slots, populated by load().
+        # collect() uses these to preserve the on-disk moves whenever the
+        # user has NOT actively touched a slot's combo — the combo's
+        # currentData() can briefly read as MOVE_NONE during transient
+        # UI rebuilds (party-type toggles, panel reloads, etc.), and
+        # without this fallback that transient read was being persisted
+        # to disk as a real wipe.  Bug surfaced as wholesale move-data
+        # loss across ~30% of custom-move trainers in the test project.
+        self._loaded_moves: list[str] = []
+        self._user_touched_moves: list[bool] = [False, False, False, False]
         self._build()
         # Prevent scroll-wheel from changing combos/spins unless clicked
         try:
@@ -1199,7 +1209,13 @@ class _PartySlotWidget(QWidget):
                 cb.setMinimumWidth(160)
                 for const, name in self._moves_list:
                     cb.addItem(name, const)
-                cb.currentIndexChanged.connect(lambda: self.changed.emit())
+                # The slot index needs to be captured per-combo so the
+                # tracker knows WHICH move slot the user just touched.
+                # Without ``mi=...`` every lambda would close over the
+                # final loop value and only ever set slot 3.
+                cb.currentIndexChanged.connect(
+                    lambda _idx, mi=slot_num - 1: self._on_move_combo_changed(mi)
+                )
                 self._move_cbs.append(cb)
                 row_layout.addWidget(cb)
             moves_outer.addLayout(row_layout)
@@ -1218,6 +1234,19 @@ class _PartySlotWidget(QWidget):
         self._item_row_w.setVisible(party_type  in ("ITEM_DEFAULT_MOVES",   "ITEM_CUSTOM_MOVES"))
         self._moves_row_w.setVisible(party_type in ("NO_ITEM_CUSTOM_MOVES", "ITEM_CUSTOM_MOVES"))
 
+    def _on_move_combo_changed(self, slot_idx: int) -> None:
+        """Mark slot ``slot_idx`` (0-3) as user-edited and propagate dirty.
+
+        ``set_const()`` blocks signals while it adjusts the combo on load,
+        so this handler only ever fires for a real user-driven change —
+        which is exactly the signal collect() needs to decide whether to
+        trust the live combo value or fall back to the on-disk-loaded
+        original.
+        """
+        if 0 <= slot_idx < len(self._user_touched_moves):
+            self._user_touched_moves[slot_idx] = True
+        self.changed.emit()
+
     def load(self, member: dict):
         # _SearchableConstCombo.set_const preserves unknown constants from
         # disk by appending them as extra items — so currentData() always
@@ -1234,8 +1263,20 @@ class _PartySlotWidget(QWidget):
             self._iv_spin.setValue(0)
         self._item_cb.set_const(member.get("heldItem", "ITEM_NONE"))
         moves = member.get("moves", [])
+        # Capture the loaded moves verbatim so collect() can fall back to
+        # them whenever the user hasn't actively edited a slot.  This is
+        # the only thing standing between transient UI state (a party-type
+        # toggle, a panel rebuild) and a real on-disk wipe.
+        self._loaded_moves = [
+            (moves[i] if i < len(moves) else "MOVE_NONE")
+            for i in range(4)
+        ]
+        # Reset the user-touched flags BEFORE populating the combos so the
+        # signal-blocked set_const calls don't leave them in some random
+        # state from a prior load.
+        self._user_touched_moves = [False, False, False, False]
         for i, cb in enumerate(self._move_cbs):
-            cb.set_const(moves[i] if i < len(moves) else "MOVE_NONE")
+            cb.set_const(self._loaded_moves[i])
         # Populate sprite now that species is set (signals were blocked above)
         self._on_species_changed()
 
@@ -1252,11 +1293,33 @@ class _PartySlotWidget(QWidget):
         }
         if self._item_row_w.isVisible():
             result["heldItem"] = self._item_cb.currentData() or "ITEM_NONE"
+        # For each move slot, trust the combo's currentData() ONLY when
+        # the user has actually touched it.  Otherwise fall back to the
+        # value that was loaded into the slot — which mirrors what's on
+        # disk and prevents transient UI state (an invisible moves row
+        # mid-rebuild, a freshly-toggled party type, a panel re-creation)
+        # from being persisted as a wholesale move wipe.
         if self._moves_row_w.isVisible():
-            result["moves"] = [
-                (cb.currentData() or "MOVE_NONE")
-                for cb in self._move_cbs
-            ]
+            moves: list[str] = []
+            for i, cb in enumerate(self._move_cbs):
+                if self._user_touched_moves[i]:
+                    moves.append(cb.currentData() or "MOVE_NONE")
+                else:
+                    moves.append(
+                        self._loaded_moves[i] if i < len(self._loaded_moves)
+                        else "MOVE_NONE"
+                    )
+            result["moves"] = moves
+        elif self._loaded_moves and any(
+            m and m != "MOVE_NONE" for m in self._loaded_moves
+        ):
+            # The moves row is HIDDEN but the slot was loaded with real
+            # moves — this is the wipe path the original bug took.  Keep
+            # the loaded data in the result so save_path code that needs
+            # to write CUSTOM_MOVES C still has the moves to emit.  When
+            # the party type genuinely IS default-moves the loaded list
+            # is empty / all-MOVE_NONE and this branch is a no-op.
+            result["moves"] = list(self._loaded_moves)
         return result
 
     def _on_species_changed(self):

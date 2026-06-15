@@ -568,7 +568,7 @@ class _DirectionAnimator(QLabel):
         self.direction = direction
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(64, 96)
-        self.setStyleSheet("background: #111; border: 1px solid #333;")
+        self.setStyleSheet("background: transparent; border: 1px solid palette(mid);")
         self._frames: list[QPixmap] = []
         self._idx = 0
         self._timer = QTimer(self)
@@ -1005,7 +1005,7 @@ class NewSpriteDialog(QDialog):
         self._preview_lbl = QLabel()
         self._preview_lbl.setFixedHeight(80)
         self._preview_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._preview_lbl.setStyleSheet("background: #111; border: 1px solid #333;")
+        self._preview_lbl.setStyleSheet("background: transparent; border: 1px solid palette(mid);")
         form.addRow("Preview:", self._preview_lbl)
 
         # Name
@@ -1775,7 +1775,7 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_sheet_lbl = QLabel("Select a sprite")
         self._fe_sheet_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._fe_sheet_lbl.setMinimumHeight(100)
-        self._fe_sheet_lbl.setStyleSheet("background: #111; border: 1px solid #333;")
+        self._fe_sheet_lbl.setStyleSheet("background: transparent; border: 1px solid palette(mid);")
         sg.addWidget(self._fe_sheet_lbl)
 
         self._fe_sheet_info = QLabel("")
@@ -2628,7 +2628,7 @@ class _EmoteReviewDialog(QDialog):
             thumb.setFixedSize(40, 40)
             thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
             thumb.setStyleSheet(
-                "background: #1a1a1a; border: 1px solid #333;"
+                "background: transparent; border: 1px solid palette(mid);"
             )
             info = info_data.get(cand.info_name, {})
             tag = info.get("paletteTag", "")
@@ -2758,6 +2758,15 @@ class OverworldGraphicsTab(QWidget):
         # gfx_const keys whose animation table was reassigned in the detail
         # panel.  Save rewrites each sprite's GraphicsInfo .anims field.
         self._anim_dirty: set[str] = set()
+        # gfx_const keys whose frame size was changed in the detail panel.
+        # Save calls replace_sprite_sheet() which rewrites the GraphicsInfo
+        # .width/.height/.size/.oam/.subspriteTables, rebuilds the pic
+        # table, generates any new OAM/subsprite scaffolding, and updates
+        # spritesheet_rules.mk in one atomic pass.
+        self._geometry_dirty: set[str] = set()
+        # Pending (W, H) per dirty sprite so the save path doesn't have to
+        # re-read the spinbox state.  Keyed by gfx_const.
+        self._pending_geometry: Dict[str, Tuple[int, int]] = {}
         # Per-sprite collision footprints (gfx_const → Footprint).  Loaded
         # from src/data/object_events/object_event_footprints.h on project
         # open, edited via the Edit Collision Footprint dialog, regenerated
@@ -2981,7 +2990,7 @@ class OverworldGraphicsTab(QWidget):
         self._sheet_lbl = QLabel()
         self._sheet_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._sheet_lbl.setMinimumHeight(100)
-        self._sheet_lbl.setStyleSheet("background: #111; border: 1px solid #333;")
+        self._sheet_lbl.setStyleSheet("background: transparent; border: 1px solid palette(mid);")
         self._sheet_lbl.setText("Select a sprite")
         sg.addWidget(self._sheet_lbl)
 
@@ -2990,6 +2999,86 @@ class OverworldGraphicsTab(QWidget):
         self._sheet_info_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._sheet_info_lbl.setWordWrap(True)
         sg.addWidget(self._sheet_info_lbl)
+
+        # Frame Size editor — lets the user change a sprite's frame
+        # geometry in place.  Both spinboxes are constrained to multiples
+        # of 16 (validate() in overworld_sprite_geometry).  A common-sizes
+        # quick-pick combo populates the spinboxes; editing the spinboxes
+        # snaps the combo back to "Custom".  Frame count is derived live
+        # from the PNG dimensions and the chosen size — no second field
+        # to keep in sync.  Save calls replace_sprite_sheet() which
+        # rewrites GraphicsInfo, pic table, OAM/subsprite scaffolding,
+        # and spritesheet_rules.mk atomically.
+        size_row = QHBoxLayout()
+        size_row.setSpacing(6)
+        size_row.addWidget(QLabel("Frame:"))
+        self._frame_w_spin = QSpinBox()
+        self._frame_w_spin.setRange(16, 256)
+        self._frame_w_spin.setSingleStep(16)
+        self._frame_w_spin.setSuffix(" px")
+        self._frame_w_spin.setEnabled(False)
+        self._frame_w_spin.wheelEvent = lambda e: e.ignore()
+        self._frame_w_spin.setToolTip(
+            "Frame width in pixels.  Must be a multiple of 16.\n"
+            "Combined with the height this picks the OAM template and\n"
+            "subsprite table the engine uses for this sprite."
+        )
+        size_row.addWidget(self._frame_w_spin)
+        size_row.addWidget(QLabel("×"))
+        self._frame_h_spin = QSpinBox()
+        self._frame_h_spin.setRange(16, 256)
+        self._frame_h_spin.setSingleStep(16)
+        self._frame_h_spin.setSuffix(" px")
+        self._frame_h_spin.setEnabled(False)
+        self._frame_h_spin.wheelEvent = lambda e: e.ignore()
+        self._frame_h_spin.setToolTip(
+            "Frame height in pixels.  Must be a multiple of 16."
+        )
+        size_row.addWidget(self._frame_h_spin)
+        self._frame_preset_combo = QComboBox()
+        self._frame_preset_combo.wheelEvent = lambda e: e.ignore()
+        self._frame_preset_combo.setEnabled(False)
+        self._frame_preset_combo.setToolTip(
+            "Quick-pick a common frame size.  Choosing one fills the\n"
+            "width and height to the left.  Editing the spinboxes by\n"
+            "hand snaps this back to Custom."
+        )
+        for label, w, h in (
+            ("Custom",           0,  0),
+            ("16×16",           16, 16),
+            ("16×32 — NPC",     16, 32),
+            ("32×32",           32, 32),
+            ("32×48",           32, 48),
+            ("32×64",           32, 64),
+            ("48×48",           48, 48),
+            ("48×80",           48, 80),
+            ("64×64",           64, 64),
+            ("64×80",           64, 80),
+            ("80×96",           80, 96),
+            ("96×96",           96, 96),
+            ("128×128",        128, 128),
+        ):
+            self._frame_preset_combo.addItem(label, (w, h))
+        size_row.addWidget(self._frame_preset_combo, 1)
+        sg.addLayout(size_row)
+
+        # Derived frame-count + anim-table hint.  Plain English so the
+        # user can read it without knowing the C symbols.  Updated by
+        # _refresh_frame_size_hint() whenever the size or PNG changes.
+        self._frame_hint_lbl = QLabel("")
+        self._frame_hint_lbl.setStyleSheet(
+            "color: #888; font-size: 10px;"
+        )
+        self._frame_hint_lbl.setWordWrap(True)
+        sg.addWidget(self._frame_hint_lbl)
+
+        # Signals — guarded by self._loading so initial population from
+        # _show_sprite_detail does not register as an edit.
+        self._frame_w_spin.valueChanged.connect(self._on_frame_size_edited)
+        self._frame_h_spin.valueChanged.connect(self._on_frame_size_edited)
+        self._frame_preset_combo.currentIndexChanged.connect(
+            self._on_frame_preset_picked
+        )
 
         sprite_btn_row = QHBoxLayout()
         sprite_btn_row.setSpacing(6)
@@ -3211,6 +3300,8 @@ class OverworldGraphicsTab(QWidget):
         self._sprite_imgs.clear()
         self._sprite_png_dirty.clear()
         self._anim_dirty.clear()
+        self._geometry_dirty.clear()
+        self._pending_geometry.clear()
         # Re-parse the project's collision footprints from disk.  Empty
         # dict when the header doesn't exist yet (fresh project that
         # has never used the feature).
@@ -3241,6 +3332,9 @@ class OverworldGraphicsTab(QWidget):
         self._pal_info_lbl.setText("Select a sprite to view its palette")
         self._sheet_lbl.clear()
         self._sheet_lbl.setText("Select a sprite")
+        self._sheet_lbl.setStyleSheet(
+            "background: transparent; border: 1px solid palette(mid);"
+        )
         self._sheet_info_lbl.setText("")
         # Reset swatch row to all-black — safe because set_colors uses emit=False
         # so colors_changed / _on_palette_edited never fires here.
@@ -3277,6 +3371,24 @@ class OverworldGraphicsTab(QWidget):
             self._detail_cycle_btn.setEnabled(False)
         if hasattr(self, "_edit_footprint_btn"):
             self._edit_footprint_btn.setEnabled(False)
+        # Reset Frame Size editor — disable spinboxes and clear the
+        # derived-info hint so a fresh F5 shows no stale sprite data.
+        if hasattr(self, "_frame_w_spin"):
+            self._frame_w_spin.blockSignals(True)
+            self._frame_h_spin.blockSignals(True)
+            self._frame_preset_combo.blockSignals(True)
+            try:
+                self._frame_w_spin.setValue(16)
+                self._frame_h_spin.setValue(32)
+                self._frame_preset_combo.setCurrentIndex(0)
+                self._frame_w_spin.setEnabled(False)
+                self._frame_h_spin.setEnabled(False)
+                self._frame_preset_combo.setEnabled(False)
+            finally:
+                self._frame_w_spin.blockSignals(False)
+                self._frame_h_spin.blockSignals(False)
+                self._frame_preset_combo.blockSignals(False)
+            self._frame_hint_lbl.setText("")
 
         # Check DOWP status
         self._update_dowp_status()
@@ -3472,7 +3584,7 @@ class OverworldGraphicsTab(QWidget):
         thumb = QLabel()
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb.setFixedSize(64, 64)
-        thumb.setStyleSheet("background: #1a1a1a; border: 1px solid #333;")
+        thumb.setStyleSheet("background: transparent; border: 1px solid palette(mid);")
         palette = self._get_palette_for_sprite(entry)
         pix = self._render_frame_thumbnail(
             cand.png_path, palette, cand.frames_used,
@@ -4072,6 +4184,23 @@ class OverworldGraphicsTab(QWidget):
         if cycle_btn is not None:
             cycle_btn.setEnabled(True)
 
+        # Populate the frame-size editor for the selected sprite.  Signals
+        # are blocked here so re-selecting a sprite never registers as a
+        # geometry edit.  An unrecognised size lands as "Custom".
+        self._refresh_frame_size_controls(entry)
+        # Sync the sprite-sheet preview border to THIS sprite's geometry
+        # dirty state (Pattern C re-evaluated per selection).  An amber
+        # border tells the user the currently-selected sprite has an
+        # unsaved size change waiting in the queue.
+        if entry.gfx_const in self._geometry_dirty:
+            self._sheet_lbl.setStyleSheet(
+                "background: transparent; border: 1px solid #ffb74d;"
+            )
+        else:
+            self._sheet_lbl.setStyleSheet(
+                "background: transparent; border: 1px solid palette(mid);"
+            )
+
         # The footprint editor is enabled whenever the sprite's dimensions
         # are known and 8-aligned (any sprite created through the New
         # Sprite flow satisfies both).
@@ -4126,6 +4255,266 @@ class OverworldGraphicsTab(QWidget):
         # Debounce the grid rebuild so the card's amber border appears.
         if not self._list_refresh_timer.isActive():
             self._list_refresh_timer.start(400)
+
+    # ── Frame Size editor ────────────────────────────────────────────────
+    def _refresh_frame_size_controls(self, entry: SpriteEntry) -> None:
+        """Sync the Frame Size W/H spinboxes + preset combo to ``entry``.
+
+        Signals are blocked so populating the controls from the selected
+        sprite never registers as an edit (which would mark the sprite
+        geometry-dirty and prompt a save).  An unrecognised size lands
+        as "Custom" (preset index 0).
+
+        Also calls _refresh_frame_size_hint() so the derived frame-count
+        + suggested-anim line updates on every selection change.
+        """
+        w = entry.width if isinstance(entry.width, int) else 16
+        h = entry.height if isinstance(entry.height, int) else 32
+        # If the sprite already has a pending geometry edit, restore the
+        # pending values so the user sees their own in-flight change.
+        pending = self._pending_geometry.get(entry.gfx_const)
+        if pending:
+            w, h = pending
+        self._frame_w_spin.blockSignals(True)
+        self._frame_h_spin.blockSignals(True)
+        self._frame_preset_combo.blockSignals(True)
+        try:
+            self._frame_w_spin.setValue(w)
+            self._frame_h_spin.setValue(h)
+            self._frame_w_spin.setEnabled(True)
+            self._frame_h_spin.setEnabled(True)
+            self._frame_preset_combo.setEnabled(True)
+            # Match the size against the preset list; fall back to Custom
+            # (index 0) when no preset fits.
+            idx = 0
+            for i in range(self._frame_preset_combo.count()):
+                data = self._frame_preset_combo.itemData(i)
+                if data == (w, h):
+                    idx = i
+                    break
+            self._frame_preset_combo.setCurrentIndex(idx)
+        finally:
+            self._frame_w_spin.blockSignals(False)
+            self._frame_h_spin.blockSignals(False)
+            self._frame_preset_combo.blockSignals(False)
+        self._refresh_frame_size_hint(entry, w, h)
+
+    def _refresh_frame_size_hint(
+        self, entry: SpriteEntry, w: int, h: int,
+    ) -> None:
+        """Update the small derived-info line under the size spinboxes.
+
+        Shows: PNG dimensions, frame count at the chosen size, an OAM
+        classification (single hardware sprite vs composite), and a
+        suggested animation table when the frame count matches a known
+        preset.  All plain English so the user can read it without
+        knowing the C symbols.
+        """
+        if not entry or not entry.png_path:
+            self._frame_hint_lbl.setText("")
+            return
+        # Probe the PNG cheaply.  An unreadable file or one whose dims
+        # don't divide cleanly surfaces as an amber warning so the user
+        # knows the save will fail.
+        try:
+            probe = QImage(entry.png_path)
+            png_w = probe.width() if not probe.isNull() else 0
+            png_h = probe.height() if not probe.isNull() else 0
+        except Exception:
+            png_w, png_h = 0, 0
+        parts: List[str] = []
+        if png_w and png_h:
+            parts.append(f"PNG {png_w}×{png_h}")
+        if w > 0 and h > 0:
+            if w % 16 or h % 16:
+                self._frame_hint_lbl.setStyleSheet(
+                    "color: #ffb74d; font-size: 10px;"
+                )
+                self._frame_hint_lbl.setText(
+                    f"Frame {w}×{h} — width and height must both be "
+                    f"multiples of 16."
+                )
+                return
+            if png_w and png_h:
+                if png_w % w or png_h % h:
+                    self._frame_hint_lbl.setStyleSheet(
+                        "color: #ffb74d; font-size: 10px;"
+                    )
+                    self._frame_hint_lbl.setText(
+                        f"PNG {png_w}×{png_h} does not divide cleanly into "
+                        f"{w}×{h} frames — re-import the sheet or pick a "
+                        f"size that fits."
+                    )
+                    return
+                cols = png_w // w
+                rows = png_h // h
+                n_frames = cols * rows
+                parts.append(
+                    f"{n_frames} frame{'' if n_frames == 1 else 's'}"
+                    f"  ({cols}×{rows})"
+                )
+            # Geometry classification.
+            try:
+                from core.overworld_sprite_geometry import (
+                    validate as _vgeo, decompose as _dgeo,
+                )
+                ok, _reasons = _vgeo(w, h)
+                if ok:
+                    d = _dgeo(w, h)
+                    parts.append(
+                        "single hardware sprite"
+                        if d.is_single_oam
+                        else f"composite of {d.piece_count} pieces"
+                    )
+            except Exception:
+                pass
+            # Anim-table suggestion based on frame count.
+            if png_w and png_h:
+                hint = self._suggest_anim_table_for_count(
+                    png_w // w * (png_h // h)
+                )
+                if hint:
+                    parts.append(f"suggests {hint}")
+        self._frame_hint_lbl.setStyleSheet(
+            "color: #888; font-size: 10px;"
+        )
+        self._frame_hint_lbl.setText("  ·  ".join(parts))
+
+    @staticmethod
+    def _suggest_anim_table_for_count(n_frames: int) -> str:
+        """Return a plain-English anim-table label that fits ``n_frames``.
+
+        Walk-cycle (9) and walk-cycle+emote (20) are the only fixed-name
+        anchors; any other frame count routes to the matching Generic
+        Loop preset.  An empty string means "no obvious match — let the
+        user pick from the dropdown".
+        """
+        if n_frames <= 0:
+            return ""
+        if n_frames == 1:
+            return "Static / Inanimate"
+        if n_frames == 9:
+            return "Walk Cycle (standard NPC)"
+        if n_frames == 20:
+            return "Walk Cycle + Emote"
+        if 2 <= n_frames <= 8:
+            return f"Generic Loop · {n_frames} frames"
+        return ""
+
+    def _on_frame_size_edited(self) -> None:
+        """User typed a new value into the W or H spinbox.
+
+        Snaps the preset combo back to Custom (without re-firing
+        _on_frame_preset_picked), marks the sprite geometry-dirty, and
+        refreshes the derived-info hint.  The actual rewrite happens on
+        save (flush_to_disk → replace_sprite_sheet).
+        """
+        if self._loading or not self._current_sprite:
+            return
+        entry = self._current_sprite
+        w = self._frame_w_spin.value()
+        h = self._frame_h_spin.value()
+        # Sync the preset combo silently — picking the spinbox value
+        # means "Custom" unless it matches an entry exactly.
+        self._frame_preset_combo.blockSignals(True)
+        try:
+            idx = 0
+            for i in range(self._frame_preset_combo.count()):
+                if self._frame_preset_combo.itemData(i) == (w, h):
+                    idx = i
+                    break
+            self._frame_preset_combo.setCurrentIndex(idx)
+        finally:
+            self._frame_preset_combo.blockSignals(False)
+        # Same size as on disk → not dirty; clear any stale pending entry.
+        cur_w = entry.width if isinstance(entry.width, int) else 0
+        cur_h = entry.height if isinstance(entry.height, int) else 0
+        if w == cur_w and h == cur_h:
+            self._geometry_dirty.discard(entry.gfx_const)
+            self._pending_geometry.pop(entry.gfx_const, None)
+        else:
+            self._geometry_dirty.add(entry.gfx_const)
+            self._pending_geometry[entry.gfx_const] = (w, h)
+            self.modified.emit()
+        # Refresh the derived-info line (frame count, OAM class, suggestion).
+        self._refresh_frame_size_hint(entry, w, h)
+        # Light the amber detail-panel frame so the user sees the section
+        # has unsaved geometry edits (Pattern C from CLAUDE.md).
+        if self._geometry_dirty:
+            self._sheet_lbl.setStyleSheet(
+                "background: transparent; "
+                "border: 1px solid #ffb74d;"
+            )
+        else:
+            self._sheet_lbl.setStyleSheet(
+                "background: transparent; "
+                "border: 1px solid palette(mid);"
+            )
+        # Live-preview the slicing at the PENDING size so the user sees
+        # immediately what the fix will look like — no save needed first.
+        # Skip when the pending size is invalid (validate() rejects) or
+        # the PNG can't divide cleanly; otherwise the FourDirectionPreview
+        # would draw garbage slices and that's the LESS useful broken
+        # state than just leaving the prior frame up.
+        if w % 16 == 0 and h % 16 == 0 and w >= 16 and h >= 16:
+            try:
+                from PyQt6.QtGui import QImage as _Q
+                probe = _Q(entry.png_path) if entry.png_path else None
+                pw = probe.width() if probe and not probe.isNull() else 0
+                ph = probe.height() if probe and not probe.isNull() else 0
+                divides = (pw and ph and pw % w == 0 and ph % h == 0)
+            except Exception:
+                divides = False
+            if divides:
+                palette = self._get_palette_for_sprite(entry)
+                anim = getattr(entry, "anim_table", "sAnimTable_Standard")
+                self._four_dir.load_sprite(
+                    entry.png_path, palette, w, h, anim,
+                )
+                # Also update the centre info line so it reflects the
+                # PENDING size, not the saved one — and append "(unsaved)"
+                # so the user can tell at a glance which is which.
+                anim_type = FourDirectionPreview.anim_type_label(anim)
+                cls_str = ""
+                try:
+                    from core.overworld_sprite_geometry import (
+                        validate as _v, decompose as _d,
+                    )
+                    if _v(w, h)[0]:
+                        dec = _d(w, h)
+                        cls_str = ("  ·  single hardware sprite"
+                                   if dec.is_single_oam
+                                   else f"  ·  composite, {dec.piece_count} pieces")
+                except Exception:
+                    cls_str = ""
+                pending_flag = (
+                    "  (unsaved)"
+                    if entry.gfx_const in self._geometry_dirty
+                    else ""
+                )
+                self._sheet_info_lbl.setText(
+                    f"{entry.display_name}  —  {entry.gfx_const}\n"
+                    f"Frame: {w}×{h}px{cls_str}{pending_flag}  |  "
+                    f"Palette: {entry.palette_tag}  |  {anim_type}"
+                )
+
+    def _on_frame_preset_picked(self, idx: int) -> None:
+        """User picked a preset from the Frame Size quick-pick combo.
+
+        Index 0 is "Custom" — picking it just snaps to whatever the
+        spinboxes already show, no edit.  Any other index pushes its
+        (w, h) data into the spinboxes, which fires _on_frame_size_edited.
+        """
+        if self._loading or not self._current_sprite:
+            return
+        data = self._frame_preset_combo.itemData(idx)
+        if not data or data == (0, 0):
+            return  # Custom — leave spinboxes alone
+        w, h = data
+        # Setting spinbox values triggers _on_frame_size_edited which
+        # marks dirty and updates the hint — no other work to do here.
+        self._frame_w_spin.setValue(w)
+        self._frame_h_spin.setValue(h)
 
     def _on_edit_footprint(self) -> None:
         """Open the Edit Collision Footprint dialog for the selected sprite.
@@ -5547,6 +5936,7 @@ class OverworldGraphicsTab(QWidget):
         return (bool(self._palette_dirty) or bool(self._sprite_png_dirty)
                 or bool(self._anim_dirty)
                 or bool(self._footprint_dirty)
+                or bool(self._geometry_dirty)
                 or self._fe_tab.has_unsaved_changes())
 
     def flush_to_disk(self) -> tuple[int, list[str]]:
@@ -5678,6 +6068,52 @@ class OverworldGraphicsTab(QWidget):
             except Exception as exc:
                 errors.append(f"overworld-anim:{gfx_key} ({exc})")
 
+        # Pass 2d — geometry resizes.  Each sprite the user retargeted
+        # via the Frame Size editor in the detail panel gets its
+        # GraphicsInfo .width/.height/.size/.oam/.subspriteTables
+        # rewritten, its pic table rebuilt, any missing OAM template /
+        # subsprite table generated, and spritesheet_rules.mk updated —
+        # all in one atomic pass via replace_sprite_sheet().  The
+        # PNG on disk is reused (its mtime is bumped so the build picks
+        # up new metatile flags), and for composites the same routine
+        # re-lays-out the strip vertically.  After a successful resize
+        # the in-memory entry's width/height/anim_table reference are
+        # updated so the panel re-render matches what's on disk.
+        for gfx_key in list(self._geometry_dirty):
+            entry = self._all_sprites.get(gfx_key)
+            pending = self._pending_geometry.get(gfx_key)
+            if entry is None or pending is None:
+                self._geometry_dirty.discard(gfx_key)
+                self._pending_geometry.pop(gfx_key, None)
+                continue
+            new_w, new_h = pending
+            info_name = getattr(entry, "info_name", "")
+            if not info_name or not entry.png_path:
+                errors.append(
+                    f"overworld-geom:{gfx_key} (missing info name or PNG)"
+                )
+                continue
+            try:
+                from core.overworld_sprite_creator import replace_sprite_sheet
+                # Same-source rebake: replace_sprite_sheet handles
+                # new_png_path == on-disk path by bumping mtime so the
+                # build picks up new -mwidth/-mheight flags.
+                ok_geo, applied_geo, errs_geo = replace_sprite_sheet(
+                    self._project_root, info_name,
+                    entry.png_path, new_w, new_h,
+                )
+                if ok_geo:
+                    entry.width = new_w
+                    entry.height = new_h
+                    self._geometry_dirty.discard(gfx_key)
+                    self._pending_geometry.pop(gfx_key, None)
+                    ok += 1
+                else:
+                    for e in errs_geo:
+                        errors.append(f"overworld-geom:{gfx_key} ({e})")
+            except Exception as exc:
+                errors.append(f"overworld-geom:{gfx_key} ({exc})")
+
         # Pass 2c — per-sprite collision footprints.  Auto-installs the
         # engine support (ObjectFootprint struct + the GetObjectEventIdByXY
         # extension) on first footprint save, then regenerates the
@@ -5758,11 +6194,24 @@ class OverworldGraphicsTab(QWidget):
         # Clear amber highlight if everything is clean now.
         if (not self._palette_dirty and not self._sprite_png_dirty
                 and not self._anim_dirty
-                and not self._footprint_dirty):
+                and not self._footprint_dirty
+                and not self._geometry_dirty):
             self._pal_frame.setStyleSheet("")
             self._anim_frame.setStyleSheet("")
+            # Reset the sprite-sheet preview border (amber when a
+            # geometry edit was pending).
+            self._sheet_lbl.setStyleSheet(
+                "background: transparent; border: 1px solid palette(mid);"
+            )
             # Rebuild grid to clear amber thumbnail borders.
             self._rebuild_grid()
+        # If only geometry was clean but other sections still dirty, still
+        # reset the sheet border so the user sees their geometry change
+        # landed.
+        elif not self._geometry_dirty:
+            self._sheet_lbl.setStyleSheet(
+                "background: transparent; border: 1px solid palette(mid);"
+            )
 
         # Pass 3 — field effect sprites
         fe_ok, fe_errors = self._fe_tab.flush_to_disk()

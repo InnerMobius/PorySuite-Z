@@ -683,7 +683,16 @@ def _rebuild_color_table(
     for i, (r, g, b) in enumerate(palette):
         alpha = 0 if i == transparent_index else 255
         ct.append((alpha << 24) | (r << 16) | (g << 8) | b)
-    while len(ct) < 256:
+    # Pad the table so it still covers every pixel index the image uses, but
+    # DO NOT force it up to 256 — that turned a 16-colour (4bpp) PNG into a
+    # 256-colour (8bpp) PNG padded with opaque black (the Palette Editor's
+    # "16 colours became far more, with black spots" bug, and a latent bloat
+    # on every sprite-bake path). The source image's own colorCount already
+    # covers all of its indices (it was a valid indexed PNG); only grow past
+    # that if the caller supplied a longer palette. This preserves each
+    # sprite's native bit depth.
+    target = max(len(ct), img.colorCount())
+    while len(ct) < target:
         ct.append(0xFF000000)
     result = img.copy()
     result.setColorTable(ct)

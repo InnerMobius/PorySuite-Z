@@ -856,6 +856,19 @@ QTabBar::tab:hover:!selected {
 
         # Connect selection change signals
         self.ui.tree_pokemon.itemSelectionChanged.connect(self.update_tree_pokemon)
+        # Right-click menu on the species tree: Add Form (base) / Delete Form (form)
+        try:
+            self.ui.tree_pokemon.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.CustomContextMenu)
+            self.ui.tree_pokemon.customContextMenuRequested.connect(
+                self._pokemon_tree_context_menu)
+        except Exception:
+            pass
+        # In-page form selector bar above the species editor tabs.
+        try:
+            self._setup_form_bar()
+        except Exception:
+            logging.getLogger(__name__).exception("form bar setup failed")
         # React to changes in species flags (e.g. Genderless)
         try:
             self.ui.species_flags.itemChanged.connect(self.on_species_flag_changed)
@@ -1202,6 +1215,22 @@ QTabBar::tab:hover:!selected {
             self._loading_depth += 1
             try:
                 self.refresh_current_species()
+            finally:
+                self._loading_depth -= 1
+        except Exception:
+            pass
+        # F5 also reverts the form dropdown + Forms panel to disk: drop the
+        # detected-forme cache and clear the unsaved-rules flag FIRST (so the panel
+        # reloads clean instead of flushing the edits), then resync the bar.
+        try:
+            self._loading_depth += 1
+            try:
+                if getattr(self, "_species_formes", None) is not None:
+                    self._species_formes.clear()
+                self._form_rules_dirty = False
+                base = self.previous_selected_species
+                if base:
+                    self._sync_form_bar(base, self.previous_selected_form)
             finally:
                 self._loading_depth -= 1
         except Exception:
@@ -4180,13 +4209,977 @@ QTabBar::tab:hover:!selected {
                 form_item = QTreeWidgetItem([form_name, form, species])
                 form_item.setIcon(0, self._species_list_icon(species, form))
                 species_item.addChild(form_item)
-                self.ui.evo_species.addItem("    " + form, form, species)
-                self.ui.starter1_species.addItem("    " + form_name, form, species)
-                self.ui.starter2_species.addItem("    " + form_name, form, species)
-                self.ui.starter3_species.addItem("    " + form_name, form, species)
+                # QComboBox.addItem takes (text, userData) — one data value.
+                # userData = the form const (uniquely identifies it, like the
+                # base rows above use the species const).
+                self.ui.evo_species.addItem("    " + form, form)
+                self.ui.starter1_species.addItem("    " + form_name, form)
+                self.ui.starter2_species.addItem("    " + form_name, form)
+                self.ui.starter3_species.addItem("    " + form_name, form)
             species_item.setExpanded(False)
 
         return species_item
+
+    # ── Alternate-form CRUD ───────────────────────────────────────────────
+    # A form is an appended species linked to a base by a per-base form table.
+    # Add/Delete drive the codegen in core/append_species.py; the engine source
+    # is written immediately (a structural change, like the other patchers) and
+    # the in-memory model + tree are kept in sync. Editing a form's stats needs
+    # no special UI — selecting the child row loads it, and Save persists it.
+
+    def _find_species_tree_item(self, const):
+        """Top-level species-tree item whose const is *const*, or None."""
+        tree = self.ui.tree_pokemon
+        for i in range(tree.topLevelItemCount()):
+            it = tree.topLevelItem(i)
+            if it.text(1) == const:
+                return it
+        return None
+
+    def _form_frame_index(self, base, form):
+        """Frame of a form within the base's stacked sprite sheet: base = 0,
+        first form = 1, second = 2, … (the form's position in the base's form
+        list, which mirrors the engine form table). 0 for a base species."""
+        if not form:
+            return 0
+        try:
+            forms = (self.source_data.get_pokemon_data().get(base, {})
+                     .get("forms", {}))
+            return list(forms.keys()).index(form) + 1
+        except Exception:
+            return 0
+
+    def _gfx_root(self):
+        """The source root under which ``graphics/…`` lives (project dir joined
+        with the source prefix, mirroring ``get_species_image_path``)."""
+        info = self.project_info or {}
+        d = info.get("dir", "") or ""
+        prefix = info.get("source_prefix",
+                          getattr(self.source_data, "SOURCE_PREFIX", "")) or ""
+        return os.path.join(d, prefix) if prefix else d
+
+    def _forme_abs(self, rel_png):
+        """A forme's gfx-root-relative PNG → an absolute path (forward slashes,
+        same shape as get_species_image_path), or None if the file is missing."""
+        if not rel_png:
+            return None
+        p = os.path.normpath(os.path.join(self._gfx_root(), rel_png.replace("/", os.sep)))
+        p = p.replace(os.sep, "/") if os.sep == "\\" else p
+        return p if os.path.isfile(p) else None
+
+    def _formes_for(self, species):
+        """Vanilla alternate formes detected for *species* (cached). Deoxys →
+        Normal/Attack/Defense; an ordinary mon → []. Reads the engine encoding
+        in pokemon.h via core.forme_detect — nothing species-specific here."""
+        cache = getattr(self, "_species_formes", None)
+        if cache is None:
+            cache = self._species_formes = {}
+        if species in cache:
+            return cache[species]
+        formes = []
+        try:
+            from core.forme_detect import detect_formes
+            short = species[len("SPECIES_"):] if species.startswith("SPECIES_") else species
+            camel = "".join(p.capitalize() for p in short.lower().split("_"))
+            formes = detect_formes(self._gfx_root(), camel)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "detect_formes failed for %s", species)
+            formes = []
+        cache[species] = formes
+        return formes
+
+    def _set_active_forme(self, species, formes, idx):
+        """Record which detected forme is currently being shown so the sprite
+        render paths (Info tab + Graphics tab) override to its sheet/icon/frame."""
+        if not formes or not (0 <= idx < len(formes)):
+            self._active_forme = None
+            return
+        fm = formes[idx]
+        self._active_forme = {"species": species, "index": idx, **fm}
+
+    def _init_active_forme(self, species):
+        """Reset the active forme when a species is freshly selected: a mon with
+        detected formes starts on its Normal forme; everything else clears it."""
+        formes = self._formes_for(species) if species else []
+        if formes:
+            self._set_active_forme(species, formes, 0)
+        else:
+            self._active_forme = None
+
+    def _pokemon_tree_context_menu(self, pos):
+        """Right-click menu: Add Form on a base row, Delete Form on a form row."""
+        from PyQt6.QtWidgets import QMenu
+        tree = self.ui.tree_pokemon
+        item = tree.itemAt(pos)
+        if item is None or not getattr(self, "source_data", None):
+            return
+        data = self.source_data.get_pokemon_data() or {}
+        const = item.text(1)
+        menu = QMenu(tree)
+        if const in data:                         # base species row
+            menu.addAction("Add Form…", lambda *_: self._add_form(const))
+            menu.addAction("Form Change Triggers…",
+                           lambda *_: self._edit_form_changes(const))
+        elif item.text(2):                        # form child row
+            menu.addAction("Delete Form",
+                           lambda *_: self._delete_form(item.text(2), const))
+            menu.addAction("Form Change Triggers…",
+                           lambda *_: self._edit_form_changes(const))
+        else:
+            return
+        menu.exec(tree.viewport().mapToGlobal(pos))
+
+    @staticmethod
+    def _gender_ratio_macro(val):
+        """int gender ratio (model form) → C macro (append_species form)."""
+        if not isinstance(val, int):
+            return "MON_GENDERLESS"
+        if val == 255:
+            return "MON_GENDERLESS"
+        if val == 0:
+            return "MON_MALE"
+        if val == 254:
+            return "MON_FEMALE"
+        pct = round(val * 100 / 255, 1)
+        if pct == int(pct):
+            pct = int(pct)
+        return f"PERCENT_FEMALE({pct})"
+
+    def _form_stats_from_species_info(self, si):
+        """Convert a model species_info dict into the flat stats dict that
+        create_form expects (lists → indexed macros, int gender → macro). A new
+        form starts as a copy of its base."""
+        types = si.get("types") or ["TYPE_NORMAL", "TYPE_NORMAL"]
+        abil = si.get("abilities") or ["ABILITY_NONE", "ABILITY_NONE", "ABILITY_NONE"]
+        eggs = si.get("eggGroups") or ["EGG_GROUP_NONE", "EGG_GROUP_NONE"]
+
+        def _int(key, default):
+            v = si.get(key, default)
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+
+        stats = {
+            "baseHP": _int("baseHP", 1), "baseAttack": _int("baseAttack", 1),
+            "baseDefense": _int("baseDefense", 1), "baseSpeed": _int("baseSpeed", 1),
+            "baseSpAttack": _int("baseSpAttack", 1),
+            "baseSpDefense": _int("baseSpDefense", 1),
+            "type1": types[0], "type2": types[1] if len(types) > 1 else types[0],
+            "catchRate": _int("catchRate", 255), "expYield": _int("expYield", 0),
+            "genderRatio": self._gender_ratio_macro(si.get("genderRatio", 255)),
+            "eggCycles": _int("eggCycles", 20), "friendship": _int("friendship", 70),
+            "growthRate": si.get("growthRate") or "GROWTH_MEDIUM_FAST",
+            "eggGroup1": eggs[0], "eggGroup2": eggs[1] if len(eggs) > 1 else eggs[0],
+            "ability1": abil[0] if abil else "ABILITY_NONE",
+            "ability2": abil[1] if len(abil) > 1 else "ABILITY_NONE",
+            "bodyColor": si.get("bodyColor") or "BODY_COLOR_RED",
+            "noFlip": si.get("noFlip") if si.get("noFlip") in ("TRUE", "FALSE") else "FALSE",
+        }
+        for k in ("evYield_HP", "evYield_Attack", "evYield_Defense",
+                  "evYield_Speed", "evYield_SpAttack", "evYield_SpDefense"):
+            v = si.get(k)
+            if isinstance(v, int) and v:
+                stats[k] = v
+        return stats
+
+    def _add_form(self, base_const):
+        """Add a form to *base_const* in one cohesive step (the Add-Form wizard):
+        choose new-species vs link-existing, set graphics, AND set the in-game
+        trigger — then create/link the form and write the trigger as a form-change
+        rule, so it's wired end to end and Form Changes already reflects it."""
+        from PyQt6.QtWidgets import QMessageBox
+        proj = (self.project_info or {}).get("dir")
+        if not proj or not getattr(self, "source_data", None):
+            return
+        data = self.source_data.get_pokemon_data() or {}
+        if base_const not in data:
+            return
+        base_name = base_const[len("SPECIES_"):]
+        cur = set((data[base_const].get("forms") or {}).keys())
+        choices = [(c[len("SPECIES_"):], c) for c in sorted(data.keys())
+                   if c != base_const and c not in cur]
+        try:
+            from ui.dialogs.add_form_dialog import AddFormDialog
+        except Exception as e:
+            QMessageBox.critical(self, "Add Form", f"Could not open Add Form:\n\n{e}")
+            return
+        dlg = AddFormDialog(self, base_name.replace("_", " ").title(), choices,
+                            self._form_change_param_options(proj))
+        if not dlg.exec():
+            return
+        if dlg.is_existing():
+            form_const = self._do_link_form(base_const, dlg.existing_const())
+        else:
+            own_image, own_palette = dlg.graphics_mode()
+            form_const = self._do_create_form(base_const, dlg.form_suffix(),
+                                              own_image, own_palette)
+        if not form_const:
+            return
+        # Write the chosen trigger as a form-change rule on the base, so the form
+        # is wired in-game without a separate trip to Form Changes (which now
+        # already shows this rule).
+        method, param = dlg.trigger()
+        if method:
+            try:
+                from core.append_species import read_form_changes, set_form_change
+                rules = [r for r in read_form_changes(proj, base_const)
+                         if r.get("target") != form_const]
+                rules.append({"method": method, "target": form_const, "param": param})
+                set_form_change(proj, base_const, rules)
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Add Form",
+                    f"The form was created, but saving its trigger failed:\n\n{e}\n\n"
+                    f"You can still set it from Form Changes.")
+        # Land back on the base so the dropdown lists the new form and the Forms
+        # tab shows its just-written trigger rule (rules are anchored on the base).
+        # Create left the tree on the new child; link left it on the base — handle
+        # both so everything (panels, dropdown, Forms tab) ends up consistent.
+        base_item = self._find_species_tree_item(base_const)
+        tree = getattr(self.ui, "tree_pokemon", None)
+        if base_item is not None and tree is not None and tree.currentItem() is not base_item:
+            tree.setCurrentItem(base_item)          # fires the full reload path
+        else:
+            self.update_data(base_const)
+            self._sync_form_bar(base_const, None)
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("species", True)
+
+    def _do_create_form(self, base_const, suffix, own_image, own_palette):
+        """Create a NEW form-species + mirror it into the model/tree (no dialogs).
+        Returns the form const, or None on failure."""
+        from PyQt6.QtWidgets import QMessageBox
+        proj = (self.project_info or {}).get("dir")
+        data = self.source_data.get_pokemon_data() or {}
+        base_name = base_const[len("SPECIES_"):]
+        if not suffix:
+            return None
+        form_const = f"SPECIES_{base_name}_{suffix}"
+        if form_const in (data[base_const].get("forms") or {}):
+            QMessageBox.warning(self, "Add Form", f"{form_const} already exists.")
+            return None
+        base_si = data[base_const].get("species_info", {})
+        stats = self._form_stats_from_species_info(base_si)
+        try:
+            from core.form_system_patch import apply_form_system
+            from core.append_species import create_form
+            apply_form_system(proj)
+            create_form(proj, base_const, suffix, stats,
+                        own_image=own_image, own_palette=own_palette)
+        except Exception as e:
+            QMessageBox.critical(self, "Add Form", f"Could not create the form:\n\n{e}")
+            return None
+        label = f"{base_name}_{suffix}"
+        data[base_const].setdefault("forms", {})[form_const] = {
+            "species_info": copy.deepcopy(base_si), "name": label,
+        }
+        base_item = self._find_species_tree_item(base_const)
+        if base_item is not None:
+            child = QTreeWidgetItem([label, form_const, base_const])
+            try:
+                child.setIcon(0, self._species_list_icon(base_const, form_const))
+            except Exception:
+                pass
+            base_item.addChild(child)
+            base_item.setExpanded(True)
+            self.ui.tree_pokemon.setCurrentItem(child)
+        for combo, txt in ((getattr(self.ui, "evo_species", None), form_const),
+                           (getattr(self.ui, "starter1_species", None), label),
+                           (getattr(self.ui, "starter2_species", None), label),
+                           (getattr(self.ui, "starter3_species", None), label)):
+            try:
+                if combo is not None:
+                    combo.addItem("    " + txt, form_const)
+            except Exception:
+                pass
+        return form_const
+
+    def _do_link_form(self, base_const, existing_const):
+        """Link an EXISTING mon as a form + mirror into the model/tree (warns on a
+        cross-family conflict). Returns the linked const, or None on cancel/failure."""
+        from PyQt6.QtWidgets import QMessageBox
+        proj = (self.project_info or {}).get("dir")
+        data = self.source_data.get_pokemon_data() or {}
+        base_name = base_const[len("SPECIES_"):]
+        if not existing_const:
+            return None
+        label = existing_const[len("SPECIES_"):]
+        try:
+            from core.form_system_patch import apply_form_system
+            from core.append_species import link_existing_form, form_family_of
+        except Exception as e:
+            QMessageBox.critical(self, "Add Form", f"Could not link the form:\n\n{e}")
+            return None
+        try:
+            fam = form_family_of(proj, existing_const)
+        except Exception:
+            fam = None
+        if fam:
+            if QMessageBox.question(
+                    self, "Add Form",
+                    f"{label} already belongs to a form family. A species can be in "
+                    f"only one — linking it to {base_name} moves it here. Continue?"
+            ) != QMessageBox.StandardButton.Yes:
+                return None
+        try:
+            apply_form_system(proj)
+            link_existing_form(proj, base_const, existing_const)
+        except Exception as e:
+            QMessageBox.critical(self, "Add Form", f"Could not link the form:\n\n{e}")
+            return None
+        data[base_const].setdefault("forms", {})[existing_const] = {
+            "species_info": data.get(existing_const, {}).get("species_info", {}),
+            "name": label, "linked": True,
+        }
+        base_item = self._find_species_tree_item(base_const)
+        if base_item is not None:
+            child = QTreeWidgetItem([label, existing_const, base_const])
+            try:
+                child.setIcon(0, self._species_list_icon(existing_const, None))
+            except Exception:
+                pass
+            base_item.addChild(child)
+            base_item.setExpanded(True)
+        return existing_const
+
+    def _delete_form(self, base_const, form_const):
+        """Remove an alternate form: codegen cleanup + model + tree + dropdowns."""
+        from PyQt6.QtWidgets import QMessageBox
+        proj = (self.project_info or {}).get("dir")
+        if not proj or not getattr(self, "source_data", None):
+            return
+        data = self.source_data.get_pokemon_data() or {}
+        finfo = (data.get(base_const, {}).get("forms") or {}).get(form_const, {})
+        is_linked = bool(finfo.get("linked"))
+        short = form_const[len("SPECIES_"):]
+        base_short = base_const[len("SPECIES_"):]
+        if is_linked:
+            prompt = (f"Unlink {short} from {base_short}?\n\n{short} stays in the "
+                      f"dex with its own data — it just stops being a form of "
+                      f"{base_short}.")
+        else:
+            prompt = (f"Delete {form_const}?\n\nThis removes the form species and "
+                      f"all of its data from the project. It cannot be undone.")
+        if QMessageBox.question(self, "Delete Form", prompt) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from core.append_species import delete_form, unlink_form
+            if is_linked:
+                unlink_form(proj, base_const, form_const)   # keep the species
+            else:
+                delete_form(proj, form_const)               # remove the species
+        except Exception as e:
+            QMessageBox.critical(self, "Delete Form",
+                                 f"Could not remove the form:\n\n{e}")
+            return
+        (data.get(base_const, {}).get("forms") or {}).pop(form_const, None)
+        base_item = self._find_species_tree_item(base_const)
+        if base_item is not None:
+            for i in range(base_item.childCount()):
+                if base_item.child(i).text(1) == form_const:
+                    base_item.removeChild(base_item.child(i))
+                    break
+        for combo in (getattr(self.ui, "evo_species", None),
+                      getattr(self.ui, "starter1_species", None),
+                      getattr(self.ui, "starter2_species", None),
+                      getattr(self.ui, "starter3_species", None)):
+            try:
+                if combo is not None:
+                    idx = combo.findData(form_const)
+                    if idx >= 0:
+                        combo.removeItem(idx)
+            except Exception:
+                pass
+        # Always land on the base after a delete/unlink so the dropdown drops the
+        # removed form and the Forms tab reloads — whether or not that form was the
+        # one being viewed.
+        if getattr(self, "previous_selected_form", None) == form_const:
+            self.previous_selected_form = None
+        tree = getattr(self.ui, "tree_pokemon", None)
+        if base_item is not None and tree is not None and tree.currentItem() is not base_item:
+            tree.setCurrentItem(base_item)          # fires the full reload path
+        else:
+            self.update_data(base_const)
+            self._sync_form_bar(base_const, None)
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("species", True)
+
+    # Advance Map's weather option labels, keyed by the weather VALUE (the byte
+    # stored in a map header — AM indexes its list by that byte). Using AM's exact
+    # wording so a rule reads the same as what the user sees in their map editor:
+    # notably value 2 is "Regular weather" (the normal everyday outdoor weather most
+    # maps use), NOT a special "sunny" effect. Any value not listed (custom weather,
+    # or higher ids AM doesn't label) falls back to the prettified constant name.
+    _ADVANCEMAP_WEATHER_LABELS = {
+        0: "In-house weather",
+        1: "Sunny weather with clouds in water",
+        2: "Regular weather",
+        3: "Rainy weather",
+        4: "Three snow flakes",
+        5: "Rain with thunder storm",
+        6: "Steady mist",
+        7: "Steady snowing",
+        8: "Sand storm",
+        9: "Mist from top right corner",
+        10: "Dense bright mist",
+        11: "Cloudy",
+        12: "Underground flashes",
+    }
+
+    @staticmethod
+    def _parse_weather_constants(proj):
+        """[(WEATHER_* const, label), …] parsed from include/constants/weather.h
+        (no get_constant category for weather). Labels match Advance Map's weather
+        option names by value; an unrecognised value falls back to the prettified
+        constant name. Empty list if absent."""
+        out = []
+        path = os.path.join(proj, "include", "constants", "weather.h")
+        labels = MainWindow._ADVANCEMAP_WEATHER_LABELS
+        try:
+            with open(path, encoding="utf-8") as f:
+                for m in re.finditer(r"#define\s+(WEATHER_\w+)\s+(\d+)", f.read()):
+                    c, val = m.group(1), int(m.group(2))
+                    label = labels.get(val, c[len("WEATHER_"):].replace("_", " ").title())
+                    out.append((c, label))
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _parse_flag_constants(proj):
+        """[(FLAG_* const, label), …] from include/constants/flags.h for the story-
+        flag form trigger. Lists every FLAG_* the project defines — the user picks
+        the progress flag their scripts set; a combo type-ahead makes the long list
+        navigable. Project-parsed; no hardcoding. Empty list if absent."""
+        out, seen = [], set()
+        path = os.path.join(proj, "include", "constants", "flags.h")
+        try:
+            with open(path, encoding="utf-8") as f:
+                for m in re.finditer(r"#define\s+(FLAG_\w+)\b", f.read()):
+                    c = m.group(1)
+                    if c not in seen:
+                        seen.add(c)
+                        out.append((c, c[len("FLAG_"):]))
+        except Exception:
+            pass
+        return out
+
+    def _form_change_param_options(self, proj):
+        """Build {FORM_CHANGE_* : [(value_const, label), …]} for the dynamic
+        Parameter dropdowns, loaded from the project — real items, real weather,
+        real story flags, the conventional time-of-day periods. All project-parsed;
+        no hardcoding."""
+        opts = {}
+        items = [("ITEM_NONE", "None")]
+        try:
+            for k, v in (self.source_data.get_pokemon_items() or {}).items():
+                name = (v.get("english") or v.get("name") or k) if isinstance(v, dict) else k
+                items.append((k, name))
+        except Exception:
+            pass
+        opts["FORM_CHANGE_ITEM_HOLD"] = items
+        opts["FORM_CHANGE_ITEM_USE"] = items
+        opts["FORM_CHANGE_WEATHER"] = self._parse_weather_constants(proj)
+        opts["FORM_CHANGE_FLAG"] = self._parse_flag_constants(proj)
+        # Status conditions — the standard pokefirered STATUS1_* masks (engine
+        # constants, like the time-of-day periods, so a curated list is fine). The
+        # mon shows the form while afflicted and reverts when cured.
+        opts["FORM_CHANGE_STATUS"] = [
+            ("STATUS1_POISON", "Poisoned"),
+            ("STATUS1_TOXIC_POISON", "Badly poisoned"),
+            ("STATUS1_BURN", "Burned"),
+            ("STATUS1_PARALYSIS", "Paralyzed"),
+            ("STATUS1_SLEEP", "Asleep"),
+            ("STATUS1_FREEZE", "Frozen"),
+            ("STATUS1_ANY", "Any status"),
+        ]
+        # Time of day is RTC-dependent (PorySuite adds no clock); offer the
+        # conventional periods a project's PorySuite_GetTimeOfDay would report.
+        opts["FORM_CHANGE_TIME_OF_DAY"] = [("0", "Morning"), ("1", "Day"), ("2", "Night")]
+        return opts
+
+    def _edit_form_changes(self, species_const):
+        """Open the in-game form-change editor for *species_const* — its rules for
+        turning into ANOTHER species under a trigger (the expansion model: a form
+        change is a species swap, target = any mon). On OK, write to the engine
+        (Layer B). Edits THIS species' table, so opening it on a form edits that
+        form's rules."""
+        from PyQt6.QtWidgets import QMessageBox
+        proj = (self.project_info or {}).get("dir")
+        if not proj or not getattr(self, "source_data", None):
+            return
+        data = self.source_data.get_pokemon_data() or {}
+        # "Becomes" choices: every species in the dex + its forms (target any mon)
+        choices = []
+        for b in sorted(data.keys()):
+            choices.append((b[len("SPECIES_"):], b))
+            for fc in (data[b].get("forms") or {}):
+                choices.append(("    " + fc[len("SPECIES_"):], fc))
+        who = species_const[len("SPECIES_"):].replace("_", " ").title()
+        try:
+            from core.append_species import read_form_changes, set_form_change
+            from ui.dialogs.form_change_dialog import FormChangeDialog
+        except Exception as e:
+            QMessageBox.critical(self, "Form Changes",
+                                 f"Could not open the editor:\n\n{e}")
+            return
+        try:
+            entries = read_form_changes(proj, species_const)
+        except Exception:
+            entries = []
+        # The dialog open is wrapped so a runtime error can never fail silently
+        # (Qt swallows slot exceptions to stderr): log the full traceback to a
+        # dedicated diag file + show the cause instead of "nothing happens".
+        try:
+            dlg = FormChangeDialog(self, who, choices,
+                                   self._form_change_param_options(proj), entries)
+            accepted = dlg.exec()
+        except Exception as exc:
+            import traceback
+            logging.getLogger(__name__).exception(
+                "Form-change editor failed to open for %s", species_const)
+            try:
+                diag = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "diag_formchange.log")
+                with open(diag, "a", encoding="utf-8") as f:
+                    f.write(f"\n[{species_const}] {exc!r}\n{traceback.format_exc()}\n")
+            except Exception:
+                pass
+            QMessageBox.critical(
+                self, "Form Changes",
+                f"The form-change editor hit an error and couldn't open:\n\n{exc}\n\n"
+                f"The full details were written to diag_formchange.log.")
+            return
+        if accepted:
+            try:
+                set_form_change(proj, species_const, dlg.entries())
+            except Exception as e:
+                QMessageBox.critical(self, "Form Changes",
+                                     f"Could not save the form changes:\n\n{e}")
+                return
+            self.setWindowModified(True)
+            self.sectionDirtyChanged.emit("species", True)
+
+    # ── In-page form selector bar (above the species sub-tabs) ────────────
+    # The form dropdown swaps the displayed form (driving the tree's existing
+    # save-then-load flow); Add / Delete / Form Changes sit right next to it, so
+    # the whole feature lives on the main page instead of a right-click menu.
+
+    def _setup_form_bar(self):
+        """Build the form-selector bar and slot it above the species editor tabs."""
+        from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                                      QComboBox, QPushButton)
+        from ui.custom_widgets.scroll_guard import install_scroll_guard
+        splitter = getattr(self.ui, "pokemon_list_splitter", None)
+        tabs = getattr(self.ui, "tab_pokemon_data", None)
+        if splitter is None or tabs is None:
+            return
+
+        bar = QWidget()
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(6, 4, 6, 2)
+        h.setSpacing(6)
+        h.addWidget(QLabel("Form:"))
+        self._form_combo = QComboBox()
+        self._form_combo.setMinimumWidth(170)
+        self._form_combo.setToolTip(
+            "Switch between the base species and its alternate forms.\n"
+            "Stats, graphics and everything else update to the selected form.")
+        install_scroll_guard(self._form_combo)
+        h.addWidget(self._form_combo)
+        h.addStretch(1)
+
+        container = QWidget()
+        v = QVBoxLayout(container)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        v.addWidget(bar)
+        v.addWidget(tabs)            # reparents the tab widget into the container
+        splitter.insertWidget(1, container)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        self._form_combo.currentIndexChanged.connect(self._on_form_combo_changed)
+        # All form management (Add / Delete / Modernize + the in-game form-change
+        # editor) now lives in the Pokémon "Forms" sub-tab; the bar keeps only the
+        # form switcher.
+        self._setup_forms_tab()
+
+    # Help text shown beside the form-change rules table (Forms sub-tab). Plain
+    # English; lays out how each trigger behaves + the caveats so the user doesn't
+    # have to learn them by trial and error.
+    _FORMS_HELP_HTML = """
+<h3>How form changes work</h3>
+<p>A rule makes this species turn into <b>another</b> species while a condition is true,
+and turn back to <b>this</b> species when it stops. Rules are read top to bottom &mdash;
+the first match wins.</p>
+<p><b>Picking a species under &ldquo;Becomes&rdquo; links it as a form of this one.</b>
+You don&rsquo;t set it up separately; choosing it here makes it part of this species&rsquo;
+form family.</p>
+
+<h3>Triggers (&ldquo;When&rdquo;)</h3>
+<ul>
+<li><b>Holds an item</b> &mdash; while the mon holds that item; reverts the moment it&rsquo;s
+taken off.</li>
+<li><b>Time of day</b> &mdash; needs a clock in your project. PorySuite doesn&rsquo;t add
+one, so this only fires if your hack has its own day/night system.</li>
+<li><b>Overworld weather</b> &mdash; while that weather is active. Names match Advance Map.
+&ldquo;Rainy weather&rdquo; also covers thunderstorms and downpours. Note that
+<b>&ldquo;Regular weather&rdquo; is the normal everyday outdoor weather</b> most maps use,
+so a form set on it shows almost everywhere outdoors.</li>
+<li><b>After a story flag is set</b> &mdash; while that flag is on (a flag your scripts set,
+e.g. after clearing a dungeon). Use a <b>permanent</b> flag, not a TEMP one &mdash; TEMP
+flags reset every time you change maps.</li>
+<li><b>Has a status condition</b> &mdash; while the mon is poisoned / burned / asleep / etc.;
+reverts when cured. Works both walking around <b>and during battle</b> (it re-checks at the
+end of each turn).</li>
+</ul>
+
+<h3>When it updates</h3>
+<p>Outside battle, forms re-check at safe moments: opening the Pok&eacute;mon menu, entering
+a battle, the weather changing, and walking to a new map. It is <b>not</b> the exact instant
+a flag or status flips between those &mdash; the next of those moments catches up (usually
+immediate in practice). In battle, status forms re-check at the end of each turn.</p>
+
+<h3>Reverting</h3>
+<p>When no rule&rsquo;s condition is true, the mon returns to its <b>base</b> form (this
+species).</p>
+
+<h3>Heads-up: linking a real species</h3>
+<p>If &ldquo;Becomes&rdquo; points at a <b>real species you also use normally</b> (say a
+legendary), that species becomes a form of this one too &mdash; so if you ever carry it on
+its own, it will also turn back into this species when its condition isn&rsquo;t met. To
+keep a species usable on its own, use <b>Add Form &rarr; &ldquo;create a new form&rdquo;</b>
+(a private copy) instead of pointing at the real one.</p>
+
+<h3>Don&rsquo;t forget to build</h3>
+<p>Click <b>Save form changes</b>, then <b>Make</b> / rebuild for the change to take effect
+in the game.</p>
+"""
+
+    def _setup_forms_tab(self):
+        """Build the Pokémon 'Forms' sub-tab — Add / Delete / Modernize a form plus
+        the inline in-game form-change rules editor — and insert it right after
+        Evolutions. The form dropdown stays in the bar for switching."""
+        from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                                      QPushButton, QSplitter, QTextBrowser)
+        from PyQt6.QtCore import Qt
+        from ui.dialogs.form_change_dialog import FormChangePanel
+        tabs = getattr(self.ui, "tab_pokemon_data", None)
+        evos = getattr(self.ui, "tab_pokemon_evos", None)
+        if tabs is None:
+            return
+        page = QWidget()
+        v = QVBoxLayout(page)
+        self._forms_header = QLabel("Forms")
+        self._forms_header.setWordWrap(True)
+        v.addWidget(self._forms_header)
+
+        row = QHBoxLayout()
+        self._form_add_btn = QPushButton("+ Add Form")
+        self._form_del_btn = QPushButton("Delete Form")
+        self._form_modernize_btn = QPushButton("Modernize Forms…")
+        self._form_add_btn.setToolTip(
+            "Create a new form, or link an existing mon — with its in-game trigger.")
+        self._form_del_btn.setToolTip(
+            "Delete (or unlink) the form currently shown in the Form dropdown.")
+        self._form_modernize_btn.setToolTip(
+            "This species still uses pokefirered's legacy build-time form system.\n"
+            "Convert its forms into real, fully-editable species (opt-in, reversible).")
+        self._form_modernize_btn.setStyleSheet(
+            "QPushButton { background:#3d2e00; border:1px solid #ffb74d; "
+            "border-radius:4px; padding:2px 8px; } QPushButton:hover { background:#4d3a00; }")
+        self._form_modernize_btn.setVisible(False)
+        row.addWidget(self._form_add_btn)
+        row.addWidget(self._form_del_btn)
+        row.addStretch(1)
+        row.addWidget(self._form_modernize_btn)
+        v.addLayout(row)
+
+        v.addWidget(QLabel("In-game form changes — what makes this species morph:"))
+        # Rules editor (left) + a help panel (right) in a resizable splitter — the help
+        # lays out how triggers behave + the caveats in the space beside the rules.
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self._form_changes_panel = FormChangePanel(split)
+        split.addWidget(self._form_changes_panel)
+        help_box = QTextBrowser()
+        help_box.setOpenExternalLinks(False)
+        help_box.setStyleSheet("QTextBrowser { background: transparent; }")
+        help_box.setHtml(self._FORMS_HELP_HTML)
+        help_box.setMinimumWidth(280)
+        split.addWidget(help_box)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        v.addWidget(split, 1)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        self._form_save_btn = QPushButton("Save form changes")
+        self._form_save_btn.setToolTip("Write these form-change rules to the engine.")
+        save_row.addWidget(self._form_save_btn)
+        v.addLayout(save_row)
+
+        idx = (tabs.indexOf(evos) + 1) if evos is not None else tabs.count()
+        tabs.insertTab(idx, page, "Forms")
+
+        self._form_add_btn.clicked.connect(lambda *_: self._form_bar_add())
+        self._form_del_btn.clicked.connect(lambda *_: self._form_bar_delete())
+        self._form_modernize_btn.clicked.connect(lambda *_: self._form_bar_modernize())
+        self._form_save_btn.clicked.connect(lambda *_: self._save_form_changes())
+        # Editing a rule marks the section dirty so the unsaved state is visible
+        # (the panel guards programmatic load() so this only fires on real edits).
+        self._form_changes_panel.modified.connect(self._on_form_rules_edited)
+        self._form_rules_dirty = False
+
+    def _on_form_rules_edited(self):
+        self._form_rules_dirty = True
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("species", True)
+
+    def _load_forms_tab(self, species):
+        """Populate the Forms sub-tab (header + form-change rules) for the selected
+        species, and enable Delete only when a deletable form is shown."""
+        panel = getattr(self, "_form_changes_panel", None)
+        if panel is None or not getattr(self, "source_data", None) or not species:
+            return
+        # Flush unsaved rule edits for the PREVIOUSLY-loaded species before we
+        # repopulate the panel — otherwise switching species silently discards them.
+        prev = getattr(self, "_forms_tab_species", None)
+        if getattr(self, "_form_rules_dirty", False) and prev and prev != species:
+            self._save_form_changes(notify=False)
+        proj = (self.project_info or {}).get("dir")
+        data = self.source_data.get_pokemon_data() or {}
+        who = species[len("SPECIES_"):].replace("_", " ").title()
+        if hasattr(self, "_forms_header"):
+            self._forms_header.setText(
+                f"<b>{who}</b> — add forms, and set what makes it morph in-game.")
+        choices = []
+        for b in sorted(data.keys()):
+            choices.append((b[len("SPECIES_"):], b))
+            for fc in (data[b].get("forms") or {}):
+                choices.append(("    " + fc[len("SPECIES_"):], fc))
+        try:
+            from core.append_species import read_form_changes
+            entries = read_form_changes(proj, species) if proj else []
+        except Exception:
+            entries = []
+        opts = self._form_change_param_options(proj) if proj else {}
+        panel.load(who, choices, opts, entries)   # load() is _loading-guarded
+        self._forms_tab_species = species
+        self._form_rules_dirty = False            # freshly loaded = clean
+
+    def _save_form_changes(self, notify=True):
+        """Write the Forms sub-tab's edited rules to the engine for the species
+        currently loaded in the tab. *notify* shows a confirmation dialog (button
+        save); it's suppressed on the silent auto-flush when switching species."""
+        from PyQt6.QtWidgets import QMessageBox
+        proj = (self.project_info or {}).get("dir")
+        species = getattr(self, "_forms_tab_species", None)
+        panel = getattr(self, "_form_changes_panel", None)
+        if not proj or not species or panel is None:
+            return
+        try:
+            from core.append_species import set_form_change
+            set_form_change(proj, species, panel.entries())
+        except Exception as e:
+            QMessageBox.critical(self, "Form Changes",
+                                 f"Could not save the form changes:\n\n{e}")
+            return
+        self._form_rules_dirty = False
+        self.setWindowModified(True)
+        self.sectionDirtyChanged.emit("species", True)
+        if notify:
+            QMessageBox.information(
+                self, "Form Changes",
+                f"Saved in-game form changes for {species[len('SPECIES_'):]}. "
+                f"Build with Make to play them.")
+
+    def _sync_form_bar(self, base, form):
+        """Repopulate + select the form dropdown to match the loaded species.
+
+        Entries:
+          • DETECTED vanilla formes (int data = forme index) — read from the
+            engine's graphics encoding by core.forme_detect. Deoxys lists
+            Normal / Attack / Defense (engine-named via OBJ_EVENT_GFX_DEOXYS_N/A/D
+            + ShouldIgnoreDeoxysForm's "normal Deoxys form").
+          • APPENDED form species (str const data) — user-added forms; shown
+            under a "Normal" base entry.
+        A mon with only ONE form gets an EMPTY, disabled dropdown — there's
+        nothing to pick, so it shows nothing (no stray "Base — NAME").
+        Signal-blocked so it never re-triggers a load."""
+        from PyQt6.QtCore import QSignalBlocker
+        combo = getattr(self, "_form_combo", None)
+        if combo is None or not getattr(self, "source_data", None) or not base:
+            return
+        data = self.source_data.get_pokemon_data() or {}
+        appended = list((data.get(base, {}).get("forms") or {}).keys())
+        formes = self._formes_for(base)
+        with QSignalBlocker(combo):
+            combo.clear()
+            combo.setProperty("base_const", base)
+            if formes:
+                for i, fm in enumerate(formes):            # Normal / Attack / Defense
+                    combo.addItem(fm["name"], i)
+            elif appended:
+                # No vanilla formes, but user-added forms exist → the base is the
+                # default/unchanged form ("Normal") that the appended forms sit under.
+                combo.addItem("Normal", 0)
+            # else: a single-form mon — leave the dropdown empty (nothing to pick).
+            for fc in appended:                            # appended species
+                # show just the form part ("DEOXYS_ATTACK" → "Attack"), falling
+                # back to the bare const name if it isn't prefixed by the base.
+                if fc.startswith(base + "_"):
+                    label = fc[len(base) + 1:]
+                else:
+                    label = fc[len("SPECIES_"):] if fc.startswith("SPECIES_") else fc
+                combo.addItem(label.replace("_", " ").title(), fc)
+            if isinstance(form, str) and form:
+                sel = form
+            else:
+                af = getattr(self, "_active_forme", None)
+                sel = (af["index"] if (af and af.get("species") == base and formes)
+                       else 0)
+            i = combo.findData(sel)
+            combo.setCurrentIndex(i if i >= 0 else 0)
+        # Nothing to choose for a single-form mon → inert, empty dropdown.
+        combo.setEnabled(combo.count() > 1)
+        # Offer "Modernize" only on a mon still using the legacy build-time forme
+        # system (forme_detect found formes); once modernized it detects none.
+        if hasattr(self, "_form_modernize_btn"):
+            self._form_modernize_btn.setVisible(bool(formes))
+        # Keep the active-forme state consistent with the shown selection (no
+        # re-render — the current load already painted this species).
+        if formes and not (isinstance(form, str) and form):
+            cur = combo.currentData()
+            if isinstance(cur, int):
+                self._set_active_forme(base, formes, cur)
+        # Delete is enabled when the dropdown is showing a real (appended/linked)
+        # form — driven by the actual selection, not the passed-in form, so it's
+        # right whether the form was picked in the tree or the dropdown.
+        sel = combo.currentData()
+        if hasattr(self, "_form_del_btn"):
+            self._form_del_btn.setEnabled(isinstance(sel, str) and bool(sel))
+        # Load the Forms sub-tab for the selected species (its form-change rules).
+        self._load_forms_tab(sel if (isinstance(sel, str) and sel) else base)
+
+    def _on_form_combo_changed(self, idx):
+        """User picked a form in the bar.
+
+        A DETECTED forme (int = forme index) re-renders the current species with
+        that forme's sheet / icon / frame — no species change. An APPENDED form
+        (str const) selects the matching tree row, reusing the tree's save-then-
+        load flow."""
+        if getattr(self, "_is_updating_selection", False) or idx < 0:
+            return
+        combo = self._form_combo
+        base = combo.property("base_const")
+        val = combo.itemData(idx)
+        if not base:
+            return
+        if isinstance(val, int):
+            # a detected vanilla forme of this species (e.g. a Deoxys forme)
+            formes = self._formes_for(base)
+            # Persist base edits before update_data() overwrites the widgets — but
+            # ONLY when we're currently on the base (no active forme). A forme view
+            # shows READ-ONLY forme stats; saving that back would corrupt the base.
+            if getattr(self, "_active_forme", None) is None and self.previous_selected_species:
+                if self.save_species_data(self.previous_selected_species, form=None):
+                    self.setWindowModified(True)
+                    self.sectionDirtyChanged.emit("species", True)
+            self._set_active_forme(base, formes, val)
+            self.update_data(base)
+            return
+        # appended-species form → drive the existing tree save/load flow
+        self._active_forme = None
+        base_item = self._find_species_tree_item(base)
+        if base_item is None:
+            return
+        base_item.setExpanded(True)
+        for i in range(base_item.childCount()):
+            if base_item.child(i).text(1) == val:
+                self.ui.tree_pokemon.setCurrentItem(base_item.child(i))
+                break
+
+    def _form_bar_add(self):
+        combo = getattr(self, "_form_combo", None)
+        base = combo.property("base_const") if combo is not None else None
+        if base:
+            self._add_form(base)
+
+    def _form_bar_delete(self):
+        combo = getattr(self, "_form_combo", None)
+        if combo is None:
+            return
+        base = combo.property("base_const")
+        fc = combo.itemData(combo.currentIndex())
+        # only appended-species forms (str const) are deletable — sheet frames aren't
+        if base and isinstance(fc, str) and fc:
+            self._delete_form(base, fc)
+
+    def _form_bar_modernize(self):
+        """Opt-in: convert a mon's legacy build-time formes (e.g. Deoxys) into
+        real, fully-editable forme-species, then reload so they appear as forms.
+        Previewed + confirmed; the migration keeps the original art and is
+        reversible from the Git panel."""
+        from PyQt6.QtWidgets import QMessageBox
+        combo = getattr(self, "_form_combo", None)
+        proj = (self.project_info or {}).get("dir")
+        base = combo.property("base_const") if combo is not None else None
+        formes = self._formes_for(base) if base else []
+        if not proj or not base or not formes:
+            return
+        short = base[len("SPECIES_"):]
+        alt_names = ", ".join(fm["name"] for fm in formes[1:])
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Question)
+        msg.setWindowTitle("Modernize Forms")
+        msg.setText(f"Convert {short}'s forms to editable species?")
+        msg.setInformativeText(
+            f"{short} uses pokefirered's legacy build-time form system, so only "
+            f"one form works per ROM and its alternate stats and graphics are "
+            f"locked.\n\n"
+            f"This creates {len(formes) - 1} real, fully-editable forms "
+            f"({alt_names}) — each with its own sprite (sliced from the existing "
+            f"art), palette and stats — all reachable in one game.\n\n"
+            f"• The original sheets are kept; this is reversible from the Git panel.\n"
+            f"• It rewrites engine files and reloads the project, so save any other "
+            f"unsaved work first.\n"
+            f"• Build with Make afterwards to see it in-game.")
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok
+                               | QMessageBox.StandardButton.Cancel)
+        ok_btn = msg.button(QMessageBox.StandardButton.Ok)
+        if ok_btn is not None:
+            ok_btn.setText("Modernize")
+        if msg.exec() != QMessageBox.StandardButton.Ok:
+            return
+        try:
+            from core.legacy_forme_patch import modernize_forme
+            created = modernize_forme(proj, base)
+        except Exception:
+            logging.getLogger(__name__).exception("modernize_forme failed for %s", base)
+            QMessageBox.critical(
+                self, "Modernize Forms",
+                "Modernizing failed — see the crash log. Revert from the Git panel "
+                "if any partial changes were written.")
+            return
+        # The forme cache + the whole in-memory model are now stale vs disk.
+        if getattr(self, "_species_formes", None) is not None:
+            self._species_formes.clear()
+        self._active_forme = None
+        self._refresh_project()          # re-parse C headers → formes become species
+        try:
+            self._select_species_in_tree(base)
+        except Exception:
+            pass
+        QMessageBox.information(
+            self, "Modernize Forms",
+            f"Done — {short} now has {len(created)} editable forms.\n\n"
+            f"Pick a form in the Form dropdown to edit its stats and graphics, then "
+            f"use “Form Changes…” to set what makes each form appear in-game "
+            f"(held item, weather, …). Build with Make to play it.")
 
     @contextmanager
     def _loading_guard(self):
@@ -4409,6 +5402,13 @@ QTabBar::tab:hover:!selected {
             self._update_data_impl(species, form)
 
     def _update_data_impl(self, species, form=None):
+        # Active detected forme for THIS species (e.g. Deoxys Attack/Defense),
+        # set by the Form bar. Drives the per-forme sprite/icon/frame AND the
+        # per-forme base stats below. Guarded by species so a stale selection
+        # from another mon never leaks in.
+        af = getattr(self, "_active_forme", None)
+        af = af if (af and af.get("species") == species) else None
+        af_stats = af.get("stats") if af else None
         # Update species information
         self.ui.species_name.setText(
             self.source_data.get_species_info(species, "speciesName", form) or ""
@@ -4423,24 +5423,24 @@ QTabBar::tab:hover:!selected {
         self.ui.species_description.setPlainText(
             self.source_data.get_species_info(species, "description", form) or ""
         )
-        self.ui.base_hp.setValue(
-            self.source_data.get_species_info(species, "baseHP", form) or 0
-        )
-        self.ui.base_atk.setValue(
-            self.source_data.get_species_info(species, "baseAttack", form) or 0
-        )
-        self.ui.base_def.setValue(
-            self.source_data.get_species_info(species, "baseDefense", form) or 0
-        )
-        self.ui.base_speed.setValue(
-            self.source_data.get_species_info(species, "baseSpeed", form) or 0
-        )
-        self.ui.base_spatk.setValue(
-            self.source_data.get_species_info(species, "baseSpAttack", form) or 0
-        )
-        self.ui.base_spdef.setValue(
-            self.source_data.get_species_info(species, "baseSpDefense", form) or 0
-        )
+        # Base stats. When a detected alt-forme is shown (Deoxys Attack/Defense),
+        # display ITS stats from the engine source and lock the fields read-only
+        # — those values live in pokemon.c, not the base species, so editing them
+        # here would clobber the base. The Normal/base forme stays fully editable.
+        for _w, _k in (
+            (self.ui.base_hp, "baseHP"), (self.ui.base_atk, "baseAttack"),
+            (self.ui.base_def, "baseDefense"), (self.ui.base_speed, "baseSpeed"),
+            (self.ui.base_spatk, "baseSpAttack"), (self.ui.base_spdef, "baseSpDefense"),
+        ):
+            if af_stats and _k in af_stats:
+                _w.setValue(int(af_stats[_k]))
+            else:
+                _w.setValue(self.source_data.get_species_info(species, _k, form) or 0)
+            _w.setReadOnly(bool(af_stats))
+            _w.setToolTip(
+                f"{af['name']} form stats (from the engine source — read-only here)"
+                if af_stats else ""
+            )
 
         # Update types
         types = self.source_data.get_species_info(species, "types", form)
@@ -4879,6 +5879,12 @@ QTabBar::tab:hover:!selected {
         front_pic = self.source_data.get_species_image_path(
             species, "frontPic", form=form
         )
+        # A detected vanilla forme (e.g. Deoxys Normal/Attack/Defense) overrides
+        # the sheet / icon / frame for THIS species' render (af computed above).
+        if af and af.get("front_png"):
+            _fp = self._forme_abs(af["front_png"])
+            if _fp:
+                front_pic = _fp
         # Store the graphics folder for the Open Folder button
         if front_pic:
             self._current_species_gfx_folder = os.path.dirname(
@@ -4916,6 +5922,10 @@ QTabBar::tab:hover:!selected {
         back_pic = self.source_data.get_species_image_path(
             species, "backPic", form=form
         )
+        if af and af.get("back_png"):
+            _bp = self._forme_abs(af["back_png"])
+            if _bp:
+                back_pic = _bp
         self.ui.backPic.setStyleSheet(
             ""
             if back_pic is None
@@ -4929,6 +5939,10 @@ QTabBar::tab:hover:!selected {
         icon_pic = self.source_data.get_species_image_path(
             species, "iconSprite", form=form
         )
+        if af and af.get("icon_png"):
+            _ip = self._forme_abs(af["icon_png"])
+            if _ip:
+                icon_pic = _ip
         self.ui.iconPic.setStyleSheet(
             ""
             if icon_pic is None
@@ -4952,6 +5966,18 @@ QTabBar::tab:hover:!selected {
                 "Loaded image URL for %s[%s]: %s", species, "footprint", footprint_pic
             )
 
+        # Which frame of the sheet to show: a detected forme's own frame wins
+        # (e.g. Deoxys Attack = bottom frame of front.png); otherwise an appended
+        # form uses its table index, and a plain base species uses frame 0
+        # (mon_sheet_frame no-ops).
+        if af is not None:
+            form_frame = af.get("frame", 0)
+        elif getattr(self, "_frame_override", None) is not None:
+            form_frame = self._frame_override
+        else:
+            form_frame = self._form_frame_index(species, form)
+        self._current_form_frame = form_frame
+
         # Update Info-tab sprite thumbnails, constant label, and animated icon
         self._update_species_info_sprites(front_pic, icon_pic, species=species)
 
@@ -4964,6 +5990,7 @@ QTabBar::tab:hover:!selected {
                     back_path=back_pic or "",
                     icon_path=icon_pic or "",
                     footprint_path=footprint_pic or "",
+                    frame=form_frame,
                 )
         except Exception:
             logging.exception("graphics_tab_widget.load_species failed")
@@ -5190,13 +6217,20 @@ QTabBar::tab:hover:!selected {
             except Exception:
                 pass
 
-        # Check and update base stats
-        update_if_needed("baseHP", self.ui.base_hp.value())
-        update_if_needed("baseAttack", self.ui.base_atk.value())
-        update_if_needed("baseDefense", self.ui.base_def.value())
-        update_if_needed("baseSpeed", self.ui.base_speed.value())
-        update_if_needed("baseSpAttack", self.ui.base_spatk.value())
-        update_if_needed("baseSpDefense", self.ui.base_spdef.value())
+        # Check and update base stats — BUT skip when a detected alt-forme is
+        # shown: the spinboxes then hold the forme's (read-only) stats from the
+        # engine source, not the base's, so writing them would clobber the base
+        # species. The Normal/base forme has stats=None → saves normally.
+        _afs = getattr(self, "_active_forme", None)
+        _afs = _afs if (_afs and _afs.get("species") == species
+                        and _afs.get("stats")) else None
+        if not _afs:
+            update_if_needed("baseHP", self.ui.base_hp.value())
+            update_if_needed("baseAttack", self.ui.base_atk.value())
+            update_if_needed("baseDefense", self.ui.base_def.value())
+            update_if_needed("baseSpeed", self.ui.base_speed.value())
+            update_if_needed("baseSpAttack", self.ui.base_spatk.value())
+            update_if_needed("baseSpDefense", self.ui.base_spdef.value())
 
         # Check and update types
         types = [self.ui.type1.currentData(), self.ui.type2.currentData()]
@@ -5323,7 +6357,13 @@ QTabBar::tab:hover:!selected {
                                 update_if_needed("genderRatio", 255)
                         elif key in ("UNBREEDABLE",):
                             if checked:
-                                update_if_needed("eggGroups", ["EGG_GROUP_UNDISCOVERED"])
+                                # eggGroups is stored as TWO slots; write both so
+                                # a checked Undiscovered flag matches the stored
+                                # [UNDISCOVERED, UNDISCOVERED] and doesn't falsely
+                                # mark the species dirty just from viewing it.
+                                update_if_needed("eggGroups",
+                                                 ["EGG_GROUP_UNDISCOVERED",
+                                                  "EGG_GROUP_UNDISCOVERED"])
                             else:
                                 orig = item.data(1000)
                                 if isinstance(orig, list):
@@ -5625,6 +6665,8 @@ QTabBar::tab:hover:!selected {
             if pokemon in self.source_data.get_pokemon_data():
                 self.previous_selected_species = pokemon
                 self.previous_selected_form = None
+                # Fresh species → start on its Normal forme (or no forme).
+                self._init_active_forme(pokemon)
                 self.update_data(pokemon)
                 self._select_pokedex_item(pokemon)
                 self._refresh_pokedex_display(pokemon)
@@ -5632,9 +6674,15 @@ QTabBar::tab:hover:!selected {
                 base_species = selected_species[0].text(2)
                 self.previous_selected_species = base_species
                 self.previous_selected_form = pokemon
+                # An appended-species form renders via its own form= graphics.
+                self._active_forme = None
                 self.update_data(base_species, pokemon)
                 self._select_pokedex_item(base_species)
                 self._refresh_pokedex_display(base_species)
+
+            # Keep the in-page form dropdown in sync with the tree selection.
+            self._sync_form_bar(self.previous_selected_species,
+                                self.previous_selected_form)
 
             # Note: update_data() was already called above for the newly
             # selected species, so we do NOT call refresh_current_species()
@@ -7037,8 +8085,10 @@ QTabBar::tab:hover:!selected {
                                 )
                         except Exception:
                             pal = None
-                    from core.sprite_render import load_sprite_pixmap
+                    from core.sprite_render import load_sprite_pixmap, mon_sheet_frame
                     pm = load_sprite_pixmap(front_pic, pal)
+                    if pm is not None:
+                        pm = mon_sheet_frame(pm, getattr(self, "_current_form_frame", 0))
                     self._info_front_lbl.setPixmap(pm or QPixmap())
                     # Remember what we're displaying so a palette edit on
                     # another tab can refresh it without a full reload.
@@ -7093,7 +8143,7 @@ QTabBar::tab:hover:!selected {
             if category != "pokemon":
                 return
 
-            from core.sprite_render import load_sprite_pixmap
+            from core.sprite_render import load_sprite_pixmap, mon_sheet_frame
             from core.sprite_palette_bus import get_bus
 
             # Info tab front pic ------------------------------------------
@@ -7107,7 +8157,8 @@ QTabBar::tab:hover:!selected {
                     if pal and hasattr(self, "_info_front_lbl"):
                         pm = load_sprite_pixmap(path, pal)
                         if pm is not None:
-                            self._info_front_lbl.setPixmap(pm)
+                            self._info_front_lbl.setPixmap(
+                                mon_sheet_frame(pm, getattr(self, "_current_form_frame", 0)))
 
             # Starter sprites ---------------------------------------------
             species_list = getattr(self, "_starter_sprite_species", [])
@@ -9419,6 +10470,38 @@ QTabBar::tab:hover:!selected {
                 edits.get("pics", {}),
                 self.trainer_class_editor.get_class_to_fac(),
             )
+            # Class-role flag edits — install/refresh the data-driven
+            # trainer-class flags system and write the full class→flagset
+            # table.  This drives battle BGM, victory music, arena terrain,
+            # transition, Quest Log category, rival-name text and league
+            # friendship — all rename-proof.  set_flags also (re)applies the
+            # engine gate rewrites (PORYSUITE-fenced / idempotent).
+            role_edits = edits.get("roles", {}) or {}
+            try:
+                from core.trainer_class_flags_patch import (
+                    set_flags, apply as apply_class_flags, is_installed,
+                )
+                if role_edits:
+                    # User toggled roles — write their explicit choices and
+                    # (re)apply the engine gate rewrites.
+                    _ok, _ap, errs_f = set_flags(root, role_edits)
+                elif not is_installed(root):
+                    # No role edits, but the rename-proof engine isn't
+                    # installed yet — install it now with auto-detected flags
+                    # so this project stops breaking on class rename/reassign.
+                    _ok, _ap, errs_f = apply_class_flags(root)
+                else:
+                    errs_f = []
+                if errs_f:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "_save_trainer_classes roles: %s", "; ".join(errs_f)
+                    )
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "_save_trainer_classes roles: %s", exc
+                )
             self.trainer_class_editor.clear_dirty()
         except Exception as exc:
             import logging
@@ -9465,6 +10548,23 @@ QTabBar::tab:hover:!selected {
                 import logging
                 logging.getLogger(__name__).warning(
                     "_save_trainers_editor dialogue write: %s", exc
+                )
+
+            # Refresh the data-driven trainer-class flags table.  Reassigning a
+            # trainer to a different class here can change which class a gym
+            # leader / E4 / champion / rival now uses; re-running detection
+            # (idempotent, preserves user role choices, no-ops the gate
+            # rewrites) keeps gym music / victory / terrain / etc. correct
+            # without the user needing to open the Trainer Classes tab.
+            try:
+                root = self.project_info.get("dir", "") if self.project_info else ""
+                from core.trainer_class_flags_patch import apply as apply_class_flags, is_installed
+                if root and is_installed(root):
+                    apply_class_flags(root)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "_save_trainers_editor class-flags refresh: %s", exc
                 )
         except Exception as exc:
             import logging
@@ -10144,7 +11244,8 @@ QTabBar::tab:hover:!selected {
         # (e.g. _reapply_slider from update_data) that overwrite the inline
         # widgets with fallback values, clobbering the user's edits.
         if self.previous_selected_species is not None:
-            self.save_species_data(self.previous_selected_species)
+            self.save_species_data(self.previous_selected_species,
+                                   self.previous_selected_form)
         # Flag: species data was already captured above. update_main_tabs must
         # NOT call save_species_data again — by then processEvents will have
         # clobbered the widgets back to stale/fallback values.
@@ -10635,6 +11736,17 @@ QTabBar::tab:hover:!selected {
                     break
             return block
 
+        # Flatten base species + their alternate forms into one
+        # const→species_info map. A form's stats live nested under
+        # data[base]["forms"][form_const], but its block in species_info.h is a
+        # top-level [SPECIES_X_FORM] = entry — so without this, form stat edits
+        # would never be written back.
+        info_by_const = {}
+        for _base, _rec in sp_data.data.items():
+            info_by_const[_base] = _rec.get("species_info", {})
+            for _fc, _frec in (_rec.get("forms", {}) or {}).items():
+                info_by_const[_fc] = _frec.get("species_info", {})
+
         # Walk through lines, find [SPECIES_XXX] = blocks, patch them
         out = []
         i = 0
@@ -10665,9 +11777,9 @@ QTabBar::tab:hover:!selected {
                         break
                     j += 1
 
-                # Patch if we have data for this species
-                if species_const and species_const in sp_data.data:
-                    info = sp_data.data[species_const].get("species_info", {})
+                # Patch if we have data for this species (base OR form)
+                if species_const and species_const in info_by_const:
+                    info = info_by_const[species_const]
                     before = list(block)
 
                     # Integer fields (may be stored as int or str)

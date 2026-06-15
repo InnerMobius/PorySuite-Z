@@ -351,19 +351,26 @@ def inc_to_display(raw: str) -> tuple[str, list[str], list[tuple[int, int, str]]
     """
     text = raw.rstrip("$").rstrip()
 
-    # Newlines first — they affect plain-text positions everywhere else.
-    escape_map: list[str] = []
-    nl_chars: list[str] = []
-    i = 0
-    while i < len(text):
-        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in "npl":
-            escape_map.append(text[i:i + 2])
-            nl_chars.append("\n")
-            i += 2
-        else:
-            nl_chars.append(text[i])
-            i += 1
-    text_with_nl = "".join(nl_chars)
+    # Line breaks use the EDIT-PROOF blank-line convention, NOT a positional
+    # escape_map.  The old escape_map recorded each break's kind (\n/\p/\l) by
+    # newline INDEX and restored it the same way on save — which desynced the
+    # instant the user added or removed a line, silently turning every \p past
+    # the edit point into \n.  Worse, the trainer-dialogue tab feeds this
+    # function parse_text_inc output (already real newlines), so the escape_map
+    # came up empty and EVERY save flattened \p -> \n.  That was the gym-leader
+    # "one giant unbroken intro speech / 10-second text crawl" corruption.
+    #
+    # The fix carries the break KIND in the text structure itself:
+    #   \p  <-> blank line (\n\n)   — new textbox screen / paragraph
+    #   \n  <-> single newline      — line break within a screen
+    #   \l  -> kept as a literal visible token (rare scroll code)
+    # The GBA message box is 2 lines, so two consecutive breaks always mean a
+    # new screen — making blank-line == \p unambiguous and safe.  This works
+    # whether the input arrives as literal escapes (EVENTide / text editor) or
+    # as already-real newlines (trainer tab): the literal-escape replaces below
+    # are simply no-ops in the latter case, and the real \n\n is handled on the
+    # way back out by display_to_inc.
+    text_with_nl = text.replace("\\p", "\n\n").replace("\\n", "\n")
 
     # Replace emoji tokens with Unicode glyphs FIRST. Doing this before
     # the color parse means the resulting ``color_runs`` positions are
@@ -374,7 +381,9 @@ def inc_to_display(raw: str) -> tuple[str, list[str], list[tuple[int, int, str]]
     # Strip color tokens, capture runs.
     plain_text, color_runs = parse_color_runs(text_with_nl_emoji)
 
-    return plain_text, escape_map, color_runs
+    # escape_map is returned empty — kept in the tuple purely for call-site
+    # signature compatibility (set_inc_text / set_eventide_text unpack it).
+    return plain_text, [], color_runs
 
 
 def display_to_inc(plain_text: str,
@@ -396,17 +405,14 @@ def display_to_inc(plain_text: str,
     text = emit_color_runs(plain_text, color_runs)
     text = _replace_emoji_glyphs(text)
 
-    # Newlines back to escapes, with escape_map preserving original kinds.
-    parts = text.split("\n")
-    out: list[str] = []
-    for idx, part in enumerate(parts):
-        out.append(part)
-        if idx < len(parts) - 1:
-            if escape_map and idx < len(escape_map):
-                out.append(escape_map[idx])
-            else:
-                out.append("\\n")
-    result = "".join(out)
+    # Line breaks back to escapes via the blank-line convention (the inverse of
+    # inc_to_display).  ``escape_map`` is accepted for call-site compatibility
+    # but DELIBERATELY ignored — the break kind is now carried by the text
+    # structure (blank line == \p), which survives arbitrary editing instead of
+    # desyncing like the old positional map did.
+    #   \n\n (blank line) -> \p   ;   remaining \n -> \n
+    # Any literal \l already in the text passes through untouched.
+    result = text.replace("\n\n", "\\p").replace("\n", "\\n")
     if not result.endswith("$"):
         result += "$"
     return result

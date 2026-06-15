@@ -1707,14 +1707,19 @@ class GraphicsTabWidget(QWidget):
 
     def load_species(self, species: str,
                      front_path: str = "", back_path: str = "",
-                     icon_path: str = "", footprint_path: str = "") -> None:
-        """Load all data + sprites for the given SPECIES_ constant."""
+                     icon_path: str = "", footprint_path: str = "",
+                     frame: int = 0) -> None:
+        """Load all data + sprites for the given SPECIES_ constant.
+
+        *frame* selects which stacked frame of the front/back sheet to show — a
+        form passes its index (base species = 0)."""
         self._current_species = species
+        self._form_frame = int(frame or 0)
         self._loading = True
         try:
-            # Thumbnails (front/back full, footprint full, icon = first frame only)
-            self._set_thumb(self._front_thumb[1], front_path)
-            self._set_thumb(self._back_thumb[1], back_path)
+            # Thumbnails (front/back = this form's frame, footprint full)
+            self._set_thumb(self._front_thumb[1], front_path, frame=self._form_frame)
+            self._set_thumb(self._back_thumb[1], back_path, frame=self._form_frame)
             self._set_thumb(self._foot_thumb[1], footprint_path)
 
             # Icon source (animated separately)
@@ -1825,14 +1830,19 @@ class GraphicsTabWidget(QWidget):
         instead of re-reading the PNG from disk — so the change is live
         before the user Saves.
         """
+        from core.sprite_render import mon_sheet_frame
         palette: Optional[List[Color]] = None
         sp = self._current_species
         if sp and sp in self._palettes:
             key = "shiny" if self._preview_shiny else "normal"
             palette = self._palettes[sp].get(key)
+        _frame = getattr(self, "_form_frame", 0)
         if not palette:
-            self._preview.set_front_pixmap(self._front_src)
-            self._preview.set_back_pixmap(self._back_src)
+            # Show this species/form's frame — a front/back sheet may stack more
+            # than one 64x64 frame (e.g. Deoxys = 64x128 = normal + form). A form
+            # selects its frame index; base species use frame 0.
+            self._preview.set_front_pixmap(mon_sheet_frame(self._front_src, _frame))
+            self._preview.set_back_pixmap(mon_sheet_frame(self._back_src, _frame))
             return
 
         cached = self._sprite_imgs.get(sp or "", {})
@@ -1853,12 +1863,12 @@ class GraphicsTabWidget(QWidget):
         front_pix = _recolour("front", self._front_src_path, self._front_src)
         back_pix = _recolour("back", self._back_src_path, self._back_src)
 
-        self._preview.set_front_pixmap(front_pix)
-        self._preview.set_back_pixmap(back_pix)
+        self._preview.set_front_pixmap(mon_sheet_frame(front_pix, _frame))
+        self._preview.set_back_pixmap(mon_sheet_frame(back_pix, _frame))
 
         # Keep left-column thumbnails in sync with the palette too
-        self._set_thumb(self._front_thumb[1], self._front_src_path, palette)
-        self._set_thumb(self._back_thumb[1], self._back_src_path, palette)
+        self._set_thumb(self._front_thumb[1], self._front_src_path, palette, frame=_frame)
+        self._set_thumb(self._back_thumb[1], self._back_src_path, palette, frame=_frame)
 
     def _load_species_palettes(self, species: str) -> None:
         if not self._project_root:
@@ -1874,7 +1884,7 @@ class GraphicsTabWidget(QWidget):
         self._shiny_row.set_colors(pal["shiny"])
 
     def _set_thumb(self, lbl: QLabel, path: str,
-                   palette: Optional[List[Color]] = None) -> None:
+                   palette: Optional[List[Color]] = None, frame: int = 0) -> None:
         if not path or not os.path.exists(path):
             lbl.clear()
             return
@@ -1887,6 +1897,8 @@ class GraphicsTabWidget(QWidget):
         if pix.isNull():
             lbl.clear()
             return
+        from core.sprite_render import mon_sheet_frame
+        pix = mon_sheet_frame(pix, frame)   # slice to the requested frame
         # Scale to fit
         target = lbl.width()
         scaled = pix.scaled(

@@ -21,6 +21,7 @@ from PyQt6.QtGui import QFont
 from ui.custom_widgets.scroll_guard import install_scroll_guard
 
 from app_info import get_settings_path
+from app_theme import THEME_KEY, apply_theme
 from suppress_dialog import SUPPRESSIBLE, suppress, is_suppressed, clear_all
 
 
@@ -131,6 +132,25 @@ class SettingsDialog(QDialog):
 
     def _build_general_page(self):
         scroll, layout = self._make_page_scroll()
+
+        # ── Appearance ──────────────────────────────────────────────────────
+        appearance_box = QGroupBox("Appearance")
+        appearance_lay = QFormLayout(appearance_box)
+        appearance_lay.addRow(QLabel(
+            "App color theme. Automatic follows your Windows light/dark setting."
+        ))
+        self.theme_combo = QComboBox()
+        install_scroll_guard(self.theme_combo)
+        self._theme_modes = ["auto", "light", "dark"]
+        self.theme_combo.addItems(
+            ["Automatic (follow Windows)", "Light", "Dark"])
+        _cur_theme = str(
+            self.settings.value(THEME_KEY, "auto", type=str)).strip().lower()
+        if _cur_theme not in self._theme_modes:
+            _cur_theme = "auto"
+        self.theme_combo.setCurrentIndex(self._theme_modes.index(_cur_theme))
+        appearance_lay.addRow("Theme:", self.theme_combo)
+        layout.addWidget(appearance_box)
 
         # ── Project Display Name ────────────────────────────────────────────
         proj_box = QGroupBox("Project")
@@ -688,6 +708,14 @@ class SettingsDialog(QDialog):
             self._project_info["name"] = self.new_project_name
 
         # General
+        # Appearance theme — persisted with the dialog's settings (synced below
+        # with everything else) and applied live to the running app on OK.
+        _theme_mode = self._theme_modes[self.theme_combo.currentIndex()]
+        self.settings.setValue(THEME_KEY, _theme_mode)
+        try:
+            apply_theme(_theme_mode)
+        except Exception:
+            pass
         self.settings.setValue("advanced_diagnostics", bool(self.adv_checkbox.isChecked()))
         self.settings.setValue("crashlog/keep_days",
                                self._crashlog_day_values[self.crashlog_days_combo.currentIndex()])

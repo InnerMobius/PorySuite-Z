@@ -703,6 +703,47 @@ class SpeciesDataExtractor(PokemonDataExtractor):
                 for form in info.get("forms", {}).values():
                     form["name"] = names[const]
 
+        # ── Relocate alternate forms under their base species ──
+        # A form parses as a top-level [SPECIES_X_FORM] entry (it has its own
+        # gSpeciesInfo block), but belongs under its base's "forms" so the UI
+        # shows it as a child row, not a standalone species. Done after names
+        # are assigned (the form keeps its in-game speciesName) but before the
+        # standalone validation below (so forms are excluded from it). Read raw
+        # (not preprocessed) so the SPECIES_* member names survive.
+        _fst_path = os.path.join(self.local_util.repo_root(), "src", "data",
+                                 "pokemon", "form_species_tables.h")
+        if os.path.isfile(_fst_path):
+            try:
+                with open(_fst_path, encoding="utf-8") as _f:
+                    _fst_text = _f.read()
+            except Exception:
+                _fst_text = ""
+            for _tm in re.finditer(r"\{([^}]*)\}", _fst_text):
+                _members = [s for s in re.findall(r"\bSPECIES_\w+", _tm.group(1))
+                            if not s.endswith("_END")]
+                if len(_members) < 2 or _members[0] not in species:
+                    continue
+                _base = _members[0]
+                _base_prefix = _base + "_"
+                for _fc in _members[1:]:
+                    if _fc == _base or _fc not in species:
+                        continue
+                    if _fc.startswith(_base_prefix):
+                        # A created form-species (SPECIES_<BASE>_<SUFFIX>) has no
+                        # standalone dex slot — relocate it under the base.
+                        _rec = species.pop(_fc)
+                        _rec["name"] = _fc[len("SPECIES_"):]  # distinguishing UI label
+                        species[_base]["forms"][_fc] = _rec
+                    else:
+                        # A LINKED existing mon keeps its own top-level dex entry —
+                        # only REFERENCE it under the base's forms so the form
+                        # dropdown lists it (don't pop it out of the dex).
+                        species[_base]["forms"][_fc] = {
+                            "species_info": species[_fc].get("species_info", {}),
+                            "name": _fc[len("SPECIES_"):],
+                            "linked": True,
+                        }
+
         required = {"baseHP", "types", "abilities"}
         defaults = {
             "baseHP": 1,
@@ -817,6 +858,27 @@ class SpeciesDataExtractor(PokemonDataExtractor):
                 ):
                     si["types"] = header_types
                     fixed_types += 1
+
+            # Merge engine-parsed alternate forms into the cached data, and drop
+            # any form-const that leaked in as a top-level species. The engine's
+            # form_species_tables.h is the source of truth for what is a form, so
+            # forms appear even when the cached species.json predates them. Uses
+            # setdefault so a form the user already saved (with edits) wins over
+            # the freshly-parsed engine copy.
+            _form_members = set()
+            for _sp, _hinfo in header.items():
+                _hforms = _hinfo.get("forms") or {}
+                if not _hforms:
+                    continue
+                _form_members.update(_hforms)
+                _base = data.get(_sp)
+                if _base is not None:
+                    _base.setdefault("forms", {})
+                    for _fc, _frec in _hforms.items():
+                        _base["forms"].setdefault(_fc, _frec)
+            for _fc in _form_members:
+                if _fc in data:        # a form leaked in as a top-level species
+                    data.pop(_fc, None)
 
             if fixed_types and self.rebuild_on_type_mismatch:
                 print("Rebuilding species caches due to type mismatches…")
