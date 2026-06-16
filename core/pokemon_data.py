@@ -4,6 +4,7 @@ from core.pokemon_data_base import ReadSourceFile, WriteSourceFile, MissingSourc
 import re
 import os
 import json
+import shutil
 import logging
 from pathlib import Path
 from local_env import LocalUtil
@@ -827,6 +828,12 @@ class PokemonItems(pokemon_data.PokemonItems):
         self.add_file_to_backup(header_path, file_key="ITEMS_H")
         self.add_generated_file(header_path, file_key="ITEMS_H")
         self._items_header_path: str | None = None
+        # Full ordered item list captured at load (BEFORE the lossy collapse to a
+        # dict keyed by itemId). items.json contains duplicate-itemId filler slots
+        # — 68 identical ITEM_NONE entries on a stock FireRed — which a dict can't
+        # represent; save() rebuilds the on-disk list from this so it round-trips
+        # losslessly. None until the first list-shaped load.
+        self._items_full_order: list | None = None
 
         # Instantiate your corresponding extractor class
         self.instantiate_extractor(pee.ItemsDataExtractor)
@@ -859,6 +866,17 @@ class PokemonItems(pokemon_data.PokemonItems):
             return items
         return None
 
+    @staticmethod
+    def _extract_item_list(items):
+        """Return the raw ordered item *list* (unwrapping ``{"items": [...]}``)
+        or ``None`` if *items* is already the dict-keyed editing form. Used to
+        snapshot the full, duplicate-preserving order at load time."""
+        if isinstance(items, dict) and "items" in items:
+            items = items.get("items")
+        if isinstance(items, list):
+            return items
+        return None
+
     def _ensure_map(self):
         """Convert list-based data into a dictionary keyed by item constant.
 
@@ -870,6 +888,13 @@ class PokemonItems(pokemon_data.PokemonItems):
         never equal, and ``items.json`` is rewritten on every refresh —
         producing a phantom ``modified:`` entry in ``git status``.
         """
+        # Snapshot the full ordered list (with duplicate-itemId filler) BEFORE
+        # collapsing to a dict — only when handed a list (load / F5 refresh),
+        # never when self.data is already the editing dict (e.g. during save()).
+        # This is the lossless source save() rebuilds items.json from.
+        raw_list = self._extract_item_list(self.data)
+        if raw_list is not None:
+            self._items_full_order = json.loads(json.dumps(raw_list))
         normalized = self._normalize_items(self.data)
         if normalized is not None:
             self.data = normalized
@@ -944,6 +969,116 @@ class PokemonItems(pokemon_data.PokemonItems):
             with WriteSourceFile(self.project_info, header_rel, require_existing=True) as out:
                 out.write(updated_text)
 
+    # --- Lossless items.json round-trip + safety guard --------------------
+
+    @staticmethod
+    def _encode_new_entry(iid, info) -> dict:
+        """Encode an item not present in the captured order, matching items.json's
+        english-first / itemId-second field layout."""
+        entry: dict = {}
+        if isinstance(info, dict):
+            keys = list(info.keys())
+            if keys:
+                entry[keys[0]] = info[keys[0]]
+            entry["itemId"] = iid
+            for k in keys[1:]:
+                if k != "itemId":
+                    entry[k] = info[k]
+        else:
+            entry["itemId"] = iid
+        return entry
+
+    def _reconstruct_items_list(self, mapping: dict) -> list:
+        """Rebuild the full, ordered items list for items.json from the load-time
+        order in ``_items_full_order``, overlaying edits from *mapping* (dict
+        keyed by itemId):
+
+          * duplicate-itemId slots (the ITEM_NONE filler) are preserved verbatim
+            at their original positions — the editing dict can't represent them;
+          * uniquely-keyed items get edited fields overlaid onto the original
+            entry, preserving field order (a no-edit save is byte-identical);
+          * items removed from the dict drop out of their slot;
+          * items added in the editor (keys absent from the order) are appended.
+
+        Falls back to a flat encode of *mapping* if no order was captured — that
+        case is then caught by the count guard before any write reaches disk."""
+        order = self._items_full_order
+        if not order:
+            return [self._encode_new_entry(c, i) for c, i in mapping.items()]
+        from collections import Counter
+        counts = Counter(e.get("itemId") for e in order if isinstance(e, dict))
+        out: list = []
+        emitted: set = set()
+        for orig in order:
+            if not isinstance(orig, dict):
+                continue
+            iid = orig.get("itemId")
+            if not iid or counts[iid] > 1:
+                # filler / duplicate slot — preserve exactly as loaded
+                out.append(json.loads(json.dumps(orig)))
+                continue
+            if iid in mapping:
+                entry = json.loads(json.dumps(orig))   # original field order + itemId
+                info = mapping[iid]
+                if isinstance(info, dict):
+                    for k, v in info.items():
+                        if k != "itemId":
+                            entry[k] = v
+                out.append(entry)
+                emitted.add(iid)
+            # else: deleted from the dict — drop this slot
+        for iid, info in mapping.items():
+            if counts.get(iid, 0) == 0 and iid not in emitted:
+                out.append(self._encode_new_entry(iid, info))
+        return out
+
+    def _parse_items_count(self) -> int | None:
+        """ITEMS_COUNT from include/constants/items.h (the gItems[] length the
+        engine expects), or None if unreadable."""
+        try:
+            root = self.local_util.repo_root()
+        except Exception:
+            return None
+        try:
+            with open(os.path.join(root, "include", "constants", "items.h"),
+                      "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            return None
+        m = re.search(r"#define\s+ITEMS_COUNT\s+(\d+)", text)
+        return int(m.group(1)) if m else None
+
+    def _items_write_floor(self) -> int:
+        """Minimum acceptable count for an items.json write: the higher of what
+        we loaded this session and ITEMS_COUNT from items.h."""
+        loaded = len(self._items_full_order) if self._items_full_order else 0
+        return max(loaded, self._parse_items_count() or 0)
+
+    def _abort_items_write(self, outgoing: int, floor: int) -> None:
+        """Refuse to write a shrunken items.json: log loudly and back up the
+        current on-disk file, leaving it otherwise untouched. A short items.json
+        shifts every later item onto wrong data and crashes the bag, so a count
+        below the floor is a bug — never a silent overwrite."""
+        file_path = os.path.join(
+            self.project_info["dir"], "src", "data", self.DATA_FILE
+        )
+        loaded = len(self._items_full_order) if self._items_full_order else 0
+        msg = (
+            f"ABORTED {self.DATA_FILE} write: outgoing item count {outgoing} is "
+            f"below the safe floor {floor} (loaded {loaded}, ITEMS_COUNT "
+            f"{self._parse_items_count()}). Refusing to truncate — a short "
+            f"items.json corrupts items.h/gItems[]. On-disk file left intact."
+        )
+        logger.error(msg)
+        print(msg)
+        try:
+            if os.path.isfile(file_path):
+                bak = file_path + ".prewrite_backup"
+                shutil.copy2(file_path, bak)
+                logger.error("Backed up current %s to %s", self.DATA_FILE, bak)
+        except OSError as exc:
+            logger.error("Backup of %s failed: %s", self.DATA_FILE, exc)
+
     @override
     def save(self):
         self._synchronise_header_target()
@@ -951,20 +1086,15 @@ class PokemonItems(pokemon_data.PokemonItems):
         mapping = self.data if isinstance(self.data, dict) else {}
         payload = None
         if isinstance(mapping, dict):
-            encoded = []
-            for const, info in mapping.items():
-                if isinstance(info, dict):
-                    # Re-insert itemId after the first key to match original order
-                    keys = list(info.keys())
-                    entry = {}
-                    if keys:
-                        entry[keys[0]] = info[keys[0]]
-                    entry["itemId"] = const
-                    for k in keys[1:] if keys else []:
-                        entry[k] = info[k]
-                else:
-                    entry = {"itemId": const}
-                encoded.append(entry)
+            # Rebuild the FULL ordered list (preserving the duplicate-itemId
+            # filler slots) — not just the dict's unique keys, which silently
+            # dropped 67 ITEM_NONE entries and corrupted the build.
+            encoded = self._reconstruct_items_list(mapping)
+            # ── HARD SAFETY GUARD ────────────────────────────────────────────
+            floor = self._items_write_floor()
+            if floor and len(encoded) < floor:
+                self._abort_items_write(len(encoded), floor)
+                return
             payload = {"items": encoded}
         if payload is not None:
             original = self.data

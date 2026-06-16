@@ -117,9 +117,15 @@ _C_STRING_RE = re.compile(
 # Categorize strings.c entries by prefix
 _STRINGS_C_CATEGORIES: list[tuple[str, str, str]] = [
     # (prefix, category, subcategory)
-    ("gText_NewGame",       "game_ui.start_menu", "Start Menu"),
-    ("gText_Continue",      "game_ui.start_menu", "Start Menu"),
-    ("gText_MenuPokemon",   "game_ui.start_menu", "Start Menu"),
+    ("gText_NewGame",       "game_ui.start_menu", "Title-Screen Menu"),
+    # More specific than gText_Continue — keep the PC "Continue BOX operations?"
+    # prompt out of the title-menu group it would otherwise be swept into.
+    ("gText_ContinueBox",   "game_ui.pc",         "PC Interface"),
+    ("gText_Continue",      "game_ui.start_menu", "Title-Screen Menu"),
+    # All start-menu item LABELS share the gText_Menu* convention (POKéDEX,
+    # POKéMON, BAG, {PLAYER}, SAVE, OPTION, EXIT, RETIRE, …). Match the whole
+    # family so every renamable option appears, not just POKéMON.
+    ("gText_Menu",          "game_ui.start_menu", "Menu Options"),
     ("gText_Boy",           "game_ui.gender",     "Gender & Naming"),
     ("gText_Girl",          "game_ui.gender",     "Gender & Naming"),
     ("gText_EggNickname",   "game_ui.gender",     "Gender & Naming"),
@@ -127,7 +133,9 @@ _STRINGS_C_CATEGORIES: list[tuple[str, str, str]] = [
     ("gText_National",      "game_ui.pokedex_ui", "Pokédex UI"),
     ("gText_Controls",      "game_ui.misc",       "Miscellaneous"),
     ("gPCText_",            "game_ui.pc",         "PC Interface"),
-    ("gStartMenuDesc_",     "game_ui.start_menu_desc", "Start Menu"),
+    # The per-option help blurbs — kept in their own subgroup so they don't
+    # get mixed up with the renamable labels above.
+    ("gStartMenuDesc_",     "game_ui.start_menu_desc", "Help Descriptions"),
 ]
 
 # Prefixes owned by other tabs — search-only, no editing here
@@ -252,6 +260,68 @@ def _parse_text_inc(project_dir: str, rel_path: str,
 
 # ── new_game_intro.inc parser ─────────────────────────────────────────────────
 
+def _resolve_firered_branch(body: str) -> str:
+    """Within a C array body, keep ``#if defined(FIRERED)`` sections and drop the
+    ``#elif defined(LEAFGREEN)`` / ``#else`` sections, so we read the FireRed name
+    set (PorySuite is pokefirered-only). Lines outside any ``#if`` are kept."""
+    out: list[str] = []
+    mode = None  # None = outside any #if (keep); "keep"; "drop"
+    for line in body.splitlines():
+        s = line.strip()
+        if s.startswith("#if") or s.startswith("#elif"):
+            mode = "keep" if "FIRERED" in s else "drop"
+            continue
+        if s.startswith("#else"):
+            mode = "drop" if mode == "keep" else "keep"
+            continue
+        if s.startswith("#endif"):
+            mode = None
+            continue
+        if mode != "drop":
+            out.append(line)
+    return "\n".join(out)
+
+
+def _name_pool_subcat(pool_set: set) -> str:
+    """Human-readable subgroup name for a name's pool membership."""
+    if not pool_set:
+        return "Name Pool — Unused (this game)"
+    order = [p for p in ("Male", "Female", "Rival") if p in pool_set]
+    if order == ["Male"]:
+        return "Name Pool — Male player"
+    if order == ["Female"]:
+        return "Name Pool — Female player"
+    if order == ["Rival"]:
+        return "Name Pool — Rival"
+    if order == ["Male", "Female"]:
+        return "Name Pool — Male & Female player"
+    return "Name Pool — " + " / ".join(order)
+
+
+def _parse_name_pools(project_dir: str) -> dict:
+    """Map each ``gNameChoice_*`` label to the pool(s) it belongs to
+    (Male / Female / Rival), read from oak_speech.c's choice tables. This is
+    where the game decides which preset names a male player, a female player,
+    and the rival are offered — the label itself carries no such info."""
+    text = _read(os.path.join(project_dir, "src", "oak_speech.c"))
+    pools: dict = {}
+    if not text:
+        return pools
+    arrays = {
+        "Male": "sMaleNameChoices",
+        "Female": "sFemaleNameChoices",
+        "Rival": "sRivalNameChoices",
+    }
+    for pool, arr in arrays.items():
+        m = re.search(re.escape(arr) + r"\[\]\s*=\s*\{(.*?)\}", text, re.DOTALL)
+        if not m:
+            continue
+        body = _resolve_firered_branch(m.group(1))
+        for name in re.findall(r"\b(gNameChoice_\w+)\b", body):
+            pools.setdefault(name, set()).add(pool)
+    return pools
+
+
 def _parse_new_game_intro(project_dir: str) -> list[TextEntry]:
     """Parse Oak speech + intro pages from data/text/new_game_intro.inc."""
     rel = "data/text/new_game_intro.inc"
@@ -261,6 +331,7 @@ def _parse_new_game_intro(project_dir: str) -> list[TextEntry]:
         return []
 
     entries: list[TextEntry] = []
+    pools = _parse_name_pools(project_dir)   # gNameChoice_* → {Male/Female/Rival}
 
     for m in _ASM_LABEL_RE.finditer(text):
         label = m.group(1)
@@ -278,7 +349,7 @@ def _parse_new_game_intro(project_dir: str) -> list[TextEntry]:
             subcat = "Professor Speech"
         elif "NameChoice" in label:
             cat = "new_game.names"
-            subcat = "Name Pools"
+            subcat = _name_pool_subcat(pools.get(label, set()))
         else:
             cat = "new_game.oak"
             subcat = "Professor Speech"
