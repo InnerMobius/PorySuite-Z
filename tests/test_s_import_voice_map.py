@@ -125,3 +125,94 @@ def test_dialog_collects_remap_only_for_changed_rows():
     combos[0].setCurrentIndex(12)
     assert dlg._build_voice_remap() == {0: 12}  # only the changed row
     dlg.deleteLater()
+
+
+@pytest.mark.skipif(not _QT_OK, reason="PyQt6 unavailable")
+def test_companion_mid_regenerated_over_stale(tmp_path):
+    # A re-import must rebuild the companion .mid from the freshly imported .s,
+    # NOT keep a stale .mid on disk — otherwise the build can regenerate the .s
+    # from the wrong .mid and silently replace the imported song (this is how
+    # an imported SE got reduced to a few wrong notes).
+    import mido
+    QApplication.instance() or QApplication([])
+    from ui.dialogs.s_file_import_dialog import _SImportWorker
+
+    s_text = (
+        '\t.include "MPlayDef.s"\n\n'
+        '\t.equ\tse_t_grp, voicegroup000\n'
+        '\t.equ\tse_t_pri, 0\n\t.equ\tse_t_rev, reverb_set+0\n'
+        '\t.equ\tse_t_mvl, 127\n\t.equ\tse_t_key, 0\n\t.equ\tse_t_tbs, 1\n\n'
+        '\t.section .rodata\n\t.global\tse_t\n\t.align\t2\n\n'
+        'se_t_1:\n\t.byte\tKEYSH , 0\n\t.byte\tTEMPO , 75\n\t.byte\tVOICE , 0\n'
+        '\t.byte\tN04 , Cn4 , v100\n\t.byte\tW04\n'
+        '\t.byte\tN04 , En4 , v100\n\t.byte\tW04\n'
+        '\t.byte\tN04 , Gn4 , v100\n\t.byte\tW04\n\t.byte\tFINE\n\n'
+        'se_t:\n\t.byte\t1\n\t.byte\t0\n\t.byte\tse_t_pri\n\t.byte\tse_t_rev\n'
+        '\t.word\tse_t_grp\n\t.word\tse_t_1\n\t.end\n'
+    )
+    d = str(tmp_path)
+    s_path = os.path.join(d, "se_t.s")
+    with open(s_path, "w", encoding="utf-8") as f:
+        f.write(s_text)
+
+    # Plant a stale 1-note .mid — the bug condition.
+    stale = os.path.join(d, "se_t.mid")
+    mf = mido.MidiFile(); trk = mido.MidiTrack(); mf.tracks.append(trk)
+    trk.append(mido.Message('note_on', note=60, velocity=100, time=0))
+    trk.append(mido.Message('note_off', note=60, time=10))
+    mf.save(stale)
+
+    w = _SImportWorker(d, s_path, "SE_T", "se_t", 1,
+                       "voicegroup000", "voicegroup000", 0, 127, 0)
+    w._create_companion_mid(d, s_path)
+
+    m = mido.MidiFile(stale)
+    notes = sum(1 for t in m.tracks for x in t
+                if x.type == 'note_on' and x.velocity > 0)
+    assert notes == 3, f"companion .mid not regenerated from .s (got {notes})"
+
+
+@pytest.mark.skipif(not _QT_OK, reason="PyQt6 unavailable")
+def test_malformed_import_rolls_back(tmp_path):
+    # A malformed source must NOT clobber an existing good sound: the import is
+    # rejected and the project is left exactly as it was (transactional).
+    QApplication.instance() or QApplication([])
+    from ui.dialogs.s_file_import_dialog import _SImportWorker
+
+    good = (
+        '\t.include "MPlayDef.s"\n\t.equ\tse_x_grp, voicegroup013\n'
+        '\t.equ\tse_x_pri, 5\n\t.equ\tse_x_rev, reverb_set+0\n'
+        '\t.equ\tse_x_mvl, 127\n\t.equ\tse_x_key, 0\n\t.equ\tse_x_tbs, 1\n'
+        '\t.section .rodata\n\t.global\tse_x\n\t.align\t2\n'
+        'se_x_1:\n\t.byte\tKEYSH , se_x_key+0\n\t.byte\tVOICE , 0\n'
+        '\t.byte\tN04 , Cn4 , v127\n\t.byte\tW04\n\t.byte\tFINE\n'
+        'se_x:\n\t.byte\t1\n\t.byte\t0\n\t.byte\tse_x_pri\n\t.byte\tse_x_rev\n'
+        '\t.word\tse_x_grp\n\t.word\tse_x_1\n\t.end\n'
+    )
+    bad_src = (
+        '\t.include "MPlayDef.s"\n\t.section .rodata\n\t.global\tbad\n'
+        'bad_1:\n\t.byte\tN04 , Cn4 , v53\n\t.byte\tFINE\n'   # 2-digit vel
+        'bad:\n\t.byte\t1\n\t.byte\t0\n\t.byte\tbad_pri\n\t.byte\tbad_rev\n'
+        '\t.hword\tbad_1\n\t.end\n'                            # .hword + no grp
+    )
+    d = str(tmp_path)
+    midi = os.path.join(d, "sound", "songs", "midi")
+    os.makedirs(midi)
+    dest = os.path.join(midi, "se_x.s")
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(good)
+    src = os.path.join(d, "bad_source.s")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(bad_src)
+
+    w = _SImportWorker(d, src, "SE_X", "se_x", 1, "voicegroup013",
+                       "voicegroup000", 0, 127, 5,
+                       overwrite=True, skip_registration=True)
+    res = []
+    w.finished.connect(lambda ok, path, err: res.append((ok, err)))
+    w.run()
+
+    assert res and res[0][0] is False, "malformed import should be rejected"
+    assert "blocked" in res[0][1].lower()
+    with open(dest, encoding="utf-8") as f:
+        assert f.read() == good, "rollback failed — good sound was clobbered"

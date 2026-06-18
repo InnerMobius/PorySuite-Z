@@ -72,7 +72,6 @@ class _RenderRequest:
     velocity: int
     duration_samples: int
     release_samples: int
-    track_vol: float
     pan: int
     track: int
 
@@ -223,8 +222,9 @@ class RealtimeSequencer:
     def set_track_volume(self, track_index: int, volume: int):
         """Update a track's volume in real time (0-127).
 
-        Active voices keep their current volume. New notes triggered
-        after this call use the updated volume.
+        Applies immediately to notes that are ALREADY sounding — the mixer
+        reads each track's volume live per block, so a slider drag is audible
+        at once (it is not baked into a note's audio at render time).
         """
         with self._lock:
             ts = self._track_states.get(track_index)
@@ -395,9 +395,6 @@ class RealtimeSequencer:
             except Exception:
                 continue
 
-            if req.track_vol < 1.0:
-                audio *= req.track_vol
-
             voice = _ActiveVoice(
                 audio=audio,
                 position=0,
@@ -467,12 +464,18 @@ class RealtimeSequencer:
                         continue
                     usable = min(chunk_len, remaining)
                     chunk = voice.audio[voice.position:voice.position + usable]
+                    # Per-track volume applied LIVE here (not baked at render
+                    # time) so a track-volume slider drag — or a VOL event —
+                    # changes notes that are already sounding, matching the GBA
+                    # M4A channel-volume behaviour.
+                    tvs = track_states.get(voice.track)
+                    tvol = (tvs.volume / 127.0) if tvs else 1.0
                     # GBA linear crossfade (matches ChnVolSetAsm / apply_pan)
                     signed_pan = voice.pan - 64
                     left_gain = (127 - signed_pan) / 255.0
                     right_gain = (signed_pan + 128) / 255.0
-                    outdata[write_pos:write_pos + usable, 0] += chunk * left_gain * vol
-                    outdata[write_pos:write_pos + usable, 1] += chunk * right_gain * vol
+                    outdata[write_pos:write_pos + usable, 0] += chunk * left_gain * vol * tvol
+                    outdata[write_pos:write_pos + usable, 1] += chunk * right_gain * vol * tvol
                     voice.position += usable
 
                 # Advance tick clock
@@ -589,16 +592,17 @@ class RealtimeSequencer:
         duration_samples = min(duration_samples, OUTPUT_SAMPLE_RATE * 60)
         release_samples = min(2048, duration_samples)
 
-        track_vol = (ts.volume / 127.0) if ts else 1.0
         pan = ts.pan if ts else 64
 
+        # NOTE: track volume is deliberately NOT baked into the rendered audio.
+        # It's applied live at mix time (see _audio_callback) so a VOL change or
+        # a track-volume slider drag affects notes that are already sounding.
         self._render_queue.append(_RenderRequest(
             voice_slot=voice_slot,
             pitch=pitch,
             velocity=velocity,
             duration_samples=duration_samples,
             release_samples=release_samples,
-            track_vol=track_vol,
             pan=pan,
             track=note.get('track', 0),
         ))

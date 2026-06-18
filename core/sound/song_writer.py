@@ -1030,6 +1030,32 @@ def save_song_file(song: SongData, path: Optional[str] = None) -> str:
         raise ValueError(f"No file path for song '{song.label}'")
 
     content = write_song(song)
+
+    # Export-time validation gate — refuse to write a malformed or
+    # out-of-range .s so a bad code path can never put a non-building or
+    # wrong-voicegroup sound on disk. The existing (good) file is left
+    # untouched on failure. Fail-OPEN only if the validator itself errors
+    # (a validator bug must not block every legitimate save); fail-CLOSED on
+    # any validation error it returns.
+    try:
+        from core.sound.song_validator import validate_song_export
+        _verrs = validate_song_export(song, content)
+    except Exception as _vexc:
+        import logging as _logging
+        _logging.getLogger("SoundEditor.SongWriter").warning(
+            "Export validator could not run for %s: %s — writing anyway",
+            song.label, _vexc)
+        _verrs = []
+    if _verrs:
+        import logging as _logging
+        _logging.getLogger("SoundEditor.SongWriter").error(
+            "Refusing to write %s — export validation failed:\n  - %s",
+            song.label, "\n  - ".join(_verrs))
+        raise ValueError(
+            "Export blocked: the generated .s for '{}' is invalid and was "
+            "NOT written (your existing file is unchanged):\n  - {}".format(
+                song.label, "\n  - ".join(_verrs)))
+
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(content)
 

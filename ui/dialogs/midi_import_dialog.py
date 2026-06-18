@@ -86,6 +86,22 @@ class _ImportWorker(QThread):
                                        f"Song imported but structure edit failed: {e}")
                     return
 
+            # Validate the FINAL .s (after voice-remap + structure edits).
+            # mid2agb itself emits valid output, but the regex post-processing
+            # above could break it — surface that instead of leaving a
+            # non-building song registered.
+            try:
+                from core.sound.song_validator import validate_s_file
+                verrs = validate_s_file(result.s_file_path, self._project_root)
+            except Exception:
+                verrs = []
+            if verrs:
+                self.finished.emit(
+                    False, result.s_file_path,
+                    "Imported, but the result failed validation and may not "
+                    "build — re-import or fix:\n  - " + "\n  - ".join(verrs))
+                return
+
             self.finished.emit(True, result.s_file_path, "")
         except Exception as e:
             self.finished.emit(False, "", str(e))

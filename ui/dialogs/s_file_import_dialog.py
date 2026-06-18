@@ -115,6 +115,23 @@ class _SImportWorker(QThread):
                                    f"File already exists: sound/songs/midi/{dest_filename}")
                 return
 
+            # Snapshot the existing .s + .mid (if any) so a failed/invalid
+            # import can be rolled back. A replace must NEVER leave a broken
+            # sound in place of a working one, and a new import must not leave
+            # an orphan behind. Restored by _rollback_import() on validation
+            # failure below.
+            def _snap(p):
+                try:
+                    with open(p, "rb") as _bf:
+                        return _bf.read()
+                except OSError:
+                    return None
+            mid_path = os.path.join(dest_dir, self._label + ".mid")
+            self._dest_existed = os.path.isfile(dest_path)
+            self._mid_existed = os.path.isfile(mid_path)
+            self._dest_backup = _snap(dest_path) if self._dest_existed else None
+            self._mid_backup = _snap(mid_path) if self._mid_existed else None
+
             # Copy the .s file (overwrites if approved)
             shutil.copy2(self._source_s_path, dest_path)
 
@@ -144,6 +161,23 @@ class _SImportWorker(QThread):
                 from ui.dialogs.midi_import_dialog import _postprocess_voice_remap
                 _postprocess_voice_remap(dest_path, self._voice_remap)
 
+            # GATE: validate the freshly written .s BEFORE anything irreversible
+            # (companion .mid render, registration). A malformed or out-of-range
+            # .s must never reach the song tables — that breaks the build for
+            # this AND every other song. On failure, roll back to the pre-import
+            # state (restore the previous .s/.mid, or remove brand-new files)
+            # and abort, so the user's project is left exactly as it was.
+            from core.sound.song_validator import validate_s_file
+            _verrs = validate_s_file(dest_path, self._project_root)
+            if _verrs:
+                self._rollback_import(dest_path, mid_path)
+                self.finished.emit(
+                    False, "",
+                    "Import blocked — the resulting .s would not build and was "
+                    "NOT applied (your project is unchanged):\n  - "
+                    + "\n  - ".join(_verrs))
+                return
+
             # Generate a real, content-matching .mid alongside the .s.
             # This replaces the previous 26-byte placeholder approach,
             # which left the .s exposed to build-time wipe: any later
@@ -153,20 +187,6 @@ class _SImportWorker(QThread):
             # With a content-matching .mid the worst-case mid2agb re-run
             # produces an audibly-equivalent .s — no data loss.
             self._create_companion_mid(dest_dir, dest_path)
-
-            # Ensure .s is newer than .mid — make's %.s:%.mid rule runs
-            # mid2agb when .mid is newer, which would overwrite our .s.
-            # 1-hour backdate (matching save_song_file) — 2 seconds was
-            # inside filesystem-clock-jitter range.  Label / voicegroup
-            # rewriting was already done above before the .mid render,
-            # so the .s on disk is already in its final form.
-            import time as _time
-            now = _time.time()
-            os.utime(dest_path, (now, now))
-            mid_file = os.path.join(dest_dir, self._label + ".mid")
-            if os.path.isfile(mid_file):
-                far_past = now - 3600
-                os.utime(mid_file, (far_past, far_past))
 
             # Register in song_table.inc, songs.h, midi.cfg
             # (skipped when reimporting — the song is already registered)
@@ -201,11 +221,68 @@ class _SImportWorker(QThread):
                         pass
                     self.finished.emit(False, "", err)
                     return
+            else:
+                # Re-import over an EXISTING song: keep its table slot (don't
+                # re-register, so its index/order in songs.h + song_table.inc
+                # is preserved), but still re-sync its midi.cfg flags to the
+                # wizard's choices. Without this, changing the voicegroup /
+                # reverb / volume / priority on a replace updated the .s but
+                # left midi.cfg stale, so a later mid2agb regen would use the
+                # OLD settings. Mirrors what a fresh register_song would write.
+                from core.sound.song_table_manager import update_midi_cfg_flags
+                vg_num = 0
+                m = re.search(r'(\d+)',
+                              self._target_vg_name or self._source_vg_name or '')
+                if m:
+                    vg_num = int(m.group(1))
+                update_midi_cfg_flags(
+                    self._project_root, self._label,
+                    priority=self._priority, reverb=self._reverb,
+                    volume=self._volume, voicegroup=vg_num)
+
+            # Lock mtimes LAST — after register_song has (re)written midi.cfg.
+            # The Make rule `%.s: %.mid midi.cfg` regenerates the .s if EITHER
+            # the .mid OR midi.cfg is newer than it. register_song bumps
+            # midi.cfg to "now", which would otherwise let the next build
+            # overwrite the .s we just imported (running mid2agb on the .mid).
+            # _backdate_mid touches the .s to now and pushes BOTH the .mid and
+            # midi.cfg into the past, so the imported .s always wins. Doing
+            # this earlier (before register_song) left midi.cfg newer — the
+            # original cause of imported songs getting silently regenerated.
+            try:
+                from ui.dialogs.midi_import_dialog import _backdate_mid
+                _backdate_mid(dest_path)
+            except Exception as e:
+                _log.warning("Import mtime lock failed for %s: %s",
+                             dest_path, e)
 
             self.finished.emit(True, dest_path, "")
 
         except Exception as e:
             self.finished.emit(False, "", str(e))
+
+    def _rollback_import(self, dest_path: str, mid_path: str):
+        """Undo a failed/invalid import: restore the pre-import .s + .mid (a
+        replace) or remove the brand-new files (a fresh import), so the
+        project is left exactly as it was before the import started."""
+        try:
+            if self._dest_existed and self._dest_backup is not None:
+                with open(dest_path, "wb") as f:
+                    f.write(self._dest_backup)
+            elif not self._dest_existed and os.path.isfile(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+        try:
+            if self._mid_existed and self._mid_backup is not None:
+                with open(mid_path, "wb") as f:
+                    f.write(self._mid_backup)
+            elif not self._mid_existed and os.path.isfile(mid_path):
+                os.remove(mid_path)
+        except OSError:
+            pass
+        _log.warning("Rolled back invalid import of %s — project unchanged",
+                     self._label)
 
     def _rewrite_labels(self, dest_path: str):
         """Rewrite the .s's internal naming to match our target label.
@@ -324,17 +401,14 @@ class _SImportWorker(QThread):
         """
         mid_path = os.path.join(dest_dir, self._label + ".mid")
 
-        # If the user already has a real-content .mid at this path, leave
-        # it alone — we don't want to nuke their DAW source.
-        if os.path.isfile(mid_path):
-            try:
-                if os.path.getsize(mid_path) > 30:
-                    _log.info(
-                        ".mid already has content; leaving alone: %s",
-                        mid_path)
-                    return
-            except OSError:
-                pass
+        # ALWAYS (re)generate the companion .mid from the just-imported .s.
+        # For a .s import the .s IS the source of truth and the .mid is purely
+        # derived from it. A stale .mid left from a previous import/build is
+        # dangerous: the Make rule `%.s: %.mid midi.cfg` can regenerate the .s
+        # FROM that stale .mid, silently replacing the file the user just
+        # imported (this is exactly how an imported SE got reduced to a few
+        # wrong notes — a 4-note stale .mid overwrote a 38-note import). So we
+        # overwrite any existing .mid here instead of leaving it alone.
 
         try:
             from core.sound.song_parser import parse_song_file
@@ -375,7 +449,8 @@ class SFileImportDialog(QDialog):
 
     def __init__(self, project_root: str, voicegroup_names: list[str],
                  voicegroup_data=None,
-                 parent: Optional[QWidget] = None):
+                 parent: Optional[QWidget] = None,
+                 replace_target=None):
         super().__init__(parent)
         self._project_root = project_root
         self._voicegroup_names = voicegroup_names
@@ -385,12 +460,20 @@ class SFileImportDialog(QDialog):
         self._worker = None
         # (old_voice_num, slot_combo) rows on the Instruments page
         self._voice_map_combos: list = []
+        # When set (a SongEntry), this is a "Replace" — the wizard overwrites
+        # that song's .s and KEEPS its slot/registration, but still runs the
+        # full voicegroup + instrument setup. Otherwise it's a fresh import.
+        self._replace_target = replace_target
 
-        self.setWindowTitle("Import Song (.s File)")
+        self.setWindowTitle(
+            f"Replace '{getattr(replace_target, 'friendly_name', '')}' with .s File"
+            if replace_target is not None else "Import Song (.s File)")
         self.setMinimumSize(650, 500)
         self.resize(700, 550)
 
         self._build_ui()
+        if replace_target is not None:
+            self._apply_replace_target()
 
     # ═══════════════════════════════════════════════════════════════════════
     # UI construction
@@ -779,22 +862,24 @@ class SFileImportDialog(QDialog):
                                     "Please select a .s song file first.")
                 return
 
-            # Validate name
-            display_name = self._name_edit.text().strip()
-            if not display_name:
-                QMessageBox.warning(self, "Missing Name",
-                                    "Please enter a name for the song.")
-                return
-            constant = self._derive_constant(display_name)
-            if not constant:
-                QMessageBox.warning(self, "Invalid Name",
-                                    "Could not derive a valid constant from that name.")
-                return
-            from core.sound.midi_importer import validate_constant_name
-            valid, err = validate_constant_name(constant, self._project_root)
-            if not valid and "already exists" not in err:
-                QMessageBox.warning(self, "Invalid Name", err)
-                return
+            # Validate name (fresh import only — replace mode has a locked,
+            # already-registered constant).
+            if self._replace_target is None:
+                display_name = self._name_edit.text().strip()
+                if not display_name:
+                    QMessageBox.warning(self, "Missing Name",
+                                        "Please enter a name for the song.")
+                    return
+                constant = self._derive_constant(display_name)
+                if not constant:
+                    QMessageBox.warning(self, "Invalid Name",
+                                        "Could not derive a valid constant from that name.")
+                    return
+                from core.sound.midi_importer import validate_constant_name
+                valid, err = validate_constant_name(constant, self._project_root)
+                if not valid and "already exists" not in err:
+                    QMessageBox.warning(self, "Invalid Name", err)
+                    return
 
             self._populate_voicegroup_page()
             self._stack.setCurrentIndex(_PAGE_VOICEGROUP)
@@ -868,8 +953,10 @@ class SFileImportDialog(QDialog):
                 ])
                 self._track_tree.addTopLevelItem(item)
 
-            # Auto-suggest display name from label
-            if song.label and not self._name_edit.text().strip():
+            # Auto-suggest display name from label (fresh import only — a
+            # replace keeps the existing song's locked name/constant).
+            if (self._replace_target is None and song.label
+                    and not self._name_edit.text().strip()):
                 # Convert mus_battle_theme -> Battle Theme
                 name = song.label
                 for prefix in ('mus_', 'se_'):
@@ -902,6 +989,30 @@ class SFileImportDialog(QDialog):
         if not clean:
             return ""
         return prefix + clean
+
+    def _effective_constant(self) -> str:
+        """The constant this import targets. In replace mode it's locked to the
+        existing song (so it overwrites + keeps its slot); otherwise derived
+        from the name field."""
+        if self._replace_target is not None:
+            return self._replace_target.constant
+        return self._derive_constant(self._name_edit.text())
+
+    def _apply_replace_target(self):
+        """Lock the name/prefix to the song being replaced and label the UI as
+        a replace. The voicegroup + instrument + property pages still run, and
+        on import the existing constant triggers overwrite + skip-registration
+        (its table slot is preserved)."""
+        tgt = self._replace_target
+        const = tgt.constant
+        self._prefix_combo.setCurrentIndex(1 if const.startswith("SE_") else 0)
+        self._prefix_combo.setEnabled(False)
+        self._name_edit.setText(getattr(tgt, 'friendly_name', None) or const)
+        self._name_edit.setReadOnly(True)
+        self._const_label.setText(const)
+        self._name_status.setText(
+            f"Replacing {const} — keeps its slot in the song tables.")
+        self._name_status.setStyleSheet("color: #6a6; font-size: 10px;")
 
     def _validate_name(self, text: str):
         """Live validation of the display name field."""
@@ -982,13 +1093,30 @@ class SFileImportDialog(QDialog):
                 "Pick a voicegroup for this song to use.")
             self._vg_status_label.setStyleSheet("color: #c90;")
 
+        # In replace mode, default to the song's CURRENT voicegroup (keep the
+        # same bank) instead of the source file's — overrides the above. The
+        # user can still change it on this page.
+        if self._replace_target is not None:
+            vgi = getattr(self._replace_target, 'voicegroup_index', None)
+            if vgi is not None:
+                for i in range(self._vg_combo.count()):
+                    if self._vg_combo.itemText(i).startswith(
+                            f"voicegroup{vgi:03d}"):
+                        self._vg_combo.setCurrentIndex(i)
+                        self._vg_status_label.setText(
+                            f"Replacing — defaulting to this song's current "
+                            f"voicegroup (voicegroup{vgi:03d}). Change it if the "
+                            f"new file needs different instruments.")
+                        self._vg_status_label.setStyleSheet("color: #6a6;")
+                        break
+
     # ═══════════════════════════════════════════════════════════════════════
     # Import execution
     # ═══════════════════════════════════════════════════════════════════════
 
     def _start_import(self):
         song = self._parsed_song
-        constant = self._derive_constant(self._name_edit.text())
+        constant = self._effective_constant()
         label = constant.lower()
         music_player = self._player_combo.currentIndex()
 
@@ -1011,7 +1139,14 @@ class SFileImportDialog(QDialog):
         overwrite = False
         skip_registration = False
 
-        if file_exists or constant_exists:
+        if self._replace_target is not None:
+            # Right-click "Replace with .s File": overwrite the existing song's
+            # .s and KEEP its slot (skip re-registration so its index/order in
+            # songs.h + song_table.inc don't move). The user already chose to
+            # replace this song, so don't prompt again.
+            overwrite = True
+            skip_registration = True
+        elif file_exists or constant_exists:
             # Ask the user before overwriting
             parts = []
             if file_exists:

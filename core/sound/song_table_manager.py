@@ -324,6 +324,33 @@ def write_songs_h(project_root: str, data: SongTableData,
         f.writelines(lines)
 
 
+def _resolve_voicegroup_index_from_s(project_root: str, entry) -> None:
+    """If an entry has no voicegroup index, recover it from the song's .s file
+    (``.equ <label>_grp, voicegroupNNN``) so midi.cfg never drops the -G flag.
+
+    A midi.cfg line written without -G makes mid2agb default the song to
+    voicegroup000 — which strands custom SFX (e.g. a VOICE 127 sound) on the
+    wrong bank and plays garbage. The .s file is the source of truth for the
+    voicegroup, so we read it back rather than ever omitting -G.
+    """
+    if getattr(entry, 'voicegroup_index', None) is not None:
+        return
+    label = getattr(entry, 'label', None)
+    if not label:
+        return
+    s_path = os.path.join(project_root, 'sound', 'songs', 'midi', label + '.s')
+    if not os.path.isfile(s_path):
+        return
+    try:
+        with open(s_path, encoding='utf-8') as f:
+            txt = f.read()
+        m = re.search(r'\.equ\s+\w+_grp\s*,\s*voicegroup(\d+)', txt)
+        if m:
+            entry.voicegroup_index = int(m.group(1))
+    except OSError:
+        pass
+
+
 def write_midi_cfg(project_root: str, data: SongTableData,
                    removed_midi_files: set[str] | None = None):
     """Write the midi.cfg file, preserving entries not in our data model.
@@ -344,9 +371,12 @@ def write_midi_cfg(project_root: str, data: SongTableData,
     cfg_path = os.path.join(project_root, 'sound', 'songs', 'midi', 'midi.cfg')
     removed = removed_midi_files or set()
 
-    # Build a set of midi filenames we manage
+    # Build a set of midi filenames we manage. Recover any missing voicegroup
+    # index from the .s first so the rewritten line ALWAYS carries -G (a
+    # -G-less line would default the song to voicegroup000 on the next build).
     managed: dict[str, SongEntry] = {}
     for entry in data.entries:
+        _resolve_voicegroup_index_from_s(project_root, entry)
         midi_file = entry.midi_filename or (entry.label + '.mid')
         managed[midi_file] = entry
 
@@ -406,13 +436,18 @@ def write_midi_cfg(project_root: str, data: SongTableData,
 def update_midi_cfg_flags(project_root: str, label: str,
                           priority: Optional[int] = None,
                           reverb: Optional[int] = None,
-                          volume: Optional[int] = None) -> bool:
-    """Surgically update the -P / -R / -V flags for ONE song's line in midi.cfg,
-    preserving every other line AND that line's other flags (-G, -E, ...).
+                          volume: Optional[int] = None,
+                          voicegroup: Optional[int] = None) -> bool:
+    """Surgically update the -P / -R / -V (and optionally -G) flags for ONE
+    song's line in midi.cfg, preserving every other line AND that line's other
+    flags (-E, ...).
 
     Keeps midi.cfg in sync with the song's .s equates so a mid2agb regeneration
-    on build reproduces a priority/reverb/volume edit instead of reverting it.
-    mid2agb omits -P0/-R0 (matching register_song); -V is always written.
+    on build reproduces a priority/reverb/volume/voicegroup edit instead of
+    reverting it. mid2agb omits -P0/-R0 (matching register_song); -V is always
+    written. -G is only touched when `voicegroup` is given (None preserves the
+    existing -G — used by inline property edits that don't change the bank; a
+    re-import passes it so a remapped voicegroup survives a regen).
     Backdates midi.cfg afterwards so it never out-dates a freshly-saved .s and
     triggers a needless mid2agb re-run. Returns True if the line was rewritten."""
     cfg_path = os.path.join(project_root, 'sound', 'songs', 'midi', 'midi.cfg')
@@ -434,6 +469,9 @@ def update_midi_cfg_flags(project_root: str, label: str,
         setf('-P', str(priority) if (priority is not None and priority > 0) else None)
         setf('-R', str(reverb) if (reverb is not None and reverb > 0) else None)
         setf('-V', f"{volume:03d}" if volume is not None else None)
+        # -G only when explicitly given — None preserves the existing bank.
+        if voicegroup is not None:
+            setf('-G', f"{voicegroup:03d}")
         return out
 
     changed = False
@@ -503,7 +541,46 @@ def rename_song(
     new_label = new_constant.lower()
     old_label = entry.label
 
-    # Update the entry
+    midi_dir = os.path.join(project_root, 'sound', 'songs', 'midi')
+    old_s = os.path.join(midi_dir, f'{old_label}.s')
+    new_s = os.path.join(midi_dir, f'{new_label}.s')
+
+    # ── Compute + VALIDATE the renamed .s BEFORE changing ANY project state ──
+    # The stem rewrite is regex-based; a botched rewrite (e.g. a leftover old
+    # stem that breaks the `.word <name>_grp` voicegroup pointer) must NOT be
+    # committed alongside config changes that already point at the new name —
+    # that leaves the project inconsistent and non-building. Validate the
+    # rewritten content first; if it's bad, abort with NOTHING changed.
+    rewritten_content = None
+    if os.path.isfile(old_s):
+        with open(old_s, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Rewrite EVERY internal stem (public label AND the equate stem, which
+        # can differ on an imported file). Anchor at a word start and allow a
+        # trailing `_suffix`: a bare `\b<stem>\b` misses `<stem>_grp`/`<stem>_1`
+        # because `_` is a word char (no boundary) — that's what left orphaned
+        # `<oldstem>_*` garbage after a rename and blanked the voicegroup.
+        import re as _re
+        stems = {old_label}
+        em = _re.search(r'^\s*\.equ\s+(\w+)_grp\s*,', content, _re.MULTILINE)
+        if em:
+            stems.add(em.group(1))
+        stems.discard(new_label)
+        stems.discard('')
+        for stem in sorted(stems, key=len, reverse=True):
+            content = _re.sub(r'\b' + _re.escape(stem) + r'(?=_|\b)',
+                              new_label, content)
+
+        from core.sound.song_validator import validate_s_text
+        verrs = validate_s_text(content, new_label)
+        if verrs:
+            raise ValueError(
+                "Rename blocked — the renamed .s would be invalid and nothing "
+                "was changed:\n  - " + "\n  - ".join(verrs))
+        rewritten_content = content
+
+    # ── Commit: update the entry + rewrite the three config files ──
     entry.constant = new_constant
     entry.label = new_label
 
@@ -517,39 +594,10 @@ def rename_song(
     write_midi_cfg(project_root, data, removed_midi_files={old_midi})
     data.rebuild_indices()
 
-    # Rename the .s file
-    midi_dir = os.path.join(project_root, 'sound', 'songs', 'midi')
-    old_s = os.path.join(midi_dir, f'{old_label}.s')
-    new_s = os.path.join(midi_dir, f'{new_label}.s')
-
-    if os.path.isfile(old_s):
-        # Rewrite internal labels in the .s file
-        with open(old_s, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        # Replace the old internal naming with the new one. A song .s shares one
-        # stem across its labels + equates, but the public label and the equate
-        # stem can differ (an imported file may keep the source's stem), so
-        # rewrite BOTH. Anchor at a word start and allow a trailing `_suffix`:
-        # a bare `\b<stem>\b` misses `<stem>_grp`/`<stem>_1` because `_` is a
-        # word char (no boundary) — that's what left orphaned `<oldstem>_*`
-        # garbage after a rename and blanked the voicegroup display.
-        import re as _re
-        stems = {old_label}
-        em = _re.search(r'^\s*\.equ\s+(\w+)_grp\s*,', content, _re.MULTILINE)
-        if em:
-            stems.add(em.group(1))
-        stems.discard(new_label)
-        stems.discard('')
-        for stem in sorted(stems, key=len, reverse=True):
-            content = _re.sub(r'\b' + _re.escape(stem) + r'(?=_|\b)',
-                              new_label, content)
-
-        # Write to new file (or same if name didn't change)
+    # Write the validated .s under the new name, remove the old one.
+    if rewritten_content is not None:
         with open(new_s, 'w', encoding='utf-8') as f:
-            f.write(content)
-
-        # Remove old file if name actually changed
+            f.write(rewritten_content)
         if old_s != new_s and os.path.isfile(old_s):
             os.remove(old_s)
 

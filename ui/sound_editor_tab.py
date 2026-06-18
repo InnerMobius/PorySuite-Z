@@ -938,204 +938,39 @@ class SoundEditorTab(QWidget):
             QMessageBox.critical(self, "Export Failed", str(e))
 
     def _replace_song(self, entry):
-        """Replace a song's .s file with another .s file.
+        """Replace a song's .s file via the full import wizard, keeping its slot.
 
-        Keeps the same constant, registration, and song table entry.
-        Rewrites labels in the new file to match the existing song.
+        Routes through SFileImportDialog in "replace" mode so the user gets the
+        SAME setup as a fresh import — voicegroup picker, per-track instrument
+        mapping, and reverb/volume/priority — plus the same companion-.mid
+        render and build-timestamp protection. The song's constant and its index
+        in songs.h / song_table.inc are preserved (the wizard skips
+        re-registration). This replaces the old hand-rolled path, which ignored
+        the voicegroup (kept the source file's reference, so it defaulted to 00)
+        and offered no instrument step.
         """
-        from PyQt6.QtWidgets import QFileDialog, QMessageBox
-        import re
-        import shutil
-
-        source, _ = QFileDialog.getOpenFileName(
-            self, f"Replace '{entry.friendly_name}' with...",
-            "", "Assembly Files (*.s);;All Files (*)")
-        if not source:
+        if not self._project_root:
             return
 
-        # Preview the source file
-        try:
-            from core.sound.song_parser import parse_song_file
-            source_song = parse_song_file(source)
-            track_info = f"{len(source_song.tracks)} tracks"
-        except Exception:
-            track_info = "could not preview"
-
-        ans = QMessageBox.question(
-            self, "Replace Song",
-            f"Replace '{entry.friendly_name}' ({entry.constant}) with the "
-            f"contents of:\n\n"
-            f"  {os.path.basename(source)}\n"
-            f"  ({track_info})\n\n"
-            f"The existing .s file will be overwritten. The song's constant "
-            f"name and registration stay the same — only the music data "
-            f"changes.\n\n"
-            f"Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel,
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            midi_dir = os.path.join(
-                self._project_root, "sound", "songs", "midi")
-            dest_path = os.path.join(midi_dir, f"{entry.label}.s")
-            mid_path = os.path.join(midi_dir, f"{entry.label}.mid")
-            cfg_path = os.path.join(midi_dir, "midi.cfg")
-
-            # ── Step 1: close any open piano roll window for this song.
-            # The piano roll caches the SongData it was constructed with.
-            # If it's open and dirty (even if user thought they closed it
-            # earlier — it may still be alive in memory), the main-window
-            # Save pipeline will call its save_to_disk() and overwrite our
-            # replacement with the OLD parse. Close + forget it.
-            prw = getattr(self, "_piano_roll_window", None)
-            if prw is not None:
-                try:
-                    # Force not-dirty so closing doesn't prompt, then close.
-                    if hasattr(prw, "_is_dirty"):
-                        prw._is_dirty = False
-                    prw.close()
-                except Exception:
-                    pass
-                self._piano_roll_window = None
-                _log.info("Closed piano roll window before replacing %s", entry.label)
-
-            # ── Step 2: read the source file
-            with open(source, encoding="utf-8") as f:
-                content = f.read()
-
-            # Detect the source file's original label and rename all
-            # occurrences to match our target label.
-            m = re.search(r'\.global\s+(\w+)\s*$', content, re.MULTILINE)
-            if m:
-                original_label = m.group(1)
-                if original_label != entry.label:
-                    content = content.replace(original_label, entry.label)
-
-            # ── Step 3: write via atomic replace so a partially written
-            # .s can never be seen by the build or by re-parse. try/except
-            # cleanup so a failure between the .tmp open and os.replace
-            # doesn't leave a stray .tmp in the user's sound/songs/ tree
-            # (would otherwise pollute git status).
-            tmp_path = dest_path + ".tmp"
+        # Close any open piano roll first: it caches the SongData it was built
+        # with, and a later Save could write that stale parse back over the
+        # replacement.
+        prw = getattr(self, "_piano_roll_window", None)
+        if prw is not None:
             try:
-                with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(content)
-                    f.flush()
-                    try:
-                        os.fsync(f.fileno())
-                    except OSError:
-                        pass
-                os.replace(tmp_path, dest_path)
+                if hasattr(prw, "_is_dirty"):
+                    prw._is_dirty = False
+                prw.close()
             except Exception:
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                raise
+                pass
+            self._piano_roll_window = None
 
-            # ── Step 4: ensure a content-matching .mid exists.
-            # The Makefile's MID_OBJS wildcard is `sound/songs/midi/*.mid`,
-            # so the file MUST exist or the build can't see this song.
-            # We render the .mid from the .s we just wrote so the two
-            # files agree on content — this is what protects the .s
-            # from build-time wipe: even if midi.cfg gets touched later
-            # and Make fires mid2agb, the regenerated .s is audibly
-            # equivalent to what we just wrote. A previous version of
-            # this path wrote a 26-byte empty placeholder, which left
-            # the .s exposed: any midi.cfg bump caused mid2agb to wipe
-            # the .s back to 0 tracks (this is exactly what destroyed
-            # storms_short and sun_short).
-            try:
-                from core.sound.song_parser import parse_song_file
-                from core.sound.midi_exporter import write_midi_file
-                parsed = parse_song_file(dest_path)
-                if parsed.tracks and write_midi_file(parsed, mid_path):
-                    _log.info(
-                        "Rendered content-matching .mid for %s",
-                        entry.label)
-                elif not os.path.isfile(mid_path):
-                    # Parsing returned no tracks (rare) AND no .mid
-                    # currently on disk — fall back to the placeholder
-                    # so the Makefile wildcard still finds something.
-                    from ui.dialogs.s_file_import_dialog import _SImportWorker
-                    with open(mid_path, "wb") as mf:
-                        mf.write(_SImportWorker._make_placeholder_mid())
-                    _log.info(
-                        "Wrote placeholder .mid (.s had no tracks) for %s",
-                        entry.label)
-            except Exception as exc:
-                _log.warning(
-                    "Could not render .mid from %s — falling back to "
-                    "placeholder. Reason: %s",
-                    entry.label, exc, exc_info=True)
-                if not os.path.isfile(mid_path):
-                    from ui.dialogs.s_file_import_dialog import _SImportWorker
-                    with open(mid_path, "wb") as mf:
-                        mf.write(_SImportWorker._make_placeholder_mid())
-
-            # ── Step 5: lock mtimes so mid2agb CANNOT re-run on build.
-            # pokefirered's audio_rules.mk declares:
-            #     $(MID_ASM_DIR)/%.s: $(MID_SUBDIR)/%.mid $(MID_CFG_PATH)
-            # make re-runs mid2agb (which overwrites our .s) if EITHER
-            # the .mid OR midi.cfg is newer than .s. A tiny 2-second
-            # backdate on .mid is not enough — any later edit that touches
-            # midi.cfg, or filesystem clock skew, or a make -j race, can
-            # flip the ordering.  Push both dependencies 1 HOUR into the
-            # past relative to .s and touch .s to "now".  midi.cfg only
-            # has its mtime moved (contents untouched), so other songs are
-            # unaffected — make only cares about the timestamp.
-            import time as _time
-            now = _time.time()
-            os.utime(dest_path, (now, now))
-            far_past = now - 3600  # 1 hour back
-            if os.path.isfile(mid_path):
-                os.utime(mid_path, (far_past, far_past))
-            if os.path.isfile(cfg_path):
-                cfg_mtime = os.stat(cfg_path).st_mtime
-                if cfg_mtime >= now:
-                    # Only push it back if it's currently at/after our .s;
-                    # if it's already in the past we leave it alone.
-                    os.utime(cfg_path, (far_past, far_past))
-
-            # ── Step 6: verify the bytes we meant to write are on disk.
-            with open(dest_path, encoding="utf-8") as f:
-                disk_content = f.read()
-            if disk_content != content:
-                raise RuntimeError(
-                    f"Replace verify failed: disk content for {entry.label} "
-                    f"does not match what we wrote "
-                    f"(wrote {len(content)} bytes, disk has {len(disk_content)})")
-            _log.info(
-                "Replaced %s (%d bytes) — .s mtime=%s, .mid backdated",
-                entry.label, len(content),
-                _time.strftime("%H:%M:%S", _time.localtime(now)))
-
-            # ── Step 7: re-parse the new .s and install it in the cache.
-            # The old code popped _all_songs[label] and relied on the next
-            # access to re-parse. That left a window where any consumer
-            # holding a prior reference to the parsed SongData (e.g. a
-            # piano roll that was reopened, a preview worker) could use
-            # the stale object. Pop AND immediately reparse from the
-            # just-written file so subsequent consumers get the new one.
-            self._all_songs.pop(entry.label, None)
-            try:
-                self._parse_song(entry)
-            except Exception as pe:
-                _log.warning("Re-parse after replace failed for %s: %s",
-                             entry.label, pe)
-
-            # Refresh the details panel so the user sees the new song.
-            self._on_song_selected(self._song_tree.currentItem(), None)
-            self.modified.emit()
-
-            _log.info("Replace complete: %s ← %s", entry.label, source)
-        except Exception as e:
-            QMessageBox.critical(self, "Replace Failed", str(e))
-            _log.error("Replace failed: %s", e, exc_info=True)
+        from ui.dialogs.s_file_import_dialog import SFileImportDialog
+        dlg = SFileImportDialog(self._project_root, self._build_vg_names(),
+                                voicegroup_data=self._voicegroup_data,
+                                parent=self, replace_target=entry)
+        dlg.song_imported.connect(self._on_s_imported)
+        dlg.exec()
 
     def _parse_song(self, entry):
         """Parse a song's .s file on demand."""
@@ -1865,12 +1700,10 @@ class SoundEditorTab(QWidget):
         except Exception as e:
             _log.error("Failed to reload after MIDI import: %s", e)
 
-    def _open_s_import(self):
-        """Open the .s file import wizard dialog."""
-        if not self._project_root:
-            return
-
-        # Build voicegroup name list for the dialog
+    def _build_vg_names(self) -> list:
+        """Voicegroup name list (friendly label + instrument count) for the .s
+        import / replace wizard. Shared by the Import button and right-click
+        Replace so both offer the same voicegroup picker."""
         vg_names = []
         if self._voicegroup_data:
             for name in sorted(self._voicegroup_data.voicegroups.keys()):
@@ -1886,9 +1719,14 @@ class SoundEditorTab(QWidget):
                 else:
                     vg_names.append(
                         f"voicegroup{vg.number:03d} ({non_filler} instruments)")
+        return vg_names
 
+    def _open_s_import(self):
+        """Open the .s file import wizard dialog."""
+        if not self._project_root:
+            return
         from ui.dialogs.s_file_import_dialog import SFileImportDialog
-        dlg = SFileImportDialog(self._project_root, vg_names,
+        dlg = SFileImportDialog(self._project_root, self._build_vg_names(),
                                 voicegroup_data=self._voicegroup_data,
                                 parent=self)
         dlg.song_imported.connect(self._on_s_imported)
