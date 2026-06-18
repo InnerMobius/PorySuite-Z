@@ -213,9 +213,19 @@ def parse_song_file(filepath: str) -> SongData:
         if m:
             song_label = m.group(1)
 
-    # Extract metadata from .equ names
-    # Convention: <song_label>_grp, _pri, _rev, _mvl, _key, _tbs
+    # Extract metadata from .equ names.
+    # Convention: <song_label>_grp, _pri, _rev, _mvl, _key, _tbs — all sharing
+    # ONE prefix, usually the song label. But an imported/renamed .s can keep
+    # the source's internal prefix (e.g. public label `se_confirm` with
+    # `se_sfx_minish_106_*` equates). If the label-derived prefix has no _grp
+    # equate, fall back to the prefix the equates actually use, so the
+    # voicegroup + properties still resolve instead of showing blank.
     prefix = song_label + '_' if song_label else ''
+    if not prefix or (prefix + 'grp') not in raw_equs:
+        for name in raw_equs:
+            if name.endswith('_grp'):
+                prefix = name[:-3]  # drop 'grp', keep the trailing '_'
+                break
 
     song = SongData(
         label=song_label,
@@ -240,6 +250,12 @@ def parse_song_file(filepath: str) -> SongData:
         song.master_volume = equs.get(prefix + 'mvl', 127)
         song.key_shift = equs.get(prefix + 'key', 0)
         song.tempo_base = equs.get(prefix + 'tbs', 1)
+
+    # Track labels share the equate stem (resolved above), which can differ from
+    # the public .global label on an imported/renamed .s (e.g. .global se_confirm
+    # but tracks se_sfx_minish_106_1). Match on the stem, not song_label, or no
+    # tracks parse and the song shows "Tracks: 0" with an empty track list.
+    track_stem = prefix.rstrip('_') if prefix else song_label
 
     # --- Pass 2: parse tracks ---
     tracks: list[Track] = []
@@ -286,8 +302,8 @@ def parse_song_file(filepath: str) -> SongData:
             if current_track is None or label_name != current_track.label:
                 # Check if this is starting a new track (matches <song>_N pattern)
                 track_match = re.match(
-                    re.escape(song_label) + r'_(\d+)$', label_name
-                ) if song_label else None
+                    re.escape(track_stem) + r'_(\d+)$', label_name
+                ) if track_stem else None
 
                 if track_match:
                     # Save previous track

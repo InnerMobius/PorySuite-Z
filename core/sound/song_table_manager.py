@@ -11,10 +11,14 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
 from core.sound.sound_constants import PLAYER_NAMES
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +235,55 @@ def load_song_table(project_root: str) -> SongTableData:
 # Writers (for add/remove/edit song operations)
 # ---------------------------------------------------------------------------
 
-def write_song_table(project_root: str, data: SongTableData):
+def _count_on_disk_songs(project_root: str) -> int:
+    """Count `song ...` lines currently in song_table.inc on disk — the
+    authoritative live song count, independent of any in-memory model."""
+    path = os.path.join(project_root, 'sound', 'song_table.inc')
+    n = 0
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                if line.strip().startswith('song '):
+                    n += 1
+    return n
+
+
+def _shrink_blocked(project_root: str, file_path: str, model_count: int,
+                    allow_shrink: bool, what: str) -> bool:
+    """Return True (and back up + log) if writing *model_count* songs would
+    drop sounds currently registered on disk.
+
+    A wholesale rebuild of songs.h / song_table.inc from a STALE in-memory
+    model silently deleted custom sounds and corrupted the build — every later
+    sound shifts onto the wrong data and the bag crashes. Never let a shrink
+    reach disk unless it was explicitly requested (a real delete / cleanup)."""
+    if allow_shrink:
+        return False
+    on_disk = _count_on_disk_songs(project_root)
+    if model_count >= on_disk:
+        return False
+    msg = (f"REFUSED {what} write: would drop sounds "
+           f"({model_count} in-memory vs {on_disk} on disk). A stale song "
+           f"model must not truncate the registered song list — that shifts "
+           f"every later sound onto wrong data and breaks the build. On-disk "
+           f"file left intact.")
+    logger.error(msg)
+    print(msg)
+    try:
+        if os.path.isfile(file_path):
+            shutil.copy2(file_path, file_path + ".prewrite_backup")
+    except OSError as exc:
+        logger.error("Backup of %s failed: %s", file_path, exc)
+    return True
+
+
+def write_song_table(project_root: str, data: SongTableData,
+                     allow_shrink: bool = False):
     """Write the song_table.inc file."""
     table_path = os.path.join(project_root, 'sound', 'song_table.inc')
+    if _shrink_blocked(project_root, table_path, len(data.entries),
+                       allow_shrink, 'song_table.inc'):
+        return
     lines = ['gSongTable::\n']
     for entry in data.entries:
         lines.append(f'\tsong {entry.label}, {entry.music_player}, {entry.unknown}\n')
@@ -245,9 +295,13 @@ def write_song_table(project_root: str, data: SongTableData):
         f.writelines(lines)
 
 
-def write_songs_h(project_root: str, data: SongTableData):
+def write_songs_h(project_root: str, data: SongTableData,
+                  allow_shrink: bool = False):
     """Write the songs.h constants file."""
     songs_h_path = os.path.join(project_root, 'include', 'constants', 'songs.h')
+    if _shrink_blocked(project_root, songs_h_path, len(data.entries),
+                       allow_shrink, 'songs.h'):
+        return
     lines = [
         '#ifndef GUARD_CONSTANTS_SONGS_H\n',
         '#define GUARD_CONSTANTS_SONGS_H\n',
@@ -349,6 +403,63 @@ def write_midi_cfg(project_root: str, data: SongTableData,
                 pass
 
 
+def update_midi_cfg_flags(project_root: str, label: str,
+                          priority: Optional[int] = None,
+                          reverb: Optional[int] = None,
+                          volume: Optional[int] = None) -> bool:
+    """Surgically update the -P / -R / -V flags for ONE song's line in midi.cfg,
+    preserving every other line AND that line's other flags (-G, -E, ...).
+
+    Keeps midi.cfg in sync with the song's .s equates so a mid2agb regeneration
+    on build reproduces a priority/reverb/volume edit instead of reverting it.
+    mid2agb omits -P0/-R0 (matching register_song); -V is always written.
+    Backdates midi.cfg afterwards so it never out-dates a freshly-saved .s and
+    triggers a needless mid2agb re-run. Returns True if the line was rewritten."""
+    cfg_path = os.path.join(project_root, 'sound', 'songs', 'midi', 'midi.cfg')
+    if not os.path.isfile(cfg_path):
+        return False
+    mid_name = label + '.mid'
+    with open(cfg_path, encoding='utf-8') as f:
+        lines = f.readlines()
+
+    def _apply(flags: list[str]) -> list[str]:
+        out = list(flags)
+
+        def setf(prefix: str, text: Optional[str]):
+            nonlocal out
+            out = [g for g in out if not g.startswith(prefix)]
+            if text is not None:
+                out.append(prefix + text)
+
+        setf('-P', str(priority) if (priority is not None and priority > 0) else None)
+        setf('-R', str(reverb) if (reverb is not None and reverb > 0) else None)
+        setf('-V', f"{volume:03d}" if volume is not None else None)
+        return out
+
+    changed = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        head, sep, rest = line.partition(':')
+        if not sep or head.strip() != mid_name:
+            continue
+        lines[i] = f"{(mid_name + ':').ljust(30)}{' '.join(_apply(rest.split()))}\n"
+        changed = True
+        break
+
+    if changed:
+        with open(cfg_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.writelines(lines)
+        try:
+            import time as _t
+            past = _t.time() - 3600
+            os.utime(cfg_path, (past, past))
+        except OSError:
+            pass
+    return changed
+
+
 def _format_cfg_line(entry: SongEntry) -> str:
     """Format a single midi.cfg line from a SongEntry."""
     midi_file = entry.midi_filename or (entry.label + '.mid')
@@ -416,11 +527,23 @@ def rename_song(
         with open(old_s, 'r', encoding='utf-8') as f:
             content = f.read()
 
-        # Replace the old label with the new one (assembly labels) on word
-        # boundaries only — a bare substring replace would also corrupt labels
-        # that embed the name (e.g. renaming "mus_x" hitting "mus_x_intro").
+        # Replace the old internal naming with the new one. A song .s shares one
+        # stem across its labels + equates, but the public label and the equate
+        # stem can differ (an imported file may keep the source's stem), so
+        # rewrite BOTH. Anchor at a word start and allow a trailing `_suffix`:
+        # a bare `\b<stem>\b` misses `<stem>_grp`/`<stem>_1` because `_` is a
+        # word char (no boundary) — that's what left orphaned `<oldstem>_*`
+        # garbage after a rename and blanked the voicegroup display.
         import re as _re
-        content = _re.sub(r'\b' + _re.escape(old_label) + r'\b', new_label, content)
+        stems = {old_label}
+        em = _re.search(r'^\s*\.equ\s+(\w+)_grp\s*,', content, _re.MULTILINE)
+        if em:
+            stems.add(em.group(1))
+        stems.discard(new_label)
+        stems.discard('')
+        for stem in sorted(stems, key=len, reverse=True):
+            content = _re.sub(r'\b' + _re.escape(stem) + r'(?=_|\b)',
+                              new_label, content)
 
         # Write to new file (or same if name didn't change)
         with open(new_s, 'w', encoding='utf-8') as f:
@@ -513,9 +636,10 @@ def delete_song(
     for i, e in enumerate(data.entries):
         e.index = i
 
-    # Write all three config files
-    write_songs_h(project_root, data)
-    write_song_table(project_root, data)
+    # Write all three config files. allow_shrink=True: a delete legitimately
+    # removes one entry, so the shrink guard must not block it.
+    write_songs_h(project_root, data, allow_shrink=True)
+    write_song_table(project_root, data, allow_shrink=True)
     write_midi_cfg(project_root, data, removed_midi_files={deleted_midi})
     data.rebuild_indices()
 
@@ -578,9 +702,10 @@ def cleanup_orphaned_songs(project_root: str) -> list[str]:
         for i, e in enumerate(data.entries):
             e.index = i
 
-        # Rewrite all three config files
-        write_songs_h(project_root, data)
-        write_song_table(project_root, data)
+        # Rewrite all three config files. allow_shrink=True: cleanup
+        # intentionally removes confirmed-orphan entries.
+        write_songs_h(project_root, data, allow_shrink=True)
+        write_song_table(project_root, data, allow_shrink=True)
         write_midi_cfg(project_root, data, removed_midi_files=removed_midis)
         data.rebuild_indices()
 

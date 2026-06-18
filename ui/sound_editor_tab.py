@@ -282,9 +282,24 @@ class SoundEditorTab(QWidget):
         volume_row.addWidget(self._spin_volume)
         volume_row.addStretch()
 
+        priority_row = QHBoxLayout()
+        priority_row.setContentsMargins(0, 0, 0, 0)
+        priority_row.addWidget(QLabel("Priority:"))
+        self._spin_priority = QSpinBox()
+        self._spin_priority.setRange(0, 127)
+        self._spin_priority.setValue(0)
+        self._spin_priority.setEnabled(False)
+        self._spin_priority.setToolTip(
+            "Playback priority (0–127). Higher = less likely to be cut off when\n"
+            "another sound plays. Edits save immediately to the .s file + midi.cfg.")
+        install_scroll_guard(self._spin_priority)
+        priority_row.addWidget(self._spin_priority)
+        priority_row.addStretch()
+
         self._detail_loop = QLabel("Loop: —")
         props_right.addLayout(reverb_row)
         props_right.addLayout(volume_row)
+        props_right.addLayout(priority_row)
         props_right.addWidget(self._detail_loop)
 
         props_layout.addLayout(props_left)
@@ -409,6 +424,7 @@ class SoundEditorTab(QWidget):
         self._spin_tempo.valueChanged.connect(self._on_song_tempo_changed)
         self._spin_reverb.valueChanged.connect(self._on_song_reverb_changed)
         self._spin_volume.valueChanged.connect(self._on_song_volume_changed)
+        self._spin_priority.valueChanged.connect(self._on_song_priority_changed)
 
     def _on_tab_changed(self, index: int):
         """Load sample data when switching to tabs that need it."""
@@ -692,6 +708,7 @@ class SoundEditorTab(QWidget):
             self._spin_tempo.setEnabled(False)
             self._spin_reverb.setEnabled(False)
             self._spin_volume.setEnabled(False)
+            self._spin_priority.setEnabled(False)
             self._detail_loop.setText("")
             self._btn_play.setEnabled(False)
             self._btn_piano_roll.setEnabled(False)
@@ -710,6 +727,8 @@ class SoundEditorTab(QWidget):
             self._spin_reverb.setEnabled(True)
             self._spin_volume.setValue(song.master_volume)
             self._spin_volume.setEnabled(True)
+            self._spin_priority.setValue(getattr(song, 'priority', 0) or 0)
+            self._spin_priority.setEnabled(True)
             self._loading_song = False
 
             if loop_start is not None:
@@ -731,6 +750,7 @@ class SoundEditorTab(QWidget):
             self._spin_tempo.setEnabled(False)
             self._spin_reverb.setEnabled(False)
             self._spin_volume.setEnabled(False)
+            self._spin_priority.setEnabled(False)
             self._detail_loop.setText("Loop: —")
             self._btn_play.setEnabled(False)
             self._btn_piano_roll.setEnabled(False)
@@ -1193,6 +1213,10 @@ class SoundEditorTab(QWidget):
         self._spin_volume.blockSignals(True)
         self._spin_volume.setValue(127)
         self._spin_volume.blockSignals(False)
+        self._spin_priority.setEnabled(False)
+        self._spin_priority.blockSignals(True)
+        self._spin_priority.setValue(0)
+        self._spin_priority.blockSignals(False)
         self._detail_loop.setText("Loop: —")
         self._track_tree.clear()
         self._btn_play.setEnabled(False)
@@ -1233,11 +1257,35 @@ class SoundEditorTab(QWidget):
         song.master_volume = value
         self._save_song_inline(song)
 
+    def _on_song_priority_changed(self, value: int):
+        if self._loading_song:
+            return
+        song = self._all_songs.get(self._current_song_key)
+        if not song or not hasattr(song, 'priority'):
+            return
+        song.priority = value
+        self._save_song_inline(song)
+
     def _save_song_inline(self, song):
-        """Write song header changes (tempo/reverb/volume) directly to the .s file."""
+        """Write song header changes (tempo/reverb/volume/priority) to the .s
+        file, then mirror priority/reverb/volume into midi.cfg so a mid2agb
+        regeneration on build reproduces them instead of reverting the edit."""
         try:
             from core.sound.song_writer import save_song_file
             save_song_file(song)
+            # Keep midi.cfg's -P/-R/-V in sync with the .s equates. The .s is the
+            # source of truth, but the Make rule can regen it from the .mid via
+            # mid2agb, which reads these flags — stale flags would revert the edit.
+            try:
+                from core.sound.song_table_manager import update_midi_cfg_flags
+                update_midi_cfg_flags(
+                    self._project_root, song.label,
+                    priority=getattr(song, 'priority', None),
+                    reverb=getattr(song, 'reverb', None),
+                    volume=getattr(song, 'master_volume', None),
+                )
+            except Exception as e:
+                _log.warning("midi.cfg sync failed for %s: %s", song.label, e)
             # Data is on disk — clear any existing dirty tint for this song.
             # Do NOT add to _dirty_songs; inline saves don't leave pending changes.
             key = self._current_song_key
@@ -1850,6 +1898,16 @@ class SoundEditorTab(QWidget):
         """Called after a .s file was successfully imported."""
         try:
             from core.sound.song_table_manager import load_song_table
+
+            # Invalidate the parsed-song cache for this label. If a prior
+            # failed import (or a stale parse) left a 0-track SongData in
+            # _all_songs, the UI keeps showing that stale parse on every
+            # subsequent selection because _on_song_selected only re-parses
+            # when the key is missing. Drop the cached entry so the next
+            # selection forces a fresh parse_song_file() against disk.
+            label = constant.lower()
+            self._all_songs.pop(label, None)
+
             self._song_table = load_song_table(self._project_root)
             self._populate_song_list()
 

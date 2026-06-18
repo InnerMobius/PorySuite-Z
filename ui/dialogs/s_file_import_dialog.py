@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QComboBox, QGroupBox, QFormLayout, QFileDialog,
     QTreeWidget, QTreeWidgetItem, QHeaderView, QSpinBox,
     QProgressBar, QMessageBox, QFrame, QSizePolicy,
-    QStackedWidget, QWidget, QTextEdit,
+    QStackedWidget, QWidget, QTextEdit, QScrollArea, QGridLayout,
 )
 
 from ui.custom_widgets.scroll_guard import install_scroll_guard
@@ -32,7 +32,47 @@ _log = logging.getLogger("SoundEditor")
 # Page indices
 _PAGE_FILE = 0
 _PAGE_VOICEGROUP = 1
-_PAGE_PROGRESS = 2
+_PAGE_MAPPING = 2
+_PAGE_PROGRESS = 3
+
+
+def _extract_voice_usage(song) -> dict:
+    """Map each VOICE slot number used in the song to the track indices that
+    use it.
+
+    Returns ``{voice_num: [track_index, ...]}`` sorted. A song with no explicit
+    VOICE commands yields an empty dict — the caller treats that as "voice 0".
+    """
+    usage: dict = {}
+    for track in song.tracks:
+        for cmd in track.commands:
+            if cmd.cmd == 'VOICE' and cmd.value is not None:
+                num = int(cmd.value)
+                bucket = usage.setdefault(num, [])
+                if track.index not in bucket:
+                    bucket.append(track.index)
+    for num in usage:
+        usage[num].sort()
+    return usage
+
+
+def _type_tag(inst) -> str:
+    """Short instrument-type tag for the slot dropdown ('square', 'sample'…).
+
+    Lets the user spot a square/PSG voice when remapping, instead of having to
+    guess from the friendly name alone.
+    """
+    if getattr(inst, 'is_keysplit', False):
+        return 'keysplit'
+    if getattr(inst, 'is_square', False):
+        return 'square'
+    if getattr(inst, 'is_programmable_wave', False):
+        return 'wave'
+    if getattr(inst, 'is_noise', False):
+        return 'noise'
+    if getattr(inst, 'is_directsound', False):
+        return 'sample'
+    return ''
 
 
 # ── Worker thread ─────────────────────────────────────────────────────────
@@ -45,6 +85,7 @@ class _SImportWorker(QThread):
                  constant: str, label: str, music_player: int,
                  target_vg_name: str, source_vg_name: str,
                  reverb: int, volume: int, priority: int,
+                 voice_remap: Optional[dict] = None,
                  overwrite: bool = False,
                  skip_registration: bool = False):
         super().__init__()
@@ -58,6 +99,7 @@ class _SImportWorker(QThread):
         self._reverb = reverb
         self._volume = volume
         self._priority = priority
+        self._voice_remap = voice_remap or {}
         self._overwrite = overwrite
         self._skip_registration = skip_registration
 
@@ -83,6 +125,24 @@ class _SImportWorker(QThread):
             if (self._target_vg_name and self._source_vg_name
                     and self._target_vg_name != self._source_vg_name):
                 self._rewrite_voicegroup(dest_path)
+
+            # Persist the wizard's priority / reverb / volume into the .s's
+            # .equ equates. register_song only writes these to midi.cfg; without
+            # this the copied .s keeps the source file's values (usually 0), so
+            # the wizard's Priority box never took effect. Writing both the .s
+            # equate AND midi.cfg keeps them consistent so a mid2agb regen can't
+            # silently revert the edit.
+            self._rewrite_properties(dest_path)
+
+            # Remap VOICE commands to the voicegroup slots the user chose on
+            # the Instruments page. The source .s keeps whatever slot it was
+            # authored against (often 0); without this the song silently uses
+            # whatever instrument happens to sit in that slot of the target
+            # voicegroup. Reuses the MIDI importer's proven rewriter. Done
+            # BEFORE the companion .mid render so the .mid reflects the remap.
+            if self._voice_remap:
+                from ui.dialogs.midi_import_dialog import _postprocess_voice_remap
+                _postprocess_voice_remap(dest_path, self._voice_remap)
 
             # Generate a real, content-matching .mid alongside the .s.
             # This replaces the previous 26-byte placeholder approach,
@@ -148,26 +208,38 @@ class _SImportWorker(QThread):
             self.finished.emit(False, "", str(e))
 
     def _rewrite_labels(self, dest_path: str):
-        """Rewrite the song label in the .s file to match our target label.
+        """Rewrite the .s's internal naming to match our target label.
 
-        A .s file uses labels like mus_old_name, mus_old_name_1, mus_old_name_grp, etc.
-        We need to rename all of these to use our new label.
+        A song .s uses one stem for its labels + equates (mus_x, mus_x_1,
+        mus_x_grp, ...). The public ``.global`` label and that equate stem CAN
+        differ when the source was itself imported/renamed (e.g. ``.global
+        se_confirm`` but ``.equ se_sfx_minish_106_grp``). Rewrite EVERY internal
+        stem to the target so the file is consistent — otherwise the parser
+        can't match the voicegroup/properties and a later rename leaves orphaned
+        ``<oldstem>_*`` garbage behind.
         """
         with open(dest_path, encoding="utf-8") as f:
             content = f.read()
 
-        # Detect the original song label from the .s file
-        # Look for the footer pattern: .global <label>
-        m = re.search(r'\.global\s+(\w+)\s*$', content, re.MULTILINE)
-        if not m:
-            return  # can't detect, leave as-is
+        stems = set()
+        gm = re.search(r'^\s*\.global\s+(\w+)\s*$', content, re.MULTILINE)
+        if gm:
+            stems.add(gm.group(1))
+        # The per-song equates carry the .s's TRUE internal stem, which the
+        # parser keys off — rewrite it even if the .global label already matches.
+        for em in re.finditer(r'^\s*\.equ\s+(\w+)_grp\s*,', content, re.MULTILINE):
+            stems.add(em.group(1))
+        stems.discard(self._label)
+        stems.discard('')
+        if not stems:
+            return
 
-        original_label = m.group(1)
-        if original_label == self._label:
-            return  # same label, nothing to do
-
-        # Replace all occurrences of the original label with the new one
-        content = content.replace(original_label, self._label)
+        # Longest first so a shorter stem can't partially clobber a longer one.
+        # Anchor at a word start + allow a trailing `_suffix`: a bare `\b...\b`
+        # misses `<stem>_grp` because `_` is a word character (no boundary).
+        for stem in sorted(stems, key=len, reverse=True):
+            content = re.sub(r'\b' + re.escape(stem) + r'(?=_|\b)',
+                             self._label, content)
 
         with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(content)
@@ -191,6 +263,30 @@ class _SImportWorker(QThread):
         if changed:
             with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
                 f.writelines(lines)
+
+    def _rewrite_properties(self, dest_path: str):
+        """Write the wizard's priority / reverb / volume into the .s's
+        ``.equ <label>_pri/_rev/_mvl`` equates. The priority struct byte at the
+        bottom is emitted as ``.byte <label>_pri``, so updating the equate
+        updates it too. Reverb keeps the engine's ``reverb_set+N`` form."""
+        with open(dest_path, encoding="utf-8") as f:
+            lines = f.readlines()
+
+        pri_re = re.compile(r'^(\s*\.equ\s+\w+_pri\s*,\s*).*$')
+        rev_re = re.compile(r'^(\s*\.equ\s+\w+_rev\s*,\s*).*$')
+        mvl_re = re.compile(r'^(\s*\.equ\s+\w+_mvl\s*,\s*).*$')
+
+        for i, line in enumerate(lines):
+            stripped = line.rstrip('\n')
+            if pri_re.match(stripped):
+                lines[i] = pri_re.sub(rf'\g<1>{self._priority}', stripped) + '\n'
+            elif rev_re.match(stripped):
+                lines[i] = rev_re.sub(rf'\g<1>reverb_set+{self._reverb}', stripped) + '\n'
+            elif mvl_re.match(stripped):
+                lines[i] = mvl_re.sub(rf'\g<1>{self._volume}', stripped) + '\n'
+
+        with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
+            f.writelines(lines)
 
     @staticmethod
     def _make_placeholder_mid() -> bytes:
@@ -287,6 +383,8 @@ class SFileImportDialog(QDialog):
         self._parsed_song = None  # SongData from parser
         self._source_path = ""
         self._worker = None
+        # (old_voice_num, slot_combo) rows on the Instruments page
+        self._voice_map_combos: list = []
 
         self.setWindowTitle("Import Song (.s File)")
         self.setMinimumSize(650, 500)
@@ -315,7 +413,8 @@ class SFileImportDialog(QDialog):
 
         self._build_page_file()        # 0
         self._build_page_voicegroup()  # 1
-        self._build_page_progress()    # 2
+        self._build_page_mapping()     # 2
+        self._build_page_progress()    # 3
 
         # Bottom buttons
         btn_bar = QHBoxLayout()
@@ -341,7 +440,7 @@ class SFileImportDialog(QDialog):
 
     def _update_step_label(self):
         page = self._stack.currentIndex()
-        names = ["Select File", "Voicegroup", "Import"]
+        names = ["Select File", "Voicegroup", "Instruments", "Import"]
         if 0 <= page < len(names):
             parts = []
             for i, n in enumerate(names):
@@ -512,7 +611,138 @@ class SFileImportDialog(QDialog):
         layout.addStretch()
         self._stack.addWidget(page)
 
-    # ── Page 2: Progress / result ─────────────────────────────────────────
+    # ── Page 2: Instrument Mapping ────────────────────────────────────────
+
+    def _build_page_mapping(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+
+        layout.addWidget(QLabel(
+            "This .s file plays each track on a numbered instrument slot of the\n"
+            "voicegroup. Pick which slot each one should use here — the source\n"
+            "file's instrument bank doesn't come with it, so a slot that's wrong\n"
+            "in your project (e.g. a sampled piano where the original was a\n"
+            "square) will sound wrong in-game even if the notes are right.\n"
+            "Leave a row on its original number to keep the .s file's choice."))
+
+        self._mapping_info = QLabel("")
+        self._mapping_info.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(self._mapping_info)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self._mapping_container = QWidget()
+        self._mapping_layout = QGridLayout(self._mapping_container)
+        self._mapping_layout.setColumnStretch(0, 0)   # Voice #
+        self._mapping_layout.setColumnStretch(1, 2)   # Used by
+        self._mapping_layout.setColumnStretch(2, 0)   # Arrow
+        self._mapping_layout.setColumnStretch(3, 3)   # VG slot picker
+
+        for col, text in enumerate(["Voice", "Used by", "", "VG Instrument"]):
+            self._mapping_layout.addWidget(QLabel(f"<b>{text}</b>"), 0, col)
+
+        scroll.setWidget(self._mapping_container)
+        layout.addWidget(scroll, 1)
+
+        self._stack.addWidget(page)
+
+    def _get_target_vg_instruments(self) -> list:
+        """Instrument list for the voicegroup currently selected on page 1."""
+        if not self._vg_data:
+            return []
+        m = re.search(r'(\d+)', self._vg_combo.currentText())
+        if not m:
+            return []
+        vg = self._vg_data.get_voicegroup_by_number(int(m.group(1)))
+        return vg.instruments if vg else []
+
+    def _populate_mapping_page(self):
+        """Build one row per VOICE slot the song uses, each with a dropdown of
+        the target voicegroup's instruments."""
+        from ui.dialogs.midi_import_dialog import _is_filler
+
+        # Clear previous rows (keep the header row 0).
+        for i in reversed(range(self._mapping_layout.count())):
+            item = self._mapping_layout.itemAt(i)
+            if item and item.widget():
+                row, _c, _rs, _cs = self._mapping_layout.getItemPosition(i)
+                if row > 0:
+                    item.widget().deleteLater()
+        self._voice_map_combos.clear()
+
+        song = self._parsed_song
+        if not song:
+            return
+
+        vg_instruments = self._get_target_vg_instruments()
+        usage = _extract_voice_usage(song)
+        if not usage:
+            usage = {0: []}  # no explicit VOICE — the engine defaults to slot 0
+
+        self._mapping_info.setText(
+            f"Voicegroup: {self._vg_combo.currentText()}")
+
+        row = 1
+        for voice_num in sorted(usage):
+            tracks = usage[voice_num]
+
+            vlabel = QLabel(str(voice_num))
+            vlabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._mapping_layout.addWidget(vlabel, row, 0)
+
+            if tracks:
+                used_by = ", ".join(f"Track {t + 1}" for t in tracks)
+            else:
+                used_by = "(default)"
+            self._mapping_layout.addWidget(QLabel(used_by), row, 1)
+
+            arrow = QLabel("  →  ")
+            arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._mapping_layout.addWidget(arrow, row, 2)
+
+            slot_combo = QComboBox()
+            slot_combo.setMaxVisibleItems(20)
+            slot_combo.setMinimumWidth(280)
+            install_scroll_guard(slot_combo)
+            for idx in range(128):
+                if vg_instruments and idx < len(vg_instruments):
+                    inst = vg_instruments[idx]
+                    if _is_filler(inst):
+                        label = f"{idx}: (empty)"
+                    else:
+                        tag = _type_tag(inst)
+                        tagstr = f"[{tag}] " if tag else ""
+                        label = f"{idx}: {tagstr}{inst.friendly_name}"
+                else:
+                    label = f"{idx}: (unknown)"
+                slot_combo.addItem(label, idx)
+            for idx in range(slot_combo.count()):
+                if vg_instruments and idx < len(vg_instruments):
+                    inst = vg_instruments[idx]
+                    color = QColor("#c44") if _is_filler(inst) else QColor("#6a6")
+                    slot_combo.setItemData(
+                        idx, color, Qt.ItemDataRole.ForegroundRole)
+            slot_combo.setCurrentIndex(max(0, min(127, voice_num)))
+            slot_combo.setToolTip(
+                f"Which voicegroup slot this voice plays.\n"
+                f"Default {voice_num} keeps the .s file's original instrument.")
+            self._mapping_layout.addWidget(slot_combo, row, 3)
+
+            self._voice_map_combos.append((voice_num, slot_combo))
+            row += 1
+
+    def _build_voice_remap(self) -> dict:
+        """Collect {old_voice: new_slot} for rows the user actually changed."""
+        remap: dict = {}
+        for old_voice, combo in self._voice_map_combos:
+            data = combo.currentData()
+            new_slot = int(data) if data is not None else combo.currentIndex()
+            if new_slot != int(old_voice):
+                remap[int(old_voice)] = new_slot
+        return remap
+
+    # ── Page 3: Progress / result ─────────────────────────────────────────
 
     def _build_page_progress(self):
         page = QWidget()
@@ -569,9 +799,15 @@ class SFileImportDialog(QDialog):
             self._populate_voicegroup_page()
             self._stack.setCurrentIndex(_PAGE_VOICEGROUP)
             self._btn_back.setVisible(True)
-            self._btn_next.setText("Import")
+            self._btn_next.setText("Next")
 
         elif current == _PAGE_VOICEGROUP:
+            # Build the instrument-mapping rows against the chosen voicegroup.
+            self._populate_mapping_page()
+            self._stack.setCurrentIndex(_PAGE_MAPPING)
+            self._btn_next.setText("Import")
+
+        elif current == _PAGE_MAPPING:
             self._start_import()
 
         self._update_step_label()
@@ -581,6 +817,9 @@ class SFileImportDialog(QDialog):
         if current == _PAGE_VOICEGROUP:
             self._stack.setCurrentIndex(_PAGE_FILE)
             self._btn_back.setVisible(False)
+            self._btn_next.setText("Next")
+        elif current == _PAGE_MAPPING:
+            self._stack.setCurrentIndex(_PAGE_VOICEGROUP)
             self._btn_next.setText("Next")
         self._update_step_label()
 
@@ -813,6 +1052,7 @@ class SFileImportDialog(QDialog):
             self._reverb_spin.value(),
             self._vol_spin.value(),
             self._priority_spin.value(),
+            voice_remap=self._build_voice_remap(),
             overwrite=overwrite,
             skip_registration=skip_registration,
         )
