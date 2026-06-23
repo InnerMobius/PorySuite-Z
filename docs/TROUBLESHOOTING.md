@@ -54,6 +54,43 @@ Fixed 2026-05-18. The frame-count helper used to require Pillow (PIL), which isn
 
 ---
 
+## Sound Editor
+
+### A sound I imported or edited won't build (or the game has no/garbled audio for it)
+As of 2026-06-21 this shouldn't reach a build at all. Every time the Sound Editor writes a song — saving in the Piano Roll, importing a `.s`, or replacing one — it runs two checks before the file is allowed to touch disk:
+
+1. A fast structural check for the known ways a sound breaks the build (bad note velocities, wrong pointer types, a missing or wrong voicegroup link, double-colon labels).
+2. **GATE 1** — the *real* GBA assembler (the same one your build uses) actually assembles the file. If it wouldn't build, the save is refused and your existing working file is left untouched; an import is rolled back to exactly how it was.
+
+If you see a "blocked" message, it's telling you the sound as written wouldn't build — fix what it names (or pick a different voicegroup/instrument) and try again. If you have an older project with a sound that was corrupted before this safety net, re-import the original `.s` to recover it. (If your machine can't reach the assembler, the structural check still runs.)
+
+### The track volume slider snaps back to a lower number, or a track won't get as loud as I set it
+That's the slider being honest. A track's volume can never exceed the song's **master volume** — the game clamps it. Older builds let the slider go to 127 even on a song whose master was, say, 90, so anything above 90 silently played (and reloaded) as 90. Now each track's slider stops at the song's master volume, so what you see is what plays. To make a track louder than that, raise the **master volume** (in the song header) or use the **🔊 Max Volume** button, which raises master to 127 and re-opens every track's slider to the full range.
+
+---
+
+## Shop Editor
+
+### I deleted a shop and now the game crashes when I talk to a certain NPC
+Deleting a shop removes its item list, but on purpose it does **not** touch the `pokemart` command in the NPC's script that opened it — so that command now points at a list that no longer exists, which crashes the game at that NPC. The delete dialog warns you about this when the shop is still wired to an NPC, and offers to jump you to EVENTide to fix it. Open that map in EVENTide, find the NPC, and remove (or re-point) its `pokemart` command, then save.
+
+### I created a new shop but it doesn't open in-game
+A new shop starts as just an item list, flagged "(not wired)" in the list. A shop only opens in-game when an NPC's script runs a `pokemart` command pointing at it. Add some items, then click **Open in EVENTide** to jump to that map, add a `pokemart <your list label>` command to an NPC (e.g. after `lock` / `faceplayer`), save in EVENTide, and rebuild. The shop will then open when the player talks to that NPC.
+
+### The shop list shows item codes like ITEM_POKE_BALL instead of names
+Update PorySuite — as of 2026-06-21 the Shop Editor shows the friendly item names from your project (the same names the Items editor uses). Hover a row to see its underlying constant. If a row still shows a raw code, that item isn't in your project's item data file; it still saves correctly.
+
+---
+
+## Tilemap Editor — palette export
+
+### Exporting palettes saved them as palette_0.pal / palette_1.pal instead of the real name
+Fixed 2026-06-21. "Export palettes" (the toolbar button and the palette panel's right-click Export options) used to name every exported file `palette_00.pal`, `palette_01.pal`, … regardless of the source. It now names them after the palette's real source file. For a background like `graphics/item_menu/bg.bin` whose palette is one combined file (`bg.gbapal`, holding 3 sub-palettes), the separate-16-color export produces `bg_0.pal`, `bg_1.pal`, `bg_2.pal`. For an asset that uses several separate `.pal` files, each exported file keeps its own name.
+
+Note: if your goal is just to save palette edits back into the project, use **Save (Ctrl+S)** — it writes your edits straight back to the original palette file the build reads (e.g. `bg.gbapal`). The separate-file export is for pulling the palettes out as individual `.pal` files (the build won't read those).
+
+---
+
 ## v0.0.63b — recently fixed
 
 ### `src/data/items.json` keeps showing as "modified" in Git after a pull (even without editing anything)

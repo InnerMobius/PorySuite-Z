@@ -135,6 +135,14 @@ class _SImportWorker(QThread):
             # Copy the .s file (overwrites if approved)
             shutil.copy2(self._source_s_path, dest_path)
 
+            # Normalize for the RAW sound build (audio_rules.mk assembles with
+            # NO preproc): collapse any `name::` label (pret-preproc shorthand
+            # that LADX/tmc decomp browsers emit) to a single-colon `name:`.
+            # Raw GNU `as` rejects `::` ("junk at end of line ... `:`"), AND the
+            # export validator below rejects it too — so without this a `::`
+            # source could never import. The label name/meaning is unchanged.
+            self._normalize_for_raw_as(dest_path)
+
             # Rewrite label references BEFORE generating the companion .mid
             # so the .mid is rendered from the same parsed content the user
             # will see in the editor (correct label, voicegroup, etc).
@@ -176,6 +184,24 @@ class _SImportWorker(QThread):
                     "Import blocked — the resulting .s would not build and was "
                     "NOT applied (your project is unchanged):\n  - "
                     + "\n  - ".join(_verrs))
+                return
+
+            # GATE 1 — assemble the imported .s with the REAL toolchain (exactly
+            # as the build does). Catches any raw-`as` error the static check
+            # doesn't know about. Fail-open if no toolchain is reachable. Roll
+            # back to the pre-import state on a genuine assemble failure.
+            try:
+                from core.sound.song_assembler import assemble_file
+                _aok, _aerr = assemble_file(dest_path, self._project_root)
+            except Exception:
+                _aok, _aerr = True, None
+            if not _aok:
+                self._rollback_import(dest_path, mid_path)
+                self.finished.emit(
+                    False, "",
+                    "Import blocked — the resulting .s does NOT assemble and "
+                    "was not applied (your project is unchanged):\n"
+                    + (_aerr or ""))
                 return
 
             # Generate a real, content-matching .mid alongside the .s.
@@ -260,6 +286,28 @@ class _SImportWorker(QThread):
 
         except Exception as e:
             self.finished.emit(False, "", str(e))
+
+    def _normalize_for_raw_as(self, dest_path: str):
+        """Make an imported .s safe for the raw (no-preproc) sound build.
+
+        Currently collapses `name::` labels (pret-preproc shorthand emitted by
+        LADX/tmc decomp browsers) to a single-colon `name:`. Only the extra
+        colon — which raw GNU `as` rejects — is removed; the label name and
+        meaning are unchanged. Extend here if other decomp-isms ever need
+        flattening so the fix stays in the exporter, not in hand-edited files.
+        """
+        try:
+            with open(dest_path, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return
+        new = re.sub(r'(?m)^([ \t]*[A-Za-z_]\w*):{2,}([ \t]*)$', r'\1:\2',
+                     content)
+        if new != content:
+            with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(new)
+            _log.info("Normalized '::' labels to ':' on import of %s",
+                      self._label)
 
     def _rollback_import(self, dest_path: str, mid_path: str):
         """Undo a failed/invalid import: restore the pre-import .s + .mid (a

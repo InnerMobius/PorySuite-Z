@@ -72,6 +72,34 @@ def parse_item_constants(root: str) -> List[str]:
     return out or ["ITEM_NONE"]
 
 
+def parse_item_choices(root: str) -> list:
+    """``[(ITEM_const, display_name)]`` for the starting-item pickers.
+
+    Reads ``src/data/items.json`` — the same source the rest of the app uses for
+    item names — so the dropdowns show friendly names ("Master Ball") while the
+    saved value stays the ``ITEM_*`` constant. Falls back to constant-only pairs
+    from items.h when items.json is missing or unreadable.
+    """
+    import json
+    path = os.path.join(root, "src", "data", "items.json")
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            out = []
+            for it in (data.get("items") or []):
+                const = it.get("itemId")
+                if not const:
+                    continue
+                name = (it.get("english") or it.get("name") or const).strip()
+                out.append((const, name or const))
+            if out:
+                return out
+        except Exception:
+            pass
+    return [(c, c) for c in parse_item_constants(root)]
+
+
 def parse_map_constants(root: str) -> List[str]:
     """Every real MAP_* constant from include/constants/map_groups.h (sorted).
 

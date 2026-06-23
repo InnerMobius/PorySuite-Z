@@ -1,6 +1,6 @@
 # PorySuite-Z
 
-A unified PyQt6 editor for **pokefirered** decomp projects. Data editing (species, items, moves, trainers, abilities), event/script editing (NPCs, triggers, signs, map scripts), sound editing (songs, instruments, voicegroups, piano roll), overworld sprite editing, battle-animation editing, and Porymap integration — all in one window with an RPG Maker XP-style toolbar.
+A unified PyQt6 editor for **pokefirered** decomp projects. Data editing (species, items, moves, trainers, abilities), event/script editing (NPCs, triggers, signs, map scripts), sound editing (songs, instruments, voicegroups, piano roll), overworld sprite editing, battle-animation editing, shop editing (mart contents, with create/delete and a jump to the NPC that opens each shop), and Porymap integration — all in one window with an RPG Maker XP-style toolbar.
 
 All edits are written back into the project's canonical `src/`, `include/`, and `data/` files so `make` builds stay stable.
 

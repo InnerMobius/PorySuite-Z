@@ -23,9 +23,12 @@ never blocks a legitimate save. Returns a list of human-readable error strings
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Optional
+
+_log = logging.getLogger("SoundEditor.Validator")
 
 
 # Bare tokens that are NOT defined by MPlayDef.s and must never appear as a
@@ -98,6 +101,18 @@ def validate_s_text(text: str, song_label: str) -> list[str]:
                 f"song header has too few '.word' pointers "
                 f"(need voicegroup + at least one track)")
 
+    # 6. Double-colon labels (`name_1::`) are pret-preproc shorthand. The
+    #    pokefirered sound build assembles .s RAW (audio_rules.mk, no preproc),
+    #    where `::` is "junk at end of line, first unrecognized character is
+    #    `:`" — the exact se_heart/se_water_splash build failure. Our writer
+    #    emits single colons, but a pasted/imported decomp .s (LADX/tmc) can
+    #    carry `::`, so the gate must reject it.
+    for i, ln in enumerate(lines, 1):
+        if re.match(r'\s*[A-Za-z_]\w*::', ln):
+            errors.append(
+                f"line {i}: '::' label is pret-preproc shorthand, invalid "
+                f"for the raw sound build (use a single colon) — {ln.strip()}")
+
     return errors
 
 
@@ -159,6 +174,56 @@ def validate_song_voices(song, project_root: Optional[str],
                     f"({count} voices) and maps to no instrument even via ROM "
                     f"overflow — it will play garbage")
     return errors
+
+
+def validate_song_warnings(song, project_root: Optional[str] = None,
+                           vg_data=None) -> list[str]:
+    """Non-blocking semantic warnings — logged + surfaced, never block a save.
+
+    Currently: a VOICE pointing at a voicegroup entry with a NON-ZERO frequency
+    sweep. A sweep ramps the channel's pitch over time; on a short, high one-shot
+    SFX it sweeps the tone out of audible range so the sound plays silent
+    (se_small_item: VOICE 109 = voice_square_1_alt, sweep 21 → inaudible). It's
+    legal M4A (music sometimes wants a sweep), so this WARNS rather than rejects
+    — but for a one-shot SFX it's almost always a mistake. The caller decides
+    whether to surface it (the .s import does, since imports are SFX)."""
+    warnings: list[str] = []
+    vg_name = getattr(song, 'voicegroup', None)
+    if not vg_name:
+        return warnings
+    if vg_data is None and project_root:
+        try:
+            from core.sound.voicegroup_parser import load_voicegroup_data
+            vg_data = load_voicegroup_data(project_root)
+        except Exception:
+            return warnings
+    if vg_data is None:
+        return warnings
+
+    seen: set[int] = set()
+    for track in getattr(song, 'tracks', []) or []:
+        for cmd in getattr(track, 'commands', []) or []:
+            if cmd.cmd != 'VOICE' or cmd.value is None:
+                continue
+            v = int(cmd.value)
+            if v in seen:
+                continue
+            seen.add(v)
+            try:
+                inst = vg_data.get_instrument_overflow(vg_name, v)
+            except Exception:
+                inst = None
+            if inst is None:
+                continue
+            sweep = getattr(inst, 'sweep', 0) or 0
+            if sweep:
+                warnings.append(
+                    f"VOICE {v} ({vg_name}) uses a square with frequency sweep "
+                    f"{sweep} — a short/high one-shot SFX may sweep out of "
+                    f"audible range and play SILENT. Use a sweep-0 voice for SFX.")
+    for w in warnings:
+        _log.warning("%s: %s", getattr(song, 'label', '?'), w)
+    return warnings
 
 
 def validate_song_export(song, s_text: str,

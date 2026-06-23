@@ -179,21 +179,22 @@ class _NoScrollComboBox(QComboBox):
 class _ItemRowDialog(QDialog):
     """Pick an item constant + quantity for a starting-items list."""
 
-    def __init__(self, choices, item="ITEM_NONE", qty=1, parent=None):
+    def __init__(self, pairs, item="ITEM_NONE", qty=1, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Starting Item")
         self.setMinimumWidth(360)
         lay = QVBoxLayout(self)
         form = QFormLayout()
+        self._pairs = [(str(c), str(d))
+                       for c, d in (pairs or [("ITEM_NONE", "None")])]
         self._item = _NoScrollComboBox()
-        self._item.setEditable(True)
+        self._item.setEditable(True)            # type-to-filter the long list
         self._item.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self._item.addItems(choices or ["ITEM_NONE"])
-        i = self._item.findText(item)
+        for const, display in self._pairs:
+            self._item.addItem(display, const)  # show the name, store the const
+        i = self._item.findData(item)
         if i >= 0:
             self._item.setCurrentIndex(i)
-        elif item:
-            self._item.setCurrentText(item)
         form.addRow("Item:", self._item)
         self._qty = QSpinBox()
         self._qty.setRange(1, 999)
@@ -208,7 +209,20 @@ class _ItemRowDialog(QDialog):
         lay.addWidget(bb)
 
     def values(self):
-        return self._item.currentText().strip(), self._qty.value()
+        """Return (ITEM_const, qty). Resolves the selection back to a constant:
+        the combo's stored data first, then a display-name or raw-constant match
+        on the typed text."""
+        const = self._item.currentData()
+        if not const:
+            txt = self._item.currentText().strip()
+            low = txt.lower()
+            for c, d in self._pairs:
+                if d.lower() == low or c.lower() == low:
+                    const = c
+                    break
+            if not const:
+                const = txt          # last resort: a raw constant typed by hand
+        return const, self._qty.value()
 
 
 class _ItemSlotEditor(QWidget):
@@ -220,7 +234,8 @@ class _ItemSlotEditor(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._items: list[tuple[str, int]] = []
-        self._choices: list[str] = ["ITEM_NONE"]
+        self._pairs: list[tuple[str, str]] = [("ITEM_NONE", "None")]
+        self._display: dict[str, str] = {"ITEM_NONE": "None"}
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
@@ -243,7 +258,17 @@ class _ItemSlotEditor(QWidget):
         lay.addLayout(col)
 
     def set_choices(self, choices):
-        self._choices = list(choices) if choices else ["ITEM_NONE"]
+        """Accept [(const, display)] pairs OR a bare [const] list (display ==
+        const). Stores the picker pairs + a const→display map for the rows."""
+        pairs = []
+        for c in (choices or []):
+            if isinstance(c, (tuple, list)) and len(c) >= 2:
+                pairs.append((str(c[0]), str(c[1])))
+            else:
+                pairs.append((str(c), str(c)))
+        self._pairs = pairs or [("ITEM_NONE", "None")]
+        self._display = {c: d for c, d in self._pairs}
+        self._refresh()
 
     def set_items(self, items):
         self._items = [(str(c), int(q)) for c, q in (items or [])]
@@ -260,10 +285,13 @@ class _ItemSlotEditor(QWidget):
             self._list.addItem(it)
             return
         for c, q in self._items:
-            self._list.addItem(f"{c}   ×{q}")
+            name = self._display.get(c, c)
+            it = QListWidgetItem(f"{name}   ×{q}")
+            it.setToolTip(c)            # underlying ITEM_* constant on hover
+            self._list.addItem(it)
 
     def _add(self):
-        dlg = _ItemRowDialog(self._choices, parent=self)
+        dlg = _ItemRowDialog(self._pairs, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             c, q = dlg.values()
             if c and c != "ITEM_NONE":
@@ -276,7 +304,7 @@ class _ItemSlotEditor(QWidget):
         if not (0 <= row < len(self._items)):
             return
         c0, q0 = self._items[row]
-        dlg = _ItemRowDialog(self._choices, c0, q0, parent=self)
+        dlg = _ItemRowDialog(self._pairs, c0, q0, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             c, q = dlg.values()
             if c and c != "ITEM_NONE":
@@ -663,10 +691,10 @@ class ConfigTabWidget(QWidget):
             try:
                 import core.new_game_config as ngc
                 maps = ngc.parse_map_constants(project_dir)
-                items = ngc.parse_item_constants(project_dir)
+                items = ngc.parse_item_choices(project_dir)   # [(const, name)]
                 vals = ngc.read_all(project_dir)
             except Exception:
-                maps, items, vals = [], ["ITEM_NONE"], {}
+                maps, items, vals = [], [("ITEM_NONE", "None")], {}
 
             self._money_spin.setValue(int(vals.get("money", 3000)))
 

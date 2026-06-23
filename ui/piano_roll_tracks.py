@@ -145,14 +145,22 @@ class TrackRow(QFrame):
         vol_row.itemAt(0).widget().setStyleSheet("font-size: 9px; color: #888;")
         self._vol_slider = QSlider(Qt.Orientation.Horizontal)
         install_scroll_guard(self._vol_slider)
-        self._vol_slider.setRange(0, 127)
-        self._vol_slider.setValue(track_info.get('volume', 100))
+        # Clamp the slider to the song's master volume (the M4A ceiling). A
+        # track's effective VOL can never exceed master — a higher value would
+        # be written, clamped by the assembler, and snap back on reload — so
+        # capping the max keeps "what the slider shows" == "what plays". To go
+        # louder, raise the song's master volume (header editor).
+        self._vol_ceiling = max(1, int(track_info.get('max_volume', 127)))
+        self._vol_slider.setRange(0, self._vol_ceiling)
+        self._vol_slider.setValue(
+            min(track_info.get('volume', 100), self._vol_ceiling))
         self._vol_slider.setFixedHeight(16)
-        self._vol_slider.setToolTip("Track volume (0-127)")
+        self._vol_slider.setToolTip(self._vol_tooltip())
         self._vol_slider.valueChanged.connect(
             lambda v: self.volume_changed.emit(self._index, v))
         vol_row.addWidget(self._vol_slider, 1)
-        self._vol_label = QLabel(str(track_info.get('volume', 100)))
+        self._vol_label = QLabel(
+            str(min(track_info.get('volume', 100), self._vol_ceiling)))
         self._vol_label.setFixedWidth(24)
         self._vol_label.setStyleSheet("font-size: 9px; color: #888;")
         self._vol_slider.valueChanged.connect(
@@ -243,6 +251,27 @@ class TrackRow(QFrame):
         if index < 0:
             return
         self.instrument_changed.emit(self._index, index)
+
+    def _vol_tooltip(self) -> str:
+        c = getattr(self, '_vol_ceiling', 127)
+        if c >= 127:
+            return "Track volume (0-127)"
+        return (f"Track volume (0-{c}) — capped at this song's master volume.\n"
+                f"Raise the master volume (song header) to go louder.")
+
+    def set_volume_ceiling(self, ceiling: int):
+        """Cap the volume slider at the song's master volume (the M4A ceiling).
+        Called when the master volume changes (e.g. Max Volume raises it to 127)
+        so the slider's reachable range tracks what can actually play."""
+        self._vol_ceiling = max(1, int(ceiling))
+        # setMaximum auto-clamps the current value if it now exceeds the ceiling
+        # (honest: a track genuinely can't be louder than master). Block the
+        # signal so a pure ceiling change doesn't spuriously mark the song dirty.
+        self._vol_slider.blockSignals(True)
+        self._vol_slider.setMaximum(self._vol_ceiling)
+        self._vol_slider.blockSignals(False)
+        self._vol_label.setText(str(self._vol_slider.value()))
+        self._vol_slider.setToolTip(self._vol_tooltip())
 
     def set_muted(self, muted: bool):
         """Programmatically set mute state (for Mute All / Unmute All)."""
@@ -487,6 +516,13 @@ class TrackSidebar(QWidget):
         for row in self._rows:
             row.update_instrument_names(names)
 
+    def set_volume_ceiling(self, ceiling: int):
+        """Cap every track's volume slider at the song's master volume. Called
+        when the master changes (e.g. Max Volume raises it to 127) so each
+        slider's reachable range tracks what can actually play."""
+        for row in self._rows:
+            row.set_volume_ceiling(ceiling)
+
     def _on_row_selected(self, index: int):
         self._selected_index = index
         self.track_selected.emit(index)
@@ -597,6 +633,9 @@ def extract_track_infos(song_data, vg_data=None) -> list[dict]:
             'instrument': -1,
             'instrument_name': '',
             'volume': 100,
+            # The song's master volume is the per-track ceiling: a track's
+            # effective VOL can never exceed it (see TrackRow's slider clamp).
+            'max_volume': getattr(song_data, 'master_volume', 127),
             'pan': 64,
             'modulation': 0,
             'note_count': 0,

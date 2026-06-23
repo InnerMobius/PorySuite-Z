@@ -86,10 +86,11 @@ class Tilemap:
             width = _guess_width(count)
         height = max(1, (count + width - 1) // width)
 
-        # Pad if needed (partial last row)
-        while len(entries) < width * height:
-            entries.append(TileEntry())
-
+        # Do NOT pad entries to width*height. The entry list IS the file's true
+        # data; padding it inflates the saved size whenever the guessed width
+        # doesn't divide the count (e.g. a 216-entry list displayed 32-wide).
+        # Cells past the list (a partial last row) render as a default
+        # TileEntry via get(), and save() writes only the real entries.
         return Tilemap(
             width=width, height=height,
             entries=entries, source_path=path,
@@ -98,36 +99,27 @@ class Tilemap:
     def save(self, path: str = "") -> None:
         """Write the tilemap back to a .bin file.
 
-        Writes EXACTLY ``width * height * 2`` bytes — never more, never
-        less. This is a hard invariant the engine relies on: the .bin
-        is loaded via ``CopyToBgTilemapBuffer`` which decompresses
-        straight into BG0's tilemap RAM (sized for the declared
-        dimensions). One extra byte and the decompressor overflows the
-        buffer and corrupts adjacent WRAM, crashing the game on the
-        first BG redraw. The user's "battle crashes on entry" bug from
-        the 2026-05-10 build report was this exact failure mode —
-        ``_on_dimensions_changed`` had ratcheted ``len(self.entries)``
-        past ``width * height`` via repeated spinner scrubs, and this
-        method was writing all of them.
+        Writes EXACTLY ``len(self.entries)`` entries — the file's TRUE data
+        count. That equals the original count on load (``from_file`` no longer
+        pads) or the count an explicit Resize set; display W/H rewrapping
+        (``_on_dimensions_changed``) only re-flows the grid on screen and never
+        touches the entry list. So scrubbing the width/height spinners can NOT
+        grow or shrink the file — the only way to change the count is Resize.
 
-        If ``self.entries`` is shorter than ``width * height``, pad
-        with default ``TileEntry()`` (this can happen mid-construction
-        and is a non-issue at write time). If longer, the surplus is
-        ignored. Either way, the file size on disk is exactly the
-        declared dimensions.
+        Why this matters: the .bin is `INCBIN`'d into a fixed-size array (e.g.
+        ``sItemListTilemap[LIST_TILES_WIDTH * LIST_TILES_HEIGHT]``) and/or LZ-
+        decompressed into a BG tilemap buffer sized for the declared map. The
+        file MUST stay exactly the size the engine expects. The 2026-06 item_menu
+        ``list.bin`` corruption was the old ``width * height`` write: a 216-entry
+        list auto-detected 32-wide padded to 224 on load, then 18×13=234 after a
+        width change, writing 468 bytes into a [18*12=216] array → broken build.
+        Writing ``len(entries)`` keeps the file pinned to its real data size.
         """
         target = path or self.source_path
         if not target:
             raise ValueError("No path specified")
-        n_expected = self.width * self.height
-        # Take exactly width*height entries. Pad with defaults if short,
-        # truncate if long.
-        seq = list(self.entries[:n_expected])
-        while len(seq) < n_expected:
-            seq.append(TileEntry())
-        data = struct.pack(
-            f"<{n_expected}H", *(e.to_u16() for e in seq)
-        )
+        n = len(self.entries)
+        data = struct.pack(f"<{n}H", *(e.to_u16() for e in self.entries))
         with open(target, "wb") as f:
             f.write(data)
         if not path:
@@ -149,7 +141,13 @@ class Tilemap:
 
 
 def _guess_width(entry_count: int) -> int:
-    """Guess tilemap width from entry count."""
+    """Guess tilemap width from entry count.
+
+    Prefer a width that DIVIDES the count exactly, so width*height == count and
+    there's no partial last row. (A non-dividing width — e.g. 32 for a
+    216-entry list — used to pad the entry list on load and then grow the file
+    on save: the item_menu/list.bin corruption.)
+    """
     # Common GBA tilemap sizes
     known = {
         640: 32,    # 32x20 = GBA screen
@@ -159,11 +157,18 @@ def _guess_width(entry_count: int) -> int:
     }
     if entry_count in known:
         return known[entry_count]
-    # Default: 32 wide if divisible, else find best fit
+    if entry_count <= 0:
+        return 32
     if entry_count % 32 == 0:
         return 32
     if entry_count % 30 == 0:
         return 30
+    # Largest exact divisor <= 32 (a sensible GBA BG stride) so the grid has no
+    # partial row. The user can still set any width via the spinner (rewrap is
+    # display-only and never changes the saved size).
+    for w in range(32, 0, -1):
+        if entry_count % w == 0:
+            return w
     return 32
 
 

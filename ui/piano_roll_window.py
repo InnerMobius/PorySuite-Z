@@ -665,6 +665,8 @@ class PianoRollWindow(QMainWindow):
 
         # 1) Master volume → 127 so track VOL=127 survives save/reload
         self._song.master_volume = 127
+        # Master is now the max — re-expand every track slider's ceiling to 127.
+        self._track_sidebar.set_volume_ceiling(127)
 
         # 2) Every VOL event on THIS track → 127 (and add one if missing);
         #    also every note-command velocity on THIS track → 127.
@@ -817,19 +819,11 @@ class PianoRollWindow(QMainWindow):
                 from core.sound.song_parser import TrackCommand
                 track.commands.insert(0, TrackCommand(
                     cmd='VOL', tick=0, value=volume, raw_line=''))
-            # ── Ceiling fix ───────────────────────────────────────────
-            # The .s file writes VOL as `raw*mvl/mxv`, and the writer's
-            # _raw_vol() reverse-computes raw = round(value * 127 / mvl),
-            # then clamps to 127. If `volume` exceeds the current
-            # `master_volume` (`_mvl` in the .s), the write clamps and
-            # the next cold-load parse evaluates back to the ceiling
-            # (e.g. user slides to 120 with mvl=90 → file says 127*mvl/mxv
-            # → reload reads 90). Hoist master_volume up to 127 so the
-            # full 0-127 VOL range can round-trip losslessly. A 127 mvl
-            # means _raw_vol(v, 127) == v exactly — every track's VOL is
-            # written faithfully and re-parses to the same number.
-            if volume > getattr(self._song, 'master_volume', 127):
-                self._song.master_volume = 127
+            # The slider is clamped to the song's master volume (the M4A
+            # ceiling), so `volume` is always <= master and round-trips
+            # losslessly — no master hoist needed here. To lift the ceiling the
+            # user raises the master volume directly (header editor) or uses Max
+            # Volume, which re-expands every track slider.
             self._mark_dirty()
 
     def _on_track_pan(self, track_index: int, pan: int):

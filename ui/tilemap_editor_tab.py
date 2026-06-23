@@ -51,6 +51,38 @@ class _NoScrollCombo(QComboBox):
 SWATCH = 14  # pixels per color swatch
 
 
+def _slot_export_filename(pset, slot: int) -> str:
+    """Default .pal filename when exporting a palette slot.
+
+    Uses the slot's real source-file stem (written as JASC `.pal`) so an
+    exported palette keeps its original name — e.g. ``bg_female.pal``, not a
+    generic ``palette_01.pal``. Mirrors the save path's slot↔source_paths
+    alignment (``PaletteSet.from_pal_files`` keeps ``source_paths`` slot-aligned
+    for single-palette files). Falls back to a generic name only when a slot has
+    no distinct source (e.g. one combined 256-colour file split into many slots).
+    """
+    paths = list(getattr(pset, "source_paths", None) or [])
+    n_loaded = (pset.loaded_slot_count()
+                if hasattr(pset, "loaded_slot_count") else len(paths))
+
+    # Case A — one distinct source file per loaded slot (a split set like
+    # textbox1.pal / textbox2.pal): each slot keeps its own file's name.
+    if len(paths) == n_loaded and slot < len(paths) and paths[slot]:
+        stem = os.path.splitext(os.path.basename(paths[slot]))[0]
+        if stem:
+            return stem + ".pal"
+
+    # Case B — a single combined source (e.g. bg.gbapal = 48 colours) split
+    # into several slots: number them after that one stem (bg_0, bg_1, bg_2).
+    # A lone 16-colour file (one slot) just gets the stem with no number.
+    if paths and paths[0]:
+        stem = os.path.splitext(os.path.basename(paths[0]))[0]
+        if stem:
+            return f"{stem}_{slot}.pal" if n_loaded > 1 else f"{stem}.pal"
+
+    return f"palette_{slot:02d}.pal"
+
+
 class PaletteEditorWidget(QWidget):
     """Shows palette slots as color swatch rows with import/export.
 
@@ -245,7 +277,7 @@ class PaletteEditorWidget(QWidget):
             return
         path, _ = QFileDialog.getSaveFileName(
             self, f"Export Palette Slot {slot}",
-            f"palette_{slot}.pal",
+            _slot_export_filename(self._palette_set, slot),
             "JASC Palette (*.pal)")
         if not path:
             return
@@ -317,7 +349,8 @@ class PaletteEditorWidget(QWidget):
             count = 0
             for slot in range(min(16, self._palette_set.palette_count())):
                 if self._palette_set.is_slot_loaded(slot):
-                    path = os.path.join(dir_path, f"palette_{slot:02d}.pal")
+                    path = os.path.join(
+                        dir_path, _slot_export_filename(self._palette_set, slot))
                     write_jasc_pal(path, self._palette_set.palettes[slot])
                     count += 1
             QMessageBox.information(
@@ -1216,13 +1249,16 @@ class TilemapEditorTab(QWidget):
         pal_header.addWidget(self._pal_header_label)
 
         self._pal_source_combo = _NoScrollCombo()
-        self._pal_source_combo.addItem("Auto .pal", "pal")
+        self._pal_source_combo.addItem("Auto (this tilemap)", "pal")
         self._pal_source_combo.addItem("PNG colors", "png")
-        self._pal_source_combo.setFixedWidth(100)
+        self._pal_source_combo.setMinimumWidth(150)
         self._pal_source_combo.setToolTip(
-            "Palette source:\n"
-            "  Auto .pal — load from .pal files in the tilemap's directory\n"
-            "  PNG colors — extract from the tile sheet image's color table")
+            "Which palette to edit:\n"
+            "  Auto (this tilemap) — the palette this .bin renders with\n"
+            "  PNG colors — the tile sheet image's own color table\n"
+            "  …plus every other palette file in this folder, by name\n"
+            "    (e.g. a gender/variant override like bg_female) so you can\n"
+            "    edit it here too. The readout below shows where edits save.")
         self._pal_source_combo.currentIndexChanged.connect(
             self._on_pal_source_changed)
         pal_header.addWidget(self._pal_source_combo)
@@ -1248,6 +1284,14 @@ class TilemapEditorTab(QWidget):
         self._pal_editor = PaletteEditorWidget()
         self._pal_editor.palette_changed.connect(self._on_palette_edited)
         right_layout.addWidget(self._pal_editor)  # no stretch, fixed height
+
+        # Save-target readout — tells the user exactly which file(s) their
+        # palette edits land in (the real source, not a build artifact), so
+        # the data flow is never a mystery. Updated on every load / source pick.
+        self._pal_save_label = QLabel("")
+        self._pal_save_label.setWordWrap(True)
+        self._pal_save_label.setStyleSheet("color: #8aa; font-size: 10px;")
+        right_layout.addWidget(self._pal_save_label)
 
         # -- Status --
         self._status = QLabel("No tilemap loaded")
@@ -1392,10 +1436,12 @@ class TilemapEditorTab(QWidget):
         self._offset_spin.setValue(0)
         self._offset_spin.blockSignals(False)
 
-        # Reset palette source combo
-        self._pal_source_combo.blockSignals(True)
-        self._pal_source_combo.setCurrentIndex(0)
-        self._pal_source_combo.blockSignals(False)
+        # Reset palette source combo + list every palette file in this folder
+        # (so siblings like a gender/variant override are reachable), and show
+        # the user where edits will save.
+        self._pal_save_override = None
+        self._populate_pal_sources(assets)
+        self._update_pal_save_label()
 
         # Update canvas
         self._canvas.set_data(self._tilemap, self._sheet, self._palettes)
@@ -1635,12 +1681,17 @@ class TilemapEditorTab(QWidget):
         # only the color table is rewritten so opening the file in GIMP
         # shows the new colors. Refuses non-Indexed8 PNGs (would otherwise
         # produce an RGB PNG that breaks gbagfx during the build).
+        # Bake ONLY when editing the tilemap's own palette. If the user is
+        # editing a sibling palette file (a variant override, window palette,
+        # …), its edits go to that file alone — never the tilemap's tile-sheet
+        # PNG (which has a different palette).
         sheet_path = ""
-        if self._sheet and getattr(self._sheet, 'source_path', ""):
-            sheet_path = self._sheet.source_path
-        else:
-            idx = self._sheet_combo.currentIndex()
-            sheet_path = self._sheet_combo.itemData(idx) if idx >= 0 else ""
+        if not getattr(self, '_pal_save_override', None):
+            if self._sheet and getattr(self._sheet, 'source_path', ""):
+                sheet_path = self._sheet.source_path
+            else:
+                idx = self._sheet_combo.currentIndex()
+                sheet_path = self._sheet_combo.itemData(idx) if idx >= 0 else ""
         if sheet_path and _os.path.isfile(sheet_path):
             try:
                 from PyQt6.QtGui import QImage
@@ -2400,20 +2451,94 @@ class TilemapEditorTab(QWidget):
         self._tile_offset = val
         self._refresh_canvas()
 
-    def _on_pal_source_changed(self, idx: int):
-        """Switch between .pal file palettes and tile sheet embedded palette."""
-        if not self._sheet:
+    def _populate_pal_sources(self, assets) -> None:
+        """List every palette file in the tilemap's folder in the source combo
+        (deduped by stem, preferring the editable ``.pal`` over a ``.gbapal``
+        build artifact), so sibling palettes — variant/gender overrides, window
+        palettes, etc. — are reachable and editable here. The tilemap's own
+        palette is the "Auto" entry, so its stem is skipped. Project-agnostic:
+        names come from the files on disk, nothing hardcoded."""
+        combo = self._pal_source_combo
+        combo.blockSignals(True)
+        while combo.count() > 2:          # keep "Auto" + "PNG colors"
+            combo.removeItem(2)
+        base = ""
+        if self._tilemap and self._tilemap.source_path:
+            base = os.path.splitext(
+                os.path.basename(self._tilemap.source_path))[0]
+        by_stem: dict[str, str] = {}
+        for p in (getattr(assets, "pal_files", None) or []):
+            stem = os.path.splitext(os.path.basename(p))[0]
+            if stem == base:
+                continue              # the tilemap's own palette == "Auto"
+            ext = os.path.splitext(p)[1].lower()
+            cur = by_stem.get(stem)
+            # Prefer the committed .pal source over a .gbapal build artifact.
+            if cur is None or (cur.lower().endswith(".gbapal") and ext == ".pal"):
+                by_stem[stem] = p
+        for stem in sorted(by_stem):
+            combo.addItem(stem, by_stem[stem])   # userData = the file path
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _update_pal_save_label(self) -> None:
+        """Show exactly which file(s) the current palette's edits will save to,
+        so the data flow is never a mystery."""
+        lbl = getattr(self, "_pal_save_label", None)
+        if lbl is None:
             return
+        if not self._palettes or self._palettes.palette_count() == 0:
+            lbl.setText("")
+            return
+        n = (self._palettes.loaded_slot_count()
+             if hasattr(self._palettes, "loaded_slot_count")
+             else self._palettes.palette_count())
+        colors = n * 16
+        override = getattr(self, "_pal_save_override", None)
+        if override:
+            name = os.path.basename(override)
+            lbl.setText(f"Editing {name} — {colors} colours "
+                        f"({n} palette{'s' if n != 1 else ''}) · saves to {name}")
+            return
+        # The tilemap's own palette: its source file(s) + a bake into the source
+        # tile-sheet PNG (the file the build actually reads).
+        targets = [os.path.basename(p)
+                   for p in (self._palettes.source_paths or []) if p]
+        sheet = ""
+        if self._sheet and getattr(self._sheet, "source_path", ""):
+            sheet = os.path.basename(self._sheet.source_path)
+        if sheet and sheet not in targets:
+            targets.append(f"{sheet} (image source)")
+        where = ", ".join(targets) if targets else "the tile sheet PNG"
+        lbl.setText(f"Editing this tilemap's palette — {colors} colours "
+                    f"({n} sub-palette{'s' if n != 1 else ''}) · saves to {where}")
+
+    def _on_pal_source_changed(self, idx: int):
+        """Switch which palette is being edited: the tilemap's own ("Auto"), the
+        tile sheet PNG's colours, or any other palette file in the folder."""
         source = self._pal_source_combo.itemData(idx)
+        from core.tilemap_data import PaletteSet
         if source == "png":
-            from core.tilemap_data import PaletteSet
+            if not self._sheet:
+                return
             self._palettes = PaletteSet.from_indexed_image(self._sheet.image)
-        else:
-            # Reload from .pal files
+            self._pal_save_override = None
+        elif source == "pal":
             self._reload_pal_files()
-        self._refresh_canvas()
-        self._picker.set_sheet(self._sheet, self._palettes)
+            self._pal_save_override = None
+        else:
+            # A specific palette file in the folder (userData = its path) —
+            # edits save straight back to THAT file (see _flush_palette_edits).
+            try:
+                self._palettes = PaletteSet.from_pal_files([source])
+                self._pal_save_override = source
+            except Exception:
+                pass
+        if self._sheet:
+            self._refresh_canvas()
+            self._picker.set_sheet(self._sheet, self._palettes)
         self._update_pal_editor()
+        self._update_pal_save_label()
 
     def _on_palette_edited(self):
         """Called when the palette editor widget changes a palette slot."""
@@ -2513,7 +2638,8 @@ class TilemapEditorTab(QWidget):
             count = 0
             for slot in range(min(16, self._palettes.palette_count())):
                 if self._palettes.is_slot_loaded(slot):
-                    path = os.path.join(dir_path, f"palette_{slot:02d}.pal")
+                    path = os.path.join(
+                        dir_path, _slot_export_filename(self._palettes, slot))
                     write_jasc_pal(path, self._palettes.palettes[slot])
                     count += 1
             QMessageBox.information(

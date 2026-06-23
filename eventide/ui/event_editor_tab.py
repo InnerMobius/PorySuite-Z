@@ -6645,7 +6645,7 @@ class EventEditorTab(QWidget):
 
     def open_map_and_select(self, map_name: str, local_id: str = '',
                             trainer_const: str = '',
-                            text_label: str = ''):
+                            text_label: str = '', mart_label: str = ''):
         """Public API: load a map and optionally select an NPC or find a trainer.
 
         Called by the unified window for cross-editor navigation.
@@ -6655,6 +6655,9 @@ class EventEditorTab(QWidget):
         *text_label*: text constant to find (e.g. "PalletTown_Text_CanStoreItemsAndMonsInPC")
                       — searches every NPC's full command tree for a msgbox
                       referencing this text, regardless of script chain depth.
+        *mart_label*: shop item-list label (e.g. "ViridianCity_Mart_Items") —
+                      selects the NPC whose script opens that mart via a
+                      `pokemart <label>` command.
         """
         if not self._root_dir:
             return
@@ -6692,6 +6695,18 @@ class EventEditorTab(QWidget):
                         if (cmd and len(cmd) >= 2 and
                             'trainerbattle' in cmd[0] and
                             trainer_const in cmd[1]):
+                            self.obj_combo.setCurrentIndex(i)
+                            return
+
+        # Try to find the NPC whose script opens this shop (pokemart <label>)
+        if mart_label:
+            for i, obj in enumerate(self._objects):
+                for page in obj.get('_pages', []):
+                    for cmd in page.get('commands', []):
+                        if not cmd or len(cmd) < 2 or cmd[0] != 'pokemart':
+                            continue
+                        arg = str(cmd[1]).strip().split()
+                        if arg and arg[0] == mart_label:
                             self.obj_combo.setCurrentIndex(i)
                             return
 

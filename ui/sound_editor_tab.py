@@ -1107,7 +1107,9 @@ class SoundEditorTab(QWidget):
         regeneration on build reproduces them instead of reverting the edit."""
         try:
             from core.sound.song_writer import save_song_file
-            save_song_file(song)
+            # Header-only edit (priority/reverb/volume equates) — can't change
+            # the .s's assemble-ability, so skip the ~1s GATE-1 toolchain run.
+            save_song_file(song, verify_build=False)
             # Keep midi.cfg's -P/-R/-V in sync with the .s equates. The .s is the
             # source of truth, but the Make rule can regen it from the .mid via
             # mid2agb, which reads these flags — stale flags would revert the edit.

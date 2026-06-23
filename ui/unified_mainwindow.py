@@ -165,6 +165,7 @@ class UnifiedMainWindow(QMainWindow):
             "maps":      "maps",
             "regionmap": "regionmap",
             "tilesets":  "tilesets",
+            "shops":     "shops",
             "ui":        "ui",
             "config":    "config",
             "labels":    "labels",
@@ -273,6 +274,10 @@ class UnifiedMainWindow(QMainWindow):
 
         # ── Tilemap Editor ───────────────────────────────────────────────────
         btn = self._make_page_button("tilesets", "Tilemap Editor")
+        tb2.addWidget(btn)
+
+        # ── Shop Editor ──────────────────────────────────────────────────────
+        btn = self._make_page_button("shops", "Shop Editor")
         tb2.addWidget(btn)
 
         _add_separator(tb2)
@@ -803,6 +808,13 @@ class UnifiedMainWindow(QMainWindow):
             # Any tab whose visuals depend on a file the Tilemap Editor
             # writes can subscribe to file_saved and refresh.
             self._tilemap_editor.tilemap_saved.connect(self.file_saved.emit)
+            # Saving via the tab's own Save button must ALSO clear the page's
+            # dirty dot — otherwise a successful save looks like a no-op (the
+            # dot stays lit). Only clear when nothing else under this page is
+            # still unsaved (the palette baker tracks its own dirty state).
+            self._tilemap_editor.tilemap_saved.connect(
+                lambda *_a: self.set_page_dirty("tilesets", False)
+                if not self._tilemap_editor.has_unsaved_changes() else None)
             anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
             if anim_ed and hasattr(anim_ed, 'modified'):
                 anim_ed.modified.connect(
@@ -817,6 +829,21 @@ class UnifiedMainWindow(QMainWindow):
                              self.setWindowModified(True)))
         except Exception as e:
             print(f"[TilemapEditor] Failed to load: {e}")
+            import traceback; traceback.print_exc()
+
+        # ── Shop Editor ─────────────────────────────────────────────────────
+        try:
+            from ui.shop_editor_tab import ShopEditorTab
+            self._shop_editor = ShopEditorTab()
+            idx = self.stack.addWidget(self._shop_editor)
+            self._page_indices["shops"] = idx
+            self._shop_editor.modified.connect(
+                lambda: (self.set_page_dirty("shops", True),
+                         self.setWindowModified(True)))
+            self._shop_editor.jump_to_script_requested.connect(
+                self._on_jump_to_shop_script)
+        except Exception as e:
+            print(f"[ShopEditor] Failed to load: {e}")
             import traceback; traceback.print_exc()
 
         # ── Disconnect PorySuite's own tab-change handler ────────────────────
@@ -1307,8 +1334,30 @@ class UnifiedMainWindow(QMainWindow):
                 except Exception as e:
                     self.log_message(f"Error saving tile animation properties: {e}")
 
-        if saved_tilemap or saved_tile_anim:
+        # Clear the tilesets dirty dot if the tab is now clean — whether THIS
+        # Save-All did the writing OR a prior per-tab Save already saved it (in
+        # which case flush_to_disk is a no-op but the dot must still come off).
+        if saved_tilemap or saved_tile_anim or (
+                hasattr(self, '_tilemap_editor')
+                and hasattr(self._tilemap_editor, 'has_unsaved_changes')
+                and not self._tilemap_editor.has_unsaved_changes()):
             self.set_page_dirty("tilesets", False)
+
+        # Save Shop Editor (rewrites .2byte item lists in map scripts.inc)
+        saved_shops = False
+        if hasattr(self, '_shop_editor') and \
+                self._shop_editor.has_unsaved_changes():
+            try:
+                ok, errs = self._shop_editor.flush_to_disk()
+                if ok > 0:
+                    saved_shops = True
+                    self.log_message(f"Saved {ok} shop(s)")
+                if errs:
+                    self.log_message(f"Shop save errors: {', '.join(errs)}")
+            except Exception as e:
+                self.log_message(f"Error saving shops: {e}")
+        if saved_shops:
+            self.set_page_dirty("shops", False)
 
         if saved_labels:
             self.set_page_dirty("labels", False)
@@ -1322,7 +1371,7 @@ class UnifiedMainWindow(QMainWindow):
 
         if (saved_porysuite or saved_eventide or saved_credits
                 or saved_labels or saved_sound or saved_tile_anim
-                or saved_tilemap):
+                or saved_tilemap or saved_shops):
             self.statusBar().showMessage("All changes saved.", 4000)
         else:
             self.statusBar().showMessage("Nothing to save.", 2000)
@@ -1719,6 +1768,21 @@ class UnifiedMainWindow(QMainWindow):
             project_dir = (self.project_info or {}).get("dir", "")
             if project_dir and hasattr(self, '_tilemap_editor'):
                 self._tilemap_editor.set_project(project_dir)
+        elif page_name == "shops":
+            project_dir = (self.project_info or {}).get("dir", "")
+            if project_dir and hasattr(self, '_shop_editor'):
+                # Scan once on first open. Re-opening the tab must NOT discard
+                # unsaved edits — that's what Refresh (F5) is for. set_project
+                # calls load() which resets dirty state, so only do it when the
+                # editor isn't already pointed at this project.
+                if getattr(self._shop_editor, '_project_root', '') != project_dir:
+                    # Pass the app's friendly item names so the shop stock shows
+                    # "Poké Ball", not "ITEM_POKE_BALL" (same source every editor
+                    # uses). Optional — the tab prettifies constants without it.
+                    item_names = (self.project_data.get_items_list()
+                                  if hasattr(self, 'project_data') else None)
+                    self._shop_editor.set_project(
+                        project_dir, item_names=item_names)
 
     # ── Phase 3: Cross-editor navigation handlers ─────────────────────────
 
@@ -1778,6 +1842,38 @@ class UnifiedMainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f'{trainer_const} is not on a map yet — add a trainerbattle '
                 f'command to an NPC.', 8000)
+
+    def _on_jump_to_shop_script(self, map_name: str, mart_label: str):
+        """Jump to EVENTide for a shop ("Open in EVENTide" in the Shop Editor).
+
+        Opens the map whose NPC runs this shop's `pokemart` call and selects
+        that NPC. For a not-yet-wired shop mart_label is '' — the map just opens
+        so the user can add a `pokemart` NPC.
+        """
+        if not map_name:
+            return
+        self._switch_to_page('events')
+        ev = self._eventide_window
+        eet = getattr(ev, 'event_editor_tab', None) if ev else None
+        if eet is None:
+            return
+        try:
+            eet.open_map_and_select(map_name, mart_label=mart_label)
+        except Exception as e:
+            self.log_message(f'Shop → EVENTide jump error: {e}')
+            return
+        if mart_label:
+            self.log_message(
+                f'Opened {map_name} in EVENTide and selected the NPC that '
+                f'opens shop {mart_label}.')
+            self.statusBar().showMessage(
+                f'{mart_label}: NPC selected in {map_name}.', 8000)
+        else:
+            self.log_message(
+                f'Opened {map_name} in EVENTide — add a pokemart command to an '
+                f'NPC to wire the shop.')
+            self.statusBar().showMessage(
+                f'Opened {map_name} in EVENTide.', 8000)
 
     def _on_jump_to_trainer(self, trainer_const: str):
         """Switch to Trainers tab and select the given trainer."""
@@ -1994,6 +2090,20 @@ class UnifiedMainWindow(QMainWindow):
                 self._credits_editor.load_project(project_dir)
             except Exception:
                 pass
+
+        # Refresh Shop Editor — only if it was already pointed at this project
+        # (i.e. the user has opened the tab at least once). load() does a full
+        # state reset + fresh re-scan, honouring the F5 contract.
+        if project_dir and hasattr(self, "_shop_editor"):
+            if getattr(self._shop_editor, "_project_root", ""):
+                try:
+                    # Refresh friendly item names too (items may have changed).
+                    if hasattr(self, 'project_data'):
+                        self._shop_editor.set_item_names(
+                            self.project_data.get_items_list())
+                    self._shop_editor.load()
+                except Exception as e:
+                    self.log_message(f"Shop editor refresh error: {e}")
 
         # Clear dirty flags on all sub-editors immediately AND after deferred
         # widget loads (QTimer.singleShot(0) in PorySuite's load path).
@@ -2241,6 +2351,9 @@ class UnifiedMainWindow(QMainWindow):
             vg_tab = getattr(self._sound_editor, '_voicegroups_tab', None)
             if vg_tab and vg_tab.has_unsaved_changes():
                 return True
+        if hasattr(self, '_shop_editor') and \
+                self._shop_editor.has_unsaved_changes():
+            return True
         return False
 
     def closeEvent(self, event):

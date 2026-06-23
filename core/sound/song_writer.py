@@ -985,10 +985,17 @@ def write_song(song: SongData) -> str:
     return _uniquify_colliding_labels('\n'.join(lines), prefix)
 
 
-def save_song_file(song: SongData, path: Optional[str] = None) -> str:
+def save_song_file(song: SongData, path: Optional[str] = None,
+                   verify_build: bool = True) -> str:
     """Write a SongData to its .s file. Returns the path written to.
 
     If path is None, uses song.file_path (the original location).
+
+    ``verify_build`` (default True) runs GATE 1 — the real assembler on the
+    generated .s before writing it — so a song that wouldn't compile never
+    reaches disk. Callers that only tweak a header equate (priority/reverb/
+    volume — which can't change the .s's assemble-ability) pass False to skip
+    the ~1s toolchain round-trip; the static validator still runs always.
 
     The .s file is the canonical, full-fidelity source of truth for any
     song that's been edited in the Piano Roll or via the inline header
@@ -1055,6 +1062,35 @@ def save_song_file(song: SongData, path: Optional[str] = None) -> str:
             "Export blocked: the generated .s for '{}' is invalid and was "
             "NOT written (your existing file is unchanged):\n  - {}".format(
                 song.label, "\n  - ".join(_verrs)))
+
+    # GATE 1 — assemble the generated .s with the REAL toolchain, exactly as the
+    # build does, so a song that won't compile never reaches disk. Catches
+    # anything the static validator doesn't know about. Fail-OPEN when the
+    # toolchain isn't reachable (the static validator stays the guarantee).
+    # Skipped when verify_build=False (header-only equate edits can't change
+    # assemble-ability and shouldn't pay the ~1s toolchain round-trip).
+    if verify_build:
+        try:
+            from core.sound.song_assembler import (
+                assemble_text, _repo_root_from_path)
+            _repo = _repo_root_from_path(output_path)
+            _aok, _aerr = assemble_text(
+                content, _repo or '', os.path.dirname(output_path))
+        except Exception as _aexc:
+            import logging as _logging
+            _logging.getLogger("SoundEditor.SongWriter").warning(
+                "Assemble gate could not run for %s: %s — writing anyway",
+                song.label, _aexc)
+            _aok, _aerr = True, None
+        if not _aok:
+            import logging as _logging
+            _logging.getLogger("SoundEditor.SongWriter").error(
+                "Refusing to write %s — it does not assemble:\n%s",
+                song.label, _aerr)
+            raise ValueError(
+                "Export blocked: the generated .s for '{}' does NOT assemble "
+                "and was not written (your existing file is unchanged):\n{}"
+                .format(song.label, _aerr))
 
     with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(content)

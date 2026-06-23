@@ -90,6 +90,15 @@ class ExportValidatorTest(unittest.TestCase):
     def test_clean_text_passes(self):
         self.assertEqual(validate_s_text(_GOOD_S, "se_x"), [])
 
+    def test_double_colon_label_rejected(self):
+        # `name_1::` (pret-preproc shorthand) fails the raw sound build.
+        bad = _GOOD_S.replace('se_x_1:\n', 'se_x_1::\n')
+        errs = validate_s_text(bad, "se_x")
+        self.assertTrue(any('::' in e for e in errs),
+                        f"'::' label should be rejected, got {errs}")
+        # The single-colon reference must still pass cleanly.
+        self.assertEqual(validate_s_text(_GOOD_S, "se_x"), [])
+
     def test_malformed_text_rejected(self):
         errs = validate_s_text(_BAD_S, "se_x")
         joined = " ".join(errs)
