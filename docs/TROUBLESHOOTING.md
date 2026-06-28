@@ -67,6 +67,28 @@ If you see a "blocked" message, it's telling you the sound as written wouldn't b
 ### The track volume slider snaps back to a lower number, or a track won't get as loud as I set it
 That's the slider being honest. A track's volume can never exceed the song's **master volume** — the game clamps it. Older builds let the slider go to 127 even on a song whose master was, say, 90, so anything above 90 silently played (and reloaded) as 90. Now each track's slider stops at the song's master volume, so what you see is what plays. To make a track louder than that, raise the **master volume** (in the song header) or use the **🔊 Max Volume** button, which raises master to 127 and re-opens every track's slider to the full range.
 
+### I changed a sound's volume and now it's broken / distorted / wrong in-game (but it's fine in the editor)
+As of 2026-06-28, volume edits go through the game's own sound converter (mid2agb), so this shouldn't happen. Older builds wrote the assembly with PorySuite's own converter, which encoded some overlapping notes differently from the game and applied the master volume twice (making the sound quieter or distorted on each save). Now editing the master Volume field or the per-track slider regenerates the sound through mid2agb — exactly what the build produces — so the in-game result matches the editor. If an older project still has a sound corrupted this way, open it in the Sound Editor and re-save (or nudge its volume) to regenerate it cleanly.
+
+### A sound effect plays the wrong instrument or is silent in-game, even though it looks right in the editor
+The instrument a sound uses lives in its `.mid` (the source the build compiles), not just the `.s`. If a sound's `.mid` held a stale instrument number, every build regenerated the `.s` with that wrong instrument — so hand-editing the `.s` kept reverting. Fixed by writing the chosen instrument into the `.mid`. To repair such a sound: open it in the Sound Editor, set the instrument you want, and save — that writes the `.mid`, and the build then renders it correctly. (Example: the bomb-pickup chime was silent because its `.mid` pointed at a silent voice; it now points at the audible one.)
+
+---
+
+## Git — Pull / Push
+
+### I pulled and my uncommitted work disappeared
+As of 2026-06-28, Pull saves your uncommitted work to a **stash** before it syncs to the remote, so it isn't lost. Older builds ran a hard reset that permanently wiped anything you hadn't committed. After a pull, open the Git panel's **Stash** section (or run `git stash pop`) to bring your pre-pull work back. Note: this saves what's on disk — edits still open in an editor tab that you haven't saved are NOT captured, so Save first.
+
+### I pushed to "master" (or another branch) but my work didn't go up
+As of 2026-06-28, choosing a branch in the Push dialog pushes **your current branch's work** to that branch (e.g. promoting your feature branch to master) and fast-forwards it. Older builds pushed the stale local branch of that name instead — so "push to master" sent the old master, not your work. If the target already has commits your branch doesn't, PorySuite asks before force-pushing. The dialog label now reads "Push '<your branch>' → branch: <target>" so it's clear where your work goes.
+
+### Push said it worked but nothing changed on the remote
+If your branch already matched the remote, the push had nothing to send — the dialog now says "already up to date — nothing pushed" instead of a misleading success. If you *expected* to push work and see this, you're probably on the wrong branch: the Git panel's status line warns "⚠ Unpushed work on other branches: <name>" when your commits sit on a branch you're not currently on. Switch to that branch and push.
+
+### My work seems to have vanished after switching branches
+It's almost certainly safe on another branch. The Git panel's status line lists any branches holding commits not yet on the remote ("⚠ Unpushed work on other branches: …"). Committed work lives in git's history even when the branch you're viewing doesn't show it — switch to the named branch to find it. Committed work is essentially never lost; only *uncommitted* edits can be, and the pull-stash above now protects those.
+
 ---
 
 ## Shop Editor

@@ -1789,23 +1789,24 @@ QTabBar::tab:hover:!selected {
                 preview_lines = lines[:12]
                 if len(lines) > 12:
                     preview_lines.append(f"  … and {len(lines) - 12} more")
-                clean_preview = "\n\nUntracked files that will be deleted:\n" + "\n".join(
+                clean_preview = "\n\nUntracked files (saved to the stash, not deleted):\n" + "\n".join(
                     f"  {l}" for l in preview_lines
                 )
 
         confirm_text = (
-            f"⚠ WARNING: Pulling will overwrite your local files.\n\n"
-            f"Your local copy will be replaced with whatever is on the "
-            f"remote. Any work you haven't committed will be permanently lost.\n\n"
+            "Pull replaces your local files with what's on the remote.\n\n"
+            "Before that, PorySuite SAVES all your uncommitted work to a Git "
+            "stash, so nothing is lost — you can restore it afterward from the "
+            "Git panel → Stash section (or 'git stash pop').\n\n"
             f"  Remote: {remote_label}\n"
             + (f"  Branch: {branch_label}\n" if branch_label else "") +
-            f"\nWhat will be wiped:\n"
-            f"  • All uncommitted changes to tracked files\n"
-            f"  • All unsaved edits open in the editor\n"
-            f"  • All queued rename operations not yet written to disk\n"
-            + ("  • ALL untracked files (custom graphics, scripts, etc.)\n" if is_upstream_pull else "") +
+            "\nSaved to the stash first:\n"
+            "  • Uncommitted changes to tracked files\n"
+            + ("  • Untracked files (custom graphics, scripts, etc.)\n" if is_upstream_pull else "") +
             clean_preview +
-            f"\nAre you sure you want to continue?"
+            "\n⚠ NOT saved: edits open in an editor tab you haven't written to "
+            "disk yet, and queued renames not yet applied — Save those first.\n"
+            "\nContinue?"
         )
 
         ans = QMessageBox.question(
@@ -1858,7 +1859,25 @@ QTabBar::tab:hover:!selected {
         self._refresh_action.setEnabled(False)
         self._git_set_all_enabled(False)
 
+        # SAFETY: stash ALL uncommitted work (tracked changes + untracked
+        # files) BEFORE the destructive reset/clean, so a pull can never
+        # silently destroy work — it lands in a stash the user can restore.
+        # `git stash push` is a no-op when the tree is clean ("No local changes
+        # to save", rc 0), so this step is harmless then.  --include-untracked
+        # also pulls in custom files the later `clean -fd` would otherwise wipe.
+        import time as _time
+        _stash_msg = ("PorySuite pre-pull safety stash "
+                      + _time.strftime("%Y-%m-%d %H:%M:%S"))
+        # Stash tracked changes always (reset --hard would discard them). Add
+        # untracked files only for an upstream pull, where the follow-up
+        # `clean -fd` would delete them — a plain origin pull leaves untracked
+        # files alone, so don't relocate them into a stash needlessly.
+        _stash_args = ["stash", "push"]
+        if is_upstream_pull:
+            _stash_args.append("--include-untracked")
+        _stash_args += ["-m", _stash_msg]
         _steps = [
+            (_stash_args, 60, "git stash  (safety: saving your uncommitted work)"),
             (fetch_args, 180, fetch_label),
             (reset_args,  60, reset_label),
         ]
@@ -1951,8 +1970,14 @@ QTabBar::tab:hover:!selected {
         worker = _PullWorker(self._git_exe(), project_dir, _steps)
         self._git_worker = worker
 
+        _pull_stash_made = [False]
+
         def _append_line(ln: str):
             _out.appendPlainText(ln)
+            # The safety stash prints "Saved working directory ..." only when it
+            # actually stashed something (clean tree prints "No local changes").
+            if "Saved working directory" in ln:
+                _pull_stash_made[0] = True
 
         def _on_done(ok: bool, msg: str):
             self._refresh_action.setEnabled(True)
@@ -1963,6 +1988,14 @@ QTabBar::tab:hover:!selected {
             prog_dlg.show()
 
             if ok:
+                if _pull_stash_made[0]:
+                    _out.appendPlainText(
+                        "\n✓ Your uncommitted work was saved to a Git stash "
+                        "before the pull. Restore it any time from the Git "
+                        "panel → Stash section (or run 'git stash pop'). "
+                        "Nothing was lost.")
+                    _status_lbl.setText(
+                        "✓ Pulled — your prior work is saved in a stash (Git → Stash).")
                 # Clear ALL in-memory state referencing the old repo so
                 # apply_pending on next Save doesn't re-write stale renames.
                 try:
@@ -2595,9 +2628,12 @@ QTabBar::tab:hover:!selected {
         dlg.setMinimumWidth(520)
         vlay = QVBoxLayout(dlg)
 
-        # Branch selector
+        # Branch selector — this is the TARGET branch on the remote. The push
+        # always sends the CURRENT branch's work (HEAD) to it, so "push to
+        # master" promotes everything you're working on, not some other
+        # branch's stale tip.
         branch_row = QHBoxLayout()
-        branch_row.addWidget(QLabel("<b>Branch to push:</b>"))
+        branch_row.addWidget(QLabel(f"<b>Push '{current_branch}' → branch:</b>"))
         branch_combo = QComboBox()
         branch_combo.setFocusPolicy(_Qt.FocusPolicy.StrongFocus)
         branch_combo.installEventFilter(self._combo_wheel_filter())
@@ -2734,6 +2770,7 @@ QTabBar::tab:hover:!selected {
         new_branch_btn.clicked.connect(_create_and_switch)
 
         chosen_branch = [None]
+        force_push = [False]
 
         def _do_push():
             sel = branch_combo.currentText()
@@ -2742,7 +2779,8 @@ QTabBar::tab:hover:!selected {
                 ans = QMessageBox.warning(
                     dlg,
                     f"Push to {sel}?",
-                    f"You are about to push directly to '{sel}'.\n\n"
+                    f"You are about to push your current branch "
+                    f"('{current_branch}') to '{sel}'.\n\n"
                     f"This will update the remote immediately. Anyone pulling "
                     f"from this remote will receive these changes.\n\n"
                     f"Are you sure? Consider using a feature branch if your "
@@ -2752,6 +2790,30 @@ QTabBar::tab:hover:!selected {
                 )
                 if ans != QMessageBox.StandardButton.Yes:
                     return
+            # If origin/<sel> has commits the current branch doesn't, a normal
+            # push is rejected (non-fast-forward). Offer an explicit force so
+            # "push everything to that branch" still works, but warn loudly.
+            force_push[0] = False
+            ok_ls, ls_out = self._git_run("ls-remote", "--heads", "origin", sel, timeout=15)
+            if (ls_out or "").strip():
+                is_anc, _anc_out = self._git_run(
+                    "merge-base", "--is-ancestor", f"origin/{sel}", "HEAD", timeout=10)
+                if not is_anc:
+                    ans = QMessageBox.warning(
+                        dlg, f"'{sel}' has work yours doesn't",
+                        f"origin/{sel} contains commits your current branch "
+                        f"('{current_branch}') does not have.\n\n"
+                        f"A normal push would be rejected. Force-pushing makes "
+                        f"'{sel}' match your branch EXACTLY, discarding those "
+                        f"other commits on the remote.\n\n"
+                        f"Only force-push if you're certain '{sel}' should be "
+                        f"replaced with your branch.",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                        QMessageBox.StandardButton.Cancel,
+                    )
+                    if ans != QMessageBox.StandardButton.Yes:
+                        return
+                    force_push[0] = True
             chosen_branch[0] = sel
             dlg.accept()
 
@@ -2771,15 +2833,25 @@ QTabBar::tab:hover:!selected {
 
         class _PushWorker(QThread):
             done = _sig(bool, str)
-            def __init__(self, git, cwd, br):
+            def __init__(self, git, cwd, br, force=False):
                 super().__init__()
                 self._git = git
                 self._cwd = cwd
                 self._branch = br
+                self._force = force
             def run(self):
+                # Push the CURRENT work (HEAD) to the chosen target branch, so
+                # "push to master" sends everything you're on — not the stale
+                # local branch that happens to be named master. --force-with-
+                # lease only when the user explicitly confirmed overwriting a
+                # diverged target.
+                push_args = ["push"]
+                if self._force:
+                    push_args.append("--force-with-lease")
+                push_args += ["origin", f"HEAD:{self._branch}"]
                 try:
                     r = subprocess.run(
-                        [self._git, "-C", self._cwd, "push", "origin", self._branch],
+                        [self._git, "-C", self._cwd, *push_args],
                         capture_output=True, text=True, timeout=180,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
@@ -2792,7 +2864,7 @@ QTabBar::tab:hover:!selected {
                 except Exception as exc:
                     self.done.emit(False, str(exc))
 
-        worker = _PushWorker(self._git_exe(), project_dir, branch)
+        worker = _PushWorker(self._git_exe(), project_dir, branch, force=force_push[0])
         self._git_worker = worker
 
         # Capture remote URL for the success dialog so the user can copy
@@ -2805,8 +2877,13 @@ QTabBar::tab:hover:!selected {
             self._git_set_all_enabled(True)
             self._git_refresh_status_bar()
             if ok:
-                self.statusBar().showMessage(
-                    f"Push complete: {branch} → origin", 5000)
+                _low = (msg or "").lower()
+                if "up-to-date" in _low or "up to date" in _low:
+                    self.statusBar().showMessage(
+                        f"{branch}: already up to date — nothing pushed", 5000)
+                else:
+                    self.statusBar().showMessage(
+                        f"Push complete: {branch} → origin", 5000)
                 self._show_push_success_dialog(branch, captured_remote_url, msg)
             else:
                 self.statusBar().showMessage("Push failed.", 4000)
@@ -2829,13 +2906,27 @@ QTabBar::tab:hover:!selected {
         """
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Information)
-        box.setWindowTitle("Push Complete")
-        box.setText(f"Pushed <b>{branch}</b> to origin successfully.")
+        # Be honest: git push returns success even when it pushed NOTHING
+        # ("Everything up-to-date"). Don't claim work was pushed if it wasn't —
+        # that's the "it said it worked, but it didn't" trap.
+        low = (output or "").lower()
+        nothing_pushed = "up-to-date" in low or "up to date" in low
+        box.setWindowTitle("Nothing to Push" if nothing_pushed else "Push Complete")
+        if nothing_pushed:
+            box.setText(
+                f"<b>{branch}</b> was already up to date on the remote — "
+                f"nothing new was pushed.")
+        else:
+            box.setText(f"Pushed <b>{branch}</b> to origin successfully.")
         info_lines = []
         if remote_url:
             info_lines.append(f"Remote: {remote_url}")
         info_lines.append(
-            "The remote branch is now up to date with your local commits."
+            "Nothing changed on the remote — your branch already matched it. "
+            "If you expected to push work, check you're on the right branch "
+            "(the Git panel flags unpushed work on other branches)."
+            if nothing_pushed else
+            f"origin/{branch} is now up to date with your pushed commits."
         )
         box.setInformativeText("\n\n".join(info_lines))
         if output:
@@ -11473,9 +11564,11 @@ QTabBar::tab:hover:!selected {
                 else:
                     dlg.log_line("Learnset headers: skipped (error)")
 
-                # Regenerate items.h from items.json
+                # items.h is regenerated from items.json by the build (jsonproc).
                 n_items = self._write_items_header()
-                if n_items >= 0:
+                if n_items == -2:
+                    dlg.log_line("items.h: build-generated from items.json — left for the build to regenerate")
+                elif n_items >= 0:
                     dlg.log_line(f"items.h regenerated ({n_items} items)")
                 else:
                     dlg.log_line("items.h: skipped (file not found or error)")
@@ -12535,6 +12628,26 @@ QTabBar::tab:hover:!selected {
 
         if not os.path.isfile(json_path):
             return -1
+
+        # items.h is a jsonproc BUILD ARTIFACT in modern pokefirered: the
+        # Makefile regenerates it from items.json (+ the Inja template
+        # items.json.txt) via AUTO_GEN_TARGETS. Re-deriving it here duplicates
+        # jsonproc imperfectly (it dropped custom-pocket items) AND, by writing
+        # items.h at the same moment as items.json, gave them equal mtimes so
+        # `make` saw items.h as up-to-date and SKIPPED the regen — compiling the
+        # stale/wrong header. So DON'T write it. Delete any stale copy (it's a
+        # non-tracked build artifact — same treatment as the post-pull cleanup
+        # above) so the build cleanly regenerates a correct items.h from the
+        # source of truth, items.json. (Only falls through to the hand-writer
+        # for an old fork that genuinely has no jsonproc rule for items.h.)
+        from core.make_targets import is_autogenerated_header
+        if is_autogenerated_header(proj_dir, "items.h"):
+            try:
+                if os.path.isfile(header_path):
+                    os.remove(header_path)
+            except OSError:
+                pass
+            return -2
 
         try:
             with open(json_path, "r", encoding="utf-8") as f:

@@ -207,6 +207,11 @@ PARTY_TYPE_FOR_STRUCT: dict[str, str] = {v: k for k, v in STRUCT_FOR_PARTY_TYPE.
 
 
 # ── Item categories ──────────────────────────────────────────────────────────
+# FALLBACK ONLY. The Items editor populates its Pocket / Item-Type dropdowns by
+# parsing the loaded project's own constants (core.item_enums →
+# include/**/*.h); these vanilla-shaped lists are used only if that parse finds
+# nothing. Do NOT treat them as the source of truth — they are wrong for any
+# project that renames pockets (POCKET_TM_CASE) or reorders the type enum.
 
 POCKET_CHOICES: list[tuple[str, str]] = [
     ("Items",       "POCKET_ITEMS"),

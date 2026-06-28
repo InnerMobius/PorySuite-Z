@@ -94,6 +94,17 @@ class SoundEditorTab(QWidget):
         self._playback_timer.setInterval(100)
         self._playback_timer.timeout.connect(self._update_playback_position)
 
+        # Debounce inline header edits (tempo/reverb/volume/priority). Each
+        # valueChanged now triggers a mid2agb recompile; saving on every digit
+        # or slider tick stacks one subprocess per tick and freezes the tab.
+        # Coalesce a burst of changes into ONE save ~400ms after it stops.
+        self._inline_save_timer = QTimer(self)
+        self._inline_save_timer.setSingleShot(True)
+        self._inline_save_timer.setInterval(400)
+        self._inline_save_timer.timeout.connect(self._flush_inline_save)
+        self._pending_inline_song = None
+        self._pending_inline_regen = False
+
         # Connect thread-safe signals
         self._render_done.connect(self._start_playback)
         self._render_failed.connect(self._on_render_error)
@@ -720,6 +731,9 @@ class SoundEditorTab(QWidget):
             self._detail_voicegroup.setText(f"Voicegroup: {song.voicegroup}")
             self._btn_goto_vg.setVisible(bool(song.voicegroup))
             self._detail_tracks.setText(f"Tracks: {len(song.tracks)}")
+            # Commit any pending debounced header edit on the OUTGOING song
+            # before we populate the spinboxes for this one.
+            self._flush_inline_save()
             self._loading_song = True
             self._spin_tempo.setValue(bpm)
             self._spin_tempo.setEnabled(True)
@@ -1072,7 +1086,9 @@ class SoundEditorTab(QWidget):
             if cmd.cmd == 'TEMPO':
                 cmd.value = int(value * tbs / 2)
                 break
-        self._save_song_inline(song)
+        # Tempo lives in the .mid (mid2agb derives the TEMPO command from it),
+        # so the .mid must be regenerated for this edit.
+        self._schedule_inline_save(song, regen_mid=True)
 
     def _on_song_reverb_changed(self, value: int):
         if self._loading_song:
@@ -1081,7 +1097,7 @@ class SoundEditorTab(QWidget):
         if not song or not hasattr(song, 'reverb'):
             return
         song.reverb = value
-        self._save_song_inline(song)
+        self._schedule_inline_save(song)
 
     def _on_song_volume_changed(self, value: int):
         if self._loading_song:
@@ -1090,7 +1106,7 @@ class SoundEditorTab(QWidget):
         if not song or not hasattr(song, 'master_volume'):
             return
         song.master_volume = value
-        self._save_song_inline(song)
+        self._schedule_inline_save(song)
 
     def _on_song_priority_changed(self, value: int):
         if self._loading_song:
@@ -1099,30 +1115,112 @@ class SoundEditorTab(QWidget):
         if not song or not hasattr(song, 'priority'):
             return
         song.priority = value
-        self._save_song_inline(song)
+        self._schedule_inline_save(song)
 
-    def _save_song_inline(self, song):
-        """Write song header changes (tempo/reverb/volume/priority) to the .s
-        file, then mirror priority/reverb/volume into midi.cfg so a mid2agb
-        regeneration on build reproduces them instead of reverting the edit."""
-        try:
-            from core.sound.song_writer import save_song_file
-            # Header-only edit (priority/reverb/volume equates) — can't change
-            # the .s's assemble-ability, so skip the ~1s GATE-1 toolchain run.
-            save_song_file(song, verify_build=False)
-            # Keep midi.cfg's -P/-R/-V in sync with the .s equates. The .s is the
-            # source of truth, but the Make rule can regen it from the .mid via
-            # mid2agb, which reads these flags — stale flags would revert the edit.
+    def _schedule_inline_save(self, song, regen_mid: bool = False):
+        """Debounce an inline header save. The caller has already updated the
+        in-memory song value (so the spinbox + preview are instant); this only
+        defers the disk write + mid2agb recompile until the user stops adjusting,
+        so dragging a slider or typing digits doesn't fire one subprocess per
+        tick. regen_mid is OR-ed across a burst (a tempo edit forces a .mid
+        rewrite even if a later volume tick in the same burst wouldn't)."""
+        self._pending_inline_song = song
+        self._pending_inline_regen = self._pending_inline_regen or regen_mid
+        self._inline_save_timer.start()  # restarts the countdown each tick
+
+    def _flush_inline_save(self):
+        """Run the pending debounced inline save now — fired by the timer, or
+        forced before switching songs / closing so an edit is never lost."""
+        self._inline_save_timer.stop()
+        song = self._pending_inline_song
+        if song is None:
+            return
+        regen = self._pending_inline_regen
+        self._pending_inline_song = None
+        self._pending_inline_regen = False
+        self._save_song_inline(song, regen)
+
+    def _save_song_via_mid2agb(self, song, regen_mid: bool) -> bool:
+        """Persist a MIDI-sourced song by editing its SOURCE and regenerating
+        the .s with the project's own **mid2agb** — the same reference encoder
+        the build uses — instead of PorySuite's hand-rolled .s writer.
+
+        PorySuite's writer can mis-encode some note shapes (e.g. it drops the
+        explicit length on a chord tone that mid2agb keeps), which assembles
+        fine but plays back broken. Routing through mid2agb makes a save
+        produce exactly what a build would, so editing volume / priority /
+        reverb / tempo can never desync the .s from the engine's encoding.
+
+        * Volume / priority / reverb are mid2agb FLAGS in midi.cfg — the .mid
+          note data is left untouched (``regen_mid=False``). For a master
+          volume change this is essential: the .mid holds the raw per-note
+          multipliers and mid2agb re-applies the new master, so the envelope
+          scales correctly and the decay is preserved.
+        * Tempo lives in the .mid, so ``regen_mid=True`` rewrites it first.
+
+        Returns True if mid2agb regenerated the .s; False to tell the caller to
+        fall back to the legacy writer (song isn't MIDI-sourced, or no mid2agb).
+        """
+        import os as _os
+        from core.sound.song_compiler import recompile_song, find_mid2agb
+        root = self._project_root
+        label = song.label
+        mid_path = _os.path.join(root, 'sound', 'songs', 'midi', label + '.mid')
+        if not (_os.path.isfile(mid_path) and find_mid2agb(root)):
+            return False
+        if regen_mid:
+            # Note / tempo edit: rewrite the .mid from the song. The master is
+            # unchanged for these edits, so write_midi_file's VOL un-scale is
+            # consistent and the round-trip preserves levels.
             try:
-                from core.sound.song_table_manager import update_midi_cfg_flags
-                update_midi_cfg_flags(
-                    self._project_root, song.label,
-                    priority=getattr(song, 'priority', None),
-                    reverb=getattr(song, 'reverb', None),
-                    volume=getattr(song, 'master_volume', None),
-                )
+                from core.sound.midi_exporter import write_midi_file
+                write_midi_file(song, mid_path)
             except Exception as e:
-                _log.warning("midi.cfg sync failed for %s: %s", song.label, e)
+                _log.warning("write_midi_file failed for %s: %s", label, e)
+                return False
+        # Sync midi.cfg's -P/-R/-V (and -G) BEFORE recompiling — mid2agb reads
+        # these flags, and recompile must see the new master volume.
+        try:
+            from core.sound.song_table_manager import update_midi_cfg_flags
+            update_midi_cfg_flags(
+                root, label,
+                priority=getattr(song, 'priority', None),
+                reverb=getattr(song, 'reverb', None),
+                volume=getattr(song, 'master_volume', None),
+            )
+        except Exception as e:
+            _log.warning("midi.cfg sync failed for %s: %s", label, e)
+        ok, err = recompile_song(root, label)
+        if not ok:
+            _log.warning("mid2agb recompile failed for %s: %s — using fallback",
+                         label, err)
+            return False
+        _log.info("Inline save via mid2agb: %s (regen_mid=%s)", label, regen_mid)
+        return True
+
+    def _save_song_inline(self, song, regen_mid: bool = False):
+        """Persist an inline header edit (tempo/reverb/volume/priority).
+
+        For a MIDI-sourced song the .s is a build artifact, so we edit the
+        source (.mid for tempo, midi.cfg flags for volume/priority/reverb) and
+        regenerate the .s with mid2agb — never PorySuite's .s writer. Falls back
+        to the legacy writer when the song isn't MIDI-sourced or mid2agb is
+        unavailable."""
+        try:
+            if not self._save_song_via_mid2agb(song, regen_mid):
+                # Legacy fallback: PorySuite's own .s writer + midi.cfg sync.
+                from core.sound.song_writer import save_song_file
+                save_song_file(song, verify_build=False)
+                try:
+                    from core.sound.song_table_manager import update_midi_cfg_flags
+                    update_midi_cfg_flags(
+                        self._project_root, song.label,
+                        priority=getattr(song, 'priority', None),
+                        reverb=getattr(song, 'reverb', None),
+                        volume=getattr(song, 'master_volume', None),
+                    )
+                except Exception as e:
+                    _log.warning("midi.cfg sync failed for %s: %s", song.label, e)
             # Data is on disk — clear any existing dirty tint for this song.
             # Do NOT add to _dirty_songs; inline saves don't leave pending changes.
             key = self._current_song_key

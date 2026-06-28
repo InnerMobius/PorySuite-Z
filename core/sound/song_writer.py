@@ -681,10 +681,28 @@ def notes_to_track_commands(
     for cmd in tick0_controls.values():
         commands.append(cmd)
 
-    # Build a timeline: merge notes with mid-song control changes
-    # Control events after tick 0
+    # Build a timeline: merge notes with mid-song control changes.
+    #
+    # ONE INSTRUMENT PER TRACK. The piano roll models a single instrument per
+    # track (the sidebar dropdown = the track's tick-0 VOICE) and cannot show
+    # or edit a mid-track instrument change. Carrying mid-song VOICE changes
+    # (tick > 0) from the imported source therefore both (a) contradicts what
+    # the UI shows and (b) DESYNCS from the notes on any move/edit: the VOICE
+    # change keeps its frozen original tick while the notes move, so a note can
+    # slide onto the wrong instrument — the "note went silent / wrong instrument
+    # after I shift-dragged the song" bug. Drop mid-song VOICE so the track
+    # always renders as its one sidebar instrument. Positional controls
+    # (VOL/PAN/MOD/BEND/...) are inherently time-anchored and are kept.
+    _dropped_voice = [c for c in control_events
+                      if c.tick > 0 and c.cmd == 'VOICE']
+    if _dropped_voice:
+        import logging as _logging
+        _logging.getLogger("SoundEditor.SongWriter").info(
+            "Track %s: collapsed %d mid-track VOICE change(s) to the track's "
+            "instrument (1 track = 1 instrument).",
+            track_index, len(_dropped_voice))
     mid_controls = sorted(
-        [c for c in control_events if c.tick > 0],
+        [c for c in control_events if c.tick > 0 and c.cmd != 'VOICE'],
         key=lambda c: c.tick,
     )
 

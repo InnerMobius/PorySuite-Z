@@ -1449,8 +1449,25 @@ class PianoRollWidget(QWidget):
                 if end > total_ticks:
                     total_ticks = end
 
+        # Extend the timeline to cover the LOOP region, not just the notes.
+        # A loop whose end (or start) sits past the last note — "play once then
+        # loop", or a loop point in trailing silence — otherwise fell off the
+        # right edge: total_ticks stopped at the last note, so the ruler/cursor
+        # couldn't reach the loop tick AND a saved loop end rendered off-screen,
+        # which looks exactly like "my loop didn't save". The save itself is
+        # fine; this is purely the visible extent.
+        if loop_start is not None:
+            total_ticks = max(total_ticks, int(loop_start))
+        if loop_end is not None:
+            total_ticks = max(total_ticks, int(loop_end))
+
         if total_ticks <= 0:
             total_ticks = 960
+
+        # One measure of trailing room so a loop point can be PLACED just past
+        # the content (the ruler/cursor is bounded by total_ticks). Display
+        # only — the writer derives length from the notes, never from this.
+        total_ticks += _TICKS_PER_BEAT * 4
 
         self._canvas.set_notes(notes, total_ticks)
         self._canvas._control_events = control_events  # for sequencer playback

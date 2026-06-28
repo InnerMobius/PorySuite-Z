@@ -451,6 +451,10 @@ class ItemDetailPanel(QWidget):
         super().__init__(parent)
         self._loading = False
         self._dirty = False
+        # Max DISPLAYABLE item-name length = ITEM_NAME_LENGTH - 1 (the buffer's
+        # last byte is the string terminator). Default to vanilla 14-1=13;
+        # set_name_limit() overrides it from the loaded project's source.
+        self._name_limit = 13
         self._sym_to_png: dict[str, str] = {}
         self._icon_to_default_pal: dict[str, str] = {}
         self._current_icon_path: str = ""
@@ -564,18 +568,27 @@ class ItemDetailPanel(QWidget):
         id_card, id_form = _card("Identity")
 
         self.f_name = QLineEdit()
-        self.f_name.setMaxLength(14)   # ITEM_NAME_LENGTH = 14 (include/constants/global.h)
+        # Cap at the max DISPLAYABLE length (ITEM_NAME_LENGTH - 1); the buffer's
+        # last byte is the terminator, so a full-length name overflows the menu.
+        # Hardcoding ITEM_NAME_LENGTH itself (14) was the bug — it let a 14-char
+        # name through. set_name_limit() refines this from the project source.
+        self.f_name.setMaxLength(self._name_limit)
         self.f_name.setPlaceholderText("In-game display name")
-        self._name_counter = QLabel("0/14")
+        self._name_counter = QLabel(f"0/{self._name_limit}")
         self._name_counter.setStyleSheet("color: #888888; font-size: 10px; font-family: 'Courier New';")
-        self._name_counter.setToolTip("Characters used / character limit (ITEM_NAME_LENGTH = 14)")
+        self._name_counter.setToolTip("Characters used / max name length (ITEM_NAME_LENGTH - 1)")
         def _update_name_counter(text):
             used = len(text)
-            self._name_counter.setText("{0}/14".format(used))
+            cap = self._name_limit
+            self._name_counter.setText(f"{used}/{cap}")
+            # At the limit, the field blocks further input — flag it amber so the
+            # user knows why, not as an error (a name of exactly cap is valid).
+            at_limit = used >= cap
             self._name_counter.setStyleSheet(
-                "color: #cc3333; font-size: 10px; font-family: 'Courier New';" if used >= 14
+                "color: #ffb74d; font-size: 10px; font-family: 'Courier New';" if at_limit
                 else "color: #888888; font-size: 10px; font-family: 'Courier New';"
             )
+        self._update_name_counter = _update_name_counter
         self.f_name.textChanged.connect(_update_name_counter)
         name_row = QHBoxLayout()
         name_row.setContentsMargins(0, 0, 0, 0)
@@ -667,9 +680,19 @@ class ItemDetailPanel(QWidget):
         # ── Properties card ────────────────────────────────────────────────────
         prop_card, prop_form = _card("Properties")
 
+        # Editable: the engine's item "type" field is overloaded — most items
+        # use an ITEM_TYPE_* constant, but Poké Balls store a numeric ball id
+        # in the same field. set_enum_choices() fills the ITEM_TYPE_* names
+        # (parsed from the project source) as suggestions; any value (name or
+        # number) is accepted and preserved verbatim.
         self.f_type = QComboBox()
-        for display, val in ITEM_TYPE_CHOICES:
-            self.f_type.addItem(display, val)
+        self.f_type.setEditable(True)
+        self.f_type.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.f_type.setToolTip(
+            "Item-type value. Most items use an ITEM_TYPE_* constant (from the "
+            "project's source); Poké Balls store a numeric ball id here, so a "
+            "raw number is also accepted."
+        )
         prop_form.addRow(_lbl("Item Type"), self.f_type)
 
         self.f_importance = QCheckBox("Important item  (Key Item behaviour)")
@@ -692,10 +715,10 @@ class ItemDetailPanel(QWidget):
         self.f_fieldUseFunc.currentTextChanged.connect(self._emit)
         self.f_battleUseFunc.currentTextChanged.connect(self._emit)
         self.f_holdEffect.currentTextChanged.connect(self._emit)
+        self.f_type.currentTextChanged.connect(self._emit)
         for w in (self.f_price, self.f_holdEffectParam, self.f_battleUsage, self.f_secondaryId):
             w.valueChanged.connect(self._emit)
-        for w in (self.f_pocket, self.f_type):
-            w.currentIndexChanged.connect(self._emit)
+        self.f_pocket.currentIndexChanged.connect(self._emit)
         for w in (self.f_importance, self.f_registrability):
             w.checkStateChanged.connect(self._emit)
         self.f_icon_combo.currentIndexChanged.connect(self._on_icon_changed)
@@ -789,6 +812,115 @@ class ItemDetailPanel(QWidget):
         self._icon_lbl.setStyleSheet(_PLACEHOLDER_ICON_SS)
         self._icon_lbl.setText("?")
 
+    @staticmethod
+    def _select_or_add_combo_data(combo: "QComboBox", value) -> None:
+        """Select the combo entry whose userData == *value*.
+
+        If the project uses a custom/unknown enum constant that isn't in our
+        built-in choice list (e.g. a project-added POCKET_EQUIPMENT or
+        ITEM_TYPE_BAG_MENU), append it verbatim and select it — so it
+        round-trips on save instead of being silently coerced to the default
+        (index 0). The data is stored as a string so currentData() returns the
+        original constant unchanged.
+        """
+        sval = str(value)
+        idx = combo.findData(sval)
+        if idx < 0:
+            combo.addItem(sval, sval)
+            idx = combo.count() - 1
+        combo.setCurrentIndex(idx)
+
+    @staticmethod
+    def _coerce_type_value(value):
+        """Normalise the Item Type field back to its source form.
+
+        Built-in numeric types (vanilla items.json stores ``type`` as a small
+        integer) become an int; custom enum constants (``ITEM_TYPE_*`` strings
+        a project may add) are preserved verbatim as strings so they aren't
+        destroyed by an ``int()`` coercion.
+        """
+        if value is None or value == "":
+            return 0
+        s = str(value)
+        if s.lstrip("+-").isdigit():
+            return int(s)
+        return s
+
+    @staticmethod
+    def _keep_if_unrepresentable(base: dict, field: str, widget_value):
+        """Guard for fields backed by a numeric spinbox / bool checkbox.
+
+        Those widgets can only hold a number — but a project may store a string
+        ENUM in such a field (e.g. a fishing rod's ``secondaryId`` is
+        ``"OLD_ROD"``/``"GOOD_ROD"``/``"SUPER_ROD"``). That value loads as 0 and
+        would be saved back as 0, silently destroying it. So if the item's
+        stored value is a non-numeric string the widget can't represent, return
+        it VERBATIM instead of the widget's coerced number — never coerce an
+        unrecognized value to 0. A genuinely numeric field is unaffected (the
+        widget round-trips it), so real edits still save.
+        """
+        orig = base.get(field)
+        if isinstance(orig, str) and not orig.lstrip("+-").isdigit():
+            return orig
+        return widget_value
+
+    def merge_pocket_values(self, pockets) -> None:
+        """Ensure every pocket constant actually used by the project is a
+        selectable option, even one the source headers didn't define (stale or
+        hand-authored), so it's preserved verbatim rather than coerced.
+
+        Item type needs no equivalent — its combo is editable and preserves any
+        value (name or numeric ball id) on its own.
+        """
+        self._loading = True
+        try:
+            for val in pockets:
+                if val is None:
+                    continue
+                if self.f_pocket.findData(str(val)) < 0:
+                    self.f_pocket.addItem(str(val), str(val))
+        finally:
+            self._loading = False
+
+    def set_enum_choices(self, pocket_choices, type_choices) -> None:
+        """Rebuild the Pocket / Item-Type combos from the PROJECT'S OWN parsed
+        constants (``core.item_enums``), not a hardcoded vanilla list — the
+        user's hack is not Kanto. Each arg is ``[(display, stored_value)]``.
+        Falls back to the built-in lists ONLY if a list is empty (a project
+        that defines no such constants), so a dropdown is never empty.
+        """
+        self._loading = True
+        try:
+            self.f_pocket.clear()
+            for display, val in (pocket_choices or POCKET_CHOICES):
+                self.f_pocket.addItem(display, val)
+            # f_type is an editable combo (overloaded engine field): add the
+            # parsed ITEM_TYPE_* names as suggestions; load_item shows whatever
+            # each item actually stores (name OR numeric ball id) and collect
+            # preserves it. Fall back to the built-in numeric values.
+            self.f_type.clear()
+            type_values = [v for _d, v in type_choices] if type_choices \
+                else [v for _d, v in ITEM_TYPE_CHOICES]
+            for val in type_values:
+                self.f_type.addItem(str(val))
+        finally:
+            self._loading = False
+
+    def set_name_limit(self, max_chars: int) -> None:
+        """Cap the item-name field at *max_chars* (the project's
+        ITEM_NAME_LENGTH - 1, i.e. the max DISPLAYABLE name length). Blocks
+        typing past it and refreshes the counter. Called from the tab's load so
+        the cap follows the loaded project, not a hardcoded value."""
+        try:
+            cap = int(max_chars)
+        except (TypeError, ValueError):
+            return
+        if cap < 1:
+            return
+        self._name_limit = cap
+        self.f_name.setMaxLength(cap)
+        self._update_name_counter(self.f_name.text())
+
     def load_item(self, const: str, data: dict, icon_path: str | None = None,
                   icon_sym: str | None = None):
         self._loading = True
@@ -816,11 +948,11 @@ class ItemDetailPanel(QWidget):
             except (TypeError, ValueError):
                 self.f_price.setValue(0)
 
-            pocket_val = str(data.get("pocket", "POCKET_ITEMS"))
-            pocket_idx = next(
-                (i for i, (_, v) in enumerate(POCKET_CHOICES) if v == pocket_val), 0
+            # Custom/unknown pockets are added verbatim by the helper so the
+            # value survives a save instead of snapping to index 0.
+            self._select_or_add_combo_data(
+                self.f_pocket, data.get("pocket", "POCKET_ITEMS")
             )
-            self.f_pocket.setCurrentIndex(pocket_idx)
 
             desc = data.get("description_english") or data.get("description") or ""
             # stored with literal \n; convert to real newlines for the editor
@@ -857,11 +989,14 @@ class ItemDetailPanel(QWidget):
             except (TypeError, ValueError):
                 self.f_battleUsage.setValue(0)
 
-            type_val = str(data.get("type", "0"))
-            type_idx = next(
-                (i for i, (_, v) in enumerate(ITEM_TYPE_CHOICES) if v == type_val), 0
-            )
-            self.f_type.setCurrentIndex(type_idx)
+            # Item type is an editable combo: show whatever the item stores —
+            # an ITEM_TYPE_* name or a numeric ball id — preserved verbatim.
+            type_val = str(data.get("type", 0))
+            ti = self.f_type.findText(type_val)
+            if ti >= 0:
+                self.f_type.setCurrentIndex(ti)
+            else:
+                self.f_type.setCurrentText(type_val)
 
             self.f_importance.setChecked(bool(data.get("importance", 0)))
             self.f_registrability.setChecked(bool(data.get("registrability", 0)))
@@ -888,21 +1023,26 @@ class ItemDetailPanel(QWidget):
         return pal_map.get(icon_sym, "gItemIconPalette_QuestionMark")
 
     def collect(self, base: dict) -> dict:
+        # Starts from the loaded item dict, so any field the editor doesn't
+        # touch at all is preserved as-is. Each numeric/bool field below is run
+        # through _keep_if_unrepresentable so a string-enum value the spinbox /
+        # checkbox can't hold (e.g. a rod's secondaryId) is never coerced to 0.
+        keep = self._keep_if_unrepresentable
         d = dict(base)
         d["english"] = self.f_name.text()
-        d["price"] = self.f_price.value()
+        d["price"] = keep(base, "price", self.f_price.value())
         d["pocket"] = self.f_pocket.currentData()
         # convert real newlines back to the GBA literal \n separator
         d["description_english"] = self.f_description.toPlainText().replace("\n", "\\n")
         d["holdEffect"] = self.f_holdEffect.currentText()
-        d["holdEffectParam"] = self.f_holdEffectParam.value()
+        d["holdEffectParam"] = keep(base, "holdEffectParam", self.f_holdEffectParam.value())
         d["fieldUseFunc"] = self.f_fieldUseFunc.currentText() or "NULL"
-        d["battleUsage"] = self.f_battleUsage.value()
+        d["battleUsage"] = keep(base, "battleUsage", self.f_battleUsage.value())
         d["battleUseFunc"] = self.f_battleUseFunc.currentText() or "NULL"
-        d["type"] = int(self.f_type.currentData() or "0")
-        d["importance"] = int(self.f_importance.isChecked())
-        d["registrability"] = int(self.f_registrability.isChecked())
-        d["secondaryId"] = self.f_secondaryId.value()
+        d["type"] = self._coerce_type_value(self.f_type.currentText())
+        d["importance"] = keep(base, "importance", int(self.f_importance.isChecked()))
+        d["registrability"] = keep(base, "registrability", int(self.f_registrability.isChecked()))
+        d["secondaryId"] = keep(base, "secondaryId", self.f_secondaryId.value())
         return d
 
     def clear(self):
@@ -1140,6 +1280,36 @@ class ItemsTabWidget(QWidget):
             for const, entry in items.items():
                 self._items[const] = dict(entry)
                 self._order.append(const)
+
+        # Build the Pocket / Item-Type dropdowns from the PROJECT'S OWN source
+        # constants (parsed from include/**/*.h) — never a hardcoded vanilla
+        # list, since the user's hack is not Kanto and may rename/add pockets
+        # or reorder the item-type enum.
+        from core.item_enums import (
+            parse_pockets, parse_item_types, parse_item_name_length,
+        )
+        src_pockets = parse_pockets(project_path) if project_path else []
+        src_types = parse_item_types(project_path) if project_path else []
+        pocket_choices = [(n, n) for n, _v in src_pockets]
+        type_choices = [(n, n) for n, _i in src_types]
+        self._detail.set_enum_choices(pocket_choices, type_choices)
+
+        # Cap item names at the project's max DISPLAYABLE length
+        # (ITEM_NAME_LENGTH - 1) — a full-length name has no room for the string
+        # terminator and overflows the in-game menu.
+        if project_path:
+            self._detail.set_name_limit(parse_item_name_length(project_path) - 1)
+
+        # Pocket safety net: surface any pocket the DATA uses that the source
+        # headers didn't define (stale or hand-authored), preserved verbatim so
+        # a save never coerces an unknown constant to the default. (Item type
+        # needs no equivalent — its combo is editable and preserves any value.)
+        used_pockets = []
+        for entry in self._items.values():
+            p = entry.get("pocket")
+            if p is not None and p not in used_pockets:
+                used_pockets.append(p)
+        self._detail.merge_pocket_values(used_pockets)
 
         # Resolve icons (simple map for list thumbnails)
         self._icons = _parse_item_icon_map(project_path) if project_path else {}

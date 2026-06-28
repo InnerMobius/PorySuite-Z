@@ -199,6 +199,36 @@ class GitPanel(QDialog):
 
         self._main.addLayout(row)
 
+        # Second line: warns when OTHER local branches hold commits the remote
+        # doesn't have — so you never assume your work is gone just because the
+        # branch you're looking at doesn't show it.
+        self._status_other_lbl = QLabel("")
+        self._status_other_lbl.setWordWrap(True)
+        self._status_other_lbl.hide()
+        self._main.addWidget(self._status_other_lbl)
+
+    def _unpushed_on_other_branches(self, current: str) -> list:
+        """Local branches (other than `current`) that have commits not on the
+        remote.  Uses local refs only — fast, no network."""
+        _, out = self._mw._git_run(
+            "for-each-ref", "--format=%(refname:short)", "refs/heads", timeout=8)
+        results = []
+        for b in (out or "").splitlines():
+            b = b.strip()
+            if not b or b == current:
+                continue
+            has_remote, _ = self._mw._git_run(
+                "rev-parse", "--verify", "--quiet", f"origin/{b}", timeout=5)
+            if has_remote:
+                ok_n, n_out = self._mw._git_run(
+                    "rev-list", "--count", f"origin/{b}..{b}", timeout=5)
+                n = int(n_out.strip()) if (ok_n and n_out.strip().isdigit()) else 0
+                if n > 0:
+                    results.append(f"{b} (↑{n})")
+            else:
+                results.append(f"{b} (local-only)")
+        return results
+
     def _refresh_status(self):
         _, branch = self._mw._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=5)
         branch = (branch or "").strip()
@@ -238,6 +268,22 @@ class GitPanel(QDialog):
                 except ValueError:
                     pass
 
+        # Flag unpushed work on OTHER branches (the "my work vanished" trap).
+        others = self._unpushed_on_other_branches(branch)
+        if others:
+            shown = others[:4]
+            more = f"  +{len(others) - 4} more" if len(others) > 4 else ""
+            self._status_other_lbl.setText(
+                "⚠ Unpushed work on other branches: " + ", ".join(shown) + more
+                + "   — switch to one to push it; it is NOT lost.")
+            self._status_other_lbl.setStyleSheet(
+                "color: #e8a44a; font-size: 11px; background: #3a2a10; "
+                "padding: 5px; border-radius: 3px;")
+            self._status_other_lbl.show()
+        else:
+            self._status_other_lbl.setText("")
+            self._status_other_lbl.hide()
+
     # ══════════════════════════════════════════════════════════════════════════
     # Section 2 — Pull
     # ══════════════════════════════════════════════════════════════════════════
@@ -251,8 +297,9 @@ class GitPanel(QDialog):
         lay.addWidget(_desc(
             "Pull downloads code from the internet and replaces your local files "
             "with it — like syncing from the cloud.  "
-            "Anything you haven't committed will be lost, so commit or stash first "
-            "if you want to keep your work.  Choose where to pull from:"
+            "Your uncommitted work is automatically saved to a stash first "
+            "(restore it below under Stash), so a pull won't lose it.  "
+            "Choose where to pull from:"
         ))
 
         # Radio: upstream vs origin
@@ -293,7 +340,9 @@ class GitPanel(QDialog):
         pull_btn = QPushButton("⬇  Pull Now")
         pull_btn.setFixedWidth(130)
         pull_btn.setToolTip(
-            "Runs  git fetch <remote>  then  git reset --hard  to the fetched HEAD.\n"
+            "Saves your uncommitted work to a stash, then runs  git fetch <remote>\n"
+            "and  git reset --hard  to the fetched HEAD.  Your pre-pull work stays\n"
+            "in the stash (restore it under Stash below).\n"
             "Stale auto-generated files (.h headers from JSON) are deleted\n"
             "afterward so make rebuilds them cleanly."
         )

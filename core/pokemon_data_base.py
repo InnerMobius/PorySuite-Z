@@ -162,6 +162,15 @@ class AbstractPokemonData(ABC):
         self.data = None
         self.original_data = None
         self.pending_changes = False
+        # On-disk JSON formatting, captured at load so a save round-trips
+        # byte-for-byte instead of reflowing the file. Defaults match the
+        # pokefirered convention (2-space indent, trailing newline). The
+        # ensure_ascii default is True so an as-yet-uninspected file keeps the
+        # upstream \uXXXX-escaped style; load detection overrides it to match
+        # whatever the actual file uses.
+        self._json_indent = 2
+        self._json_trailing_nl = True
+        self._json_ensure_ascii = True
         if "source_prefix" not in self.project_info:
             prefix = getattr(parent, "SOURCE_PREFIX", self.SOURCE_PREFIX)
             self.project_info["source_prefix"] = prefix
@@ -177,6 +186,23 @@ class AbstractPokemonData(ABC):
             return {"national_dex": [], "regional_dex": []}
         return {}
 
+    @staticmethod
+    def _detect_json_indent(raw: str):
+        """Return the indent unit used by an existing JSON file.
+
+        Looks at the first indented, non-empty line (one nesting level deep in
+        a pretty-printed file) and reports either the number of leading spaces
+        or a literal tab. Used so a save preserves the file's original indent
+        instead of forcing a fixed width. Defaults to 2 (pokefirered style).
+        """
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            lead = line[: len(line) - len(line.lstrip())]
+            if lead:
+                return "\t" if "\t" in lead else len(lead)
+        return 2
+
     def __load_data(self) -> bool:
         """Load JSON data if available and fall back to defaults."""
 
@@ -189,8 +215,17 @@ class AbstractPokemonData(ABC):
         if json_path and os.path.isfile(json_path):
             try:
                 with open(json_path, encoding="utf-8") as f:
-                    self.data = json.load(f)
-                    self.original_data = json.loads(json.dumps(self.data))
+                    raw = f.read()
+                self.data = json.loads(raw)
+                self.original_data = json.loads(json.dumps(self.data))
+                # Capture the on-disk formatting so save() round-trips
+                # byte-for-byte (indent width + trailing newline + whether the
+                # file uses literal UTF-8 or \uXXXX escapes). A file containing
+                # any literal non-ASCII char (é, …) was written without escapes,
+                # so we must keep writing it that way to avoid churning it.
+                self._json_indent = self._detect_json_indent(raw)
+                self._json_trailing_nl = raw.endswith("\n")
+                self._json_ensure_ascii = raw.isascii()
                 return True
             except (FileNotFoundError, json.decoder.JSONDecodeError):
                 pass
@@ -327,8 +362,17 @@ class AbstractPokemonData(ABC):
                 if not self.data:
                     print("Error: refusing to overwrite with empty data")
                     return
-                # Convert the data to a JSON string with indentation
-                json_str = json.dumps(self.data, indent=4)
+                # Serialize preserving the source file's formatting so editing
+                # one field doesn't reflow / re-escape the whole file: keep the
+                # original indent width, trailing newline, and ascii style
+                # (literal UTF-8 vs \uXXXX escapes) detected at load.
+                indent = getattr(self, "_json_indent", 2)
+                ensure_ascii = getattr(self, "_json_ensure_ascii", True)
+                json_str = json.dumps(
+                    self.data, indent=indent, ensure_ascii=ensure_ascii
+                )
+                if getattr(self, "_json_trailing_nl", True):
+                    json_str += "\n"
                 # Write the JSON string to the file
                 with open(file_path, 'w', encoding="utf-8", newline="\n") as json_file:
                     json_file.write(json_str)

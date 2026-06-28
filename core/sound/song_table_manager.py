@@ -351,6 +351,41 @@ def _resolve_voicegroup_index_from_s(project_root: str, entry) -> None:
         pass
 
 
+def _backdate_midi_cfg(cfg_path: str) -> None:
+    """Push midi.cfg's mtime just below the OLDEST generated .s in its folder.
+
+    The build rule is ``%.s: %.mid midi.cfg`` — if midi.cfg is newer than a
+    .s, the next ``make`` re-runs mid2agb on that song and regenerates the .s
+    from its .mid. When the .mid has drifted from the user's .s (e.g. an SE
+    whose instrument was repointed in the .s but whose .mid still encodes the
+    old voice), that REVERTS the edit — the bomb-sound-keeps-dying bug.
+
+    PorySuite treats the .s as the canonical edit (it writes the .s directly),
+    so midi.cfg must never be the newer file. Backdating it below the oldest
+    .s guarantees no .s is ever regenerated *because of a midi.cfg rewrite*,
+    while a genuinely newer .mid (a fresh MIDI import) still rebuilds its own
+    .s. Crucially this touches ONLY midi.cfg — it never disturbs the mtime of
+    individual .s files, so saving one thing can't perturb a sound the user
+    never opened. A fixed "now - 1h" was not enough: any .s built more than an
+    hour ago stayed older than midi.cfg and got needlessly regenerated.
+    """
+    midi_dir = os.path.dirname(cfg_path)
+    try:
+        s_mtimes = [
+            os.stat(os.path.join(midi_dir, fn)).st_mtime
+            for fn in os.listdir(midi_dir) if fn.endswith('.s')
+        ]
+    except OSError:
+        return
+    if not s_mtimes:
+        return
+    target = min(s_mtimes) - 2
+    try:
+        os.utime(cfg_path, (target, target))
+    except OSError:
+        pass
+
+
 def write_midi_cfg(project_root: str, data: SongTableData,
                    removed_midi_files: set[str] | None = None):
     """Write the midi.cfg file, preserving entries not in our data model.
@@ -416,21 +451,16 @@ def write_midi_cfg(project_root: str, data: SongTableData,
     with open(cfg_path, 'w', encoding='utf-8') as f:
         f.writelines(existing_lines)
 
-    # CRITICAL: midi.cfg is a Makefile dependency for EVERY .s file.
-    # Rewriting midi.cfg makes its mtime newer than all .s files, so the
-    # next `make` will re-run mid2agb on EVERY song.  For songs with
-    # placeholder .mid files (e.g. .s-imported or piano-roll-edited songs),
-    # mid2agb produces empty/garbage output that wipes the real music.
-    #
-    # Fix: touch every .s file so they're all newer than midi.cfg.
-    midi_dir = os.path.dirname(cfg_path)
-    for fn in os.listdir(midi_dir):
-        if fn.endswith('.s'):
-            s_path = os.path.join(midi_dir, fn)
-            try:
-                os.utime(s_path)
-            except OSError:
-                pass
+    # midi.cfg is a Makefile prerequisite of EVERY generated .s
+    # (rule: %.s: %.mid midi.cfg). Rewriting it bumps its mtime to NOW, which
+    # would make the next `make` re-run mid2agb on every song and regenerate
+    # each .s from its .mid — silently reverting any .s edit whose .mid drifted
+    # (and producing garbage for .s-authored / piano-roll songs). Backdate
+    # midi.cfg below the oldest .s so it can never be the newer file. This
+    # replaces the old "os.utime every .s" workaround, which touched the mtime
+    # of sound files the user never opened (the reported "PorySuite keeps
+    # touching my sounds" surprise) and was fragile besides.
+    _backdate_midi_cfg(cfg_path)
 
 
 def update_midi_cfg_flags(project_root: str, label: str,
@@ -489,12 +519,10 @@ def update_midi_cfg_flags(project_root: str, label: str,
     if changed:
         with open(cfg_path, 'w', encoding='utf-8', newline='\n') as f:
             f.writelines(lines)
-        try:
-            import time as _t
-            past = _t.time() - 3600
-            os.utime(cfg_path, (past, past))
-        except OSError:
-            pass
+        # Backdate below the oldest .s so this rewrite can't trigger a mid2agb
+        # re-run that reverts a freshly-saved .s (see _backdate_midi_cfg). A
+        # fixed "now - 1h" left any .s built earlier than that exposed.
+        _backdate_midi_cfg(cfg_path)
     return changed
 
 

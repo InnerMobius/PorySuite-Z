@@ -39,6 +39,7 @@ sys.modules.setdefault("PyQt6.QtCore", _qtc)
 sys.modules.setdefault("PyQt6.QtGui", _qtg)
 
 from core.pokemon_data import PokemonItems
+from core.pokemon_data_base import AbstractPokemonData
 
 _FILLER = {
     "english": "????????", "itemId": "ITEM_NONE", "price": 0,
@@ -157,6 +158,131 @@ class ItemsRoundTripTest(unittest.TestCase):
         out = self._read()
         self.assertEqual(len(out), 376, "guard must not let a short list reach disk")
         self.assertTrue(os.path.isfile(self.json_path + ".prewrite_backup"))
+
+
+class ItemsFormatPreservationTest(unittest.TestCase):
+    """Pins the items.json save-corruption fix (see BUGS.md):
+
+      * a save MATCHES the file's on-disk ascii style — a literal-UTF-8 file
+        (é) is NOT re-escaped to \\uXXXX on every save, and an escaped upstream
+        file stays escaped (no phantom diff);
+      * indent width + trailing newline are preserved;
+      * editing one field is a one-line diff — every other byte is identical;
+      * a custom enum value (pocket / type) in the data is written verbatim.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "src", "data"), exist_ok=True)
+        self.json_path = os.path.join(self.root, "src", "data", "items.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _obj_from_text(self, text):
+        """Write *text* to disk and build an object whose on-disk format attrs
+        are captured exactly as pokemon_data_base.__load_data would."""
+        with open(self.json_path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        obj = PokemonItems.__new__(PokemonItems)
+        obj.project_info = {"dir": self.root}
+        obj.DATA_FILE = "items.json"
+        obj.local_util = _LU(self.root)
+        obj._items_full_order = None
+        obj.pending_changes = False
+        obj._synchronise_header_target = lambda: None
+        obj.data = json.loads(text)
+        obj.original_data = json.loads(json.dumps(obj.data))
+        obj._json_indent = AbstractPokemonData._detect_json_indent(text)
+        obj._json_trailing_nl = text.endswith("\n")
+        obj._json_ensure_ascii = text.isascii()
+        obj._ensure_map()
+        obj.original_data = json.loads(json.dumps(obj.data))
+        return obj
+
+    def _read_text(self):
+        with open(self.json_path, encoding="utf-8") as f:
+            return f.read()
+
+    def _items_text(self, items):
+        return json.dumps({"items": items}, indent=2, ensure_ascii=False) + "\n"
+
+    def test_no_edit_save_is_byte_identical_literal_utf8(self):
+        items = [dict(_FILLER, itemId="ITEM_NONE"),
+                 {"english": "POKé BALL", "itemId": "ITEM_POKE_BALL", "price": 200,
+                  "description_english": "A device for\\ncatching créatures.",
+                  "pocket": "POCKET_EQUIPMENT", "type": "ITEM_TYPE_BAG_MENU"}]
+        text = self._items_text(items)
+        self.assertFalse(text.isascii(), "fixture must contain literal é")
+        obj = self._obj_from_text(text)
+        obj.save()
+        out = self._read_text()
+        self.assertEqual(out, text, "no-edit save must be byte-identical")
+        self.assertIn("é", out)
+        self.assertNotIn("\\u00e9", out)
+
+    def test_escaped_file_stays_escaped(self):
+        items = [dict(_FILLER, itemId="ITEM_NONE"),
+                 {"english": "POKé BALL", "itemId": "ITEM_POKE_BALL", "price": 200,
+                  "pocket": "POCKET_ITEMS", "type": "ITEM_TYPE_BAG_MENU"}]
+        # upstream-style: escaped, ascii-only on disk
+        text = json.dumps({"items": items}, indent=2, ensure_ascii=True) + "\n"
+        self.assertTrue(text.isascii())
+        obj = self._obj_from_text(text)
+        obj.save()
+        out = self._read_text()
+        self.assertEqual(out, text, "escaped file must round-trip escaped (no phantom diff)")
+        self.assertIn("\\u00e9", out)
+
+    def test_single_field_edit_is_one_line_diff(self):
+        items = [dict(_FILLER, itemId="ITEM_NONE")]
+        for i in range(20):
+            items.append({"english": f"ITEM {i}", "itemId": f"ITEM_T_{i:02d}",
+                          "price": i, "pocket": "POCKET_EQUIPMENT",
+                          "type": "ITEM_TYPE_BAG_MENU", "description_english": "désc"})
+        text = self._items_text(items)
+        obj = self._obj_from_text(text)
+        obj.data["ITEM_T_07"]["price"] = 9999
+        obj.save()
+        out = self._read_text()
+        diff = [i for i, (a, b) in enumerate(zip(text.splitlines(), out.splitlines())) if a != b]
+        self.assertEqual(len(diff), 1, f"one-field edit must change one line, got {diff}")
+        self.assertIn("9999", out.splitlines()[diff[0]])
+
+    def test_custom_enum_written_verbatim(self):
+        items = [dict(_FILLER, itemId="ITEM_NONE"),
+                 {"english": "BOMB", "itemId": "ITEM_SOOT_SACK", "price": 50,
+                  "pocket": "POCKET_EQUIPMENT", "type": "ITEM_TYPE_BAG_MENU"}]
+        obj = self._obj_from_text(self._items_text(items))
+        obj.data["ITEM_SOOT_SACK"]["price"] = 75   # touch the item, force a write
+        obj.save()
+        out = json.loads(self._read_text())["items"]
+        bomb = next(e for e in out if e["itemId"] == "ITEM_SOOT_SACK")
+        self.assertEqual(bomb["pocket"], "POCKET_EQUIPMENT")
+        self.assertEqual(bomb["type"], "ITEM_TYPE_BAG_MENU")
+
+    def test_extractor_write_json_matches_existing_ascii_style(self):
+        from core.pokemon_data_extractor import _write_json
+        data = [{"english": "POKé BALL", "itemId": "ITEM_POKE_BALL"}]
+        # brand-new file -> upstream-escaped default
+        _write_json(self.json_path, data)
+        new_text = self._read_text()
+        self.assertNotIn("é", new_text)
+        self.assertIn("\\u00e9", new_text)
+        # existing literal-UTF-8 file -> re-extraction keeps the literals
+        with open(self.json_path, "w", encoding="utf-8", newline="") as f:
+            f.write('[\n  {\n    "english": "POKé BALL",\n    "itemId": "ITEM_POKE_BALL"\n  }\n]\n')
+        _write_json(self.json_path, data)
+        lit_text = self._read_text()
+        self.assertIn("é", lit_text)
+        self.assertNotIn("\\u00e9", lit_text)
+
+    def test_detect_json_indent(self):
+        self.assertEqual(AbstractPokemonData._detect_json_indent('{\n  "a": 1\n}\n'), 2)
+        self.assertEqual(AbstractPokemonData._detect_json_indent('{\n    "a": 1\n}\n'), 4)
+        self.assertEqual(AbstractPokemonData._detect_json_indent('{\n\t"a": 1\n}\n'), "\t")
+        self.assertEqual(AbstractPokemonData._detect_json_indent("{}"), 2)  # fallback
 
 
 if __name__ == "__main__":

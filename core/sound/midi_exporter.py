@@ -136,14 +136,22 @@ def song_to_midi(song: SongData) -> mido.MidiFile:
     mid.tracks.append(conductor)
 
     # ---- one MidiTrack per SongData track ----------------------------------
+    # The song's master volume is needed to un-scale VOL back to a raw cc7 (see
+    # _build_midi_track) so mid2agb's re-scaling on rebuild round-trips exactly.
+    master = getattr(song, 'master_volume', None)
     for ti, track in enumerate(song.tracks):
-        mid.tracks.append(_build_midi_track(track, ti))
+        mid.tracks.append(_build_midi_track(track, ti, master))
 
     return mid
 
 
-def _build_midi_track(track: Track, track_index: int) -> mido.MidiTrack:
-    """Convert one Track to a mido.MidiTrack of note + control events."""
+def _build_midi_track(track: Track, track_index: int,
+                      master_volume: int | None = None) -> mido.MidiTrack:
+    """Convert one Track to a mido.MidiTrack of note + control events.
+
+    *master_volume* is the song's mvl: VOL levels are un-scaled by it on the
+    way out (see the VOL branch) so a build's mid2agb re-scale round-trips.
+    """
     mt = mido.MidiTrack()
 
     # Channel resolution: prefer the track's parsed midi_channel, else fall
@@ -220,8 +228,18 @@ def _build_midi_track(track: Track, track_index: int) -> mido.MidiTrack:
 
         elif kind == 'VOL':
             # VOL=0 is silence (valid).  Use None check, not `or`.
-            v = 100 if cmd.value is None else int(cmd.value)
-            val = max(0, min(127, v))
+            eff = 100 if cmd.value is None else int(cmd.value)
+            # The parser stores the EFFECTIVE level it read from the .s
+            # expression "<mult>*mvl/mxv" (already master-scaled). mid2agb
+            # re-applies the master (-V) when it regenerates the .s on build,
+            # so we must store the RAW multiplier here (eff*mxv/mvl, mxv=127)
+            # — otherwise the master is applied twice and every save quietens
+            # the track. With no/full master, eff already IS the raw value.
+            if master_volume and 0 < int(master_volume) < 127:
+                raw = round(eff * 127 / int(master_volume))
+            else:
+                raw = eff
+            val = max(0, min(127, raw))
             events.append((tick, -1, mido.Message(
                 'control_change', channel=channel,
                 control=7, value=val, time=0)))

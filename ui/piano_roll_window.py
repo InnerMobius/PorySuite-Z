@@ -22,6 +22,11 @@ from ui.piano_roll_tracks import TrackSidebar, extract_track_infos, get_instrume
 from ui.piano_roll_structure import SongStructurePanel
 from ui.custom_widgets.scroll_guard import install_scroll_guard
 
+import logging
+
+# Propagates to the Sound Editor's file handler (porysuite/sound_editor.log).
+_log = logging.getLogger("SoundEditor.PianoRoll")
+
 
 class PianoRollWindow(QMainWindow):
     """Standalone Piano Roll editor window.
@@ -794,37 +799,68 @@ class PianoRollWindow(QMainWindow):
         self._mark_dirty()
 
     def _on_track_volume(self, track_index: int, volume: int):
-        """User changed a track's volume slider."""
+        """User changed a track's volume slider.
+
+        SCALE the track's whole VOL envelope by the slider's change so any
+        fade / volume-automation SHAPE is preserved.
+
+        The earlier code set EVERY VOL event to the same value, which flattened
+        a decaying SFX into a constant level (the "no decay / ^v^v^v" bug); an
+        even-earlier version bumped only the first, letting the track ramp back
+        down. Scaling about the track's starting (first) VOL — the level the
+        slider represents — does neither: the entire curve, including mid-song
+        fade steps, moves together, exactly like raising the master volume.
+
+        The save reconstructs a track's mid-song controls from a snapshot taken
+        at piano-roll-open AND/OR the canvas control-event list, NOT from the
+        live song object, so the same factor is applied to all three — otherwise
+        the saved fade would disagree with the slider. raw_line is cleared on
+        the scaled commands so the writer regenerates them from the new value
+        (it correctly re-derives the `n*mvl/mxv` multiplier; verified no
+        double-scaling).
+        """
         if self._sequencer is not None:
             self._sequencer.set_track_volume(track_index, volume)
-        # Also persist in song data so save captures it.
-        #
-        # ── Bump EVERY VOL event, not just the first ──────────────────
-        # mid2agb often emits multiple VOL events throughout a track
-        # (automation/fades). If we only bumped the first one, the track
-        # would ramp back down to the imported low value a few ticks in,
-        # leaving the SFX quieter than the user expected. Bump them all
-        # to match the slider so the whole track plays at the requested
-        # level. (If the user wants a fade, they can set per-note
-        # velocity or edit individual VOL events via Note Properties.)
-        if 0 <= track_index < len(self._song.tracks):
-            track = self._song.tracks[track_index]
-            found_any = False
-            for cmd in track.commands:
-                if cmd.cmd == 'VOL':
-                    cmd.value = volume
-                    found_any = True
-            if not found_any:
-                # Track had no VOL event at all — insert one at tick 0
+        if not (0 <= track_index < len(self._song.tracks)):
+            return
+        track = self._song.tracks[track_index]
+        live_vols = [c for c in track.commands
+                     if c.cmd == 'VOL' and c.value is not None]
+        ref = live_vols[0].value if live_vols else None
+        if not ref or ref <= 0:
+            # No usable reference envelope — set/insert a single tick-0 VOL.
+            if live_vols:
+                live_vols[0].value = volume
+                live_vols[0].raw_line = ''
+            else:
                 from core.sound.song_parser import TrackCommand
                 track.commands.insert(0, TrackCommand(
                     cmd='VOL', tick=0, value=volume, raw_line=''))
-            # The slider is clamped to the song's master volume (the M4A
-            # ceiling), so `volume` is always <= master and round-trips
-            # losslessly — no master hoist needed here. To lift the ceiling the
-            # user raises the master volume directly (header editor) or uses Max
-            # Volume, which re-expands every track slider.
             self._mark_dirty()
+            return
+
+        factor = volume / ref
+
+        def _scale_cmds(cmds):
+            for c in cmds:
+                if c.cmd == 'VOL' and c.value is not None:
+                    c.value = max(0, min(127, round(c.value * factor)))
+                    c.raw_line = ''   # regenerate from the scaled value
+
+        # 1) Live song — drives the preview and the saved tick-0 VOL.
+        _scale_cmds(track.commands)
+        # 2) Open-time snapshot the save rebuilds mid-song controls from.
+        _scale_cmds(self._original_track_commands.get(track_index, []))
+        # 3) Canvas control-event list — the other mid-song VOL source on save
+        #    (plain dicts, no raw_line to clear).
+        try:
+            for e in self._piano_roll.canvas._control_events:
+                if (e.get('track') == track_index and e.get('type') == 'VOL'
+                        and e.get('value') is not None):
+                    e['value'] = max(0, min(127, round(e['value'] * factor)))
+        except AttributeError:
+            pass
+        self._mark_dirty()
 
     def _on_track_pan(self, track_index: int, pan: int):
         """User changed a track's pan slider."""
@@ -995,6 +1031,27 @@ class PianoRollWindow(QMainWindow):
 
         from core.sound.song_writer import save_song_file
         path = save_song_file(self._song)
+
+        # save_song_file rewrites the .mid from the edited notes/levels. For a
+        # MIDI-sourced song the .s is a build artifact, so regenerate it from
+        # that .mid with the project's own mid2agb — the reference encoder the
+        # build uses — overwriting PorySuite's .s writer output. PorySuite's
+        # writer can mis-encode chord notes (dropping an explicit length mid2agb
+        # keeps), which assembles but plays broken; this guarantees a piano-roll
+        # edit (notes, per-track volume) renders exactly as the build would.
+        try:
+            from core.sound.song_compiler import recompile_song, find_mid2agb
+            if self._project_root and find_mid2agb(self._project_root):
+                ok, err = recompile_song(self._project_root, self._song.label)
+                if ok:
+                    _log.info("Piano-roll save: regenerated %s.s via mid2agb",
+                              self._song.label)
+                else:
+                    _log.warning("mid2agb recompile failed for %s: %s "
+                                 "(keeping PorySuite .s)", self._song.label, err)
+        except Exception as e:  # never let this block a successful save
+            _log.warning("mid2agb recompile skipped for %s: %s",
+                         self._song.label, e)
 
         self._is_dirty = False
         self.saved.emit()

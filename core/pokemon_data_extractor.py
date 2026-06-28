@@ -92,11 +92,13 @@ def _write_json(path: str, data: dict | list, min_entries: int = 1) -> bool:
     logged and ``False`` is returned so callers can abort loading when
     parsing produced no results.
 
-    Format matches upstream's ``src/data/*.json`` exactly:
+    Format matches upstream's ``src/data/*.json``:
       - ``indent=2`` (every upstream JSON uses 2-space indent).
-      - ``ensure_ascii=True`` (upstream ships ASCII-escaped unicode, e.g.
-        ``"POK\\u00e9 BALL"``).  Writing literal UTF-8 would produce a
-        phantom diff against every upstream checkout.
+      - ascii style MATCHES the existing file: a brand-new file defaults to
+        escaped unicode (upstream ships ASCII-escaped, e.g. ``"POKé BALL"`` as
+        a ``\\u`` escape — so a fresh extraction has no phantom diff vs an
+        upstream checkout), but a project file that already stores literal
+        UTF-8 keeps its literals so re-extraction never re-escapes / churns it.
     """
 
     if not data or len(data) < min_entries:
@@ -106,9 +108,18 @@ def _write_json(path: str, data: dict | list, min_entries: int = 1) -> bool:
         return False
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Default to upstream's escaped style; if the file already exists and holds
+    # literal UTF-8, preserve that so we don't churn a project that diverged.
+    ensure_ascii = True
+    try:
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as _f:
+                ensure_ascii = _f.read().isascii()
+    except OSError:
+        pass
     # Render to string first, then byte-equality-guard the write so a
     # save that produces identical content doesn't dirty the file in git.
-    text = json.dumps(data, indent=2, ensure_ascii=True)
+    text = json.dumps(data, indent=2, ensure_ascii=ensure_ascii)
     from core.file_io import write_text_if_changed
     if write_text_if_changed(path, text):
         print(f"Wrote {os.path.abspath(path)}")
