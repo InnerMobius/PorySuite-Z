@@ -30,7 +30,7 @@ def _dbg(msg: str):
     import time
     ts = time.strftime("%H:%M:%S")
     try:
-        with open(_DEBUG_LOG, "a") as f:
+        with open(_DEBUG_LOG, "a", newline='\n') as f:
             f.write(f"[{ts}] SEQ: {msg}\n")
     except Exception:
         pass

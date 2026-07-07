@@ -27,7 +27,7 @@ def replace_in_file(path: str, replacements: List[Tuple[str, str]]):
     for old, new in replacements:
         text = text.replace(old, new)
     if text != original:
-        with open(path, 'w', encoding='utf-8') as f:
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
             f.write(text)
 
 

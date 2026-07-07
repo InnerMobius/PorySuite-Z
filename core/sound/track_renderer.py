@@ -323,6 +323,59 @@ class TrackState:
 
 
 # ---------------------------------------------------------------------------
+# Mid-note pitch-bend curve
+# ---------------------------------------------------------------------------
+
+def _bend_curve_for_note(flat_cmds, note_idx, note_start, note_dur,
+                         cur_bend, cur_range, total_len, spt):
+    """Per-sample semitone-offset curve for a note whose pitch is bent WHILE
+    held (BEND commands with tick inside the note's span). Returns None when no
+    BEND falls inside the note — the caller then keeps the old fixed-pitch path,
+    so notes without a mid-note bend render byte-identically to before.
+
+    ``cur_bend`` is the signed bend (value-64) active at note start; ``spt`` is
+    samples-per-tick at the note's tempo. The GBA holds each bend value until the
+    next BEND, so the curve is a step function expanded to per-sample offsets.
+    """
+    if spt <= 0 or total_len <= 0:
+        return None
+    end_tick = note_start + note_dur
+    events = []
+    has_bend = False
+    for fc in flat_cmds[note_idx + 1:]:
+        t = getattr(fc, 'tick', None)
+        if t is None:
+            continue
+        if t > end_tick:
+            break
+        if t < note_start:
+            continue
+        if fc.cmd == 'BEND' and fc.value is not None:
+            events.append((t, 'bend', fc.value - 64)); has_bend = True
+        elif fc.cmd == 'BENDR' and fc.value is not None:
+            events.append((t, 'range', fc.value))
+    if not has_bend:
+        return None
+
+    curve = np.empty(total_len, dtype=np.float32)
+    b = float(cur_bend)
+    r = max(1, int(cur_range))
+    cursor = 0
+    events.sort(key=lambda e: e[0])
+    for t, kind, val in events:
+        off = int(round((t - note_start) * spt))
+        off = max(cursor, min(off, total_len))
+        curve[cursor:off] = (b / 64.0) * r
+        cursor = off
+        if kind == 'bend':
+            b = float(val)
+        else:
+            r = max(1, int(val))
+    curve[cursor:] = (b / 64.0) * r
+    return curve
+
+
+# ---------------------------------------------------------------------------
 # Single track renderer
 # ---------------------------------------------------------------------------
 
@@ -363,7 +416,7 @@ def render_track(
     import os, time as _t2
     _dbg2 = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'sound_debug.log')
     def _tlog(msg):
-        with open(_dbg2, 'a', encoding='utf-8') as _f:
+        with open(_dbg2, 'a', encoding='utf-8', newline='\n') as _f:
             _f.write(f"[{_t2.strftime('%H:%M:%S')}]   track: {msg}\n")
 
     # Flatten the command list (expand PATT/PEND and GOTO)
@@ -401,7 +454,7 @@ def render_track(
 
     current_tempo = bpm
 
-    for cmd in flat_cmds:
+    for cmd_idx, cmd in enumerate(flat_cmds):
         if cmd.cmd == 'VOICE' and cmd.value is not None:
             state.voice = cmd.value
 
@@ -456,13 +509,11 @@ def render_track(
             else:
                 note_duration = cmd.duration
 
+            # Base pitch (no bend yet). The bend is applied below, AFTER
+            # note_samples is known — as a constant offset for a note with no
+            # mid-note BEND, or as a per-sample glide curve when BEND commands
+            # occur WHILE the note is held (so a held sweep isn't flat).
             midi_note = float(cmd.pitch + state.key_shift)
-
-            if state.bend != 0:
-                # bend is -64 to +63, scale to -1.0 to +1.0 then multiply by range
-                bend_semitones = (state.bend / 64.0) * state.bend_range
-                midi_note += bend_semitones
-            midi_note = max(0.0, min(127.0, midi_note))
 
             velocity = cmd.velocity if cmd.velocity is not None else 100
 
@@ -500,11 +551,25 @@ def render_track(
                 continue
 
             release_samples = min(2048, note_samples)
+
+            # Pitch bend: if BEND commands occur DURING this note, build a
+            # per-sample glide curve (so the held note slides — an Oracle jump's
+            # boing). Otherwise apply the current bend as a constant offset, or
+            # nothing — identical to the previous fixed-pitch behaviour.
+            total_len = note_samples + release_samples
+            spt = note_samples / note_duration if note_duration else 0.0
+            bend_curve = _bend_curve_for_note(
+                flat_cmds, cmd_idx, cmd.tick, note_duration,
+                state.bend, state.bend_range, total_len, spt)
+            if bend_curve is None and state.bend != 0:
+                midi_note += (state.bend / 64.0) * state.bend_range
+            midi_note = max(0.0, min(127.0, midi_note))
+
             try:
                 note_audio = render_instrument(
                     instrument, midi_note, velocity,
                     note_samples, sample_data, voicegroup_data,
-                    release_samples=release_samples,
+                    release_samples=release_samples, bend_curve=bend_curve,
                 )
             except Exception:
                 continue
@@ -560,7 +625,7 @@ def render_song(
     import os, time as _t
     _dbg = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'sound_debug.log')
     def _log(msg):
-        with open(_dbg, 'a', encoding='utf-8') as _f:
+        with open(_dbg, 'a', encoding='utf-8', newline='\n') as _f:
             _f.write(f"[{_t.strftime('%H:%M:%S')}] {msg}\n")
 
     bpm = get_song_tempo(song)

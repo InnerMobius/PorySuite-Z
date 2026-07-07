@@ -42,6 +42,8 @@ extern u8 gHostPalGray[32];           /* per-slot greyscale flag (stub_engine.c)
 extern u8 gHostBldEva;                /* BLDALPHA top-layer coefficient 0..16 */
 extern u8 gHostMonBg[4];              /* per-battler BG-copy layer 0/1/2 (Memento) */
 extern s16 gHostMonBgBaseY[4];        /* base BGnVOFS at copy time (data[10]) */
+extern s8 gHostBgPriority[4];         /* per-anim-BG OAM priority (Protect layering) */
+extern u8 gHostMonIsDoll[4];          /* per-battler substitute-doll-showing flag */
 extern u16 gPlttBufferFaded[];        /* the displayed palette buffer (stub_engine.c) —
     * battle-anim tasks animate the BG palette here directly (rotation, fades, …).
     * The host never populates it, so the driver lets Python load the real BG
@@ -115,6 +117,12 @@ struct Snap {
     int subspriteCount;  /* number of subsprite pieces (SetSubspriteTables — the
                           * frozen ice cube is 4 pieces). >0 → the renderer queries
                           * engine_subsprites(id) and assembles all pieces. */
+    int bgPriority;      /* for a mon copied to a BG (bgCopy != 0): the OAM priority
+                          * of that BG. An effect sprite with priority > this renders
+                          * BEHIND the mon (Protect shield); <= it renders in front
+                          * (Swords Dance blade). -1 = not a BG-copied mon. */
+    int isDoll;          /* 1 → this mon's graphic was swapped to the substitute doll
+                          * (the renderer draws the project's doll PNG over it). */
 };
 static struct Snap sSnap[MAX_SPRITES];
 
@@ -362,8 +370,12 @@ int engine_snapshot(void)
         if (o->isMon >= 0 && o->isMon < 4) {
             o->bgCopy = gHostMonBg[o->isMon];
             o->bgCopyBaseY = gHostMonBgBaseY[o->isMon];
+            /* The OAM priority of the BG this mon was copied to — the threshold an
+             * effect's priority is compared against for behind-vs-front layering. */
+            o->bgPriority = o->bgCopy ? gHostBgPriority[o->bgCopy] : -1;
+            o->isDoll = gHostMonIsDoll[o->isMon];
         } else {
-            o->bgCopy = 0; o->bgCopyBaseY = 0;
+            o->bgCopy = 0; o->bgCopyBaseY = 0; o->bgPriority = -1; o->isDoll = 0;
         }
         /* Additional-mon sprite (Role Play silhouette & friends): the renderer
          * substitutes the reference mon — driven by the engine MARKER, not a

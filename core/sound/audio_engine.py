@@ -101,6 +101,21 @@ def _midi_key_to_freq(wav_freq_raw: int, key: float) -> float:
     return playback_freq / OUTPUT_SAMPLE_RATE
 
 
+def _fit_curve(curve: np.ndarray, n: int) -> np.ndarray:
+    """Coerce a per-sample control curve (e.g. a bend envelope) to length ``n``:
+    clip if longer, hold the last value if shorter. Keeps the renderers safe
+    against off-by-one length mismatches between the curve and total_len."""
+    m = len(curve)
+    if m == n:
+        return curve
+    if m > n:
+        return curve[:n]
+    out = np.empty(n, dtype=curve.dtype)
+    out[:m] = curve
+    out[m:] = curve[-1] if m else 0.0
+    return out
+
+
 # ---------------------------------------------------------------------------
 # GBA ADSR envelope
 # ---------------------------------------------------------------------------
@@ -225,6 +240,7 @@ def render_directsound(
     sustain: int = 15,
     release: int = 0,
     no_resample: bool = False,
+    bend_curve: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Render a DirectSound instrument for a given note.
 
@@ -234,6 +250,10 @@ def render_directsound(
 
     If no_resample is True (voice_directsound_no_resample / 0x08), the sample
     plays at its native rate without any pitch shifting.
+
+    ``bend_curve`` (per-sample added semitones) glides the read rate within the
+    note so a mid-note BEND (held-note sweep) is heard. Ignored for no_resample
+    (that voice is fixed-pitch by design). None = fixed rate.
     """
     if not sample.pcm_data:
         return np.zeros(duration_samples + release_samples, dtype=np.float32)
@@ -262,6 +282,15 @@ def render_directsound(
 
     total_len = duration_samples + release_samples
 
+    # Per-sample source positions. With a bend curve the read rate glides
+    # (cumulative), so the pitch slides within the note; otherwise it's the
+    # flat arange*ratio as before.
+    if bend_curve is not None and not no_resample:
+        rate_curve = total_ratio * (2.0 ** (_fit_curve(bend_curve, total_len) / 12.0))
+        positions_full = np.cumsum(rate_curve)
+    else:
+        positions_full = np.arange(total_len, dtype=np.float64) * total_ratio
+
     # Generate the resampled audio
     if sample.has_loop and sample.header.loop_start > 0:
         # Looping sample: play from start, then loop the sustain portion
@@ -274,8 +303,8 @@ def render_directsound(
             loop_start = 0
             loop_len = len(raw)
 
-        # Generate all source positions at once
-        positions = np.arange(total_len, dtype=np.float64) * total_ratio
+        # Generate all source positions at once (bend-aware; see positions_full)
+        positions = positions_full
         int_pos = positions.astype(np.int64)
         fracs = (positions - int_pos).astype(np.float32)
 
@@ -294,9 +323,8 @@ def render_directsound(
         # Linear interpolation (vectorized)
         output = raw[idx0] * (1.0 - fracs) + raw[idx1] * fracs
     else:
-        # Non-looping sample: one-shot playback
-        # Generate source indices
-        indices = np.arange(total_len, dtype=np.float64) * total_ratio
+        # Non-looping sample: one-shot playback (bend-aware; see positions_full)
+        indices = positions_full
         int_indices = indices.astype(np.int64)
         fracs = (indices - int_indices).astype(np.float32)
 
@@ -344,16 +372,30 @@ def render_square_wave(
     decay: int = 0,
     sustain: int = 15,
     release: int = 0,
+    bend_curve: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Render a square wave tone for a given MIDI note."""
+    """Render a square wave tone for a given MIDI note.
+
+    ``bend_curve`` (per-sample added semitones) makes the pitch GLIDE within the
+    note — needed so a held note with mid-note BEND commands (e.g. an Oracle
+    jump's rising sweep) previews correctly instead of flat. None = fixed pitch.
+    """
     duty = DUTY_CYCLES.get(duty_cycle, 0.5)
     freq = 440.0 * (2.0 ** ((midi_note - 69) / 12.0))
 
     total_len = duration_samples + release_samples
     t = np.arange(total_len, dtype=np.float64) / OUTPUT_SAMPLE_RATE
 
+    if bend_curve is not None:
+        # Per-sample frequency from the bent MIDI key; phase-accumulate so the
+        # tone slides continuously (combines with any voicegroup sweep).
+        mc = _fit_curve(bend_curve, total_len)
+        freqs = 440.0 * (2.0 ** ((midi_note + mc - 69) / 12.0))
+        if sweep != 0:
+            freqs = freqs + (sweep / 128.0 * freq) * t
+        phase = np.cumsum(freqs / OUTPUT_SAMPLE_RATE)
     # Apply sweep if non-zero (frequency slides)
-    if sweep != 0:
+    elif sweep != 0:
         # Sweep changes frequency over time
         sweep_rate = sweep / 128.0 * freq
         freqs = freq + sweep_rate * t
@@ -391,8 +433,12 @@ def render_programmable_wave(
     decay: int = 0,
     sustain: int = 15,
     release: int = 0,
+    bend_curve: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Render a programmable wave instrument (16-byte wavetable)."""
+    """Render a programmable wave instrument (16-byte wavetable).
+
+    ``bend_curve`` (per-sample added semitones) glides the pitch within the note
+    (mid-note BEND). None = fixed pitch."""
     # Get 32 4-bit samples from the waveform
     samples_4bit = wave_sample.samples_4bit if wave_sample.raw_data else [8] * 32
 
@@ -404,8 +450,13 @@ def render_programmable_wave(
     total_len = duration_samples + release_samples
 
     # Generate by stepping through the wavetable at the right speed
-    phase_inc = freq * table_len / OUTPUT_SAMPLE_RATE
-    phase = np.arange(total_len, dtype=np.float64) * phase_inc
+    if bend_curve is not None:
+        mc = _fit_curve(bend_curve, total_len)
+        freqs = 440.0 * (2.0 ** ((midi_note + mc - 69) / 12.0))
+        phase = np.cumsum(freqs * table_len / OUTPUT_SAMPLE_RATE)
+    else:
+        phase_inc = freq * table_len / OUTPUT_SAMPLE_RATE
+        phase = np.arange(total_len, dtype=np.float64) * phase_inc
     indices = (phase % table_len).astype(np.int32)
 
     wave = wavetable[indices]
@@ -496,8 +547,12 @@ def render_instrument(
     voicegroup_data: VoicegroupData,
     release_samples: int = 2048,
     _depth: int = 0,
+    bend_curve: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Render a note using the given instrument definition.
+
+    ``bend_curve`` (per-sample added semitones, or None) glides the note's pitch
+    for mid-note BEND — passed through to the pitched channel renderers.
 
     Handles keysplit routing by recursing into sub-voicegroups.
 
@@ -519,7 +574,7 @@ def render_instrument(
         if render_instrument._log_count <= 20:
             import os, time as _t
             _dbg = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'sound_debug.log')
-            with open(_dbg, 'a', encoding='utf-8') as _f:
+            with open(_dbg, 'a', encoding='utf-8', newline='\n') as _f:
                 _f.write(f"[{_t.strftime('%H:%M:%S')}] render_instrument: note={midi_note} vel={velocity} "
                          f"dur={duration_samples} type={instrument.voice_type} "
                          f"ds={instrument.is_directsound} sq={instrument.is_square} "
@@ -556,7 +611,7 @@ def render_instrument(
             return render_instrument(
                 target_inst, midi_note, velocity, duration_samples,
                 sample_data, voicegroup_data, release_samples,
-                _depth=_depth + 1,
+                _depth=_depth + 1, bend_curve=bend_curve,
             )
         return np.zeros(duration_samples + release_samples, dtype=np.float32)
 
@@ -570,7 +625,7 @@ def render_instrument(
                 duration_samples, release_samples,
                 instrument.attack, instrument.decay,
                 instrument.sustain, instrument.release,
-                no_resample=no_resample,
+                no_resample=no_resample, bend_curve=bend_curve,
             )
         return np.zeros(duration_samples + release_samples, dtype=np.float32)
 
@@ -582,6 +637,7 @@ def render_instrument(
             release_samples,
             instrument.attack, instrument.decay,
             instrument.sustain, instrument.release,
+            bend_curve=bend_curve,
         )
 
     # --- Programmable wave ---
@@ -593,6 +649,7 @@ def render_instrument(
                 release_samples,
                 instrument.attack, instrument.decay,
                 instrument.sustain, instrument.release,
+                bend_curve=bend_curve,
             )
         return np.zeros(duration_samples + release_samples, dtype=np.float32)
 

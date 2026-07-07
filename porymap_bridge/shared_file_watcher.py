@@ -46,6 +46,13 @@ class SharedFileWatcher(QObject):
     # Emitted when src/data/heal_locations.h changes.
     heal_locations_changed = pyqtSignal()
 
+    # Emitted when a sound .s file (sound/songs/midi/<label>.s) changes
+    # externally — e.g. a hand-edit in a text editor. Args: label (str, the
+    # song stem without ".s"). The .s files are gitignored build artifacts, so
+    # an external edit must be captured back into the committed .mid source
+    # (via the song-integrity sweep) or it's lost on the next clean build.
+    sound_s_changed = pyqtSignal(str)
+
     # Generic signal for any shared file change — carries the relative path.
     # This is handy for logging or showing a single "files changed" banner.
     file_changed = pyqtSignal(str)
@@ -134,6 +141,20 @@ class SharedFileWatcher(QObject):
         if os.path.isdir(layouts_dir):
             self._watcher.addPath(layouts_dir)
 
+        # ── Watch the sound .s directory + every .s file ────────────────────
+        # sound/songs/midi/*.s are gitignored build artifacts regenerated from
+        # the committed .mid. An EXTERNAL edit to a .s (a hand-fix in a text
+        # editor) lives only in that gitignored file, so it must be captured
+        # back into the .mid or it's lost on the next clean build. We watch the
+        # dir (to catch new .s files) and each .s (to catch edits).
+        sound_dir = os.path.join(root, "sound", "songs", "midi")
+        if os.path.isdir(sound_dir):
+            self._watcher.addPath(sound_dir)
+            for entry in os.scandir(sound_dir):
+                if entry.is_file() and entry.name.endswith(".s"):
+                    self._watcher.addPath(entry.path)
+                    self._record_mtime(entry.path)
+
     def _record_mtime(self, path: str):
         """Record the current mtime for a file."""
         try:
@@ -182,6 +203,25 @@ class SharedFileWatcher(QObject):
                                 self._watcher.addPath(fpath)
                                 self._record_mtime(fpath)
 
+        # Sound .s directory changed — register any new .s file AND treat a
+        # changed .s as a pending change (some platforms only fire the dir
+        # signal for a rewrite-in-place, not the file signal).
+        sound_dir = os.path.join(self._project_dir, "sound", "songs", "midi")
+        if dir_path == sound_dir and os.path.isdir(sound_dir):
+            for entry in os.scandir(sound_dir):
+                if not (entry.is_file() and entry.name.endswith(".s")):
+                    continue
+                if entry.path not in self._watcher.files():
+                    self._watcher.addPath(entry.path)
+                try:
+                    new_mtime = os.path.getmtime(entry.path)
+                except OSError:
+                    continue
+                if new_mtime != self._mtimes.get(entry.path, 0):
+                    self._mtimes[entry.path] = new_mtime
+                    self._pending_changes.add(entry.path)
+                    self._debounce_timer.start()
+
     def _flush_changes(self):
         """Process all pending file changes after debounce window."""
         if not self._pending_changes:
@@ -225,3 +265,9 @@ class SharedFileWatcher(QObject):
 
             elif rel == "src/data/heal_locations.h":
                 self.heal_locations_changed.emit()
+
+            elif rel.startswith("sound/songs/midi/") and rel.endswith(".s"):
+                # A gitignored build-artifact .s was edited externally — emit the
+                # song label so the main window can capture it back into the .mid.
+                label = os.path.basename(rel)[:-2]   # strip ".s"
+                self.sound_s_changed.emit(label)

@@ -611,7 +611,7 @@ def _write_species_graphics(project_root, sym, slug, image=False, palette=False)
             d[k] = v
             changed = True
     if changed:
-        with open(p, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8", newline='\n') as f:
             json.dump(d, f, indent=2, ensure_ascii=False)
             f.write("\n")
     return add

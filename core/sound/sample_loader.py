@@ -630,7 +630,7 @@ def import_wav_as_sample(
     # Append to direct_sound_data.inc
     inc_path = os.path.join(project_root, 'sound', 'direct_sound_data.inc')
     entry = f"\n\t.align 2\n{label}::\n\t.incbin \"{bin_rel}\"\n"
-    with open(inc_path, 'a', encoding='utf-8') as f:
+    with open(inc_path, 'a', encoding='utf-8', newline='\n') as f:
         f.write(entry)
 
     # Load the new sample back
@@ -885,5 +885,5 @@ def _remove_inc_entry(inc_path: str, label: str) -> None:
         new_lines.append(lines[i])
         i += 1
 
-    with open(inc_path, 'w', encoding='utf-8') as f:
+    with open(inc_path, 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(new_lines)

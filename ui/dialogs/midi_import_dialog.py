@@ -907,16 +907,38 @@ class MidiImportDialog(QDialog):
         gm_vg = generate_gm_voicegroup(self._vg_data)
         self._vg_data.voicegroups[gm_vg.name] = gm_vg
 
+        # Persist to voice_groups.inc RIGHT NOW. The song being imported wires
+        # itself to this voicegroup (-G / _grp), so it must exist on disk before
+        # the build — deferring to "save the project later" is what made imports
+        # fail validation with "voicegroupNNN does not exist".
+        persist_err = None
+        try:
+            # Append-only — preserves every other voicegroup byte-for-byte
+            # (inline comments, custom formatting) instead of rewriting the
+            # whole file.
+            from core.sound.voicegroup_writer import append_voicegroup_to_inc
+            append_voicegroup_to_inc(gm_vg, self._project_root)
+        except Exception as e:
+            persist_err = str(e)
+
         # Add to combo and select it
         self._vg_combo.addItem(gm_vg.name)
         idx = self._vg_combo.findText(gm_vg.name)
         if idx >= 0:
             self._vg_combo.setCurrentIndex(idx)
 
-        QMessageBox.information(
-            self, "GM Voicegroup Created",
-            f"Created {gm_vg.name} with {mapped} real instruments.\n\n"
-            f"It's now selected as the voicegroup for this import.")
+        if persist_err:
+            QMessageBox.warning(
+                self, "GM Voicegroup — not saved",
+                f"Created {gm_vg.name} in memory, but writing voice_groups.inc "
+                f"failed:\n{persist_err}\n\nSave the Voicegroups tab before "
+                f"building, or the song won't find its instruments.")
+        else:
+            QMessageBox.information(
+                self, "GM Voicegroup Created",
+                f"Created and saved {gm_vg.name} with {mapped} real "
+                f"instruments.\n\nIt's now selected as the voicegroup for this "
+                f"import and written to voice_groups.inc.")
 
     def _get_selected_vg_instruments(self) -> list:
         """Get the instrument list for the currently selected voicegroup."""

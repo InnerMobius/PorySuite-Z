@@ -291,7 +291,7 @@ def write_song_table(project_root: str, data: SongTableData,
     lines.append('\n')
     lines.append('dummy_song_header:\n')
     lines.append('\t.byte 0, 0, 0, 0\n')
-    with open(table_path, 'w', encoding='utf-8') as f:
+    with open(table_path, 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(lines)
 
 
@@ -311,7 +311,17 @@ def write_songs_h(project_root: str, data: SongTableData,
     # Find max constant name length for alignment
     max_len = max((len(e.constant) for e in data.entries), default=20)
 
+    # Emit each constant NAME only once. The song table pads reserved/unused
+    # slots with `song mus_dummy` fillers (e.g. at 332 and 346), so MUS_DUMMY
+    # appears several times in data.entries — writing one #define per slot
+    # produced `#define MUS_DUMMY 0 / 332 / 346` and a storm of "redefined"
+    # warnings. Vanilla defines MUS_DUMMY once (at 0) and leaves the filler
+    # slots as gaps in the header; do the same.
+    seen_constants: set[str] = set()
     for entry in data.entries:
+        if entry.constant in seen_constants:
+            continue
+        seen_constants.add(entry.constant)
         padded = entry.constant.ljust(max_len)
         lines.append(f'#define {padded} {entry.index}\n')
 
@@ -320,7 +330,7 @@ def write_songs_h(project_root: str, data: SongTableData,
     lines.append('\n')
     lines.append('#endif  // GUARD_CONSTANTS_SONGS_H\n')
 
-    with open(songs_h_path, 'w', encoding='utf-8') as f:
+    with open(songs_h_path, 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(lines)
 
 
@@ -448,7 +458,7 @@ def write_midi_cfg(project_root: str, data: SongTableData,
         if midi_file not in seen_managed:
             existing_lines.append(_format_cfg_line(entry) + '\n')
 
-    with open(cfg_path, 'w', encoding='utf-8') as f:
+    with open(cfg_path, 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(existing_lines)
 
     # midi.cfg is a Makefile prerequisite of EVERY generated .s
@@ -624,7 +634,7 @@ def rename_song(
 
     # Write the validated .s under the new name, remove the old one.
     if rewritten_content is not None:
-        with open(new_s, 'w', encoding='utf-8') as f:
+        with open(new_s, 'w', encoding='utf-8', newline='\n') as f:
             f.write(rewritten_content)
         if old_s != new_s and os.path.isfile(old_s):
             os.remove(old_s)

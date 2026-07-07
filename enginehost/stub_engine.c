@@ -260,6 +260,22 @@ u16 gHostBldCnt = 0;
  * running in-engine and read out via driver exports. */
 u8  gHostMonBg[4];        /* per-battler: 0 none, 1 BG1, 2 BG2 */
 s16 gHostMonBgBaseY[4];   /* base BGnVOFS at copy time (data[10]) */
+/* Per-anim-BG OAM priority (index 1 = BG1, 2 = BG2). The real engine sets this
+ * via SetAnimBgAttribute(bg, BG_ANIM_PRIORITY, n) — MoveBattlerSpriteToBG sets it
+ * to 2 when a mon is copied to a BG, and splitbgprio sets BG1=1/BG2=2. The host
+ * used to ignore it (GetAnimBgAttribute returned 0), which collapsed the depth a
+ * shield/wall sprite is given relative to the mon-BG (AnimProtect = bgPrio+1) and
+ * made "behind the mon" indistinguishable from "in front" (Protect shield vs
+ * Swords Dance blade). Default 0 = unset (preserves old behaviour for any BG no
+ * move touched). */
+s8  gHostBgPriority[4];
+/* Per-battler "the substitute DOLL graphic is currently showing" flag. The real
+ * AnimTask_MonToSubstitute swaps the mon sprite's VRAM tiles to the doll via
+ * LoadBattleMonGfxAndAnimate(battler, FALSE, ...) — a no-op in the host (the VRAM
+ * fill faults under wasm), so the doll was never visible. We record the swap here
+ * so the renderer draws the project's substitute doll PNG over that mon. Cleared
+ * when the mon graphic is reloaded (loadMonSprite = TRUE). */
+u8  gHostMonIsDoll[4];
 u8  gHostShadowLayer;     /* BG layer (1/2) the ACTIVE scanline stretch drives —
                            * recorded from ScanlineEffect_SetParams' dmaDest so
                            * the renderer ties the current stretch to the one mon
@@ -319,6 +335,8 @@ void HostResetPalBlend(void)
     gHostBldEva = 16;   /* opaque until a setalpha/fade changes it */
     gPaletteFade.active = 0;   /* no software fade in progress */
     for (i = 0; i < 4; i++) { gHostMonBg[i] = 0; gHostMonBgBaseY[i] = 0; }
+    for (i = 0; i < 4; i++) { gHostBgPriority[i] = 0; }  /* 0 = unset (old behaviour) */
+    for (i = 0; i < 4; i++) { gHostMonIsDoll[i] = 0; }   /* no substitute doll yet */
     gScanlineEffect.state = 0;   /* no shadow scanline stretch in progress */
     gScanlineEffect.srcBuffer = 0;
     gHostShadowLayer = 0;
@@ -457,7 +475,16 @@ void FillBgTilemapBufferRect(u8 a, u16 t, u8 x, u8 y, u8 w, u8 h, u8 p) { (void)
 void CopyToBgTilemapBufferRect_ChangePalette(u8 a, const void *s, u8 x, u8 y, u8 w, u8 h, u8 p) { (void)a;(void)s;(void)x;(void)y;(void)w;(void)h;(void)p; }
 void CopyBattlerSpriteToBg(s32 a, u8 x, u8 y, u8 pos, u8 pal, u8 *td, u16 *mp, u16 to) { (void)a;(void)x;(void)y;(void)pos;(void)pal;(void)td;(void)mp;(void)to; }
 void DrawMainBattleBackground(void) {}
-s32 GetAnimBgAttribute(u8 a, u8 b) { (void)a;(void)b; return 0; }
+extern s8 gHostBgPriority[4];
+s32 GetAnimBgAttribute(u8 a, u8 b)
+{
+    /* Return the recorded OAM priority for BG_ANIM_PRIORITY so GetBattlerSprite
+     * BGPriority() (and thus AnimProtect's bgPrio+1 shield depth) sees the real
+     * value. Any other attribute, and any BG no move set, stays 0 — unchanged. */
+    if (b == BG_ANIM_PRIORITY && a < 4)
+        return gHostBgPriority[a];
+    return 0;
+}
 /* Capture the anim BG's SCREEN_SIZE (attributeId 0 = BG_ANIM_SCREEN_SIZE) the
  * move sets. The renderer needs it to lay out the tilemap's screenblocks: a
  * 2-screenblock map is 512x256 (side-by-side) for size 1 vs 256x512 (stacked)
@@ -465,9 +492,10 @@ s32 GetAnimBgAttribute(u8 a, u8 b) { (void)a;(void)b; return 0; }
 s8 gHostAnimBgScreenSize = -1;   /* -1 = unset (assume linear 256-wide) */
 void SetAnimBgAttribute(u8 bgId, u8 attributeId, u8 value)
 {
-    (void)bgId;
     if (attributeId == 0)        /* BG_ANIM_SCREEN_SIZE */
         gHostAnimBgScreenSize = (s8)value;
+    else if (attributeId == BG_ANIM_PRIORITY && bgId < 4)
+        gHostBgPriority[bgId] = (s8)value;   /* splitbgprio / MoveBattlerSpriteToBG */
 }
 
 void LoadSpecialPokePic(const struct CompressedSpriteSheet *s, void *d, s32 sp, u32 p, bool8 f) { (void)s;(void)d;(void)sp;(void)p;(void)f; }
@@ -531,7 +559,15 @@ static const u32 sDummyPal[8] = {0};
 const u32 *GetMonSpritePalFromSpeciesAndPersonality(u16 s, u32 o, u32 p) { (void)s;(void)o;(void)p; return sDummyPal; }
 bool8 ShouldIgnoreDeoxysForm(u8 a, u8 b) { (void)a;(void)b; return FALSE; }
 void HandleSpeciesGfxDataChange(u8 a, u8 b, u8 c) { (void)a;(void)b;(void)c; gHostMonSwapped = 1; }
-void LoadBattleMonGfxAndAnimate(u8 a, bool8 b, u8 c) { (void)a;(void)b;(void)c; }
+void LoadBattleMonGfxAndAnimate(u8 a, bool8 b, u8 c)
+{
+    /* b = loadMonSprite: FALSE → the substitute doll was swapped in for battler a;
+     * TRUE → the real mon gfx was restored. Record it so the renderer draws the
+     * doll PNG over that mon (the real VRAM swap is a no-op in the host). */
+    (void)c;
+    if (a < 4)
+        gHostMonIsDoll[a] = b ? 0 : 1;
+}
 u8 UpdateMonIconFrame(struct Sprite *s) { (void)s; return 0; }
 void SetBattlerShadowSpriteCallback(u8 a, u16 b) { (void)a;(void)b; }
 void SetHealthboxSpriteInvisible(u8 a) { (void)a; }
@@ -629,6 +665,12 @@ void MoveBattlerSpriteToBG(u8 battlerId, u8 toBG_2)
     else         { gBattle_BG2_X = baseX; gBattle_BG2_Y = baseY; }
     gHostMonBg[battlerId] = toBG_2 ? 2 : 1;
     gHostMonBgBaseY[battlerId] = baseY;
+    /* The real MoveBattlerSpriteToBG sets the destination BG's OAM priority to 2
+     * (SetAnimBgAttribute(bg, BG_ANIM_PRIORITY, 2)). Replicate it so GetAnimBg
+     * Attribute reports the mon-BG priority — without this an effect's depth
+     * relative to the mon-BG (AnimProtect shield = bgPrio+1) collapses to 0 and
+     * "behind the mon" can't be told from "in front". */
+    SetAnimBgAttribute(toBG_2 ? 2 : 1, BG_ANIM_PRIORITY, 2);
 }
 
 /* --- GetSpriteTileStartByTag (sheet-load visibility guard) ------------------

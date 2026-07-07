@@ -2598,7 +2598,7 @@ class InstrumentsTab(QWidget):
                         'direct_sound_data.inc')
                     entry = (f"\n\t.align 2\n{label}::\n"
                              f"\t.incbin \"{bin_rel}\"\n")
-                    with open(inc_path, 'a', encoding='utf-8') as f:
+                    with open(inc_path, 'a', encoding='utf-8', newline='\n') as f:
                         f.write(entry)
 
                     # Load the new sample into memory

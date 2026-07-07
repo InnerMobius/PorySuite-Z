@@ -791,6 +791,10 @@ class BattleAnimTab(QWidget):
             self._template_tags = parse_template_tags(project_root)
             self._tpl_callbacks = parse_template_callbacks(project_root)
             self._callback_arch = classify_anim_callbacks(project_root)
+            # Substitute doll asset paths/pixmaps are project-specific — re-parse
+            # them for the newly loaded project.
+            self._doll_paths_cache = False
+            self._doll_pix_cache = {}
             # Per-species sprite y-offsets + elevation — the SAME data the
             # Pokemon Graphics tab uses to position mons, so the reference
             # mons here sit exactly where they do there (and in-game).
@@ -2129,15 +2133,25 @@ class BattleAnimTab(QWidget):
         return max(lo, min(hi, c))
 
     def _synthesize_screen_blend(self, timeline, n_frames):
-        """Per-frame full-screen tint/brighten OVERLAY from the move's BG-inclusive
-        palette blends — the headless engine can't apply them (selection needs
-        battle state it lacks), so replay the coeff ramp/cycle from the script
-        args. Morning Sun white, Eruption red, Explosion white-out, etc. Returns
-        [(coeff<<24)|BGR555 per frame], or [] if the move has no screen blend."""
+        """Per-frame tint overlays from the move's BG-inclusive palette blends — the
+        headless engine can't apply them (selection needs battle state it lacks), so
+        replay the coeff ramp/cycle from the script args. Returns (scene, screen):
+
+          • scene  = BACKGROUND-only palette blends (F_PAL_BG: Moonlight's dark sky,
+            Morning Sun's bright sky, Eruption's red scene). In-game these blend the
+            BG palettes and NEVER the OBJ sprites, so the preview draws them BEHIND
+            the mons + effect sprites — the moon/sun/sparkles and the Pokemon stay
+            visible over the tinted scene (the old code drew them over everything,
+            which black-screened Moonlight and hid its moon).
+          • screen = true WHOLE-screen hardware fades (BeginHardwarePaletteFade,
+            selector SCREEN) that fade everything, sprites included — drawn on top.
+
+        Each is [(coeff<<24)|BGR555 per frame], or [] if the move has none."""
         if n_frames <= 0:
-            return []
-        out = [0] * n_frames
-        any_screen = False
+            return [], []
+        scene = [0] * n_frames
+        screen = [0] * n_frames
+        any_scene = any_screen = False
         seen = False        # has a prior screen blend established a flash this move?
         for (sf, rate, sc, ec, col, sel, cycle, excl) in self._parse_blends(timeline):
             if self._blend_target(sel, excl) != "screen":
@@ -2149,11 +2163,18 @@ class BattleAnimTab(QWidget):
             if not cycle and sc > ec and not seen:
                 continue
             seen = True
-            any_screen = True
+            # A hardware SCREEN fade covers everything; a BG-palette blend covers
+            # only the background (it never touches the OBJ sprites in-game).
+            whole = (str(sel) == "SCREEN")
+            dst = screen if whole else scene
+            if whole:
+                any_screen = True
+            else:
+                any_scene = True
             for f in range(max(0, sf), n_frames):     # later blend overwrites earlier
                 c = self._coeff_at(f, sf, rate, sc, ec, cycle)
-                out[f] = (((c & 0xFF) << 24) | (col & 0xFFFF)) if c > 0 else 0
-        return out if any_screen else []
+                dst[f] = (((c & 0xFF) << 24) | (col & 0xFFFF)) if c > 0 else 0
+        return (scene if any_scene else []), (screen if any_screen else [])
 
     def _synthesize_mon_tints(self, timeline, n_frames):
         """Per-frame MON tint/glow from the move's mon-targeted palette blends —
@@ -2685,6 +2706,15 @@ class BattleAnimTab(QWidget):
             P.set_screen_tint(_v & 0xFFFF, (_v >> 24) & 0xFF)
         else:
             P.set_screen_tint(0, 0)
+        # BACKGROUND-only tint drawn BEHIND the mons + effects (Moonlight's dark
+        # sky, Morning Sun's bright sky): a F_PAL_BG palette blend that darkens the
+        # scene but leaves the moon/sun/sparkles and the Pokemon visible over it.
+        _st = getattr(self, "_engine_scenetint", None)
+        if _st and 0 <= self._engine_idx < len(_st) and _st[self._engine_idx]:
+            _v = _st[self._engine_idx]
+            P.set_scene_tint(_v & 0xFFFF, (_v >> 24) & 0xFF)
+        else:
+            P.set_scene_tint(0, 0)
         # Full-screen colour inversion (InvertScreenColor) — negative-colour flash.
         _inv = getattr(self, "_invert_frames", None)
         P.set_screen_invert(bool(_inv and 0 <= self._engine_idx < len(_inv)
@@ -2739,6 +2769,11 @@ class BattleAnimTab(QWidget):
             P.set_mon_alpha(which, s.get("alpha", 16))
             # Greyscale (Perish Song greys the mons as the notes flip).
             P.set_mon_gray(which, bool(s.get("gray", 0)))
+            # Substitute: the engine swapped this mon's gfx to the doll — draw the
+            # project's substitute doll sprite over it (the shrink + drop-in motion
+            # is the mon sprite's own, applied below). None = mon gfx restored.
+            P.set_mon_override(which, self._doll_pixmap(which)
+                               if s.get("isDoll") else None)
             # Dig-style burrow: the engine HIDES the attacker's mon sprite and
             # wiggles a BG layer the mon was copied onto (monbg + DigDownMovement)
             # — so a plain hide loses the sink. If this is the attacker and its
@@ -2838,7 +2873,46 @@ class BattleAnimTab(QWidget):
         # Effect sprites → canvas (lower subpriority drawn on top).
         canvas = QPixmap(P.CANVAS_W, P.CANVAS_H)
         canvas.fill(QColor(0, 0, 0, 0))
-        painter = _QPainter(canvas)
+        # Two extra full-scene layers for effects that render BEHIND a mon
+        # (Protect shield, etc.). In-game these moves copy the caster's mon onto a
+        # background layer and give the effect a depth BELOW it. The engine reports
+        # each BG-copied mon's real background depth (`bgPriority`), so an effect
+        # with `priority > bgPriority` goes behind that mon (Protect shield 3 > 2)
+        # while `priority <= bgPriority` stays in front (Swords Dance blade 2). No
+        # BG-copied mon this frame → both behind layers stay empty, nothing changes.
+        cv_behind_back = QPixmap(P.CANVAS_W, P.CANVAS_H)
+        cv_behind_back.fill(QColor(0, 0, 0, 0))
+        cv_behind_front = QPixmap(P.CANVAS_W, P.CANVAS_H)
+        cv_behind_front.fill(QColor(0, 0, 0, 0))
+        pt_front = _QPainter(canvas)
+        pt_behind_back = _QPainter(cv_behind_back)
+        pt_behind_front = _QPainter(cv_behind_front)
+
+        # Mons copied to a BG this frame: (side, centre_x, BG priority threshold).
+        # isMon 0/2 = player (back) side, 1/3 = enemy (front) side.
+        _bg_mons = []
+        for _m in frame:
+            if (_m.get("isMon", -1) in (0, 1, 2, 3) and _m.get("bgCopy", 0)
+                    and _m.get("bgPriority", -1) >= 0):
+                _side = "back" if _m.get("isMon") in (0, 2) else "front"
+                _bg_mons.append((_side, _m.get("x", 0) + _m.get("x2", 0),
+                                 _m.get("bgPriority", -1)))
+
+        def _pick_painter(s):
+            """Front layer unless this effect's OAM priority is GREATER than a
+            BG-copied mon's background priority — the GBA rule that puts Protect's
+            shield (3) behind the mon-BG (2) while keeping Swords Dance's blade (2)
+            in front. Among qualifying mons pick the nearest by x."""
+            if not _bg_mons:
+                return pt_front
+            p = s.get("priority", 0) & 3
+            ex = s.get("x", 0) + s.get("x2", 0)
+            cands = [(abs(ex - mx), side) for (side, mx, bgp) in _bg_mons if p > bgp]
+            if not cands:
+                return pt_front
+            cands.sort()
+            return pt_behind_back if cands[0][1] == "back" else pt_behind_front
+
         try:
             # Effect sprites: script-created (host template index) OR TASK-
             # spawned (no index, but a real ANIM_TAG_* tileTag — Hail, Sandstorm).
@@ -2857,6 +2931,8 @@ class BattleAnimTab(QWidget):
                               | (s.get("subpriority", 0) & 0xFF))):
                 if s["invisible"]:
                     continue
+                # Route to the front layer or one of the behind-mon layers.
+                painter = _pick_painter(s)
                 if s.get("addlMon"):
                     # Additional-mon sprite (Role Play silhouette): the host has no
                     # mon pixels, so substitute the reference mon (already WHITE, the
@@ -2952,7 +3028,15 @@ class BattleAnimTab(QWidget):
                 if a < 16:
                     painter.setOpacity(1.0)
         finally:
-            painter.end()
+            pt_front.end()
+            pt_behind_back.end()
+            pt_behind_front.end()
+        # Publish behind-mon layers only when a BG-copied mon exists; else clear
+        # them so nothing lingers behind a mon from a prior frame.
+        if _bg_mons:
+            P.set_anim_behind(cv_behind_back, cv_behind_front)
+        else:
+            P.set_anim_behind(None, None)
         P.set_anim_pixmap(canvas, P.CANVAS_W // 2, P.CANVAS_H // 2)
 
     def _start_play_move(self):
@@ -3051,7 +3135,8 @@ class BattleAnimTab(QWidget):
             self._engine_bg2scroll = []
             self._engine_bg3scroll = []     # BG3 scroll per frame — terrain shake / anim-bg ride
             self._engine_coordoff = []      # gSpriteCoordOffset per frame — sprite-layer mon shake
-            self._engine_screenblend = []   # screen-wide tint/brighten per frame ((coeff<<24)|color)
+            self._engine_screenblend = []   # whole-screen hardware fade per frame ((coeff<<24)|color)
+            self._engine_scenetint = []     # BG-only tint (behind mons+effects) per frame
             self._engine_bgblend = []       # BG-layer alpha-blend per frame (eva|tgt1<<8|eff<<16)
             self._mon_tint_front = []       # per-mon tint/glow per frame ((coeff<<24)|color)
             self._mon_tint_back = []
@@ -3161,8 +3246,9 @@ class BattleAnimTab(QWidget):
             # scene and hide every sprite. The script-arg synthesis captures only the
             # real FLASHES (the over-everything tints) and nothing else.
             try:
-                self._engine_screenblend = self._synthesize_screen_blend(
-                    self._cur_timeline, len(self._engine_frames))
+                self._engine_scenetint, self._engine_screenblend = \
+                    self._synthesize_screen_blend(
+                        self._cur_timeline, len(self._engine_frames))
             except Exception:
                 _log.exception("screen-blend synthesis failed")
             # Per-mon tint/glow (Self-Destruct red flash, Swords Dance / Growth /
@@ -4019,6 +4105,64 @@ class BattleAnimTab(QWidget):
         except Exception:
             _log.exception("reference mon render failed: %s %s", slug, view)
             return None
+
+    def _doll_paths(self):
+        """(front_png, back_png, pal_path) for the substitute doll, parsed from the
+        project's OWN ``src/graphics.c`` INCBIN paths — no hardcoded location, so a
+        project that moves/renames the doll graphic still resolves. Cached; None on
+        miss (the project may not define the doll symbols)."""
+        cached = getattr(self, "_doll_paths_cache", False)
+        if cached is not False:
+            return cached
+        result = None
+        root = self._project_root or ""
+        try:
+            import re
+            txt = open(os.path.join(root, "src", "graphics.c"),
+                       encoding="utf-8", errors="replace").read()
+
+            def _incbin(sym):
+                m = re.search(re.escape(sym) + r"\[\]\s*=\s*INCBIN_\w+\(\"([^\"]+)\"",
+                              txt)
+                return m.group(1) if m else None
+
+            front = _incbin("gSubstituteDollFrontGfx")
+            back = _incbin("gSubstituteDollBackGfx")
+            pal = _incbin("gSubstituteDollPal")
+            if front and back and pal:
+                def _png(p):
+                    return os.path.join(root, re.sub(r"\.4bpp\.lz$", ".png", p))
+
+                def _palp(p):
+                    return os.path.join(root, re.sub(r"\.gbapal\.lz$", ".gbapal", p))
+                result = (_png(front), _png(back), _palp(pal))
+        except Exception:
+            _log.exception("substitute doll path parse failed")
+        self._doll_paths_cache = result
+        return result
+
+    def _doll_pixmap(self, which: str) -> Optional[QPixmap]:
+        """The substitute doll sprite for a side ('front'=enemy, 'back'=player),
+        loaded from the project's own doll PNG + palette through the sanctioned
+        sprite pipeline. Cached per side. None on miss."""
+        cache = getattr(self, "_doll_pix_cache", None)
+        if cache is None:
+            cache = self._doll_pix_cache = {}
+        if which in cache:
+            return cache[which]
+        pix = None
+        paths = self._doll_paths()
+        if paths:
+            front_png, back_png, pal_path = paths
+            png = back_png if which == "back" else front_png
+            try:
+                from core.overworld_palette_io import read_palette_pair
+                pal = read_palette_pair(pal_path) or []
+                pix = mon_sheet_frame(load_sprite_pixmap(png, pal), 0)
+            except Exception:
+                _log.exception("substitute doll render failed: %s", which)
+        cache[which] = pix
+        return pix
 
     @staticmethod
     def _mon_const(slug: str) -> str:

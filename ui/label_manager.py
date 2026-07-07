@@ -241,7 +241,7 @@ class LabelManagerWidget(QWidget):
 
         data = {"version": 1, "labels": clean}
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8", newline='\n') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             self._dirty = False
             self._save_btn.setEnabled(False)

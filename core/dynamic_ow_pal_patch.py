@@ -58,7 +58,7 @@ def is_dowp_enabled(project_root: str) -> bool:
     if source_patched and not marker_exists:
         # Source is patched but marker is missing — recreate it
         try:
-            with open(marker_path, "w") as f:
+            with open(marker_path, "w", newline='\n') as f:
                 f.write(
                     "Dynamic Overworld Palettes (DOWP) enabled by PorySuite-Z.\n"
                     "This file marks that the DOWP patch has been applied to this project.\n"
@@ -1464,7 +1464,7 @@ def apply_dowp_patch(project_root: str,
     # 8. Write marker file
     # ════════════════════════════════════════════════════════════════════════
     marker_path = os.path.join(project_root, MARKER_FILE)
-    with open(marker_path, "w") as f:
+    with open(marker_path, "w", newline='\n') as f:
         f.write(
             "Dynamic Overworld Palettes (DOWP) enabled by PorySuite-Z.\n"
             "This file marks that the DOWP patch has been applied to this project.\n"

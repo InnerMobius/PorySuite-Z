@@ -123,7 +123,7 @@ class _JsonLineHandler(logging.Handler):
                 "name": record.name,
                 "message": self.format(record) if self.formatter else record.getMessage(),
             }
-            with open(self._path, "a", encoding="utf-8") as f:
+            with open(self._path, "a", encoding="utf-8", newline='\n') as f:
                 f.write(json.dumps(obj, ensure_ascii=False))
                 f.write("\n")
         except Exception:

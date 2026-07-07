@@ -1806,30 +1806,35 @@ class VoicegroupsTab(QWidget):
                     f"{inst.attack}, {inst.decay}, "
                     f"{inst.sustain}, {inst.release}")
 
+        # PSG (square/noise/wave) voices: force the ADSR into the only ranges the
+        # Game Boy hardware accepts (attack/decay/release 0-7, sustain 0-15). A
+        # leaked DirectSound 0-255 value here makes a short effect fade in over
+        # ~a minute = dead silent (the voicegroup-013 `attack 255` noise bug);
+        # the converter maps it to its CGB equivalent so it can never be written.
+        from core.sound.sound_constants import clamp_psg_envelope
+        a, d, s, r = clamp_psg_envelope(
+            inst.attack, inst.decay, inst.sustain, inst.release)
+
         if vt in ('voice_square_1', 'voice_square_1_alt'):
             return (f"{vt} {inst.base_midi_key}, {inst.pan}, "
                     f"{inst.sweep}, {inst.duty_cycle}, "
-                    f"{inst.attack}, {inst.decay}, "
-                    f"{inst.sustain}, {inst.release}")
+                    f"{a}, {d}, {s}, {r}")
 
         if vt in ('voice_square_2', 'voice_square_2_alt'):
             return (f"{vt} {inst.base_midi_key}, {inst.pan}, "
                     f"{inst.duty_cycle}, "
-                    f"{inst.attack}, {inst.decay}, "
-                    f"{inst.sustain}, {inst.release}")
+                    f"{a}, {d}, {s}, {r}")
 
         if vt in ('voice_programmable_wave',
                    'voice_programmable_wave_alt'):
             return (f"{vt} {inst.base_midi_key}, {inst.pan}, "
                     f"{inst.wave_label}, "
-                    f"{inst.attack}, {inst.decay}, "
-                    f"{inst.sustain}, {inst.release}")
+                    f"{a}, {d}, {s}, {r}")
 
         if vt in ('voice_noise', 'voice_noise_alt'):
             return (f"{vt} {inst.base_midi_key}, {inst.pan}, "
                     f"{inst.period}, "
-                    f"{inst.attack}, {inst.decay}, "
-                    f"{inst.sustain}, {inst.release}")
+                    f"{a}, {d}, {s}, {r}")
 
         if vt == 'voice_keysplit':
             return (f"{vt} {inst.target_voicegroup}, "

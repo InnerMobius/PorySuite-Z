@@ -34,7 +34,7 @@ _SNAP_FIELDS = (
     "priority", "subpriority", "paletteNum", "invisible", "templateIndex", "isMon",
     "tileTag", "isClone", "blendCoeff", "blendColor", "alpha", "objMode", "gray",
     "bgCopy", "bgCopyBaseY", "addlMon", "addlMonBattler", "addlMonBackpic",
-    "subspriteCount",
+    "subspriteCount", "bgPriority", "isDoll",
 )
 _SNAP = struct.Struct("<%di" % len(_SNAP_FIELDS))
 

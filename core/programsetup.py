@@ -1408,7 +1408,7 @@ class ProgramSetup(QDialog):
     def _on_finish(self):
         path = get_setup_complete_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", newline='\n') as f:
             f.write("complete")
         self.accept()
 

@@ -160,6 +160,47 @@ PROGRAMMABLE_WAVE_VOICE_TYPES = {
     'voice_programmable_wave', 'voice_programmable_wave_alt',
 }
 
+# Game Boy PSG (CGB) voice macros — square, noise, programmable wave. Unlike
+# DirectSound (sampled) voices, their ADSR fields are TINY and must NOT carry
+# 0-255 DirectSound values.
+CGB_VOICE_TYPES = {
+    'voice_square_1', 'voice_square_1_alt',
+    'voice_square_2', 'voice_square_2_alt',
+    'voice_programmable_wave', 'voice_programmable_wave_alt',
+    'voice_noise', 'voice_noise_alt',
+}
+
+
+def clamp_psg_envelope(attack, decay, sustain, release):
+    """Force a Game Boy PSG (square/noise/wave) ADSR into the only ranges the
+    hardware accepts: attack/decay/release 0-7, sustain 0-15 (attack/release
+    0 = instant, higher = slower; sustain 15 = full).
+
+    DirectSound (sampled) voices use 0-255 ADSR. When a 0-255 value leaks into a
+    PSG voice — an import, a DirectSound-style default, a hand edit — a short
+    effect ramps in over ~a minute and plays DEAD SILENT (the real
+    voicegroup-013 noise bug: `attack 255`). A naive clamp (255 -> 7) would still
+    be the SLOWEST attack, so we instead recognise an out-of-CGB-range value as a
+    leaked DirectSound value and convert it to its CGB equivalent — instant
+    DirectSound attack 255 -> CGB 0 (the fix). Already-valid CGB values pass
+    through untouched. Mirrors the forward map in audio_engine `_cgb_to_ds_adsr`
+    (attack: ds=255-cgb*32; decay/release: ds=cgb*32; sustain: ds=cgb*17)."""
+    def _i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+    a, d, s, r = _i(attack), _i(decay), _i(sustain), _i(release)
+    if not 0 <= a <= 7:                      # attack: DS 255 (instant) -> CGB 0
+        a = 0 if a >= 255 else max(0, min(7, round((255 - a) / 32)))
+    if not 0 <= d <= 7:                      # decay: DS = cgb*32
+        d = max(0, min(7, round(d / 32)))
+    if not 0 <= s <= 15:                     # sustain: DS = cgb*17
+        s = max(0, min(15, round(s / 17)))
+    if not 0 <= r <= 7:                      # release: DS = cgb*32
+        r = max(0, min(7, round(r / 32)))
+    return a, d, s, r
+
 # Modulation types
 MOD_VIBRATO = 0   # mod_vib
 MOD_TREMOLO = 1   # mod_tre

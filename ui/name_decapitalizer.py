@@ -441,7 +441,7 @@ def _flush_abilities(path: str, pending: dict[str, str]) -> None:
 
     new_text = _ABILITY_LINE_RX.sub(_sub, text)
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline='\n') as f:
             f.write(new_text)
     except Exception:
         pass

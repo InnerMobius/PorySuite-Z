@@ -455,7 +455,11 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
 
         # ── Messages ─────────────────────────────────────────────────
         if stripped.startswith('msgbox'):
-            m = re.match(r'msgbox\s+"((?:\\.|[^\"]*)*)"(?:\s*,\s*(\S+))?', stripped)
+            # NOTE: the character class is [^"\\] (single char), NOT [^"]* — a
+            # nested unbounded quantifier here caused catastrophic backtracking
+            # (an app freeze) on an unterminated quote, e.g. a msgbox whose text
+            # spans two physical lines. This linear form fails fast instead.
+            m = re.match(r'msgbox\s+"((?:\\.|[^"\\])*)"(?:\s*,\s*(\S+))?', stripped)
             if m:
                 text = m.group(1).replace('\\n', '\n').replace('\\p', '\n\n')
                 msg_type = m.group(2)
@@ -1119,6 +1123,207 @@ def parse_script_pages(map_dir: Path, texts: OrderedDict | None = None) -> tuple
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Yes/No choice branches — RPG-Maker-style desugar / resugar
+#
+# The Event Editor represents a yes/no branch as four flat marker commands:
+#     ('choice_yesno',)  ('when_yes',)  ('when_no',)  ('branch_end',)
+# with the question living in the message command immediately ABOVE the choice.
+#
+# On the way OUT (desugar) these expand to the exact idiom real pokefirered
+# scripts use — the preceding msgbox becomes MSGBOX_YESNO and a compare/goto
+# with two sub-labels carries the branches:
+#
+#     msgbox <question>, MSGBOX_YESNO
+#     goto_if_eq VAR_RESULT, NO, <base>_YesNo1_No
+#     <yes body>
+#     goto <base>_YesNo1_End
+#     <base>_YesNo1_No::            (emitted via a _label_marker)
+#     <no body>
+#     <base>_YesNo1_End::           (emitted via a _label_marker)
+#
+# On the way IN (resugar) that same shape — a message(YESNO) + goto_if_eq
+# VAR_RESULT NO L + goto E + label L + label E — collapses back to the four
+# markers. Matching is structural (targets line up with the two labels), so it
+# also folds hand-authored yes/no scripts, and anything that doesn't match is
+# left as raw primitives (still fully editable, just not collapsed).
+# ═════════════════════════════════════════════════════════════════════════════
+
+_CHOICE_MARKERS = ('choice_yesno', 'when_yes', 'when_no', 'branch_end')
+
+
+def _retype_message_yesno(msg: tuple) -> tuple:
+    """Return a copy of a ('message', label, text, type, [render]) tuple with
+    its MSGBOX type set to MSGBOX_YESNO."""
+    parts = list(msg)
+    while len(parts) < 4:
+        parts.append('' if len(parts) != 1 else None)
+    parts[3] = 'MSGBOX_YESNO'
+    return tuple(parts)
+
+
+def _split_choice_block(cmds: list, start: int) -> tuple:
+    """Given cmds[start] == ('choice_yesno',), return (yes_body, no_body,
+    end_index) where end_index is the position of the matching branch_end.
+    Nested choices are kept intact inside the bodies (depth-tracked)."""
+    yes_body: list = []
+    no_body: list = []
+    target = yes_body
+    depth = 0
+    i = start + 1
+    end_index = len(cmds) - 1
+    while i < len(cmds):
+        c = cmds[i]
+        head = c[0] if c else None
+        if head == 'choice_yesno':
+            depth += 1
+            target.append(c)
+        elif head == 'branch_end':
+            if depth == 0:
+                end_index = i
+                break
+            depth -= 1
+            target.append(c)
+        elif head == 'when_yes' and depth == 0:
+            target = yes_body
+        elif head == 'when_no' and depth == 0:
+            target = no_body
+        else:
+            target.append(c)
+        i += 1
+    return yes_body, no_body, end_index
+
+
+def desugar_choices(commands: list, base_label: str) -> list:
+    """Expand ('choice_yesno' ...) marker blocks into real pokefirered
+    primitives (msgbox YESNO + compare/goto + sub-labels). Recursive, so
+    nested branches expand correctly. Unique labels are derived from
+    *base_label*."""
+    counter = [0]
+
+    def expand(cmds: list) -> list:
+        out: list = []
+        i = 0
+        while i < len(cmds):
+            c = cmds[i]
+            if c and c[0] == 'choice_yesno':
+                yes_body, no_body, end_i = _split_choice_block(cmds, i)
+                yes_lines = expand(yes_body)
+                no_lines = expand(no_body)
+                counter[0] += 1
+                n = counter[0]
+                l_no = f'{base_label}_YesNo{n}_No'
+                l_end = f'{base_label}_YesNo{n}_End'
+                # merge the immediately-preceding message into the yes/no box
+                for bi in range(len(out) - 1, -1, -1):
+                    if not out[bi]:
+                        continue
+                    if out[bi][0] == 'message':
+                        out[bi] = _retype_message_yesno(out[bi])
+                    break
+                out.append(('goto_if_eq', 'VAR_RESULT', 'NO', l_no))
+                out.extend(yes_lines)
+                out.append(('goto', l_end))
+                out.append(('_label_marker', l_no))
+                out.extend(no_lines)
+                out.append(('_label_marker', l_end))
+                i = end_i + 1
+                continue
+            out.append(c)
+            i += 1
+        return out
+
+    # nothing to do if there are no choice markers (fast path)
+    if not any(c and c[0] in _CHOICE_MARKERS for c in commands):
+        return list(commands)
+    return expand(commands)
+
+
+def resugar_choices(commands: list) -> list:
+    """Collapse the desugared yes/no idiom back into choice markers for
+    display. Structural match; unrecognised shapes are returned unchanged."""
+
+    def _target(ct):
+        # goto_if_eq VAR_RESULT, NO, LABEL  -> LABEL ; goto LABEL -> LABEL
+        if not ct:
+            return None
+        if ct[0] == 'goto' and len(ct) > 1:
+            return ct[1]
+        if ct[0] == 'goto_if_eq' and len(ct) > 3:
+            return ct[3]
+        return None
+
+    def collapse(cmds: list) -> list:
+        out: list = []
+        i = 0
+        n = len(cmds)
+        while i < n:
+            c = cmds[i]
+            # detect: goto_if_eq VAR_RESULT, NO, L  ... goto E ... _lm L ... _lm E
+            # Only when the branch is genuinely a yes/no box — i.e. the command
+            # right above is a MSGBOX_YESNO message. This avoids mis-collapsing
+            # an unrelated VAR_RESULT branch (a special/multichoice result).
+            prev_is_yesno = bool(
+                out and out[-1] and out[-1][0] == 'message'
+                and len(out[-1]) > 3 and out[-1][3] == 'MSGBOX_YESNO')
+            if (prev_is_yesno and c and c[0] == 'goto_if_eq' and len(c) > 3
+                    and c[1] == 'VAR_RESULT' and str(c[2]).upper() in ('NO', '0')):
+                l_no = c[3]
+                # find `goto E` and the two label markers at this level
+                yes_body = []
+                j = i + 1
+                goto_end = None
+                while j < n:
+                    cj = cmds[j]
+                    if cj and cj[0] == 'goto' and len(cj) > 1:
+                        goto_end = cj[1]
+                        break
+                    if cj and cj[0] == '_label_marker':
+                        break  # ran into labels without a goto — not our shape
+                    yes_body.append(cj)
+                    j += 1
+                if goto_end is None:
+                    out.append(c); i += 1; continue
+                # next must be _label_marker l_no
+                if not (j + 1 < n and cmds[j + 1] and cmds[j + 1][0] == '_label_marker'
+                        and cmds[j + 1][1] == l_no):
+                    out.append(c); i += 1; continue
+                # collect no_body until _label_marker goto_end
+                no_body = []
+                k = j + 2
+                found_end = False
+                while k < n:
+                    ck = cmds[k]
+                    if ck and ck[0] == '_label_marker' and ck[1] == goto_end:
+                        found_end = True
+                        break
+                    no_body.append(ck)
+                    k += 1
+                if not found_end:
+                    out.append(c); i += 1; continue
+                # SUCCESS — retype the preceding message back to plain, emit block
+                for bi in range(len(out) - 1, -1, -1):
+                    if not out[bi]:
+                        continue
+                    if out[bi][0] == 'message' and len(out[bi]) > 3 and out[bi][3] == 'MSGBOX_YESNO':
+                        m = list(out[bi]); m[3] = ''
+                        out[bi] = tuple(m)
+                    break
+                out.append(('choice_yesno',))
+                out.append(('when_yes',))
+                out.extend(collapse(yes_body))
+                out.append(('when_no',))
+                out.extend(collapse(no_body))
+                out.append(('branch_end',))
+                i = k + 1  # past the _label_marker end
+                continue
+            out.append(c)
+            i += 1
+        return out
+
+    return collapse(list(commands))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Script writing — command tuples back to .inc lines
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1178,6 +1383,17 @@ def lines_from_commands(
             continue
         cmd = data[0]
 
+        # ── Inline sub-label (defensive) ─────────────────────────────
+        # The save path normally SPLITS on _label_marker into separate
+        # Label:: blocks before reaching here, so this rarely fires. If a
+        # marker does leak through (any caller that doesn't split), emit a
+        # real label line instead of a garbage `_label_marker X` command.
+        if cmd == '_label_marker':
+            lbl = data[1] if len(data) > 1 else ''
+            if lbl:
+                visible.append(f'{lbl}::\n')
+            continue
+
         # ── Message ──────────────────────────────────────────────────
         if cmd == 'message':
             label_name = data[1] if len(data) > 1 else None
@@ -1211,7 +1427,13 @@ def lines_from_commands(
                 visible.append(line + '\n')
                 texts[label_name] = text
             else:
+                # Escape so the whole string stays on ONE physical line — the
+                # reader is line-based, and an embedded real newline both breaks
+                # parsing and (historically) froze it. Inverse of the reader's
+                # `\n`->newline / `\p`->blank-line mapping: paragraph breaks
+                # (blank line) become \p, single breaks become \n.
                 escaped = text.replace('"', '\\"')
+                escaped = escaped.replace('\n\n', '\\p').replace('\n', '\\n')
                 line = f'msgbox "{escaped}"'
                 if msg_type:
                     line += f', {msg_type}'

@@ -246,7 +246,12 @@ def _make_filler(slot: int) -> Instrument:
 
 
 def _make_square_fallback(slot: int, duty: int = 2) -> Instrument:
-    """Create a usable square wave instrument as a fallback."""
+    """Create a usable square wave instrument as a fallback.
+
+    PSG (Game Boy square) ADSR uses TINY ranges — attack/decay/release 0-7,
+    sustain 0-15 — NOT DirectSound's 0-255. Use instant attack + full sustain so
+    the fallback is actually audible. (Earlier 255/0/255/165 were DirectSound
+    scale and would make the voice ramp in over ~a minute = silent.)"""
     return Instrument(
         slot_index=slot,
         voice_type='voice_square_1',
@@ -255,10 +260,10 @@ def _make_square_fallback(slot: int, duty: int = 2) -> Instrument:
         pan=0,
         sweep=0,
         duty_cycle=duty,
-        attack=255,
+        attack=0,     # instant
         decay=0,
-        sustain=255,
-        release=165,
+        sustain=15,   # full volume
+        release=0,
     )
 
 
@@ -339,6 +344,25 @@ def _catalog_all_instruments(
     return list(seen.values())
 
 
+def _find_drum_keysplit(voicegroup_data: VoicegroupData):
+    """Return the project's drum-kit keysplit instrument, or None.
+
+    Prefers slot 0 of voicegroup000 (the stock drum slot), else the first
+    `voice_keysplit_all` found anywhere. That instrument routes every drum note
+    to the percussion kit voicegroup (e.g. voicegroup001)."""
+    vg0 = voicegroup_data.voicegroups.get('voicegroup000')
+    if vg0 and vg0.instruments:
+        first = vg0.instruments[0]
+        if getattr(first, 'is_keysplit', False) and first.target_voicegroup:
+            return first
+    for vg_name in sorted(voicegroup_data.voicegroups):
+        for inst in voicegroup_data.voicegroups[vg_name].instruments:
+            if (inst.voice_type == 'voice_keysplit_all'
+                    and inst.target_voicegroup):
+                return inst
+    return None
+
+
 def generate_gm_voicegroup(
     voicegroup_data: VoicegroupData,
     voicegroup_number: Optional[int] = None,
@@ -402,6 +426,19 @@ def generate_gm_voicegroup(
     for slot, label in _prefer.items():
         if label in catalog:
             gm_slots[slot] = catalog[label]
+
+    # ── Drums ────────────────────────────────────────────────────────────
+    # A GM drum track lives on MIDI channel 10 and mid2agb emits it as
+    # VOICE <program> (program 0 = Standard Kit), so the drum kit must sit at
+    # voicegroup slot 0 as a keysplit — exactly how vanilla voicegroup000 does
+    # it. Without this the generated voicegroup has melodic piano at slot 0 and
+    # NO drums. Placing the project's real drum keysplit here makes percussion
+    # play. (Trade-off: a melodic track that genuinely uses GM program 0 piano
+    # must be remapped on the instrument-mapping page — the drum channel wins
+    # slot 0, same as every stock pokefirered song.)
+    drum_ks = _find_drum_keysplit(voicegroup_data)
+    if drum_ks is not None:
+        gm_slots[0] = drum_ks
 
     # Collect non-DirectSound unique instruments to fill appropriate GM slots
     # Square waves -> Lead 1 (slot 80), synth slots
@@ -503,6 +540,10 @@ def generate_gm_voicegroup(
                 decay=src.decay,
                 sustain=src.sustain,
                 release=src.release,
+                # keysplit targets MUST be carried or a drum kit becomes silent
+                target_voicegroup=getattr(src, 'target_voicegroup', None),
+                keysplit_table=getattr(src, 'keysplit_table', None),
+                period=getattr(src, 'period', 0),
             )
             instruments.append(inst)
         else:

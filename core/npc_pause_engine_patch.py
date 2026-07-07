@@ -504,7 +504,7 @@ def _patch_npctakestep(project_root: str) -> str:
             _re.DOTALL)
         new_text, n = _fence.subn(lambda _m: _PAUSE_BLOCK, text, count=1)
         if n and new_text != text:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8", newline='\n') as f:
                 f.write(new_text)
             return f"upgraded NpcTakeStep pause block in {_MOVEMENT_C_REL}"
         return ""  # already current

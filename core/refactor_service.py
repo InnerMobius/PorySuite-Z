@@ -157,7 +157,7 @@ class RefactorService:
 
     def _write_history(self) -> None:
         os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
-        with open(self.history_path, "w", encoding="utf-8") as f:
+        with open(self.history_path, "w", encoding="utf-8", newline='\n') as f:
             json.dump(self.history, f, indent=2)
 
     def _record(self, category: str, old: str, new: str) -> None:
@@ -1022,7 +1022,7 @@ class RefactorService:
                                         changed = True
                         if changed:
                             try:
-                                with open(dex_path, "w", encoding="utf-8") as f:
+                                with open(dex_path, "w", encoding="utf-8", newline='\n') as f:
                                     json.dump(dex, f, indent=2)
                             except Exception:
                                 logging.exception("Failed writing %s", dex_path)

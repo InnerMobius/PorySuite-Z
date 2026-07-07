@@ -166,6 +166,7 @@ class UnifiedMainWindow(QMainWindow):
             "regionmap": "regionmap",
             "tilesets":  "tilesets",
             "shops":     "shops",
+            "maptransfer": "maptransfer",
             "ui":        "ui",
             "config":    "config",
             "labels":    "labels",
@@ -278,6 +279,10 @@ class UnifiedMainWindow(QMainWindow):
 
         # ── Shop Editor ──────────────────────────────────────────────────────
         btn = self._make_page_button("shops", "Shop Editor")
+        tb2.addWidget(btn)
+
+        # ── Map Transfer ─────────────────────────────────────────────────────
+        btn = self._make_page_button("maptransfer", "Map Transfer")
         tb2.addWidget(btn)
 
         _add_separator(tb2)
@@ -846,6 +851,24 @@ class UnifiedMainWindow(QMainWindow):
             print(f"[ShopEditor] Failed to load: {e}")
             import traceback; traceback.print_exc()
 
+        # ── Map Transfer ─────────────────────────────────────────────────────
+        try:
+            from ui.map_transfer_tab import MapTransferTab
+            self._map_transfer = MapTransferTab()
+            idx = self.stack.addWidget(self._map_transfer)
+            self._page_indices["maptransfer"] = idx
+            # An import writes new maps/layouts/tilesets straight to disk. Mark
+            # the window modified only in the sense that other tabs should be
+            # refreshed (F5) to see the new data — Map Transfer has no unsaved
+            # buffer of its own.
+            self._map_transfer.project_changed.connect(
+                lambda: self.log_message(
+                    "Map Transfer: import complete — press F5 in Maps/Tilesets "
+                    "to see the new data."))
+        except Exception as e:
+            print(f"[MapTransfer] Failed to load: {e}")
+            import traceback; traceback.print_exc()
+
         # ── Disconnect PorySuite's own tab-change handler ────────────────────
         # Pages have been reparented out of mainTabs, so PorySuite's
         # on_main_tab_changed would fire spuriously and set dirty flags.
@@ -1037,7 +1060,7 @@ class UnifiedMainWindow(QMainWindow):
             try:
                 import os, time
                 log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                with open(log, "a", encoding="utf-8") as f:
+                with open(log, "a", encoding="utf-8", newline='\n') as f:
                     f.write(
                         f"[{time.strftime('%H:%M:%S')}] _unified_set_modified({modified}) "
                         f"suppress={self._suppress_dirty} "
@@ -1401,6 +1424,25 @@ class UnifiedMainWindow(QMainWindow):
 
         project_dir = self.project_info.get("dir", "")
         midi_dir = os.path.join(project_dir, "sound", "songs", "midi") if project_dir else ""
+
+        # Step 0a: CRLF guard. The decomp toolchain is LF-only and mapjson is
+        # silently broken by CRLF. Every tool writer passes newline='\n', but
+        # this backstop normalizes any decomp text file that slipped through
+        # (a missed writer, a hand edit, a bad merge) so the class of bug can
+        # never reach the compiler.
+        if project_dir:
+            try:
+                from core.crlf_guard import heal_project_crlf
+                healed = heal_project_crlf(project_dir)
+                if healed:
+                    shown = ", ".join(healed[:8])
+                    if len(healed) > 8:
+                        shown += f", … (+{len(healed) - 8} more)"
+                    self.log_message(
+                        f"Pre-build CRLF guard: normalized {len(healed)} "
+                        f"file(s) to LF ({shown})")
+            except Exception as exc:
+                self.log_message(f"Pre-build CRLF guard failed: {exc}")
 
         # Step 0: pre-flight .gba lock check.  If an emulator (mGBA, VBA-M,
         # etc.) still has the previously-built .gba open, the final objcopy
@@ -1783,6 +1825,14 @@ class UnifiedMainWindow(QMainWindow):
                                   if hasattr(self, 'project_data') else None)
                     self._shop_editor.set_project(
                         project_dir, item_names=item_names)
+        elif page_name == "maptransfer":
+            project_dir = (self.project_info or {}).get("dir", "")
+            if project_dir and hasattr(self, '_map_transfer'):
+                # Rescan only when first pointed at this project — reopening the
+                # tab must not clobber a half-configured import. F5 forces a
+                # full reload via load().
+                if getattr(self._map_transfer, '_root', '') != project_dir:
+                    self._map_transfer.set_project(project_dir)
 
     # ── Phase 3: Cross-editor navigation handlers ─────────────────────────
 
@@ -2105,6 +2155,14 @@ class UnifiedMainWindow(QMainWindow):
                 except Exception as e:
                     self.log_message(f"Shop editor refresh error: {e}")
 
+        # Map Transfer — re-scan maps/groups (e.g. after an import added some).
+        if project_dir and hasattr(self, "_map_transfer"):
+            if getattr(self._map_transfer, "_root", ""):
+                try:
+                    self._map_transfer.load()
+                except Exception as e:
+                    self.log_message(f"Map Transfer refresh error: {e}")
+
         # Clear dirty flags on all sub-editors immediately AND after deferred
         # widget loads (QTimer.singleShot(0) in PorySuite's load path).
         if self._porysuite_window:
@@ -2186,7 +2244,7 @@ class UnifiedMainWindow(QMainWindow):
                 if entry.get("dir", "") == proj_dir:
                     entry["name"] = new_name
                     break
-            with open(pj_path, "w", encoding="utf-8") as f:
+            with open(pj_path, "w", encoding="utf-8", newline='\n') as f:
                 json.dump(pj, f, indent=2)
         except Exception:
             pass
@@ -2199,7 +2257,7 @@ class UnifiedMainWindow(QMainWindow):
                 with open(cfg_path, encoding="utf-8") as f:
                     cfg = json.load(f)
                 cfg["name"] = new_name
-                with open(cfg_path, "w", encoding="utf-8") as f:
+                with open(cfg_path, "w", encoding="utf-8", newline='\n') as f:
                     json.dump(cfg, f, indent=4)
             except Exception:
                 pass
@@ -2603,7 +2661,7 @@ class UnifiedMainWindow(QMainWindow):
             data = {}
         data[cwd] = remotes
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline='\n') as f:
             json.dump(data, f, indent=2)
 
     def _git_upstream_url(self) -> str:
@@ -2630,7 +2688,7 @@ class UnifiedMainWindow(QMainWindow):
             data["__upstream__"] = {}
         data["__upstream__"][cwd] = url
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline='\n') as f:
             json.dump(data, f, indent=2)
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -2808,10 +2866,43 @@ class UnifiedMainWindow(QMainWindow):
         sfw.scripts_changed.connect(self._on_shared_scripts_changed)
         sfw.layouts_changed.connect(self._on_shared_layouts_changed)
         sfw.map_groups_changed.connect(self._on_shared_map_groups_changed)
+        sfw.sound_s_changed.connect(self._on_sound_s_changed)
         sfw.file_changed.connect(
             lambda rel: self.log_message(f"External change detected: {rel}"))
 
         sfw.start()
+
+    def _on_sound_s_changed(self, label: str):
+        """A sound .s file was edited externally (hand-fix, another tool, etc.).
+
+        The .s files in sound/songs/midi/ are gitignored build artifacts
+        regenerated from the committed .mid. An external edit therefore lives
+        ONLY in that gitignored file and would be lost on the next clean build
+        (or git clean), UNLESS it's captured back into the .mid source. The
+        song-integrity sweep does exactly that: it parses the .s (authoritative)
+        and re-renders a matching .mid when the .mid has drifted — and it's
+        idempotent, so a .s the app itself just generated (already matching its
+        .mid) is a no-op. So we run the sweep scoped to just this song right
+        when the edit is detected, keeping the .s safely gitignorable.
+        """
+        project_dir = (self.project_info or {}).get("dir", "")
+        if not project_dir:
+            return
+        try:
+            from core.sound.song_integrity import run_sweep
+            report = run_sweep(project_dir, song_labels=[label])
+            if report.regenerated:
+                self.log_message(
+                    f"♪ Captured your '{label}.s' edit back into '{label}.mid' "
+                    f"(the .s is a gitignored build file — the .mid keeps it "
+                    f"safe). Rebuild to hear it in-game.")
+                self.setWindowModified(True)
+            elif report.errors:
+                for lbl, err in report.errors:
+                    self.log_message(
+                        f"⚠ Couldn't capture '{lbl}.s' edit: {err}")
+        except Exception as exc:
+            self.log_message(f"Sound .s capture failed for '{label}': {exc}")
 
     def _on_shared_map_changed(self, map_folder: str):
         """A map's map.json was modified externally (likely by Porymap)."""

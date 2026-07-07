@@ -43,6 +43,65 @@ from eventide.backend.constants_manager import ConstantsManager
 from eventide.ui.widgets import ConstantPicker, MapPicker, SpritePreview
 from ui.custom_widgets.scroll_guard import install_scroll_guard_recursive
 
+
+# ── "No script" sentinels ───────────────────────────────────────────────────
+# In pokefirered an event's script pointer of NULL / 0 / 0x0 all mean the SAME
+# thing: no script. NULL is the C null pointer — a RESERVED symbol — so treating
+# it as a script NAME and emitting a `NULL::` label breaks the build ("symbol
+# NULL is already defined"), and generating a `NULL_Text` alongside. These must
+# all be recognised as "no script" everywhere so EVENTide never writes a block
+# for one, and so the New Script / rename flows offer to give the event a REAL
+# script instead of operating on the sentinel.
+_NO_SCRIPT_SENTINELS = frozenset({'', '0', '0x0', '0x00', 'null'})
+
+
+def _is_no_script(script) -> bool:
+    """True if *script* is a null / no-script pointer (NULL, 0, 0x0, empty)."""
+    return str(script or '').strip().lower() in _NO_SCRIPT_SENTINELS
+
+
+# A leftover script/text block whose LABEL is a no-script sentinel — e.g.
+# `NULL::` or `NULL_Text::`. These are invalid stubs a prior bug wrote (before
+# NULL was recognised as "no script"); `NULL::` is a reserved-symbol hard build
+# break. Only the EXACT sentinel names match (NULL / 0 / 0x0 / 0x00, optionally
+# `_Text`), so a real label like `NULL_Something::` is never touched.
+_SENTINEL_BLOCK_LABEL_RE = re.compile(
+    r'^\s*(?:NULL|0|0x0|0x00)(?:_Text)?::\s*$', re.IGNORECASE)
+
+
+def _strip_sentinel_blocks(path) -> bool:
+    """Remove any `NULL::` / `NULL_Text::` (or 0/0x0 equivalent) label block from
+    an .inc file so a build isn't broken by a reserved-symbol label. A block runs
+    from its label line up to the next `label::` (or EOF). Returns True if the
+    file changed."""
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        return False
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    changed = False
+    _next_label = re.compile(r'^\w+::')
+    while i < len(lines):
+        if _SENTINEL_BLOCK_LABEL_RE.match(lines[i]):
+            changed = True
+            i += 1
+            # Skip the block body (and trailing blanks) up to the next label.
+            while i < len(lines) and not _next_label.match(lines[i]):
+                i += 1
+        else:
+            out.append(lines[i])
+            i += 1
+    if changed:
+        result = re.sub(r'\n{3,}', '\n\n', ''.join(out))
+        try:
+            path.write_text(result, encoding='utf-8')
+        except OSError:
+            return False
+    return changed
+
+
 # ── Sound Editor integration callbacks (set by unified_mainwindow) ──────────
 # These let the playbgm/playse/playfanfare widgets talk to the Sound Editor
 # without threading parent refs through dozens of constructors.
@@ -382,6 +441,11 @@ def _apply_cmd_color(item: QListWidgetItem, cmd_tuple: tuple):
         item.setForeground(QColor('#f39c12'))
         return
 
+    # Yes/No branch structure — a calm blue so the block reads at a glance
+    if cmd in ('choice_yesno', 'when_yes', 'when_no', 'branch_end'):
+        item.setForeground(QColor('#4aa3df'))
+        return
+
     # Flow navigation (RMXP: Jump to Label, Label)
     if cmd in ('goto', 'call'):
         item.setForeground(QColor(_CATEGORY_COLORS.get('flow', '#c0392b')))
@@ -657,6 +721,17 @@ def _stringize(cmd_tuple: tuple) -> str:
         if '_EventScript_' in label:
             short = label.split('_EventScript_', 1)[1]
         return f'@>Label: {short}'
+
+    # Yes/No choice branch markers (RPG-Maker style). Indentation is applied
+    # by the list builder based on nesting depth, so these are the bare labels.
+    if cmd == 'choice_yesno':
+        return '@>Show Choices: Yes, No'
+    if cmd == 'when_yes':
+        return ': When [Yes]'
+    if cmd == 'when_no':
+        return ': When [No]'
+    if cmd == 'branch_end':
+        return ': Branch End'
 
     friendly = _FRIENDLY_NAMES.get(cmd, cmd)
 
@@ -5379,10 +5454,11 @@ _PAGE_1_COMMANDS = [
     ]),
     ('Dialogue', [
         ('Show Message', 'message'),
-        ('Yes/No Choice', 'yesnobox'),
+        ('Show Choices: Yes/No', 'choice_yesno'),
         ('Multi-Choice Box', 'multichoice'),
         ('Wait for Message', 'waitmessage'),
         ('Close Message', 'closemessage'),
+        ('Yes/No Box — position only (advanced)', 'yesnobox'),
     ]),
     ('Movement', [
         ('Set Move Route', 'applymovement'),
@@ -6104,14 +6180,19 @@ class EventEditorTab(QWidget):
             return
         obj = self._objects[self._current_obj_idx]
         pages = obj.get('_pages', [])
-        # (1) Flush _cmd_tuples into the active page dict.
+        # (1) Flush _cmd_tuples into the active page dict. Desugar the display
+        # markers back to raw primitives so the page dict AND the _all_scripts
+        # mirror below stay in the canonical (non-marker) form other tabs read.
         if 0 <= self._current_page_idx < len(pages):
-            pages[self._current_page_idx]['commands'] = list(self._cmd_tuples)
+            from eventide.backend.eventide_utils import desugar_choices
+            page = pages[self._current_page_idx]
+            base = page.get('_label') or obj.get('script') or 'EventScript'
+            page['commands'] = desugar_choices(list(self._cmd_tuples), base)
         # (2) Mirror every page's commands into _all_scripts[label].
         default_label = obj.get('script', '')
         for page in pages:
             label = page.get('_label') or default_label
-            if not label or label == '0x0':
+            if _is_no_script(label):
                 continue
             cmds = page.get('commands', [])
             if isinstance(cmds, list):
@@ -6348,7 +6429,9 @@ class EventEditorTab(QWidget):
         self.script_edit.setPlaceholderText('script label')
         self.script_edit.setToolTip(_tt(
             'The script label this event runs when activated\n'
-            'This is the entry point label in scripts.inc'))
+            'This is the entry point label in scripts.inc\n'
+            'Type a name here to give a scriptless event a script.'))
+        self.script_edit.editingFinished.connect(self._on_script_edit_finished)
         pf.addRow('Script:', self.script_edit)
         self.gfx_combo = QComboBox()
         self.gfx_combo.setEditable(True)
@@ -6872,7 +6955,7 @@ class EventEditorTab(QWidget):
         for ev_list_key in ('object_events', 'coord_events', 'bg_events'):
             for ev in self._map_data.get(ev_list_key, []):
                 s = ev.get('script', '')
-                if s and s != '0x0':
+                if not _is_no_script(s):
                     referenced_labels.add(s)
 
         # Also scan map's own scripts for goto/call to external labels
@@ -6934,7 +7017,7 @@ class EventEditorTab(QWidget):
         for obj in self._map_data.get('object_events', []):
             script = obj.get('script', '')
             obj['_event_type'] = 'object'
-            if script and script != '0x0' and script in self._all_scripts:
+            if not _is_no_script(script) and script in self._all_scripts:
                 obj['_pages'] = self._build_script_pages(script, self._all_scripts)
             else:
                 obj['_pages'] = [{'commands': [], '_label': script or '(empty)',
@@ -7099,7 +7182,7 @@ class EventEditorTab(QWidget):
         for obj in self._objects:
             script = obj.get('script', '')
             etype = obj.get('_event_type', 'object')
-            if not script or script == '0x0':
+            if _is_no_script(script):
                 continue
             pages = obj.get('_pages', [])
             # If all pages are empty, the script label wasn't in scripts.inc
@@ -7526,7 +7609,21 @@ class EventEditorTab(QWidget):
     # ─────────────────────────────────────────────────────────────────────
 
     def _on_object_changed(self, idx):
+        # The user picked a different event in the dropdown — save the CURRENT
+        # UI back into its object first, then display the newly-selected one.
         self._collect_current()
+        self._display_object(idx)
+
+    def _display_object(self, idx):
+        """Populate the UI from an object's data WITHOUT collecting the current
+        UI back first.
+
+        Use this after a PROGRAMMATIC edit (New Script, a template, rename) so
+        the freshly-set script/pages aren't clobbered by a stale-UI collect —
+        that collect (script_edit still showing 'NULL', command list still
+        empty) was silently wiping every edit, which is why New Script / rename
+        appeared to do nothing.
+        """
         self._current_obj_idx = idx
         self._loading = True  # Suppress dirty while populating fields
         if idx < 0 or idx >= len(self._objects):
@@ -7621,6 +7718,75 @@ class EventEditorTab(QWidget):
         # Scan for cross-references (other scripts that modify this object)
         self._update_xref(obj)
         self._loading = False
+
+    def _refresh_current_object(self):
+        """Re-display the current event from its (just-edited) data WITHOUT
+        collecting the UI first, and refresh its dropdown label. Call this after
+        New Script / a template / rename so the display shows the new script and
+        the label stops saying NULL."""
+        idx = self._current_obj_idx
+        if idx < 0 or idx >= len(self._objects):
+            return
+        self._display_object(idx)
+        self._update_obj_combo_label(idx)
+
+    def _update_obj_combo_label(self, idx):
+        """Recompute one event's dropdown label after its script/local_id
+        changed (the combo is otherwise only built at map load, so a renamed or
+        newly-scripted event kept showing its old '[NPC] NULL')."""
+        if idx < 0 or idx >= len(self._objects) or idx >= self.obj_combo.count():
+            return
+        obj = self._objects[idx]
+        etype = obj.get('_event_type', 'object')
+        script = obj.get('script', '') or ''
+
+        def _short(s):
+            return s.split('_EventScript_', 1)[1] if '_EventScript_' in s else s
+
+        if etype == 'object':
+            label = f'[NPC] {obj.get("local_id") or script or "object"}'
+        elif etype == 'coord':
+            label = f'[Trigger] {_short(script) or "trigger"}'
+        elif etype == 'bg':
+            label = f'[Sign] {_short(script)}'
+        else:
+            return  # map scripts / hidden items keep their built label
+        self.obj_combo.blockSignals(True)
+        self.obj_combo.setItemText(idx, label)
+        self.obj_combo.blockSignals(False)
+
+    def _on_script_edit_finished(self):
+        """User typed a name directly in the Script field. Assign it, make sure
+        there's a page under that name (so a previously-scriptless event becomes
+        usable right here — not only via New Script/Rename), and refresh the
+        dropdown label. Rejects the NULL/0/0x0 no-script sentinels."""
+        if self._loading:
+            return
+        idx = self._current_obj_idx
+        if idx < 0 or idx >= len(self._objects):
+            return
+        obj = self._objects[idx]
+        if obj.get('_event_type') != 'object':
+            return  # only object events have an editable script field
+        name = self.script_edit.text().strip()
+        old = obj.get('script') or ''
+        if name == old:
+            return
+        obj['script'] = name
+        if not _is_no_script(name):
+            pages = obj.get('_pages') or []
+            if _is_no_script(old) or not pages:
+                # Was scriptless → give it an entry page named `name`
+                # (preserving any commands already on a placeholder page).
+                cmds = pages[0].get('commands', []) if pages else []
+                obj['_pages'] = [{'commands': cmds, '_label': name,
+                                  '_short_label': name.split('_')[-1]}]
+            elif pages and pages[0].get('_label') == old:
+                pages[0]['_label'] = name
+                pages[0]['_short_label'] = name.split('_')[-1]
+            self._register_labels([name])
+        self._update_obj_combo_label(idx)
+        self._mark_dirty()
 
     def _on_gfx_changed(self, text):
         self._update_sprite(text)
@@ -8080,10 +8246,14 @@ class EventEditorTab(QWidget):
             self._apply_position_override(obj, pages[idx])
 
     def _display_page(self, page: dict):
+        from eventide.backend.eventide_utils import resugar_choices
         self._cmd_list.clear()
         self._cmd_tuples: list[tuple] = []
 
-        commands = page.get('commands', [])
+        # The page dict stores raw pokefirered primitives (msgbox YESNO +
+        # compare/goto + sub-labels). Collapse that idiom into RMXP-style
+        # Show-Choices / When[Yes] / When[No] / Branch-End markers for display.
+        commands = resugar_choices(page.get('commands', []))
         for cmd_tuple in commands:
             # During initial load, append directly (don't use insert-before-empty logic)
             text = _stringize(cmd_tuple)
@@ -8097,6 +8267,7 @@ class EventEditorTab(QWidget):
         empty_item = QListWidgetItem('@>')
         empty_item.setData(Qt.ItemDataRole.UserRole, None)
         self._cmd_list.addItem(empty_item)
+        self._reindent_list()
 
     def _add_list_item(self, cmd_tuple: tuple, at_idx: int = -1):
         """Add a command tuple to the list as a display string."""
@@ -8115,6 +8286,7 @@ class EventEditorTab(QWidget):
         else:
             self._cmd_list.insertItem(at_idx, item)
             self._cmd_tuples.insert(at_idx, cmd_tuple)
+        self._reindent_list()
         return item
 
     def _refresh_item(self, idx: int):
@@ -8153,7 +8325,13 @@ class EventEditorTab(QWidget):
         obj = self._objects[self._current_obj_idx]
         pages = obj.get('_pages', [])
         if 0 <= self._current_page_idx < len(pages):
-            pages[self._current_page_idx]['commands'] = list(self._cmd_tuples)
+            from eventide.backend.eventide_utils import desugar_choices
+            page = pages[self._current_page_idx]
+            # Expand the display markers back into raw primitives so the page
+            # dict, cross-tab mirrors, save and navigation all see real
+            # pokefirered commands (msgbox YESNO + compare/goto + sub-labels).
+            base = page.get('_label') or (obj.get('script') or 'EventScript')
+            page['commands'] = desugar_choices(list(self._cmd_tuples), base)
 
     def _collect_current(self):
         self._collect_current_page()
@@ -8407,6 +8585,11 @@ class EventEditorTab(QWidget):
             self._on_add_camera_sequence()
             return
 
+        # Show Choices: Yes/No inserts a four-marker branch block
+        if cmd == 'choice_yesno':
+            self._on_add_yesno_choice()
+            return
+
         # For trainer battle variants, auto-scaffold text labels
         cmd_tuple = self._scaffold_command(cmd)
 
@@ -8451,6 +8634,56 @@ class EventEditorTab(QWidget):
         self._mw.log_message(
             f'Event Editor: added camera sequence ({len(commands)} commands, '
             f'{len(movements)} movement labels)')
+
+    def _on_add_yesno_choice(self):
+        """Insert an RPG-Maker-style Yes/No branch: Show Choices + When[Yes] +
+        When[No] + Branch End. The user fills each branch by selecting the
+        line inside it and adding commands. The question comes from a Text
+        command placed ABOVE the Show Choices line."""
+        block = [
+            ('choice_yesno',),
+            ('when_yes',),
+            ('when_no',),
+            ('branch_end',),
+        ]
+        idx = self._selected_cmd_idx()
+        insert_at = idx + 1 if idx >= 0 else len(self._cmd_tuples)
+        for i, ct in enumerate(block):
+            self._add_list_item(ct, insert_at + i)
+        # select the When[Yes] line so the next command drops into the Yes branch
+        self._cmd_list.setCurrentRow(insert_at + 1)
+        self._reindent_list()
+        self._mark_dirty()
+        self._mw.log_message('Event Editor: added Yes/No choice block')
+        # nudge: if there's no message directly above, hint the user
+        above = self._cmd_tuples[insert_at - 1] if insert_at > 0 else None
+        if not (above and above[0] == 'message'):
+            self._mw.log_message(
+                'Tip: add a "Show Message" command just above the Yes/No block '
+                '— its text becomes the question shown with the choice.')
+
+    def _reindent_list(self):
+        """Re-apply RMXP-style nesting indentation to every command row based
+        on choice/when/branch_end depth. Called after any structural change."""
+        depth = 0
+        for i, ct in enumerate(self._cmd_tuples):
+            head = ct[0] if ct else None
+            if head == 'choice_yesno':
+                ind = depth
+                depth += 1
+            elif head in ('when_yes', 'when_no'):
+                ind = max(0, depth - 1)
+            elif head == 'branch_end':
+                depth = max(0, depth - 1)
+                ind = depth
+            else:
+                ind = depth
+            item = self._cmd_list.item(i)
+            if item is None:
+                continue
+            pad = '      ' * ind
+            base = _stringize(ct)
+            item.setText('\n'.join(pad + ln for ln in base.split('\n')))
 
     def _scaffold_command(self, cmd: str) -> tuple:
         """Build a command tuple with auto-created supporting data.
@@ -8521,15 +8754,49 @@ class EventEditorTab(QWidget):
         idx = self._selected_cmd_idx()
         if idx < 0 or idx >= len(self._cmd_tuples):
             return
+        head = self._cmd_tuples[idx][0] if self._cmd_tuples[idx] else None
         # Label markers are structural — can't be deleted
-        if self._cmd_tuples[idx] and self._cmd_tuples[idx][0] == '_label_marker':
+        if head == '_label_marker':
+            return
+        # Deleting the Show Choices header removes the WHOLE branch block
+        # (header + both branches + their bodies + Branch End).
+        if head == 'choice_yesno':
+            end = self._choice_block_end(idx)
+            for j in range(end, idx - 1, -1):
+                self._cmd_tuples.pop(j)
+                self._cmd_list.takeItem(j)
+            new_idx = min(idx, len(self._cmd_tuples) - 1)
+            if new_idx >= 0:
+                self._cmd_list.setCurrentRow(new_idx)
+            self._reindent_list()
+            self._mark_dirty()
+            return
+        # The inner When/Branch-End markers can't be deleted on their own —
+        # they'd unbalance the block. Delete the Show Choices header instead.
+        if head in ('when_yes', 'when_no', 'branch_end'):
+            self._mw.log_message(
+                'Delete the "Show Choices" line to remove the whole Yes/No block.')
             return
         self._cmd_tuples.pop(idx)
         self._cmd_list.takeItem(idx)
         new_idx = min(idx, len(self._cmd_tuples) - 1)
         if new_idx >= 0:
             self._cmd_list.setCurrentRow(new_idx)
+        self._reindent_list()
         self._mark_dirty()
+
+    def _choice_block_end(self, start: int) -> int:
+        """Index of the branch_end matching the choice_yesno at *start*."""
+        depth = 0
+        for j in range(start + 1, len(self._cmd_tuples)):
+            h = self._cmd_tuples[j][0] if self._cmd_tuples[j] else None
+            if h == 'choice_yesno':
+                depth += 1
+            elif h == 'branch_end':
+                if depth == 0:
+                    return j
+                depth -= 1
+        return len(self._cmd_tuples) - 1
 
     def _on_rows_moved(self, *_args):
         """Rebuild _cmd_tuples from list widget items after drag-and-drop reorder."""
@@ -8539,6 +8806,7 @@ class EventEditorTab(QWidget):
             if data is not None:  # Skip the empty @> insertion line
                 new_tuples.append(data)
         self._cmd_tuples = new_tuples
+        self._reindent_list()
         self._mark_dirty()
 
     def _on_move_up(self):
@@ -8552,6 +8820,7 @@ class EventEditorTab(QWidget):
         self._refresh_item(idx)
         self._refresh_item(idx - 1)
         self._cmd_list.setCurrentRow(idx - 1)
+        self._reindent_list()
         self._mark_dirty()
 
     def _on_move_down(self):
@@ -8563,6 +8832,7 @@ class EventEditorTab(QWidget):
         self._refresh_item(idx)
         self._refresh_item(idx + 1)
         self._cmd_list.setCurrentRow(idx + 1)
+        self._reindent_list()
         self._mark_dirty()
 
     def _on_duplicate(self):
@@ -8819,6 +9089,11 @@ class EventEditorTab(QWidget):
         new_label = new_label.strip()
         # Update the page data
         page['_label'] = new_label
+        # Keep the event's script pointer in sync: if we just renamed the entry
+        # page (the one the event points at), the object's `script` must follow,
+        # or the event would point at a label that no longer exists.
+        if old_label and obj.get('script') == old_label:
+            obj['script'] = new_label
         # Generate a short label for the tab
         short = new_label
         map_name = self._map_dir.name if self._map_dir else ''
@@ -8852,6 +9127,14 @@ class EventEditorTab(QWidget):
             else:
                 self._mw.log_message(
                     f'Event Editor: renamed page → "{new_label}"')
+
+        # Reflect the rename in the event's dropdown label + Script field so the
+        # user actually SEES it change (the combo is otherwise only built at load,
+        # so a rename used to leave the event still reading "[NPC] NULL").
+        self._update_obj_combo_label(self._current_obj_idx)
+        if obj.get('script') == new_label:      # entry page → keep field in sync
+            self.script_edit.setText(new_label)
+        self._mark_dirty()
 
         self._mark_dirty()
 
@@ -8894,7 +9177,7 @@ class EventEditorTab(QWidget):
             return
         idx = self._current_page_idx
         pages.pop(idx)
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
 
     # ─────────────────────────────────────────────────────────────────────
@@ -9144,6 +9427,59 @@ class EventEditorTab(QWidget):
     # New NPC Script templates
     # ─────────────────────────────────────────────────────────────────────
 
+    def _suggest_script_name(self, obj) -> str:
+        """A sensible, UNIQUE default script label for an event that has none —
+        ``<Map>_EventScript_<Role><N>`` (role guessed from the graphics)."""
+        map_name = self._map_dir.name if self._map_dir else 'Map'
+        gfx = (obj.get('graphics_id', '') or '').upper()
+        if 'ITEM_BALL' in gfx:
+            role = 'ItemBall'
+        elif 'SIGN' in gfx or obj.get('_event_type') == 'bg':
+            role = 'Sign'
+        else:
+            role = 'NPC'
+        existing = getattr(self, '_all_scripts', set()) or set()
+        base = f'{map_name}_EventScript_{role}'
+        n = 1
+        while f'{base}{n}' in existing:
+            n += 1
+        return f'{base}{n}'
+
+    def _prompt_and_assign_script_name(self, obj) -> str:
+        """Event has no script yet — ask for a label (pre-filled with a
+        suggestion), assign it to the event's script pointer, and refresh the
+        display. Returns the chosen label, or '' if cancelled. This is what lets
+        New Script (and its templates) create a real, editable script for a
+        previously-scriptless event, all in the UI — no hand-editing."""
+        from PyQt6.QtWidgets import QInputDialog
+        suggested = self._suggest_script_name(obj)
+        name, ok = QInputDialog.getText(
+            self, 'Name the New Script',
+            'Script label for this event:\n'
+            '(the template creates it under this name — you can rename it later)',
+            text=suggested)
+        if not ok or not name.strip():
+            return ''
+        name = name.strip().replace(' ', '_')
+        if _is_no_script(name):
+            # Guard: don't let the user name a script NULL/0/0x0 — those are the
+            # null-pointer sentinels and emit a reserved-symbol label.
+            self._mw.log_message(
+                f'Event Editor: "{name}" is a reserved no-script name — pick another.')
+            return ''
+        obj['script'] = name
+        # Give it an empty page under the new name so it's immediately usable
+        # (and shows the name, not NULL) even if the user skips the template
+        # menu; a chosen template replaces this page. Refresh WITHOUT collecting
+        # first, or the stale 'NULL' in the Script field would overwrite `name`.
+        obj['_pages'] = [{'commands': [], '_label': name,
+                          '_short_label': name.split('_')[-1]}]
+        self._register_labels([name])
+        self.script_edit.setText(name)
+        self._refresh_current_object()
+        self._mark_dirty()
+        return name
+
     def _on_new_npc_script(self):
         """Show a menu of script templates organized by category."""
         menu = QMenu(self)
@@ -9162,12 +9498,14 @@ class EventEditorTab(QWidget):
             return
         obj = self._objects[self._current_obj_idx]
         script = obj.get('script', '')
-        if not script or script == '0x0':
-            act = menu.addAction('(Set a script name first for script templates)')
-            act.setEnabled(False)
-            menu.exec(self._btn_new_script.mapToGlobal(
-                self._btn_new_script.rect().bottomLeft()))
-            return
+        if _is_no_script(script):
+            # This event has no script yet (its pointer is NULL/0/0x0). Instead
+            # of dead-ending, ask for a name (pre-filled with a suggestion),
+            # assign it to the event, then continue to the template menu — so the
+            # chosen template creates a REAL, editable script under that name.
+            script = self._prompt_and_assign_script_name(obj)
+            if not script:
+                return  # user cancelled the name prompt
 
         gfx = obj.get('graphics_id', '')
 
@@ -9300,7 +9638,7 @@ class EventEditorTab(QWidget):
         self._external_script_files[script] = item_ball_file
 
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
 
         item_name = _resolve_name(item_const)
@@ -9334,7 +9672,7 @@ class EventEditorTab(QWidget):
 
         self._register_text(text_label, placeholder)
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created talker script for {script}')
 
@@ -9442,7 +9780,7 @@ class EventEditorTab(QWidget):
                           '_short_label': script.split('_')[-1]}]
 
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(
             f'Event Editor: created trainer script for {trainer_const}\n'
@@ -9488,7 +9826,7 @@ class EventEditorTab(QWidget):
         ]
 
         self._register_labels([script, label_done])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(
             f'Event Editor: created item giver for {script} (flag: {flag})')
@@ -9537,7 +9875,7 @@ class EventEditorTab(QWidget):
         ]
 
         self._register_labels([script, label_after])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(
             f'Event Editor: created flag-gated script for {script} (flag: {flag})')
@@ -9566,7 +9904,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created sign script for {script}')
 
@@ -9604,7 +9942,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         item_name = _resolve_name(item_const)
         self._mw.log_message(
@@ -9629,7 +9967,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created door warp for {script}')
         QMessageBox.information(
@@ -9650,7 +9988,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created cave warp for {script}')
         QMessageBox.information(
@@ -9664,32 +10002,32 @@ class EventEditorTab(QWidget):
     # ─────────────────────────────────────────────────────────────────────
 
     def _create_nurse_wrapper(self, obj, script):
-        """Nurse NPC — heals the party using callstd STD_POKEMON_CENTER_NURSE."""
+        """Nurse NPC — heals the party. pokefirered has no
+        STD_POKEMON_CENTER_NURSE (pokeemerald constant); it uses the shared
+        EventScript_PkmnCenterNurse, which handles lock / heal / goodbye."""
         cmds = [
             ('lock',),
             ('faceplayer',),
-            ('callstd', 'STD_POKEMON_CENTER_NURSE'),
-            ('end',),
+            ('goto', 'EventScript_PkmnCenterNurse'),
         ]
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created nurse script for {script}')
 
     def _create_pc_wrapper(self, obj, script):
-        """PC — opens the storage system using callstd STD_PC."""
+        """PC — opens the storage system. pokefirered has no STD_PC (that's a
+        pokeemerald constant); it uses the shared EventScript_PC, which does
+        its own lockall / menu / end."""
         cmds = [
-            ('lockall',),
-            ('callstd', 'STD_PC'),
-            ('releaseall',),
-            ('end',),
+            ('goto', 'EventScript_PC'),
         ]
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created PC script for {script}')
 
@@ -9711,7 +10049,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created mart script for {script}')
         QMessageBox.information(
@@ -9735,7 +10073,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created cut tree script for {script}')
         QMessageBox.information(
@@ -9754,7 +10092,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(
             f'Event Editor: created rock smash script for {script}')
@@ -9769,7 +10107,7 @@ class EventEditorTab(QWidget):
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
-        self._on_object_changed(self._current_obj_idx)
+        self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(
             f'Event Editor: created strength boulder script for {script}')
@@ -9856,12 +10194,97 @@ class EventEditorTab(QWidget):
     # Save
     # ─────────────────────────────────────────────────────────────────────
 
+    def _ensure_map_inc_registered(self, kind: str):
+        """Ensure `.include "data/maps/<Map>/<kind>"` exists in event_scripts.s.
+
+        Map headers are auto-generated, but scripts.inc and text.inc are each
+        hand-listed in event_scripts.s. A map created/imported without those
+        lines leaves its scripts / text labels undefined at link time.
+        """
+        if not self._map_dir or not self._root_dir:
+            return
+        map_name = self._map_dir.name
+        es = Path(self._root_dir) / 'data' / 'event_scripts.s'
+        if not es.is_file():
+            return
+        inc_key = f'data/maps/{map_name}/{kind}'
+        try:
+            text = es.read_text(encoding='utf-8')
+        except OSError:
+            return
+        if inc_key in text:
+            return
+        import re as _re
+        lines = text.replace('\r\n', '\n').split('\n')
+        pat = _re.compile(r'\.include\s+"data/maps/.+?/' + _re.escape(kind) + '"')
+        last = -1
+        for i, ln in enumerate(lines):
+            if pat.search(ln):
+                last = i
+        inc = f'\t.include "{inc_key}"'
+        if last >= 0:
+            lines.insert(last + 1, inc)
+        else:
+            lines.append(inc)
+        es.write_text('\n'.join(lines), encoding='utf-8', newline='\n')
+        self._mw.log_message(
+            f'Event Editor: registered {map_name}/{kind} in event_scripts.s')
+
+    def _materialize_inline_text(self):
+        """Turn every inline message (text but no label) into a real text
+        label written to text.inc.
+
+        pokefirered's `msgbox` macro takes a POINTER, not an inline string —
+        `msgbox "hi, there", TYPE` makes gas split on the comma and die with
+        "too many positional arguments". So a message must always compile to
+        `msgbox <Label>, TYPE` with the text living in text.inc as a .string.
+        """
+        if not self._map_dir:
+            return
+        map_name = self._map_dir.name
+        used = set(self._texts.keys())
+        counter = 0
+
+        def _next_label():
+            nonlocal counter
+            while True:
+                counter += 1
+                lbl = f'{map_name}_Text_{counter}'
+                if lbl not in used:
+                    used.add(lbl)
+                    return lbl
+
+        for obj in self._objects:
+            for page in obj.get('_pages', []):
+                cmds = page.get('commands', [])
+                for i, ct in enumerate(cmds):
+                    if not ct or ct[0] != 'message':
+                        continue
+                    label = ct[1] if len(ct) > 1 else None
+                    text = ct[2] if len(ct) > 2 else ''
+                    render = ct[4] if len(ct) > 4 else 'normal'
+                    # braille already forces a label; only plain inline text
+                    # with no label needs materialising.
+                    if label or not text or render == 'braille':
+                        continue
+                    lbl = _next_label()
+                    self._texts[lbl] = text
+                    self._local_text_labels.add(lbl)
+                    new = list(ct)
+                    while len(new) < 4:
+                        new.append('' if len(new) != 1 else None)
+                    new[1] = lbl
+                    cmds[i] = tuple(new)
+
     def _on_save(self):
         if not self._map_dir or not self._map_data:
             QMessageBox.information(self, 'Save', 'No map loaded.')
             return
 
         self._collect_current()
+        # Inline message text can't assemble (the msgbox macro needs a label);
+        # convert any to real text.inc labels before writing.
+        self._materialize_inline_text()
 
         from eventide.backend.eventide_utils import (
             write_scripts_inc, write_text_inc,
@@ -9887,7 +10310,7 @@ class EventEditorTab(QWidget):
             ordered_objects.append(current_obj)
         for obj in ordered_objects:
             script = obj.get('script', '')
-            if not script or script == '0x0':
+            if _is_no_script(script):
                 continue
             pages = obj.get('_pages', [{'commands': []}])
 
@@ -9910,7 +10333,7 @@ class EventEditorTab(QWidget):
             # Process each page — split on _label_marker boundaries
             for page in pages:
                 page_label = page.get('_label', script)
-                if page_label == '0x0':
+                if _is_no_script(page_label):
                     continue
                 all_cmds = page.get('commands', [])
 
@@ -9983,6 +10406,24 @@ class EventEditorTab(QWidget):
                     local_texts[label] = content
             if local_texts:
                 write_text_inc(local_texts, text_path)
+                # Self-heal: a map's text.inc is only assembled if
+                # event_scripts.s .include's it (a separate list from
+                # scripts.inc). A map imported without that line — or a map
+                # that never had local text before — would leave every text
+                # label undefined at link. Register it if missing.
+                self._ensure_map_inc_registered('text.inc')
+            # scripts.inc is likewise hand-listed — make sure it's registered.
+            self._ensure_map_inc_registered('scripts.inc')
+
+            # Self-heal: remove any leftover NULL:: / NULL_Text:: (or 0/0x0)
+            # stub block a prior bug may have written — NULL:: is a reserved
+            # symbol that hard-breaks the build. Safe: only exact sentinel
+            # labels match, and the writers above never emit them anymore.
+            if _strip_sentinel_blocks(scripts_path):
+                self._mw.log_message(
+                    'Event Editor: removed a leftover NULL:: stub block that '
+                    'was breaking the build.')
+            _strip_sentinel_blocks(text_path)
 
             # Split objects back into their original map.json arrays
             obj_events = []

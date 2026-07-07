@@ -450,6 +450,10 @@ class BattleScenePreview(QWidget):
         self._mwin = None               # (pix, which, sx, sy, alpha): a scrolling BG
         #   clipped to a mon's silhouette + drawn IN FRONT (Stats Change arrows — the GBA OBJ-window)
         self._screen_tint = None        # (rgb, coeff 1..16): full-screen tint/brighten
+        self._scene_tint = None         # (rgb, coeff 1..16): BACKGROUND-only tint, drawn
+        #   BEHIND the mons + effect sprites (Moonlight/Morning Sun darken the BG via a
+        #   F_PAL_BG palette blend that never touches the OBJ sprites, so the moon/sun and
+        #   the Pokemon stay bright over the darkened scene)
         self._screen_invert = False     # full-screen colour inversion (InvertScreenColor)
         #   overlay — Morning Sun's white flash, Eruption's red tint (engine scene blend)
 
@@ -460,6 +464,15 @@ class BattleScenePreview(QWidget):
         self._anim_pix: Optional[QPixmap] = None
         self._anim_cx = self.ENEMY_CX
         self._anim_cy = self.ENEMY_CY
+        # Effect layers that render BEHIND a mon (Protect shield, etc.). In-game
+        # these moves copy the mon to a background layer and give the effect a
+        # depth below it, so it sits behind the Pokemon. The engine now reports the
+        # background's real depth, so the renderer can tell "behind" (Protect
+        # shield, depth 3 > background 2) from "in front" (Swords Dance blade,
+        # depth 2). _anim_behind_front draws just before the enemy (front) mon,
+        # _anim_behind_back just before the player (back) mon. None when unused.
+        self._anim_behind_back: Optional[QPixmap] = None
+        self._anim_behind_front: Optional[QPixmap] = None
         # Battle-animation BACKGROUND (Surf/Cosmic/Sandstorm/...): a full-screen
         # image drawn OVER the battle BG and BEHIND the mons, scrolled by
         # (_anim_bg_x, _anim_bg_y). None = no anim background this move.
@@ -773,6 +786,23 @@ class BattleScenePreview(QWidget):
             self._screen_tint = ((r | r >> 5, g | g >> 5, b | b >> 5), c)
         self.update()
 
+    def set_scene_tint(self, color_bgr555: int = 0, coeff: int = 0) -> None:
+        """BACKGROUND-only tint drawn BEHIND the mons and effect sprites — for a
+        palette blend that targets the background palettes only (Moonlight's dark
+        sky, Morning Sun's bright sky). The Pokemon and the move's foreground
+        effects (the moon, sparkles) are OBJ sprites the blend never touches, so
+        they stay bright over the tinted scene. ``coeff`` 0 clears."""
+        c = max(0, min(16, int(coeff)))
+        if c <= 0:
+            self._scene_tint = None
+        else:
+            v = int(color_bgr555) & 0xFFFF
+            r = (v & 31) << 3
+            g = ((v >> 5) & 31) << 3
+            b = ((v >> 10) & 31) << 3
+            self._scene_tint = ((r | r >> 5, g | g >> 5, b | b >> 5), c)
+        self.update()
+
     def set_screen_invert(self, on: bool) -> None:
         """Full-screen colour INVERSION (AnimTask_InvertScreenColor → InvertPlttBuffer)
         — a true negative-colour flash. Rendered as a white difference-blend so it
@@ -806,6 +836,7 @@ class BattleScenePreview(QWidget):
         self._mon_shake = (0, 0)
         self._mwin = None
         self._screen_tint = None
+        self._scene_tint = None
         self._screen_invert = False
         changed = (self._front_fx != (0, 0, 1.0, 1.0)
                    or self._back_fx != (0, 0, 1.0, 1.0)
@@ -892,6 +923,20 @@ class BattleScenePreview(QWidget):
             self._anim_cx = int(cx)
         if cy is not None:
             self._anim_cy = int(cy)
+        # Clearing the effect overlay (pix is None) also clears the behind-mon
+        # layers, so every existing stop/clear site drops them too.
+        if pix is None:
+            self._anim_behind_back = None
+            self._anim_behind_front = None
+        self.update()
+
+    def set_anim_behind(self, back_pix: Optional[QPixmap],
+                        front_pix: Optional[QPixmap]) -> None:
+        """Set the effect layers that render BEHIND the mons. *back_pix* draws
+        behind the player (back) mon, *front_pix* behind the enemy (front) mon.
+        Full-scene overlays (240x160 canvas coords, origin 0,0). None clears."""
+        self._anim_behind_back = back_pix
+        self._anim_behind_front = front_pix
         self.update()
 
     @staticmethod
@@ -1119,6 +1164,16 @@ class BattleScenePreview(QWidget):
                             xx += bw
                         yy += bh
 
+        # BACKGROUND-only scene tint (Moonlight dark sky, Morning Sun bright sky):
+        # a F_PAL_BG palette blend darkens/brightens the background but NOT the OBJ
+        # sprites, so it's drawn HERE — over the background, but BEHIND the shadow,
+        # mons, and every effect sprite (the moon, the sun, sparkles), which all
+        # stay bright over the tinted scene.
+        if self._scene_tint is not None:
+            (_sr, _sg, _sb), _sc = self._scene_tint
+            p.fillRect(0, 0, self.CANVAS_W * s, self.CANVAS_H * s,
+                       QColor(_sr, _sg, _sb, int(255 * _sc / 16)))
+
         # Shadow is created at (enemy_x, enemy_y + 29) per pokefirered
         # (src/battle_gfx_sfx_util.c :: LoadAndCreateEnemyShadowSprites).
         # It's a FIXED position — independent of the sprite frame. The game
@@ -1167,6 +1222,12 @@ class BattleScenePreview(QWidget):
                          self._front_clones)
             p.setOpacity(1.0)
 
+        # Effect layer drawn BEHIND the enemy (front) mon (Protect cast by the
+        # enemy): full-scene overlay, origin 0,0.
+        if self._anim_behind_front and not self._anim_behind_front.isNull():
+            p.drawPixmap(0, 0, self.CANVAS_W * s, self.CANVAS_H * s,
+                         self._anim_behind_front)
+
         # Enemy (front) sprite — pokefirered draws the 64x64 frame
         # CENTERED on sBattlerCoords, plus y_offset pushes it DOWN,
         # minus enemy elevation pushes it UP.
@@ -1200,6 +1261,12 @@ class BattleScenePreview(QWidget):
                                fw, fh, self._front_fx, s)
             if self._front_alpha < 16:
                 p.setOpacity(1.0)
+
+        # Effect layer drawn BEHIND the player (back) mon (Protect cast by the
+        # player): full-scene overlay, origin 0,0.
+        if self._anim_behind_back and not self._anim_behind_back.isNull():
+            p.drawPixmap(0, 0, self.CANVAS_W * s, self.CANVAS_H * s,
+                         self._anim_behind_back)
 
         # Player (back) sprite — same frame-center rule, back y_offset
         # pushes DOWN.

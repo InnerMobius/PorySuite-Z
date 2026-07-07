@@ -200,7 +200,7 @@ class RegionMapManager:
             f"sRegionMapSections_{new_camel}",
             text,
         )
-        with open(layout_path, "w", encoding="utf-8") as f:
+        with open(layout_path, "w", encoding="utf-8", newline='\n') as f:
             f.write(text)
 
     def find_external_region_references(self, region_name: str,

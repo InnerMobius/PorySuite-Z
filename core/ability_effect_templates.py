@@ -2880,7 +2880,7 @@ def _ensure_snow_warning_battle_script(project_root: str) -> bool:
             end_pos += 1  # past the first '\n' of the '\n\n' pair
         s_text = s_text[:end_pos] + new_block + s_text[end_pos:]
         try:
-            with open(s_path, "w", encoding="utf-8") as f:
+            with open(s_path, "w", encoding="utf-8", newline='\n') as f:
                 f.write(s_text)
         except OSError:
             return False
@@ -2908,7 +2908,7 @@ def _ensure_snow_warning_battle_script(project_root: str) -> bool:
         insert_pos = h_text.find("\n", anchor_pos) + 1
         h_text = h_text[:insert_pos] + extern_line + h_text[insert_pos:]
         try:
-            with open(h_path, "w", encoding="utf-8") as f:
+            with open(h_path, "w", encoding="utf-8", newline='\n') as f:
                 f.write(h_text)
         except OSError:
             return False
@@ -3011,7 +3011,7 @@ def apply_battle_effect(project_root: str, template_id: str,
                     lines.insert(insert_at + idx, ln)
                 written += 1
 
-        with open(filepath, "w", encoding="utf-8") as f:
+        with open(filepath, "w", encoding="utf-8", newline='\n') as f:
             f.writelines(lines)
 
     return written
@@ -3157,7 +3157,7 @@ def apply_field_effect(project_root: str, template_id: str,
                 lines.insert(insert_at + idx, ln)
             written += 1
 
-            with open(filepath, "w", encoding="utf-8") as f:
+            with open(filepath, "w", encoding="utf-8", newline='\n') as f:
                 f.writelines(lines)
 
     return written
@@ -3180,7 +3180,7 @@ def remove_battle_effect(project_root: str, ability_const: str) -> int:
 
         count = _remove_ability_from_lines(lines, ability_const)
         if count > 0:
-            with open(filepath, "w", encoding="utf-8") as f:
+            with open(filepath, "w", encoding="utf-8", newline='\n') as f:
                 f.writelines(lines)
             removed += count
 
@@ -3205,7 +3205,7 @@ def remove_field_effect(project_root: str, ability_const: str) -> int:
         count = _remove_marker_block(lines, ability_const)
         count += _remove_ability_from_lines(lines, ability_const)
         if count > 0:
-            with open(filepath, "w", encoding="utf-8") as f:
+            with open(filepath, "w", encoding="utf-8", newline='\n') as f:
                 f.writelines(lines)
             removed += count
 

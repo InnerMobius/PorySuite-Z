@@ -438,6 +438,6 @@ def _remove_voicegroup_block(inc_path: str, vg_name: str) -> None:
 
     # Atomic in-place write — never a partial/truncated file on crash.
     tmp = inc_path + ".tmp"
-    with open(tmp, 'w', encoding='utf-8') as f:
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
         f.writelines(lines)
     os.replace(tmp, inc_path)

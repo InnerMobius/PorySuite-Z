@@ -564,30 +564,11 @@ class GitPanel(QDialog):
         self._main.addWidget(box)
 
     def _refresh_commit_files(self):
-        _, status_out = self._mw._git_run("status", "--short", timeout=10)
-
-        # IMPORTANT: _git_run calls .strip() on the full output, which EATS
-        # the leading space of the first line's XY column.  `git status
-        # --porcelain` outputs ` M path` (space + M + space + path) for
-        # unstaged modifications — after .strip() the first line becomes
-        # `M path`, and a fixed-position parse (`raw[3:]`) would produce
-        # `rc/data/items.json` instead of `src/data/items.json`.  Use
-        # str.split(None, 1) which handles every porcelain format
-        # regardless of leading whitespace:
-        #   " M path", "M  path", "MM path", "?? path"  →  (code, path)
-        def _parse_status_line(raw: str) -> tuple[str, str] | None:
-            parts = raw.split(None, 1)
-            if len(parts) != 2:
-                return None
-            return parts[0], parts[1]
-
-        all_lines = [l for l in (status_out or "").splitlines() if l.strip()]
-        parsed: list[tuple[str, str]] = []
-        for raw in all_lines:
-            p = _parse_status_line(raw)
-            if p is not None:
-                parsed.append(p)
-
+        # Use the shared -z parser: it returns VERBATIM paths (no quoting), so a
+        # filename with a space — which `git status --short` wraps in quotes like
+        # `"a b.png"` — stages correctly. Parsing the quoted form and handing it
+        # to `git add` staged NOTHING, so spaced files silently refused to commit.
+        parsed = self._mw._git_status_entries()
         tracked   = [(c, p) for (c, p) in parsed if c != "??"]
         untracked = [(c, p) for (c, p) in parsed if c == "??"]
 
@@ -641,19 +622,26 @@ class GitPanel(QDialog):
             return
 
         staged = 0
-        # Stage checked tracked files
-        for i in range(self._commit_file_list.count()):
-            item = self._commit_file_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                self._mw._git_run("add", item.data(256), timeout=10)
-                staged += 1
-        # Stage checked untracked files (user opted in)
-        for i in range(self._commit_untracked_list.count()):
-            item = self._commit_untracked_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
-                self._mw._git_run("add", item.data(256), timeout=10)
-                staged += 1
+        failed = []
+        # Stage checked tracked + untracked files. `--` guards paths starting
+        # with '-'; paths are verbatim (from -z) so spaces/special chars stage.
+        for lst in (self._commit_file_list, self._commit_untracked_list):
+            for i in range(lst.count()):
+                item = lst.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    ok, out = self._mw._git_run("add", "--", item.data(256), timeout=15)
+                    if ok:
+                        staged += 1
+                    else:
+                        failed.append((item.data(256), out))
 
+        if failed:
+            p, err = failed[0]
+            more = f"  (+{len(failed) - 1} more)" if len(failed) > 1 else ""
+            self._commit_status_lbl.setText(
+                f"✗  Could not stage '{p}'{more}: {(err or '').splitlines()[0][:120]}")
+            self._commit_status_lbl.setStyleSheet("color: #e06c75; font-size: 11px;")
+            return
         if staged == 0:
             self._commit_status_lbl.setText("⚠  No files checked.")
             self._commit_status_lbl.setStyleSheet("color: #e8a44a; font-size: 11px;")

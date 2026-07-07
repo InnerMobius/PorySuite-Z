@@ -36,7 +36,7 @@ def save_labels(project_dir: str, labels: dict[str, str]):
     """Write the label mapping to disk."""
     path = _labels_path(project_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
         json.dump(labels, f, indent=2, sort_keys=True)
 
 

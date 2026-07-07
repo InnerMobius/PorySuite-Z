@@ -643,7 +643,7 @@ def _migrate_legacy_state(project_root: str) -> None:
             os.makedirs(os.path.dirname(new_path), exist_ok=True)
             with open(legacy_file, encoding="utf-8") as src:
                 data = src.read()
-            with open(new_path, "w", encoding="utf-8") as dst:
+            with open(new_path, "w", encoding="utf-8", newline='\n') as dst:
                 dst.write(data)
         os.remove(legacy_file)
     except OSError:
@@ -1311,7 +1311,7 @@ def _save_auto_state(project_root: str, auto_refactors: List[Dict]) -> None:
     state_path = _auto_state_path(project_root)
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
     import json
-    with open(state_path, "w", encoding="utf-8") as f:
+    with open(state_path, "w", encoding="utf-8", newline='\n') as f:
         json.dump(auto_refactors, f, indent=2)
 
 

@@ -782,7 +782,7 @@ QTabBar::tab:hover:!selected {
                 try:
                     import os, time
                     log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                    with open(log, "a", encoding="utf-8") as f:
+                    with open(log, "a", encoding="utf-8", newline='\n') as f:
                         f.write(f"[{time.strftime('%H:%M:%S')}] _dirty SUPPRESSED depth={self._loading_depth}\n")
                 except Exception:
                     pass
@@ -790,7 +790,7 @@ QTabBar::tab:hover:!selected {
             try:
                 import os, time
                 log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                with open(log, "a", encoding="utf-8") as f:
+                with open(log, "a", encoding="utf-8", newline='\n') as f:
                     f.write(f"[{time.strftime('%H:%M:%S')}] _dirty FIRED species={getattr(self,'previous_selected_species', None)!r}\n")
             except Exception:
                 pass
@@ -1093,7 +1093,7 @@ QTabBar::tab:hover:!selected {
         projects["projects"] = [p for p in projects.get("projects", []) if p.get("dir") != project_dir]
         projects["projects"].insert(0, new_entry)
         try:
-            with open(projects_file, "w") as f:
+            with open(projects_file, "w", newline='\n') as f:
                 json.dump(projects, f)
         except Exception:
             pass
@@ -1354,6 +1354,44 @@ QTabBar::tab:hover:!selected {
         except Exception as exc:
             return False, str(exc)
 
+    def _git_status_entries(self) -> "list[tuple[str, str]]":
+        """Return [(xy, path), ...] from ``git status --porcelain -z``.
+
+        Uses -z (NUL-delimited) so paths are VERBATIM — git's normal status
+        output WRAPS any path containing a space or special char in quotes
+        (e.g. `"concept/UI/trainer card concept.png"`), and passing that quoted
+        string to `git add` stages NOTHING (no file by that literal name), which
+        is exactly why files with spaces silently refused to commit. -z avoids
+        the quoting entirely, so every listed file stages correctly.
+        """
+        cwd = (self.project_info or {}).get("dir", "")
+        if not cwd:
+            return []
+        try:
+            r = subprocess.run(
+                [self._git_exe(), "-C", cwd, "status", "--porcelain", "-z"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return []
+        # Do NOT strip: a record's first byte can be a meaningful space (" M").
+        records = (r.stdout or "").split("\x00")
+        entries: "list[tuple[str, str]]" = []
+        i = 0
+        while i < len(records):
+            rec = records[i]
+            if not rec:
+                i += 1
+                continue
+            xy = rec[:2]
+            path = rec[3:]               # XY (2 chars) + 1 space, then the path
+            if xy and xy[0] in ("R", "C"):
+                i += 1                    # rename/copy: the next field is the ORIGIN
+            entries.append((xy, path))
+            i += 1
+        return entries
+
     def _open_git_panel(self, page: str = "") -> None:
         """Open (or bring to front) the Git Panel window.
 
@@ -1417,7 +1455,7 @@ QTabBar::tab:hover:!selected {
             data = {}
         data[cwd] = remotes
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline='\n') as f:
             json.dump(data, f, indent=2)
 
     def _git_upstream_url(self) -> str:
@@ -1445,7 +1483,7 @@ QTabBar::tab:hover:!selected {
             data["__upstream__"] = {}
         data["__upstream__"][cwd] = url
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline='\n') as f:
             json.dump(data, f, indent=2)
 
     def _git_refresh_status_bar(self) -> None:
@@ -2411,10 +2449,9 @@ QTabBar::tab:hover:!selected {
             return
         project_dir = self.project_info.get("dir", "")
 
-        _, status_out = self._git_run("status", "--short", timeout=10)
-        lines = [l for l in (status_out or "").splitlines() if l.strip()]
+        entries = self._git_status_entries()
 
-        if not lines:
+        if not entries:
             from PyQt6.QtWidgets import QMessageBox as _MB
             _MB.information(self, "Commit", "Nothing to commit — working tree is clean.")
             return
@@ -2436,17 +2473,9 @@ QTabBar::tab:hover:!selected {
         file_list.setAlternatingRowColors(True)
         file_list.setMaximumHeight(180)
 
-        for raw in lines:
-            # _git_run .strip()s the full output which can eat the leading
-            # space of the first line's XY column.  split(None, 1) handles
-            # every porcelain format (" M path", "M  path", "MM path",
-            # "?? path") without position-based fragility.
-            parts = raw.split(None, 1)
-            if len(parts) != 2:
-                continue
-            xy, path = parts[0], parts[1]
+        for xy, path in entries:
             item = QListWidgetItem(f"{xy}  {path}")
-            item.setData(256, path)
+            item.setData(256, path)          # VERBATIM path (no quotes) → git add works
             item.setCheckState(_Qt.CheckState.Checked)
             file_list.addItem(item)
 
@@ -2473,24 +2502,36 @@ QTabBar::tab:hover:!selected {
             if not msg:
                 status_lbl.setText("⚠  Please write a commit message.")
                 return
-            # Stage selected files
-            staged_any = False
-            for i in range(file_list.count()):
-                item = file_list.item(i)
-                if item.checkState() == _Qt.CheckState.Checked:
-                    path = item.data(256)
-                    ok, out = self._git_run("add", path, timeout=10)
-                    staged_any = True
-            if not staged_any:
-                status_lbl.setText("⚠  No files selected.")
+            checked = [file_list.item(i).data(256)
+                       for i in range(file_list.count())
+                       if file_list.item(i).checkState() == _Qt.CheckState.Checked]
+            if not checked:
+                status_lbl.setText("⚠  No files checked.")
+                return
+            # Stage each checked file. `--` guards paths that start with '-';
+            # the path is verbatim (from -z) so spaces/special chars are fine.
+            # A file shown in this list is never .gitignored (status omits ignored
+            # files), so a plain add stages it — but if any add DOES fail, surface
+            # it loudly instead of marching on to a commit that stages nothing.
+            failed = []
+            for path in checked:
+                ok, out = self._git_run("add", "--", path, timeout=15)
+                if not ok:
+                    failed.append((path, out))
+            if failed:
+                p, err = failed[0]
+                more = f"  (+{len(failed) - 1} more)" if len(failed) > 1 else ""
+                status_lbl.setText(
+                    f"✗  Could not stage '{p}'{more}: {(err or '').splitlines()[0][:140]}")
                 return
             ok, out = self._git_run("commit", "-m", msg, timeout=30)
             if ok:
-                status_lbl.setText(f"✓  Committed successfully.")
+                self.statusBar().showMessage(
+                    f"Committed {len(checked)} file(s).", 5000)
                 self._git_refresh_status_bar()
                 dlg.accept()
             else:
-                status_lbl.setText(f"✗  {out}")
+                status_lbl.setText(f"✗  {(out or 'commit failed').splitlines()[0][:180]}")
 
         btns.accepted.connect(_do_commit)
         dlg.exec()
@@ -3582,11 +3623,11 @@ QTabBar::tab:hover:!selected {
         p["projects"].insert(0, d_dir_project_info)
 
         # Save the updated projects.json file
-        with open(p_file, "w") as f:
+        with open(p_file, "w", newline='\n') as f:
             json.dump(p, f, indent=4)
 
         # Save the local project info in the project.json file
-        with open(os.path.join(self.project_info["dir"], "project.json"), "w") as f:
+        with open(os.path.join(self.project_info["dir"], "project.json"), "w", newline='\n') as f:
             local_project_info = {
                 "name": self.project_info["name"],
                 "project_name": self.project_info["project_name"],
@@ -3700,7 +3741,7 @@ QTabBar::tab:hover:!selected {
                 "date_modified": self.project_info.get("date_modified"),
             }
         )
-        with open(project_file, "w") as f:
+        with open(project_file, "w", newline='\n') as f:
             json.dump(p_data, f, indent=4)
 
         # Set item delegates and fonts for the UI elements
@@ -4217,7 +4258,7 @@ QTabBar::tab:hover:!selected {
             log_path = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "save_diag.log")
-            with open(log_path, "a", encoding="utf-8") as f:
+            with open(log_path, "a", encoding="utf-8", newline='\n') as f:
                 f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         except Exception:
             pass
@@ -4835,7 +4876,7 @@ QTabBar::tab:hover:!selected {
                 diag = os.path.join(
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                     "diag_formchange.log")
-                with open(diag, "a", encoding="utf-8") as f:
+                with open(diag, "a", encoding="utf-8", newline='\n') as f:
                     f.write(f"\n[{species_const}] {exc!r}\n{traceback.format_exc()}\n")
             except Exception:
                 pass
@@ -5468,7 +5509,7 @@ in the game.</p>
         try:
             import traceback, os, time
             log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-            with open(log, "a", encoding="utf-8") as f:
+            with open(log, "a", encoding="utf-8", newline='\n') as f:
                 f.write(f"[{time.strftime('%H:%M:%S')}] setWindowModified({modified}) depth={self._loading_depth}\n")
                 for line in traceback.format_stack(limit=8)[:-1]:
                     f.write("  " + line.rstrip() + "\n")
@@ -6213,7 +6254,7 @@ in the game.</p>
                 try:
                     import os, time
                     log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                    with open(log, "a", encoding="utf-8") as f:
+                    with open(log, "a", encoding="utf-8", newline='\n') as f:
                         f.write(f"[{time.strftime('%H:%M:%S')}] DIRTY {species} attr={attribute} stored={stored!r} ui={ui_value!r} norm_stored={_normalize(stored)!r} norm_ui={_normalize(ui_value)!r}\n")
                 except Exception:
                     pass
@@ -6738,7 +6779,7 @@ in the game.</p>
                 try:
                     import os, time
                     log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                    with open(log, "a", encoding="utf-8") as f:
+                    with open(log, "a", encoding="utf-8", newline='\n') as f:
                         f.write(f"[{time.strftime('%H:%M:%S')}] save_species_data({self.previous_selected_species}) returned updated={updated}\n")
                 except Exception:
                     pass
@@ -8468,7 +8509,7 @@ QTabBar::tab:hover:!selected {
         try:
             import os, time, traceback
             log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-            with open(log, "a", encoding="utf-8") as f:
+            with open(log, "a", encoding="utf-8", newline='\n') as f:
                 f.write(f"[{time.strftime('%H:%M:%S')}] _on_pokedex_panel_edited depth={self._loading_depth} current_dex={getattr(self, '_current_dex_const', None)!r}\n")
                 for line in traceback.format_stack(limit=10)[:-1]:
                     f.write("  " + line.rstrip() + "\n")

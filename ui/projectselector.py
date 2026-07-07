@@ -159,7 +159,7 @@ class ProjectSelector(QMainWindow):
         ]
 
         try:
-            with open(projects_file, "w") as f:
+            with open(projects_file, "w", newline='\n') as f:
                 json.dump(data, f)
         except Exception as exc:
             QMessageBox.warning(
@@ -246,7 +246,7 @@ class ProjectSelector(QMainWindow):
                                 "%Y-%m-%d %H:%M:%S"
                             ),
                         }
-                        with open(config_json, "w") as f:
+                        with open(config_json, "w", newline='\n') as f:
                             json.dump(project_info, f, indent=4)
                     else:
                         return
@@ -282,7 +282,7 @@ class ProjectSelector(QMainWindow):
             projects["projects"] = [p for p in projects["projects"] if p.get("dir") != project_dir]
             projects["projects"].insert(0, new_entry)
 
-            with open(projects_file, "w") as f:
+            with open(projects_file, "w", newline='\n') as f:
                 json.dump(projects, f)
 
             self.selected_index = 0
@@ -324,7 +324,7 @@ class ProjectSelector(QMainWindow):
         # doesn't re-copy old projects back on the next launch).
         import json as _json
         projects_file = os.path.join(data_dir, "projects.json")
-        with open(projects_file, "w") as _f:
+        with open(projects_file, "w", newline='\n') as _f:
             _json.dump({"projects": []}, _f)
 
         # Remove settings INI

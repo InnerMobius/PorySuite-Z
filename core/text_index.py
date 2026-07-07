@@ -626,18 +626,51 @@ def build_script_xrefs(project_dir: str) -> dict[str, list[tuple[str, str, str]]
 
 # ── Save-back writers ─────────────────────────────────────────────────────────
 
+def _encode_gba_linebreaks(content: str) -> str:
+    """Encode dialogue text to pokefirered's GBA line-break convention.
+
+    Guarantees NO raw newline ever reaches a ``.string`` / ``_("...")`` — a real
+    newline inside the quotes is unterminated and the assembler/compiler rejects
+    it (breaks the build). Works from EITHER real newlines (an editor that
+    returned plain text) OR existing literal ``\\n``/``\\l``/``\\p`` escapes, and
+    is idempotent (re-encoding its own output is a no-op).
+
+    Convention, matching how pokefirered authors text in a 2-line message box:
+      * blank line (paragraph break)        -> ``\\p``  (clear box, wait)
+      * first line break within a paragraph -> ``\\n``  (line 1 -> line 2)
+      * each subsequent break in that para  -> ``\\l``  (scroll up one line)
+    """
+    s = content.replace("\r\n", "\n").replace("\r", "\n")
+    # Collapse existing literal escapes to real newlines so we re-derive the
+    # breaks from one canonical form (longest first: \p before \n/\l).
+    s = s.replace("\\p", "\n\n").replace("\\l", "\n").replace("\\n", "\n")
+    out_paras = []
+    for para in re.split(r"\n[ \t]*\n", s):           # blank line == paragraph
+        lines = para.split("\n")
+        if len(lines) <= 1:
+            out_paras.append(lines[0] if lines else "")
+        else:
+            # first break \n, every following break \l (the box only shows 2 lines)
+            out_paras.append(lines[0] + "\\n" + "\\l".join(lines[1:]))
+    return "\\p".join(out_paras)
+
+
 def _save_c_string(entry: TextEntry) -> None:
     """Write back a modified C string (_("...")) to its source file."""
     text = _read(entry.file_path)
     if not text:
         return
 
+    # A GBA C string (`_("...")`) uses the same \n / \l / \p escapes — a raw
+    # newline would be an unterminated string literal and fail the build.
+    content = _encode_gba_linebreaks(entry.content)
+
     pattern = re.compile(
         r'(\b' + re.escape(entry.label) +
         r'\s*\[\s*\]\s*=\s*_\(\s*")((?:[^"\\]|\\.)*)("\s*\)\s*;)',
     )
     new_text, n = pattern.subn(
-        lambda m: m.group(1) + entry.content + m.group(3),
+        lambda m: m.group(1) + content + m.group(3),
         text, count=1,
     )
     if n > 0:
@@ -650,8 +683,14 @@ def _save_asm_string(entry: TextEntry) -> None:
     if not text:
         return
 
+    # GBA `.string` content MUST use line-break ESCAPES (\n / \l / \p), NEVER a
+    # raw newline — a literal newline inside `.string "..."` is unterminated and
+    # the assembler rejects it (breaks the build). Encode to the convention from
+    # whatever form the content is in (real newlines from a plain-text edit, or
+    # existing escapes); idempotent, so a clean entry is rewritten unchanged.
+    value = _encode_gba_linebreaks(entry.content)
+
     # Split value at GBA line-break boundaries, keeping delimiter attached
-    value = entry.content
     segments = re.split(r"(?<=\\[npl])", value)
     segments = [s for s in segments if s]
     if not segments:
@@ -667,7 +706,12 @@ def _save_asm_string(entry: TextEntry) -> None:
         r"(?:[ \t]+\.string\s+\"[^\"]*\"[ \t]*\n?)+",
         re.MULTILINE,
     )
-    new_text, n = pattern.subn(new_block, text, count=1)
+    # IMPORTANT: pass the replacement as a FUNCTION, not a string. re.sub treats a
+    # string replacement as a TEMPLATE and interprets backslash escapes in it —
+    # so the `\n` in our `.string "...\n"` would be turned into a REAL newline
+    # (the unterminated-.string build break) and a `\l` would raise "bad escape
+    # \l". A function replacement is inserted VERBATIM, escapes intact.
+    new_text, n = pattern.subn(lambda _m: new_block, text, count=1)
     if n > 0:
         _write(entry.file_path, new_text)
 

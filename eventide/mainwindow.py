@@ -380,7 +380,7 @@ class EventideMainWindow(QMainWindow):
             data = {}
         data[cwd] = remotes
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline='\n') as f:
             json.dump(data, f, indent=2)
 
     def _git_upstream_url(self) -> str:
@@ -405,7 +405,7 @@ class EventideMainWindow(QMainWindow):
             data["__upstream__"] = {}
         data["__upstream__"][cwd] = url
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8", newline='\n') as f:
             json.dump(data, f, indent=2)
 
     def _git_refresh_status_bar(self) -> None:

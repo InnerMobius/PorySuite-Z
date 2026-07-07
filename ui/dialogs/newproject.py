@@ -172,7 +172,7 @@ class NewProject(QDialog):
                     projects["projects"].remove(p)
                     break
             projects["projects"].insert(0, data_dir_project_info)
-            with open(projects_file, "w") as f:
+            with open(projects_file, "w", newline='\n') as f:
                 json.dump(projects, f)
 
             self.accept()
@@ -416,10 +416,10 @@ class NewProject(QDialog):
             "date_modified": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         projects["projects"].insert(0, data_dir_project_info)
-        with open(projects_file, "w") as f:
+        with open(projects_file, "w", newline='\n') as f:
             json.dump(projects, f)
         os.makedirs(os.path.join(self.project_dir, "data"), exist_ok=True)
-        with open(os.path.join(self.project_dir, "project.json"), "w") as f:
+        with open(os.path.join(self.project_dir, "project.json"), "w", newline='\n') as f:
             json.dump(self.project_info, f)
         # Ensure project.json is gitignored — it's PorySuite metadata, not
         # part of the decomp project. Without this entry it'd show up in
@@ -443,7 +443,7 @@ class NewProject(QDialog):
                     if p["dir"] == self.project_dir:
                         projects["projects"].remove(p)
                         break
-                with open(projects_file, "w") as f:
+                with open(projects_file, "w", newline='\n') as f:
                     json.dump(projects, f)
                 shutil.rmtree(self.project_dir)
             except Exception as e:
