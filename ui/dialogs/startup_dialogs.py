@@ -46,8 +46,12 @@ class UpdateDialog(QDialog):
         tag = self._release.get("tag", "?")
         name = self._release.get("name", tag)
 
+        # The GitHub release name already reads "PorySuite-Z vX.Y.Zb", so don't
+        # prefix another "PorySuite-Z" (that produced "PorySuite-Z PorySuite-Z
+        # v0.1.34b is available"). Fall back to the tag if the name is blank.
+        title = name or tag
         header = QLabel(
-            f'<h2>PorySuite-Z {name} is available</h2>'
+            f'<h2>{title} is available</h2>'
             f'<p>You are currently running <b>{VERSION}</b>.</p>'
         )
         header.setTextFormat(Qt.TextFormat.RichText)

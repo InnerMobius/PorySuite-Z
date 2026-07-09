@@ -55,6 +55,8 @@ class TrackRow(QFrame):
     modulation_changed = pyqtSignal(int, int)  # track_index, modulation depth (0-127, 0=off)
     instrument_changed = pyqtSignal(int, int)  # track_index, new voice slot
     selected = pyqtSignal(int)             # track_index — user clicked this row
+    remove_requested = pyqtSignal(int)     # track_index — right-click → Delete
+    duplicate_requested = pyqtSignal(int)  # track_index — right-click → Duplicate
 
     def __init__(self, track_index: int, track_info: dict,
                  instrument_names: Optional[list] = None, parent=None):
@@ -297,6 +299,22 @@ class TrackRow(QFrame):
             self.selected.emit(self._index)
         super().mousePressEvent(event)
 
+    def contextMenuEvent(self, event):
+        """Right-click a track → Duplicate / Delete, so removing a track isn't
+        buried in the tiny bottom-left '-' button. Nothing is written to disk —
+        the change is staged in the song until the user hits Save."""
+        from PyQt6.QtWidgets import QMenu
+        # select this row first so any highlight / active-track state follows
+        self.selected.emit(self._index)
+        menu = QMenu(self)
+        act_dup = menu.addAction("Duplicate Track")
+        act_del = menu.addAction("Delete Track")
+        chosen = menu.exec(event.globalPos())
+        if chosen is act_del:
+            self.remove_requested.emit(self._index)
+        elif chosen is act_dup:
+            self.duplicate_requested.emit(self._index)
+
     @property
     def is_muted(self) -> bool:
         return self._muted
@@ -500,6 +518,8 @@ class TrackSidebar(QWidget):
         for i, info in enumerate(track_infos):
             row = TrackRow(i, info, instrument_names=instrument_names)
             row.selected.connect(self._on_row_selected)
+            row.remove_requested.connect(self.track_removed.emit)
+            row.duplicate_requested.connect(self.track_duplicated.emit)
             row.mute_toggled.connect(self.track_muted.emit)
             row.solo_toggled.connect(self.track_soloed.emit)
             row.volume_changed.connect(self.track_volume.emit)

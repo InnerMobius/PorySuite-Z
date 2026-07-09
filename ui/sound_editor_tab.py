@@ -1178,15 +1178,19 @@ class SoundEditorTab(QWidget):
             except Exception as e:
                 _log.warning("write_midi_file failed for %s: %s", label, e)
                 return False
-        # Sync midi.cfg's -P/-R/-V (and -G) BEFORE recompiling — mid2agb reads
-        # these flags, and recompile must see the new master volume.
+        # Sync midi.cfg's -P/-R/-V AND -G BEFORE recompiling — mid2agb reads
+        # these flags, and recompile regenerates the .s from the .mid using them.
+        # -G MUST be synced to the song's current voicegroup or a bank change
+        # silently reverts on recompile (the .s comes back on the old -G).
         try:
-            from core.sound.song_table_manager import update_midi_cfg_flags
+            from core.sound.song_table_manager import (
+                update_midi_cfg_flags, voicegroup_index_from_name)
             update_midi_cfg_flags(
                 root, label,
                 priority=getattr(song, 'priority', None),
                 reverb=getattr(song, 'reverb', None),
                 volume=getattr(song, 'master_volume', None),
+                voicegroup=voicegroup_index_from_name(getattr(song, 'voicegroup', None)),
             )
         except Exception as e:
             _log.warning("midi.cfg sync failed for %s: %s", label, e)
@@ -1212,12 +1216,14 @@ class SoundEditorTab(QWidget):
                 from core.sound.song_writer import save_song_file
                 save_song_file(song, verify_build=False)
                 try:
-                    from core.sound.song_table_manager import update_midi_cfg_flags
+                    from core.sound.song_table_manager import (
+                        update_midi_cfg_flags, voicegroup_index_from_name)
                     update_midi_cfg_flags(
                         self._project_root, song.label,
                         priority=getattr(song, 'priority', None),
                         reverb=getattr(song, 'reverb', None),
                         volume=getattr(song, 'master_volume', None),
+                        voicegroup=voicegroup_index_from_name(getattr(song, 'voicegroup', None)),
                     )
                 except Exception as e:
                     _log.warning("midi.cfg sync failed for %s: %s", song.label, e)

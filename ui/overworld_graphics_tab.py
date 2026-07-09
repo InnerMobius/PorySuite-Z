@@ -1820,6 +1820,13 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_import_pal_btn = QPushButton("Import from .pal…")
         self._fe_import_pal_btn.setToolTip(
             "Load a JASC .pal file and apply it to this sprite.")
+        self._fe_bake_png_btn = QPushButton("Bake Palette → PNG")
+        self._fe_bake_png_btn.setToolTip(
+            "Bake the palette shown above (whatever you just loaded or edited —\n"
+            "e.g. a tileset's palette) straight into THIS sprite's PNG now, so\n"
+            "GIMP shows the same colours the game will use. This is the plain\n"
+            "'use my loaded palette' bake — it does NOT need an overworld\n"
+            "palette tag (that's what 'Re-bake from Palette Tag' is for).")
         self._fe_rebake_tag_btn = QPushButton("Re-bake from Palette Tag…")
         self._fe_rebake_tag_btn.setToolTip(
             "Replace this sprite's palette with the live colours of an\n"
@@ -1833,6 +1840,7 @@ class FieldEffectSpritesTab(QWidget):
         fe_pal_btns.addWidget(self._fe_import_png_btn)
         fe_pal_btns.addWidget(self._fe_import_manual_btn)
         fe_pal_btns.addWidget(self._fe_import_pal_btn)
+        fe_pal_btns.addWidget(self._fe_bake_png_btn)
         fe_pal_btns.addWidget(self._fe_rebake_tag_btn)
         fe_pal_btns.addWidget(self._fe_browse_folder_btn)
         fe_pal_btns.addStretch(1)
@@ -1854,6 +1862,7 @@ class FieldEffectSpritesTab(QWidget):
         self._fe_import_png_btn.clicked.connect(self._import_palette_from_png)
         self._fe_import_manual_btn.clicked.connect(self._import_palette_from_png_manual)
         self._fe_import_pal_btn.clicked.connect(self._import_palette_from_pal)
+        self._fe_bake_png_btn.clicked.connect(self._bake_palette_to_png)
         self._fe_rebake_tag_btn.clicked.connect(self._rebake_from_palette_tag)
         self._fe_browse_folder_btn.clicked.connect(self._open_sprite_folder)
         self._fe_open_folder_btn.clicked.connect(self._open_current_sprite_folder)
@@ -2248,6 +2257,81 @@ class FieldEffectSpritesTab(QWidget):
                     self._open_folder(os.path.dirname(fp))
             else:
                 self._open_folder(os.path.dirname(fp))
+
+    def _bake_palette_to_png(self) -> None:
+        """Bake the palette currently shown in the swatch row (whatever the
+        user loaded/edited — e.g. a tileset's palette) straight into THIS
+        sprite's PNG right now, without needing an overworld palette tag.
+
+        Mirrors what File → Save does for this entry (writes the .pal sibling
+        if there is one, the DOWP .gbapal if the sprite is covered, and bakes
+        the PNG colour table), but scoped to the current sprite and immediate —
+        so opening the PNG in GIMP shows the game colours. Pixel indices are
+        untouched; only the colour table changes."""
+        if not self._current:
+            QMessageBox.information(self, "No Sprite", "Select a sprite first.")
+            return
+        entry = self._current
+        if not entry.png_path or not os.path.isfile(entry.png_path):
+            QMessageBox.warning(self, "Bake Palette",
+                                "This sprite has no PNG on disk to bake into.")
+            return
+        colors = list(self._fe_pal_row.colors())
+        key = self._bus_key(entry)
+        self._palettes[key] = colors
+        _get_palette_bus().set_overworld_palette(key, colors)
+
+        wrote = []
+        # 1. .pal sibling, if this sprite has one.
+        if entry.pal_path:
+            if write_jasc_pal(entry.pal_path, colors):
+                wrote.append(".pal")
+            else:
+                QMessageBox.warning(self, "Bake Palette",
+                                    f"Could not write {entry.pal_path}.")
+                return
+        # 2. DOWP .gbapal, if this sprite is covered by the refactor — keeps the
+        #    in-game bytes in sync (same as the save path).
+        try:
+            from core import field_effect_palette_refactor as _fer
+            from core.tilemap_data import _write_gbapal_file as _wgp
+            rel = os.path.relpath(entry.png_path, self._project_root).replace("\\", "/")
+            refactor = _fer.find_refactor_for_png(rel) if self._project_root else None
+            if refactor:
+                gbapal_abs = _fer.gbapal_path_for_refactor(self._project_root, refactor)
+                if _wgp(gbapal_abs, list(colors)):
+                    wrote.append(".gbapal")
+        except Exception:
+            pass
+        # 3. Bake into the PNG colour table (export_indexed_png needs indexed).
+        img = self._sprite_imgs.get(entry.png_path)
+        if img is None or img.format() != QImage.Format.Format_Indexed8:
+            disk_img = QImage(entry.png_path)
+            if disk_img.isNull():
+                QMessageBox.warning(self, "Bake Palette",
+                                    "Could not read the sprite PNG.")
+                return
+            if disk_img.format() != QImage.Format.Format_Indexed8:
+                disk_img = disk_img.convertToFormat(QImage.Format.Format_Indexed8)
+            img = disk_img
+        try:
+            export_indexed_png(img, colors, entry.png_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Bake Palette",
+                                f"Could not bake the PNG:\n{exc}")
+            return
+        wrote.append("PNG")
+
+        self._palette_dirty.discard(key)
+        self._sprite_png_dirty.discard(entry.png_path)
+        if not self._palette_dirty and not self._sprite_png_dirty:
+            self._fe_pal_frame.setStyleSheet("")
+        self._rebuild_list()
+        self.modified.emit()
+        QMessageBox.information(
+            self, "Palette Baked",
+            f"Baked the current palette into {entry.name} "
+            f"({', '.join(wrote)}). Open it in GIMP — it now shows these colours.")
 
     def _rebake_from_palette_tag(self) -> None:
         """Bake an OBJ_EVENT_PAL_TAG_* palette into the current FE sprite.

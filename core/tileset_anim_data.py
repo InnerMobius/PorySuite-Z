@@ -478,22 +478,25 @@ def add_frame_to_anim(project_dir: str, anim: TileAnimation,
         source, count=1
     )
 
-    # 2. Add new var to the frame array
-    # Find the array: sTilesetAnims_XXX[] = { ..., lastVar };
+    # 2. Add the new var to the frame array by inserting before the closing
+    # brace. The OLD approach matched `lastVar\s*}` which silently FAILED
+    # whenever the array had a trailing comma (`lastVar,\n}`) — the common case
+    # — so frames got INCBIN'd but never listed, and never played. Inserting
+    # before `};` and normalising the trailing comma is robust either way.
     arr_name = f"sTilesetAnims_{anim.anim_id}"
-    # Replace the closing of the array to include the new frame
-    arr_pattern = re.compile(
-        r'(static\s+const\s+u16\s+\*\s*const\s+'
-        + re.escape(arr_name)
-        + r'\[\]\s*=\s*\{[^}]*?)'
-        + re.escape(last_var)
-        + r'(\s*\})',
-        re.DOTALL
+    arr_close = re.compile(
+        r'(static\s+const\s+u16\s+\*\s*const\s+' + re.escape(arr_name)
+        + r'\[\]\s*=\s*\{.*?)(\n?\}\s*;)',
+        re.DOTALL,
     )
-    source = arr_pattern.sub(
-        lambda m: m.group(1) + last_var + ",\n    " + new_var + m.group(2),
-        source, count=1
-    )
+
+    def _add_entry(mm):
+        body = mm.group(1).rstrip()
+        if not body.endswith('{') and not body.endswith(','):
+            body += ','
+        return body + f"\n    {new_var}," + mm.group(2)
+
+    source, _n = arr_close.subn(_add_entry, source, count=1)
 
     with open(src_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
@@ -580,6 +583,88 @@ def discover_anim_dirs(project_dir: str) -> List[Tuple[str, str, str]]:
                 if pngs:
                     results.append((ts_type, tileset_name, anim_name))
     return results
+
+
+@dataclass
+class OrphanFrame:
+    """A frame PNG on disk that no animation in tileset_anims.c references."""
+    abs_path: str
+    rel_path: str          # path relative to project_dir, forward slashes
+    size: int              # bytes
+    tileset: str           # tileset folder name
+    tileset_type: str      # "primary" / "secondary"
+    anim_name: str         # anim folder name
+    whole_anim_orphaned: bool  # True if NO frame in this folder is referenced
+
+
+def find_orphaned_frames(project_dir: str) -> List["OrphanFrame"]:
+    """Return every numbered frame PNG on disk that is not referenced by any
+    animation in ``src/tileset_anims.c``.
+
+    Two ways a frame becomes orphaned:
+    * a single frame was deleted from an animation (the ``N.png`` stayed on
+      disk) — its folder still has other, referenced frames;
+    * a whole animation was removed or renamed — its old folder still has all
+      its PNGs but nothing references them.
+
+    The distinction is recorded in ``whole_anim_orphaned`` so the UI can group
+    them.  Files are matched case-insensitively on their absolute, normalised
+    path, so a Windows path never mismatches a reference parsed from the C
+    source.
+    """
+    def _norm(p: str) -> str:
+        return os.path.normcase(os.path.abspath(p))
+
+    referenced = set()
+    for anim in parse_tileset_anims(project_dir):
+        for fr in anim.frames:
+            if fr.png_path:
+                referenced.add(_norm(fr.png_path))
+
+    orphans: List[OrphanFrame] = []
+    tilesets_dir = os.path.join(project_dir, "data", "tilesets")
+    if not os.path.isdir(tilesets_dir):
+        return orphans
+
+    for ts_type in ("primary", "secondary"):
+        type_dir = os.path.join(tilesets_dir, ts_type)
+        if not os.path.isdir(type_dir):
+            continue
+        for tileset_name in os.listdir(type_dir):
+            anim_root = os.path.join(type_dir, tileset_name, "anim")
+            if not os.path.isdir(anim_root):
+                continue
+            for anim_name in os.listdir(anim_root):
+                anim_path = os.path.join(anim_root, anim_name)
+                if not os.path.isdir(anim_path):
+                    continue
+                pngs = [
+                    f for f in os.listdir(anim_path)
+                    if f.lower().endswith(".png") and f[:-4].isdigit()
+                ]
+                if not pngs:
+                    continue
+                abs_pngs = {f: os.path.join(anim_path, f) for f in pngs}
+                any_referenced = any(
+                    _norm(p) in referenced for p in abs_pngs.values())
+                for fname, apath in sorted(abs_pngs.items()):
+                    if _norm(apath) in referenced:
+                        continue
+                    try:
+                        size = os.path.getsize(apath)
+                    except OSError:
+                        size = 0
+                    rel = os.path.relpath(apath, project_dir).replace("\\", "/")
+                    orphans.append(OrphanFrame(
+                        abs_path=apath,
+                        rel_path=rel,
+                        size=size,
+                        tileset=tileset_name,
+                        tileset_type=ts_type,
+                        anim_name=anim_name,
+                        whole_anim_orphaned=not any_referenced,
+                    ))
+    return orphans
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1310,6 +1395,12 @@ def add_animation_to_tileset(
                           newline="\n") as f:
                     f.write(hdr)
 
+        # A brand-new InitTilesetAnim_<Tileset> must ALSO be declared in
+        # include/tileset_anims.h, or tilesets.c fails to compile
+        # ("InitTilesetAnim_X undeclared here") when headers.h references it as
+        # the tileset .callback.
+        ensure_init_declaration(project_dir, init_func_name)
+
     # ── Write updated source ─────────────────────────────────────────────
     with open(src_path, "w", encoding="utf-8", newline="\n") as f:
         f.write(source)
@@ -1339,6 +1430,177 @@ def add_animation_to_tileset(
         palette_hint=0,
         dispatch_func=dispatch_name,
     )
+
+
+def ensure_init_declaration(project_dir: str, init_func_name: str) -> bool:
+    """Make sure ``void <init_func_name>(void);`` is declared in
+    include/tileset_anims.h. Returns True if the header now contains it."""
+    hdr = os.path.join(project_dir, "include", "tileset_anims.h")
+    if not os.path.isfile(hdr):
+        return False
+    with open(hdr, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    decl = f"void {init_func_name}(void);"
+    if decl in text:
+        return True
+    # Insert after the last existing InitTilesetAnim_* declaration, else before
+    # the include guard's #endif.
+    decls = list(re.finditer(
+        r'void\s+InitTilesetAnim_\w+\s*\(void\);', text))
+    if decls:
+        pos = decls[-1].end()
+        text = text[:pos] + "\n" + decl + text[pos:]
+    else:
+        m = re.search(r'\n#endif\b', text)
+        if m:
+            text = text[:m.start()] + "\n" + decl + "\n" + text[m.start():]
+        else:
+            text = text.rstrip() + "\n" + decl + "\n"
+    with open(hdr, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    return True
+
+
+def remove_init_declaration(project_dir: str, init_func_name: str) -> bool:
+    """Remove a ``void <init_func_name>(void);`` line from
+    include/tileset_anims.h (called when the init function itself is deleted, so
+    no orphaned prototype is left behind). Returns True if a line was removed."""
+    hdr = os.path.join(project_dir, "include", "tileset_anims.h")
+    if not os.path.isfile(hdr):
+        return False
+    with open(hdr, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    new = re.sub(
+        r'^[ \t]*void[ \t]+' + re.escape(init_func_name) + r'[ \t]*\(void\);[ \t]*\n',
+        '', text, flags=re.MULTILINE)
+    if new == text:
+        return False
+    with open(hdr, "w", encoding="utf-8", newline="\n") as f:
+        f.write(new)
+    return True
+
+
+def sync_tileset_anim_declarations(project_dir: str) -> int:
+    """Self-heal: ensure EVERY ``void InitTilesetAnim_X(void)`` defined in
+    src/tileset_anims.c has a matching declaration in include/tileset_anims.h.
+    Fixes projects where an animation was added before the declaration step
+    existed (the "InitTilesetAnim_X undeclared here" build error). Returns the
+    number of declarations added."""
+    src = os.path.join(project_dir, "src", "tileset_anims.c")
+    if not os.path.isfile(src):
+        return 0
+    with open(src, "r", encoding="utf-8", errors="replace") as f:
+        source = f.read()
+    defined = re.findall(r'void\s+(InitTilesetAnim_\w+)\s*\(void\)\s*\{', source)
+    added = 0
+    for name in dict.fromkeys(defined):  # de-dup, keep order
+        hdr = os.path.join(project_dir, "include", "tileset_anims.h")
+        before = ''
+        if os.path.isfile(hdr):
+            with open(hdr, "r", encoding="utf-8", errors="replace") as f:
+                before = f.read()
+        if f"void {name}(void);" not in before:
+            if ensure_init_declaration(project_dir, name):
+                added += 1
+    return added
+
+
+def resync_anim_frame_array(project_dir: str, anim: "TileAnimation") -> bool:
+    """Rebuild an animation's ``sTilesetAnims_<id>[]`` array so it lists EVERY
+    ``Frame<N>`` INCBIN that exists for it, in numeric order. Repairs animations
+    whose frames were INCBIN'd but never added to the array (the "Add Frame said
+    it worked but the frame didn't play" bug). Returns True if the array was
+    rewritten."""
+    src = os.path.join(project_dir, "src", "tileset_anims.c")
+    if not os.path.isfile(src):
+        return False
+    with open(src, "r", encoding="utf-8", errors="replace") as f:
+        source = f.read()
+    prefix = f"sTilesetAnims_{anim.anim_id}_Frame"
+    frame_nums = sorted(int(n) for n in re.findall(
+        re.escape(prefix) + r'(\d+)\b', source))
+    frame_nums = list(dict.fromkeys(frame_nums))
+    if not frame_nums:
+        return False
+    arr_name = f"sTilesetAnims_{anim.anim_id}"
+    arr_re = re.compile(
+        r'static\s+const\s+u16\s+\*\s*const\s+' + re.escape(arr_name)
+        + r'\[\]\s*=\s*\{.*?\}\s*;', re.DOTALL)
+    m = arr_re.search(source)
+    if not m:
+        return False
+    entries = ",\n    ".join(f"{prefix}{n}" for n in frame_nums)
+    new_arr = (f"static const u16 *const {arr_name}[] = {{\n"
+               f"    {entries},\n}};")
+    source = source[:m.start()] + new_arr + source[m.end():]
+    with open(src, "w", encoding="utf-8", newline="\n") as f:
+        f.write(source)
+    return True
+
+
+def rebuild_anim_frames_from_disk(project_dir: str,
+                                  anim: "TileAnimation") -> bool:
+    """Rebuild an animation's INCBIN declarations AND its frame array from the
+    ``N.png`` files that exist on disk, in clean numeric order (0,1,2,…).
+
+    Repairs animations whose frame declarations got scrambled or dropped by
+    add/remove/resize (e.g. missing Frame0/Frame2, out-of-order entries). It is
+    idempotent — running it on a healthy animation is a no-op. Returns True if
+    the source was rewritten."""
+    src = os.path.join(project_dir, "src", "tileset_anims.c")
+    if not os.path.isfile(src):
+        return False
+    anim_dir = anim.anim_dir
+    if not anim_dir or not os.path.isdir(anim_dir):
+        return False
+
+    nums = sorted(int(f[:-4]) for f in os.listdir(anim_dir)
+                  if f.lower().endswith(".png") and f[:-4].isdigit())
+    if not nums:
+        return False
+
+    # Derive the INCBIN relative path from the tileset/anim identity.
+    rel_base = (f"data/tilesets/{anim.tileset_type}/{anim.tileset_name}/anim/"
+                f"{anim.name}")
+    cid = anim.anim_id
+
+    with open(src, "r", encoding="utf-8", errors="replace") as f:
+        source = f.read()
+
+    # Remove every existing Frame INCBIN line for this animation.
+    incbin_re = re.compile(
+        r'^static\s+const\s+u16\s+sTilesetAnims_' + re.escape(cid)
+        + r'_Frame\d+\[\]\s*=\s*INCBIN_U16\([^)]*\);\s*\n',
+        re.MULTILINE)
+    first_incbin = incbin_re.search(source)
+    insert_at = first_incbin.start() if first_incbin else None
+    source = incbin_re.sub('', source)
+
+    # Build clean INCBIN block + array.
+    incbins = "\n".join(
+        f'static const u16 sTilesetAnims_{cid}_Frame{n}[] = '
+        f'INCBIN_U16("{rel_base}/{n}.4bpp");' for n in nums)
+    entries = ",\n    ".join(f"sTilesetAnims_{cid}_Frame{n}" for n in nums)
+    new_array = (f"static const u16 *const sTilesetAnims_{cid}[] = {{\n"
+                 f"    {entries},\n}};")
+
+    # Replace the existing array in place.
+    arr_re = re.compile(
+        r'static\s+const\s+u16\s+\*\s*const\s+sTilesetAnims_' + re.escape(cid)
+        + r'\[\]\s*=\s*\{.*?\}\s*;', re.DOTALL)
+    arr_m = arr_re.search(source)
+    if not arr_m:
+        return False
+    source = source[:arr_m.start()] + new_array + source[arr_m.end():]
+
+    # Re-insert the clean INCBIN block just before the array.
+    arr_m = arr_re.search(source)  # re-find after array replacement
+    ins = arr_m.start() if arr_m else (insert_at or 0)
+    source = source[:ins] + incbins + "\n" + source[ins:]
+
+    with open(src, "w", encoding="utf-8", newline="\n") as f:
+        f.write(source)
+    return True
 
 
 def remove_animation_from_tileset(project_dir: str,
@@ -1431,6 +1693,9 @@ def remove_animation_from_tileset(project_dir: str,
                     )
                     source = init_pattern.sub('\n', source)
 
+                    # Drop its now-orphaned prototype from tileset_anims.h.
+                    remove_init_declaration(project_dir, anim.init_func)
+
                     # Set .callback = NULL in headers.h
                     hdr_path = os.path.join(
                         project_dir, "src", "data", "tilesets", "headers.h")
@@ -1455,9 +1720,115 @@ def remove_animation_from_tileset(project_dir: str,
     return True
 
 
+def _sanitize_anim_name(name: str) -> str:
+    """Normalise a user-entered animation name to a valid snake_case C-ident
+    fragment (lowercase, [a-z0-9_], never leading-digit)."""
+    s = re.sub(r'[^A-Za-z0-9]+', '_', (name or '').strip()).strip('_').lower()
+    if s and s[0].isdigit():
+        s = 'a_' + s
+    return s
+
+
+def rename_animation(project_dir: str, anim: TileAnimation,
+                     new_name: str) -> Optional[TileAnimation]:
+    """Rename an animation EVERYWHERE and return the mutated *anim* (or None on
+    failure / no-op / collision).
+
+    Renames, consistently: the C symbols in ``tileset_anims.c``
+    (``sTilesetAnims_<id>`` — the frame vars + the array — and
+    ``QueueAnimTiles_<id>``), the INCBIN frame paths, and the on-disk frame
+    directory. Only the ANIM part of the id changes; the tileset prefix stays.
+    """
+    import shutil
+    new_snake = _sanitize_anim_name(new_name)
+    if not new_snake or new_snake == anim.name:
+        return None
+
+    tileset_camel = _snake_to_camel(anim.tileset_name)
+    new_camel = _snake_to_camel(new_snake)
+    old_c_id = anim.anim_id                       # e.g. "General_Flower"
+    new_c_id = f"{tileset_camel}_{new_camel}"     # e.g. "General_Waterfall"
+    if new_c_id == old_c_id:
+        return None
+
+    src_path = os.path.join(project_dir, "src", "tileset_anims.c")
+    if not os.path.isfile(src_path):
+        return None
+    with open(src_path, encoding="utf-8", errors="replace") as f:
+        source = f.read()
+
+    # Refuse a collision with an existing animation of the new id.
+    if re.search(r'sTilesetAnims_' + re.escape(new_c_id) + r'(?![A-Za-z0-9])',
+                 source):
+        return None
+    new_dir = os.path.join(project_dir, "data", "tilesets", anim.tileset_type,
+                           anim.tileset_name, "anim", new_snake)
+    if os.path.exists(new_dir):
+        return None
+
+    # 1. Rename the C symbols. The negative lookahead keeps a longer sibling id
+    #    (Flower vs FlowerBig) from being partially matched, while still catching
+    #    the ``_Frame0`` suffixes and the ``[`` array uses.
+    for prefix in ("sTilesetAnims_", "QueueAnimTiles_"):
+        source = re.sub(
+            re.escape(prefix + old_c_id) + r'(?![A-Za-z0-9])',
+            prefix + new_c_id, source)
+
+    # 2. Rename the INCBIN frame paths (they use the snake anim name), scoped to
+    #    THIS tileset so a same-named anim in another tileset isn't touched.
+    old_rel = f"{anim.tileset_type}/{anim.tileset_name}/anim/{anim.name}/"
+    new_rel = f"{anim.tileset_type}/{anim.tileset_name}/anim/{new_snake}/"
+    source = source.replace(old_rel, new_rel)
+
+    with open(src_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(source)
+
+    # 3. Move the frame directory on disk.
+    old_dir = os.path.join(project_dir, "data", "tilesets", anim.tileset_type,
+                           anim.tileset_name, "anim", anim.name)
+    if os.path.isdir(old_dir):
+        try:
+            shutil.move(old_dir, new_dir)
+        except OSError:
+            pass
+
+    # 4. Update the in-memory anim so the UI reflects it without a full reload.
+    anim.name = new_snake
+    anim.anim_id = new_c_id
+    for fr in anim.frames:
+        fr.png_path = os.path.join(new_dir, os.path.basename(fr.png_path))
+        fr.var_name = re.sub(
+            r'sTilesetAnims_' + re.escape(old_c_id) + r'(?![A-Za-z0-9])',
+            f'sTilesetAnims_{new_c_id}', fr.var_name)
+    return anim
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Palette Loader
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def find_primary_for_secondary(project_dir: str, secondary_name: str) -> str:
+    """Return the snake-case dir name of the primary tileset a secondary is
+    paired with in layouts.json (e.g. ``'general'``). Secondary tilesets don't
+    define palette slots 0..6 — those come from whatever primary is loaded with
+    them at runtime — so we need the pairing to show the right colours.
+    Defaults to ``'general'`` (the standard outdoor primary) if not found."""
+    import json
+    sec_sym = f"gTileset_{_snake_to_camel(secondary_name)}"
+    layouts = os.path.join(project_dir, "data", "layouts", "layouts.json")
+    if os.path.isfile(layouts):
+        try:
+            with open(layouts, encoding="utf-8") as f:
+                data = json.load(f)
+            for lay in data.get("layouts", []):
+                if lay and lay.get("secondary_tileset") == sec_sym:
+                    prim = lay.get("primary_tileset", "")
+                    if prim.startswith("gTileset_"):
+                        return _camel_to_snake(prim[len("gTileset_"):])
+        except Exception:
+            pass
+    return "general"
 
 
 def load_tileset_palettes(
@@ -1467,18 +1838,34 @@ def load_tileset_palettes(
 
     Returns a list of 16 palettes, each containing 16 ``(r, g, b)`` tuples
     clamped to GBA 15-bit colour depth.
+
+    For a SECONDARY tileset, palette slots 0..6 (``NUM_PALS_IN_PRIMARY``) are
+    supplied by the paired PRIMARY tileset at runtime — not by the secondary's
+    own placeholder files — so those slots are loaded from the primary (General
+    by default). This matches what the game actually renders.
     """
     from ui.palette_utils import read_jasc_pal
 
-    pal_dir = os.path.join(
-        project_dir, "data", "tilesets", tileset_type, tileset_name,
-        "palettes")
+    NUM_PALS_IN_PRIMARY = 7
+
+    def _pal_dir(name: str, ttype: str) -> str:
+        return os.path.join(project_dir, "data", "tilesets", ttype, name,
+                            "palettes")
+
+    own_dir = _pal_dir(tileset_name, tileset_type)
+    primary_dir = None
+    if tileset_type == "secondary":
+        primary_name = find_primary_for_secondary(project_dir, tileset_name)
+        primary_dir = _pal_dir(primary_name, "primary")
 
     black16: List[Tuple[int, int, int]] = [(0, 0, 0)] * 16
     palettes: List[List[Tuple[int, int, int]]] = []
 
     for slot in range(16):
-        pal_path = os.path.join(pal_dir, f"{slot:02d}.pal")
+        if primary_dir is not None and slot < NUM_PALS_IN_PRIMARY:
+            pal_path = os.path.join(primary_dir, f"{slot:02d}.pal")
+        else:
+            pal_path = os.path.join(own_dir, f"{slot:02d}.pal")
         if not os.path.isfile(pal_path):
             palettes.append(list(black16))
             continue

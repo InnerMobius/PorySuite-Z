@@ -21,7 +21,7 @@ for _p in (ROOT_DIR, os.path.join(ROOT_DIR, "core")):
 
 from core.sound.song_table_manager import (
     SongTableData, SongEntry, write_midi_cfg, update_midi_cfg_flags,
-    _backdate_midi_cfg,
+    _backdate_midi_cfg, voicegroup_index_from_name,
 )
 
 _NAMES = ("se_heart", "se_rupee", "se_small_item")
@@ -90,6 +90,56 @@ class MidiCfgMtimeTest(unittest.TestCase):
         self.assertLess(cfg_mt, min(self._s_mtime(n) for n in _NAMES))
         for n in _NAMES:
             self.assertEqual(self._s_mtime(n), before[n])
+
+    def test_voicegroup_index_from_name(self):
+        self.assertEqual(voicegroup_index_from_name("voicegroup013"), 13)
+        self.assertEqual(voicegroup_index_from_name("voicegroup008"), 8)
+        self.assertEqual(voicegroup_index_from_name("voicegroup8"), 8)
+        self.assertIsNone(voicegroup_index_from_name(None))
+        self.assertIsNone(voicegroup_index_from_name("nope"))
+
+    def test_update_flags_syncs_G_and_preserves_other_flags(self):
+        # The voicegroup-desync fix: a save must be able to change -G to the
+        # song's current bank so the mid2agb recompile can't revert it. Passing
+        # the other flags too must PRESERVE them (a None arg drops a flag).
+        ok = update_midi_cfg_flags(self.root, "se_small_item",
+                                   voicegroup=voicegroup_index_from_name("voicegroup008"),
+                                   volume=90, reverb=50, priority=0)
+        self.assertTrue(ok)
+        line = [l for l in open(self.cfg, encoding="utf-8")
+                if l.startswith("se_small_item.mid")][0]
+        self.assertIn("-G008", line, "-G must be synced to the new voicegroup")
+        self.assertIn("-V090", line, "-V must be preserved, not dropped")
+        self.assertIn("-R50", line, "-R must be preserved when passed")
+        # every OTHER song's line is untouched (surgical, one-line update)
+        others = [l for l in open(self.cfg, encoding="utf-8")
+                  if l.startswith("se_heart.mid") or l.startswith("se_rupee.mid")]
+        for l in others:
+            self.assertIn("-G013", l)
+
+    def test_save_paths_still_wire_the_voicegroup_G_sync(self):
+        # GUARD against the exact regression the user hit ("the -G thing didn't
+        # stick"): a save path calls recompile_song, which regenerates the .s
+        # from midi.cfg's -G — so it MUST first update_midi_cfg_flags(...,
+        # voicegroup=...). If a refactor drops that arg, the bank silently
+        # reverts again. Assert the wiring is present in each save path body.
+        import re as _re
+        checks = [
+            ("ui/piano_roll_window.py", r"def save_to_disk"),
+            ("ui/sound_editor_tab.py", r"def _save_song_via_mid2agb"),
+        ]
+        for rel, fn_re in checks:
+            src = open(os.path.join(ROOT_DIR, rel), encoding="utf-8").read()
+            m = _re.search(fn_re, src)
+            self.assertIsNotNone(m, f"{fn_re} not found in {rel}")
+            # body = from the def to the next top-level def
+            body = src[m.start():]
+            nxt = _re.search(r"\n    def ", body[10:])
+            body = body[:nxt.start() + 10] if nxt else body
+            self.assertIn("voicegroup", body,
+                          f"{rel}:{fn_re} must pass voicegroup to update_midi_cfg_flags "
+                          f"before recompile_song, or a bank change reverts")
+            self.assertIn("recompile_song", body)
 
     def test_backdate_helper_handles_no_s_files(self):
         # An empty dir (no .s) must not raise and must leave cfg alone.

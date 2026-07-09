@@ -292,14 +292,27 @@ def _deduplicate_simultaneous_notes(mid: mido.MidiFile) -> mido.MidiFile:
                 key = (msg.channel, msg.time)
                 simultaneous.setdefault(key, []).append((i, msg.note, msg.velocity))
 
-        # For each group with >1 note_on, keep highest velocity, drop the rest
+        # For each chord (>1 note_on at the same channel+tick) keep ONE note.
+        # Which one matters — M4A is monophonic per track, so the survivor is
+        # what you hear:
+        #   • Melodic channels: keep the HIGHEST-PITCH note. In almost all
+        #     arrangements the melody is the top voice of a chord, so keeping
+        #     the top note preserves the tune. (Keeping the loudest note here —
+        #     the old behaviour — dropped the melody wherever a harmony/bass
+        #     note happened to be louder, which is exactly "some notes are the
+        #     wrong notes".)
+        #   • Drum channel (9): keep the LOUDEST hit (a kick matters more than
+        #     a hi-hat); pitch is meaningless for percussion.
         drop_indices: set[int] = set()
         # bag of (channel, note) → remaining note_offs to drop for each dropped note_on
         drop_note_off_bag: dict[tuple, int] = {}
-        for group in simultaneous.values():
+        for (grp_ch, _tick), group in simultaneous.items():
             if len(group) < 2:
                 continue
-            group.sort(key=lambda x: x[2], reverse=True)  # sort by velocity desc
+            if grp_ch == 9:  # drums — loudest wins
+                group.sort(key=lambda x: x[2], reverse=True)
+            else:            # melodic — top note (the melody) wins
+                group.sort(key=lambda x: (x[1], x[2]), reverse=True)
             for idx, note, _vel in group[1:]:
                 drop_indices.add(idx)
                 key = (abs_msgs[idx].channel, note)
@@ -334,6 +347,129 @@ def _deduplicate_simultaneous_notes(mid: mido.MidiFile) -> mido.MidiFile:
         _abs_to_delta(clean)
         out.tracks.append(mido.MidiTrack(clean))
 
+    return out
+
+
+def _split_polyphony_to_voices(mid: mido.MidiFile, drum_channel: int = 9):
+    """Split overlapping notes on each MELODIC channel across extra channels so
+    the monophonic GBA engine can play the whole chord/arpeggio.
+
+    The old approach threw chord notes away (a 2-voice arpeggio became a
+    scrambled single line). Instead, within any group of overlapping notes the
+    HIGHEST pitch stays on the original channel (voice 0 = the top line) and
+    each lower voice moves to a freshly-allocated free channel — so a track's
+    worth of notes becomes one GBA track per voice, and nothing is lost.
+
+    The drum channel is left untouched (percussion is genuinely one-shot).
+    Returns a new MidiFile.
+    """
+    ticks = mid.ticks_per_beat
+
+    # ── Collect notes + non-note events per channel (absolute time) ──────────
+    # notes[ch] = list of dicts {start, end, note, vel}
+    notes: dict[int, list[dict]] = {}
+    others: dict[int, list] = {}   # ch -> [(abs_time, msg)] non-note channel msgs
+    conductor: list = []           # (abs_time, meta msg)
+    for track in mid.tracks:
+        t = 0
+        pending: dict[tuple, list[int]] = {}   # (ch, note) -> [start times]
+        for msg in track:
+            t += msg.time
+            ch = getattr(msg, 'channel', None)
+            if ch is None:
+                if msg.is_meta and msg.type != 'end_of_track':
+                    conductor.append((t, msg))
+                continue
+            if msg.type == 'note_on' and msg.velocity > 0:
+                pending.setdefault((ch, msg.note), []).append((t, msg.velocity))
+                notes.setdefault(ch, [])
+            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                st_list = pending.get((ch, msg.note))
+                if st_list:
+                    start, vel = st_list.pop(0)
+                    notes.setdefault(ch, []).append(
+                        {'start': start, 'end': t, 'note': msg.note, 'vel': vel})
+            else:
+                others.setdefault(ch, []).append((t, msg))
+
+    used = set(notes) | set(others)
+    free = [c for c in range(16) if c != drum_channel and c not in used]
+
+    out = mido.MidiFile(type=1, ticks_per_beat=ticks)
+    # conductor track
+    conductor.sort(key=lambda x: x[0])
+    cond = [m.copy(time=at) for at, m in conductor]
+    _abs_to_delta(cond)
+    cond.append(mido.MetaMessage('end_of_track', time=0))
+    out.tracks.append(mido.MidiTrack(cond))
+
+    def emit_channel(ch_out, chan_notes, chan_others):
+        events = []
+        for n in chan_notes:
+            events.append((n['start'], mido.Message(
+                'note_on', channel=ch_out, note=n['note'], velocity=n.get('vel', 100))))
+            events.append((n['end'], mido.Message(
+                'note_off', channel=ch_out, note=n['note'], velocity=0)))
+        for at, m in chan_others:
+            events.append((at, m.copy(channel=ch_out)))
+        # stable sort: at a tick, note_off before note_on so a retrigger of the
+        # same pitch doesn't cancel itself
+        order = {'note_off': 0}
+        events.sort(key=lambda e: (e[0], order.get(e[1].type, 1)))
+        msgs = [m.copy(time=at) for at, m in events]
+        _abs_to_delta(msgs)
+        msgs.append(mido.MetaMessage('end_of_track', time=0))
+        out.tracks.append(mido.MidiTrack(msgs))
+
+    # A voice only earns its own GBA track if it's a real independent line;
+    # a couple of stray legato overlaps fold back to the main voice (they play
+    # mono, an inaudible cut) rather than burning a whole track on one note.
+    MIN_VOICE_NOTES = 4
+
+    for ch in sorted(notes):
+        chan_notes = notes[ch]
+        chan_others = others.get(ch, [])
+        if ch == drum_channel:
+            # percussion: collapse same-tick stacks to the loudest hit (the old
+            # drum-thinning) — pitch is meaningless, and it keeps the buffer lean
+            by_tick: dict[int, list[dict]] = {}
+            for n in chan_notes:
+                by_tick.setdefault(n['start'], []).append(n)
+            kept = []
+            for grp in by_tick.values():
+                kept.append(max(grp, key=lambda n: n.get('vel', 0)))
+            emit_channel(ch, kept, chan_others)
+            continue
+        # assign notes to voices: highest pitch = voice 0. Greedy — a note joins
+        # the lowest voice whose previous note has already ended.
+        chan_notes.sort(key=lambda n: (n['start'], -n['note']))
+        voices: list[list[dict]] = []
+        voice_end: list[int] = []
+        for n in chan_notes:
+            placed = False
+            for vi in range(len(voices)):
+                if voice_end[vi] <= n['start']:
+                    voices[vi].append(n)
+                    voice_end[vi] = n['end']
+                    placed = True
+                    break
+            if not placed:
+                voices.append([n])
+                voice_end.append(n['end'])
+        # keep substantial voices as separate tracks; fold thin ones into voice 0
+        main = voices[0] if voices else []
+        keep_voices = [main]
+        for v in voices[1:]:
+            if len(v) >= MIN_VOICE_NOTES and free:
+                keep_voices.append(v)
+            else:
+                main.extend(v)   # fold back (plays mono where it overlaps)
+        main.sort(key=lambda n: n['start'])
+        for vi, vnotes in enumerate(keep_voices):
+            # every voice carries the channel's control events (program change,
+            # pan, volume…) so a split-off voice plays the SAME instrument as
+            # its parent instead of defaulting to voicegroup slot 0.
+            emit_channel(ch if vi == 0 else free.pop(0), vnotes, chan_others)
     return out
 
 
@@ -475,10 +611,12 @@ def run_mid2agb(
         if mid.type == 0 and len(mid.tracks) == 1:
             mid = _split_type0_to_type1(mid)
 
-        # Remove simultaneous note_ons on the same channel at the same tick.
-        # Drum tracks especially can have kick+snare+cymbal all at beat 1,
-        # which bloats mid2agb's per-track event buffer and causes truncation.
-        mid = _deduplicate_simultaneous_notes(mid)
+        # Split polyphony into voices so chords/arpeggios survive the GBA's
+        # one-note-per-track engine (a melodic chord becomes N tracks instead
+        # of being collapsed to a scrambled single line), and thin same-tick
+        # drum stacks to the loudest hit (keeps mid2agb's buffer from
+        # overflowing on kick+snare+cymbal beats).
+        mid = _split_polyphony_to_voices(mid)
 
         mid.save(midi_dest)
     except Exception:

@@ -423,6 +423,286 @@ def parse_scripts_inc(map_dir: Path, texts: OrderedDict | None = None) -> tuple[
     return results, hidden_lines
 
 
+# ── Multi-condition page support ──────────────────────────────────────────
+# A condition-page can require SEVERAL flag/var checks that must ALL be true
+# (logical AND), like RPG Maker's page conditions. A single condition keeps the
+# vanilla positive-jump form (no churn on existing single-flag scripts); 2+
+# conditions lower to a guard block that jumps to a skip label if ANY check
+# fails, then falls into the page body only when every check passed.
+#
+# A "condition" is a target-less positive check tuple, reusing the command
+# vocab so _condition_text and the pickers work unchanged:
+#     ('goto_if_set',  FLAG)                — flag must be ON
+#     ('goto_if_unset', FLAG)               — flag must be OFF
+#     ('goto_if_eq', VAR, VALUE) (or ne/lt/ge/le/gt)  — variable comparison
+
+_NEGATE_GOTO = {
+    'goto_if_set': 'goto_if_unset', 'goto_if_unset': 'goto_if_set',
+    'goto_if_eq': 'goto_if_ne', 'goto_if_ne': 'goto_if_eq',
+    'goto_if_lt': 'goto_if_ge', 'goto_if_ge': 'goto_if_lt',
+    'goto_if_le': 'goto_if_gt', 'goto_if_gt': 'goto_if_le',
+}
+
+
+def _cond_with_target(cond: tuple, target: str) -> tuple:
+    """Append *target* to a target-less condition tuple → a real goto tuple."""
+    return tuple(cond) + (target,)
+
+
+def _cond_without_target(goto_tuple: tuple) -> tuple:
+    """Strip the trailing target label from a goto_if_* tuple → a condition."""
+    return tuple(goto_tuple[:-1])
+
+
+def _negate_cond(cond: tuple) -> tuple:
+    """Return the logical negation of a condition (for guard-block jumps)."""
+    return (_NEGATE_GOTO.get(cond[0], cond[0]),) + tuple(cond[1:])
+
+
+def lower_conditions_to_gotos(conditions: list, page_label: str,
+                              skip_label: str) -> list:
+    """Turn a page's AND-conditions into the command tuples that select it.
+
+    * 1 condition  → ``[positive_goto → page_label]`` (vanilla form, no churn).
+    * 2+ conditions → guard block: negated check → *skip_label* for each, then
+      ``goto page_label``, then an inline ``skip_label::`` marker so the next
+      page's checks / the default body continue there.
+    """
+    conditions = [tuple(c) for c in conditions if c]
+    if not conditions:
+        return []
+    if len(conditions) == 1:
+        return [_cond_with_target(conditions[0], page_label)]
+    out = [_cond_with_target(_negate_cond(c), skip_label) for c in conditions]
+    out.append(('goto', page_label))
+    out.append(('_label_marker', skip_label))
+    return out
+
+
+_CONDITION_GOTOS = frozenset(_NEGATE_GOTO.keys())
+
+
+def gather_condition_selectors(entry_label: str, scripts: dict,
+                               preamble_cmds: frozenset):
+    """Chain-walk a script's leading condition checks, following the skip labels
+    that the save-split turns into separate blocks, so multi-condition guard
+    blocks reassemble correctly on load.
+
+    Returns ``(preamble, selectors, default_label, default_body, consumed,
+    inline)``:
+      * *selectors* — flat list of ``{conditions, page_label, ...}`` per page.
+      * *default_label* — label whose block holds the fall-through body.
+      * *default_body* — the fall-through command list.
+      * *consumed* — set of skip-label blocks absorbed by the walk (the caller
+        must not also present them as their own pages).
+      * *inline* — the inline hand-written selector if one was folded, else None.
+    """
+    preamble_out: list = []
+    selectors_out: list = []
+    consumed: set = set()
+    cur_label = entry_label
+    cur = list(scripts.get(entry_label, []))
+    first = True
+    guard = 0  # safety bound against pathological loops
+    while guard < 4096:
+        guard += 1
+        pre, sels, bstart = lift_leading_conditions(cur, preamble_cmds)
+        if first:
+            preamble_out = pre
+            first = False
+        inl = next((s for s in sels if s.get('inline')), None)
+        selectors_out.extend([s for s in sels if not s.get('inline')])
+        if inl is not None:
+            return (preamble_out, selectors_out, cur_label,
+                    list(cur[bstart:]), consumed, inl)
+        cont = None
+        if selectors_out and bstart >= len(cur):
+            sk = selectors_out[-1].get('skip_label')
+            if sk and sk in scripts and sk not in consumed and sk != cur_label:
+                cont = sk
+        if cont:
+            consumed.add(cont)
+            cur_label = cont
+            cur = list(scripts.get(cont, []))
+            continue
+        return (preamble_out, selectors_out, cur_label,
+                list(cur[bstart:]), consumed, None)
+    return preamble_out, selectors_out, cur_label, [], consumed, None
+
+
+def lift_leading_conditions(cmds: list, preamble_cmds: frozenset):
+    """Walk a script's leading checks and group them into page selectors.
+
+    Recognises three shapes and returns ``(preamble, selectors, body_start)``:
+
+    * **single positive jump** — ``goto_if_set FLAG, Label`` → one selector with
+      one condition, body under ``Label`` (unchanged vanilla behavior).
+    * **EVENTide guard block** — negated checks all jumping to a shared skip
+      label, then ``goto PageLabel``, then that ``skip_label::`` inline → one
+      selector with the checks re-negated to their required (positive) form,
+      body under ``PageLabel``.
+    * **hand-written guard chain** — 2+ consecutive same-target checks followed
+      by an INLINE body (no ``goto``) → one selector requiring the negated
+      checks, whose body is the inline entry body and whose fallback is the
+      shared target. ``page_label=None`` marks the inline-body case.
+
+    Each selector is ``{'conditions': [...], 'page_label': str|None,
+    'skip_label': str|None, 'inline': bool}``. ``body_start`` is the index in
+    *cmds* where the default/inline body begins.
+    """
+    def _last(t):
+        return t[-1] if t and len(t) > 1 else None
+
+    preamble: list = []
+    selectors: list = []
+    i, n = 0, len(cmds)
+    while i < n:
+        c = cmds[i]
+        if not c:
+            i += 1
+            continue
+        cmd = c[0]
+        if cmd in preamble_cmds:
+            preamble.append(c)
+            i += 1
+            continue
+        if cmd not in _CONDITION_GOTOS:
+            break  # first real body command
+
+        target = _last(c)
+        run = [c]
+        j = i + 1
+        while (j < n and cmds[j] and cmds[j][0] in _CONDITION_GOTOS
+               and _last(cmds[j]) == target):
+            run.append(cmds[j])
+            j += 1
+
+        # Guard block: 2+ checks that SHARE a target (the skip label), followed
+        # by `goto PageLabel`. The checks are negated back to their required
+        # (positive) form. Covers both the pre-split form (an inline
+        # `_label_marker skip` follows) and the reloaded form (skip is a
+        # separate block reached by fall-through, no marker).
+        if (len(run) >= 2 and j < n and cmds[j] and cmds[j][0] == 'goto'
+                and len(cmds[j]) > 1):
+            page_label = cmds[j][1]
+            conditions = [_negate_cond(_cond_without_target(g)) for g in run]
+            selectors.append({'conditions': conditions,
+                              'page_label': page_label,
+                              'skip_label': target, 'inline': False})
+            i = j + 1
+            if (i < n and cmds[i] and cmds[i][0] == '_label_marker'
+                    and _last(cmds[i]) == target):
+                i += 1  # swallow the inline skip marker (pre-split form)
+            continue
+
+        # Single positive jump (vanilla one-condition page): condition kept
+        # as-is, body under its own target. A `goto` that may follow is the
+        # default jump, left for the body walk to pick up.
+        if len(run) == 1:
+            selectors.append({'conditions': [_cond_without_target(c)],
+                              'page_label': target, 'skip_label': None,
+                              'inline': False})
+            i += 1
+            continue
+
+        # 2+ shared-target checks with an INLINE body (hand-written, no trailing
+        # goto): fold into one AND-page whose body is what follows inline.
+        conditions = [_negate_cond(_cond_without_target(g)) for g in run]
+        selectors.append({'conditions': conditions, 'page_label': None,
+                          'skip_label': target, 'inline': True})
+        i = j
+        break
+
+    return preamble, selectors, i
+
+
+def parse_raw_script_text(raw_text: str, texts: dict | None = None
+                          ) -> tuple[dict[str, list], dict[str, str], list[str]]:
+    """Parse hand-edited raw ``.inc`` text (the Raw Script Code editor) back
+    into command tuples and text strings.
+
+    The text may contain a mix of script label blocks (``Label::`` followed by
+    command lines) and text label blocks (``Label::`` followed by ``.string``/
+    ``.braille`` lines). Each ``Label::`` starts a new block; a block is a TEXT
+    block if its body has any ``.string``/``.braille`` directive, otherwise it
+    is a SCRIPT block parsed with the same parser the file loader uses.
+
+    Returns ``(scripts, out_texts, order)`` where *scripts* maps label →
+    command-tuple list, *out_texts* maps label → string (``__BRAILLE__``-
+    prefixed for braille), and *order* is the label order as written. Text
+    blocks are resolved BEFORE scripts so a ``msgbox Label`` picks up the
+    edited string. Raises ``ValueError`` with a plain-English message on a
+    malformed block so the caller can refuse to save.
+    """
+    label_re = re.compile(r'^([A-Za-z0-9_]+)::')
+    string_re = re.compile(r'\.string\s+"((?:\\.|[^"])*)"')
+    braille_re = re.compile(r'\.braille\s+"((?:\\.|[^"])*)"')
+
+    # ── Split into (label, body_lines) blocks ────────────────────────────
+    blocks: list[tuple[str, list[str]]] = []
+    current: str | None = None
+    body: list[str] = []
+    for raw_line in raw_text.splitlines():
+        stripped = raw_line.strip()
+        m = label_re.match(stripped)
+        if m:
+            if current is not None:
+                blocks.append((current, body))
+            current = m.group(1)
+            body = []
+            continue
+        if current is None:
+            # Non-blank, non-comment content before any label is an error.
+            if stripped and not stripped.startswith('@'):
+                raise ValueError(
+                    f'Line before the first label:: — "{stripped[:40]}"')
+            continue
+        body.append(raw_line)
+    if current is not None:
+        blocks.append((current, body))
+
+    if not blocks:
+        raise ValueError('No script labels (Name::) found.')
+
+    # ── First pass: text blocks ──────────────────────────────────────────
+    merged_texts: dict[str, str] = dict(texts or {})
+    out_texts: dict[str, str] = {}
+    order: list[str] = []
+    script_blocks: list[tuple[str, list[str]]] = []
+    for label, blines in blocks:
+        order.append(label)
+        is_text = any(string_re.search(l) or braille_re.search(l)
+                      for l in blines)
+        if is_text:
+            buf: list[str] = []
+            is_braille = False
+            for l in blines:
+                bm = braille_re.search(l)
+                if bm:
+                    is_braille = True
+                    buf.append(bm.group(1).replace('\\n', '\n')
+                               .replace('\\p', '\n\n'))
+                    continue
+                sm = string_re.search(l)
+                if sm:
+                    buf.append(sm.group(1).replace('\\n', '\n')
+                               .replace('\\p', '\n\n'))
+            val = ''.join(buf)
+            if is_braille:
+                val = _BRAILLE_PREFIX + val
+            out_texts[label] = val
+            merged_texts[label] = val
+        else:
+            script_blocks.append((label, blines))
+
+    # ── Second pass: script blocks (with texts resolved) ─────────────────
+    scripts: dict[str, list] = {}
+    for label, blines in script_blocks:
+        scripts[label] = _parse_script_lines(blines, merged_texts)
+
+    return scripts, out_texts, order
+
+
 _FLAG_RE = re.compile(r'\bFLAG_[A-Za-z0-9_]+\b')
 _VAR_RE = re.compile(r'\bVAR_[A-Za-z0-9_]+\b')
 
@@ -1573,10 +1853,12 @@ def _render_label_block(
                 page.get('hidden_lines') or hidden_lines.get(page_label, []),
             )
             out.extend(merged)
-            # Only append end if the commands don't already end with
-            # end/return/releaseall
+            # Only append end if the commands don't already TERMINATE the
+            # script. releaseall is NOT a terminator — in vanilla it is always
+            # followed by `end` — so a script ending in releaseall still needs
+            # one, or execution runs past it into the next block.
             last_cmd = _last_nonblank(merged)
-            if last_cmd not in ('end', 'return', 'releaseall', 'step_end'):
+            if last_cmd not in ('end', 'return', 'step_end'):
                 out.append('end\n')
             out.append('\n')
     else:
@@ -1590,8 +1872,10 @@ def _render_label_block(
             cmd_lines, hidden_lines.get(label, []),
         )
         out.extend(merged)
+        # releaseall is NOT a terminator (vanilla always follows it with `end`),
+        # so a script ending in releaseall still needs an appended `end`.
         last_cmd = _last_nonblank(merged)
-        if last_cmd not in ('end', 'return', 'releaseall', 'step_end'):
+        if last_cmd not in ('end', 'return', 'step_end'):
             out.append('end\n')
         out.append('\n')
 

@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QMenu, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
+    QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QVBoxLayout,
     QWidget,
 )
 
@@ -44,6 +44,7 @@ from core.tileset_anim_data import (
     write_counter_max_to_source,
     add_frame_to_anim, remove_frame_from_anim,
     add_animation_to_tileset, remove_animation_from_tileset,
+    rename_animation,
 )
 from ui.open_folder_util import open_folder, open_in_folder
 from ui.palette_utils import Color, clamp_to_gba, read_jasc_pal, write_jasc_pal
@@ -711,7 +712,11 @@ class _AddAnimDialog(QDialog):
 
         self._png_paths: List[str] = []
         self._png_label = QLabel("No files selected")
-        btn_pick = QPushButton("Select Frame PNGs...")
+        btn_pick = QPushButton("Select Frame Images...")
+        btn_pick.setToolTip(
+            "Pick the frame pictures for this animation.\n"
+            "Indexed PNG or indexed BMP (legacy AnimEdit tools). BMPs are\n"
+            "converted to indexed PNGs automatically, keeping their palette.")
         btn_pick.clicked.connect(self._pick_pngs)
         png_row = QHBoxLayout()
         png_row.addWidget(btn_pick)
@@ -729,7 +734,8 @@ class _AddAnimDialog(QDialog):
 
     def _pick_pngs(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Frame PNGs", "", "PNG Images (*.png)")
+            self, "Select Frame Images", "",
+            "Images (*.png *.bmp);;PNG Images (*.png);;BMP Images (*.bmp)")
         if paths:
             self._png_paths = sorted(paths)
             self._png_label.setText(f"{len(paths)} file(s) selected")
@@ -829,6 +835,23 @@ class TileAnimEditorWidget(QWidget):
         self._btn_remove_anim.clicked.connect(self._remove_animation)
         header.addWidget(self._btn_remove_anim)
 
+        self._btn_rename_anim = QPushButton("Rename")
+        self._btn_rename_anim.setFixedWidth(65)
+        self._btn_rename_anim.setToolTip(
+            "Rename the selected animation everywhere — its source symbols\n"
+            "(sTilesetAnims_*, QueueAnimTiles_*), its INCBIN frame paths, and\n"
+            "its frame folder. The tileset prefix is kept.")
+        self._btn_rename_anim.clicked.connect(self._rename_animation)
+        header.addWidget(self._btn_rename_anim)
+
+        self._btn_cleanup_frames = QPushButton("Clean Up…")
+        self._btn_cleanup_frames.setFixedWidth(80)
+        self._btn_cleanup_frames.setToolTip(
+            "Find and delete leftover frame pictures that no animation uses\n"
+            "anymore (from deleted frames or removed animations).")
+        self._btn_cleanup_frames.clicked.connect(self._cleanup_frames)
+        header.addWidget(self._btn_cleanup_frames)
+
         sep1 = QLabel("|")
         sep1.setStyleSheet("color: #555;")
         header.addWidget(sep1)
@@ -868,18 +891,22 @@ class TileAnimEditorWidget(QWidget):
         # ================================================================
         #  MAIN BODY: LEFT (properties, fixed) | RIGHT (preview + frames)
         # ================================================================
-        main_hbox = QHBoxLayout()
-        main_hbox.setSpacing(4)
-        main_hbox.setContentsMargins(0, 0, 0, 0)
+        # A draggable splitter so the user can widen the left panel (its content
+        # — palette swatches, Import/Bake buttons — is wider than the old fixed
+        # 310px and was being clipped with no way to resize).
+        main_hbox = QSplitter(Qt.Orientation.Horizontal)
+        main_hbox.setChildrenCollapsible(False)
 
         # ==============================================================
-        #  LEFT PANEL (fixed width, no splitter gap)
+        #  LEFT PANEL (resizable via the splitter; scrolls if made narrow)
         # ==============================================================
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
+        # Show a horizontal scrollbar when the panel is narrower than its content
+        # instead of clipping it (the "buttons cut off, can't click" bug).
         left_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        left_scroll.setFixedWidth(310)
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left_scroll.setMinimumWidth(220)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -919,7 +946,7 @@ class TileAnimEditorWidget(QWidget):
             "VRAM tile index where this animation writes to.\n"
             "Shown in hex to match Porymap's Tileset Editor.")
         self._start_tile_spin.valueChanged.connect(
-            lambda _v: self._mark_props_dirty())
+            lambda _v: (self._mark_props_dirty(), self._update_range_label()))
         start_row.addWidget(self._start_tile_spin)
         props_layout.addLayout(start_row)
 
@@ -931,7 +958,7 @@ class TileAnimEditorWidget(QWidget):
         self._tile_amount_spin.setRange(1, 128)
         self._tile_amount_spin.setToolTip("Number of 8x8 tiles per frame")
         self._tile_amount_spin.valueChanged.connect(
-            lambda _v: self._mark_props_dirty())
+            lambda _v: (self._mark_props_dirty(), self._update_range_label()))
         amount_row.addWidget(self._tile_amount_spin)
         props_layout.addLayout(amount_row)
 
@@ -958,6 +985,16 @@ class TileAnimEditorWidget(QWidget):
             lambda _v: self._mark_props_dirty())
         cmax_row.addWidget(self._counter_max_spin)
         props_layout.addLayout(cmax_row)
+
+        # VRAM tile-range read-out + collision warning. This animation writes
+        # `tile amount` tiles starting at `start tile`, so it occupies
+        # [start, start+amount). If that range overlaps another animation in the
+        # SAME tileset, both fight over those tiles in-game (flicker / "extra
+        # frames"). This label makes the range visible and turns red on overlap.
+        self._range_label = QLabel("")
+        self._range_label.setWordWrap(True)
+        self._range_label.setStyleSheet("font-size: 11px; margin-left: 4px;")
+        props_layout.addWidget(self._range_label)
 
         left_layout.addWidget(props_group)
 
@@ -1010,6 +1047,19 @@ class TileAnimEditorWidget(QWidget):
         pal_btns.addWidget(btn_import_png_manual)
 
         pal_layout.addLayout(pal_btns)
+
+        # Bake the CURRENT palette into the frame image files on disk. The app
+        # renders the live/edited palette, but each frame PNG keeps whatever
+        # palette was last baked in — so an external editor (GIMP) shows the OLD
+        # colours. This writes the live palette into every frame so they match.
+        btn_bake = QPushButton("Bake Palette → Frame Images")
+        btn_bake.setToolTip(
+            "Write the CURRENT palette into every frame image on disk.\n"
+            "The app shows the live/edited palette, but the PNG files keep the\n"
+            "palette last baked into them — so opening a frame in GIMP shows the\n"
+            "old colours. Click this to make the files match what you see here.")
+        btn_bake.clicked.connect(self._bake_palette_to_frames)
+        pal_layout.addWidget(btn_bake)
         left_layout.addWidget(pal_group)
 
         # -- Info group --
@@ -1023,6 +1073,10 @@ class TileAnimEditorWidget(QWidget):
             ("anim_name", "Animation"),
             ("tileset_name", "Tileset"),
             ("tileset_type", "Type"),
+            ("frames", "Frames"),
+            ("frame_size", "Frame Size"),
+            ("tiles_frame", "Tiles / Frame"),
+            ("src_symbol", "Source Symbol"),
             ("init_func", "Init Function"),
             ("frame_dir", "Frame Directory"),
         ]
@@ -1221,12 +1275,23 @@ class TileAnimEditorWidget(QWidget):
         btn_del_frame.clicked.connect(self._delete_frame)
         frame_actions.addWidget(btn_del_frame)
 
+        self._btn_resize_frames = QPushButton("Resize Frames")
+        self._btn_resize_frames.setToolTip(
+            "Change the pixel size of EVERY frame in this animation\n"
+            "(e.g. 16×32 → 8×8). Tile Amount is updated to match.")
+        self._btn_resize_frames.clicked.connect(self._resize_frames)
+        frame_actions.addWidget(self._btn_resize_frames)
+
         frame_actions.addStretch()
         right_layout.addLayout(frame_actions)
 
-        main_hbox.addWidget(right_widget, 1)
+        main_hbox.addWidget(right_widget)
+        # The preview side takes the extra space; the left panel keeps its size.
+        main_hbox.setStretchFactor(0, 0)
+        main_hbox.setStretchFactor(1, 1)
+        main_hbox.setSizes([320, 900])
 
-        root.addLayout(main_hbox, 1)
+        root.addWidget(main_hbox, 1)
 
     # ------------------------------------------------------------------
     #  Data Loading
@@ -1348,9 +1413,11 @@ class TileAnimEditorWidget(QWidget):
         else:
             self._clear_display()
 
-        # Enable/disable add/remove buttons
+        # Enable/disable add/remove/rename buttons
         self._btn_add_anim.setEnabled(True)
         self._btn_remove_anim.setEnabled(bool(anims))
+        self._btn_rename_anim.setEnabled(bool(anims))
+        self._btn_resize_frames.setEnabled(bool(anims))
 
     def _on_anim_selected(self, idx: int):
         """Animation changed -- load and display it."""
@@ -1442,6 +1509,9 @@ class TileAnimEditorWidget(QWidget):
         # Info panel
         self._update_info_panel(anim)
 
+        # VRAM tile-range read-out + overlap check (must run after spinboxes set)
+        self._update_range_label()
+
         # Auto-play
         self._preview.play()
         self._btn_play.setText("\u23f8 Pause")
@@ -1458,6 +1528,8 @@ class TileAnimEditorWidget(QWidget):
         self._frame_pos_label.setText("0 / 0")
         for lbl in self._info_labels.values():
             lbl.setText("\u2014")
+        if hasattr(self, "_range_label"):
+            self._range_label.setText("")
 
     def _load_frame_png(self, png_path: str):
         """Load a single frame PNG and append to frame lists."""
@@ -1524,8 +1596,97 @@ class TileAnimEditorWidget(QWidget):
             anim.tileset_name.replace("_", " ").title())
         self._info_labels["tileset_type"].setText(
             anim.tileset_type.title())
+
+        n_frames = len(anim.frames)
+        self._info_labels["frames"].setText(str(n_frames))
+
+        fw = getattr(self, "_frame_w", 0) or 0
+        fh = getattr(self, "_frame_h", 0) or 0
+        if fw and fh:
+            self._info_labels["frame_size"].setText(f"{fw} \u00d7 {fh} px")
+            derived_tiles = (fw // 8) * (fh // 8)
+            note = ""
+            if anim.tile_count and derived_tiles != anim.tile_count:
+                note = f"  (Tile Amount set to {anim.tile_count})"
+            self._info_labels["tiles_frame"].setText(
+                f"{derived_tiles} ({fw // 8}\u00d7{fh // 8} grid){note}")
+        else:
+            self._info_labels["frame_size"].setText("\u2014")
+            self._info_labels["tiles_frame"].setText("\u2014")
+
+        self._info_labels["src_symbol"].setText(
+            f"sTilesetAnims_{anim.anim_id}" if anim.anim_id else "\u2014")
         self._info_labels["init_func"].setText(anim.init_func or "\u2014")
         self._info_labels["frame_dir"].setText(anim.anim_dir or "\u2014")
+
+    def _overlapping_anims(self, dest: int, count: int):
+        """Return a list of (other_anim, first, last) for every OTHER animation
+        in the current tileset whose VRAM tile range overlaps [dest, dest+count).
+
+        Two animations sharing any tile fight over it every game frame — the
+        classic "the animation is messed up / shows extra frames in-game" bug.
+        """
+        results = []
+        cur = self._current_anim
+        others = getattr(self, "_current_tileset_anims", []) or []
+        a0, a1 = dest, dest + max(1, count) - 1
+        for other in others:
+            if other is cur:
+                continue
+            oc = other.tile_count or 1
+            b0, b1 = other.dest_tile, other.dest_tile + oc - 1
+            if a0 <= b1 and b0 <= a1:            # ranges intersect
+                lo, hi = max(a0, b0), min(a1, b1)
+                results.append((other, lo, hi))
+        return results
+
+    def _update_range_label(self):
+        """Refresh the VRAM tile-range read-out and colour it red on a clash."""
+        if not hasattr(self, "_range_label"):
+            return
+        if self._loading or not self._current_anim:
+            self._range_label.setText("")
+            return
+        dest = self._start_tile_spin.value()
+        count = self._tile_amount_spin.value()
+        last = dest + max(1, count) - 1
+        base = (f"Uses VRAM tiles <b>0x{dest:X}–0x{last:X}</b> "
+                f"({dest}–{last}, {count} tile{'s' if count != 1 else ''}).")
+
+        # Warnings, most important first. VRAM tile numbering is CONTINUOUS:
+        # primary tileset = 0x000..0x27F, secondary continues 0x280..0x3FF
+        # (NUM_TILES_IN_PRIMARY = 640). An animation SUPPLIES its own tiles to
+        # VRAM, so any slot in the tileset's half of VRAM is valid — it is NOT
+        # limited to the static tiles.png count.
+        NUM_TILES_IN_PRIMARY = 640
+        ttype = getattr(self._current_anim, "tileset_type", "")
+        if ttype == "secondary" and dest < NUM_TILES_IN_PRIMARY:
+            warns.append(
+                f"⚠ This is a <b>secondary</b> tileset — its tiles start at "
+                f"<b>0x280</b> (640). 0x{dest:X} is in the primary tileset's "
+                f"range, so this won't point at the right tiles in-game.")
+        if last > 1023:
+            warns.append(
+                f"⚠ Range runs past the last VRAM tile (0x3FF). "
+                f"{count} tiles from 0x{dest:X} overflows — lower the start tile "
+                f"or the tile amount.")
+        clashes = self._overlapping_anims(dest, count)
+        if clashes:
+            names = ", ".join(
+                f"{o.name.replace('_', ' ').title()} "
+                f"(0x{lo:X}–0x{hi:X})" for o, lo, hi in clashes)
+            warns.append(
+                f"⚠ Overlaps: {names}. Both animations will fight over those "
+                f"tiles in-game — move this one to a free tile.")
+
+        if warns:
+            self._range_label.setStyleSheet(
+                "font-size: 11px; margin-left: 4px; color: #ff5555;")
+            self._range_label.setText(base + "<br>" + "<br>".join(warns))
+        else:
+            self._range_label.setStyleSheet(
+                "font-size: 11px; margin-left: 4px; color: #888;")
+            self._range_label.setText(base)
 
     def _update_fps_label(self, divisor: int):
         """Update the fps/ms display label."""
@@ -1775,6 +1936,24 @@ class TileAnimEditorWidget(QWidget):
         if ok > 0 or not errors:
             self._dirty = False
 
+        # Last-chance collision warning: if this animation's tile range now
+        # overlaps another in the same tileset, both will fight over those
+        # tiles in-game. Warn loudly on the explicit save.
+        clashes = self._overlapping_anims(anim.dest_tile, anim.tile_count or 1)
+        if clashes:
+            names = "\n".join(
+                f"  • {o.name.replace('_', ' ').title()} "
+                f"(tiles 0x{lo:X}–0x{hi:X})" for o, lo, hi in clashes)
+            QMessageBox.warning(
+                self, "Animations Overlap In VRAM",
+                f"'{anim.display_name}' uses tiles "
+                f"0x{anim.dest_tile:X}–0x{anim.dest_tile + (anim.tile_count or 1) - 1:X}, "
+                f"which overlaps:\n\n{names}\n\n"
+                f"Two animations sharing tiles fight over them every frame — "
+                f"in-game this looks like flickering or extra frames. Give this "
+                f"animation its own Start Tile so its range doesn't overlap the "
+                f"others.")
+
         return (ok, errors)
 
     # ------------------------------------------------------------------
@@ -1851,6 +2030,127 @@ class TileAnimEditorWidget(QWidget):
         self._refresh_display()
         self._dirty = True
         self.modified.emit()
+
+    def _bake_palette_to_frames(self):
+        """Explicitly write the current palette into every frame image on disk.
+
+        The preview renders the live/edited palette, but each frame PNG keeps
+        the palette last baked into it, so an external editor shows stale
+        colours. This forces them into sync.
+        """
+        if not self._current_anim:
+            QMessageBox.information(self, "Bake Palette",
+                                    "Select an animation first.")
+            return
+        colors = self._pal_row.colors()
+        frames = self._current_anim.frames
+        indexed = non_indexed = 0
+        for frame in frames:
+            if not os.path.isfile(frame.png_path):
+                continue
+            img = QImage(frame.png_path)
+            if img.isNull():
+                continue
+            if img.format() == QImage.Format.Format_Indexed8:
+                indexed += 1
+            else:
+                non_indexed += 1
+        # _apply_palette_to_frames writes the color table into each indexed frame
+        # PNG (and the slot .pal), then refreshes + marks dirty.
+        self._apply_palette_to_frames(colors)
+        msg = (f"Baked the current palette into {indexed} frame image(s).\n\n"
+               f"Opening them in an external editor (e.g. GIMP) now shows these "
+               f"colours.")
+        if non_indexed:
+            msg += (f"\n\nSkipped {non_indexed} frame(s) that aren't "
+                    f"palette-indexed (nothing to bake into a full-colour "
+                    f"image).")
+        QMessageBox.information(self, "Bake Palette", msg)
+
+    @staticmethod
+    def _convert_to_indexed_png(src_path: str, dest_png: str) -> bool:
+        """Convert any image file to an indexed PNG, keeping its OWN palette.
+
+        Used when creating a NEW animation from frame files: unlike replacing a
+        frame in an existing animation (which remaps onto the tab's live
+        palette), a new animation has no palette yet, so the source's own
+        indexed colour table becomes the animation's palette. An indexed .bmp
+        (legacy AnimEdit tooling) is read by Qt as Format_Indexed8 and saved
+        straight through, preserving slot order. A source Qt reads as full
+        colour is quantised to an indexed image as a best effort. Returns False
+        only if the file can't be read at all."""
+        img = QImage(src_path)
+        if img.isNull():
+            return False
+        if img.format() != QImage.Format.Format_Indexed8:
+            img = img.convertToFormat(QImage.Format.Format_Indexed8)
+        return bool(img.save(dest_png, "PNG"))
+
+    def _write_frame_from_source(self, src_path: str, dest_png: str) -> bool:
+        """Copy/convert a chosen image file into a frame's indexed PNG.
+
+        A ``.png`` is copied verbatim (keeps its exact bytes + embedded
+        palette). A ``.bmp`` (legacy tile-anim tools used indexed BMPs) is
+        REMAPPED onto the tab's current palette by matching each pixel's colour
+        to the nearest palette slot — see :meth:`_remap_image_to_palette` for
+        why raw indices can't be trusted. Returns False on a load failure."""
+        ext = os.path.splitext(src_path)[1].lower()
+        if ext == ".png":
+            shutil.copy2(src_path, dest_png)
+            return True
+        img = QImage(src_path)
+        if img.isNull():
+            return False
+        return self._remap_image_to_palette(img, dest_png)
+
+    def _remap_image_to_palette(self, img: QImage, dest_png: str) -> bool:
+        """Write *img* into *dest_png* as an indexed PNG whose indices are the
+        tab's CURRENT palette slots, chosen by matching each pixel's colour.
+
+        Why not keep the source's own indices? A legacy indexed BMP stores the
+        same colours but often in a DIFFERENT slot order than this tileset's
+        palette (and some legacy BMP variants Qt reads as RGB, dropping indices
+        entirely). Keeping the raw indices then renders every colour against the
+        wrong slot — the scrambled import. Matching by COLOUR instead lands each
+        pixel on the right slot regardless of the source's index order, so the
+        frame comes in looking exactly like it should under the live palette."""
+        pal = list(self._palette_colors or [])
+        if not pal:
+            # No palette loaded — best-effort straight indexed save.
+            if img.format() != QImage.Format.Format_Indexed8:
+                img = img.convertToFormat(QImage.Format.Format_Indexed8)
+            img.save(dest_png, "PNG")
+            return True
+        pal = (pal + [(0, 0, 0)] * 16)[:16]
+
+        # Exact-match table on GBA-quantised (5-bit) colour, so an 8-bit source
+        # colour like 255 matches a 5-bit palette 248; nearest as the fallback.
+        def _q(c):
+            return c & 0xF8
+        exact = {}
+        for i, (r, g, b) in enumerate(pal):
+            exact.setdefault((_q(r), _q(g), _q(b)), i)
+
+        out = QImage(img.width(), img.height(), QImage.Format.Format_Indexed8)
+        out.setColorTable([
+            qRgba(r, g, b, 0 if i == 0 else 255)
+            for i, (r, g, b) in enumerate(pal)
+        ])
+        for y in range(img.height()):
+            for x in range(img.width()):
+                px = img.pixel(x, y)
+                r, g, b = (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF
+                idx = exact.get((_q(r), _q(g), _q(b)))
+                if idx is None:
+                    best, bd = 0, 1 << 30
+                    for i, (pr, pg, pb) in enumerate(pal):
+                        d = (pr - r) ** 2 + (pg - g) ** 2 + (pb - b) ** 2
+                        if d < bd:
+                            bd, best = d, i
+                    idx = best
+                out.setPixel(x, y, idx)
+        out.save(dest_png, "PNG")
+        return True
 
     def _import_pal(self):
         """Import a JASC .pal file and apply to all frames."""
@@ -2002,7 +2302,41 @@ class TileAnimEditorWidget(QWidget):
             return
         if not vals["png_paths"]:
             QMessageBox.warning(self, "No Frames",
-                                "At least one frame PNG is required.")
+                                "Select at least one frame image "
+                                "(indexed PNG or BMP).")
+            return
+
+        # The backend copies each frame file verbatim as N.png, so anything
+        # that isn't already a PNG (e.g. a legacy indexed .bmp) must be
+        # converted to an indexed PNG first — preserving the source's OWN
+        # palette, since a brand-new animation has no palette to match against.
+        import tempfile
+        frame_paths = []
+        tmp_files = []
+        convert_failed = None
+        for p in vals["png_paths"]:
+            if os.path.splitext(p)[1].lower() == ".png":
+                frame_paths.append(p)
+                continue
+            tmp = os.path.join(
+                tempfile.gettempdir(),
+                os.path.splitext(os.path.basename(p))[0] + "_animnew.png")
+            if not self._convert_to_indexed_png(p, tmp):
+                convert_failed = p
+                break
+            tmp_files.append(tmp)
+            frame_paths.append(tmp)
+
+        if convert_failed:
+            for t in tmp_files:
+                try:
+                    os.remove(t)
+                except OSError:
+                    pass
+            QMessageBox.warning(
+                self, "Import Failed",
+                f"Could not read this frame image:\n{convert_failed}\n\n"
+                f"Use an indexed PNG or a 16-colour indexed BMP.")
             return
 
         ts_type = "secondary" if ts["is_secondary"] else "primary"
@@ -2014,8 +2348,14 @@ class TileAnimEditorWidget(QWidget):
             start_tile=vals["start_tile"],
             tile_amount=vals["tile_amount"],
             divisor=vals["divisor"],
-            frame_png_paths=vals["png_paths"],
+            frame_png_paths=frame_paths,
         )
+
+        for t in tmp_files:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
 
         if result:
             self._dirty = True
@@ -2071,6 +2411,72 @@ class TileAnimEditorWidget(QWidget):
                 "Could not remove the animation from tileset_anims.c.\n"
                 "The C source may have been modified in an unexpected way.")
 
+    def _cleanup_frames(self):
+        """Open the cleanup dialog to find/delete orphaned frame PNGs."""
+        if not self._project_dir:
+            return
+        from ui.dialogs.tile_anim_cleanup_dialog import TileAnimCleanupDialog
+        dlg = TileAnimCleanupDialog(self._project_dir, parent=self)
+        dlg.exec()
+        # Reload in case whole animation folders were removed.
+        ts_idx = self._tileset_combo.currentIndex()
+        anim_idx = self._anim_combo.currentIndex()
+        self._load_data()
+        if ts_idx < self._tileset_combo.count():
+            self._tileset_combo.setCurrentIndex(ts_idx)
+        if anim_idx < self._anim_combo.count():
+            self._anim_combo.setCurrentIndex(anim_idx)
+
+    def _rename_animation(self):
+        """Rename the currently selected animation everywhere."""
+        if not self._current_anim or not self._project_dir:
+            return
+        anim = self._current_anim
+        ts_pretty = anim.tileset_name.replace("_", " ").title()
+
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Animation",
+            f"New name for '{anim.display_name}':\n\n"
+            f"Use letters, numbers and spaces only. The tileset it belongs to\n"
+            f"('{ts_pretty}') stays the same — only this animation's own name\n"
+            f"changes. Its source symbols and frame folder are renamed to match.",
+            text=anim.name.replace("_", " "))
+        if not ok or not new_name.strip():
+            return
+
+        result = rename_animation(self._project_dir, anim, new_name.strip())
+        if result is None:
+            QMessageBox.warning(
+                self, "Rename Failed",
+                "Could not rename the animation.\n\n"
+                "The new name may be empty, unchanged, or already used by "
+                "another animation in this tileset. Pick a different name and "
+                "try again.")
+            return
+
+        new_id = result.anim_id
+        self._dirty = True
+        self.modified.emit()
+
+        ts_idx = self._tileset_combo.currentIndex()
+        self._load_data()
+        if ts_idx < self._tileset_combo.count():
+            self._tileset_combo.setCurrentIndex(ts_idx)
+
+        # Re-select the renamed animation by its new source id.
+        anims = getattr(self, "_current_tileset_anims", [])
+        for i, a in enumerate(anims):
+            if a.anim_id == new_id:
+                self._anim_combo.setCurrentIndex(i)
+                self._on_anim_selected(i)
+                break
+
+        QMessageBox.information(
+            self, "Animation Renamed",
+            f"Renamed to '{result.display_name}'.\n\n"
+            f"Its source code and frame folder were updated to match.\n"
+            f"Rebuild the ROM to see the change in-game.")
+
     # ------------------------------------------------------------------
     #  Frame Operations
     # ------------------------------------------------------------------
@@ -2093,13 +2499,15 @@ class TileAnimEditorWidget(QWidget):
                                 f"Source frame not found:\n{src_path}")
             return
 
+        save_dir = (getattr(self, "_last_import_dir", "")
+                    or os.path.dirname(src_path))
         dest, _ = QFileDialog.getSaveFileName(
             self, "Save Frame Image",
-            os.path.join(os.path.dirname(src_path),
-                         f"frame_{frame_idx}.png"),
+            os.path.join(save_dir, f"frame_{frame_idx}.png"),
             "PNG Images (*.png)")
         if not dest:
             return
+        self._last_import_dir = os.path.dirname(dest)
 
         try:
             shutil.copy2(src_path, dest)
@@ -2107,6 +2515,199 @@ class TileAnimEditorWidget(QWidget):
                                     f"Frame saved to:\n{dest}")
         except Exception as e:
             QMessageBox.warning(self, "Save Failed", f"Could not save:\n{e}")
+
+    def _sync_tile_amount_after_import(self) -> str:
+        """After importing a frame, make Tile Amount match the frame's real
+        size.  A GBA tile is 8×8, so a W×H-pixel frame holds
+        (W/8)×(H/8) tiles.  When the newly imported frame is a different size
+        (e.g. the user swapped in a bigger image), the animation's Tile Amount
+        must follow or the engine copies the wrong number of tiles.  Writes the
+        new value to tileset_anims.c and updates the spin box.  Returns a short
+        plain-English note describing the change (empty string if nothing
+        changed).
+        """
+        anim = self._current_anim
+        if not anim or not self._project_dir:
+            return ""
+        fw = getattr(self, "_frame_w", 0) or 0
+        fh = getattr(self, "_frame_h", 0) or 0
+        if fw < 8 or fh < 8:
+            return ""
+        derived = (fw // 8) * (fh // 8)
+        if derived < 1 or derived == anim.tile_count:
+            return ""
+        old = anim.tile_count
+        if not write_tile_amount_to_source(self._project_dir, anim, derived):
+            return ""
+        anim.tile_count = derived
+        self._loading = True
+        self._tile_amount_spin.setValue(derived)
+        self._loading = False
+        self._update_info_panel(anim)
+        return (f"\n\nThe image is {fw}×{fh}, so Tile Amount was updated "
+                f"from {old} to {derived} tiles to match.")
+
+    # ------------------------------------------------------------------
+    #  Resize whole animation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resize_indexed_image(img: QImage, new_w: int, new_h: int,
+                              method: str) -> QImage:
+        """Return a new W×H indexed image from *img*, preserving palette slots.
+
+        ``method='scale'`` stretches/squishes the picture to the new size using
+        nearest-neighbour sampling (no blur, keeps pixel-art crisp and keeps the
+        exact palette indices). ``method='crop'`` keeps every pixel where it is,
+        cutting off anything past the new size and padding new area with slot 0.
+        """
+        if img.format() != QImage.Format.Format_Indexed8:
+            img = img.convertToFormat(QImage.Format.Format_Indexed8)
+        sw, sh = img.width(), img.height()
+        ct = img.colorTable()
+        out = QImage(new_w, new_h, QImage.Format.Format_Indexed8)
+        if ct:
+            out.setColorTable(ct)
+        out.fill(0)
+        if method == "crop":
+            for dy in range(min(new_h, sh)):
+                for dx in range(min(new_w, sw)):
+                    out.setPixel(dx, dy, img.pixelIndex(dx, dy))
+        else:  # scale (nearest-neighbour)
+            for dy in range(new_h):
+                sy = min(sh - 1, (dy * sh) // new_h) if new_h else 0
+                for dx in range(new_w):
+                    sx = min(sw - 1, (dx * sw) // new_w) if new_w else 0
+                    out.setPixel(dx, dy, img.pixelIndex(sx, sy))
+        return out
+
+    def _resize_frames(self):
+        """Resize EVERY frame of the current animation to a new pixel size."""
+        if not self._current_anim or not self._project_dir:
+            QMessageBox.information(self, "Resize Frames",
+                                    "Select an animation first.")
+            return
+        anim = self._current_anim
+        cur_w = getattr(self, "_frame_w", 0) or 8
+        cur_h = getattr(self, "_frame_h", 0) or 8
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Resize Animation Frames")
+        form = QFormLayout(dlg)
+
+        intro = QLabel(
+            f"Every frame of '{anim.display_name}' is currently "
+            f"{cur_w}×{cur_h} pixels.\n"
+            f"Choose the new size below. GBA tiles are 8×8, so width and "
+            f"height\nstep in eights.")
+        intro.setWordWrap(True)
+        form.addRow(intro)
+
+        w_spin = _NoScrollSpin()
+        w_spin.setRange(8, 256)
+        w_spin.setSingleStep(8)
+        w_spin.setValue(cur_w if cur_w >= 8 else 8)
+        form.addRow("New width (px):", w_spin)
+
+        h_spin = _NoScrollSpin()
+        h_spin.setRange(8, 256)
+        h_spin.setSingleStep(8)
+        h_spin.setValue(cur_h if cur_h >= 8 else 8)
+        form.addRow("New height (px):", h_spin)
+
+        method_combo = _NoScrollCombo()
+        method_combo.addItem("Scale — stretch the picture to the new size", "scale")
+        method_combo.addItem("Crop / Pad — keep pixels in place, cut or add space", "crop")
+        form.addRow("How:", method_combo)
+
+        tiles_lbl = QLabel("")
+        tiles_lbl.setStyleSheet("color:#aaa;font-size:11px;")
+        form.addRow("Tiles per frame:", tiles_lbl)
+
+        def _update_tiles():
+            w8 = w_spin.value() // 8
+            h8 = h_spin.value() // 8
+            tiles_lbl.setText(f"{w8 * h8}  ({w8}×{h8} grid)")
+        w_spin.valueChanged.connect(lambda _v: _update_tiles())
+        h_spin.valueChanged.connect(lambda _v: _update_tiles())
+        _update_tiles()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_w = (w_spin.value() // 8) * 8
+        new_h = (h_spin.value() // 8) * 8
+        method = method_combo.currentData()
+        if new_w < 8 or new_h < 8:
+            return
+        if new_w == cur_w and new_h == cur_h:
+            QMessageBox.information(
+                self, "Resize Frames",
+                "The new size matches the current size — nothing to do.")
+            return
+
+        done = failed = 0
+        for frame in anim.frames:
+            path = frame.png_path
+            if not os.path.isfile(path):
+                failed += 1
+                continue
+            img = QImage(path)
+            if img.isNull():
+                failed += 1
+                continue
+            try:
+                out = self._resize_indexed_image(img, new_w, new_h, method)
+                if not out.save(path, "PNG"):
+                    failed += 1
+                    continue
+                done += 1
+            except Exception:
+                failed += 1
+
+        if done == 0:
+            QMessageBox.warning(
+                self, "Resize Failed",
+                "None of the frame images could be resized — they may be "
+                "missing or locked by another program.")
+            return
+
+        # Point Tile Amount at the new tile count and write it to the source.
+        new_tiles = (new_w // 8) * (new_h // 8)
+        wrote_amount = write_tile_amount_to_source(
+            self._project_dir, anim, new_tiles)
+        if wrote_amount:
+            anim.tile_count = new_tiles
+
+        self._dirty = True
+        self.modified.emit()
+
+        # Reload so the preview, tile grid and Info panel pick up the new size.
+        ts_idx = self._tileset_combo.currentIndex()
+        anim_idx = self._anim_combo.currentIndex()
+        self._load_data()
+        if ts_idx < self._tileset_combo.count():
+            self._tileset_combo.setCurrentIndex(ts_idx)
+        if anim_idx < self._anim_combo.count():
+            self._anim_combo.setCurrentIndex(anim_idx)
+            self._on_anim_selected(anim_idx)
+
+        msg = (f"Resized {done} frame(s) to {new_w}×{new_h}.\n"
+               f"Tile Amount set to {new_tiles} tiles per frame.")
+        if not wrote_amount:
+            msg += ("\n\n(Couldn't update Tile Amount in the source "
+                    "automatically — set it by hand in the properties.)")
+        if failed:
+            msg += f"\n\n{failed} frame(s) could not be resized and were skipped."
+        msg += "\n\nRebuild the ROM to see the change in-game."
+        QMessageBox.information(self, "Frames Resized", msg)
 
     def _replace_frame(self):
         """Replace the currently selected frame's PNG."""
@@ -2128,13 +2729,19 @@ class TileAnimEditorWidget(QWidget):
             return
 
         frame = anim.frames[frame_idx]
-        start_dir = os.path.dirname(frame.png_path) if frame.png_path else ""
+        # Remember the folder the user last browsed to (they're usually replacing
+        # several frames from the SAME external folder) instead of resetting to
+        # the project's frame folder every time.
+        start_dir = (getattr(self, "_last_import_dir", "")
+                     or (os.path.dirname(frame.png_path) if frame.png_path else ""))
 
         path, _ = QFileDialog.getOpenFileName(
             self, f"Replace Frame {frame_idx}",
-            start_dir, "PNG Images (*.png)")
+            start_dir,
+            "Images (*.png *.bmp);;PNG Images (*.png);;BMP Images (*.bmp)")
         if not path:
             return
+        self._last_import_dir = os.path.dirname(path)
 
         img = QImage(path)
         if img.isNull():
@@ -2143,29 +2750,38 @@ class TileAnimEditorWidget(QWidget):
             return
 
         if img.width() != self._frame_w or img.height() != self._frame_h:
+            new_tiles = (img.width() // 8) * (img.height() // 8)
             reply = QMessageBox.question(
-                self, "Size Mismatch",
-                f"The new image is {img.width()}\u00d7{img.height()} but the "
+                self, "Different Size",
+                f"The new image is {img.width()}\u00d7{img.height()}, but the "
                 f"existing frames are {self._frame_w}\u00d7{self._frame_h}.\n\n"
-                f"Import anyway? (The GBA may not render it correctly.)",
+                f"That's fine \u2014 the tool will resize this animation to the new "
+                f"image and set Tile Amount to {new_tiles} tiles automatically.\n\n"
+                f"For the animation to look right in-game, every frame should be "
+                f"the same size, so plan to re-import the other frames at "
+                f"{img.width()}\u00d7{img.height()} too.\n\n"
+                f"Import this frame now?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
         try:
-            shutil.copy2(path, frame.png_path)
+            if not self._write_frame_from_source(path, frame.png_path):
+                raise RuntimeError("could not read the source image")
         except Exception as e:
             QMessageBox.warning(self, "Replace Failed",
-                                f"Could not copy file:\n{e}")
+                                f"Could not import file:\n{e}")
             return
 
         self._dirty = True
         self.modified.emit()
         self._on_anim_selected(self._anim_combo.currentIndex())
+        size_note = self._sync_tile_amount_after_import()
 
         QMessageBox.information(
             self, "Frame Replaced",
-            f"Frame {frame_idx} replaced with:\n{os.path.basename(path)}")
+            f"Frame {frame_idx} replaced with:\n{os.path.basename(path)}"
+            f"{size_note}")
 
     def _add_frame(self):
         """Add a new frame PNG to the animation."""
@@ -2173,12 +2789,14 @@ class TileAnimEditorWidget(QWidget):
             return
 
         anim = self._current_anim
-        start_dir = anim.anim_dir or ""
+        start_dir = getattr(self, "_last_import_dir", "") or (anim.anim_dir or "")
 
         path, _ = QFileDialog.getOpenFileName(
-            self, "Add New Frame", start_dir, "PNG Images (*.png)")
+            self, "Add New Frame", start_dir,
+            "Images (*.png *.bmp);;PNG Images (*.png);;BMP Images (*.bmp)")
         if not path:
             return
+        self._last_import_dir = os.path.dirname(path)
 
         img = QImage(path)
         if img.isNull():
@@ -2186,16 +2804,21 @@ class TileAnimEditorWidget(QWidget):
                                 f"Could not load image:\n{path}")
             return
 
-        if self._frame_w > 16 or self._frame_h > 16:
-            if img.width() != self._frame_w or img.height() != self._frame_h:
-                reply = QMessageBox.question(
-                    self, "Size Mismatch",
-                    f"The new image is {img.width()}\u00d7{img.height()} but "
-                    f"existing frames are {self._frame_w}\u00d7{self._frame_h}.\n\n"
-                    f"Import anyway?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
+        if img.width() != self._frame_w or img.height() != self._frame_h:
+            new_tiles = (img.width() // 8) * (img.height() // 8)
+            reply = QMessageBox.question(
+                self, "Different Size",
+                f"The new image is {img.width()}\u00d7{img.height()}, but the "
+                f"existing frames are {self._frame_w}\u00d7{self._frame_h}.\n\n"
+                f"That's fine \u2014 the tool will resize this animation to the new "
+                f"image and set Tile Amount to {new_tiles} tiles automatically.\n\n"
+                f"For the animation to look right in-game, every frame should be "
+                f"the same size, so plan to re-import the other frames at "
+                f"{img.width()}\u00d7{img.height()} too.\n\n"
+                f"Add this frame now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         reply = QMessageBox.question(
             self, "Add Frame",
@@ -2209,7 +2832,27 @@ class TileAnimEditorWidget(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        result = add_frame_to_anim(self._project_dir, anim, path)
+        # A BMP source (legacy anim tools) is converted to an indexed PNG in a
+        # temp file first, since the backend expects a .png to INCBIN.
+        add_src = path
+        _tmp_png = None
+        if os.path.splitext(path)[1].lower() != ".png":
+            import tempfile
+            _tmp_png = os.path.join(
+                tempfile.gettempdir(),
+                os.path.splitext(os.path.basename(path))[0] + "_anim.png")
+            if not self._write_frame_from_source(path, _tmp_png):
+                QMessageBox.warning(self, "Import Failed",
+                                    f"Could not read the source image:\n{path}")
+                return
+            add_src = _tmp_png
+
+        result = add_frame_to_anim(self._project_dir, anim, add_src)
+        if _tmp_png and os.path.isfile(_tmp_png):
+            try:
+                os.remove(_tmp_png)
+            except OSError:
+                pass
         if result:
             self._dirty = True
             self.modified.emit()
@@ -2220,9 +2863,11 @@ class TileAnimEditorWidget(QWidget):
                 self._tileset_combo.setCurrentIndex(old_ts)
             if old_anim < self._anim_combo.count():
                 self._anim_combo.setCurrentIndex(old_anim)
+                self._on_anim_selected(old_anim)
+            size_note = self._sync_tile_amount_after_import()
             QMessageBox.information(
                 self, "Frame Added",
-                f"New frame added:\n{os.path.basename(result)}\n\n"
+                f"New frame added:\n{os.path.basename(result)}{size_note}\n\n"
                 f"tileset_anims.c updated. Rebuild to see the change.")
         else:
             QMessageBox.warning(
@@ -2276,6 +2921,7 @@ class TileAnimEditorWidget(QWidget):
                 self._tileset_combo.setCurrentIndex(old_ts)
             if old_anim < self._anim_combo.count():
                 self._anim_combo.setCurrentIndex(old_anim)
+                self._on_anim_selected(old_anim)
             QMessageBox.information(
                 self, "Frame Removed",
                 f"Frame {frame_idx} removed from tileset_anims.c.\n"

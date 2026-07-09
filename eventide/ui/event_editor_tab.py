@@ -102,6 +102,42 @@ def _strip_sentinel_blocks(path) -> bool:
     return changed
 
 
+def _strip_label_blocks(path, labels) -> int:
+    """Remove the `<label>::` block for each label in *labels* from an .inc file
+    (from its label line through the next `<word>::` label or EOF). Used to
+    delete an event's script + its sub-labels when the event is deleted. Returns
+    the number of blocks removed."""
+    labels = {l for l in (labels or ()) if l}
+    if not labels:
+        return 0
+    try:
+        text = path.read_text(encoding='utf-8')
+    except OSError:
+        return 0
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    i = 0
+    removed = 0
+    label_re = re.compile(r'^(\w+)::')
+    while i < len(lines):
+        m = label_re.match(lines[i])
+        if m and m.group(1) in labels:
+            removed += 1
+            i += 1
+            while i < len(lines) and not label_re.match(lines[i]):
+                i += 1
+        else:
+            out.append(lines[i])
+            i += 1
+    if removed:
+        result = re.sub(r'\n{3,}', '\n\n', ''.join(out))
+        try:
+            path.write_text(result, encoding='utf-8')
+        except OSError:
+            return 0
+    return removed
+
+
 # ── Sound Editor integration callbacks (set by unified_mainwindow) ──────────
 # These let the playbgm/playse/playfanfare widgets talk to the Sound Editor
 # without threading parent refs through dozens of constructors.
@@ -699,6 +735,18 @@ _WEATHER_NAMES = {
 }
 
 
+def _pg_cond_tuples(pg: dict) -> list:
+    """A page's condition checks as target-less tuples, tolerant of both the
+    new `_conditions` list and the legacy single `_condition_cmd`."""
+    cs = pg.get('_conditions')
+    if cs:
+        return [tuple(c) for c in cs if c]
+    cc = pg.get('_condition_cmd')
+    if cc:
+        return [tuple(cc[:-1])]
+    return []
+
+
 def _stringize(cmd_tuple: tuple) -> str:
     """Convert a command tuple to a single-line RMXP-style display string.
 
@@ -775,14 +823,14 @@ def _stringize(cmd_tuple: tuple) -> str:
         # Check if this flag activates a condition page
         if cmd == 'setflag' and flag and _CURRENT_PAGES:
             for pi, pg in enumerate(_CURRENT_PAGES):
-                cc = pg.get('_condition_cmd')
-                if cc and cc[0] == 'goto_if_set' and len(cc) > 1 and cc[1] == flag:
+                if any(c[0] == 'goto_if_set' and len(c) > 1 and c[1] == flag
+                       for c in _pg_cond_tuples(pg)):
                     text += f'  → activates Page {pi + 1}'
                     break
         elif cmd == 'clearflag' and flag and _CURRENT_PAGES:
             for pi, pg in enumerate(_CURRENT_PAGES):
-                cc = pg.get('_condition_cmd')
-                if cc and cc[0] == 'goto_if_unset' and len(cc) > 1 and cc[1] == flag:
+                if any(c[0] == 'goto_if_unset' and len(c) > 1 and c[1] == flag
+                       for c in _pg_cond_tuples(pg)):
                     text += f'  → activates Page {pi + 1}'
                     break
         return text
@@ -797,11 +845,11 @@ def _stringize(cmd_tuple: tuple) -> str:
         # Check if this var assignment activates a condition page
         if cmd == 'setvar' and var and val and _CURRENT_PAGES:
             for pi, pg in enumerate(_CURRENT_PAGES):
-                cc = pg.get('_condition_cmd')
-                if cc and cc[0] == 'goto_if_eq' and len(cc) > 2:
-                    if cc[1] == var and str(cc[2]) == str(val):
-                        text += f'  → activates Page {pi + 1}'
-                        break
+                if any(c[0] == 'goto_if_eq' and len(c) > 2
+                       and c[1] == var and str(c[2]) == str(val)
+                       for c in _pg_cond_tuples(pg)):
+                    text += f'  → activates Page {pi + 1}'
+                    break
         return text
     if cmd == 'copyvar':
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
@@ -1344,6 +1392,42 @@ class _MessageWidget(_CommandWidget):
         self.render_combo.currentIndexChanged.connect(_on_render_changed)
         # Apply the initial state once.
         _on_render_changed(self.render_combo.currentIndex())
+
+        # "Raw…" — the text box above is WYSIWYG and hides {COLOR}/{SHADOW}
+        # tokens as formatting. This opens the literal .string content so the
+        # user can see and delete those tokens directly.
+        self._btn_raw = QPushButton('Raw…')
+        self._btn_raw.setMaximumWidth(60)
+        self._btn_raw.setToolTip(_tt(
+            'View/edit the raw message text with its {COLOR}/{SHADOW} tokens\n'
+            'shown as literal text — use it to strip colour formatting blocks.'))
+        self._btn_raw.clicked.connect(self._edit_raw_text)
+        top.addWidget(self._btn_raw)
+
+    def _edit_raw_text(self):
+        """Popup to edit the raw .string content (control codes visible)."""
+        from PyQt6.QtWidgets import QVBoxLayout, QLabel
+        raw = self.text_edit.get_eventide_text()
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Raw Message Text')
+        dlg.resize(520, 260)
+        v = QVBoxLayout(dlg)
+        lbl = QLabel('Edit the literal text. {COLOR X}/{SHADOW X} tokens are '
+                     'shown as-is — delete them to remove colour formatting.')
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet('color:#aaa;font-size:11px;')
+        v.addWidget(lbl)
+        box = QPlainTextEdit()
+        box.setPlainText(raw)
+        v.addWidget(box, 1)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.text_edit.set_eventide_text(box.toPlainText())
 
     def to_tuple(self):
         label = self.label_combo.currentText().strip() or None
@@ -6283,6 +6367,13 @@ class EventEditorTab(QWidget):
         btn_del = QPushButton('Delete Page')
         btn_del.setToolTip(_tt('Delete the current page and all its commands'))
         btn_del.clicked.connect(self._on_del_page)
+        btn_del_event = QPushButton('Delete Event')
+        btn_del_event.setToolTip(_tt(
+            'Delete this whole event from the map AND its script.\n'
+            'Removes the object/sign/trigger from map.json and strips its\n'
+            'script block(s) from scripts.inc on Save. Use this to get rid of\n'
+            'an event entirely (Delete Page only removes one page).'))
+        btn_del_event.clicked.connect(self._on_delete_event)
         self._btn_new_script = QPushButton('New Script ▾')
         self._btn_new_script.setToolTip(_tt(
             'Create a new script from a template'))
@@ -6293,13 +6384,22 @@ class EventEditorTab(QWidget):
         btn_find_script = QPushButton('Find Script')
         btn_find_script.setToolTip(_tt('Search for script labels across all maps (Ctrl+Shift+F)'))
         btn_find_script.clicked.connect(self._on_find_script)
+        self._btn_edit_raw = QPushButton('Edit Raw Code')
+        self._btn_edit_raw.setToolTip(_tt(
+            'Open this whole script as raw code in a pop-up.\n'
+            'Edit the actual .inc text — script commands AND the message\n'
+            'strings (including {COLOR}/{SHADOW} blocks you want to remove).\n'
+            'Save applies your edits; Cancel discards them.'))
+        self._btn_edit_raw.clicked.connect(self._on_edit_raw_code)
         page_ctrl.addWidget(btn_add)
         page_ctrl.addWidget(btn_rename)
         page_ctrl.addWidget(btn_del)
+        page_ctrl.addWidget(btn_del_event)
         page_ctrl.addWidget(self._divider_line())
         page_ctrl.addWidget(self._btn_new_script)
         page_ctrl.addWidget(btn_find_flag)
         page_ctrl.addWidget(btn_find_script)
+        page_ctrl.addWidget(self._btn_edit_raw)
         page_ctrl.addWidget(self._divider_line())
         self._btn_open_porymap = QPushButton('Open in Porymap')
         self._btn_open_porymap.setToolTip('Open the current map in Porymap (Ctrl+F7)')
@@ -6404,6 +6504,27 @@ class EventEditorTab(QWidget):
         self._cond_var_val.valueChanged.connect(self._on_cond_changed)
         var_row.addWidget(self._cond_var_val)
         cond_layout.addLayout(var_row)
+
+        # Additional ANDed conditions — the page also requires ALL of these on
+        # top of the primary flag/variable above (RPG-Maker multi-condition page).
+        self._extra_conditions: list = []
+        extra_hdr = QHBoxLayout()
+        _elbl = QLabel('Also require (all):')
+        _elbl.setStyleSheet('color:#9aa0a6;font-size:11px;')
+        extra_hdr.addWidget(_elbl)
+        extra_hdr.addStretch()
+        self._btn_add_cond = QPushButton('+ Add condition')
+        self._btn_add_cond.setMaximumWidth(140)
+        self._btn_add_cond.setToolTip(_tt(
+            'Require another flag or variable on top of the one above.\n'
+            'All conditions must be true for this page to run (AND).'))
+        self._btn_add_cond.clicked.connect(self._on_add_extra_condition)
+        extra_hdr.addWidget(self._btn_add_cond)
+        cond_layout.addLayout(extra_hdr)
+        self._extra_cond_layout = QVBoxLayout()
+        self._extra_cond_layout.setSpacing(2)
+        self._extra_cond_layout.setContentsMargins(4, 0, 0, 0)
+        cond_layout.addLayout(self._extra_cond_layout)
 
         ll.addWidget(self._conditions_box)
 
@@ -7320,13 +7441,16 @@ class EventEditorTab(QWidget):
         self._cond_var_val.setValue(0)
         self._cond_var_val.setEnabled(False)
 
+        self._extra_conditions = []
         if page:
-            cond_cmd = page.get('_condition_cmd')
-            if cond_cmd:
-                cmd = cond_cmd[0]
+            conds = self._page_conditions(page)
+            primary = conds[0] if conds else None
+            self._extra_conditions = [tuple(c) for c in conds[1:]]
+            if primary:
+                cmd = primary[0]
                 if cmd in ('goto_if_set', 'goto_if_unset'):
                     self._cond_flag_check.setChecked(True)
-                    flag = str(cond_cmd[1]) if len(cond_cmd) > 1 else ''
+                    flag = str(primary[1]) if len(primary) > 1 else ''
                     idx = self._cond_flag_picker.findText(flag)
                     if idx >= 0:
                         self._cond_flag_picker.setCurrentIndex(idx)
@@ -7339,7 +7463,7 @@ class EventEditorTab(QWidget):
                 elif cmd in ('goto_if_eq', 'goto_if_ne', 'goto_if_lt',
                               'goto_if_ge', 'goto_if_le', 'goto_if_gt'):
                     self._cond_var_check.setChecked(True)
-                    var = str(cond_cmd[1]) if len(cond_cmd) > 1 else ''
+                    var = str(primary[1]) if len(primary) > 1 else ''
                     idx = self._cond_var_picker.findText(var)
                     if idx >= 0:
                         self._cond_var_picker.setCurrentIndex(idx)
@@ -7351,12 +7475,13 @@ class EventEditorTab(QWidget):
                               'goto_if_le': 4, 'goto_if_gt': 5}
                     self._cond_var_op.setCurrentIndex(op_map.get(cmd, 0))
                     self._cond_var_op.setEnabled(True)
-                    raw_val = str(cond_cmd[2]) if len(cond_cmd) > 2 else '0'
+                    raw_val = str(primary[2]) if len(primary) > 2 else '0'
                     try:
                         self._cond_var_val.setValue(int(raw_val))
                     except (ValueError, TypeError):
                         self._cond_var_val.setValue(0)
                     self._cond_var_val.setEnabled(True)
+        self._render_extra_conditions()
 
         # Unblock signals
         self._cond_flag_check.blockSignals(False)
@@ -7403,37 +7528,126 @@ class EventEditorTab(QWidget):
             return
         page = pages[idx]
 
-        # Build the new condition command tuple from the UI
+        # Build the primary (target-less) condition from the flag/var rows.
+        primary = None
         if self._cond_flag_check.isChecked():
             flag = self._cond_flag_picker.currentText().strip()
             if flag:
-                # Determine the target label for the goto
-                target = page.get('_label', '')
                 state_idx = self._cond_flag_state.currentIndex()
                 cmd = 'goto_if_set' if state_idx == 0 else 'goto_if_unset'
-                page['_condition_cmd'] = (cmd, flag, target)
-                page['_condition'] = self._condition_text(page['_condition_cmd'])
-                self._mark_dirty()
-                return
+                primary = (cmd, flag)
         elif self._cond_var_check.isChecked():
             var = self._cond_var_picker.currentText().strip()
             if var:
-                target = page.get('_label', '')
                 op_cmds = ['goto_if_eq', 'goto_if_ne', 'goto_if_lt',
                            'goto_if_ge', 'goto_if_le', 'goto_if_gt']
                 op_idx = self._cond_var_op.currentIndex()
                 cmd = op_cmds[op_idx] if 0 <= op_idx < len(op_cmds) else 'goto_if_eq'
-                val = str(self._cond_var_val.value())
-                page['_condition_cmd'] = (cmd, var, val, target)
-                page['_condition'] = self._condition_text(page['_condition_cmd'])
-                self._mark_dirty()
-                return
+                primary = (cmd, var, str(self._cond_var_val.value()))
 
-        # If nothing checked, clear the condition
-        if '_condition_cmd' in page:
-            del page['_condition_cmd']
-        page['_condition'] = None
+        # Combine primary + additional ANDed conditions into the page's list.
+        conditions = ([primary] if primary else []) + list(self._extra_conditions)
+        if conditions:
+            page['_conditions'] = conditions
+            page['_condition'] = self._conditions_text(conditions)
+        else:
+            page['_conditions'] = []
+            page['_condition'] = None
+        # Drop the legacy single-condition key so it can't shadow the list.
+        page.pop('_condition_cmd', None)
         self._mark_dirty()
+
+    # ── Additional (ANDed) condition rows ────────────────────────────────
+    def _render_extra_conditions(self):
+        """Rebuild the read-only chip rows for the additional AND conditions."""
+        lay = self._extra_cond_layout
+        while lay.count():
+            item = lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        for i, cond in enumerate(self._extra_conditions):
+            row = QWidget()
+            hb = QHBoxLayout(row)
+            hb.setContentsMargins(0, 0, 0, 0)
+            hb.setSpacing(4)
+            tag = QLabel(f'and  {self._condition_text(cond)}')
+            tag.setStyleSheet('font-size:11px;')
+            hb.addWidget(tag, 1)
+            btn = QPushButton('✕')
+            btn.setFixedWidth(24)
+            btn.setToolTip(_tt('Remove this condition'))
+            btn.clicked.connect(lambda _c, ix=i: self._remove_extra_condition(ix))
+            hb.addWidget(btn)
+            lay.addWidget(row)
+
+    def _remove_extra_condition(self, index: int):
+        if 0 <= index < len(self._extra_conditions):
+            del self._extra_conditions[index]
+            self._render_extra_conditions()
+            self._apply_condition_edit()
+
+    def _on_add_extra_condition(self):
+        """Prompt for another flag/variable check the page also requires."""
+        cond = self._prompt_condition()
+        if cond:
+            self._extra_conditions.append(cond)
+            self._render_extra_conditions()
+            self._apply_condition_edit()
+
+    def _prompt_condition(self):
+        """Small dialog to build one target-less condition tuple, or None."""
+        from PyQt6.QtWidgets import (
+            QVBoxLayout, QLabel, QComboBox, QSpinBox, QHBoxLayout)
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Add Condition')
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel('This page also requires:'))
+        kind = QComboBox()
+        kind.addItems(['Flag', 'Variable'])
+        v.addWidget(kind)
+        # Flag row
+        frow = QWidget(); fh = QHBoxLayout(frow); fh.setContentsMargins(0, 0, 0, 0)
+        fpick = QComboBox(); fpick.setEditable(True); fpick.setMinimumWidth(160)
+        fpick.addItems(sorted(ConstantsManager.FLAGS))
+        fcomp = QCompleter(sorted(ConstantsManager.FLAGS), fpick)
+        fcomp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        fcomp.setFilterMode(Qt.MatchFlag.MatchContains); fpick.setCompleter(fcomp)
+        fstate = QComboBox(); fstate.addItems(['is ON', 'is OFF'])
+        fh.addWidget(fpick, 1); fh.addWidget(fstate)
+        v.addWidget(frow)
+        # Var row
+        vrow = QWidget(); vh = QHBoxLayout(vrow); vh.setContentsMargins(0, 0, 0, 0)
+        vpick = QComboBox(); vpick.setEditable(True); vpick.setMinimumWidth(160)
+        vpick.addItems(sorted(ConstantsManager.VARS))
+        vcomp = QCompleter(sorted(ConstantsManager.VARS), vpick)
+        vcomp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        vcomp.setFilterMode(Qt.MatchFlag.MatchContains); vpick.setCompleter(vcomp)
+        vop = QComboBox(); vop.addItems(['==', '!=', '<', '>=', '<=', '>'])
+        vval = QSpinBox(); vval.setRange(0, 65535)
+        vh.addWidget(vpick, 1); vh.addWidget(vop); vh.addWidget(vval)
+        v.addWidget(vrow)
+        vrow.setVisible(False)
+        kind.currentIndexChanged.connect(
+            lambda ix: (frow.setVisible(ix == 0), vrow.setVisible(ix == 1)))
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        if kind.currentIndex() == 0:
+            flag = fpick.currentText().strip()
+            if not flag:
+                return None
+            return ('goto_if_set' if fstate.currentIndex() == 0
+                    else 'goto_if_unset', flag)
+        var = vpick.currentText().strip()
+        if not var:
+            return None
+        op_cmds = ['goto_if_eq', 'goto_if_ne', 'goto_if_lt',
+                   'goto_if_ge', 'goto_if_le', 'goto_if_gt']
+        return (op_cmds[vop.currentIndex()], var, str(vval.value()))
 
     def _merge_sublabels(self, entry_label: str, scripts: dict,
                          exclude: set[str] | None = None) -> list[tuple]:
@@ -7475,6 +7689,106 @@ class EventEditorTab(QWidget):
 
         return merged
 
+    @staticmethod
+    def _page_conditions(page: dict) -> list:
+        """Return a page's AND-condition list, migrating the legacy single
+        `_condition_cmd` form to the list form transparently."""
+        from eventide.backend.eventide_utils import _cond_without_target
+        conds = list(page.get('_conditions') or [])
+        if not conds and page.get('_condition_cmd'):
+            conds = [_cond_without_target(page['_condition_cmd'])]
+        return conds
+
+    def _page_is_default(self, page: dict) -> bool:
+        """A page is the default (fall-through) page when it carries NO
+        conditions at all."""
+        return (not self._page_conditions(page)
+                and page.get('_condition') is None)
+
+    def _lower_page_conditions(self, pages: list, script: str):
+        """Return ``(entry_label, condition_gotos)`` for a set of pages: the
+        default page's label, and the flat command tuples that select each
+        condition page (single positive jump, or a guard block for 2+ ANDed
+        checks). Shared by both save paths so they can't drift."""
+        from eventide.backend.eventide_utils import lower_conditions_to_gotos
+        entry_label = script
+        for page in pages:
+            if self._page_is_default(page):
+                entry_label = page.get('_label', script)
+                break
+        condition_gotos: list = []
+        skip_n = 0
+        for page in pages:
+            conds = self._page_conditions(page)
+            if not conds:
+                continue
+            skip_n += 1
+            page_label = page.get('_label', script)
+            condition_gotos.extend(lower_conditions_to_gotos(
+                conds, page_label, f'{entry_label}_Skip{skip_n}'))
+        return entry_label, condition_gotos
+
+    def _object_to_save_pages(self, obj: dict) -> "OrderedDict":
+        """Flatten ONE object's pages into an ``{label: commands}`` map, exactly
+        as the main Save path does (condition-page goto re-insertion, preamble
+        sharing, and _label_marker splitting). Read-only — used by the Raw Code
+        editor so the raw text it shows matches what would actually be written.
+
+        Kept deliberately parallel to the per-object block inside ``_on_save`` —
+        if that logic changes, mirror it here.
+        """
+        from collections import OrderedDict
+        out = OrderedDict()
+        script = obj.get('script', '')
+        if _is_no_script(script):
+            return out
+        pages = obj.get('_pages', [{'commands': []}])
+
+        entry_label, condition_gotos = self._lower_page_conditions(pages, script)
+
+        _PREAMBLE = frozenset({'lock', 'lockall', 'faceplayer', 'textcolor'})
+        for page in pages:
+            page_label = page.get('_label', script)
+            if _is_no_script(page_label):
+                continue
+            all_cmds = page.get('commands', [])
+            is_default = self._page_is_default(page)
+
+            if is_default and condition_gotos:
+                preamble_end = 0
+                for ci, ct in enumerate(all_cmds):
+                    if ct and ct[0] in _PREAMBLE:
+                        preamble_end = ci + 1
+                    else:
+                        break
+                all_cmds = (list(all_cmds[:preamble_end])
+                            + list(condition_gotos)
+                            + list(all_cmds[preamble_end:]))
+                page_label = entry_label
+            elif not is_default:
+                stripped = []
+                past_preamble = False
+                for ct in all_cmds:
+                    if not past_preamble and ct and ct[0] in _PREAMBLE:
+                        continue
+                    past_preamble = True
+                    stripped.append(ct)
+                all_cmds = stripped
+
+            current_label = page_label
+            current_cmds: list[tuple] = []
+            for cmd in all_cmds:
+                if cmd and cmd[0] == '_label_marker':
+                    if current_label not in self._external_script_labels:
+                        out[current_label] = current_cmds
+                    current_label = cmd[1] if len(cmd) > 1 else current_label
+                    current_cmds = []
+                else:
+                    current_cmds.append(cmd)
+            if current_label not in self._external_script_labels:
+                out[current_label] = current_cmds
+        return out
+
     def _build_script_pages(self, entry_label: str, scripts: dict) -> list[dict]:
         """Build RMXP-style pages from a script's entry point.
 
@@ -7503,53 +7817,70 @@ class EventEditorTab(QWidget):
             'lock', 'lockall', 'faceplayer', 'textcolor',
         })
 
-        preamble: list[tuple] = []
-        condition_entries: list[tuple] = []   # (cmd_tuple, target_label)
-        body_start = 0
+        from eventide.backend.eventide_utils import gather_condition_selectors
+        (preamble, selectors, default_label, default_body,
+         consumed, inline) = gather_condition_selectors(
+            entry_label, scripts, _PREAMBLE_CMDS)
 
-        for i, ct in enumerate(entry_cmds):
-            if not ct:
-                continue
-            cmd = ct[0]
-            if cmd in _PREAMBLE_CMDS:
-                preamble.append(ct)
-                body_start = i + 1
-            elif cmd in self._CONDITION_CMDS:
-                target = self._extract_goto_target(ct)
-                if target:
-                    condition_entries.append((ct, target))
-                body_start = i + 1
-            else:
-                break  # First non-preamble, non-conditional = body starts
-
-        # If no conditions found, return a single page with everything
-        # merged inline (simple script with no branching at entry)
-        if not condition_entries:
+        # Simple script — no leading checks at all.
+        if not selectors and inline is None:
             merged = self._merge_sublabels(entry_label, scripts)
             return [{
-                'commands': merged,
-                '_label': entry_label,
+                'commands': merged, '_label': entry_label,
                 '_short_label': self._shorten_label(entry_label),
-                '_sub_labels': [entry_label],
+                '_sub_labels': [entry_label], '_conditions': [], '_condition': None,
             }]
 
-        # ── Step 2: Collect condition page target labels ─────────────
-        condition_targets = {target for _, target in condition_entries}
+        # Hand-written guard chain (2+ shared-target checks then an inline body).
+        # Fold it into one AND-page — but only if the fallback block isn't
+        # referenced elsewhere (consuming it would break those references).
+        # If it is, fall back to a single plain page (non-destructive).
+        if inline is not None:
+            fallback = inline['skip_label']
+            if self._label_referenced_elsewhere(fallback, scripts, entry_label):
+                merged = self._merge_sublabels(entry_label, scripts)
+                return [{
+                    'commands': merged, '_label': entry_label,
+                    '_short_label': self._shorten_label(entry_label),
+                    '_sub_labels': [entry_label], '_conditions': [],
+                    '_condition': None,
+                }]
+            cond_targets = {s['page_label'] for s in selectors
+                            if s.get('page_label')} | set(consumed)
+            default_merged = self._merge_sublabels(
+                fallback, scripts, exclude=cond_targets)
+            body_label = f'{entry_label}_When'
+            return [
+                {'commands': default_merged, '_label': entry_label,
+                 '_short_label': self._shorten_label(entry_label),
+                 '_sub_labels': [entry_label] + [
+                     ct[1] for ct in default_merged
+                     if ct and ct[0] == '_label_marker' and len(ct) > 1],
+                 '_conditions': [], '_condition': None},
+                {'commands': list(preamble) + list(default_body),
+                 '_label': body_label,
+                 '_short_label': self._shorten_label(body_label),
+                 '_sub_labels': [body_label],
+                 '_conditions': list(inline['conditions']),
+                 '_condition': self._conditions_text(inline['conditions'])},
+            ]
 
-        # ── Step 3: Build default page (body after conditionals) ─────
-        default_body = list(preamble) + entry_cmds[body_start:]
-        # Follow sub-labels from default body, excluding condition targets
+        # Normal case: a default page + one page per selector (each selector may
+        # carry several ANDed checks).
+        condition_targets = {s['page_label'] for s in selectors
+                             if s.get('page_label')} | set(consumed)
+
+        # Default page: BFS out from the fall-through body, under the entry
+        # label so the event's script pointer stays valid. Skip labels absorbed
+        # by the chain-walk are excluded so they aren't re-merged.
         default_sublabels = [entry_label]
         default_merged = list(default_body)
-
-        # BFS from default body commands
-        visited_default = {entry_label} | condition_targets
+        visited_default = {entry_label, default_label} | condition_targets
         queue = []
         for ct in default_body:
             target = self._extract_goto_target(ct) if ct else None
             if target and target not in visited_default:
                 queue.append(target)
-
         while queue:
             label = queue.pop(0)
             if label in visited_default:
@@ -7567,42 +7898,51 @@ class EventEditorTab(QWidget):
                     queue.append(target)
 
         pages = [{
-            'commands': default_merged,
-            '_label': entry_label,
+            'commands': default_merged, '_label': entry_label,
             '_short_label': self._shorten_label(entry_label),
-            '_sub_labels': default_sublabels,
-            '_condition': None,
+            '_sub_labels': default_sublabels, '_conditions': [], '_condition': None,
         }]
 
-        # ── Step 4: Build each condition page ────────────────────────
-        for cond_cmd, target_label in condition_entries:
-            cond_text = self._condition_text(cond_cmd)
-            # Merge sub-labels from the target, but exclude labels
-            # that belong to other pages
+        for sel in selectors:
+            target_label = sel['page_label']
+            conditions = list(sel['conditions'])
             other_targets = condition_targets - {target_label}
-            page_cmds = list(preamble)  # preamble runs on every page
-            page_merged = self._merge_sublabels(
-                target_label, scripts, exclude=other_targets)
-            page_cmds.extend(page_merged)
-
-            # Collect sub-labels for save
-            page_sublabels = [target_label]
-            for ct in page_cmds:
-                if ct and ct[0] == '_label_marker' and len(ct) > 1:
-                    page_sublabels.append(ct[1])
-
-            short = self._shorten_label(target_label)
-
+            page_cmds = list(preamble)
+            page_cmds.extend(self._merge_sublabels(
+                target_label, scripts, exclude=other_targets))
+            page_sublabels = [target_label] + [
+                ct[1] for ct in page_cmds
+                if ct and ct[0] == '_label_marker' and len(ct) > 1]
             pages.append({
-                'commands': page_cmds,
-                '_label': target_label,
-                '_short_label': short,
-                '_sub_labels': page_sublabels,
-                '_condition': cond_text,
-                '_condition_cmd': cond_cmd,
+                'commands': page_cmds, '_label': target_label,
+                '_short_label': self._shorten_label(target_label),
+                '_sub_labels': page_sublabels, '_conditions': conditions,
+                '_condition': self._conditions_text(conditions),
             })
 
         return pages
+
+    def _conditions_text(self, conditions: list) -> str:
+        """Human-readable 'A AND B' banner for a page's condition list."""
+        parts = [self._condition_text(c) for c in conditions if c]
+        parts = [p for p in parts if p]
+        return ' AND '.join(parts)
+
+    def _label_referenced_elsewhere(self, label: str, scripts: dict,
+                                    owner: str) -> bool:
+        """True if *label* is a goto/call target in any script other than the
+        *owner* entry — i.e. it can't be safely consumed as an inline default."""
+        for lbl, cmds in scripts.items():
+            if lbl == owner:
+                continue
+            for ct in cmds or []:
+                if not ct:
+                    continue
+                if ct[0] in ('goto', 'call') and len(ct) > 1 and ct[1] == label:
+                    return True
+                if self._extract_goto_target(ct) == label:
+                    return True
+        return False
 
     # ─────────────────────────────────────────────────────────────────────
     # Object selection
@@ -8106,7 +8446,8 @@ class EventEditorTab(QWidget):
         if not local_id:
             return None
 
-        cond_cmd = page.get('_condition_cmd')
+        _conds = self._page_conditions(page)
+        cond_cmd = _conds[0] if _conds else None
         if not cond_cmd:
             return None
 
@@ -8204,8 +8545,7 @@ class EventEditorTab(QWidget):
             self.y_spin.setValue(y)
             # Find the source label for the tooltip
             source = ''
-            cond_cmd = page.get('_condition_cmd')
-            if cond_cmd and hasattr(self, '_pos_overrides'):
+            if self._page_conditions(page) and hasattr(self, '_pos_overrides'):
                 local_id = str(obj.get('local_id', ''))
                 for okey, (ox, oy, src) in self._pos_overrides.items():
                     if okey[0] == local_id and ox == str(x) and oy == str(y):
@@ -8922,8 +9262,8 @@ class EventEditorTab(QWidget):
             obj = self._objects[self._current_obj_idx]
             pages = obj.get('_pages', [])
             for pi, pg in enumerate(pages):
-                cc = pg.get('_condition_cmd')
-                if cc and cc[0] == check_cmd and len(cc) > 1 and cc[1] == flag:
+                if any(c[0] == check_cmd and len(c) > 1 and c[1] == flag
+                       for c in _pg_cond_tuples(pg)):
                     self.page_tabs.setCurrentIndex(pi)
                     self._mw.log_message(
                         f'Event Editor: jumped to Page {pi + 1} '
@@ -8940,14 +9280,14 @@ class EventEditorTab(QWidget):
             obj = self._objects[self._current_obj_idx]
             pages = obj.get('_pages', [])
             for pi, pg in enumerate(pages):
-                cc = pg.get('_condition_cmd')
-                if cc and cc[0] == 'goto_if_eq' and len(cc) > 2:
-                    if cc[1] == var and str(cc[2]) == val:
-                        self.page_tabs.setCurrentIndex(pi)
-                        self._mw.log_message(
-                            f'Event Editor: jumped to Page {pi + 1} '
-                            f'(condition: {pg.get("_condition", "")})')
-                        return
+                if any(c[0] == 'goto_if_eq' and len(c) > 2
+                       and c[1] == var and str(c[2]) == val
+                       for c in _pg_cond_tuples(pg)):
+                    self.page_tabs.setCurrentIndex(pi)
+                    self._mw.log_message(
+                        f'Event Editor: jumped to Page {pi + 1} '
+                        f'(condition: {pg.get("_condition", "")})')
+                    return
             self._mw.log_message(
                 f'Event Editor: no condition page found for {var} == {val}')
             return
@@ -9135,6 +9475,219 @@ class EventEditorTab(QWidget):
         if obj.get('script') == new_label:      # entry page → keep field in sync
             self.script_edit.setText(new_label)
         self._mark_dirty()
+
+    def _on_edit_raw_code(self):
+        """Open the current script as raw .inc text (commands + message strings)
+        in a pop-up for hand-editing — e.g. to strip {COLOR}/{SHADOW} blocks the
+        WYSIWYG text editor hides. Save parses the text back into the event;
+        Cancel discards. Only touches the in-memory event; the map's own Save
+        still writes it to disk."""
+        from PyQt6.QtWidgets import QVBoxLayout, QLabel, QMessageBox
+        from PyQt6.QtGui import QFont
+        from eventide.backend.eventide_utils import (
+            _render_label_block, parse_raw_script_text)
+
+        if self._current_obj_idx < 0:
+            QMessageBox.information(self, 'Edit Raw Code',
+                                   'Select an event first.')
+            return
+        obj = self._objects[self._current_obj_idx]
+        if _is_no_script(obj.get('script', '')):
+            QMessageBox.information(
+                self, 'Edit Raw Code',
+                'This event has no script yet. Use "New Script" to create one '
+                'first, then you can edit its raw code here.')
+            return
+
+        # Flush the current UI edits into the object's pages, then flatten the
+        # object to label blocks exactly as Save would.
+        self._collect_current()
+        entry_label = obj.get('script', '')
+        save_pages = self._object_to_save_pages(obj)
+        if not save_pages:
+            QMessageBox.information(self, 'Edit Raw Code',
+                                   'Nothing to edit for this event.')
+            return
+
+        # Render script blocks; collect the message labels they reference.
+        render_texts: dict = {}
+        script_lines: list[str] = []
+        for label, cmds in save_pages.items():
+            script_lines.extend(
+                _render_label_block(label, cmds, self._hidden_lines, render_texts))
+
+        # Emit .string / .braille blocks for the referenced texts, preferring
+        # the authoritative store (faithful to text.inc, incl. $ and {COLOR}).
+        from eventide.backend.eventide_utils import _BRAILLE_PREFIX
+        text_lines: list[str] = []
+        for tlabel in render_texts:
+            content = self._texts.get(tlabel, render_texts.get(tlabel, ''))
+            if content.startswith(_BRAILLE_PREFIX):
+                actual = content[len(_BRAILLE_PREFIX):]
+                esc = actual.replace('\n\n', '\\p').replace('\n', '\\n').replace('"', '\\"')
+                text_lines.append(f'{tlabel}::\n')
+                text_lines.append(f'    .braille "{esc}"\n\n')
+            else:
+                esc = content.replace('\n\n', '\\p').replace('\n', '\\n').replace('"', '\\"')
+                text_lines.append(f'{tlabel}::\n')
+                text_lines.append(f'    .string "{esc}"\n\n')
+
+        raw = ''.join(script_lines)
+        if text_lines:
+            raw += '\n@ ==== Text (edit message wording / remove {COLOR} blocks here) ====\n\n'
+            raw += ''.join(text_lines)
+
+        # ── Build the dialog ─────────────────────────────────────────────
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f'Raw Script Code — {entry_label}')
+        dlg.resize(760, 620)
+        v = QVBoxLayout(dlg)
+        hint = QLabel(
+            'This is the actual script code. Edit the commands and/or the '
+            'message text below (including {COLOR}/{SHADOW} blocks). '
+            'Save applies your edits to this event; the map still needs its '
+            'own Save to write to disk.')
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color:#aaa;font-size:11px;')
+        v.addWidget(hint)
+
+        editor = QPlainTextEdit()
+        editor.setPlainText(raw)
+        mono = QFont('Consolas')
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(10)
+        editor.setFont(mono)
+        editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        editor.setTabStopDistance(28)
+        v.addWidget(editor, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save |
+            QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        v.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        new_raw = editor.toPlainText()
+        if new_raw.strip() == raw.strip():
+            return  # no change
+
+        # ── Parse the edited text back, with a safety net ────────────────
+        try:
+            scripts, out_texts, _order = parse_raw_script_text(
+                new_raw, self._texts)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self, 'Could Not Apply',
+                f'The raw code could not be parsed, so nothing was changed:\n\n'
+                f'{exc}\n\nFix the code and try again, or Cancel.')
+            return
+        if entry_label not in scripts:
+            QMessageBox.warning(
+                self, 'Main Label Missing',
+                f'The main script label "{entry_label}::" is no longer in the '
+                f'code, so it can\'t be applied safely. Keep that label (use '
+                f'the Rename button to rename a script instead). Nothing was '
+                f'changed.')
+            return
+
+        # Apply: update texts, rebuild pages from the edited script dict.
+        for tlabel, content in out_texts.items():
+            self._texts[tlabel] = content
+            self._register_text(tlabel, content.replace(_BRAILLE_PREFIX, '')
+                                if content.startswith(_BRAILLE_PREFIX) else content)
+        # Merge the edited script labels into the global script store so
+        # _build_script_pages can follow sub-label gotos.
+        for lbl, cmds in scripts.items():
+            self._all_scripts[lbl] = cmds
+        obj['_pages'] = self._build_script_pages(entry_label, self._all_scripts)
+
+        self._display_object(self._current_obj_idx)
+        self._mark_dirty()
+        self._mw.log_message(
+            f'Event Editor: applied raw-code edits to {entry_label}')
+
+    def _on_delete_event(self):
+        """Delete the whole current event from the map, and (on Save) strip its
+        script block(s) from scripts.inc. This is the 'get rid of it entirely'
+        action — Delete Page only removes one page of a script."""
+        from PyQt6.QtWidgets import QMessageBox
+        idx = self._current_obj_idx
+        if idx < 0 or idx >= len(self._objects):
+            return
+        obj = self._objects[idx]
+        disp = self.obj_combo.currentText() or 'this event'
+        script = obj.get('script', '') or ''
+
+        # Collect the event's script labels (entry + every page label).
+        labels = set()
+        if not _is_no_script(script):
+            labels.add(script)
+        for p in obj.get('_pages', []):
+            lbl = p.get('_label')
+            if lbl and not _is_no_script(lbl):
+                labels.add(lbl)
+
+        body = f'Delete {disp}?\n\nThis removes the event from the map'
+        if labels:
+            body += ' and deletes its script:\n  ' + '\n  '.join(sorted(labels))
+        body += ('\n\nNothing is written until you Save — and after Save you '
+                 'can still revert with Git.')
+        if QMessageBox.question(
+                self, 'Delete Event', body,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        # Never delete a label another REMAINING event still references (a
+        # shared script, e.g. several triggers goto the same battle script).
+        remaining = set()
+        for i, o in enumerate(self._objects):
+            if i == idx:
+                continue
+            s = o.get('script')
+            if s:
+                remaining.add(s)
+            for p in o.get('_pages', []):
+                if p.get('_label'):
+                    remaining.add(p['_label'])
+        to_delete = labels - remaining
+        shared = labels & remaining
+
+        # Schedule the script blocks for removal on Save (write_scripts_inc
+        # otherwise PRESERVES them as unmanaged content, leaving them orphaned).
+        if not hasattr(self, '_deleted_script_labels'):
+            self._deleted_script_labels = set()
+        self._deleted_script_labels |= to_delete
+
+        # Remove the event. The save-time map.json split reads self._objects, so
+        # dropping it here removes it from map.json on Save.
+        self._objects.pop(idx)
+        self.obj_combo.blockSignals(True)
+        self.obj_combo.removeItem(idx)
+        self.obj_combo.blockSignals(False)
+        self._mark_dirty()
+
+        # Show a neighbouring event (or clear the panel if none are left).
+        if self._objects:
+            new_idx = min(idx, len(self._objects) - 1)
+            self.obj_combo.blockSignals(True)
+            self.obj_combo.setCurrentIndex(new_idx)
+            self.obj_combo.blockSignals(False)
+            self._display_object(new_idx)
+        else:
+            self._current_obj_idx = -1
+
+        msg = f'Event Editor: deleted {disp}'
+        if to_delete:
+            msg += f' + {len(to_delete)} script label(s) (removed on Save)'
+        if shared:
+            msg += f'; kept {len(shared)} label(s) still used elsewhere'
+        self._mw.log_message(msg)
 
         self._mark_dirty()
 
@@ -9519,6 +10072,8 @@ class EventEditorTab(QWidget):
         npc_menu = menu.addMenu('NPC Scripts')
         npc_menu.addAction('Simple Talker — just says something',
                            lambda: self._create_npc_talker(obj, script))
+        npc_menu.addAction('Cutscene Talker — freezes ALL NPCs while talking',
+                           lambda: self._create_npc_cutscene_talker(obj, script))
         npc_menu.addAction('Trainer — battle with intro/defeat dialogue',
                            lambda: self._create_npc_trainer(obj, script))
         npc_menu.addAction('Item Giver — gives an item once (flag-gated)',
@@ -9675,6 +10230,34 @@ class EventEditorTab(QWidget):
         self._refresh_current_object()
         self._mark_dirty()
         self._mw.log_message(f'Event Editor: created talker script for {script}')
+
+    def _create_npc_cutscene_talker(self, obj, script):
+        """NPC that talks with EVERY npc on the map frozen (cutscene style).
+
+        Uses ``lockall``/``releaseall`` (freeze/unfreeze ALL objects) instead of
+        the per-npc lock that ``MSGBOX_NPC`` does internally — so the message
+        uses ``MSGBOX_DEFAULT`` (plain show-text, no lock of its own), which is
+        the correct pairing. Without this the msgbox's own lock/release would
+        fight the map-wide lockall.
+        """
+        text_label = f'{script}_Text'
+        placeholder = 'Everyone, listen up!$'
+
+        cmds = [
+            ('lockall',),
+            ('faceplayer',),
+            ('message', text_label, placeholder, 'MSGBOX_DEFAULT'),
+            ('releaseall',),
+        ]
+        obj['_pages'] = [{'commands': cmds, '_label': script,
+                          '_short_label': script.split('_')[-1]}]
+
+        self._register_text(text_label, placeholder)
+        self._register_labels([script])
+        self._refresh_current_object()
+        self._mark_dirty()
+        self._mw.log_message(
+            f'Event Editor: created cutscene talker script for {script}')
 
     def _load_porysuite_trainers(self) -> dict:
         """Load PorySuite's trainers.json for trainer names and metadata."""
@@ -10314,21 +10897,11 @@ class EventEditorTab(QWidget):
                 continue
             pages = obj.get('_pages', [{'commands': []}])
 
-            # Identify condition pages and collect their goto commands.
-            # These need to be prepended to the entry/default page.
-            entry_label = script
-            condition_gotos: list[tuple] = []
-            default_page = None
-            preamble_cmds: list[tuple] = []
-
-            for page in pages:
-                cond_cmd = page.get('_condition_cmd')
-                if cond_cmd:
-                    condition_gotos.append(cond_cmd)
-                elif page.get('_condition') is None:
-                    # This is the default page (no condition)
-                    default_page = page
-                    entry_label = page.get('_label', script)
+            # Identify condition pages and lower their conditions into the
+            # command tuples that select each one (positive jump or guard
+            # block). These get prepended to the entry/default page.
+            entry_label, condition_gotos = self._lower_page_conditions(
+                pages, script)
 
             # Process each page — split on _label_marker boundaries
             for page in pages:
@@ -10340,8 +10913,7 @@ class EventEditorTab(QWidget):
                 # For the default page, detect preamble commands that were
                 # shared with condition pages, then insert the condition
                 # gotos after the preamble.
-                is_default = (page.get('_condition') is None
-                              and not page.get('_condition_cmd'))
+                is_default = self._page_is_default(page)
 
                 if is_default and condition_gotos:
                     # Find where preamble ends in this page's commands
@@ -10359,7 +10931,7 @@ class EventEditorTab(QWidget):
                                      + list(all_cmds[preamble_end:]))
                     all_cmds = reconstructed
                     page_label = entry_label  # save under entry label
-                elif not is_default and page.get('_condition_cmd'):
+                elif not is_default:
                     # Condition page — strip preamble commands since they
                     # are shared from the entry label (already saved there)
                     _PREAMBLE = frozenset({
@@ -10414,6 +10986,20 @@ class EventEditorTab(QWidget):
                 self._ensure_map_inc_registered('text.inc')
             # scripts.inc is likewise hand-listed — make sure it's registered.
             self._ensure_map_inc_registered('scripts.inc')
+
+            # Remove the script blocks of any events the user DELETED this
+            # session (write_scripts_inc preserves unmanaged blocks, so they'd
+            # otherwise stay orphaned in scripts.inc). Also drop their `_Text`.
+            deleted = getattr(self, '_deleted_script_labels', None)
+            if deleted:
+                n = _strip_label_blocks(scripts_path, deleted)
+                _strip_label_blocks(text_path,
+                                    {f'{l}_Text' for l in deleted} | set(deleted))
+                if n:
+                    self._mw.log_message(
+                        f'Event Editor: removed {n} deleted script block(s) '
+                        f'from scripts.inc.')
+                self._deleted_script_labels = set()
 
             # Self-heal: remove any leftover NULL:: / NULL_Text:: (or 0/0x0)
             # stub block a prior bug may have written — NULL:: is a reserved

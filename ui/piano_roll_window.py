@@ -613,16 +613,51 @@ class PianoRollWindow(QMainWindow):
     def _on_status_msg(self, msg: str):
         self._status.showMessage(msg, 3000)
 
+    def _sync_song_structure_from_panel(self):
+        """Rebuild _song's structural commands to MATCH the panel exactly.
+
+        Removal previously only updated the panel's own list, leaving the
+        LABEL/GOTO/PATT/PEND/FINE commands in the in-memory _song. Any track
+        add/delete/duplicate calls _reload_tracks -> load_from_song(_song),
+        which re-read those stale commands and resurrected the deleted section
+        / loop (the "ghost"). Keeping _song in lockstep with the panel means a
+        removed item is gone from the model everywhere — reload, playback and
+        save all see the same thing. The flatten re-sorts by tick, so appending
+        the rebuilt structural commands is order-safe.
+        """
+        if getattr(self, '_song', None) is None:
+            return
+        from core.sound.song_parser import TrackCommand
+        _STRUCT = {'LABEL', 'GOTO', 'PATT', 'PEND', 'FINE'}
+        items = [it for it in self._structure_panel.get_structure_items()
+                 if it.cmd in _STRUCT]
+        for track in self._song.tracks:
+            kept = [c for c in track.commands if c.cmd not in _STRUCT]
+            for it in items:
+                raw = (it.label if it.cmd == 'LABEL'
+                       else it.target if it.cmd in ('GOTO', 'PATT') else '')
+                target_label = f"{track.label}_{raw}" if raw else None
+                kept.append(TrackCommand(
+                    cmd=it.cmd, tick=it.tick, target_label=target_label))
+            track.commands = kept
+
     def _on_structure_changed(self):
         """User edited song structure (sections, loops, etc.)."""
         self._mark_dirty()
         self._structure_dirty = True
+        # Keep the in-memory song matched to the panel so a removed section /
+        # loop can't be resurrected by a later track reload.
+        self._sync_song_structure_from_panel()
         # Update loop region from the structure panel
         loop_s, loop_e = self._structure_panel.get_loop_region()
         self._piano_roll.canvas._loop_start = loop_s
         self._piano_roll.canvas._loop_end = loop_e
         self._piano_roll.canvas.update()
-        if self._sequencer is not None and loop_s is not None and loop_e is not None:
+        # Always push the loop region — INCLUDING (None, None). Removing the
+        # Loop Back must actually stop the sequencer looping; the old guard
+        # only ever SET a loop, never CLEARED one, so a removed loop kept
+        # playing (the "ghost"). set_loop(None, None) clears it.
+        if self._sequencer is not None:
             self._sequencer.set_loop(loop_s, loop_e)
         self._status.showMessage("Song structure updated", 3000)
 
@@ -924,6 +959,7 @@ class PianoRollWindow(QMainWindow):
         self._song.tracks.append(new_track)
         self._song.num_tracks = len(self._song.tracks)
         self._reload_tracks()
+        self._mark_dirty()
         self._status.showMessage(f"Added Track {new_idx + 1}", 3000)
 
     def _on_remove_track(self, index: int):
@@ -955,7 +991,11 @@ class PianoRollWindow(QMainWindow):
                 n['track'] -= 1
 
         self._reload_tracks()
-        self._status.showMessage(f"Removed Track {index + 1}", 3000)
+        # Stage the change only — it persists when the user hits Save, never
+        # auto-written to disk here.
+        self._mark_dirty()
+        self._status.showMessage(
+            f"Removed Track {index + 1} (unsaved — use Save to keep it)", 4000)
 
     def _on_duplicate_track(self, index: int):
         if index < 0 or index >= len(self._song.tracks):
@@ -977,6 +1017,7 @@ class PianoRollWindow(QMainWindow):
         canvas_notes.extend(new_notes)
 
         self._reload_tracks()
+        self._mark_dirty()
         self._status.showMessage(
             f"Duplicated Track {index + 1} as Track {new_idx + 1}", 3000)
 
@@ -1039,6 +1080,29 @@ class PianoRollWindow(QMainWindow):
         # writer can mis-encode chord notes (dropping an explicit length mid2agb
         # keeps), which assembles but plays broken; this guarantees a piano-roll
         # edit (notes, per-track volume) renders exactly as the build would.
+        # CRITICAL: sync midi.cfg's -G to the song's CURRENT voicegroup BEFORE
+        # recompiling. recompile_song regenerates the .s from the .mid using
+        # midi.cfg's flags, so a stale -G reverts a voicegroup change (the .s we
+        # just wrote with the new bank gets overwritten back to the old one).
+        # Always sync (idempotent) so a bank change can never silently revert.
+        try:
+            from core.sound.song_table_manager import (
+                update_midi_cfg_flags, voicegroup_index_from_name)
+            _vg = voicegroup_index_from_name(getattr(self._song, 'voicegroup', None))
+            if _vg is not None and self._project_root:
+                # Pass the song's other flags too so this rewrite only CHANGES
+                # -G and preserves -V/-P/-R (update_midi_cfg_flags drops a flag
+                # whose arg is None). The song object is the source of truth.
+                update_midi_cfg_flags(
+                    self._project_root, self._song.label,
+                    voicegroup=_vg,
+                    priority=getattr(self._song, 'priority', None),
+                    reverb=getattr(self._song, 'reverb', None),
+                    volume=getattr(self._song, 'master_volume', None))
+        except Exception as e:
+            _log.warning("midi.cfg -G sync failed for %s: %s",
+                         self._song.label, e)
+
         try:
             from core.sound.song_compiler import recompile_song, find_mid2agb
             if self._project_root and find_mid2agb(self._project_root):

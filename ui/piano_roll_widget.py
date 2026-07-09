@@ -498,20 +498,24 @@ class PianoRollCanvas(QWidget):
         self.push_undo()
         self._selected.clear()
         base = len(self._notes)
+        # Preserve each note's ORIGINAL track and pitch — a multi-track
+        # selection must land back on the tracks it came from, not all be
+        # collapsed onto the active track (which the save then wrote out as a
+        # single track). A single-track copy naturally pastes back onto that
+        # same track. Only the time position moves (to the play cursor).
         for n in self._clipboard:
-            new = {**n, 'tick': n['tick'] + at_tick, 'track': self._active_track}
+            new = {**n, 'tick': n['tick'] + at_tick}
+            new.setdefault('track', self._active_track)
             self._notes.append(new)
             self._selected.add(base)
             base += 1
 
-        # Re-insert control events at the paste location on the active
-        # track so the pasted notes inherit their original volume/pan/bend.
+        # Re-insert control events on their ORIGINAL tracks too, so each
+        # pasted voice keeps its own volume/pan/bend.
         for e in getattr(self, '_clipboard_ctrl', []) or []:
-            self._control_events.append({
-                **e,
-                'tick': e['tick'] + at_tick,
-                'track': self._active_track,
-            })
+            ev = {**e, 'tick': e['tick'] + at_tick}
+            ev.setdefault('track', self._active_track)
+            self._control_events.append(ev)
 
         self.notes_changed.emit()
         self.update()

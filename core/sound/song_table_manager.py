@@ -473,6 +473,17 @@ def write_midi_cfg(project_root: str, data: SongTableData,
     _backdate_midi_cfg(cfg_path)
 
 
+def voicegroup_index_from_name(name: Optional[str]) -> Optional[int]:
+    """Parse a voicegroup NAME ('voicegroup008', 'voicegroup8') to its int index
+    (8). None if there's no number. Used to sync midi.cfg's -G to a song's
+    current voicegroup on save — mid2agb regenerates the .s from the .mid using
+    that -G, so a stale -G silently reverts a voicegroup change."""
+    if not name:
+        return None
+    m = re.search(r'(\d+)', str(name))
+    return int(m.group(1)) if m else None
+
+
 def update_midi_cfg_flags(project_root: str, label: str,
                           priority: Optional[int] = None,
                           reverb: Optional[int] = None,
