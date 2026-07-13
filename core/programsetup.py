@@ -257,7 +257,7 @@ def _install_devkitpro_wsl(parent=None) -> None:
     )
     subprocess.Popen(
         [exe, "bash", "-c", script],
-        creationflags=subprocess.CREATE_NEW_CONSOLE,
+        creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
     )
 
 
@@ -721,8 +721,8 @@ def _install_devkitpro():
     try:
         subprocess.Popen(
             ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            creationflags=(subprocess.CREATE_NEW_CONSOLE
-                           | subprocess.CREATE_NEW_PROCESS_GROUP),
+            creationflags=(getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                           | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)),
             close_fds=True,
         )
     except Exception:

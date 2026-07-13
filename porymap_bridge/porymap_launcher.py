@@ -612,12 +612,15 @@ def launch_porymap(project_dir: str, map_name: str = "") -> bool:
         if map_name and patched:
             cmd.append(map_name)
         log.info(f"Launching: {cmd}")
-        subprocess.Popen(
-            cmd,
-            cwd=exe_dir,
-            env=env,
-            creationflags=subprocess.DETACHED_PROCESS,
-        )
+        # Detach so Porymap keeps running after PorySuite closes. DETACHED_PROCESS
+        # is Windows-only (accessing it raises AttributeError on Linux/macOS); the
+        # POSIX equivalent is start_new_session=True (its own session/process group).
+        popen_kwargs = {"cwd": exe_dir, "env": env}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS
+        else:
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen(cmd, **popen_kwargs)
         return True
     except OSError as e:
         log.error(f"Failed to launch Porymap: {e}")

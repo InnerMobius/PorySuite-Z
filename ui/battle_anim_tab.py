@@ -1174,20 +1174,11 @@ class BattleAnimTab(QWidget):
         sprite = self._sprites.get(self._current)
         if sprite is None or not sprite.png_path:
             return
-        import subprocess
-        try:
-            if os.path.isfile(sprite.png_path):
-                subprocess.Popen(
-                    ["explorer", "/select,", os.path.normpath(sprite.png_path)])
-            else:
-                folder = os.path.dirname(sprite.png_path)
-                if os.path.isdir(folder):
-                    try:
-                        os.startfile(folder)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        # Cross-platform reveal: selects the file on Windows/macOS, opens its
+        # containing folder on Linux. The old code used explorer + os.startfile,
+        # both Windows-only, so this silently did nothing on Linux/macOS.
+        from ui.open_folder_util import open_in_folder
+        open_in_folder(sprite.png_path)
 
     def _replace_image(self):
         """Replace the sprite's PNG with a user-picked image, indexed to 16

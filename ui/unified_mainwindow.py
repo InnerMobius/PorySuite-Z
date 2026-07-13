@@ -1789,7 +1789,15 @@ class UnifiedMainWindow(QMainWindow):
                 import subprocess
                 subprocess.Popen([emulator, gba_path])
             else:
-                os.startfile(gba_path)
+                # No emulator configured — hand the ROM to the OS default app.
+                # os.startfile is Windows-only, so branch for Linux/macOS.
+                import subprocess as _sp, sys as _sys
+                if _sys.platform == "win32":
+                    os.startfile(gba_path)  # type: ignore[attr-defined]
+                elif _sys.platform == "darwin":
+                    _sp.Popen(["open", gba_path])
+                else:
+                    _sp.Popen(["xdg-open", gba_path])
             self.log_message(f"Launched: {gba_path}")
         except Exception as e:
             QMessageBox.warning(self, "Play", f"Could not launch ROM:\n{e}")

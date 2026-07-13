@@ -260,8 +260,8 @@ def launch_update_and_exit():
     # Launch the script detached so it survives our exit
     subprocess.Popen(
         ["cmd", "/c", script_path],
-        creationflags=(subprocess.CREATE_NEW_CONSOLE
-                       | subprocess.CREATE_NEW_PROCESS_GROUP),
+        creationflags=(getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+                       | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)),
         close_fds=True,
     )
     # Exit the app — the script will wait for us to fully close
