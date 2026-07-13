@@ -29,7 +29,8 @@ class ConstantPicker(QComboBox):
     """
 
     def __init__(self, constants: list[str], prefix: str = '',
-                 show_pretty: bool = True, parent: QWidget | None = None):
+                 show_pretty: bool = True, keep_order: bool = False,
+                 parent: QWidget | None = None):
         super().__init__(parent)
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
@@ -52,13 +53,17 @@ class ConstantPicker(QComboBox):
 
         # Sort alphabetically by the pretty name portion (case-insensitive)
         # so dropdowns are easy to scan — "None (TRAINER_NONE)" first when
-        # present, then all names A→Z.
-        def _sort_key(d: str) -> tuple:
-            key = d.split('  (')[0].lower()
-            # Keep "none"/"__none__" at top by flagging it first
-            is_none = ('_none' in d.lower()) or key in ('none', '')
-            return (0 if is_none else 1, key)
-        display_items.sort(key=_sort_key)
+        # present, then all names A→Z. Skipped when keep_order is set: some
+        # lists (MOVEMENT_TYPE_*) have a meaningful header/Porymap order with
+        # the project's custom entries grouped at the bottom, and must match
+        # the plain header-order dropdowns elsewhere (e.g. Event Properties).
+        if not keep_order:
+            def _sort_key(d: str) -> tuple:
+                key = d.split('  (')[0].lower()
+                # Keep "none"/"__none__" at top by flagging it first
+                is_none = ('_none' in d.lower()) or key in ('none', '')
+                return (0 if is_none else 1, key)
+            display_items.sort(key=_sort_key)
 
         self.addItems(display_items)
 

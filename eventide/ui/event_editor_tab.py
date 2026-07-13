@@ -145,6 +145,7 @@ _preview_song_cb = None      # Callable[[str], bool] — constant -> play it
 _open_in_sound_editor_cb = None  # Callable[[str], None] — constant -> switch page
 _stop_preview_cb = None      # Callable[[], None] — stop any playing preview
 _open_ow_sprite_cb = None    # Callable[[str], None] — gfx_const -> select in OW Graphics tab
+_open_label_manager_cb = None  # Callable[[str|None, bool], None] — (kind, new) -> switch to Variables & Flags page
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3113,7 +3114,7 @@ class _ApplyMovementWidget(_CommandWidget):
 
         # Edit Steps button — opens the Move Route dialog
         self._edit_btn = QPushButton('Edit Steps...')
-        self._edit_btn.setToolTip(_tt('Open RMXP-style Move Route editor'))
+        self._edit_btn.setToolTip(_tt('Open the Move Route editor'))
         self._edit_btn.clicked.connect(self._on_edit_steps)
         layout.addWidget(self._edit_btn)
 
@@ -3268,10 +3269,20 @@ class _FacePlayerWidget(_CommandWidget):
         return 'Face Player'
 
 
+# pokeemerald-style direction names → pokefirered's, so a script that already
+# has DIR_RIGHT/etc. (or an older EVENTide save) loads onto the right compass
+# direction instead of silently resetting to South.
+_EMERALD_DIR_TO_FIRERED = {
+    'DIR_DOWN': 'DIR_SOUTH', 'DIR_UP': 'DIR_NORTH',
+    'DIR_LEFT': 'DIR_WEST', 'DIR_RIGHT': 'DIR_EAST',
+}
+
+
 class _TurnObjectWidget(_CommandWidget):
     """Turn NPC — object dropdown + direction dropdown."""
-    def __init__(self, obj_id='', direction='DIR_DOWN', parent=None):
+    def __init__(self, obj_id='', direction='DIR_SOUTH', parent=None):
         super().__init__(parent)
+        direction = _EMERALD_DIR_TO_FIRERED.get(direction, direction)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Object:'))
@@ -4998,7 +5009,8 @@ class _SetObjectMovementTypeWidget(_CommandWidget):
         layout.addWidget(self.obj_combo)
         layout.addWidget(QLabel('Movement Type:'))
         self.movement_picker = ConstantPicker(
-            ConstantsManager.MOVEMENT_TYPES, prefix='MOVEMENT_TYPE_')
+            ConstantsManager.MOVEMENT_TYPES, prefix='MOVEMENT_TYPE_',
+            keep_order=True)  # header/Porymap order, matching Event Properties
         if movement_type:
             self.movement_picker.set_constant(movement_type)
         layout.addWidget(self.movement_picker, 1)
@@ -5258,7 +5270,7 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         return _FacePlayerWidget()
     if cmd == 'turnobject':
         parts = _split_args(args)
-        return _TurnObjectWidget(parts[0], parts[1] if len(parts) > 1 else 'DIR_DOWN')
+        return _TurnObjectWidget(parts[0], parts[1] if len(parts) > 1 else 'DIR_SOUTH')
     if cmd in ('setobjectxy', 'setobjectxyperm'):
         parts = _split_args(args)
         return _SetObjectXYWidget(parts[0], _safe_int(parts[1]) if len(parts) > 1 else 0,
@@ -5786,7 +5798,7 @@ _CMD_TOOLTIPS: dict[str, str] = {
     'showobjectat': 'Show a hidden NPC at a specific position',
     'hideobjectat': 'Hide an NPC at a specific position\nNPC stays in memory but becomes invisible',
     'faceplayer': 'Make the current NPC turn to face the player\nUsually the first command in an NPC script',
-    'turnobject': 'Turn an NPC to face a specific direction\n(DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT)',
+    'turnobject': 'Turn an NPC to face a specific direction\n(Down/Up/Left/Right — saved as firered DIR_SOUTH/NORTH/WEST/EAST)',
 
     # ── Page 2: Movement Locking ─────────────────────────────────────
     'lock': 'Freeze the talking NPC in place during the script\nPrevents them from walking their route',
@@ -6359,7 +6371,7 @@ class EventEditorTab(QWidget):
         # ── Page control row (RMXP-style: page buttons at top) ───────────
         page_ctrl = QHBoxLayout()
         btn_add = QPushButton('New Page')
-        btn_add.setToolTip(_tt('Add a new script page (sub-label) to this event\nPages are condition-based branches like RPG Maker event pages'))
+        btn_add.setToolTip(_tt('Add a new script page to this event.\nEach page can have its own conditions — the game runs the\nfirst page whose conditions are all met (top page = default).'))
         btn_add.clicked.connect(self._on_add_page)
         btn_rename = QPushButton('Rename')
         btn_rename.setToolTip(_tt('Rename the current page label\nAlso updates all goto/call references to the old name'))
@@ -6381,6 +6393,12 @@ class EventEditorTab(QWidget):
         btn_find_flag = QPushButton('Find Unused Flag')
         btn_find_flag.setToolTip(_tt('Scan project for the next available unused flag'))
         btn_find_flag.clicked.connect(self._on_find_unused_flag)
+        self._btn_vars = QPushButton('Variables && Flags')
+        self._btn_vars.setToolTip(_tt(
+            'Name and reuse the game\'s variable and flag slots, like RPG\n'
+            'Maker\'s Variables and Switches. Create new ones, or repurpose\n'
+            'the vanilla ones you don\'t need — no file editing.'))
+        self._btn_vars.clicked.connect(lambda: self._open_var_flag_manager())
         btn_find_script = QPushButton('Find Script')
         btn_find_script.setToolTip(_tt('Search for script labels across all maps (Ctrl+Shift+F)'))
         btn_find_script.clicked.connect(self._on_find_script)
@@ -6398,6 +6416,7 @@ class EventEditorTab(QWidget):
         page_ctrl.addWidget(self._divider_line())
         page_ctrl.addWidget(self._btn_new_script)
         page_ctrl.addWidget(btn_find_flag)
+        page_ctrl.addWidget(self._btn_vars)
         page_ctrl.addWidget(btn_find_script)
         page_ctrl.addWidget(self._btn_edit_raw)
         page_ctrl.addWidget(self._divider_line())
@@ -6417,7 +6436,7 @@ class EventEditorTab(QWidget):
         self.page_tabs.setTabPosition(QTabWidget.TabPosition.North)
         self.page_tabs.setUsesScrollButtons(True)
         self.page_tabs.setMaximumHeight(40)
-        self.page_tabs.setToolTip(_tt('Script pages — each page is a sub-label in the script\nLike RPG Maker event pages with different conditions'))
+        self.page_tabs.setToolTip(_tt('Script pages. Page 1 is the default; add more pages with\ntheir own conditions to change what this event does as the\nstory progresses. The game runs the first page whose\nconditions are all met.'))
         self.page_tabs.currentChanged.connect(self._on_page_changed)
         root.addWidget(self.page_tabs)
 
@@ -6471,6 +6490,13 @@ class EventEditorTab(QWidget):
         self._cond_flag_state.setEnabled(False)
         self._cond_flag_state.currentIndexChanged.connect(self._on_cond_changed)
         flag_row.addWidget(self._cond_flag_state)
+        self._btn_flag_manage = QPushButton('＋')
+        self._btn_flag_manage.setFixedWidth(28)
+        self._btn_flag_manage.setToolTip(_tt(
+            'New / manage flags — name a new flag or reuse a vanilla one.'))
+        self._btn_flag_manage.clicked.connect(
+            lambda: self._open_var_flag_manager('flag', new=True))
+        flag_row.addWidget(self._btn_flag_manage)
         cond_layout.addLayout(flag_row)
 
         # Variable condition row — editable
@@ -6503,6 +6529,14 @@ class EventEditorTab(QWidget):
         self._cond_var_val.setEnabled(False)
         self._cond_var_val.valueChanged.connect(self._on_cond_changed)
         var_row.addWidget(self._cond_var_val)
+        self._btn_var_manage = QPushButton('＋')
+        self._btn_var_manage.setFixedWidth(28)
+        self._btn_var_manage.setToolTip(_tt(
+            'New / manage variables — name a new variable or reuse a vanilla '
+            'one.'))
+        self._btn_var_manage.clicked.connect(
+            lambda: self._open_var_flag_manager('var', new=True))
+        var_row.addWidget(self._btn_var_manage)
         cond_layout.addLayout(var_row)
 
         # Additional ANDed conditions — the page also requires ALL of these on
@@ -6528,16 +6562,88 @@ class EventEditorTab(QWidget):
 
         ll.addWidget(self._conditions_box)
 
+        # ── State Appearance (per-page NPC look / behaviour) ─────────────
+        # A condition page can change how this NPC LOOKS and ACTS while that
+        # story state is active — most importantly its movement (e.g. jump in
+        # place until the player talks to them) and where it stands. Because an
+        # NPC's own script only runs when talked to, these passive changes are
+        # driven by the map's On Transition script, which EVENTide writes for
+        # the user from what they set here. Only shown on condition pages; the
+        # NPC's normal look lives in Event Properties below.
+        self._appearance_box = QGroupBox('State Appearance (this page)')
+        self._appearance_box.setToolTip(_tt(
+            'Change how this NPC looks and acts while this page is active.\n'
+            "Happens automatically when the player enters the map — they do\n"
+            "NOT have to talk to the NPC. Leave a row unchecked to keep the\n"
+            "NPC's normal look from Event Properties."))
+        appr_layout = QVBoxLayout(self._appearance_box)
+        appr_layout.setContentsMargins(8, 8, 8, 8)
+        appr_layout.setSpacing(6)
+
+        mv_row = QHBoxLayout()
+        self._appr_move_check = QCheckBox('Movement')
+        self._appr_move_check.setToolTip(_tt(
+            'Give this NPC a different movement while this page is active\n'
+            '(e.g. jump in place, or stand still).'))
+        self._appr_move_check.toggled.connect(self._on_appearance_edited)
+        mv_row.addWidget(self._appr_move_check)
+        self._appr_move_combo = QComboBox()
+        self._appr_move_combo.setEditable(True)
+        self._appr_move_combo.setMinimumWidth(160)
+        self._appr_move_combo.setToolTip(_tt('MOVEMENT_TYPE_* — type to search'))
+        self._appr_move_combo.wheelEvent = lambda e: e.ignore()
+        self._appr_move_combo.setEnabled(False)
+        self._appr_move_combo.currentTextChanged.connect(self._on_appearance_edited)
+        mv_row.addWidget(self._appr_move_combo, 1)
+        appr_layout.addLayout(mv_row)
+
+        pos_row = QHBoxLayout()
+        self._appr_pos_check = QCheckBox('Position')
+        self._appr_pos_check.setToolTip(_tt(
+            'Move this NPC to a different tile while this page is active.'))
+        self._appr_pos_check.toggled.connect(self._on_appearance_edited)
+        pos_row.addWidget(self._appr_pos_check)
+        pos_row.addWidget(QLabel('X'))
+        self._appr_pos_x = QSpinBox()
+        self._appr_pos_x.setRange(0, 1000)
+        self._appr_pos_x.setEnabled(False)
+        self._appr_pos_x.valueChanged.connect(self._on_appearance_edited)
+        pos_row.addWidget(self._appr_pos_x)
+        pos_row.addWidget(QLabel('Y'))
+        self._appr_pos_y = QSpinBox()
+        self._appr_pos_y.setRange(0, 1000)
+        self._appr_pos_y.setEnabled(False)
+        self._appr_pos_y.valueChanged.connect(self._on_appearance_edited)
+        pos_row.addWidget(self._appr_pos_y)
+        pos_row.addStretch()
+        appr_layout.addLayout(pos_row)
+
+        _appr_note = QLabel(
+            'Applied automatically when the player enters the map — no talking '
+            'needed.')
+        _appr_note.setStyleSheet('color:#9aa0a6;font-size:11px;')
+        _appr_note.setWordWrap(True)
+        appr_layout.addWidget(_appr_note)
+
+        self._appearance_box.hide()
+        ll.addWidget(self._appearance_box)
+
         # Object properties
         props = QGroupBox('Event Properties')
         props.setToolTip(_tt('Properties of the currently selected event object'))
         pf = QFormLayout(props)
         self.obj_id_edit = QLineEdit()
-        self.obj_id_edit.setPlaceholderText('local_id')
+        self.obj_id_edit.setPlaceholderText('a name, e.g. Jim (or leave blank)')
         self.obj_id_edit.setToolTip(_tt(
-            'Local ID number for this event on the map\n'
-            'Used by commands like applymovement and removeobject to target this NPC'))
+            'A NAME for this event so scripts can target it (applymovement,\n'
+            'removeobject, etc.) — NOT a number. Type a plain word like "Jim";\n'
+            'it becomes a LOCALID_<MAP>_<NAME> constant behind the scenes (shown\n'
+            'below). Leave blank if nothing refers to this event by name.'))
         pf.addRow('ID:', self.obj_id_edit)
+        self.obj_id_resolved_lbl = QLabel('')
+        self.obj_id_resolved_lbl.setStyleSheet('color:#8a8a8a;font-size:10px;')
+        self.obj_id_resolved_lbl.setWordWrap(True)
+        pf.addRow('', self.obj_id_resolved_lbl)
         pos_row = QHBoxLayout()
         self.x_spin = QSpinBox(); self.x_spin.setRange(0, 999)
         self.x_spin.setToolTip(_tt('X position on the map (tiles from left edge)'))
@@ -6563,8 +6669,29 @@ class EventEditorTab(QWidget):
         self.gfx_combo.currentTextChanged.connect(self._on_gfx_changed)
         pf.addRow('Graphic:', self.gfx_combo)
 
+        self.movement_combo = QComboBox()
+        self.movement_combo.setEditable(True)
+        self.movement_combo.setToolTip(_tt(
+            "How this NPC stands / idles by default (MOVEMENT_TYPE_*).\n"
+            "IMPORTANT: 'None' fully freezes the sprite — with it, lock and\n"
+            "faceplayer can't turn the NPC toward the player. For a normal\n"
+            "talking NPC use Face Down, Look Around, or a Wander type."))
+        self.movement_combo.wheelEvent = lambda e: e.ignore()
+        self.movement_combo.currentTextChanged.connect(
+            lambda: self._mark_dirty())
+        pf.addRow('Movement:', self.movement_combo)
+        # A gentle inline warning when the selected type can't face the player.
+        self.movement_warn_lbl = QLabel('')
+        self.movement_warn_lbl.setStyleSheet(
+            'color:#d9a441;font-size:10px;')
+        self.movement_warn_lbl.setWordWrap(True)
+        pf.addRow('', self.movement_warn_lbl)
+        self.movement_combo.currentTextChanged.connect(
+            self._update_movement_warning)
+
         # Mark dirty when the user edits any property field
-        self.obj_id_edit.textEdited.connect(lambda: self._mark_dirty())
+        self.obj_id_edit.textEdited.connect(
+            lambda: (self._mark_dirty(), self._update_resolved_local_id()))
         self.x_spin.valueChanged.connect(lambda: self._mark_dirty())
         self.y_spin.valueChanged.connect(lambda: self._mark_dirty())
         self.script_edit.textEdited.connect(lambda: self._mark_dirty())
@@ -6608,7 +6735,18 @@ class EventEditorTab(QWidget):
         ll.addWidget(self._open_ow_graphics_btn)
 
         ll.addStretch()
-        splitter.addWidget(left)
+        # Wrap the properties column in a scroll area so it NEVER squishes its
+        # contents (Conditions + State Appearance + Event Properties can exceed
+        # the window height on a condition page — without this the Event
+        # Properties form rows compress until they overlap and become unusable).
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setWidget(left)
+        left_scroll.setMinimumWidth(360)
+        splitter.addWidget(left_scroll)
 
         # ── Right: RMXP-style command list (primary area) ────────────────
         right = QWidget()
@@ -7141,8 +7279,29 @@ class EventEditorTab(QWidget):
             if not _is_no_script(script) and script in self._all_scripts:
                 obj['_pages'] = self._build_script_pages(script, self._all_scripts)
             else:
-                obj['_pages'] = [{'commands': [], '_label': script or '(empty)',
-                                  '_short_label': script or '(empty)'}]
+                # SELF-HEAL: an object whose script field is NULL/empty but whose
+                # derived script (from its local_id, e.g. LOCALID_KAKARIKO_ANJU →
+                # Kakariko_EventScript_Anju) still exists in scripts.inc got its
+                # link severed (a bad save wrote NULL while the script block stayed
+                # behind, orphaned). Re-adopt it so the NPC's pages/tabs come back
+                # instead of showing empty — and so the next save writes the link
+                # back to map.json. Matching by the exact derived name is safe:
+                # that name is unique to this object's local_id.
+                adopted = ''
+                if _is_no_script(script):
+                    cand = self._derived_script_name(obj)
+                    if cand and cand in self._all_scripts:
+                        adopted = cand
+                if adopted:
+                    obj['script'] = adopted
+                    obj['_pages'] = self._build_script_pages(
+                        adopted, self._all_scripts)
+                    self._mw.log_message(
+                        f'Event Editor: reconnected {obj.get("local_id") or "an NPC"} '
+                        f'to its orphaned script {adopted}.')
+                else:
+                    obj['_pages'] = [{'commands': [], '_label': script or '(empty)',
+                                      '_short_label': script or '(empty)'}]
             self._objects.append(obj)
 
             # Item balls get a special [Item] tag with the item name
@@ -7263,6 +7422,10 @@ class EventEditorTab(QWidget):
                         if '_' in short:
                             short = target_label.split(f'{name}_', 1)[-1]
                         self.obj_combo.addItem(f'[MapScript] {script_type}: {short}')
+
+        # Fold any existing On Transition scene states into the NPCs' condition
+        # pages so the State Appearance boxes show them (and round-trip cleanly).
+        self._fold_scene_appearance(name)
 
         self.obj_combo.blockSignals(False)
 
@@ -7555,6 +7718,9 @@ class EventEditorTab(QWidget):
             page['_condition'] = None
         # Drop the legacy single-condition key so it can't shadow the list.
         page.pop('_condition_cmd', None)
+        # A page only shows the State Appearance box once it has a condition —
+        # refresh now so it appears/disappears the instant one is set/cleared.
+        self._display_page_appearance(obj, page)
         self._mark_dirty()
 
     # ── Additional (ANDed) condition rows ────────────────────────────────
@@ -7705,6 +7871,102 @@ class EventEditorTab(QWidget):
         return (not self._page_conditions(page)
                 and page.get('_condition') is None)
 
+    def _ensure_default_page(self, obj: dict, entry_label: str) -> None:
+        """Guarantee the event has one DEFAULT (unconditional) page labeled
+        *entry_label* to act as its entry point. Without this, an event whose
+        only page carries a condition would save a bodyless / self-referencing
+        script (the condition can't lower with nothing to fall through to)."""
+        pages = obj.get('_pages')
+        if not pages:
+            obj['_pages'] = [{'commands': [], '_label': entry_label,
+                              '_conditions': []}]
+            return
+        default_page = next(
+            (p for p in pages if self._page_is_default(p)), None)
+        if default_page is not None:
+            old = default_page.get('_label') or ''
+            if old != entry_label:
+                # The default page IS the event's entry point — its label MUST
+                # be the script name. When a CONDITION page has its condition
+                # cleared it becomes the default but keeps its old sub-label
+                # (e.g. MomHeal). Without this reset the save writes the cleared
+                # content to that old label while the REAL entry block (Mom::,
+                # holding the goto that drives the condition) is preserved
+                # untouched — so the cleared condition/text "comes back" on
+                # reload. Reset the label to the entry and drop the now-orphaned
+                # old block (only if nothing else references it).
+                if (old and not _is_no_script(old)
+                        and not self._label_referenced_elsewhere(
+                            old, self._all_scripts, entry_label)):
+                    if not hasattr(self, '_deleted_script_labels'):
+                        self._deleted_script_labels = set()
+                    self._deleted_script_labels.add(old)
+                default_page['_label'] = entry_label
+            return
+        # Every page is conditional — give each its own body label and prepend
+        # an empty default page under the entry label.
+        for i, p in enumerate(pages):
+            if _is_no_script(p.get('_label') or ''):
+                p['_label'] = f'{entry_label}_When{i + 1}'
+        pages.insert(0, {'commands': [], '_label': entry_label,
+                         '_conditions': []})
+
+    def _normalize_page_labels(self, obj: dict, entry_label: str) -> None:
+        """Fix stale condition-page labels.
+
+        A page added while the NPC still had no script (script == NULL) got a
+        label like ``NULL_Sub2`` from ``_on_add_page`` and kept it even after the
+        script was named — producing garbage labels (and a `#define`/goto to a
+        NULL-prefixed symbol). Rename any condition page whose label doesn't
+        belong to this script to ``<entry_label>_<n>``, and mark the old label
+        for removal so its orphaned block is stripped from scripts.inc.
+        """
+        pages = obj.get('_pages', []) or []
+        ext = getattr(self, '_external_script_labels', set()) or set()
+        existing = {p.get('_label') for p in pages}
+        n = 1
+        for page in pages:
+            if self._page_is_default(page):
+                continue
+            n += 1
+            lbl = page.get('_label') or ''
+            if lbl in ext:
+                continue
+            # ONLY repair a label that is actually stale — one minted while the
+            # NPC had no script yet, so it starts with the reserved sentinel
+            # 'NULL' (e.g. 'NULL_Sub2'), or is empty. A legitimate hand-named
+            # sub-label (e.g. a shared battle script) must NEVER be renamed just
+            # because it doesn't start with this NPC's entry label — doing that
+            # silently rewrote other NPCs' labels and broke their gotos.
+            if not (lbl.startswith('NULL') or _is_no_script(lbl)):
+                continue
+            new = f'{entry_label}_{n}'
+            while new in existing:
+                n += 1
+                new = f'{entry_label}_{n}'
+            if lbl and not _is_no_script(lbl):
+                if not hasattr(self, '_deleted_script_labels'):
+                    self._deleted_script_labels = set()
+                self._deleted_script_labels.add(lbl)
+            existing.discard(lbl)
+            existing.add(new)
+            page['_label'] = new
+
+    _PREAMBLE_CMDS = frozenset({'lock', 'lockall', 'faceplayer', 'textcolor'})
+
+    def _strip_leading_preamble(self, cmds: list) -> list:
+        """Drop leading shared-preamble commands (lock/lockall/faceplayer/
+        textcolor) from a condition page's body — it inherits them from the
+        entry, and a duplicate set breaks faceplayer (see _build_script_pages)."""
+        out: list = []
+        past = False
+        for ct in cmds or []:
+            if not past and ct and ct[0] in self._PREAMBLE_CMDS:
+                continue
+            past = True
+            out.append(ct)
+        return out
+
     def _lower_page_conditions(self, pages: list, script: str):
         """Return ``(entry_label, condition_gotos)`` for a set of pages: the
         default page's label, and the flat command tuples that select each
@@ -7744,6 +8006,7 @@ class EventEditorTab(QWidget):
             return out
         pages = obj.get('_pages', [{'commands': []}])
 
+        self._normalize_page_labels(obj, script)
         entry_label, condition_gotos = self._lower_page_conditions(pages, script)
 
         _PREAMBLE = frozenset({'lock', 'lockall', 'faceplayer', 'textcolor'})
@@ -7766,14 +8029,9 @@ class EventEditorTab(QWidget):
                             + list(all_cmds[preamble_end:]))
                 page_label = entry_label
             elif not is_default:
-                stripped = []
-                past_preamble = False
-                for ct in all_cmds:
-                    if not past_preamble and ct and ct[0] in _PREAMBLE:
-                        continue
-                    past_preamble = True
-                    stripped.append(ct)
-                all_cmds = stripped
+                # Condition page inherits the entry's lock/faceplayer — strip any
+                # leading copy so it doesn't run twice (which breaks facing).
+                all_cmds = self._strip_leading_preamble(all_cmds)
 
             current_label = page_label
             current_cmds: list[tuple] = []
@@ -7850,6 +8108,10 @@ class EventEditorTab(QWidget):
             default_merged = self._merge_sublabels(
                 fallback, scripts, exclude=cond_targets)
             body_label = f'{entry_label}_When'
+            # The shared preamble runs before the guard, so it belongs to the
+            # default (fallback) page too — same reason as the normal case
+            # below. Omitting it drops lock/faceplayer on the next save.
+            default_merged = list(preamble) + list(default_merged)
             return [
                 {'commands': default_merged, '_label': entry_label,
                  '_short_label': self._shorten_label(entry_label),
@@ -7857,7 +8119,7 @@ class EventEditorTab(QWidget):
                      ct[1] for ct in default_merged
                      if ct and ct[0] == '_label_marker' and len(ct) > 1],
                  '_conditions': [], '_condition': None},
-                {'commands': list(preamble) + list(default_body),
+                {'commands': list(default_body),
                  '_label': body_label,
                  '_short_label': self._shorten_label(body_label),
                  '_sub_labels': [body_label],
@@ -7873,8 +8135,14 @@ class EventEditorTab(QWidget):
         # Default page: BFS out from the fall-through body, under the entry
         # label so the event's script pointer stays valid. Skip labels absorbed
         # by the chain-walk are excluded so they aren't re-merged.
+        #
+        # The shared preamble (lock / faceplayer / textcolor) MUST be shown on
+        # the default page too — the same way condition pages get it prepended
+        # below. Without this, Page 1 hides the lock/faceplayer, and on the next
+        # save the reconstruction finds no preamble to keep and silently drops
+        # it (the NPC then never faces the player in game).
         default_sublabels = [entry_label]
-        default_merged = list(default_body)
+        default_merged = list(preamble) + list(default_body)
         visited_default = {entry_label, default_label} | condition_targets
         queue = []
         for ct in default_body:
@@ -7897,18 +8165,40 @@ class EventEditorTab(QWidget):
                 if target and target not in visited_default:
                     queue.append(target)
 
-        pages = [{
-            'commands': default_merged, '_label': entry_label,
-            '_short_label': self._shorten_label(entry_label),
-            '_sub_labels': default_sublabels, '_conditions': [], '_condition': None,
-        }]
+        # If the default (fall-through) page has no meaningful body — only a
+        # bare terminator like `end` — AND there are condition pages, the event
+        # is CONDITION-ONLY: its entry just dispatches the conditions and ends.
+        # Don't surface an empty default TAB for it. That's what made a deleted
+        # tab-1 "come back empty": _ensure_default_page recreates the entry on
+        # save (correct — the script pointer needs it), and this used to rebuild
+        # it into a visible empty page. Now it stays hidden, so the deletion
+        # sticks. If the default has real content (dialogue, lock/faceplayer,
+        # etc.) it's shown as normal.
+        _EMPTY_DEFAULT = frozenset({'end', 'return', 'nop'})
+        default_meaningful = any(
+            ct and ct[0] not in _EMPTY_DEFAULT for ct in default_merged)
+        if selectors and not default_meaningful:
+            pages = []
+        else:
+            pages = [{
+                'commands': default_merged, '_label': entry_label,
+                '_short_label': self._shorten_label(entry_label),
+                '_sub_labels': default_sublabels,
+                '_conditions': [], '_condition': None,
+            }]
 
         for sel in selectors:
             target_label = sel['page_label']
             conditions = list(sel['conditions'])
             other_targets = condition_targets - {target_label}
-            page_cmds = list(preamble)
-            page_cmds.extend(self._merge_sublabels(
+            # A condition page INHERITS the shared preamble (lock / faceplayer /
+            # textcolor) from the entry, which runs it once before the goto. The
+            # page must NOT carry its own copy: two lock/faceplayer in a row (one
+            # in the entry, one here) makes the second `lock` cancel the first
+            # faceplayer's turn — so the NPC ends up facing the wrong way on the
+            # condition page while facing correctly on the default page. Strip
+            # any leading preamble so the page shows/saves only its own body.
+            page_cmds = self._strip_leading_preamble(self._merge_sublabels(
                 target_label, scripts, exclude=other_targets))
             page_sublabels = [target_label] + [
                 ct[1] for ct in page_cmds
@@ -7975,6 +8265,7 @@ class EventEditorTab(QWidget):
         # Properties panel — adapt to event type
         if etype == 'object':
             self.obj_id_edit.setText(str(obj.get('local_id', '')))
+            self._update_resolved_local_id()
             self.obj_id_edit.setEnabled(True)
             self.x_spin.setValue(int(obj.get('x', 0)))
             self.y_spin.setValue(int(obj.get('y', 0)))
@@ -7988,6 +8279,27 @@ class EventEditorTab(QWidget):
                 self.gfx_combo.setEditText(str(gfx))
             self.gfx_combo.setEnabled(True)
             self._update_sprite(gfx)
+            # Movement type (fill the dropdown once, then select this NPC's).
+            # Keep the header/Porymap order — do NOT sort. That order is
+            # meaningful (vanilla first, this project's custom types like CUCCO /
+            # MOBLIN_CHARGE / RAISE_HAND_AND_JUMP grouped at the bottom).
+            if self.movement_combo.count() == 0:
+                mts = list(ConstantsManager.MOVEMENT_TYPES)
+                self.movement_combo.addItems(mts)
+                comp = QCompleter(mts, self.movement_combo)
+                comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+                comp.setFilterMode(Qt.MatchFlag.MatchContains)
+                self.movement_combo.setCompleter(comp)
+            self.movement_combo.setEnabled(True)
+            mv = obj.get('movement_type', '') or ''
+            self.movement_combo.blockSignals(True)
+            midx = self.movement_combo.findText(mv)
+            if midx >= 0:
+                self.movement_combo.setCurrentIndex(midx)
+            else:
+                self.movement_combo.setEditText(str(mv))
+            self.movement_combo.blockSignals(False)
+            self._update_movement_warning()
         elif etype == 'bg' and obj.get('type') == 'hidden_item':
             # Hidden item — show dedicated panel instead of command list
             self._right_stack.setCurrentIndex(1)
@@ -8000,6 +8312,9 @@ class EventEditorTab(QWidget):
             self.y_spin.setEnabled(False)
             self.gfx_combo.setEditText('')
             self.gfx_combo.setEnabled(False)
+            self.movement_combo.setEditText('')
+            self.movement_combo.setEnabled(False)
+            self.movement_warn_lbl.setText('')
             self.sprite_preview.set_sprite(None)
             self.script_edit.setText('')
             self.script_edit.setEnabled(False)
@@ -8017,6 +8332,9 @@ class EventEditorTab(QWidget):
             self.y_spin.setEnabled(False)
             self.gfx_combo.setEditText('')
             self.gfx_combo.setEnabled(False)
+            self.movement_combo.setEditText('')
+            self.movement_combo.setEnabled(False)
+            self.movement_warn_lbl.setText('')
             self.sprite_preview.set_sprite(None)
         else:  # map_script
             self.obj_id_edit.setText('(map script)')
@@ -8027,6 +8345,9 @@ class EventEditorTab(QWidget):
             self.y_spin.setEnabled(False)
             self.gfx_combo.setEditText('')
             self.gfx_combo.setEnabled(False)
+            self.movement_combo.setEditText('')
+            self.movement_combo.setEnabled(False)
+            self.movement_warn_lbl.setText('')
             self.sprite_preview.set_sprite(None)
 
         # Ensure command list panel is shown (hidden items switch away)
@@ -8044,6 +8365,7 @@ class EventEditorTab(QWidget):
         for i, page in enumerate(pages):
             self.page_tabs.addTab(QWidget(), str(i + 1))
         self.page_tabs.blockSignals(False)
+        self._renumber_page_tabs()
         self._current_page_idx = 0
         if pages:
             self.page_tabs.setCurrentIndex(0)
@@ -8054,6 +8376,7 @@ class EventEditorTab(QWidget):
 
         # Apply position override for the initial page
         self._apply_position_override(obj, pages[0] if pages else None)
+        self._display_page_appearance(obj, pages[0] if pages else None)
 
         # Scan for cross-references (other scripts that modify this object)
         self._update_xref(obj)
@@ -8570,6 +8893,196 @@ class EventEditorTab(QWidget):
         self.y_spin.blockSignals(False)
 
     # ─────────────────────────────────────────────────────────────────────
+    # State Appearance (per-page NPC look / behaviour → On Transition script)
+    # ─────────────────────────────────────────────────────────────────────
+    def _display_page_appearance(self, obj: dict, page: dict | None):
+        """Show/populate the State Appearance box for a condition page.
+
+        Only object events on a non-default (condition) page get this box —
+        the default page's look is the NPC's base look from Event Properties.
+        """
+        box = self._appearance_box
+        if (not page or obj.get('_event_type') != 'object'
+                or self._page_is_default(page)):
+            box.hide()
+            return
+
+        # Read the stored appearance and BLOCK the widgets' signals BEFORE doing
+        # anything to them. Populating the combo with addItems() fires
+        # currentTextChanged (it moves '' → the first item), which — if not
+        # blocked — runs _on_appearance_edited → _collect_page_appearance with
+        # the widgets still empty/unchecked, silently wiping the movement out of
+        # this page's _appearance the instant tab 2 is first opened. That was the
+        # "State Appearance never saves" bug.
+        appr = page.get('_appearance') or {}
+        widgets = (self._appr_move_check, self._appr_move_combo,
+                   self._appr_pos_check, self._appr_pos_x, self._appr_pos_y)
+        for w in widgets:
+            w.blockSignals(True)
+
+        # Fill the movement dropdown once (search-as-you-type). Keep header/
+        # Porymap order — do NOT sort (custom types stay grouped at the bottom).
+        if self._appr_move_combo.count() == 0:
+            moves = list(ConstantsManager.MOVEMENT_TYPES)
+            self._appr_move_combo.addItems(moves)
+            comp = QCompleter(moves, self._appr_move_combo)
+            comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            comp.setFilterMode(Qt.MatchFlag.MatchContains)
+            self._appr_move_combo.setCompleter(comp)
+
+        has_move = bool(appr.get('movement'))
+        self._appr_move_check.setChecked(has_move)
+        self._appr_move_combo.setEnabled(has_move)
+        if has_move:
+            mv = str(appr['movement'])
+            i = self._appr_move_combo.findText(mv)
+            if i >= 0:
+                self._appr_move_combo.setCurrentIndex(i)
+            else:
+                self._appr_move_combo.setEditText(mv)
+        else:
+            self._appr_move_combo.setCurrentIndex(-1)
+            self._appr_move_combo.setEditText('')
+
+        has_pos = appr.get('x') is not None and appr.get('y') is not None
+        self._appr_pos_check.setChecked(has_pos)
+        self._appr_pos_x.setEnabled(has_pos)
+        self._appr_pos_y.setEnabled(has_pos)
+        self._appr_pos_x.setValue(int(appr.get('x', obj.get('x', 0))))
+        self._appr_pos_y.setValue(int(appr.get('y', obj.get('y', 0))))
+
+        for w in widgets:
+            w.blockSignals(False)
+        box.show()
+
+    def _fold_scene_appearance(self, map_name: str):
+        """Read the map's existing On Transition and fold each NPC scene state
+        into the matching condition page's State Appearance — but ONLY for
+        'pure' scene Set scripts (movement / position / graphic + return). A Set
+        script that also runs other commands stays as a read-only map-script
+        pseudo-event and is preserved verbatim on save, so nothing is lost."""
+        from eventide.backend.eventide_utils import (
+            parse_scene_scripts, _scene_argparts)
+
+        try:
+            states, _preamble = parse_scene_scripts(map_name, self._all_scripts)
+        except Exception as e:
+            return
+        if not states:
+            return
+
+        _PURE = {'setobjectmovementtype', 'setobjectxyperm', 'setvar', 'return'}
+
+        def _is_pure(set_label):
+            body = self._all_scripts.get(set_label, []) or []
+            for b in body:
+                if not b:
+                    continue
+                if b[0] == 'setvar':
+                    p = _scene_argparts(b)
+                    if not p or 'VAR_OBJ_GFX_ID_0' not in p[0]:
+                        return False
+                elif b[0] not in _PURE:
+                    return False
+            return True
+
+        def _norm(cond):
+            return tuple(str(x) for x in cond)
+
+        for obj in self._objects:
+            if obj.get('_event_type') != 'object':
+                continue
+            lid = self._normalize_local_id(str(obj.get('local_id', '')))
+            if not lid:
+                continue
+            pages = obj.get('_pages', []) or []
+            for s in states:
+                if s.get('localid') != lid:
+                    continue
+                set_label = s.get('set_label', '')
+                if not _is_pure(set_label):
+                    continue  # complex script — leave it read-only
+                appr: dict = {'_set_label': set_label}
+                if s.get('movement'):
+                    appr['movement'] = s['movement']
+                if s.get('x') is not None and s.get('y') is not None:
+                    appr['x'] = s['x']
+                    appr['y'] = s['y']
+                if len(appr) == 1:  # only the label, nothing to show
+                    continue
+                # Attach to the page whose primary condition matches this state.
+                cond = _norm(s['condition'])
+                for p in pages:
+                    if self._page_is_default(p):
+                        continue
+                    conds = self._page_conditions(p)
+                    if conds and _norm(conds[0]) == cond:
+                        p['_appearance'] = appr
+                        break
+
+    def _update_movement_warning(self, *_):
+        """Warn when the chosen base movement type can't turn to face the player.
+
+        MOVEMENT_TYPE_NONE (and INVISIBLE) use an empty engine callback that
+        never processes held movements — so `lock`/`faceplayer` set the turn but
+        nothing applies it, and the NPC stays frozen facing its spawn direction.
+        """
+        mv = self.movement_combo.currentText().strip().upper()
+        frozen = mv in ('MOVEMENT_TYPE_NONE', 'MOVEMENT_TYPE_INVISIBLE')
+        if frozen:
+            self.movement_warn_lbl.setText(
+                "⚠ This freezes the sprite — faceplayer can't turn this NPC. "
+                "Use Face Down / Look Around for a talking NPC.")
+        else:
+            self.movement_warn_lbl.setText('')
+
+    def _on_appearance_edited(self, *_):
+        """A State Appearance widget changed — enable/disable rows, store it."""
+        if self._loading:
+            return
+        self._appr_move_combo.setEnabled(self._appr_move_check.isChecked())
+        self._appr_pos_x.setEnabled(self._appr_pos_check.isChecked())
+        self._appr_pos_y.setEnabled(self._appr_pos_check.isChecked())
+        self._collect_page_appearance()
+        self._mark_dirty()
+
+    def _collect_page_appearance(self):
+        """Write the State Appearance widgets into the current page's data."""
+        if self._current_obj_idx < 0 or self._current_obj_idx >= len(self._objects):
+            return
+        obj = self._objects[self._current_obj_idx]
+        if obj.get('_event_type') != 'object':
+            return
+        pages = obj.get('_pages', [])
+        idx = self._current_page_idx
+        if idx < 0 or idx >= len(pages):
+            return
+        page = pages[idx]
+        if self._page_is_default(page):
+            page.pop('_appearance', None)
+            return
+        appr: dict = {}
+        # Remember the original Set-script label (from a folded-in scene) so a
+        # round-trip keeps the same label instead of renaming it.
+        prev = page.get('_appearance') or {}
+        if prev.get('_set_label'):
+            appr['_set_label'] = prev['_set_label']
+        if self._appr_move_check.isChecked():
+            mv = self._appr_move_combo.currentText().strip()
+            if mv:
+                appr['movement'] = mv
+        if self._appr_pos_check.isChecked():
+            appr['x'] = self._appr_pos_x.value()
+            appr['y'] = self._appr_pos_y.value()
+        # Keep the appearance if it has real content, OR if it remembers a
+        # folded-in Set label (so clearing it can REMOVE the on-map state on
+        # save rather than silently leaving the old scene script in place).
+        if ('movement' in appr) or ('x' in appr) or ('_set_label' in appr):
+            page['_appearance'] = appr
+        else:
+            page.pop('_appearance', None)
+
+    # ─────────────────────────────────────────────────────────────────────
     # Page display
     # ─────────────────────────────────────────────────────────────────────
 
@@ -8584,6 +9097,7 @@ class EventEditorTab(QWidget):
             self._display_page(pages[idx])
             self._update_conditions_box(pages[idx], pages)
             self._apply_position_override(obj, pages[idx])
+            self._display_page_appearance(obj, pages[idx])
 
     def _display_page(self, page: dict):
         from eventide.backend.eventide_utils import resugar_choices
@@ -8672,6 +9186,43 @@ class EventEditorTab(QWidget):
             # pokefirered commands (msgbox YESNO + compare/goto + sub-labels).
             base = page.get('_label') or (obj.get('script') or 'EventScript')
             page['commands'] = desugar_choices(list(self._cmd_tuples), base)
+        # Also capture any per-page State Appearance edits for this page.
+        self._collect_page_appearance()
+
+    def _normalize_local_id(self, raw: str) -> str:
+        """Turn whatever the user typed in the ID field into a VALID
+        LOCALID_<MAP>_<NAME> C constant (or '' if blank).
+
+        The build turns an object's local_id into `#define <local_id> <index>`,
+        so a macro name that starts with a digit or has punctuation (e.g. the
+        user typing `001`) breaks the compile. This lets the user type a plain
+        word — `Jim` → `LOCALID_KAKARIKO_JIM`, `001` → `LOCALID_KAKARIKO_001` —
+        and keeps an already-valid `LOCALID_*` unchanged."""
+        raw = (raw or '').strip()
+        if not raw:
+            return ''
+        if re.fullmatch(r'LOCALID_[A-Za-z0-9_]+', raw):
+            return raw
+        map_name = self._map_dir.name if self._map_dir else 'MAP'
+        map_up = re.sub(r'[^A-Za-z0-9]+', '_', map_name).upper().strip('_')
+        name_up = re.sub(r'[^A-Za-z0-9]+', '_', raw).upper().strip('_')
+        if not name_up:
+            return ''
+        return f'LOCALID_{map_up}_{name_up}' if map_up else f'LOCALID_{name_up}'
+
+    def _update_resolved_local_id(self):
+        """Show the LOCALID_* constant the typed name will become."""
+        if not hasattr(self, 'obj_id_resolved_lbl'):
+            return
+        raw = self.obj_id_edit.text().strip()
+        if not raw:
+            self.obj_id_resolved_lbl.setText('')
+            return
+        resolved = self._normalize_local_id(raw)
+        if resolved == raw:
+            self.obj_id_resolved_lbl.setText(f'internal name: {resolved}')
+        else:
+            self.obj_id_resolved_lbl.setText(f'→ becomes  {resolved}')
 
     def _collect_current(self):
         self._collect_current_page()
@@ -8684,9 +9235,13 @@ class EventEditorTab(QWidget):
             # Only write local_id if non-empty.  An empty string causes
             # the build to fail with "local_id cannot be empty".  Objects
             # that never had a local_id should not get one added.
-            lid = self.obj_id_edit.text().strip()
+            lid = self._normalize_local_id(self.obj_id_edit.text())
             if lid:
                 obj['local_id'] = lid
+            elif 'local_id' in obj and not self.obj_id_edit.text().strip():
+                # Field cleared — drop the id rather than write an empty one
+                # (an empty local_id fails the build).
+                obj.pop('local_id', None)
 
             # If current page has a position override from a script,
             # save edited X/Y back to the setobjectxyperm command in
@@ -8700,6 +9255,9 @@ class EventEditorTab(QWidget):
 
             obj['script'] = self.script_edit.text()
             obj['graphics_id'] = self.gfx_combo.currentText()
+            mv = self.movement_combo.currentText().strip()
+            if mv:
+                obj['movement_type'] = mv
         elif etype == 'bg' and obj.get('type') == 'hidden_item':
             data = self._hidden_item_panel.collect()
             obj['item'] = data['item']
@@ -8883,6 +9441,11 @@ class EventEditorTab(QWidget):
         cmd_tuple = self._cmd_tuples[idx]
         # Label markers are not editable — they're structural dividers
         if cmd_tuple and cmd_tuple[0] == '_label_marker':
+            return
+        # Header-only commands (Lock, Face Player, Release All, End, …) have
+        # nothing to edit — don't pop a useless "This command has no parameters"
+        # dialog on double-click; just do nothing.
+        if getattr(_widget_for_tuple(cmd_tuple), '_header_only', False):
             return
         # For applymovement, use the full edit dialog which includes
         # the Edit Steps button for the Move Route editor
@@ -9357,10 +9920,9 @@ class EventEditorTab(QWidget):
                     obj['_pages'] = pages
                     self.page_tabs.blockSignals(True)
                     for np in new_page:
-                        self.page_tabs.addTab(
-                            QWidget(),
-                            np.get('_short_label', target))
+                        self.page_tabs.addTab(QWidget(), str(self.page_tabs.count() + 1))
                     self.page_tabs.blockSignals(False)
+                    self._renumber_page_tabs()
                     self.page_tabs.setCurrentIndex(len(pages) - len(new_page))
                     self._mw.log_message(
                         f'Event Editor: added and jumped to "{target}"')
@@ -9396,15 +9958,47 @@ class EventEditorTab(QWidget):
         self._mark_dirty()
         self._mw.log_message('Event Editor: pasted command')
 
+    def _renumber_page_tabs(self):
+        """Keep page tabs labeled 1, 2, 3, … by position (they were a mix of
+        '1' and 'Sub2' before). The tab's condition / sub-label goes in its
+        hover tooltip so the number stays clean."""
+        obj = (self._objects[self._current_obj_idx]
+               if 0 <= self._current_obj_idx < len(self._objects) else None)
+        pages = obj.get('_pages', []) if obj else []
+        for i in range(self.page_tabs.count()):
+            self.page_tabs.setTabText(i, str(i + 1))
+            tip = ''
+            if i < len(pages):
+                p = pages[i]
+                if self._page_is_default(p):
+                    tip = 'Default page — runs when no other page\'s conditions match'
+                else:
+                    conds = self._page_conditions(p)
+                    if conds:
+                        tip = 'Runs when: ' + self._conditions_text(conds)
+                sl = p.get('_short_label')
+                if sl and not str(sl).startswith('Sub'):
+                    tip = f'{tip}\n({sl})' if tip else str(sl)
+            self.page_tabs.setTabToolTip(i, _tt(tip) if tip else '')
+
     def _on_add_page(self):
         if self._current_obj_idx < 0:
             return
         obj = self._objects[self._current_obj_idx]
         pages = obj.setdefault('_pages', [])
-        script = obj.get('script', 'NewScript')
-        new_label = f'{script}_Sub{len(pages) + 1}'
-        pages.append({'commands': [], '_label': new_label, '_short_label': f'Sub{len(pages) + 1}'})
-        self.page_tabs.addTab(QWidget(), f'Sub{len(pages)}')
+        # Derive the sub-label base from a REAL script name. If the NPC has no
+        # script yet (script == NULL), a suggested name is used instead of the
+        # literal 'NULL', so the page never gets a 'NULL_Sub2'-style label that
+        # would break the build. (_normalize_page_labels also repairs these on
+        # save, but starting clean avoids churn.)
+        script = obj.get('script', '') or ''
+        if _is_no_script(script):
+            script = self._suggest_script_name(obj)
+        new_label = f'{script}_{len(pages) + 1}'
+        pages.append({'commands': [], '_label': new_label,
+                      '_short_label': f'Page {len(pages) + 1}'})
+        self.page_tabs.addTab(QWidget(), str(len(pages)))
+        self._renumber_page_tabs()
         self.page_tabs.setCurrentIndex(len(pages) - 1)
         self._mark_dirty()
 
@@ -9737,6 +10331,56 @@ class EventEditorTab(QWidget):
     # Unused flag finder
     # ─────────────────────────────────────────────────────────────────────
 
+    def _open_var_flag_manager(self, kind: str | None = None, new: bool = False):
+        """Jump to the unified Variables & Flags manager (the Label Manager
+        tab). Inside the unified window this switches pages; standalone it
+        falls back to a modal dialog."""
+        if not self._root_dir:
+            QMessageBox.information(self, 'Variables & Flags',
+                                    'No project loaded.')
+            return
+        if _open_label_manager_cb:
+            _open_label_manager_cb(kind, new)
+            return
+        # Fallback (EVENTide run on its own, no unified window): modal manager.
+        try:
+            from ui.label_manager import LabelManagerWidget
+            dlg = QDialog(self)
+            dlg.setWindowTitle('Variables & Flags')
+            dlg.resize(760, 600)
+            lay = QVBoxLayout(dlg)
+            w = LabelManagerWidget()
+            w.load_project(str(self._root_dir))
+            w.constants_changed.connect(self._refresh_var_flag_pickers)
+            lay.addWidget(w)
+            if new and kind:
+                w.focus_new(kind)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.information(self, 'Variables & Flags', str(e))
+
+    def _refresh_var_flag_pickers(self):
+        """After a var/flag was created or renamed, repopulate the condition
+        pickers so the new name is immediately selectable."""
+        # ConstantsManager was already refreshed by the dialog. Repopulate the
+        # Conditions-box pickers (they only fill once, so clear then refill).
+        try:
+            cur_flag = self._cond_flag_picker.currentText()
+            cur_var = self._cond_var_picker.currentText()
+            self._cond_flag_picker.clear()
+            self._cond_var_picker.clear()
+            # _update_conditions_box refills empty pickers from ConstantsManager.
+            if 0 <= self._current_obj_idx < len(self._objects):
+                obj = self._objects[self._current_obj_idx]
+                pages = obj.get('_pages', [])
+                page = (pages[self._current_page_idx]
+                        if 0 <= self._current_page_idx < len(pages) else None)
+                self._update_conditions_box(page, pages)
+            self._cond_flag_picker.setEditText(cur_flag)
+            self._cond_var_picker.setEditText(cur_var)
+        except Exception:
+            pass
+
     def _on_find_unused_flag(self):
         """Scan the project for used flags and find the next available one."""
         if not self._root_dir:
@@ -9980,10 +10624,46 @@ class EventEditorTab(QWidget):
     # New NPC Script templates
     # ─────────────────────────────────────────────────────────────────────
 
+    def _derived_script_name(self, obj) -> str:
+        """The CANONICAL script label an object's local_id maps to
+        (LOCALID_KAKARIKO_ANJU → Kakariko_EventScript_Anju), with NO uniqueness
+        suffix. Used by the load-time self-heal to re-adopt an orphaned script.
+        Returns '' if there's no usable local_id."""
+        map_name = self._map_dir.name if self._map_dir else 'Map'
+        lid = str(obj.get('local_id', '') or '')
+        if not lid.startswith('LOCALID_'):
+            return ''
+        tail = lid[len('LOCALID_'):]
+        mu = re.sub(r'[^A-Za-z0-9]+', '_', map_name).upper().strip('_')
+        if tail.upper().startswith(mu + '_'):
+            tail = tail[len(mu) + 1:]
+        pretty = ''.join(w.capitalize() for w in tail.split('_') if w)
+        return f'{map_name}_EventScript_{pretty}' if pretty else ''
+
     def _suggest_script_name(self, obj) -> str:
         """A sensible, UNIQUE default script label for an event that has none —
         ``<Map>_EventScript_<Role><N>`` (role guessed from the graphics)."""
         map_name = self._map_dir.name if self._map_dir else 'Map'
+        existing = getattr(self, '_all_scripts', set()) or set()
+
+        # Prefer a name derived from the event's local_id (LOCALID_KAKARIKO_ANJU
+        # → Kakariko_EventScript_Anju) — far friendlier than "NPC1".
+        lid = str(obj.get('local_id', '') or '')
+        if lid.startswith('LOCALID_'):
+            tail = lid[len('LOCALID_'):]
+            mu = re.sub(r'[^A-Za-z0-9]+', '_', map_name).upper().strip('_')
+            if tail.upper().startswith(mu + '_'):
+                tail = tail[len(mu) + 1:]
+            pretty = ''.join(w.capitalize() for w in tail.split('_') if w)
+            if pretty:
+                cand = f'{map_name}_EventScript_{pretty}'
+                if cand not in existing:
+                    return cand
+                n = 2
+                while f'{cand}{n}' in existing:
+                    n += 1
+                return f'{cand}{n}'
+
         gfx = (obj.get('graphics_id', '') or '').upper()
         if 'ITEM_BALL' in gfx:
             role = 'ItemBall'
@@ -9991,7 +10671,6 @@ class EventEditorTab(QWidget):
             role = 'Sign'
         else:
             role = 'NPC'
-        existing = getattr(self, '_all_scripts', set()) or set()
         base = f'{map_name}_EventScript_{role}'
         n = 1
         while f'{base}{n}' in existing:
@@ -10067,6 +10746,23 @@ class EventEditorTab(QWidget):
             menu.addAction('Item Ball — pick-up item (finditem)',
                            lambda: self._create_item_ball_script(obj, script))
             menu.addSeparator()
+
+        # ── My Templates (user-saved from a page) ────────────────────
+        my_menu = menu.addMenu('My Templates')
+        my_menu.addAction('💾 Save this page as a template…',
+                          lambda: self._save_current_page_as_template())
+        user_templates = self._load_page_templates()
+        if user_templates:
+            my_menu.addSeparator()
+            for tname in sorted(user_templates):
+                my_menu.addAction(
+                    tname,
+                    lambda _=False, n=tname: self._apply_page_template(
+                        obj, script, n))
+            my_menu.addSeparator()
+            my_menu.addAction('🗑 Manage / delete templates…',
+                              lambda: self._manage_page_templates())
+        menu.addSeparator()
 
         # ── NPC Templates ────────────────────────────────────────────
         npc_menu = menu.addMenu('NPC Scripts')
@@ -10213,6 +10909,136 @@ class EventEditorTab(QWidget):
             f'  Item: {item_name} ({item_const})\n\n'
             f'The script will be saved to\n'
             f'data/scripts/item_ball_scripts.inc when you save.')
+
+    # ── User-defined page templates ──────────────────────────────────────
+    def _page_templates_path(self):
+        """Project-level JSON store for user page templates."""
+        if not self._root_dir:
+            return None
+        return Path(self._root_dir) / 'eventide_page_templates.json'
+
+    def _load_page_templates(self) -> dict:
+        """Return ``{name: [command_tuples]}`` from the project store."""
+        p = self._page_templates_path()
+        if not p or not p.is_file():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding='utf-8'))
+        except Exception:
+            return {}
+        out = {}
+        for name, cmds in (data or {}).items():
+            # JSON lists → command tuples (the editor works in tuples).
+            out[name] = [tuple(c) for c in cmds if isinstance(c, list)]
+        return out
+
+    def _save_page_templates(self, templates: dict) -> bool:
+        p = self._page_templates_path()
+        if not p:
+            return False
+        try:
+            serializable = {n: [list(c) for c in cmds]
+                            for n, cmds in templates.items()}
+            p.write_text(json.dumps(serializable, indent=2, ensure_ascii=False),
+                         encoding='utf-8', newline='\n')
+            return True
+        except Exception as e:
+            QMessageBox.warning(self, 'Templates', f'Could not save:\n{e}')
+            return False
+
+    def _save_current_page_as_template(self):
+        """Save the current page's commands as a reusable named template."""
+        if self._current_obj_idx < 0:
+            return
+        # Capture what's on the page right now (desugared to real primitives).
+        self._collect_current_page()
+        obj = self._objects[self._current_obj_idx]
+        pages = obj.get('_pages', [])
+        if not (0 <= self._current_page_idx < len(pages)):
+            return
+        cmds = [c for c in pages[self._current_page_idx].get('commands', [])
+                if c and c[0] != '_label_marker']
+        if not cmds:
+            QMessageBox.information(
+                self, 'Save Template',
+                'This page has no commands to save. Build the page first, '
+                'then save it as a template.')
+            return
+        name, ok = QInputDialog.getText(
+            self, 'Save Page Template',
+            'Template name (what this page does, e.g. "Locked door"):')
+        name = (name or '').strip()
+        if not ok or not name:
+            return
+        templates = self._load_page_templates()
+        if name in templates:
+            if QMessageBox.question(
+                    self, 'Overwrite?',
+                    f'A template named "{name}" already exists. Overwrite it?',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                return
+        templates[name] = cmds
+        if self._save_page_templates(templates):
+            self._mw.log_message(
+                f'Event Editor: saved page template "{name}" '
+                f'({len(cmds)} command(s))')
+
+    def _apply_page_template(self, obj, script, name):
+        """Apply a saved template's commands to the current event's page."""
+        templates = self._load_page_templates()
+        cmds = templates.get(name)
+        if not cmds:
+            return
+        obj['_pages'] = [{'commands': [tuple(c) for c in cmds],
+                          '_label': script,
+                          '_short_label': script.split('_')[-1]}]
+        self._register_labels([script])
+        self._refresh_current_object()
+        self._mark_dirty()
+        self._mw.log_message(
+            f'Event Editor: applied page template "{name}" to {script}')
+
+    def _manage_page_templates(self):
+        """Small dialog to delete saved page templates."""
+        templates = self._load_page_templates()
+        if not templates:
+            QMessageBox.information(self, 'Templates', 'No saved templates yet.')
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Manage Page Templates')
+        dlg.resize(360, 320)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel('Select templates to delete:'))
+        lst = QListWidget()
+        lst.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        for n in sorted(templates):
+            lst.addItem(f'{n}  ({len(templates[n])} cmd)')
+        v.addWidget(lst, 1)
+        row = QHBoxLayout()
+        row.addStretch()
+        del_btn = QPushButton('Delete selected')
+        close_btn = QPushButton('Close')
+        row.addWidget(del_btn)
+        row.addWidget(close_btn)
+        v.addLayout(row)
+        close_btn.clicked.connect(dlg.accept)
+
+        def _do_delete():
+            names = [i.text().rsplit('  (', 1)[0]
+                     for i in lst.selectedItems()]
+            if not names:
+                return
+            cur = self._load_page_templates()
+            for n in names:
+                cur.pop(n, None)
+            if self._save_page_templates(cur):
+                for i in lst.selectedItems():
+                    lst.takeItem(lst.row(i))
+                self._mw.log_message(
+                    f'Event Editor: deleted {len(names)} template(s)')
+        del_btn.clicked.connect(_do_delete)
+        dlg.exec()
 
     def _create_npc_talker(self, obj, script):
         """Simple NPC that says one message."""
@@ -10859,6 +11685,163 @@ class EventEditorTab(QWidget):
                     new[1] = lbl
                     cmds[i] = tuple(new)
 
+    def _scene_suffix(self, local_id: str, page_idx: int) -> str:
+        """A stable, valid-C-identifier suffix for an NPC-state Set script."""
+        import re as _re
+        short = local_id
+        if short.startswith('LOCALID_'):
+            short = short[len('LOCALID_'):]
+        short = _re.sub(r'[^A-Za-z0-9]', '', short.title())
+        return f'{short}{page_idx}'
+
+    def _inject_scene_scripts(self, save_pages: 'OrderedDict'):
+        """Turn every NPC's per-page State Appearance into the map's On
+        Transition script (+ one Set script per state) and wire the map script
+        table to run it.
+
+        Contained by design: this only does anything when at least one NPC has
+        a condition page with a State Appearance set. Maps with none are left
+        exactly as they were. Existing On Transition content (world-map flags,
+        other NPCs' states) is preserved.
+        """
+        from eventide.backend.eventide_utils import build_scene_scripts
+
+        map_name = self._map_dir.name
+
+        # Gather the states the user set in the UI. `managed` holds every NPC
+        # the user is controlling scene-wise this save (even one whose state was
+        # just CLEARED) so its old on-map state is regenerated / removed rather
+        # than left stale.
+        ui_states: list = []
+        managed: set = set()
+        for obj in self._objects:
+            if obj.get('_event_type') != 'object':
+                continue
+            pages = obj.get('_pages', []) or []
+            # Which pages carry an appearance override?
+            appr_pages = [(i, p) for i, p in enumerate(pages)
+                          if (p.get('_appearance') and not self._page_is_default(p))]
+            if not appr_pages:
+                continue
+            # This NPC needs a local_id to be targeted by the map script.
+            local_id = self._normalize_local_id(str(obj.get('local_id', '')))
+            if not local_id:
+                # Derive one from the script name (same rule as elsewhere).
+                base = obj.get('script') or f'{map_name}_EventScript_Npc'
+                nm = base.split('_EventScript_')[-1] if '_EventScript_' in base else base
+                local_id = self._normalize_local_id(nm) or self._normalize_local_id('Npc')
+            obj['local_id'] = local_id
+            managed.add(local_id)
+            for i, page in appr_pages:
+                appr = page.get('_appearance') or {}
+                # A cleared state (only remembers its old label) removes itself —
+                # skip building a state for it; `managed` already flags removal.
+                if not (appr.get('movement') or 'x' in appr):
+                    continue
+                conds = self._page_conditions(page)
+                if not conds:
+                    self._mw.log_message(
+                        f'Event Editor: skipped a State Appearance on {local_id} '
+                        f'— the page has no condition to trigger it.')
+                    continue
+                # Reuse a folded-in Set label so a round-trip keeps its name.
+                sl = appr.get('_set_label')
+                suffix = (sl.split('_EventScript_Set')[-1] if sl
+                          else self._scene_suffix(local_id, i))
+                st = {
+                    'suffix': suffix,
+                    'localid': local_id,
+                    'condition': tuple(conds[0]),
+                }
+                if appr.get('movement'):
+                    st['movement'] = appr['movement']
+                if appr.get('x') is not None and appr.get('y') is not None:
+                    st['x'] = appr['x']
+                    st['y'] = appr['y']
+                ui_states.append(st)
+
+        if not managed:
+            return  # feature dormant — leave the map untouched
+
+        from eventide.backend.eventide_utils import (
+            _CALL_TO_GOTO, _scene_argparts)
+
+        def _setbody_localid(body):
+            for b in body or []:
+                if b and b[0] in ('setobjectmovementtype', 'setobjectxyperm'):
+                    p = _scene_argparts(b)
+                    if p:
+                        return p[0]
+            return None
+
+        # Walk the EXISTING On Transition. Keep its non-scene preamble and any
+        # other NPC's call lines + Set scripts VERBATIM (so a hand-written or
+        # vanilla scene script is preserved byte-for-byte). Drop the entries for
+        # NPCs we're regenerating this save.
+        existing_ot = self._all_scripts.get(f'{map_name}_OnTransition', []) or []
+        preamble: list = []
+        kept_calls: list = []          # (call_tuple, set_label, body)
+        replaced_labels: set = set()   # managed NPCs' old Set labels
+        for ct in existing_ot:
+            if not ct:
+                continue
+            if ct[0] in _CALL_TO_GOTO:
+                a = _scene_argparts(ct)
+                set_label = a[-1] if a else ''
+                body = self._all_scripts.get(set_label, [])
+                if _setbody_localid(body) in managed:
+                    replaced_labels.add(set_label)
+                    continue
+                kept_calls.append((ct, set_label, body))
+            elif ct[0] != 'end':
+                preamble.append(ct)
+
+        # Generate the Set scripts + call lines for the states set in the UI.
+        gen, ot_label = build_scene_scripts(map_name, ui_states, preamble=None)
+        gen_ot = gen.pop(f'{map_name}_OnTransition', [])
+        ui_calls = [c for c in gen_ot if c and c[0] != 'end']
+
+        # Assemble the final On Transition: preamble, kept calls, our calls, end.
+        final_ot = (list(preamble)
+                    + [kc[0] for kc in kept_calls]
+                    + ui_calls
+                    + [('end',)])
+        save_pages[f'{map_name}_OnTransition'] = final_ot
+
+        # Our new Set scripts.
+        for label, body in gen.items():
+            save_pages[label] = body
+        # Preserved Set scripts, verbatim.
+        for (_ct, set_label, body) in kept_calls:
+            if set_label:
+                save_pages[set_label] = body
+
+        # Remove orphaned Set scripts of managed NPCs whose label changed.
+        if not hasattr(self, '_deleted_script_labels'):
+            self._deleted_script_labels = set()
+        for old in replaced_labels:
+            if old not in gen:
+                save_pages.pop(old, None)
+                self._deleted_script_labels.add(old)
+
+        # Ensure the map script table runs our On Transition, preserving any
+        # other map_script entries (on-load, on-frame, etc.).
+        table_label = f'{map_name}_MapScripts'
+        existing_table = self._all_scripts.get(table_label, []) or []
+        new_table: list = []
+        for ct in existing_table:
+            if not ct or ct[0] not in ('map_script', 'map_script_2'):
+                continue  # keep only real table entries (drop .byte/end/stray)
+            if ct[0] == 'map_script' and 'MAP_SCRIPT_ON_TRANSITION' in str(
+                    ct[1] if len(ct) > 1 else ''):
+                continue  # replace the old on-transition entry
+            new_table.append(ct)
+        new_table.append(('map_script', f'MAP_SCRIPT_ON_TRANSITION, {ot_label}'))
+        new_table.append(('.byte', '0'))
+        save_pages[table_label] = new_table
+        # Make sure the pseudo-event copies of these labels don't overwrite ours
+        # later (save_pages preserves insertion order; these are authoritative).
+
     def _on_save(self):
         if not self._map_dir or not self._map_data:
             QMessageBox.information(self, 'Save', 'No map loaded.')
@@ -10894,7 +11877,29 @@ class EventEditorTab(QWidget):
         for obj in ordered_objects:
             script = obj.get('script', '')
             if _is_no_script(script):
-                continue
+                # The event has no script label yet. If the user actually put
+                # commands or a condition on it (e.g. edited a NULL NPC), DON'T
+                # drop them — auto-create a script label and save it. Only a
+                # genuinely empty event stays script-less.
+                pages_chk = obj.get('_pages', []) or []
+                has_content = any(
+                    (p.get('commands') or self._page_conditions(p))
+                    for p in pages_chk)
+                if not has_content:
+                    continue
+                script = self._suggest_script_name(obj)
+                obj['script'] = script
+                self._register_labels([script])
+                self._mw.log_message(
+                    f'Event Editor: auto-created script {script} for an event '
+                    f'that had commands but no script label')
+            # Every event needs a DEFAULT (unconditional) page to act as the
+            # entry — otherwise a page whose only content is a condition would
+            # save a self-referencing / bodyless script. Synthesize one if the
+            # user only made conditional pages.
+            self._ensure_default_page(obj, script)
+            # Fix any stale NULL_Sub* labels minted before the script was named.
+            self._normalize_page_labels(obj, script)
             pages = obj.get('_pages', [{'commands': []}])
 
             # Identify condition pages and lower their conditions into the
@@ -10932,18 +11937,11 @@ class EventEditorTab(QWidget):
                     all_cmds = reconstructed
                     page_label = entry_label  # save under entry label
                 elif not is_default:
-                    # Condition page — strip preamble commands since they
-                    # are shared from the entry label (already saved there)
-                    _PREAMBLE = frozenset({
-                        'lock', 'lockall', 'faceplayer', 'textcolor'})
-                    stripped = []
-                    past_preamble = False
-                    for ct in all_cmds:
-                        if not past_preamble and ct and ct[0] in _PREAMBLE:
-                            continue  # skip preamble — lives in entry
-                        past_preamble = True
-                        stripped.append(ct)
-                    all_cmds = stripped
+                    # Condition page inherits the entry's lock/faceplayer — strip
+                    # any leading copy so it never runs twice. A doubled
+                    # lock/faceplayer makes the second lock cancel the first
+                    # faceplayer's turn, so the NPC faces wrong on that page.
+                    all_cmds = self._strip_leading_preamble(all_cmds)
 
                 # Split on _label_marker boundaries
                 current_label = page_label
@@ -10963,6 +11961,10 @@ class EventEditorTab(QWidget):
         if hasattr(self, '_modified_movements'):
             for mov_label, mov_steps in self._modified_movements.items():
                 save_pages[mov_label] = mov_steps
+
+        # Turn per-page State Appearance into the map's On Transition script.
+        # No-op unless an NPC actually has a per-page appearance set.
+        self._inject_scene_scripts(save_pages)
 
         scripts_path = self._map_dir / 'scripts.inc'
         text_path = self._map_dir / 'text.inc'
@@ -11019,6 +12021,18 @@ class EventEditorTab(QWidget):
                 obj.pop('_pages', None)
                 etype = obj.pop('_event_type', 'object')
                 if etype == 'object':
+                    # Guarantee a valid local_id: the build emits
+                    # `#define <local_id> <index>`, so a stray number/word
+                    # (e.g. a hand-typed "001") would compile-break. Normalize
+                    # every object, not just the edited one, so an existing bad
+                    # id is repaired on the next save.
+                    lid = obj.get('local_id')
+                    if lid:
+                        norm = self._normalize_local_id(str(lid))
+                        if norm:
+                            obj['local_id'] = norm
+                        else:
+                            obj.pop('local_id', None)
                     obj_events.append(obj)
                 elif etype == 'coord':
                     coord_events.append(obj)

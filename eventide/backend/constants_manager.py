@@ -86,11 +86,15 @@ class ConstantsManager:
     ]
 
     # ── Directions (static) ──────────────────────────────────────────────────
+    # pokefirered names its directions by compass point (DIR_SOUTH/NORTH/WEST/
+    # EAST), NOT DIR_DOWN/UP/LEFT/RIGHT (those are pokeemerald and don't exist
+    # here — emitting them fails the LINK with "undefined reference to DIR_*").
+    # Labels keep the intuitive arrow direction so authors aren't confused.
     DIRECTIONS: list[tuple[str, str]] = [
-        ('DIR_DOWN', 'Down'),
-        ('DIR_UP', 'Up'),
-        ('DIR_LEFT', 'Left'),
-        ('DIR_RIGHT', 'Right'),
+        ('DIR_SOUTH', 'Down (South)'),
+        ('DIR_NORTH', 'Up (North)'),
+        ('DIR_WEST', 'Left (West)'),
+        ('DIR_EAST', 'Right (East)'),
     ]
 
     _loaded = False

@@ -35,8 +35,12 @@ class RegionMapManager:
         self.constants_dir = os.path.join(root_dir, 'include', 'constants')
         self.graphics_dir = os.path.join(root_dir, 'graphics', 'region_map')
         self.tileset_path = os.path.join(self.graphics_dir, 'region_map.png')
-        self.edge_tiles_path = os.path.join(self.graphics_dir, 'map_edge.png')
-        self.edges_map_path = os.path.join(self.graphics_dir, 'map_edge.bin')
+        # The map border/frame overlay. pokefirered ships this as `background.*`
+        # (NOT `map_edge.*`, which never existed — that wrong name silently broke
+        # the whole region-map render since the April restructure). `background.bin`
+        # is a 30x20 tilemap (1200 bytes); `background.png` its tile sheet.
+        self.edge_tiles_path = os.path.join(self.graphics_dir, 'background.png')
+        self.edges_map_path = os.path.join(self.graphics_dir, 'background.bin')
 
         self.region_map_c_path = os.path.join(root_dir, 'src', 'region_map.c')
 
@@ -1009,9 +1013,17 @@ class RegionMapManager:
             raise FileNotFoundError('Region map graphics missing')
 
         tiles_base = self._load_tile_image(self.tileset_path, 16, 20)
-        tiles_edge = self._load_tile_image(self.edge_tiles_path, 16, 4)
         map_base = self._load_tilemap(tilemap_path, 30, 20)
-        map_edges = self._load_tilemap(self.edges_map_path, 30, 20)
+        # The border/background overlay is OPTIONAL — if it's missing or the
+        # wrong size, still render the base map rather than failing the whole
+        # tab (which is what left it stuck on "Load a project to see the region
+        # map"). A missing edge just means no decorative frame.
+        try:
+            tiles_edge = self._load_tile_image(self.edge_tiles_path, 16, 4)
+            map_edges = self._load_tilemap(self.edges_map_path, 30, 20)
+        except Exception:
+            tiles_edge = []
+            map_edges = []
 
         if _PIL_AVAILABLE:
             out = Image.new('RGBA', (30 * self.TILE_SIZE, 20 * self.TILE_SIZE))

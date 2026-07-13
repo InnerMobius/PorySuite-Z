@@ -529,6 +529,22 @@ class UnifiedMainWindow(QMainWindow):
         cleanup_sound_action.triggered.connect(self._on_cleanup_sound)
         tools_menu.addAction(cleanup_sound_action)
 
+        vars_flags_action = QAction("Variables && Flags...", self)
+        vars_flags_action.setToolTip(
+            "Name and reuse the game's variable and flag slots, RPG-Maker\n"
+            "style. Create new ones or repurpose the vanilla ones you don't\n"
+            "need — no file editing.")
+        vars_flags_action.triggered.connect(self._open_var_flag_manager)
+        tools_menu.addAction(vars_flags_action)
+
+        heal_loc_action = QAction("Heal Locations…", self)
+        heal_loc_action.setToolTip(
+            "Set where the player heals and respawns after a blackout —\n"
+            "trigger map + coordinates, respawn map, and respawn NPC.\n"
+            "Flags entries that point at a renamed/missing map.")
+        heal_loc_action.triggered.connect(self._open_heal_locations)
+        tools_menu.addAction(heal_loc_action)
+
         tools_menu.addSeparator()
 
         open_terminal_action = QAction("Open Terminal", self)
@@ -997,6 +1013,20 @@ class UnifiedMainWindow(QMainWindow):
                 _eet_mod._open_in_sound_editor_cb = self._sound_open_song
                 _eet_mod._stop_preview_cb = self._sound_stop_preview
             _eet_mod._open_ow_sprite_cb = self._open_ow_sprite
+            # EVENTide "Variables & Flags" button / "＋" pickers → Label Manager
+            _eet_mod._open_label_manager_cb = self._open_label_manager_page
+        except Exception:
+            pass
+
+        # ── Label Manager ↔ EVENTide integration ────────────────────────────
+        try:
+            import ui.label_manager as _lm_mod
+            _lm_mod.set_open_event_editor_cb(self._open_event_editor_page)
+            if hasattr(self, '_label_manager'):
+                # A code rename changes the actual constants — refresh EVENTide's
+                # pickers and display names so the new names show up at once.
+                self._label_manager.constants_changed.connect(
+                    self._on_constants_changed)
         except Exception:
             pass
 
@@ -1661,6 +1691,60 @@ class UnifiedMainWindow(QMainWindow):
             self, 'ROM Expanded',
             'Done! The Makefile now pads the ROM to 32 MB.\n\n'
             'Rebuild with Make Modern to create the larger ROM.')
+
+    def _open_heal_locations(self):
+        """Tools → Heal Locations: edit respawn points + coordinates."""
+        if not self.project_info:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        project_dir = self.project_info.get("dir", "")
+        try:
+            from eventide.ui.heal_locations_dialog import HealLocationsDialog
+            HealLocationsDialog(project_dir, parent=self).exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Heal Locations", str(e))
+
+    def _open_var_flag_manager(self):
+        """Tools → Variables & Flags: switch to the manager page."""
+        self._open_label_manager_page(None, False)
+
+    def _open_label_manager_page(self, kind=None, new=False):
+        """Switch to the Variables & Flags (Label Manager) page. If *new* is set,
+        open its New dialog for *kind* ('var'/'flag')."""
+        if not self.project_info:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        if "labels" not in self._page_indices:
+            return
+        self._switch_page("labels")
+        lm = getattr(self, "_label_manager", None)
+        if lm and new and kind:
+            try:
+                lm.focus_new(kind)
+            except Exception:
+                pass
+
+    def _open_event_editor_page(self, const_name: str = ""):
+        """Label Manager → EVENTide: switch to the Event Editor page."""
+        # The EVENTide page is registered under the eventide icon name.
+        for pname in ("eventide", "events", "event_editor"):
+            if pname in self._page_indices:
+                self._switch_page(pname)
+                break
+
+    def _on_constants_changed(self):
+        """A var/flag was created or renamed in code — refresh EVENTide."""
+        try:
+            self._update_event_editor_display_names()
+        except Exception:
+            pass
+        ev = getattr(self, '_eventide_window', None)
+        tab = getattr(ev, 'event_editor_tab', None) if ev else None
+        if tab and hasattr(tab, '_refresh_var_flag_pickers'):
+            try:
+                tab._refresh_var_flag_pickers()
+            except Exception:
+                pass
 
     def _on_cleanup_sound(self):
         """Open the Sound Cleanup dialog to find and delete orphaned audio data."""

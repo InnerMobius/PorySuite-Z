@@ -3984,15 +3984,24 @@ QTabBar::tab:hover:!selected {
         # The generated UI file put the ability combo + checkbox in row 4
         # (0-indexed) of each groupbox QFormLayout. removeRow() deletes the
         # label AND field widgets from the layout — no invisible ghost rows.
-        # We iterate in reverse index order so repeated removeRow(4) calls
-        # are safe even if one groupbox is missing.
-        _form_ability_row = 4
-        for _form_name in ("groupBox_starter1_form",
-                           "groupBox_starter2_form",
-                           "groupBox_starter3_form"):
-            _form = getattr(self.ui, _form_name, None)
-            if _form is not None and _form.rowCount() > _form_ability_row:
-                _form.removeRow(_form_ability_row)
+        #
+        # This MUST run exactly once for the life of the window. The .ui layout
+        # is built once in setupUi() and is NOT rebuilt when load_data runs
+        # again (e.g. the post-rename reload), so the ability row is already
+        # gone on a second call. Removing "row 4" again would delete whatever
+        # row 4 is NOW — the starter *move* combo — leaving self.ui.starterN_move
+        # pointing at a deleted C++ object. The next .clear() on it then throws
+        # RuntimeError, which strands the Save dialog on "Reloading project…"
+        # and locks the app. Guard it so the reload is safe.
+        if not getattr(self, "_starter_ability_rows_removed", False):
+            _form_ability_row = 4
+            for _form_name in ("groupBox_starter1_form",
+                               "groupBox_starter2_form",
+                               "groupBox_starter3_form"):
+                _form = getattr(self.ui, _form_name, None)
+                if _form is not None and _form.rowCount() > _form_ability_row:
+                    _form.removeRow(_form_ability_row)
+            self._starter_ability_rows_removed = True
         # Tooltip for Custom Move fields.
         for _n in ("starter1", "starter2", "starter3"):
             mv = getattr(self.ui, f"{_n}_move", None)
@@ -11694,29 +11703,45 @@ QTabBar::tab:hover:!selected {
                 # Skipping this for a plain save avoids re-running all extractors unnecessarily.
                 if applied_ops:
                     dlg.step("Reloading project")
-                    self.load_data(self.project_info)
-                    self._restore_species_edits()
+                    # The SAVE itself is already complete on disk at this point —
+                    # this reload is a best-effort refresh of the in-memory UI.
+                    # It MUST NOT be able to strand the modal progress dialog: if
+                    # any part of it throws, catch it, tell the user, and let
+                    # dlg.finish() close the dialog so the app never locks up on
+                    # "Reloading project…".
                     try:
-                        self._load_trainers_editor()
+                        self.load_data(self.project_info)
+                        self._restore_species_edits()
+                        try:
+                            self._load_trainers_editor()
+                        except Exception:
+                            pass
+                        try:
+                            self.load_moves_defs_table()
+                        except Exception:
+                            pass
+                        # Reselect renamed species if applicable
+                        try:
+                            for op in applied_ops:
+                                if op.get("op") == "rename_species":
+                                    new_const = op.get("new")
+                                    for i in range(self.ui.tree_pokemon.topLevelItemCount()):
+                                        item = self.ui.tree_pokemon.topLevelItem(i)
+                                        if item.text(1) == new_const:
+                                            self.ui.tree_pokemon.setCurrentItem(item)
+                                            break
+                                    break
+                        except Exception:
+                            pass
                     except Exception:
-                        pass
-                    try:
-                        self.load_moves_defs_table()
-                    except Exception:
-                        pass
-                    # Reselect renamed species if applicable
-                    try:
-                        for op in applied_ops:
-                            if op.get("op") == "rename_species":
-                                new_const = op.get("new")
-                                for i in range(self.ui.tree_pokemon.topLevelItemCount()):
-                                    item = self.ui.tree_pokemon.topLevelItem(i)
-                                    if item.text(1) == new_const:
-                                        self.ui.tree_pokemon.setCurrentItem(item)
-                                        break
-                                break
-                    except Exception:
-                        pass
+                        logging.exception("Post-rename project reload failed")
+                        try:
+                            dlg.log_line(
+                                "Reload after rename hit a problem — your changes "
+                                "were saved to disk. Close and reopen the project "
+                                "to refresh the editor.")
+                        except Exception:
+                            pass
 
             dlg.finish()
 
@@ -11726,6 +11751,12 @@ QTabBar::tab:hover:!selected {
                 central.setUpdatesEnabled(True)
             self.update()
             self._save_in_progress = False
+            # Close the modal progress dialog on the way out — leaving it open
+            # is what locks the whole app behind a frozen "Saving…" window.
+            try:
+                dlg.close()
+            except Exception:
+                pass
             raise
 
         finally:

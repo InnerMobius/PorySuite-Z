@@ -345,25 +345,59 @@ class RefactorService:
                 data = json.load(f)
         except Exception:
             return
-        if old not in data:
+        if not isinstance(data, dict):
             return
-        entry = data.pop(old)
-        data[new] = entry
-        if isinstance(entry, dict) and display is not None:
-            try:
-                entry["name"] = display
-            except Exception:
-                pass
-            si = entry.get("species_info") if isinstance(entry, dict) else None
-            if isinstance(si, dict):
-                si["speciesName"] = display
-            forms = entry.get("forms") if isinstance(entry, dict) else None
+        changed = False
+        # 1) Rename the species' own key + display fields.
+        if old in data:
+            entry = data.pop(old)
+            data[new] = entry
+            changed = True
+            if isinstance(entry, dict) and display is not None:
+                try:
+                    entry["name"] = display
+                except Exception:
+                    pass
+                si = entry.get("species_info") if isinstance(entry, dict) else None
+                if isinstance(si, dict):
+                    si["speciesName"] = display
+                forms = entry.get("forms") if isinstance(entry, dict) else None
+                if isinstance(forms, dict):
+                    for form in forms.values():
+                        if isinstance(form, dict):
+                            fsi = form.get("species_info")
+                            if isinstance(fsi, dict):
+                                fsi["speciesName"] = display
+
+        # 2) species.json bakes each species' evolutions INSIDE its
+        #    species_info (and each form's species_info). Renaming a species
+        #    must repoint every OTHER species' evolution targetSpecies that
+        #    referenced it — otherwise species.json keeps a dangling
+        #    targetSpecies (e.g. OCTO -> SPECIES_IVYSAUR after IVYSAUR was
+        #    renamed to OCTOROK), which on the post-rename reload leaves the
+        #    save-progress dialog stranded on "Reloading project…".
+        def _repoint_evos(si) -> None:
+            nonlocal changed
+            if not isinstance(si, dict):
+                return
+            evos = si.get("evolutions")
+            if isinstance(evos, list):
+                for ev in evos:
+                    if isinstance(ev, dict) and ev.get("targetSpecies") == old:
+                        ev["targetSpecies"] = new
+                        changed = True
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            _repoint_evos(entry.get("species_info"))
+            forms = entry.get("forms")
             if isinstance(forms, dict):
                 for form in forms.values():
                     if isinstance(form, dict):
-                        fsi = form.get("species_info")
-                        if isinstance(fsi, dict):
-                            fsi["speciesName"] = display
+                        _repoint_evos(form.get("species_info"))
+
+        if not changed:
+            return
         try:
             with open(path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(data, f, indent=2)

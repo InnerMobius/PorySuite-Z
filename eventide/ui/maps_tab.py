@@ -661,17 +661,27 @@ class MapsTab(QWidget):
         if confirm != QMessageBox.StandardButton.Ok:
             return
 
-        new_id = f"MAP_{new_folder.upper()}"
         try:
+            # Let rename_map derive the new MAP_ constant with its CamelCase-aware
+            # helper (MAP_{folder.upper()} is wrong for multi-word folders and
+            # would leave heal_locations.json / warps pointing at a dead constant).
             self._renamer.rename_map(
                 data["group"], old_folder,
-                new_folder=new_folder, new_id=new_id,
+                new_folder=new_folder, new_id=None,
                 callback=lambda msg: self._mw.log_message(msg))
             self._mw.log_message(f"Renamed map {old_folder} → {new_folder}")
             self._mark_dirty(new_folder)
             self._populate_tree()
             self._apply_dirty_styling()
             self.data_changed.emit()
+            stale = getattr(self._renamer, "last_stale_heal_locations", [])
+            if stale:
+                QMessageBox.warning(
+                    self, "Heal Locations Need Attention",
+                    "The map was renamed, but these heal locations still point "
+                    "at a map that no longer exists. Open Tools → Heal "
+                    "Locations… and fix them or the build will fail:\n\n• "
+                    + "\n• ".join(stale))
         except Exception as e:
             QMessageBox.critical(self, "Rename Map", str(e))
 

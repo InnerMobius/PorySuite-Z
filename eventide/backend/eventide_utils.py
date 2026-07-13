@@ -365,6 +365,114 @@ def write_text_inc(texts: dict, path: Path):
         fh.writelines(lines)
 
 
+# ── Map "scene" scripts: per-page NPC appearance ⇄ On Transition ────────────
+# An NPC whose look/behaviour changes with story progress (graphic, movement
+# type, position per state) is driven by the map's On Transition script, which
+# runs on entering the map and `call_if_*`s a small "SetX" script per state.
+# These two functions turn per-page appearance state into that On Transition
+# structure and back, so the event editor can present it as RPG-Maker-style
+# pages while EVENTide writes/reads the map script for the user. Verified to
+# reproduce the vanilla ViridianCity Old Man exactly and round-trip.
+
+_GOTO_TO_CALL = {
+    'goto_if_set': 'call_if_set', 'goto_if_unset': 'call_if_unset',
+    'goto_if_eq': 'call_if_eq', 'goto_if_ne': 'call_if_ne',
+    'goto_if_lt': 'call_if_lt', 'goto_if_ge': 'call_if_ge',
+    'goto_if_le': 'call_if_le', 'goto_if_gt': 'call_if_gt',
+}
+_CALL_TO_GOTO = {v: k for k, v in _GOTO_TO_CALL.items()}
+
+
+def build_scene_scripts(map_name: str, states: list, preamble: list | None = None):
+    """Generate the ``<Map>_OnTransition`` script + one ``SetX`` script per
+    state from a list of per-NPC appearance states.
+
+    Each *state* is a dict: ``{'suffix', 'localid', 'condition': (goto_if_*,
+    args...), 'movement'?, 'x'?, 'y'?, 'gfx'?}``. *preamble* is any non-scene
+    On Transition content to keep (e.g. ``setworldmapflag``). Returns
+    ``(scripts, on_transition_label)`` where *scripts* maps label → command
+    tuples in the generic ``(cmd, argstr)`` form the writer emits."""
+    out: dict = {}
+    ot = list(preamble or [])
+    for s in states:
+        set_label = f'{map_name}_EventScript_Set{s["suffix"]}'
+        cond = tuple(s['condition'])
+        call = _GOTO_TO_CALL.get(cond[0], 'call_if_set')
+        cond_args = ', '.join(str(a) for a in cond[1:])
+        ot.append((call, f'{cond_args}, {set_label}'))
+        body: list = []
+        if s.get('gfx'):
+            body.append(('setvar', f'VAR_OBJ_GFX_ID_0, {s["gfx"]}'))
+        if s.get('movement'):
+            body.append(('setobjectmovementtype',
+                         f'{s["localid"]}, {s["movement"]}'))
+        if s.get('x') is not None and s.get('y') is not None:
+            body.append(('setobjectxyperm',
+                         f'{s["localid"]}, {s["x"]}, {s["y"]}'))
+        body.append(('return',))
+        out[set_label] = body
+    ot.append(('end',))
+    out[f'{map_name}_OnTransition'] = ot
+    return out, f'{map_name}_OnTransition'
+
+
+def _scene_argparts(ct: tuple) -> list:
+    """Flatten a command tuple's arguments to a list of strings, regardless of
+    whether the args are one comma-joined string ``(cmd, 'a, b, c')`` — the form
+    :func:`build_scene_scripts` emits — or separate tuple elements
+    ``(cmd, 'a', 'b', 'c')`` — the form :func:`parse_scripts_inc` produces."""
+    raw = ', '.join(str(a) for a in ct[1:])
+    return [x.strip() for x in raw.split(',') if x.strip() != '']
+
+
+def parse_scene_scripts(map_name: str, scripts: dict):
+    """Inverse of :func:`build_scene_scripts`. Reads ``<Map>_OnTransition`` and
+    its ``SetX`` targets back into ``(states, preamble)`` — so an existing
+    scene NPC (e.g. the Old Man) folds into per-page appearance states, and any
+    non-scene On Transition command (setworldmapflag, …) is preserved.
+
+    Handles both command-tuple shapes (see :func:`_scene_argparts`)."""
+    ot = scripts.get(f'{map_name}_OnTransition', [])
+    states: list = []
+    preamble: list = []
+    for ct in ot:
+        if not ct:
+            continue
+        if ct[0] in _CALL_TO_GOTO and len(ct) > 1:
+            a = _scene_argparts(ct)
+            if not a:
+                continue
+            set_label = a[-1]
+            cond = (_CALL_TO_GOTO[ct[0]],) + tuple(a[:-1])
+            st: dict = {
+                'suffix': set_label.split('_EventScript_Set')[-1],
+                'condition': cond, 'set_label': set_label}
+            for b in scripts.get(set_label, []):
+                if not b:
+                    continue
+                if b[0] == 'setobjectmovementtype':
+                    p = _scene_argparts(b)
+                    if p:
+                        st['localid'] = p[0]
+                    if len(p) > 1:
+                        st['movement'] = p[1]
+                elif b[0] == 'setobjectxyperm':
+                    p = _scene_argparts(b)
+                    if p:
+                        st['localid'] = p[0]
+                    if len(p) > 2:
+                        st['x'] = int(p[1])
+                        st['y'] = int(p[2])
+                elif b[0] == 'setvar':
+                    p = _scene_argparts(b)
+                    if len(p) > 1 and 'VAR_OBJ_GFX_ID_0' in p[0]:
+                        st['gfx'] = p[1]
+            states.append(st)
+        elif ct[0] != 'end':
+            preamble.append(ct)
+    return states, preamble
+
+
 def parse_scripts_inc(map_dir: Path, texts: OrderedDict | None = None) -> tuple[dict[str, list], dict[str, list]]:
     """Return script commands and hidden lines for each label.
 

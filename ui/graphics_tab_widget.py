@@ -37,7 +37,10 @@ from ui.graphics_data import (
 )
 from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
 from ui.draggable_palette_row import DraggablePaletteRow
-from core.gba_image_utils import swap_palette_entries, export_indexed_png
+from core.gba_image_utils import (
+    swap_palette_entries, export_indexed_png, _rebuild_color_table,
+    remap_to_palette, find_closest_color,
+)
 from core.sprite_palette_bus import get_bus as _get_palette_bus
 
 
@@ -1425,7 +1428,13 @@ class GraphicsTabWidget(QWidget):
         # Per-species palette cache (normal + shiny)
         # { species: {'normal': [16 tuples], 'shiny': [16 tuples]} }
         self._palettes: Dict[str, Dict[str, List[Color]]] = {}
-        self._palette_dirty: set[str] = set()  # species keys
+        # Palette dirtiness is tracked per-channel so a SHINY-only change never
+        # rewrites the normal front/back PNGs (importing a shiny palette must
+        # leave the normal graphics untouched). Normal changes write normal.pal
+        # AND re-bake the front/back PNGs (their baked colour table must match);
+        # shiny changes write shiny.pal ONLY.
+        self._normal_pal_dirty: set[str] = set()   # write normal.pal + bake PNGs
+        self._shiny_pal_dirty: set[str] = set()    # write shiny.pal only
 
         # Per-species raw indexed QImage cache + per-species file paths.
         # Populated lazily when the user triggers "Index as Background"
@@ -1440,6 +1449,16 @@ class GraphicsTabWidget(QWidget):
         self._sprite_paths: Dict[str, Dict[str, str]] = {}
         self._sprite_png_dirty: set[str] = set()
 
+        # Imported icon / footprint graphics awaiting write on Save (these
+        # slots aren't covered by the front/back bake path above, so they get
+        # their own dirty sets + the icon keeps its imported colour table).
+        self._icon_png_dirty: set[str] = set()
+        self._footprint_png_dirty: set[str] = set()
+        # Raw (un-remapped) artwork for a pending imported icon, kept so the
+        # icon can be re-fitted whenever the species' shared icon-palette slot
+        # (0/1/2) changes — the icon never owns its palette.
+        self._icon_import_src: Dict[str, QImage] = {}
+
         # Icon palette storage (per-palette-slot, shared across all species)
         # { 0: [16 tuples], 1: [...], 2: [...] }
         self._icon_palettes: Dict[int, List[Color]] = {}
@@ -1453,12 +1472,27 @@ class GraphicsTabWidget(QWidget):
         self._icon_recoloured: Optional[QPixmap] = None  # palette-applied
         self._front_src_path: str = ""
         self._back_src_path: str = ""
+        self._foot_src_path: str = ""
         self._icon_frame = 0
         self._icon_timer = QTimer(self)
         self._icon_timer.setInterval(400)  # ~2.5 fps, matches Info tab
         self._icon_timer.timeout.connect(self._tick_icon_anim)
         self._icon_timer.start()
         self._preview_shiny = False  # False=normal, True=shiny
+
+        # Folder the user last imported a graphic/palette from. Shared across
+        # EVERY import dialog on this tab (front/back/icon/footprint sprites +
+        # palette imports) so it "sticks" when swapping normal↔shiny or moving
+        # between species — and across app restarts (persisted via QSettings).
+        self._last_import_dir: str = ""
+        try:
+            from PyQt6.QtCore import QSettings as _QS
+            saved = _QS("PorySuite", "PorySuiteZ").value(
+                "pokemon_graphics/last_import_dir", "")
+            if saved and os.path.isdir(str(saved)):
+                self._last_import_dir = str(saved)
+        except Exception:
+            pass
 
         self._build_ui()
 
@@ -1472,13 +1506,23 @@ class GraphicsTabWidget(QWidget):
         left = QVBoxLayout()
         left.setSpacing(8)
 
-        self._front_thumb = self._make_thumb(64, "Front")
-        self._back_thumb = self._make_thumb(64, "Back")
-        self._foot_thumb = self._make_thumb(16, "Footprint")
+        self._front_thumb = self._make_thumb(64, "Front", "front")
+        self._back_thumb = self._make_thumb(64, "Back", "back")
+        self._foot_thumb = self._make_thumb(64, "Footprint", "footprint")
 
         for group in (self._front_thumb[0], self._back_thumb[0],
                       self._foot_thumb[0]):
             left.addWidget(group)
+
+        self._import_set_btn = QPushButton("Import Normal + Shiny Set…")
+        self._import_set_btn.setToolTip(
+            "Import an artist's normal + shiny PNGs at once. The normal sprite's "
+            "pixels become the shared sprite; the shiny palette is auto-mapped "
+            "from the shiny PNG pixel-for-pixel, so BOTH display exactly as "
+            "drawn — even when the normal and shiny PNGs were indexed separately "
+            "and their palettes don't line up.")
+        self._import_set_btn.clicked.connect(self._import_sprite_set)
+        left.addWidget(self._import_set_btn)
 
         self._open_folder_btn = QPushButton("Open Graphics Folder")
         self._open_folder_btn.setToolTip(
@@ -1606,12 +1650,11 @@ class GraphicsTabWidget(QWidget):
 
         self._import_png_btn = QPushButton("Import PNG...")
         self._import_png_btn.setToolTip(
-            "Pick a PNG to import into the Normal or Shiny palette.\n"
-            "An indexed (palette-mode) PNG has its colour table\n"
-            "extracted directly — the image itself isn't modified.\n"
-            "A non-indexed PNG (or one with more than 16 colours)\n"
-            "automatically opens the manual palette picker so you\n"
-            "can choose the 16 colours and remap the image."
+            "Import a palette from a PNG — PALETTE ONLY, the sprite is\n"
+            "not replaced. An indexed (palette-mode) PNG has its 16\n"
+            "colours read straight into the Normal or Shiny palette.\n"
+            "(A non-indexed PNG can't give a clean 16-colour palette, so\n"
+            "it falls back to the manual picker, which does save a sprite.)"
         )
         ig_import.addWidget(self._import_png_btn)
 
@@ -1619,10 +1662,12 @@ class GraphicsTabWidget(QWidget):
         self._import_png_manual_btn.setToolTip(
             "Open the manual palette picker on a PNG (any format —\n"
             "indexed or full-colour).  You choose which colours land\n"
-            "in which slot, mark the BG/transparent slot, reorder\n"
-            "freely, and see a live preview of the remap.  The result\n"
-            "is loaded into the Normal or Shiny palette (whichever\n"
-            "radio is selected above)."
+            "in which slot, mark the BG/transparent slot, and reorder\n"
+            "freely.  WHAT YOU ARRANGE IS WHAT GETS SAVED: the picked\n"
+            "image is remapped to your exact layout and saved as the\n"
+            "sprite, together with the palette, on File → Save.\n\n"
+            "(For Shiny target this sets shiny.pal only — shiny shares\n"
+            "the normal sprite's pixels.)"
         )
         ig_import.addWidget(self._import_png_manual_btn)
 
@@ -1671,6 +1716,16 @@ class GraphicsTabWidget(QWidget):
         sel_row.addWidget(self._icon_pal_combo)
         sel_row.addStretch(1)
         ig.addLayout(sel_row)
+
+        self._import_icon_btn = QPushButton("Import Menu Icon…")
+        self._import_icon_btn.setToolTip(
+            "Replace this species' menu icon (mini) with a PNG you pick.\n"
+            "The icon is a 32×64 sheet (two stacked 32×32 frames). In-game\n"
+            "the icon is coloured by the shared icon palette selected above,\n"
+            "so pick a matching palette or edit it below. Saved on File → Save.")
+        self._import_icon_btn.clicked.connect(
+            lambda _=False: self._import_graphic("icon"))
+        ig.addWidget(self._import_icon_btn)
 
         # Three editable swatch rows
         self._icon_rows: List[PaletteSwatchRow] = []
@@ -1725,7 +1780,7 @@ class GraphicsTabWidget(QWidget):
             self._import_palette_from_png_manual)
         self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
 
-    def _make_thumb(self, display_size: int, title: str):
+    def _make_thumb(self, display_size: int, title: str, slot: str = ""):
         box = QGroupBox(title)
         bl = QVBoxLayout(box)
         bl.setContentsMargins(6, 14, 6, 6)
@@ -1735,7 +1790,18 @@ class GraphicsTabWidget(QWidget):
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setStyleSheet("background: #181818; border: 1px solid #333;")
         bl.addWidget(lbl, 0, Qt.AlignmentFlag.AlignHCenter)
-        return box, lbl
+        btn = None
+        if slot:
+            btn = QPushButton("Import…")
+            btn.setToolTip(
+                f"Replace this species' {title.lower()} image with a PNG you "
+                f"pick.\nAn indexed (≤16-colour) PNG is used directly; any "
+                f"other\nPNG opens the colour picker to remap it. Nothing is "
+                f"written\nto disk until you click File → Save.")
+            btn.clicked.connect(
+                lambda _=False, s=slot: self._import_graphic(s))
+            bl.addWidget(btn)
+        return box, lbl, btn
 
     def _wrap(self, title: str, inner: QWidget) -> QGroupBox:
         g = QGroupBox(title)
@@ -1763,7 +1829,14 @@ class GraphicsTabWidget(QWidget):
             self._icon_palettes[i] = cols
         self._icon_pal_dirty.clear()
         self._palettes.clear()
-        self._palette_dirty.clear()
+        self._normal_pal_dirty.clear()
+        self._shiny_pal_dirty.clear()
+        # Drop any pending imported graphics from a previously-open project.
+        self._sprite_imgs.clear()
+        self._sprite_png_dirty.clear()
+        self._icon_png_dirty.clear()
+        self._footprint_png_dirty.clear()
+        self._icon_import_src.clear()
         # Refresh the icon rows with loaded palettes
         self._loading = True
         try:
@@ -1791,6 +1864,7 @@ class GraphicsTabWidget(QWidget):
 
             # Icon source (animated separately)
             self._icon_src_path = icon_path or ""
+            self._foot_src_path = footprint_path or ""
             self._icon_src = self._load_pix(icon_path)
             self._icon_frame = 0
             # Build the palette-swapped version for the currently-selected
@@ -1810,6 +1884,8 @@ class GraphicsTabWidget(QWidget):
             self._sprite_paths[species] = {
                 "front": front_path or "",
                 "back": back_path or "",
+                "icon": icon_path or "",
+                "footprint": footprint_path or "",
             }
 
             # Spinboxes from data cache
@@ -1933,9 +2009,21 @@ class GraphicsTabWidget(QWidget):
         self._preview.set_front_pixmap(mon_sheet_frame(front_pix, _frame))
         self._preview.set_back_pixmap(mon_sheet_frame(back_pix, _frame))
 
-        # Keep left-column thumbnails in sync with the palette too
-        self._set_thumb(self._front_thumb[1], self._front_src_path, palette, frame=_frame)
-        self._set_thumb(self._back_thumb[1], self._back_src_path, palette, frame=_frame)
+        # Keep the left-column thumbnails in sync using the SAME recoloured
+        # pixmaps as the battle preview (which prefer the in-memory imported
+        # image over the stale on-disk PNG). Re-reading the disk PNG here was
+        # the bug: after importing a new sprite or editing the palette, the
+        # thumbnail showed the old on-disk graphic/colours.
+        def _fill_thumb(lbl, pix):
+            if pix is None or pix.isNull():
+                return
+            framed = mon_sheet_frame(pix, _frame)
+            t = lbl.width()
+            lbl.setPixmap(framed.scaled(
+                t, t, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation))
+        _fill_thumb(self._front_thumb[1], front_pix)
+        _fill_thumb(self._back_thumb[1], back_pix)
 
     def _load_species_palettes(self, species: str) -> None:
         if not self._project_root:
@@ -2019,7 +2107,7 @@ class GraphicsTabWidget(QWidget):
         self._palettes.setdefault(
             self._current_species, {"normal": [], "shiny": []}
         )["normal"] = colors
-        self._palette_dirty.add(self._current_species)
+        self._normal_pal_dirty.add(self._current_species)
         # Broadcast the new palette so viewer tabs (Pokedex, Starters,
         # Info panel, species tree, …) reskin immediately — even though
         # no .pal file has been written yet.
@@ -2038,7 +2126,7 @@ class GraphicsTabWidget(QWidget):
         self._palettes.setdefault(
             self._current_species, {"normal": [], "shiny": []}
         )["shiny"] = colors
-        self._palette_dirty.add(self._current_species)
+        self._shiny_pal_dirty.add(self._current_species)
         _get_palette_bus().set_pokemon_palette(
             self._current_species, "shiny", colors,
         )
@@ -2095,7 +2183,13 @@ class GraphicsTabWidget(QWidget):
         finally:
             self._loading = False
 
-        self._palette_dirty.add(sp)
+        # A normal-row reorder must re-bake the front/back PNGs so their colour
+        # table matches the new normal.pal order; a shiny-row reorder only
+        # rewrites shiny.pal (pixels + normal PNGs untouched).
+        if source == "normal":
+            self._normal_pal_dirty.add(sp)
+        else:
+            self._shiny_pal_dirty.add(sp)
         # Push the swapped row to the bus — viewers filter on the kind
         # they're showing.
         _get_palette_bus().set_pokemon_palette(sp, key, pal)
@@ -2212,7 +2306,8 @@ class GraphicsTabWidget(QWidget):
             self._loading = False
 
         # Mark everything dirty: both .pal files + both PNGs need saving.
-        self._palette_dirty.add(sp)
+        self._normal_pal_dirty.add(sp)
+        self._shiny_pal_dirty.add(sp)
         self._sprite_png_dirty.add(sp)
         # Push both rows — the lockstep swap rewrote both .pal rows
         # AND the PNG pixels in RAM. Viewer tabs have no access to the
@@ -2226,9 +2321,14 @@ class GraphicsTabWidget(QWidget):
 
     def _on_icon_idx(self, v: int) -> None:
         # Always rebuild the preview (even during loading, since load_species
-        # may set the combo after building the recolour).
-        self._rebuild_icon_recolour()
-        self._render_icon_frame()
+        # may set the combo after building the recolour). A species with a
+        # pending imported icon re-fits that artwork to the newly-chosen shared
+        # palette instead of reading the (stale) on-disk icon.
+        if self._current_species in self._icon_import_src:
+            self._refresh_imported_icon_preview(self._current_species)
+        else:
+            self._rebuild_icon_recolour()
+            self._render_icon_frame()
         if self._loading or not self._current_species or not self._data:
             return
         self._data.set_icon_idx(self._current_species, v)
@@ -2250,6 +2350,36 @@ class GraphicsTabWidget(QWidget):
             self._rebuild_icon_recolour()
             self._render_icon_frame()
 
+    # ─────────────────────────────────────────── shared import folder ──
+    def _import_start_dir(self) -> str:
+        """Where an import dialog should open: the last folder the user
+        imported from (persists across species + normal/shiny), else this
+        species' own graphics folder, else the project root."""
+        if self._last_import_dir and os.path.isdir(self._last_import_dir):
+            return self._last_import_dir
+        if self._project_root and self._current_species:
+            slug = species_slug_from_const(self._current_species)
+            cand = os.path.join(
+                self._project_root, "graphics", "pokemon", slug)
+            if os.path.isdir(cand):
+                return cand
+        return self._project_root or ""
+
+    def _pick_import_file(self, title: str, filt: str) -> str:
+        """Open a file dialog seeded at the remembered import folder and,
+        on a successful pick, remember that file's folder for next time."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, title, self._import_start_dir(), filt)
+        if path:
+            self._last_import_dir = os.path.dirname(path)
+            try:
+                from PyQt6.QtCore import QSettings as _QS
+                _QS("PorySuite", "PorySuiteZ").setValue(
+                    "pokemon_graphics/last_import_dir", self._last_import_dir)
+            except Exception:
+                pass
+        return path
+
     def _open_graphics_folder(self) -> None:
         if not self._project_root or not self._current_species:
             return
@@ -2267,6 +2397,430 @@ class GraphicsTabWidget(QWidget):
                 except Exception:
                     pass
 
+    # ─────────────────────────────── import a full normal+shiny set ──
+    def _import_sprite_set(self) -> None:
+        """Import an artist's normal + shiny PNGs and reconcile them into
+        pokefirered's shared-sprite format: the normal pixels become the shared
+        front/back sprite, and the shiny palette is auto-derived from the shiny
+        PNG pixel-for-pixel so both render exactly as drawn."""
+        if not self._current_species:
+            QMessageBox.information(
+                self, "No Species Selected",
+                "Select a species first, then import its sprite set.")
+            return
+        sp = self._current_species
+        from ui.dialogs.sprite_set_import_dialog import pick_sprite_set
+        picks = pick_sprite_set(self._import_start_dir(), parent=self)
+        if not picks:
+            return
+        # Remember the folder for next time.
+        for p in picks.values():
+            if p:
+                self._last_import_dir = os.path.dirname(p)
+                try:
+                    from PyQt6.QtCore import QSettings as _QS
+                    _QS("PorySuite", "PorySuiteZ").setValue(
+                        "pokemon_graphics/last_import_dir", self._last_import_dir)
+                except Exception:
+                    pass
+                break
+
+        def _load(key):
+            path = picks.get(key, "")
+            if not path or not os.path.isfile(path):
+                return None
+            im = QImage(path)
+            return None if im.isNull() else im
+
+        from core.sprite_set_import import build_sprite_set
+        result = build_sprite_set(
+            _load("front_normal"), _load("front_shiny"),
+            _load("back_normal"), _load("back_shiny"))
+
+        # Stage the shared sprites + both palettes (written together on Save).
+        imgs = self._sprite_imgs.setdefault(sp, {})
+        if result.get("front") is not None:
+            imgs["front"] = result["front"]
+        if result.get("back") is not None:
+            imgs["back"] = result["back"]
+        self._palettes.setdefault(sp, {"normal": [], "shiny": []})
+        self._palettes[sp]["normal"] = list(result["normal"])
+        self._palettes[sp]["shiny"] = list(result["shiny"])
+        self._normal_pal_dirty.add(sp)     # writes normal.pal + bakes PNGs
+        self._shiny_pal_dirty.add(sp)      # writes shiny.pal
+        self._sprite_png_dirty.add(sp)
+
+        # Menu icon (separate shared-palette path) if provided.
+        icon_img = _load("icon")
+        if icon_img is not None:
+            self._apply_imported_icon(sp, picks.get("icon", "icon"), icon_img)
+
+        # Reflect in the swatch rows + previews.
+        self._loading = True
+        try:
+            self._normal_row.set_colors(self._palettes[sp]["normal"])
+            self._shiny_row.set_colors(self._palettes[sp]["shiny"])
+        finally:
+            self._loading = False
+        _frame = getattr(self, "_form_frame", 0)
+        for kind, thumb in (("front", self._front_thumb),
+                            ("back", self._back_thumb)):
+            cimg = imgs.get(kind)
+            if cimg is not None and not cimg.isNull():
+                self._thumb_from_image(
+                    thumb[1], cimg, self._palettes[sp]["normal"], frame=_frame)
+        self._refresh_preview_sprites()
+        self.modified.emit()
+
+        warn = result.get("warnings") or []
+        msg = ("Imported the sprite set. The normal sprite reproduces your "
+               "normal PNG, and the shiny palette was auto-mapped so the SAME "
+               "sprite reproduces your shiny PNG — both display as drawn.\n\n"
+               "Toggle Preview Shiny to check, then File → Save.")
+        if warn:
+            msg += "\n\nNotes:\n• " + "\n• ".join(warn)
+        QMessageBox.information(self, "Sprite Set Imported", msg)
+
+    # ───────────────────────────────────── import a sprite GRAPHIC ──
+    def _thumb_from_image(self, lbl: QLabel, img: QImage,
+                          palette: Optional[List[Color]] = None,
+                          frame: int = 0) -> None:
+        """Paint an in-memory (not-yet-saved) QImage into a thumbnail label,
+        recolouring with *palette* when given. Mirrors _set_thumb but reads
+        from memory so an import shows before Save."""
+        if img is None or img.isNull():
+            return
+        from core.sprite_render import mon_sheet_frame
+        if palette:
+            pix = _reskin_indexed_image(img, palette)
+            if pix is None:
+                pix = QPixmap.fromImage(img)
+        else:
+            pix = QPixmap.fromImage(img)
+        if pix.isNull():
+            return
+        pix = mon_sheet_frame(pix, frame)
+        target = lbl.width()
+        lbl.setPixmap(pix.scaled(
+            target, target,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation))
+
+    def _import_graphic(self, slot: str) -> None:
+        """Replace one of this species' graphics (front / back / icon /
+        footprint) with a user-picked PNG. Nothing is written to disk until
+        the user clicks File → Save — the imported image lives in memory and
+        flows through flush_to_disk, so it's undoable via a no-save reload."""
+        if not self._current_species:
+            QMessageBox.information(
+                self, "No Species Selected",
+                "Select a species first, then import a graphic.")
+            return
+        sp = self._current_species
+        LABELS = {"front": "front sprite", "back": "back sprite",
+                  "icon": "menu icon", "footprint": "footprint"}
+        # GBA hardware frame sizes (front/back & icon may be vertical multi-
+        # frame sheets — height a multiple of the per-frame height).
+        FRAME = {"front": (64, 64), "back": (64, 64),
+                 "icon": (32, 32), "footprint": (16, 16)}
+        label = LABELS[slot]
+        ew, eh = FRAME[slot]
+
+        path = self._pick_import_file(
+            f"Select {label} PNG", "PNG Images (*.png)")
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(
+                self, "Import Failed", f"Could not load image:\n{path}")
+            return
+
+        # Size sanity check — wrong dimensions can break the build, so warn
+        # (but let the user override for genuinely custom setups).
+        w, h = img.width(), img.height()
+        multiframe = slot in ("front", "back", "icon")
+        bad = (w != ew) or (h == 0) or (h % eh != 0) or (not multiframe and h != eh)
+        if bad:
+            per = " per frame (stacked vertically)" if multiframe else ""
+            if QMessageBox.question(
+                    self, "Unexpected Size",
+                    f"The {label} is normally {ew}×{eh}px{per}.\n"
+                    f"You picked a {w}×{h}px image.\n\n"
+                    "Importing a wrong-sized graphic can break the build. "
+                    "Import it anyway?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        if slot == "footprint":
+            self._apply_imported_footprint(sp, img)
+        elif slot == "icon":
+            self._apply_imported_icon(sp, path, img)
+        else:
+            self._apply_imported_front_back(sp, slot, path, img)
+
+    def _apply_imported_footprint(self, sp: str, img: QImage) -> None:
+        """Convert any picked image to a 2-colour footprint (white bg = index
+        0, black mark = index 1) and stage it for save."""
+        src = img.convertToFormat(QImage.Format.Format_ARGB32)
+        w, h = src.width(), src.height()
+        idx = QImage(w, h, QImage.Format.Format_Indexed8)
+        idx.setColorCount(2)
+        idx.setColor(0, 0xFFFFFFFF)   # white background  (matches on-disk)
+        idx.setColor(1, 0xFF000000)   # black footprint mark
+        for y in range(h):
+            for x in range(w):
+                px = src.pixel(x, y)
+                a = (px >> 24) & 0xFF
+                r = (px >> 16) & 0xFF
+                g = (px >> 8) & 0xFF
+                b = px & 0xFF
+                lum = 0.299 * r + 0.587 * g + 0.114 * b
+                # transparent or light -> background; dark opaque -> the mark
+                idx.setPixel(x, y, 1 if (a >= 128 and lum < 128) else 0)
+        self._sprite_imgs.setdefault(sp, {})["footprint"] = idx
+        self._footprint_png_dirty.add(sp)
+        self._thumb_from_image(self._foot_thumb[1], idx)
+        self.modified.emit()
+        QMessageBox.information(
+            self, "Footprint Imported",
+            "The footprint preview is updated. Click File → Save to write it "
+            "to the species' footprint.png.")
+
+    def _extract_or_pick_palette(self, path: str, img: QImage):
+        """Return (colors, indexed_img) for a picked PNG: use an already
+        project-format indexed ≤16-colour image directly, else open the manual
+        colour picker to choose/order 16 colours and remap. Returns None if
+        the user cancels the picker."""
+        ct = (img.colorTable()
+              if img.format() == QImage.Format.Format_Indexed8 else [])
+        if (img.format() == QImage.Format.Format_Indexed8
+                and ct and len(set(ct)) <= 16):
+            colors: List[Color] = []
+            for entry in ct[:16]:
+                colors.append(clamp_to_gba(
+                    (entry >> 16) & 0xFF, (entry >> 8) & 0xFF, entry & 0xFF))
+            while len(colors) < 16:
+                colors.append((0, 0, 0))
+            idx_img = img
+        else:
+            from ui.dialogs.manual_palette_pick_dialog import (
+                import_image_manually_from_path,
+            )
+            result = import_image_manually_from_path(
+                path, target_colors=16, parent=self)
+            if result is None:
+                return None
+            colors, idx_img = result
+            colors = list(colors)
+        if idx_img.format() != QImage.Format.Format_Indexed8:
+            idx_img = idx_img.convertToFormat(QImage.Format.Format_Indexed8)
+        return colors, idx_img
+
+    @staticmethod
+    def _distinct_used_colors(true_img: Optional[QImage]) -> List[Color]:
+        """Ordered list of distinct opaque colours used by an ARGB/indexed
+        image (skips fully-transparent pixels, i.e. the background)."""
+        out: List[Color] = []
+        if true_img is None or true_img.isNull():
+            return out
+        seen = set()
+        w, h = true_img.width(), true_img.height()
+        for y in range(h):
+            for x in range(w):
+                px = true_img.pixel(x, y)
+                if ((px >> 24) & 0xFF) < 128:
+                    continue
+                c = ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF)
+                if c not in seen:
+                    seen.add(c)
+                    out.append(c)
+        return out
+
+    def _apply_imported_front_back(self, sp: str, slot: str,
+                                   path: str, img: QImage) -> None:
+        """Import a front or back sprite.
+
+        Front and back share ONE normal palette, so a shared 16-colour palette
+        is built that covers BOTH sprites (their combined colours — lossless
+        when front+back were authored to fit 16 colours, which is the norm),
+        and both sprites are re-indexed onto it. Importing the back therefore
+        keeps the front looking right instead of stealing its colours.
+
+        The SHINY palette is deliberately left ALONE — importing a sprite must
+        not touch shiny (only the normal channel is marked dirty). Set the shiny
+        colours separately with the shiny palette import, after the sprites are
+        in place."""
+        picked = self._extract_or_pick_palette(path, img)
+        if picked is None:
+            return
+        imported_colors, idx_img = picked
+        other = "back" if slot == "front" else "front"
+
+        cur = self._palettes.get(sp) or {}
+        old_normal = list(cur.get("normal") or [(0, 0, 0)] * 16)
+        while len(old_normal) < 16:
+            old_normal.append((0, 0, 0))
+
+        # True-colour views of both sprites (their own colours), so we can
+        # union their palettes and remap without depending on stale index order.
+        # The OTHER sprite is read via _true_color_sprite, which uses the disk
+        # PNG's OWN baked palette when reading from disk — NOT the loaded
+        # normal.pal. That matters when the on-disk front/back are desynced from
+        # normal.pal (front baked one palette, normal.pal holding another): the
+        # old code recoloured the other sprite with normal.pal and pulled the
+        # WRONG colours into the shared palette (the "where did these colours
+        # come from" bug).
+        imported_true = _rebuild_color_table(idx_img, imported_colors, 0)
+        other_true = self._true_color_sprite(sp, other)
+
+        # Build the shared palette: slot 0 = the imported sprite's transparent
+        # colour, then the imported sprite's colours (it wins on overflow since
+        # it's the one being imported), then the other sprite's colours.
+        bg = imported_colors[0] if imported_colors else (0, 0, 0)
+        shared: List[Color] = [bg]
+        seen = {bg}
+        for c in (self._distinct_used_colors(imported_true)
+                  + self._distinct_used_colors(other_true)):
+            if c in seen:
+                continue
+            if len(shared) >= 16:
+                break
+            seen.add(c)
+            shared.append(c)
+        while len(shared) < 16:
+            shared.append((0, 0, 0))
+
+        # Re-index BOTH sprites onto the shared palette (bg -> slot 0).
+        self._sprite_imgs.setdefault(sp, {})[slot] = remap_to_palette(
+            imported_true, shared, bg_transparent=True)
+        if other_true is not None:
+            self._sprite_imgs[sp][other] = remap_to_palette(
+                other_true, shared, bg_transparent=True)
+
+        # Normal channel only — shiny is preserved untouched.
+        self._palettes.setdefault(sp, {"normal": [], "shiny": []})["normal"] = shared
+        self._normal_pal_dirty.add(sp)
+        self._sprite_png_dirty.add(sp)
+
+        self._loading = True
+        try:
+            self._normal_row.set_colors(shared)
+        finally:
+            self._loading = False
+        _frame = getattr(self, "_form_frame", 0)
+        for kind, thumb in (("front", self._front_thumb),
+                            ("back", self._back_thumb)):
+            cimg = self._sprite_imgs[sp].get(kind)
+            if cimg is not None and not cimg.isNull():
+                self._thumb_from_image(thumb[1], cimg, shared, frame=_frame)
+        self._refresh_preview_sprites()
+
+        self.modified.emit()
+        QMessageBox.information(
+            self, "Sprite Imported",
+            f"Loaded {slot} from:\n{os.path.basename(path)}\n\n"
+            f"Front and back share one normal palette, so a combined palette was "
+            f"built and the {other} sprite kept its colours. The shiny palette "
+            f"was left untouched — set it with the shiny palette import.\n\n"
+            f"Click File → Save to write the PNGs + normal.pal.")
+
+    def _true_color_sprite(self, sp: str, slot: str) -> Optional[QImage]:
+        """Return a sprite slot as an image showing its REAL colours.
+
+        - In-memory imported image → it's indexed to this species' current
+          normal palette, so apply that palette.
+        - On-disk PNG → use the PNG's OWN baked colour table (its true colours),
+          NOT the loaded normal.pal, so a front/back that's baked out of sync
+          with normal.pal is still read correctly.
+        Returns None if the slot has no image."""
+        cached = (self._sprite_imgs.get(sp) or {}).get(slot)
+        if cached is not None and not cached.isNull():
+            pal = (self._palettes.get(sp) or {}).get("normal") or [(0, 0, 0)] * 16
+            return _rebuild_color_table(cached, pal, 0)
+        path = (self._sprite_paths.get(sp) or {}).get(slot, "")
+        if path and os.path.isfile(path):
+            disk = QImage(path)
+            if not disk.isNull():
+                return disk   # its own baked colour table = its true colours
+        return None
+
+    def _current_indexed_for(self, sp: str, slot: str,
+                             fallback_pal: List[Color]):
+        """Return the current in-memory Indexed8 QImage for a sprite slot,
+        loading it from disk (as Indexed8) when it hasn't been imported yet."""
+        cached = (self._sprite_imgs.get(sp) or {}).get(slot)
+        if cached is not None and not cached.isNull():
+            return cached
+        path = (self._sprite_paths.get(sp) or {}).get(slot, "")
+        if path and os.path.isfile(path):
+            disk = QImage(path)
+            if not disk.isNull():
+                if disk.format() != QImage.Format.Format_Indexed8:
+                    disk = disk.convertToFormat(QImage.Format.Format_Indexed8)
+                return disk
+        return None
+
+    def _icon_target_slot(self, sp: str) -> int:
+        """Which of the three shared icon palettes this species uses. Respects
+        a live combo edit for the currently-selected species, else the stored
+        gMonIconPaletteIndices value."""
+        if sp == self._current_species:
+            return self._icon_pal_combo.currentIndex()
+        if self._data:
+            try:
+                return int(self._data.get_icon_idx(sp))
+            except Exception:
+                pass
+        return 0
+
+    def _remapped_imported_icon(self, sp: str):
+        """Fit a pending imported icon's raw artwork onto this species' shared
+        icon palette. Returns (indexed_img, palette) or (None, None)."""
+        src = self._icon_import_src.get(sp)
+        if src is None or src.isNull():
+            return None, None
+        pal = list(self._icon_palettes.get(self._icon_target_slot(sp))
+                   or [(0, 0, 0)] * 16)
+        rem = remap_to_palette(src, pal, bg_transparent=True)
+        if rem.format() != QImage.Format.Format_Indexed8:
+            rem = rem.convertToFormat(QImage.Format.Format_Indexed8)
+        return rem, pal
+
+    def _refresh_imported_icon_preview(self, sp: str) -> None:
+        rem, pal = self._remapped_imported_icon(sp)
+        if rem is None:
+            return
+        self._icon_src = QPixmap.fromImage(_rebuild_color_table(rem, pal, 0))
+        self._icon_recoloured = None
+        self._icon_frame = 0
+        self._render_icon_frame()
+
+    def _apply_imported_icon(self, sp: str, path: str, img: QImage) -> None:
+        """Import a menu icon (mini). Icons don't own their palette — every
+        species points at ONE of three SHARED icon palettes
+        (gMonIconPaletteIndices[species]). The raw artwork is kept and fitted
+        onto whichever shared palette this species uses (the 0/1/2 combo),
+        never overwriting that shared palette (other species use it too). The
+        fit re-runs live if the user picks a different palette slot, and again
+        at save — so the on-disk icon.png always matches the slot in effect."""
+        self._icon_import_src[sp] = img.copy()
+        self._icon_png_dirty.add(sp)
+        self._refresh_imported_icon_preview(sp)
+
+        self.modified.emit()
+        slot = self._icon_target_slot(sp)
+        QMessageBox.information(
+            self, "Menu Icon Imported",
+            f"Loaded icon from:\n{os.path.basename(path)}\n\n"
+            f"The icon was fitted to shared icon palette #{slot} (the one this "
+            f"species uses). If the colours look off, pick a different palette "
+            f"number above (it re-fits instantly) or edit that palette's "
+            f"swatches.\n\nClick File → Save to write the icon.png.")
+
     # ────────────────────────────── palette import from indexed PNG ──
     def _import_palette_from_png(self) -> None:
         """Auto-extract palette from an indexed PNG and load it as
@@ -2278,6 +2832,100 @@ class GraphicsTabWidget(QWidget):
         and load the chosen palette as Normal or Shiny."""
         self._do_import_palette_from_png(manual=True)
 
+    @staticmethod
+    def _shiny_map_from(spr_true: QImage, shiny_argb: QImage):
+        """Build a normal-colour → shiny-colour map by pixel correspondence
+        between a NORMAL sprite (its true colours) and a same-size shiny PNG.
+        Returns (map, consistency) where consistency ∈ [0,1] is how cleanly
+        each normal colour maps to a single shiny colour (1.0 = perfect, which
+        is what you get when the shiny PNG is the same drawing recoloured)."""
+        m: Dict[Color, Dict[Color, int]] = {}
+        w, h = spr_true.width(), spr_true.height()
+        for y in range(h):
+            for x in range(w):
+                npx = spr_true.pixel(x, y)
+                if ((npx >> 24) & 0xFF) < 128:
+                    continue   # transparent → background, skip
+                nc = ((npx >> 16) & 0xFF, (npx >> 8) & 0xFF, npx & 0xFF)
+                spx = shiny_argb.pixel(x, y)
+                sc = ((spx >> 16) & 0xFF, (spx >> 8) & 0xFF, spx & 0xFF)
+                d = m.setdefault(nc, {})
+                d[sc] = d.get(sc, 0) + 1
+        total = sum(sum(d.values()) for d in m.values())
+        dom = sum(max(d.values()) for d in m.values())
+        return m, (dom / total if total else 0.0)
+
+    def _try_import_shiny_from_sprite_png(self, path: str) -> bool:
+        """Derive shiny.pal from a shiny sprite PNG by matching it against the
+        current normal front/back sprite. Returns True if it handled the
+        import (shiny-only, no PNG rewrite); False to fall through to plain
+        palette extraction."""
+        sp = self._current_species
+        if not sp:
+            return False
+        sh = QImage(path)
+        if sh.isNull():
+            return False
+        sh = sh.convertToFormat(QImage.Format.Format_ARGB32)
+
+        if sp not in self._palettes:
+            self._load_species_palettes(sp)
+        normal = list((self._palettes.get(sp) or {}).get("normal") or [])
+        if not normal:
+            return False
+        while len(normal) < 16:
+            normal.append((0, 0, 0))
+
+        # Try both normal sprites; keep whichever gives the cleanest colour
+        # correspondence (front-shiny matches front, back-shiny matches back).
+        best = None
+        for slot in ("front", "back"):
+            spr = self._current_indexed_for(sp, slot, normal)
+            if spr is None or spr.isNull():
+                continue
+            if (spr.width(), spr.height()) != (sh.width(), sh.height()):
+                continue
+            spr_true = _rebuild_color_table(spr, normal, 0)
+            m, consistency = self._shiny_map_from(spr_true, sh)
+            if best is None or consistency > best[0]:
+                best = (consistency, slot, m)
+        if best is None:
+            return False   # no same-size normal sprite → not a shiny sprite PNG
+
+        consistency, matched_slot, m = best
+        # Accumulate onto the current shiny palette (so importing the front-shiny
+        # then the back-shiny both contribute their colours). Start from a copy
+        # of normal if there's no shiny yet.
+        shiny = list((self._palettes.get(sp) or {}).get("shiny") or list(normal))
+        while len(shiny) < 16:
+            shiny.append((0, 0, 0))
+        updated = 0
+        for j, nc in enumerate(normal):
+            if nc in m and m[nc]:
+                shiny[j] = clamp_to_gba(*max(m[nc], key=m[nc].get))
+                updated += 1
+
+        self._palettes.setdefault(sp, {"normal": [], "shiny": []})["shiny"] = shiny
+        self._shiny_pal_dirty.add(sp)
+        _get_palette_bus().set_pokemon_palette(sp, "shiny", shiny)
+        self._loading = True
+        try:
+            self._shiny_row.set_colors(shiny)
+        finally:
+            self._loading = False
+        if self._preview_shiny:
+            self._refresh_preview_sprites()
+        self._mark_modified()
+
+        QMessageBox.information(
+            self, "Shiny Palette Imported",
+            f"Derived the shiny palette from:\n{os.path.basename(path)}\n\n"
+            f"Matched it against the {matched_slot} sprite and updated "
+            f"{updated} shiny colour(s). The normal graphics were NOT touched. "
+            f"Import the other view's shiny PNG too to fill any remaining "
+            f"colours.\n\nClick File → Save to write shiny.pal.")
+        return True
+
     def _do_import_palette_from_png(self, manual: bool) -> None:
         if not self._current_species:
             QMessageBox.information(
@@ -2286,24 +2934,28 @@ class GraphicsTabWidget(QWidget):
             )
             return
 
-        # Pick file — default to this species' graphics folder
-        start_dir = ""
-        if self._project_root and self._current_species:
-            slug = species_slug_from_const(self._current_species)
-            candidate = os.path.join(
-                self._project_root, "graphics", "pokemon", slug
-            )
-            if os.path.isdir(candidate):
-                start_dir = candidate
-        if not start_dir:
-            start_dir = self._project_root or ""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select PNG" if manual else "Select Indexed PNG",
-            start_dir,
-            "PNG Images (*.png)",
-        )
+        # Pick file — seeded at the remembered import folder (see
+        # _import_start_dir), falling back to this species' graphics folder.
+        path = self._pick_import_file(
+            "Select PNG" if manual else "Select Indexed PNG",
+            "PNG Images (*.png)")
         if not path:
             return
+
+        # "Import PNG" (auto) + Shiny target + a sprite-sized PNG → derive the
+        # shiny palette by matching the shiny artwork against this species'
+        # NORMAL front/back sprite pixel-for-pixel. This is the convenient way
+        # to import a shiny from a separately-drawn shiny PNG (whose index order
+        # won't match the normal sprite); it writes shiny.pal ONLY.
+        #
+        # "Import PNG Manually" (manual=True) is NEVER auto-routed — the whole
+        # point of that button is to open the manual colour-rearrange picker,
+        # for Normal AND Shiny alike, exactly like every other tab. It just
+        # targets shiny.pal (and never rewrites the normal PNG) when Shiny is
+        # selected.
+        if not manual and self._import_shiny_rb.isChecked():
+            if self._try_import_shiny_from_sprite_png(path):
+                return
 
         remapped_img = None
 
@@ -2358,11 +3010,23 @@ class GraphicsTabWidget(QWidget):
         target_label = "Shiny" if is_shiny else "Normal"
         key = "shiny" if is_shiny else "normal"
 
+        # GBA-clamp the colours ONCE, here, so the .pal write and the front/back
+        # PNG bake use identical values. Without this the .pal file clamps to
+        # 5-bit (e.g. 255 -> 248) while the baked PNG keeps the raw value, and
+        # the two drift apart. (The GBA is 15-bit colour, so this rounding is
+        # unavoidable — but it must be applied consistently.)
+        colors = [clamp_to_gba(*c) for c in colors[:16]]
+        while len(colors) < 16:
+            colors.append((0, 0, 0))
+
         # Update in-memory palette cache
         self._palettes.setdefault(
             self._current_species, {"normal": [], "shiny": []}
         )[key] = colors
-        self._palette_dirty.add(self._current_species)
+        if is_shiny:
+            self._shiny_pal_dirty.add(self._current_species)
+        else:
+            self._normal_pal_dirty.add(self._current_species)
 
         # Update the swatch row display
         self._loading = True
@@ -2374,76 +3038,49 @@ class GraphicsTabWidget(QWidget):
         finally:
             self._loading = False
 
-        # Manual mode: also remap+save the source PNG to front.png so
-        # the species's sprite art reflects the user's import.  Front is
-        # chosen as the default because that's where custom species art
-        # almost always targets — the user can import a separate back
-        # PNG via the same flow if they have one.  Auto mode never
-        # touches the PNG (palette-only — pixel indices preserved).
-        image_saved_to: Optional[str] = None
+        # MANUAL pick = "what I arranged is what gets saved." The picker remaps
+        # the imported PNG to the exact palette layout the user built (and shows
+        # in its preview), so we save BOTH that remapped sprite AND the palette.
+        # They're staged in memory and written TOGETHER on Save (never an
+        # immediate PNG write that could get ahead of the .pal), so the layout
+        # shown in the picker is exactly what lands in-game.
+        #
+        # Shiny stays palette-only even in manual mode — shiny shares the normal
+        # sprite's pixels, so only shiny.pal changes.
+        #
+        # The AUTO "Import PNG" and "Import .pal" buttons never reach this block
+        # (remapped_img is None for them), so they remain palette-only — they
+        # recolour the existing sprite without replacing it.
+        staged_slot = ""
         image_size_warning = ""
-        if manual and remapped_img is not None:
+        if manual and remapped_img is not None and not is_shiny:
             paths = self._sprite_paths.get(self._current_species, {})
             front_path = paths.get("front", "")
             back_path = paths.get("back", "")
-            # Prefer the one that matches the source's dimensions.  This
-            # auto-routes a back-view PNG to back.png if the user has one
-            # of those, while keeping front.png as the default target.
             front_dims = _png_dims(front_path)
             back_dims = _png_dims(back_path)
             src_dims = (remapped_img.width(), remapped_img.height())
-            dest_path = ""
+            slot = "front"
             if front_dims and src_dims == front_dims:
-                dest_path = front_path
+                slot = "front"
             elif back_dims and src_dims == back_dims:
-                dest_path = back_path
-            elif front_path:
-                # Dimensions don't match either — default to front.png
-                # but warn that the on-disk sprite dimensions change.
-                dest_path = front_path
-                if front_dims and src_dims != front_dims:
-                    image_size_warning = (
-                        f"\n\nWarning: the imported image is "
-                        f"{src_dims[0]}×{src_dims[1]} pixels but the "
-                        f"existing front.png is "
-                        f"{front_dims[0]}×{front_dims[1]}.  The on-disk "
-                        f"front.png now has the new dimensions.  Run "
-                        f"Make Modern to rebuild — the build may fail "
-                        f"if the project expects a specific frame size."
-                    )
-            if dest_path:
-                try:
-                    from ui.dialogs.manual_palette_pick_dialog import (
-                        save_remapped_image,
-                    )
-                    if save_remapped_image(
-                            remapped_img, colors, dest_path):
-                        image_saved_to = dest_path
-                    else:
-                        QMessageBox.warning(
-                            self, "Image Save Failed",
-                            f"Palette loaded, but couldn't write the "
-                            f"remapped PNG to:\n{dest_path}",
-                        )
-                except Exception as exc:
-                    QMessageBox.warning(
-                        self, "Image Save Failed",
-                        f"Could not save the remapped image:\n{exc}",
-                    )
-            # If we wrote a new sprite PNG, refresh the species's cached
-            # front/back QPixmap so the preview reflects it immediately.
-            if image_saved_to:
-                try:
-                    self._sprite_paths.setdefault(
-                        self._current_species, {})
-                    if image_saved_to == paths.get("front", ""):
-                        self._front_src = self._load_pix(image_saved_to)
-                        self._preview.set_front_pixmap(self._front_src)
-                    elif image_saved_to == paths.get("back", ""):
-                        self._back_src = self._load_pix(image_saved_to)
-                        self._preview.set_back_pixmap(self._back_src)
-                except Exception:
-                    pass
+                slot = "back"
+            elif front_dims and src_dims != front_dims:
+                image_size_warning = (
+                    f"\n\nNote: the image is {src_dims[0]}×{src_dims[1]} but the "
+                    f"existing front.png is {front_dims[0]}×{front_dims[1]}; "
+                    f"front.png takes the new size on Save.")
+            idx = remapped_img
+            if idx.format() != QImage.Format.Format_Indexed8:
+                idx = idx.convertToFormat(QImage.Format.Format_Indexed8)
+            self._sprite_imgs.setdefault(
+                self._current_species, {})[slot] = idx
+            self._sprite_png_dirty.add(self._current_species)
+            staged_slot = slot
+            if slot == "front":
+                self._front_src_path = front_path
+            else:
+                self._back_src_path = back_path
 
         # Refresh the battle scene preview so the user sees it immediately
         show_shiny = self._preview_shiny
@@ -2457,9 +3094,9 @@ class GraphicsTabWidget(QWidget):
             if manual else min(len(ct), 16)
         )
         image_msg = (
-            f"\nImage written to: "
-            f"{os.path.basename(image_saved_to)}"
-            if image_saved_to else ""
+            f"\nThe {staged_slot} sprite was updated to match — it and the "
+            f".pal are written together on Save."
+            if staged_slot else ""
         )
         QMessageBox.information(
             self, "Palette Imported",
@@ -2471,7 +3108,7 @@ class GraphicsTabWidget(QWidget):
             "The palette's order was preserved as-is. If the transparent\n"
             "slot is in the wrong position, drag the correct colour onto\n"
             "slot 0 in the palette row.\n\n"
-            "Click File → Save to write the .pal file to disk."
+            "Click File → Save to write everything to disk."
             f"{image_size_warning}",
         )
 
@@ -2484,22 +3121,11 @@ class GraphicsTabWidget(QWidget):
             )
             return
 
-        # Default to this species' graphics folder
-        start_dir = ""
-        if self._project_root and self._current_species:
-            slug = species_slug_from_const(self._current_species)
-            candidate = os.path.join(
-                self._project_root, "graphics", "pokemon", slug
-            )
-            if os.path.isdir(candidate):
-                start_dir = candidate
-        if not start_dir:
-            start_dir = self._project_root or ""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select JASC .pal File",
-            start_dir,
-            "JASC Palette Files (*.pal);;All Files (*)",
-        )
+        # Seeded at the remembered import folder (shared with every other
+        # import dialog on this tab), falling back to the species folder.
+        path = self._pick_import_file(
+            "Select JASC .pal File",
+            "JASC Palette Files (*.pal);;All Files (*)")
         if not path:
             return
 
@@ -2526,7 +3152,10 @@ class GraphicsTabWidget(QWidget):
         self._palettes.setdefault(
             self._current_species, {"normal": [], "shiny": []}
         )[key] = colors
-        self._palette_dirty.add(self._current_species)
+        if is_shiny:
+            self._shiny_pal_dirty.add(self._current_species)
+        else:
+            self._normal_pal_dirty.add(self._current_species)
 
         # Update the swatch row display
         self._loading = True
@@ -2558,9 +3187,12 @@ class GraphicsTabWidget(QWidget):
     def has_unsaved_changes(self) -> bool:
         return bool(
             (self._data and self._data.has_pending_changes())
-            or self._palette_dirty
+            or self._normal_pal_dirty
+            or self._shiny_pal_dirty
             or self._icon_pal_dirty
             or self._sprite_png_dirty
+            or self._icon_png_dirty
+            or self._footprint_png_dirty
         )
 
     def flush_to_disk(self) -> tuple[int, list[str]]:
@@ -2572,7 +3204,7 @@ class GraphicsTabWidget(QWidget):
         The ONLY path on this tab that rewrites PNG pixel data is the
         right-click "Index as Background" operation, which populates
         ``_sprite_png_dirty``.  Species listed there also have entries in
-        ``_palette_dirty`` (both pals were lockstep-swapped), so the .pal
+        ``_normal_pal_dirty`` (both pals were lockstep-swapped), so the .pal
         writes below stay in sync with the pixel remap.
         """
         total_ok = 0
@@ -2587,7 +3219,24 @@ class GraphicsTabWidget(QWidget):
         # colours instead of stale ones from the original PNG. (Front and
         # back are indexed PNGs sharing the normal palette by convention.)
         if self._project_root:
-            for sp in list(self._palette_dirty):
+            # SHINY-only changes: write shiny.pal and NOTHING else. The normal
+            # front/back PNGs are never touched — that's the whole point of
+            # importing a shiny palette without disturbing the normal graphics.
+            for sp in list(self._shiny_pal_dirty):
+                if sp in self._normal_pal_dirty:
+                    continue  # handled below (writes both pals)
+                _, spath = species_pal_paths(self._project_root, sp)
+                shiny_colors = (self._palettes.get(sp) or {}).get("shiny")
+                if shiny_colors and write_jasc_pal(spath, shiny_colors):
+                    total_ok += 1
+                else:
+                    all_errors.append(f"pal-shiny:{sp}")
+            self._shiny_pal_dirty.clear()
+
+            # NORMAL palette changes: write normal.pal (+ shiny.pal if it also
+            # changed) AND re-bake the front/back PNGs so their baked colour
+            # table matches the new normal.pal.
+            for sp in list(self._normal_pal_dirty):
                 npath, spath = species_pal_paths(self._project_root, sp)
                 pal = self._palettes.get(sp, {})
                 normal_colors = pal.get("normal")
@@ -2642,7 +3291,7 @@ class GraphicsTabWidget(QWidget):
                 # table, the disk PNG matches our in-memory state, so
                 # we can drop the flag preemptively.
                 self._sprite_png_dirty.discard(sp)
-            self._palette_dirty.clear()
+            self._normal_pal_dirty.clear()
             # Icon palettes
             for idx in list(self._icon_pal_dirty):
                 path = icon_palette_pal_path(self._project_root, idx)
@@ -2672,4 +3321,38 @@ class GraphicsTabWidget(QWidget):
                     else:
                         all_errors.append(f"sprite-png-{key}:{sp}")
             self._sprite_png_dirty.clear()
+
+            # Imported menu icons — fit the raw artwork onto the shared icon
+            # palette this species uses (respecting any slot change), bake that
+            # shared palette into icon.png (index 0 transparent) so the on-disk
+            # PNG matches what the game will render.
+            for sp in list(self._icon_png_dirty):
+                path = (self._sprite_paths.get(sp, {}) or {}).get("icon", "")
+                rem, pal = self._remapped_imported_icon(sp)
+                if rem is None or not path:
+                    continue
+                if export_indexed_png(rem, pal, path, transparent_index=0):
+                    total_ok += 1
+                    self._icon_import_src.pop(sp, None)
+                else:
+                    all_errors.append(f"icon-png:{sp}")
+            self._icon_png_dirty.clear()
+
+            # Imported footprints — 2-colour indexed PNG (white bg = index 0,
+            # black mark = index 1). No transparent slot (footprints are opaque
+            # black/white and build to 1bpp).
+            for sp in list(self._footprint_png_dirty):
+                img = (self._sprite_imgs.get(sp, {}) or {}).get("footprint")
+                path = (self._sprite_paths.get(sp, {}) or {}).get(
+                    "footprint", "")
+                if img is None or not path:
+                    continue
+                if img.format() != QImage.Format.Format_Indexed8:
+                    img = img.convertToFormat(QImage.Format.Format_Indexed8)
+                if export_indexed_png(img, [(255, 255, 255), (0, 0, 0)], path,
+                                      transparent_index=-1):
+                    total_ok += 1
+                else:
+                    all_errors.append(f"footprint-png:{sp}")
+            self._footprint_png_dirty.clear()
         return total_ok, all_errors

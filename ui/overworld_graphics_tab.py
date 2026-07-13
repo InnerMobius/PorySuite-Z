@@ -5108,7 +5108,28 @@ class OverworldGraphicsTab(QWidget):
         if new_fw is None or new_fh is None:
             return
         if new_fw == cur_fw and new_fh == cur_fh:
-            return  # no resize needed — clean no-op
+            # Frame SIZE unchanged — but the frame COUNT may have changed (e.g.
+            # a vanilla "standing" NPC whose stock table only references a few
+            # face frames and REPEATS them, reused for a many-frame walker). The
+            # size-change path below (replace_sprite_sheet) never fires here, so
+            # without this the stale table survived and the NPC moved WITHOUT
+            # animating. Normalize the frame table to the sheet's real frame
+            # count so it always matches. Idempotent — a clean table is a no-op.
+            # DO-NOT-REGRESS: this must run on the same-size / different-count
+            # path; that's the exact case that broke (kakrito / OLD_MAN_2).
+            try:
+                from core.overworld_sprite_creator import normalize_pic_table
+                okn, _an, _er = normalize_pic_table(
+                    self._project_root, info_name)
+                if okn:
+                    self.load(self._project_root)
+                    ne = self._all_sprites.get(gfx_const)
+                    if ne is not None:
+                        self._current_sprite = ne
+                        self._show_sprite_detail(ne)
+            except Exception:
+                pass
+            return
 
         # Geometry differs from the sprite's current frame size.  Run
         # the metadata-only sync (the PNG was already saved by the

@@ -13,6 +13,20 @@ from typing import List, Tuple, Callable, Optional
 from eventide.backend.file_utils import replace_in_file, replace_repo_wide
 
 
+def _folder_to_map_id(folder: str) -> str:
+    """Convert a map FOLDER name to its MAP_ constant the way mapjson does:
+    insert an underscore at every CamelCase boundary, then upper-case.
+
+    ``PalletTown_PlayersHouse_1F`` -> ``MAP_PALLET_TOWN_PLAYERS_HOUSE_1F``.
+    NOTE the plain ``MAP_{folder.upper()}`` form is WRONG for multi-word
+    folders — it drops the boundary underscores (``MAP_PALLETTOWN_PLAYERSHOUSE_1F``),
+    a constant that exists nowhere, so a rename using it never replaces the real
+    constant and silently breaks heal_locations.json / warps after the rename.
+    """
+    snake = re.sub(r'(?<=[a-z])(?=[A-Z])', '_', folder)
+    return 'MAP_' + snake.upper()
+
+
 class MapRenamer:
     def __init__(self, root_dir: str):
         self.root_dir = root_dir
@@ -20,6 +34,9 @@ class MapRenamer:
         self.maps_dir = os.path.join(root_dir, 'data', 'maps')
         self.layouts_dir = os.path.join(root_dir, 'data', 'layouts')
         self.groups = self.load_map_groups()
+        # Warnings from the most recent rename_map() about heal locations that
+        # still point at a now-missing map (empty when all is well).
+        self.last_stale_heal_locations: List[str] = []
 
     def load_map_groups(self) -> dict:
         if not os.path.exists(self.map_groups_json):
@@ -92,8 +109,13 @@ class MapRenamer:
                    callback: Optional[Callable[[str], None]] = None):
         new_group = new_group or group
         new_folder = new_folder or map_folder
-        old_id = f"MAP_{map_folder.upper()}"
-        new_id = new_id or old_id
+        # OLD constant: read the actual `id` from the current map.json (the only
+        # 100%-accurate source). Only if that's missing do we derive it from the
+        # folder name — using the CamelCase-aware helper, NOT MAP_{folder.upper()}
+        # which drops the boundary underscores and leaves the real constant
+        # un-replaced (that's what silently breaks heal_locations.json).
+        old_id = self._read_map_id(map_folder) or _folder_to_map_id(map_folder)
+        new_id = new_id or _folder_to_map_id(new_folder)
         # map.json 'name' is always kept in sync with the folder name.
         # External tools (Porymap, mapjson) rely on this convention.
 
@@ -133,6 +155,45 @@ class MapRenamer:
             repls.append((group, new_group))
         replace_repo_wide(self.root_dir, repls, callback)
         self._generate_headers()
+
+        # heal_locations.json references maps by MAP_ constant. replace_repo_wide
+        # above already swapped old_id -> new_id inside it, but flag anything
+        # that STILL points at a map the project no longer defines so the caller
+        # can warn the user instead of letting the build fail later.
+        self.last_stale_heal_locations = self._stale_heal_locations()
+
+    def _read_map_id(self, map_folder: str) -> Optional[str]:
+        """Return the MAP_ constant recorded in a map's map.json, or None."""
+        p = os.path.join(self.maps_dir, map_folder, 'map.json')
+        try:
+            with open(p, encoding='utf-8') as f:
+                mid = json.load(f).get('id')
+            return mid or None
+        except Exception:
+            return None
+
+    def _stale_heal_locations(self) -> List[str]:
+        """Return human-readable warnings for heal locations that reference a
+        map constant the project no longer defines (post-rename safety net)."""
+        try:
+            from eventide.backend import heal_locations as hl
+            from eventide.backend.constants_manager import ConstantsManager
+        except Exception:
+            return []
+        try:
+            # Read the FRESH constants from the header we just regenerated,
+            # not the class attribute cached when the project was opened.
+            valid = set(ConstantsManager._from_header(
+                self.root_dir, 'include/constants/map_groups.h', 'MAP_') or [])
+        except Exception:
+            valid = set()
+        if not valid:
+            return []
+        warnings: List[str] = []
+        for lid, issues in hl.validate(
+                self.root_dir, hl.load(self.root_dir), valid).items():
+            warnings.append(f"{lid}: {'; '.join(issues)}")
+        return warnings
 
     def move_map(self, group: str, map_folder: str, new_group: str):
         if group == new_group:

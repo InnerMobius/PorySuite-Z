@@ -1048,6 +1048,28 @@ class TileAnimEditorWidget(QWidget):
 
         pal_layout.addLayout(pal_btns)
 
+        pal_btns2 = QHBoxLayout()
+        pal_btns2.setSpacing(4)
+        btn_use_frame_pal = QPushButton("Use Frame's Palette")
+        btn_use_frame_pal.setToolTip(
+            "Show the frames using the palette baked into the PNG itself —\n"
+            "its own colours, index-for-index (1-to-1). Use this when the\n"
+            "frame is already indexed to the right colours (e.g. imported from\n"
+            "AdvanceMap) so it displays exactly as drawn instead of being\n"
+            "re-coloured by a tileset slot.")
+        btn_use_frame_pal.clicked.connect(self._use_frame_palette)
+        pal_btns2.addWidget(btn_use_frame_pal)
+
+        btn_from_tileset = QPushButton("From Tileset…")
+        btn_from_tileset.setToolTip(
+            "Pull a palette from any tileset and slot (the primary — e.g.\n"
+            "General — or any secondary). For a secondary tileset, slots 0–6\n"
+            "come from its paired primary, matching what the game loads.")
+        btn_from_tileset.clicked.connect(self._load_palette_from_tileset)
+        pal_btns2.addWidget(btn_from_tileset)
+        pal_btns2.addStretch(1)
+        pal_layout.addLayout(pal_btns2)
+
         # Bake the CURRENT palette into the frame image files on disk. The app
         # renders the live/edited palette, but each frame PNG keeps whatever
         # palette was last baked in — so an external editor (GIMP) shows the OLD
@@ -1975,6 +1997,119 @@ class TileAnimEditorWidget(QWidget):
         # Re-render frames with new palette
         self._rerender_frames_with_palette()
         self._refresh_display()
+
+    def _apply_display_palette(self, colors: List[Color]) -> None:
+        """Set the working palette and re-render the previews WITHOUT writing to
+        disk. Shared by the 'Use Frame's Palette' / 'From Tileset' loaders."""
+        colors = (list(colors) + [(0, 0, 0)] * 16)[:16]
+        self._palette_colors = colors
+        self._loading = True
+        self._pal_row.set_colors(colors)
+        self._loading = False
+        self._rerender_frames_with_palette()
+        self._refresh_display()
+
+    def _use_frame_palette(self) -> None:
+        """Display the frames using the palette embedded in the frame PNG itself
+        (index-for-index), so an already-correctly-indexed frame shows exactly
+        as drawn instead of being re-coloured by a tileset slot."""
+        if not self._current_anim:
+            return
+        img = None
+        if self._frame_images:
+            seq = 0
+            try:
+                seq = self._preview.current_frame()
+            except Exception:
+                seq = 0
+            order = self._current_anim.frame_order or [0]
+            fi = order[seq] if 0 <= seq < len(order) else 0
+            if 0 <= fi < len(self._frame_images):
+                img = self._frame_images[fi]
+        if img is None or img.isNull() \
+                or img.format() != QImage.Format.Format_Indexed8:
+            QMessageBox.information(
+                self, "Use Frame's Palette",
+                "This frame isn't an indexed image, so it has no embedded "
+                "palette to read.")
+            return
+        ct = img.colorTable()
+        colors: List[Color] = [
+            clamp_to_gba((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+            for c in ct[:16]]
+        self._apply_display_palette(colors)
+
+    def _load_palette_from_tileset(self) -> None:
+        """Pull a palette from a chosen tileset + slot into this animation."""
+        if not self._current_anim or not self._project_dir:
+            return
+        tilesets = getattr(self, "_all_tilesets", []) or []
+        if not tilesets:
+            QMessageBox.information(self, "From Tileset",
+                                    "No tilesets found in this project.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Load Palette from Tileset")
+        form = QFormLayout(dlg)
+        intro = QLabel(
+            "Pull a palette from any tileset's slot. For a secondary tileset, "
+            "slots 0–6 come from its paired primary (e.g. General) — the same "
+            "as the game loads.")
+        intro.setWordWrap(True)
+        form.addRow(intro)
+
+        ts_combo = _NoScrollCombo()
+        for ts in tilesets:
+            kind = "secondary" if ts.get("is_secondary") else "primary"
+            ts_combo.addItem(f"{ts.get('name', '?')}  ({kind})", ts)
+        # Default to the current animation's tileset if we can find it.
+        cur_ts_name = (self._current_anim.tileset_name or "").replace("_", "").lower()
+        for i in range(ts_combo.count()):
+            t = ts_combo.itemData(i)
+            if (t.get("dir_name", "").replace("_", "").lower() == cur_ts_name):
+                ts_combo.setCurrentIndex(i)
+                break
+        form.addRow("Tileset:", ts_combo)
+
+        slot_spin = _NoScrollSpin()
+        slot_spin.setRange(0, 15)
+        form.addRow("Palette slot:", slot_spin)
+
+        preview = PaletteSwatchRow(16)
+        form.addRow("Preview:", preview)
+
+        def _refresh_preview():
+            ts = ts_combo.currentData()
+            if not ts:
+                return
+            ttype = "secondary" if ts.get("is_secondary") else "primary"
+            pals = load_tileset_palettes(
+                self._project_dir, ts.get("dir_name", ""), ttype)
+            s = slot_spin.value()
+            if 0 <= s < len(pals):
+                preview.set_colors(pals[s])
+        ts_combo.currentIndexChanged.connect(lambda _i: _refresh_preview())
+        slot_spin.valueChanged.connect(lambda _v: _refresh_preview())
+        _refresh_preview()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        ts = ts_combo.currentData()
+        ttype = "secondary" if ts.get("is_secondary") else "primary"
+        pals = load_tileset_palettes(
+            self._project_dir, ts.get("dir_name", ""), ttype)
+        s = slot_spin.value()
+        if s < 0 or s >= len(pals):
+            return
+        self._apply_display_palette(list(pals[s]))
 
     def _on_palette_changed(self):
         """User edited a palette swatch -- apply to all frame PNGs."""

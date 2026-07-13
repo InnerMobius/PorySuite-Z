@@ -1077,6 +1077,135 @@ def _scan_pic_png_path(root: str, pic_symbol: str) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Normalize a sprite's frame table to its real on-disk frame count
+# ════════════════════════════════════════════════════════════════════════════
+
+def normalize_pic_table(root: str, info_name: str) -> Tuple[bool, List[str], List[str]]:
+    """Rewrite ``sPicTable_<info_name>[]`` to sequential frames 0..N-1 of the
+    sprite's OWN pic symbol, where N is the real frame count of its ``.4bpp`` on
+    disk (file size / bytes-per-frame from the graphics info's frame size).
+
+    WHY THIS EXISTS (do not remove): a frame table can be left in a stale layout
+    after an image is REPLACED without the table being rebuilt — the classic
+    case is a vanilla "standing" NPC whose vanilla table only references a few
+    face frames and REPEATS them (e.g. OLD_MAN_2 was ``0,1,2,0,0,1,1,2,2,<a
+    foreign OldWoman frame>``). Reused as a walking NPC, its 10-frame sheet is on
+    disk but every "walk" slot still points at a standing frame, so it slides
+    around with NO animation. Rebuilding to ``0..9`` of its own symbol fixes it.
+    The generic image-import path (``import_image_manually_from_path``) swaps the
+    image but never touches the table, so overworld import/replace callers MUST
+    call this afterward — see ui/overworld_graphics_tab.py.
+
+    Idempotent: a table already ``0..N-1`` of its own symbol is left unchanged.
+    Returns ``(success, applied, errors)``.
+    """
+    applied: List[str] = []
+    errors: List[str] = []
+
+    gi_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics_info.h")
+    if not os.path.isfile(gi_path):
+        return False, applied, [f"missing {gi_path}"]
+    gi_text = _read_file(gi_path)
+    info_symbol = f"gObjectEventGraphicsInfo_{info_name}"
+    m = re.search(
+        r"const\s+struct\s+ObjectEventGraphicsInfo\s+"
+        + re.escape(info_symbol) + r"\s*=\s*\{(?P<body>[^;]*?)\};",
+        gi_text, re.DOTALL)
+    if not m:
+        return False, applied, [f"{info_symbol} not found"]
+    body = m.group("body")
+
+    def _grab(field: str):
+        mm = re.search(r"\." + field + r"\s*=\s*([^,\n]+),", body)
+        return mm.group(1).strip() if mm else None
+
+    try:
+        w = int(_grab("width"))
+        h = int(_grab("height"))
+    except (TypeError, ValueError):
+        return False, applied, [f"{info_symbol}: can't read width/height"]
+    tile_w, tile_h = w // 8, h // 8
+    bytes_per_frame = (w * h) // 2
+    if bytes_per_frame <= 0:
+        return False, applied, [f"{info_symbol}: bad frame size {w}x{h}"]
+
+    pic_table_name = _grab("images")
+    if not pic_table_name:
+        return False, applied, [f"{info_symbol} has no .images"]
+    # Always use the sprite's OWN pic symbol (never learn it from the possibly
+    # broken existing entries — that's how the foreign OldWoman frame crept in).
+    pic_symbol = f"gObjectEventPic_{info_name}"
+
+    # Frame count from the sprite image on disk. Prefer the PNG (what the tool
+    # writes at import time, BEFORE the build regenerates the .4bpp) so wiring
+    # this into the import path is reliable; fall back to the built .4bpp.
+    g_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_graphics.h")
+    if not os.path.isfile(g_path):
+        return False, applied, [f"missing {g_path}"]
+    g_text = _read_file(g_path)
+    incm = re.search(
+        re.escape(pic_symbol) + r"\[\]\s*=\s*INCBIN_U16\(\"([^\"]+)\"\)", g_text)
+    if not incm:
+        return False, applied, [f"{pic_symbol} INCBIN not found"]
+    rel_4bpp = incm.group(1)
+    fourbpp = os.path.join(root, rel_4bpp.replace("/", os.sep))
+    png = os.path.join(root, (rel_4bpp[:-5] + ".png").replace("/", os.sep))
+
+    num_frames = None
+    if os.path.isfile(png):
+        try:
+            with open(png, "rb") as fh:
+                head = fh.read(24)
+            # PNG IHDR: 8-byte sig + 4 len + "IHDR" + 4 width + 4 height (BE).
+            if head[:8] == b"\x89PNG\r\n\x1a\n" and head[12:16] == b"IHDR":
+                pw = int.from_bytes(head[16:20], "big")
+                ph = int.from_bytes(head[20:24], "big")
+                if pw % w == 0 and ph % h == 0:
+                    num_frames = (pw // w) * (ph // h)
+        except OSError:
+            pass
+    if num_frames is None and os.path.isfile(fourbpp):
+        size = os.path.getsize(fourbpp)
+        if size % bytes_per_frame == 0:
+            num_frames = size // bytes_per_frame
+    if not num_frames or num_frames < 1:
+        return False, applied, [
+            f"{pic_symbol}: could not determine frame count from PNG/.4bpp"]
+
+    pt_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_pic_tables.h")
+    if not os.path.isfile(pt_path):
+        return False, applied, [f"missing {pt_path}"]
+    pt_text = _read_file(pt_path)
+    pat = re.compile(
+        r"(static\s+const\s+struct\s+SpriteFrameImage\s+"
+        + re.escape(pic_table_name) + r"\s*\[\]\s*=\s*\{)(?P<body>[^}]*?)(\};)",
+        re.DOTALL)
+    ptm = pat.search(pt_text)
+    if not ptm:
+        return False, applied, [f"{pic_table_name} not found"]
+
+    desired = [
+        f"    overworld_frame({pic_symbol}, {tile_w}, {tile_h}, {i}),"
+        for i in range(num_frames)]
+    new_block = ptm.group(1) + "\n" + "\n".join(desired) + "\n" + ptm.group(3)
+    if re.sub(r"\s+", "", ptm.group(0)) == re.sub(r"\s+", "", new_block):
+        return True, [f"{pic_table_name} already normalized "
+                      f"({num_frames} frames)"], errors
+    pt_text = pt_text[:ptm.start()] + new_block + pt_text[ptm.end():]
+    try:
+        _write_file(pt_path, pt_text)
+    except Exception as e:
+        return False, applied, [f"pic table write: {e}"]
+    applied.append(
+        f"Normalized {pic_table_name} -> frames 0..{num_frames - 1} "
+        f"of {pic_symbol} ({num_frames} frames)")
+    return True, applied, errors
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # Delete an overworld sprite from a project
 # ════════════════════════════════════════════════════════════════════════════
 
