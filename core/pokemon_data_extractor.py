@@ -1379,6 +1379,9 @@ class PokemonConstantsExtractor(PokemonDataExtractor):
         path = os.path.join(
             self.local_util.repo_root(), "src", "data", self.DATA_FILE
         )
+        header = os.path.join(
+            self.local_util.repo_root(), "include", "constants", "pokemon.h"
+        )
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f) or {}
@@ -1386,7 +1389,14 @@ class PokemonConstantsExtractor(PokemonDataExtractor):
                 key not in data
                 for key in ("types", "evolution_types", "egg_groups", "growth_rates")
             )
-            return missing_keys
+            if missing_keys:
+                return True
+            # DYNAMIC: rebuild whenever the source header (which defines every TYPE_*/EVO_*/EGG_GROUP_*/GROWTH_*)
+            # is newer than the cached constants.json. Without this, a project that ADDS a type (e.g. TYPE_FAIRY)
+            # keeps showing the stale cached list forever, because all four keys are still "present".
+            if os.path.isfile(header) and os.path.getmtime(header) > os.path.getmtime(path):
+                return True
+            return False
         except (FileNotFoundError, json.JSONDecodeError):
             return True
 
