@@ -5,7 +5,7 @@ Full three-column layout:
   LEFT    : Front sprite, back sprite, icon, footprint thumbnails
   CENTER  : Battle scene preview (BattleBG + sprites + shadow + textbox)
             Spinboxes: Player Y (back y_offset), Enemy Y (front y_offset),
-            Enemy Altitude (gEnemyMonElevation), Show Shadow checkbox.
+            Enemy Altitude (gEnemyMonElevation; >0 also shows the shadow).
   RIGHT   : Normal palette (16 clickable swatches)
             Shiny palette  (16 clickable swatches)
             Icon palette selector (0/1/2 dropdown) + three editable rows.
@@ -385,7 +385,6 @@ class BattleScenePreview(QWidget):
         self._front_y_off = 0   # enemy y_offset
         self._back_y_off = 0    # player y_offset
         self._enemy_elevation = 0
-        self._show_shadow = True
 
         # Per-mon transform (pixel offset + scale) for battle-anim mon-tasks
         # (shake / sway / squeeze).  Identity by default — the Pokemon
@@ -531,10 +530,6 @@ class BattleScenePreview(QWidget):
 
     def set_enemy_elevation(self, e: int) -> None:
         self._enemy_elevation = int(e)
-        self.update()
-
-    def set_show_shadow(self, show: bool) -> None:
-        self._show_shadow = bool(show)
         self.update()
 
     def _art_bottom_row(self, pix: Optional[QPixmap]) -> int:
@@ -1180,8 +1175,9 @@ class BattleScenePreview(QWidget):
         # Shadow is created at (enemy_x, enemy_y + 29) per pokefirered
         # (src/battle_gfx_sfx_util.c :: LoadAndCreateEnemyShadowSprites).
         # It's a FIXED position — independent of the sprite frame. The game
-        # only shows it when gEnemyMonElevation[species] != 0.
-        shadow_visible = (self._show_shadow and self._enemy_elevation > 0
+        # shows it exactly when gEnemyMonElevation[species] != 0, so the preview
+        # mirrors that: shadow iff the Enemy Altitude is above 0.
+        shadow_visible = (self._enemy_elevation > 0
                           and self._shadow and not self._shadow.isNull())
         if shadow_visible:
             sw = self._shadow.width()
@@ -1428,6 +1424,11 @@ class GraphicsTabWidget(QWidget):
         # Per-species palette cache (normal + shiny)
         # { species: {'normal': [16 tuples], 'shiny': [16 tuples]} }
         self._palettes: Dict[str, Dict[str, List[Color]]] = {}
+        # Which folder each cached palette was loaded from. A base and its
+        # forms share one cache key (the base const) but live in different
+        # folders; when the folder changes we must reload so a form shows ITS
+        # OWN palette instead of the base's stale cached one.
+        self._pal_folder: Dict[str, str] = {}
         # Palette dirtiness is tracked per-channel so a SHINY-only change never
         # rewrites the normal front/back PNGs (importing a shiny palette must
         # leave the normal graphics untouched). Normal changes write normal.pal
@@ -1568,16 +1569,11 @@ class GraphicsTabWidget(QWidget):
         self._enemy_alt = QSpinBox()
         self._enemy_alt.setRange(0, 255)
         self._enemy_alt.setToolTip(
-            "Enemy altitude — how many pixels the sprite floats above\n"
-            "the platform. Zero for most species, nonzero for flying/hovering.\n"
-            "(gEnemyMonElevation[SPECIES])"
-        )
-
-        self._show_shadow_cb = QCheckBox("Show Shadow")
-        self._show_shadow_cb.setChecked(True)
-        self._show_shadow_cb.setToolTip(
-            "Preview-only toggle — the actual ROM behaviour is controlled\n"
-            "by the front pic coords / battle engine, not a per-species flag."
+            "Enemy altitude — how many pixels the sprite floats above the\n"
+            "platform, AND whether it casts a battle shadow: any value above 0\n"
+            "shows the shadow; 0 = grounded with no shadow. This matches the\n"
+            "game exactly (the engine shows the shadow when the elevation is\n"
+            "nonzero).  (gEnemyMonElevation[SPECIES])"
         )
 
         self._shiny_preview_cb = QCheckBox("Preview Shiny")
@@ -1593,8 +1589,7 @@ class GraphicsTabWidget(QWidget):
         pos_row.addWidget(self._enemy_y, 0, 3)
         pos_row.addWidget(QLabel("Enemy Altitude:"), 1, 0)
         pos_row.addWidget(self._enemy_alt, 1, 1)
-        pos_row.addWidget(self._show_shadow_cb, 1, 2)
-        pos_row.addWidget(self._shiny_preview_cb, 1, 3)
+        pos_row.addWidget(self._shiny_preview_cb, 1, 2, 1, 2)
 
         pg_layout.addLayout(pos_row)
         center.addWidget(preview_group)
@@ -1748,7 +1743,6 @@ class GraphicsTabWidget(QWidget):
         self._player_y.valueChanged.connect(self._on_player_y)
         self._enemy_y.valueChanged.connect(self._on_enemy_y)
         self._enemy_alt.valueChanged.connect(self._on_enemy_alt)
-        self._show_shadow_cb.toggled.connect(self._preview.set_show_shadow)
         self._shiny_preview_cb.toggled.connect(self._on_shiny_preview_toggled)
 
         self._normal_row.colors_changed.connect(self._on_normal_changed)
@@ -1829,6 +1823,7 @@ class GraphicsTabWidget(QWidget):
             self._icon_palettes[i] = cols
         self._icon_pal_dirty.clear()
         self._palettes.clear()
+        self._pal_folder.clear()
         self._normal_pal_dirty.clear()
         self._shiny_pal_dirty.clear()
         # Drop any pending imported graphics from a previously-open project.
@@ -2025,15 +2020,37 @@ class GraphicsTabWidget(QWidget):
         _fill_thumb(self._front_thumb[1], front_pix)
         _fill_thumb(self._back_thumb[1], back_pix)
 
+    def _pal_paths_for(self, species: str) -> tuple[str, str]:
+        """(normal.pal, shiny.pal) for a LOADED species.
+
+        The palette always lives next to the sprite, so derive it from the
+        loaded front-sprite folder. For a FORM (which is keyed under its base
+        const but has its own graphics folder) this correctly returns the
+        FORM's folder — NOT the base's. Only when no sprite path is known do we
+        fall back to the base-const-derived path.
+        """
+        front = (self._sprite_paths.get(species) or {}).get("front", "")
+        if front:
+            d = os.path.dirname(front)
+            return (os.path.join(d, "normal.pal"),
+                    os.path.join(d, "shiny.pal"))
+        return species_pal_paths(self._project_root, species)
+
     def _load_species_palettes(self, species: str) -> None:
         if not self._project_root:
             return
-        if species not in self._palettes:
-            npath, spath = species_pal_paths(self._project_root, species)
+        npath, spath = self._pal_paths_for(species)
+        folder = os.path.dirname(npath)
+        # Reload when the palette folder changes (switching between a base and
+        # one of its forms — both keyed by the base const but in different
+        # folders) so a form shows ITS OWN palette, not the base's cached one.
+        if (species not in self._palettes
+                or self._pal_folder.get(species) != folder):
             self._palettes[species] = {
                 "normal": read_jasc_pal(npath) or [(0, 0, 0)] * 16,
                 "shiny": read_jasc_pal(spath) or [(0, 0, 0)] * 16,
             }
+            self._pal_folder[species] = folder
         pal = self._palettes[species]
         self._normal_row.set_colors(pal["normal"])
         self._shiny_row.set_colors(pal["shiny"])
@@ -3225,7 +3242,7 @@ class GraphicsTabWidget(QWidget):
             for sp in list(self._shiny_pal_dirty):
                 if sp in self._normal_pal_dirty:
                     continue  # handled below (writes both pals)
-                _, spath = species_pal_paths(self._project_root, sp)
+                _, spath = self._pal_paths_for(sp)
                 shiny_colors = (self._palettes.get(sp) or {}).get("shiny")
                 if shiny_colors and write_jasc_pal(spath, shiny_colors):
                     total_ok += 1
@@ -3237,7 +3254,7 @@ class GraphicsTabWidget(QWidget):
             # changed) AND re-bake the front/back PNGs so their baked colour
             # table matches the new normal.pal.
             for sp in list(self._normal_pal_dirty):
-                npath, spath = species_pal_paths(self._project_root, sp)
+                npath, spath = self._pal_paths_for(sp)
                 pal = self._palettes.get(sp, {})
                 normal_colors = pal.get("normal")
                 if normal_colors and write_jasc_pal(npath, normal_colors):

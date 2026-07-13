@@ -39,7 +39,53 @@ TYPE_COLORS: dict[str, str] = {
     "TYPE_GRASS":    "#2E7D32", "TYPE_ELECTRIC": "#F9A825",
     "TYPE_PSYCHIC":  "#C2185B", "TYPE_ICE":      "#00838F",
     "TYPE_DRAGON":   "#1A237E", "TYPE_DARK":     "#37474F",
+    "TYPE_FAIRY":    "#E48FC4",
 }
+
+# Fallback badge color for any project-defined type without an explicit entry above.
+TYPE_COLOR_FALLBACK = "#607D8B"
+
+
+def set_types_from_source(types: dict) -> None:
+    """Repopulate the type name-pools IN PLACE from a project's real TYPE_* constants.
+
+    ``types`` is the dict returned by ``source_data.get_constant("types")`` --
+    ``{ "TYPE_X": {"name": ..., "value": int}, ... }``. Called on project load so PorySuite
+    stays DYNAMIC: any custom type a project defines (e.g. TYPE_FAIRY) appears automatically in
+    every type dropdown, and the Gen-3 physical/special split follows each type's numeric value
+    relative to TYPE_MYSTERY -- no hardcoded 18-type assumption. Mutates the module-level pools in
+    place so modules that imported them (moves tab, ability templates) see the update.
+    """
+    if not types:
+        return
+    # Drop the TYPE_NONE sentinel (value 255) -- it is not a selectable mon/move type.
+    usable = {c: info for c, info in types.items()
+              if c != "TYPE_NONE" and info.get("value", 255) < 200}
+    ordered = sorted(usable, key=lambda c: usable[c].get("value", 0))
+    TYPE_CHOICES[:] = ordered
+
+    mystery = types.get("TYPE_MYSTERY", {}).get("value")
+    PHYSICAL_TYPES.clear()
+    SPECIAL_TYPES.clear()
+    if mystery is not None:
+        for const, info in usable.items():
+            val = info.get("value")
+            if val is None or val == mystery:
+                continue
+            (PHYSICAL_TYPES if val < mystery else SPECIAL_TYPES).add(const)
+
+    for const in ordered:
+        TYPE_COLORS.setdefault(const, TYPE_COLOR_FALLBACK)
+
+    # The ability-effect editor keeps its own (display, const) type list -- repopulate it in place too so custom
+    # types show up there as well. (??? / TYPE_MYSTERY is not a meaningful ability-effect type, so skip it there.)
+    try:
+        from core import ability_effect_templates as _aet
+        _aet.TYPE_CHOICES[:] = [
+            (usable[c].get("name", c), c) for c in ordered if c != "TYPE_MYSTERY"
+        ]
+    except Exception:
+        pass
 
 
 # ── Move targets ──────────────────────────────────────────────────────────────

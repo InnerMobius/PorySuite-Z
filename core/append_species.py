@@ -703,12 +703,27 @@ def delete_form(project_root, form_const):
     short = form_const[len("SPECIES_"):]
     changed = {}
 
-    # remember the graphics symbol this form pointed at (to decide art cleanup)
-    gfx_sym = None
-    mm = re.search(rf"SPECIES_SPRITE\({short},\s*gMonFrontPic_(\w+)\)",
-                   _read(pf("src", "data", "pokemon_graphics", "front_pic_table.h")))
-    if mm:
-        gfx_sym = mm.group(1)
+    # Capture EVERY graphics symbol this form references, per kind, BEFORE the
+    # table rows are removed below — so orphaned own-art can be dropped after.
+    # A form may own some art and share the rest (own image + shared palette,
+    # own palette + shared image, own icon, any mix); keying cleanup off the
+    # front-pic symbol alone (the old behaviour) missed own-palette-only forms
+    # and left dangling INCBINs pointing at a deleted folder → broken build.
+    _cap_full = set()
+    for _rel, _pat in (
+        ("front_pic_table.h", rf"SPECIES_SPRITE\({short},\s*(gMonFrontPic_\w+)\)"),
+        ("back_pic_table.h",  rf"SPECIES_SPRITE\({short},\s*(gMonBackPic_\w+)\)"),
+        ("palette_table.h",   rf"SPECIES_PAL\({short},\s*(gMonPalette_\w+)\)"),
+        ("shiny_palette_table.h",
+         rf"SPECIES_SHINY_PAL\({short},\s*(gMonShinyPalette_\w+)\)"),
+    ):
+        _m = re.search(_pat, _read(pf("src", "data", "pokemon_graphics", _rel)))
+        if _m:
+            _cap_full.add(_m.group(1))
+    _mi = re.search(rf"\[{re.escape(form_const)}\]\s*=\s*(gMonIcon_\w+)",
+                    _read(pf("src", "pokemon_icon.c")))
+    if _mi:
+        _cap_full.add(_mi.group(1))
 
     # locate the owning base + form table
     fst = pf("src", "data", "pokemon", "form_species_tables.h")
@@ -804,45 +819,50 @@ def delete_form(project_root, form_const):
     if _set_num_total_species(pf("include", "constants", "species.h")):
         changed["species.h:num_total"] = True
 
-    # 7. if the form had its OWN art and nothing else references that symbol now,
-    #    drop the INCBINs (pokemon.h) + externs (graphics.h). Share-graphics forms
-    #    point at the base's symbol, which stays referenced → skipped.
-    if gfx_sym:
-        refs = sum(_read(pf("src", "data", "pokemon_graphics", r)).count(f"_{gfx_sym})")
-                   for r in ("front_pic_table.h", "back_pic_table.h",
-                             "palette_table.h", "shiny_palette_table.h"))
-        if refs == 0:
-            syms = (f"gMonFrontPic_{gfx_sym}", f"gMonBackPic_{gfx_sym}",
-                    f"gMonPalette_{gfx_sym}", f"gMonShinyPalette_{gfx_sym}",
-                    f"gMonIcon_{gfx_sym}")
-            for rel in ("src/data/graphics/pokemon.h", "include/graphics.h"):
-                p = pf(*rel.split("/")); t = _read(p); nt = t
-                for s in syms:
-                    nt = re.sub(r"[^\n]*\b" + re.escape(s) + r"\b[^\n]*\n", "", nt)
-                if nt != t:
-                    _write(p, nt); changed[rel] = True
+    # 7. Drop each own-art symbol the form referenced that is now unreferenced by
+    #    ANY graphics/icon table — i.e. the form owned it and no base or other
+    #    form shares it. Checked PER-SYMBOL so an own-palette-only form still gets
+    #    its palette INCBIN removed even though it shared the base's image; symbols
+    #    still shared with the base stay referenced and are left untouched.
+    _tbl_blob = "".join(
+        _read(pf(*r.split("/"))) for r in (
+            "src/data/pokemon_graphics/front_pic_table.h",
+            "src/data/pokemon_graphics/back_pic_table.h",
+            "src/data/pokemon_graphics/palette_table.h",
+            "src/data/pokemon_graphics/shiny_palette_table.h",
+            "src/pokemon_icon.c",
+        ))
+    orphans = [s for s in _cap_full
+               if not re.search(r"\b" + re.escape(s) + r"\b", _tbl_blob)]
+    if orphans:
+        # externs (graphics.h) + INCBINs (pokemon.h)
+        for rel in ("src/data/graphics/pokemon.h", "include/graphics.h"):
+            p = pf(*rel.split("/")); t = _read(p); nt = t
+            for s in orphans:
+                nt = re.sub(r"[^\n]*\b" + re.escape(s) + r"\b[^\n]*\n", "", nt)
+            if nt != t:
+                _write(p, nt); changed[rel] = True
 
-            # 8. species_graphics.json manifest — drop the same own-art symbols so
-            #    the (gitignored) image map never keeps orphan entries pointing at
-            #    a deleted form's folder (the gap that left stale DeoxysAttack/
-            #    DeoxysDefense keys behind earlier).
-            sgj = pf("src", "data", "species_graphics.json")
-            if os.path.isfile(sgj):
-                try:
-                    import json as _json
-                    with open(sgj, "r", encoding="utf-8") as f:
-                        sg = _json.load(f)
-                    removed = [k for k in syms if k in sg]
-                    for k in removed:
-                        del sg[k]
-                    if removed:
-                        with open(sgj, "w", encoding="utf-8", newline="\n") as f:
-                            _json.dump(sg, f, indent=2, ensure_ascii=False)
-                            f.write("\n")
-                        changed["species_graphics.json"] = True
-                except Exception:
-                    logging.getLogger(__name__).exception(
-                        "delete_form: species_graphics.json cleanup failed")
+        # 8. species_graphics.json manifest — drop the same orphaned symbols so the
+        #    (gitignored) image map never keeps entries pointing at a deleted form's
+        #    folder (the gap that left stale DeoxysAttack/DeoxysDefense keys before).
+        sgj = pf("src", "data", "species_graphics.json")
+        if os.path.isfile(sgj):
+            try:
+                import json as _json
+                with open(sgj, "r", encoding="utf-8") as f:
+                    sg = _json.load(f)
+                removed = [k for k in orphans if k in sg]
+                for k in removed:
+                    del sg[k]
+                if removed:
+                    with open(sgj, "w", encoding="utf-8", newline="\n") as f:
+                        _json.dump(sg, f, indent=2, ensure_ascii=False)
+                        f.write("\n")
+                    changed["species_graphics.json"] = True
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "delete_form: species_graphics.json cleanup failed")
 
     return changed
 

@@ -10,6 +10,69 @@ from local_env import LocalUtil
 PreviewEntry = Tuple[str, int, str, str]
 
 
+# ── Map / region-map protection for SPECIES renames ────────────────────────────
+# A MON rename must never rewrite MAP, MAPSEC, or region-map identifiers, nor
+# in-game PLACE names — those are not species data, and touching them breaks the
+# build (e.g. a Diglett→Acheman rename turning `sMapsecName_DIGLETT_S_CAVE` into
+# an undeclared `sMapsecName_ACHEMAN_S_CAVE`) or mangles the region map / signs.
+# This is the same class of exemption as the dodrio_berry_picking minigame folder
+# and the intro cutscene assets: things that merely share a species' name but are
+# NOT that species.
+#
+# Two mechanisms work together:
+#   1. Path exclusion — the region-map name data and region_map.c (100% place
+#      data, zero species symbols) are skipped entirely by the token sweep.
+#   2. Context guard — anywhere else, a token is left untouched when it is part
+#      of a map/region symbol (preceded by one of these prefixes) or is an
+#      all-caps place-name possessive (`DIGLETT'S CAVE`).
+_MAP_SYMBOL_PREFIX_RE = re.compile(
+    r'(?:sMapsecName_|MAPSEC_|MAP_|gMapPopup\w*|AreaName_|AreaDesc_)$')
+
+# Files/dirs (repo-relative, forward slash, lowercase) the SPECIES token sweep
+# must never rewrite — pure map/region-map content.
+_MAP_EXCLUDED_PREFIXES = ("src/data/region_map/",)
+_MAP_EXCLUDED_FILES = ("src/region_map.c",)
+
+# App-managed JSON caches under src/data/. These get precise, structured rename
+# handling elsewhere in apply_pending (or ARE the rename mapping itself), so the
+# broad token sweep must skip them — sweeping species.json etc. would fight the
+# dedicated handler, and sweeping rename_history.json would rewrite the very
+# old→new pairs that record what changed. Every OTHER src/data/*.json (a game
+# jsonproc source such as wild_encounters.json, which references species by
+# constant and compiles to a .h) IS swept, so its species refs stay valid.
+_SWEEP_SKIP_JSON = frozenset({
+    "src/data/species.json", "src/data/moves.json", "src/data/pokedex.json",
+    "src/data/evolutions.json", "src/data/starters.json",
+    "src/data/species_graphics.json", "src/data/abilities.json",
+    "src/data/trainers.json", "src/data/items.json",
+    "src/data/rename_history.json",
+})
+
+
+def _is_map_excluded_path(rel_path: str) -> bool:
+    r = rel_path.replace("\\", "/").lower()
+    return (r in _MAP_EXCLUDED_FILES
+            or any(r.startswith(p) for p in _MAP_EXCLUDED_PREFIXES))
+
+
+def _is_sweep_excluded_path(rel_path: str) -> bool:
+    """True if the token sweep must skip this file: map/region-map content, or
+    an app-managed JSON cache that has its own dedicated rename handling."""
+    r = rel_path.replace("\\", "/").lower()
+    return _is_map_excluded_path(r) or r in _SWEEP_SKIP_JSON
+
+
+def _guarded_token_sub(match, line: str, mapping: dict) -> str:
+    """Replacement callback that leaves map/region-map identifiers and all-caps
+    place-name possessives untouched, so a species rename can't corrupt them."""
+    tok = match.group(0)
+    if _MAP_SYMBOL_PREFIX_RE.search(line[:match.start()]):
+        return tok                       # part of a MAP_/MAPSEC_/sMapsecName_ symbol
+    if line[match.end():match.end() + 1] == "'":
+        return tok                       # place-name possessive, e.g. DIGLETT'S CAVE
+    return mapping[tok]
+
+
 class RefactorService:
     """Utility for renaming constants across a FireRed project."""
 
@@ -208,10 +271,14 @@ class RefactorService:
         newly-written substring can never be re-matched by a later token in the
         SAME sweep.  That is the exact property needed to kill the cascade.
 
-        Word-boundary matching is NOT applied here — the existing substring
-        semantics are preserved for compatibility with identifiers that embed
-        the base name (e.g. ``gMonFrontPic_Octo``).  The fix is strictly about
-        stopping self-cascade, not about tightening which matches occur.
+        A TRAILING identifier boundary ``(?![A-Za-z0-9_])`` is applied so a
+        token can never match the PREFIX of a longer identifier: renaming
+        ``PARAS`` must NOT touch ``PARASECT`` (which is how ``SPECIES_PARASECT``
+        became the corrupt ``SPECIES_GREATFAIRYECT`` when PARAS→GREATFAIRY ran).
+        No LEADING boundary is used, so names embedded at the END of a longer
+        identifier still match (``gMonFrontPic_Paras`` → the ``Paras`` suffix is
+        replaced) — that is the substring behaviour callers rely on. The
+        boundary only blocks the prefix-cascade, nothing else.
         """
         # Deduplicate identity and empty pairs; preserve first occurrence.
         seen: set = set()
@@ -226,12 +293,22 @@ class RefactorService:
         # Longest old-key first so longer patterns win over shorter prefixes.
         clean.sort(key=lambda p: len(p[0]), reverse=True)
         mapping = {a: b for a, b in clean}
-        combined = re.compile("|".join(re.escape(a) for a, _ in clean))
+        # Boundaries so a base name can't match inside a LONGER word:
+        #   trailing (?![A-Za-z0-9_]) — PARAS can't match the front of PARASECT,
+        #       and dodrio can't match the front of dodrio_berry_picking.
+        #   leading  (?<![A-Za-z0-9]) — ABRA can't match the END of KADABRA
+        #       (that's how renaming ABRA→GORIYA corrupted KADABRA→KADGORIYA).
+        # The leading boundary allows a preceding underscore (so `_BULBASAUR` in
+        # a trainer const and `gMonFrontPic_Paras` still rename), but NOT a
+        # preceding letter/digit (KADABRA, where ABRA continues the same word).
+        combined = re.compile(
+            "(?<![A-Za-z0-9])(?:" + "|".join(re.escape(a) for a, _ in clean)
+            + ")(?![A-Za-z0-9_])")
 
         root = self.util.repo_root()
         preview: List[PreviewEntry] = []
         scan_spec = [
-            ("src",     {".c", ".h"}),
+            ("src",     {".c", ".h", ".json"}),
             ("include", {".c", ".h"}),
             ("data",    {".inc", ".s", ".json", ".pory"}),
             ("sound",   {".inc", ".s"}),
@@ -252,6 +329,9 @@ class RefactorService:
                     if not any(name.endswith(ext) for ext in exts):
                         continue
                     file_path = os.path.join(dirpath, name)
+                    # Never rewrite map / region-map name data with a MON rename.
+                    if _is_sweep_excluded_path(os.path.relpath(file_path, root)):
+                        continue
                     try:
                         with open(file_path, "r", encoding="utf-8", errors="surrogateescape") as f:
                             lines = f.readlines()
@@ -262,7 +342,8 @@ class RefactorService:
                     for idx, ln in enumerate(lines):
                         if not combined.search(ln):
                             continue
-                        new_ln = combined.sub(lambda m: mapping[m.group(0)], ln)
+                        new_ln = combined.sub(
+                            lambda m, _ln=ln: _guarded_token_sub(m, _ln, mapping), ln)
                         if new_ln != ln:
                             preview.append((os.path.relpath(file_path, root), idx + 1, ln.rstrip(), new_ln.rstrip()))
                             new_lines[idx] = new_ln
@@ -288,7 +369,7 @@ class RefactorService:
         # Walk C/header files under src/ and include/, plus assembler/script
         # includes under data/ (maps, event scripts, etc.)
         scan_spec = [
-            ("src",     {".c", ".h"}),
+            ("src",     {".c", ".h", ".json"}),
             ("include", {".c", ".h"}),
             # .json covers data/maps/**/map.json hidden-item / event-item entries
             # (separate from src/data/*.json which are handled by _rename_in_json)
@@ -316,6 +397,9 @@ class RefactorService:
                     if not any(name.endswith(ext) for ext in exts):
                         continue
                     file_path = os.path.join(dirpath, name)
+                    # Never rewrite map / region-map name data with a MON rename.
+                    if _is_sweep_excluded_path(os.path.relpath(file_path, root)):
+                        continue
                     if preview_only:
                         try:
                             with open(file_path, "r", encoding="utf-8", errors="surrogateescape") as f:
@@ -331,6 +415,65 @@ class RefactorService:
                     if _app is not None and _file_count % 50 == 0:
                         _app.processEvents()
         return preview
+
+    def _force_species_display_name(self, const: str, display: str) -> None:
+        """Force a species' human-readable name to exactly *display* in both
+        the game source (species_names.h) and the app cache (species.json),
+        overriding anything the token sweep may have capped. Idempotent."""
+        root = self.util.repo_root()
+        # 1) src/data/text/species_names.h  — gSpeciesNames string
+        names_path = os.path.join(root, "src", "data", "text", "species_names.h")
+        if os.path.isfile(names_path):
+            try:
+                with open(names_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                pat = re.compile(
+                    rf'(\[{re.escape(const)}\]\s*=\s*_\()".*?"(\))')
+                changed = False
+                for i, ln in enumerate(lines):
+                    if pat.search(ln):
+                        new_ln = pat.sub(rf'\1"{display}"\2', ln)
+                        if new_ln != ln:
+                            lines[i] = new_ln
+                            changed = True
+                if changed:
+                    with open(names_path, "w", encoding="utf-8", newline="\n") as f:
+                        f.writelines(lines)
+                    self._changed_files.add(os.path.relpath(names_path, root))
+            except OSError:
+                logging.exception("Could not force name in %s", names_path)
+        # 2) src/data/species.json — name + speciesName (+ forms)
+        sp_json = os.path.join(root, "src", "data", "species.json")
+        if os.path.isfile(sp_json):
+            try:
+                with open(sp_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                touched = False
+                entry = data.get(const)
+                if isinstance(entry, dict):
+                    entry["name"] = display
+                    si = entry.get("species_info")
+                    if isinstance(si, dict):
+                        si["speciesName"] = display
+                    touched = True
+                # A form's name also lives inside its PARENT's "forms" dict —
+                # fix it there too so the form shows its own display name.
+                for parent in data.values():
+                    if not isinstance(parent, dict):
+                        continue
+                    forms = parent.get("forms")
+                    if (isinstance(forms, dict) and const in forms
+                            and isinstance(forms[const], dict)):
+                        forms[const]["name"] = display
+                        fsi = forms[const].get("species_info")
+                        if isinstance(fsi, dict):
+                            fsi["speciesName"] = display
+                        touched = True
+                if touched:
+                    with open(sp_json, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(data, f, indent=2)
+            except Exception:
+                logging.exception("Could not force name in %s", sp_json)
 
     def _rename_in_json(self, path: str, old: str, new: str, display: str | None = None) -> None:
         """Rename a key in a JSON mapping and update display fields when present.
@@ -942,6 +1085,15 @@ class RefactorService:
                 # was finding OCTO inside the just-written OCTOROCK.
                 self._multi_search_and_replace(tokens, preview_only=False)
 
+                # Re-assert the human-readable display name LAST. The
+                # (old_base.upper() -> new_base.upper()) token above is needed
+                # for bare-base references (trainer constants etc.) but it also
+                # rewrites the NAME STRING _("SEEL") -> _("PIKIT"), capping it.
+                # Force the name back to the exact display the user typed so it
+                # is never left ALL-CAPS. Single source of truth for the name.
+                if display:
+                    self._force_species_display_name(new, display)
+
                 # names file covered by plan
 
                 # 2b) src/data/trainers.json — _search_and_replace only walks
@@ -997,11 +1149,23 @@ class RefactorService:
                         # Skip graphics/pokemon/ — already renamed as a folder above
                         if (_dirpath + os.sep).startswith(_pokemon_gfx):
                             continue
-                        # Rename files containing old_slug
+                        # Rename files whose name uses old_slug as a WHOLE
+                        # segment — NOT as the prefix of a longer name. The
+                        # trailing (?![a-z0-9_]) means "dodrio.png" and
+                        # "cry_dodrio.aif" rename, but "dodrio_berry_picking"
+                        # (a separate minigame that merely starts with the
+                        # species slug) is left completely alone. Renaming that
+                        # folder broke the build (gbagfx couldn't find
+                        # graphics/dodrio_berry_picking/berries.png).
+                        # Leading (?<![a-z0-9]) protects a slug that is the END of
+                        # a longer name (kadabra must not match via its "abra"
+                        # tail); trailing (?![a-z0-9_]) protects the FRONT
+                        # (dodrio_berry_picking). Underscore is allowed on the
+                        # leading side so cry_<slug> still renames.
+                        _slug_re = re.compile(
+                            rf'(?<![a-z0-9]){re.escape(old_slug)}(?![a-z0-9_])')
                         for _fname in _filenames:
-                            if old_slug not in _fname:
-                                continue
-                            _new_fname = _fname.replace(old_slug, new_slug)
+                            _new_fname = _slug_re.sub(new_slug, _fname)
                             if _new_fname == _fname:
                                 continue
                             _old_fp = os.path.join(_dirpath, _fname)
@@ -1013,10 +1177,13 @@ class RefactorService:
                                     self._logger(f"Renamed {_r} -> {_new_fname}")
                             except OSError:
                                 logging.exception("Asset file rename failed: %s -> %s", _old_fp, _new_fp)
-                        # Rename the directory itself if its name contains old_slug
+                        # Rename the directory itself only if old_slug is a
+                        # whole segment of its name (same boundary rule as the
+                        # files above — a folder that merely starts with the
+                        # slug, like dodrio_berry_picking, is NOT touched).
                         _dname = os.path.basename(_dirpath)
-                        if old_slug in _dname:
-                            _new_dname = _dname.replace(old_slug, new_slug)
+                        _new_dname = _slug_re.sub(new_slug, _dname)
+                        if _new_dname != _dname:
                             _new_dirpath = os.path.join(os.path.dirname(_dirpath), _new_dname)
                             try:
                                 os.rename(_dirpath, _new_dirpath)

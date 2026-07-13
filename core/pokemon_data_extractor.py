@@ -1399,14 +1399,15 @@ class PokemonConstantsExtractor(PokemonDataExtractor):
             self.local_util.repo_root(), "include", "constants", "pokemon.h"
         )
         data = _load_json(path) or {}
-        if data.get("types") and data.get("evolution_types"):
-            print(f"Loaded {len(data['types'])} types [OK]")
-            print(
-                f"Loaded {len(data['evolution_types'])} evolution types [OK]"
-            )
-            return data
+        # DYNAMIC types: ALWAYS re-parse from include/constants/pokemon.h when it exists, so a project's custom
+        # types (e.g. TYPE_FAIRY) are picked up automatically instead of being frozen in a stale cached types block
+        # in constants.json. The old short-circuit returned the cached JSON whenever it already had a types block,
+        # which meant new types were never seen. Only fall back to the cache when the source header is missing.
         if not os.path.isfile(header):
-            print(f"Missing header: {os.path.abspath(header)}")
+            if data.get("types"):
+                print(f"Loaded {len(data['types'])} types [OK] (cached; header missing)")
+            else:
+                print(f"Missing header: {os.path.abspath(header)}")
             return data
 
         print(f"Reading {os.path.abspath(header)}")

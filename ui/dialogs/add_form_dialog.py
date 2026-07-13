@@ -15,10 +15,17 @@ from PyQt6.QtWidgets import (
 from ui.custom_widgets.scroll_guard import install_scroll_guard
 
 # (label, (own_image, own_palette))
+# Order matters: the FIRST entry is the default, and it must be the fully
+# independent "own image + own palette" mode — that is what "give the form its
+# own graphics" means. The other two REUSE the base's image (they render a frame
+# of the base's sheet), which on a normal single-frame mon makes the form look
+# identical to the base ("duping"); they're only useful for a base whose sheet
+# actually stacks multiple frames (e.g. vanilla Deoxys).
 _GFX_MODES = [
-    ("Frame of the base's sheet, base colours", (False, False)),
-    ("Frame of the base's sheet, its OWN palette", (False, True)),
-    ("Its own image + its own palette", (True, True)),
+    ("Its own image + its own palette  (separate, editable — recommended)",
+     (True, True)),
+    ("Its own palette, but REUSES the base's image", (False, True)),
+    ("REUSES the base's image and palette", (False, False)),
 ]
 # (label, FORM_CHANGE_* constant); "" = no automatic trigger.
 # FORM_CHANGE_ITEM_USE is intentionally omitted: it has no in-game dispatch hook yet
@@ -71,7 +78,7 @@ class AddFormDialog(QDialog):
         self._gfx = QComboBox()
         for label, _ in _GFX_MODES:
             self._gfx.addItem(label)
-        self._gfx.setCurrentIndex(1)
+        self._gfx.setCurrentIndex(0)   # default: its own image + own palette
         install_scroll_guard(self._gfx)
         self._name_lbl = QLabel("Name:")
         self._gfx_lbl = QLabel("Graphics:")

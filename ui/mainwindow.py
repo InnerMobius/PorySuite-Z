@@ -3723,6 +3723,15 @@ QTabBar::tab:hover:!selected {
                 d.show()
             return
 
+        # Keep PorySuite's type name-pools DYNAMIC: repopulate them from THIS project's actual TYPE_* constants,
+        # so a project's custom types (e.g. TYPE_FAIRY) appear in every type dropdown and the physical/special split
+        # follows the real type values -- no hardcoded 18-type assumption anywhere.
+        try:
+            from ui import constants as _ui_constants
+            _ui_constants.set_types_from_source(self.source_data.get_constant("types") or {})
+        except Exception as e:
+            self.log(f"set_types_from_source failed: {e}")
+
         # Save selected plugin back to project.json
         project_file = os.path.join(self.project_info["dir"], "project.json")
         try:
@@ -3834,8 +3843,19 @@ QTabBar::tab:hover:!selected {
         pokemon_data = self.source_data.get_pokemon_data()
         valid_species = []
         skipped = []
+        # Fallback map: species -> its position in the national dex. A species
+        # whose cached dex_num is stale/None (e.g. after a rename desync) must
+        # NOT silently vanish from the list — if it's in the national dex, use
+        # that position instead of dropping it.
+        _natpos = {}
+        for _i, _e in enumerate(self.source_data.get_national_dex() or []):
+            _s = _e.get("species") if isinstance(_e, dict) else _e
+            if _s and _s not in _natpos:
+                _natpos[_s] = _i + 1
         for sp in pokemon_data.keys():
             dex = self.source_data.get_species_data(sp, "dex_num")
+            if not isinstance(dex, int):
+                dex = _natpos.get(sp)
             if isinstance(dex, int):
                 valid_species.append((sp, dex))
             else:

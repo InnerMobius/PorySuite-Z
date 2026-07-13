@@ -3194,6 +3194,26 @@ class PokemonDataManager(pokemon_data.PokemonDataManager):
             logging.debug("Final image path for %s: %s", log_name, ap)
             return ap
 
+        _key_to_file = {
+            "frontPic": "front.png",
+            "backPic": "back.png",
+            "iconSprite": "icon.png",
+            "footprint": "footprint.png",
+        }
+        # A form created with "its own image" has its OWN graphics folder
+        # (graphics/pokemon/<base>_<suffix>/). That folder MUST win — never the
+        # base's — otherwise selecting the form would show, and editing it would
+        # overwrite, the base's art. Only forms that share the base's sheet lack
+        # this folder, and they fall through to the base-symbol logic below.
+        if form and key in _key_to_file:
+            _fslug = (form[len("SPECIES_"):]
+                      if form.startswith("SPECIES_") else form).lower()
+            _own = os.path.join(self.project_info["dir"], "graphics",
+                                "pokemon", _fslug, _key_to_file[key])
+            _ok = _readable(_own, f"{_fslug}/{_key_to_file[key]}")
+            if _ok:
+                return _ok
+
         image_name = self.get_species_info(species, key, form)
         sg = self.data.get("species_graphics")
 
