@@ -52,6 +52,16 @@ class App:
         except Exception:
             log_path = None
         self.app = QApplication(sys.argv)
+        # Make Ctrl-C in a terminal actually quit the app. Qt's C++ event loop
+        # never returns to Python to run a KeyboardInterrupt handler, so without
+        # this a Ctrl-C just lands in whatever timer slot happened to be running,
+        # gets logged, and the app keeps going. SIG_DFL restores the OS default
+        # (immediate terminate) — the expected behaviour when run from a terminal.
+        try:
+            import signal
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        except (ValueError, OSError, AttributeError):
+            pass  # e.g. not running on the main thread
         self.app.setApplicationName("PorySuite-Z")
         self.app.setApplicationDisplayName("PorySuite-Z")
         # Apply the saved appearance theme (Light / Dark / Automatic). Default

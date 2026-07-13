@@ -27,6 +27,11 @@ from PyQt6.QtWidgets import (
 from porymap_bridge.porymap_launcher import porymap_exe_path, porymap_source_path, _exe_sha256
 
 
+# CREATE_NO_WINDOW is a Windows-only subprocess flag (suppresses the flashing
+# console window). It does not exist on Linux/macOS, so resolve it safely — 0 is
+# a valid no-op for creationflags on those platforms.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 PORYMAP_REPO_URL = "https://github.com/huderlem/porymap.git"
 
 # Qt SDK + MinGW toolchain versions (must match each other)
@@ -95,7 +100,7 @@ class InstallWorker(QThread):
         # CREATE_NO_WINDOW prevents flashing black console windows
         result = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
-            env=env, creationflags=subprocess.CREATE_NO_WINDOW,
+            env=env, creationflags=_NO_WINDOW,
         )
         if result.returncode != 0:
             err = result.stderr.strip() or result.stdout.strip()
@@ -110,7 +115,7 @@ class InstallWorker(QThread):
         self.progress.emit(f"  Running: {' '.join(cmd[:4])}...")
         proc = subprocess.Popen(
             cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, env=env, creationflags=subprocess.CREATE_NO_WINDOW,
+            text=True, env=env, creationflags=_NO_WINDOW,
         )
         file_count = 0
         last_update = time.time()

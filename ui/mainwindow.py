@@ -3444,8 +3444,9 @@ QTabBar::tab:hover:!selected {
                 # with no args.  We just need the OS to successfully load the
                 # binary — any return code is fine, OSError means it can't run.
                 import subprocess as _sp
+                # CREATE_NO_WINDOW (0x08000000) is Windows-only; 0 on other OSes.
                 _sp.run([exe], capture_output=True, timeout=5,
-                        creationflags=0x08000000)  # CREATE_NO_WINDOW
+                        creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
                 return True
             except (OSError, _sp.TimeoutExpired):
                 return False

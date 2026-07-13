@@ -166,6 +166,12 @@ def init_logging() -> str:
 
     # Exception hooks
     def _excepthook(exc_type, exc, tb):
+        # Ctrl-C / KeyboardInterrupt is a user-requested quit, not a crash — hand
+        # it to the default hook so the process exits instead of logging it as a
+        # CRITICAL error and letting the Qt event loop carry on (issue #1).
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
         logging.critical("Uncaught exception:")
         logging.critical("".join(traceback.format_exception(exc_type, exc, tb)).rstrip())
     sys.excepthook = _excepthook

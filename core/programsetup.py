@@ -6,6 +6,12 @@ import subprocess
 import threading
 import webbrowser
 
+# CREATE_NO_WINDOW is a Windows-only subprocess flag (hides the console window).
+# It doesn't exist on Linux/macOS, so resolve it safely — 0 is a valid no-op for
+# creationflags there. Accessing _NO_WINDOW directly raises
+# AttributeError on non-Windows and crashed the Porymap install (issue #1).
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 from PyQt6.QtCore import pyqtSignal, Qt, QProcess, QProcessEnvironment, QThread, QObject
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -202,7 +208,7 @@ def _wsl_devkitpro_path() -> str:
                 [exe, "test", "-f",
                  "/opt/devkitpro/devkitARM/bin/arm-none-eabi-ld"],
                 capture_output=True, timeout=8,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=_NO_WINDOW,
             )
             if r.returncode == 0:
                 return "/opt/devkitpro"
@@ -225,7 +231,7 @@ def _wsl_devkitpro_installed() -> bool:
             [exe, "test", "-f",
              "/opt/devkitpro/devkitARM/bin/arm-none-eabi-ld"],
             capture_output=True, timeout=8,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=_NO_WINDOW,
         )
         return r.returncode == 0
     except Exception:
@@ -740,7 +746,7 @@ def _devkitarm_works() -> bool:
     prev = _suppress_win_error_dialogs()
     try:
         r = subprocess.run([gcc, "--version"], capture_output=True, timeout=8,
-                           creationflags=subprocess.CREATE_NO_WINDOW)
+                           creationflags=_NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False
@@ -760,7 +766,7 @@ def _wsl_available() -> bool:
         return False
     try:
         r = subprocess.run([exe, "true"], capture_output=True, timeout=8,
-            creationflags=subprocess.CREATE_NO_WINDOW)
+            creationflags=_NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False
@@ -772,7 +778,7 @@ def _wsl_has(tool: str) -> bool:
         return False
     try:
         r = subprocess.run([exe, "which", tool], capture_output=True, timeout=8,
-            creationflags=subprocess.CREATE_NO_WINDOW)
+            creationflags=_NO_WINDOW)
         return r.returncode == 0
     except Exception:
         return False
@@ -787,7 +793,7 @@ def _wsl_has_lib(package: str) -> bool:
         r = subprocess.run(
             [exe, "dpkg", "-l", package],
             capture_output=True, timeout=8,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=_NO_WINDOW,
         )
         return r.returncode == 0 and b"ii  " + package.encode() in r.stdout
     except Exception:
