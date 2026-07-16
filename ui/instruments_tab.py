@@ -1572,10 +1572,31 @@ class InstrumentsTab(QWidget):
                 _os.utime(wav_dest, (bin_mt + 1, bin_mt + 1))
             except OSError:
                 pass
+            # Verify the loop actually landed in the tracked source. The loop
+            # must NEVER end up only in the gitignored .bin again (that lost it
+            # on every other machine). Read the .wav back and confirm.
+            if loop_on:
+                with open(wav_dest, "rb") as _wf:
+                    if b"smpl" not in _wf.read():
+                        raise RuntimeError(
+                            "loop missing from .wav after write — the tracked "
+                            "source would not carry it")
         except Exception as exc:
-            logging.getLogger("SoundEditor.Instruments").warning(
-                "Loop saved to .bin but source .wav update failed for %s: %s",
+            logging.getLogger("SoundEditor.Instruments").error(
+                "Loop written to .bin but NOT the tracked source .wav for %s: "
+                "%s — the loop will be lost on other machines.",
                 getattr(sample, "label", "?"), exc)
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self, "Sample loop not saved to source",
+                    f"The loop for '{getattr(sample, 'label', 'this sample')}' "
+                    f"was written to its .bin but could NOT be written to its "
+                    f".wav source ({exc}).\n\nThe .bin is not tracked by git, so "
+                    f"this loop would be lost on other machines. Fix the .wav "
+                    f"(check it isn't read-only/locked) and re-toggle the loop.")
+            except Exception:
+                pass
 
     def _update_loop_ui(self, sample, loop_on: bool, loop_bytes: int):
         """Sync all loop-related UI widgets after a change."""
