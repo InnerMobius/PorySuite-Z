@@ -69,6 +69,45 @@ def _add_separator(toolbar: QToolBar):
     toolbar.addWidget(sep)
 
 
+def _ensure_song_s_tracked(project_dir: str) -> bool:
+    """Make sure song .s files are NOT gitignored.
+
+    In a PorySuite project the ``sound/songs/midi/*.s`` files are the source of
+    truth (hand-edited in the Sound Editor / Piano Roll; the .mid is often just a
+    placeholder or a lossy re-export). A stock pokefirered .gitignore ignores
+    them as build artifacts — but that meant a pull on another machine had no .s
+    and rebuilt a broken/short-note song from the .mid. This comments out that
+    one ignore rule so the .s can be committed. Idempotent; returns True only if
+    the .gitignore was actually changed.
+    """
+    gi = os.path.join(project_dir, ".gitignore")
+    if not os.path.isfile(gi):
+        return False
+    try:
+        with open(gi, "r", encoding="utf-8", errors="surrogateescape") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+    changed = False
+    out = []
+    for ln in lines:
+        if ln.strip() == "sound/songs/midi/*.s":
+            out.append("# song .s files are the source of truth in PorySuite — "
+                       "tracked, not ignored (un-ignored automatically):\n")
+            out.append("# " + ln if not ln.lstrip().startswith("#") else ln)
+            changed = True
+        else:
+            out.append(ln)
+    if changed:
+        try:
+            with open(gi, "w", encoding="utf-8", errors="surrogateescape",
+                      newline="\n") as f:
+                f.writelines(out)
+        except OSError:
+            return False
+    return changed
+
+
 class UnifiedMainWindow(QMainWindow):
     """Single window containing all PorySuite + EVENTide editors."""
 
@@ -1561,70 +1600,61 @@ class UnifiedMainWindow(QMainWindow):
             except Exception as exc:
                 self.log_message(f"Pre-build integrity sweep failed: {exc}")
 
-            # Step 2: SELECTIVELY touch .s files.
-            #
-            # The Make rule `%.s: %.mid midi.cfg` re-runs mid2agb whenever
-            # .mid or midi.cfg is newer than .s.  The original protection
-            # touched EVERY .s file to NOW, defeating the rule across the
-            # board — including for songs where the .mid is real content
-            # that the user explicitly wants regenerated (e.g. they just
-            # copied a vanilla .mid in to replace a corrupted song).
-            #
-            # Correct semantics:
-            #   - If .mid is a placeholder (< 30 bytes), the .s is the
-            #     source of truth — hand-composed via piano roll or
-            #     imported from .s.  Touch the .s to prevent mid2agb from
-            #     wiping it on a stale-midi.cfg-mtime build.
-            #   - If .mid is real content (>= 30 bytes), the .mid is the
-            #     source of truth — let mid2agb regenerate the .s normally
-            #     so the user's .mid edits / replacements take effect.
-            try:
-                from core.sound.song_integrity import _PLACEHOLDER_MAX_BYTES
-            except ImportError:
-                _PLACEHOLDER_MAX_BYTES = 30
+            # Step 1b: make sure the song .s files are TRACKABLE (not ignored).
+            # A stock decomp .gitignore ignores `sound/songs/midi/*.s`, but in a
+            # PorySuite project the .s is the source of truth — ignoring it meant
+            # a pull on another machine had no .s and rebuilt a broken/short-note
+            # song from the .mid. Idempotent: only rewrites .gitignore once.
+            if project_dir:
+                try:
+                    if _ensure_song_s_tracked(project_dir):
+                        self.log_message(
+                            "Pre-build: un-ignored song .s files so they can be "
+                            "committed (they are the source of truth). Commit + "
+                            "push them so other machines get the exact songs.")
+                except Exception as exc:
+                    self.log_message(f"Pre-build .s un-ignore check failed: {exc}")
 
+            # Step 2: protect committed song .s files from a lossy rebuild.
+            # The song .s files are the TRACKED SOURCE OF TRUTH in a PorySuite
+            # project — hand-edited in the Sound Editor / Piano Roll and now
+            # committed to git (they used to be .gitignored, which is why a
+            # pull on a second machine had no .s and rebuilt a broken/short-note
+            # song from the .mid). Ensure every existing .s is newer than its
+            # .mid + midi.cfg so Make's `%.s: %.mid midi.cfg` rule can never
+            # regenerate a lossy mid2agb rebuild over a committed/edited .s.
+            # (git checkout resets mtimes, so after a pull the committed .s no
+            # longer looks newest and Make would otherwise clobber it — this is
+            # exactly what turned long notes into short notes across machines.)
+            # Only touch a .s that WOULD be rebuilt (older/equal to a dep), so a
+            # fresh save — already newest — isn't bumped and needlessly
+            # recompiled. To intentionally REPLACE a song, re-import its .mid
+            # through the Sound Editor (which regenerates the .s and makes it
+            # newest); dropping a raw .mid in by hand no longer regenerates.
             try:
                 touched = 0
-                allowed_regen = 0
+                cfg_path = os.path.join(midi_dir, 'midi.cfg')
+                cfg_m = os.path.getmtime(cfg_path) if os.path.isfile(cfg_path) else 0.0
                 for fn in os.listdir(midi_dir):
                     if not fn.endswith('.s'):
                         continue
                     s_path = os.path.join(midi_dir, fn)
                     mid_path = s_path[:-2] + '.mid'
-
-                    # Treat missing .mid as "no real source" — protect the .s.
-                    mid_is_real = False
-                    if os.path.isfile(mid_path):
-                        try:
-                            if os.path.getsize(mid_path) > _PLACEHOLDER_MAX_BYTES:
-                                mid_is_real = True
-                        except OSError:
-                            pass
-
-                    if mid_is_real:
-                        # .mid is the source of truth.  Don't touch — let
-                        # Make handle it.  If the .mid is newer than the
-                        # .s, mid2agb regenerates correctly.  If the .s
-                        # is newer (e.g. user just saved via Sound Editor),
-                        # Make skips and the user's saved .s wins.
-                        allowed_regen += 1
-                    else:
-                        # .mid is placeholder — protect .s.
-                        try:
+                    try:
+                        s_m = os.path.getmtime(s_path)
+                        dep_m = cfg_m
+                        if os.path.isfile(mid_path):
+                            dep_m = max(dep_m, os.path.getmtime(mid_path))
+                        if s_m <= dep_m:
                             os.utime(s_path)
                             touched += 1
-                        except OSError:
-                            pass
+                    except OSError:
+                        pass
 
                 if touched:
                     self.log_message(
-                        f"Pre-build: protected {touched} hand-composed "
-                        f"song(s) from mid2agb overwrite (placeholder .mid)"
-                    )
-                if allowed_regen:
-                    self.log_message(
-                        f"Pre-build: {allowed_regen} song(s) with real .mid "
-                        f"content will follow normal Make dependency tracking"
+                        f"Pre-build: protected {touched} committed song .s "
+                        f"file(s) from a lossy mid2agb rebuild"
                     )
             except Exception as e:
                 self.log_message(f"Pre-build .s protection warning: {e}")
