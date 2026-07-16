@@ -2623,6 +2623,33 @@ QTabBar::tab:hover:!selected {
 
         dlg.exec()
 
+    @staticmethod
+    def _git_push_target_key(project_dir: str) -> str:
+        """Settings key for a repo's remembered push-target branch."""
+        import re as _re
+        safe = _re.sub(r"[^A-Za-z0-9]", "_", project_dir or "default")
+        return f"git/push_target/{safe}"
+
+    def _git_saved_push_target(self, project_dir: str) -> str:
+        """The branch this repo last pushed to, or '' if none saved."""
+        try:
+            from PyQt6.QtCore import QSettings
+            from app_info import get_settings_path
+            return QSettings(get_settings_path(), QSettings.Format.IniFormat).value(
+                self._git_push_target_key(project_dir), "", type=str) or ""
+        except Exception:
+            return ""
+
+    def _git_save_push_target(self, project_dir: str, branch: str) -> None:
+        """Remember the branch this repo pushed to so the next push defaults to it."""
+        try:
+            from PyQt6.QtCore import QSettings
+            from app_info import get_settings_path
+            QSettings(get_settings_path(), QSettings.Format.IniFormat).setValue(
+                self._git_push_target_key(project_dir), branch)
+        except Exception:
+            pass
+
     def _git_push(self) -> None:
         """
         Git → Push to Remote
@@ -2680,7 +2707,14 @@ QTabBar::tab:hover:!selected {
         branch_combo.installEventFilter(self._combo_wheel_filter())
         for b in all_branches:
             branch_combo.addItem(b)
-        idx = branch_combo.findText(current_branch)
+        # Default to the branch THIS repo last pushed to, so you don't have to
+        # re-pick 'master' every time (e.g. when your local branch is named
+        # something else but you always publish to master). Falls back to the
+        # current branch on first push.
+        _saved_target = self._git_saved_push_target(project_dir)
+        _default_target = (_saved_target if _saved_target in all_branches
+                           else current_branch)
+        idx = branch_combo.findText(_default_target)
         if idx >= 0:
             branch_combo.setCurrentIndex(idx)
         branch_row.addWidget(branch_combo, 1)
@@ -2918,6 +2952,8 @@ QTabBar::tab:hover:!selected {
             self._git_set_all_enabled(True)
             self._git_refresh_status_bar()
             if ok:
+                # Remember this target so the next push defaults to it.
+                self._git_save_push_target(project_dir, branch)
                 _low = (msg or "").lower()
                 if "up-to-date" in _low or "up to date" in _low:
                     self.statusBar().showMessage(
