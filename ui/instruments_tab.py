@@ -1538,8 +1538,18 @@ class InstrumentsTab(QWidget):
         return sample
 
     def _write_loop_to_bin(self, sample, loop_on: bool, loop_start: int):
-        """Write updated loop settings to the .bin file and update memory."""
-        from core.sound.sample_loader import _write_gba_bin
+        """Write updated loop settings to the .bin AND the source .wav.
+
+        The .bin is gitignored (a build artifact); the tracked source is the
+        .wav, and the build regenerates the .bin from it (audio_rules.mk:
+        ``%.bin: %.wav``). Writing the loop only to the .bin puts it solely in
+        an ignored file — so on another machine the build rebuilds the .bin
+        from the loop-LESS .wav and the sample loses its sustain: held/long
+        notes play the sample once and stop ("short but on time"). Mirror the
+        loop into the .wav's ``smpl`` chunk so it syncs and rebuilds correctly.
+        """
+        import os as _os
+        from core.sound.sample_loader import _write_gba_bin, _write_pcm_as_wav
         _write_gba_bin(
             sample.file_path,
             sample.header.sample_rate,
@@ -1549,6 +1559,23 @@ class InstrumentsTab(QWidget):
         )
         sample.header.status = 0x4000 if loop_on else 0
         sample.header.loop_start = loop_start
+        # Mirror the loop into the tracked source .wav (smpl chunk) so it is
+        # committed and the build rebuilds the .bin with the loop elsewhere.
+        try:
+            wav_dest = _os.path.splitext(sample.file_path)[0] + ".wav"
+            _write_pcm_as_wav(
+                wav_dest, sample.header.sample_rate, sample.pcm_data,
+                loop=loop_on, loop_start=loop_start)
+            # Keep .wav mtime >= .bin so the build treats the .wav as source.
+            try:
+                bin_mt = _os.stat(sample.file_path).st_mtime
+                _os.utime(wav_dest, (bin_mt + 1, bin_mt + 1))
+            except OSError:
+                pass
+        except Exception as exc:
+            logging.getLogger("SoundEditor.Instruments").warning(
+                "Loop saved to .bin but source .wav update failed for %s: %s",
+                getattr(sample, "label", "?"), exc)
 
     def _update_loop_ui(self, sample, loop_on: bool, loop_bytes: int):
         """Sync all loop-related UI widgets after a change."""
