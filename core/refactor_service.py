@@ -311,7 +311,11 @@ class RefactorService:
             ("src",     {".c", ".h", ".json"}),
             ("include", {".c", ".h"}),
             ("data",    {".inc", ".s", ".json", ".pory"}),
-            ("sound",   {".inc", ".s"}),
+            # .cfg covers sound/songs/midi/midi.cfg, which maps each song's .mid
+            # to its mid2agb flags BY FILENAME. Renaming a song's .mid (step 3b)
+            # without rewriting its midi.cfg entry orphans the file — the build
+            # then can't regenerate its (gitignored) .s on another machine.
+            ("sound",   {".inc", ".s", ".cfg"}),
             (".",       {".mk"}),
         ]
         try:
@@ -377,7 +381,11 @@ class RefactorService:
             ("data",    {".inc", ".s", ".json", ".pory"}),
             # sound/ has .inc files that reference cry filenames by slug
             # (e.g. "sound/direct_sound_samples/cries/bulbasaur.bin")
-            ("sound",   {".inc", ".s"}),
+            # .cfg covers sound/songs/midi/midi.cfg, which maps each song's .mid
+            # to its mid2agb flags BY FILENAME. Renaming a song's .mid (step 3b)
+            # without rewriting its midi.cfg entry orphans the file — the build
+            # then can't regenerate its (gitignored) .s on another machine.
+            ("sound",   {".inc", ".s", ".cfg"}),
             # .mk files at the project root reference graphics assets by
             # slug name (e.g. old_bulbasaur.4bpp in graphics_file_rules.mk).
             (".",       {".mk"}),
