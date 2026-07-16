@@ -497,8 +497,9 @@ class GitPanel(QDialog):
         lay.addWidget(self._commit_untracked_header)
 
         self._commit_untracked_note = QLabel(
-            "These files are <b>not affected by Pull</b> — git ignores them until "
-            "you explicitly add them.  Check the ones you want to save into git."
+            "New files git isn't tracking yet.  They're <b>checked by default</b> "
+            "so committing saves them (and they reach your other machines) — "
+            "uncheck any you don't want in git."
         )
         self._commit_untracked_note.setWordWrap(True)
         self._commit_untracked_note.setStyleSheet(
@@ -603,7 +604,13 @@ class GitPanel(QDialog):
             for _, path in untracked:
                 item = QListWidgetItem(f"  ??   {path}")
                 item.setData(256, path)
-                item.setCheckState(Qt.CheckState.Unchecked)  # opt-in, not opt-out
+                # Checked by default (like tracked files): build artifacts are
+                # already excluded by .gitignore, so an untracked file shown here
+                # is a real NEW project file (song, sprite, source, map) the user
+                # needs committed. Defaulting to unchecked silently left new files
+                # behind — they never reached other machines and broke the build
+                # there. Uncheck any you don't want; the common case is "commit it".
+                item.setCheckState(Qt.CheckState.Checked)
                 self._commit_untracked_list.addItem(item)
         else:
             self._commit_untracked_header.hide()
