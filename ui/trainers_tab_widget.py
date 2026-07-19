@@ -68,6 +68,11 @@ def _load_trainer_pic(path: str, pic_const: str = "") -> QPixmap:
 # Dropdown must never change value on mouse wheel unless the popup is open.
 # User scrolls via Chrome Remote Desktop — accidental hover + wheel = data loss.
 
+def _friendly_map_name(folder: str) -> str:
+    """Map folder name -> spaced display name (ViridianForest -> Viridian Forest)."""
+    return re.sub(r'(?<!^)(?=[A-Z])', ' ', folder or "")
+
+
 class _NoScrollCombo(QComboBox):
     """QComboBox that ignores wheel events when the popup isn't showing."""
     def wheelEvent(self, event):
@@ -1346,6 +1351,7 @@ class _TrainerDetailPanel(QWidget):
     changed          = pyqtSignal()
     rename_requested = pyqtSignal(str)   # emits current const
     setup_battle_requested = pyqtSignal()  # emitted when "Set up battle" button clicked
+    move_battle_requested = pyqtSignal()  # emitted when "Move battle to another map" clicked
     edit_tier_gates_requested = pyqtSignal()  # open rematch settings dialog
     add_to_rematch_requested = pyqtSignal(str)  # emits trainer const to add
     # Emitted when the user is about to switch away from a rematch-tier party
@@ -1736,6 +1742,18 @@ class _TrainerDetailPanel(QWidget):
         self._setup_battle_btn.clicked.connect(self.setup_battle_requested.emit)
         layout.addWidget(self._setup_battle_btn)
 
+        # "Move battle to another map" button — relocates the whole battle
+        # (script + dialogue + NPC) to a different map, cleanly.
+        self._move_battle_btn = QPushButton("Move battle to another map…")
+        self._move_battle_btn.setToolTip(
+            "Relocate this trainer's whole battle — the script, its dialogue,\n"
+            "and the NPC — to a different map, renaming every map-scoped label\n"
+            "so the two maps never clash on a duplicate symbol. The NPC lands at\n"
+            "tile (1, 1); reposition it in Porymap afterward."
+        )
+        self._move_battle_btn.clicked.connect(self.move_battle_requested.emit)
+        layout.addWidget(self._move_battle_btn)
+
         # Dictionary to hold text edit widgets keyed by (map, type)
         self._dialogue_edits: dict[tuple[str, str], GameTextEdit] = {}
 
@@ -1848,6 +1866,19 @@ class _TrainerDetailPanel(QWidget):
                 self._add_dialogue_group(
                     map_name, map_texts, text_path, display_name)
 
+        # Vanilla FR keeps many trainers' battle scripts in the global
+        # data/scripts/trainers.inc, not a per-map scripts.inc — the per-map
+        # loop above misses those. Pull their dialogue from the owning map's
+        # text.inc (derived from the label prefix) so it shows and edits the
+        # real source. Skip a map already shown by the per-map loop.
+        g_map, g_texts = self._extract_global_dialogue(trainer_const)
+        if g_texts and g_map not in self._dialogue_labels:
+            found_any = True
+            self._dialogue_labels[g_map] = g_texts
+            g_text_path = os.path.join(
+                self._project_root, "data", "maps", g_map, "text.inc")
+            self._add_dialogue_group(g_map, g_texts, g_text_path)
+
         # Also show pending dialogue for trainers not yet placed on a map.
         # Stored in RAM only — will migrate to text.inc when the trainer is
         # wired to a trainerbattle command on a map.
@@ -1950,6 +1981,115 @@ class _TrainerDetailPanel(QWidget):
             break
 
         return result
+
+    def _extract_global_dialogue(self, trainer_const: str):
+        """Find a trainer's dialogue when its battle lives in the vanilla global
+        ``data/scripts/trainers.inc`` file instead of a per-map scripts.inc.
+
+        Returns ``(map_name, {type: (label, content)})`` or ``(None, {})``. The
+        script's labels carry the owning map's name (``Route11_EventScript_Yasu``
+        / ``Route11_Text_YasuIntro``), so the text is loaded from that map's
+        ``text.inc`` — which is exactly where ``save_dialogue_edits`` writes back
+        (keyed by map_name), so edits land in the real source.
+        """
+        global_path = os.path.join(
+            self._project_root, "data", "scripts", "trainers.inc")
+        if not os.path.isfile(global_path):
+            return None, {}
+        try:
+            with open(global_path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception:
+            return None, {}
+        if trainer_const not in content:
+            return None, {}
+
+        # Split the file into label -> body-lines blocks up front so we can
+        # follow cross-block references (the post-battle "after" script).
+        label_re = re.compile(r"^(\w+)::")
+        blocks: dict[str, list[str]] = {}
+        cur = None
+        for line in content.splitlines():
+            m = label_re.match(line)
+            if m:
+                cur = m.group(1)
+                blocks[cur] = []
+            elif cur is not None:
+                blocks[cur].append(line)
+
+        def _first_text_msgbox(body: list[str]) -> str | None:
+            for bl in body:
+                s = bl.strip()
+                if s.startswith("msgbox"):
+                    parts = s.split(None, 1)
+                    if len(parts) > 1:
+                        lbl = parts[1].split(",")[0].strip()
+                        if "_Text_" in lbl:
+                            return lbl
+            return None
+
+        intro = defeat = post = None
+        block_label = None
+        for lbl, body in blocks.items():
+            hit = None
+            for bl in body:
+                s = bl.strip()
+                if (s.startswith("trainerbattle") and trainer_const in s
+                        and "rematch" not in s.split(None, 1)[0]):
+                    hit = s
+                    break
+            if hit is None:
+                continue
+            block_label = lbl
+            cmd = hit.split(None, 1)[0]
+            args = [a.strip() for a in hit.split(None, 1)[1].split(",")]
+            after_label = None
+            if "no_intro" in cmd and len(args) >= 2:
+                defeat = args[1]
+                if len(args) >= 3:
+                    after_label = args[2]
+            elif len(args) >= 3:
+                intro, defeat = args[1], args[2]
+                if len(args) >= 4:
+                    after_label = args[3]
+            # Post-battle text: an inline msgbox in this block, or (the common
+            # FR pattern) a msgbox inside the after-battle script named by the
+            # trainerbattle's last argument.
+            post = _first_text_msgbox(body)
+            if post is None and after_label and after_label in blocks:
+                post = _first_text_msgbox(blocks[after_label])
+            break
+
+        if not (intro or defeat or post):
+            return None, {}
+
+        # Owning map = the label's prefix (before _EventScript_ / _Text_).
+        ref = block_label or intro or defeat or post
+        map_name = ""
+        for marker in ("_EventScript_", "_Text_"):
+            if ref and marker in ref:
+                map_name = ref.split(marker, 1)[0]
+                break
+        if not map_name:
+            return None, {}
+
+        text_path = os.path.join(
+            self._project_root, "data", "maps", map_name, "text.inc")
+        texts = {}
+        if os.path.isfile(text_path):
+            try:
+                from pathlib import Path
+                from eventide.backend.eventide_utils import parse_text_inc
+                texts = dict(parse_text_inc(Path(text_path)))
+            except Exception:
+                texts = {}
+
+        map_texts = {}
+        for text_type, lbl in (("intro", intro), ("defeat", defeat),
+                               ("post", post)):
+            if lbl and lbl in texts:
+                map_texts[text_type] = (lbl, texts[lbl])
+        return (map_name, map_texts) if map_texts else (None, {})
 
     def _add_dialogue_group(self, map_name: str, map_texts: dict, text_path: str,
                             display_name: str | None = None):
@@ -2910,6 +3050,7 @@ class TrainersTabWidget(QWidget):
         self._detail_panel.changed.connect(lambda: self.changed.emit())
         self._detail_panel.rename_requested.connect(self.rename_requested.emit)
         self._detail_panel.setup_battle_requested.connect(self._on_setup_battle)
+        self._detail_panel.move_battle_requested.connect(self._on_move_battle)
         self._detail_panel.edit_tier_gates_requested.connect(self._on_edit_tier_gates)
         self._detail_panel.add_to_rematch_requested.connect(self._on_add_to_rematch)
         # Tier-switch flushes need a pending .c write queued on the parent so
@@ -3424,6 +3565,129 @@ class TrainersTabWidget(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             # Reload everything — the file changed on disk
             self._reload_after_rematch_edit()
+
+    def _on_move_battle(self):
+        """Move the current trainer's whole battle (script + dialogue + NPC) to
+        another map via TrainerMover, then refresh the dialogue view from disk."""
+        const = self._current_const
+        if not const or not self._project_root:
+            return
+        try:
+            from eventide.backend.trainer_mover import TrainerMover
+        except Exception as e:  # pragma: no cover - defensive
+            QMessageBox.warning(self, "Move Battle",
+                                f"Could not load the battle mover:\n{e}")
+            return
+
+        mover = TrainerMover(self._project_root)
+        placements = mover.find_placements(const)
+        if not placements:
+            QMessageBox.warning(
+                self, "Not on a map yet",
+                f"{const} isn't wired to a trainerbattle on any map yet, so there's\n"
+                f"no battle to move.\n\n"
+                f"Place it on an NPC first (use 'Set up battle script' or Porymap).")
+            return
+
+        src_folders = sorted({p["map_folder"] for p in placements})
+        all_maps = mover.list_maps()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Move battle to another map")
+        v = QVBoxLayout(dlg)
+        form = QFormLayout()
+
+        src_combo = _NoScrollCombo()
+        for f in src_folders:
+            src_combo.addItem(_friendly_map_name(f), f)
+        if len(src_folders) > 1:
+            form.addRow("Move from:", src_combo)
+        else:
+            form.addRow("Move from:", QLabel(_friendly_map_name(src_folders[0])))
+
+        dst_combo = _NoScrollCombo()
+
+        def _refill_dst():
+            cur_src = (src_combo.currentData() if len(src_folders) > 1
+                       else src_folders[0])
+            dst_combo.clear()
+            for f in all_maps:
+                if f != cur_src:
+                    dst_combo.addItem(_friendly_map_name(f), f)
+
+        _refill_dst()
+        if len(src_folders) > 1:
+            src_combo.currentIndexChanged.connect(lambda _i: _refill_dst())
+        form.addRow("Move to:", dst_combo)
+        v.addLayout(form)
+
+        note = QLabel(
+            "The NPC will be placed at tile (1, 1) on the destination map.\n"
+            "Open Porymap afterward to move it to the right spot.\n\n"
+            "Tip: save your project first so your latest dialogue moves with it.")
+        note.setStyleSheet("color: #888; font-size: 10px;")
+        v.addWidget(note)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        src_folder = (src_combo.currentData() if len(src_folders) > 1
+                      else src_folders[0])
+        dst_folder = dst_combo.currentData()
+        if not dst_folder:
+            return
+
+        res = mover.move(const, src_folder, dst_folder, x=1, y=1)
+        if res.get("needs_confirm"):
+            proceed = QMessageBox.warning(
+                self, "References elsewhere",
+                res["message"] + "\n\n" + "\n".join(res["warnings"]) +
+                "\n\nMove anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if proceed != QMessageBox.StandardButton.Yes:
+                return
+            res = mover.move(const, src_folder, dst_folder, x=1, y=1,
+                             ignore_ref_warnings=True)
+
+        if res.get("blocked") or not res.get("ok"):
+            QMessageBox.critical(
+                self, "Move failed",
+                res.get("message") or "The move could not be completed.")
+            return
+
+        s = res["summary"]
+        dst_friendly = _friendly_map_name(dst_folder)
+        lines = [
+            f"Moved {const} to {dst_friendly}.",
+            "",
+            f"• Battle script: {s['new_script_label']}",
+            f"• Dialogue moved: {len(s['moved_texts'])} text label(s)",
+        ]
+        if s["npc_moved"]:
+            lines.append(f"• NPC placed at tile (1, 1) on {dst_friendly}")
+        else:
+            lines.append("• No NPC was linked — add one in Porymap")
+        for n in res.get("notes", []):
+            lines.append(f"• {n}")
+        lines += ["",
+                  f"⚠ Open Porymap and drag the NPC from tile (1, 1) to where "
+                  f"you want it on {dst_friendly}."]
+        QMessageBox.information(self, "Battle moved", "\n".join(lines))
+
+        # Refresh the dialogue view from disk (source is now empty, dest has it)
+        # and mark the project dirty so the file changes are surfaced.
+        try:
+            self._detail_panel._populate_dialogue_tab(const)
+        except Exception:
+            pass
+        self.changed.emit()
 
     def _find_trainer_map(self, trainer_const: str) -> str:
         """Find which map contains this trainer's trainerbattle command.

@@ -779,21 +779,7 @@ QTabBar::tab:hover:!selected {
         # falsely mark the project modified just for viewing data.
         def _dirty(*_a):
             if self._loading_depth > 0:
-                try:
-                    import os, time
-                    log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                    with open(log, "a", encoding="utf-8", newline='\n') as f:
-                        f.write(f"[{time.strftime('%H:%M:%S')}] _dirty SUPPRESSED depth={self._loading_depth}\n")
-                except Exception:
-                    pass
                 return
-            try:
-                import os, time
-                log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                with open(log, "a", encoding="utf-8", newline='\n') as f:
-                    f.write(f"[{time.strftime('%H:%M:%S')}] _dirty FIRED species={getattr(self,'previous_selected_species', None)!r}\n")
-            except Exception:
-                pass
             self._on_species_field_edited()
         # Starter widgets get their own handler so changes light up the
         # Starters sidebar dot, not the Pokemon dot.
@@ -1804,13 +1790,45 @@ QTabBar::tab:hover:!selected {
         else:
             _, remote_url = self._git_run("remote", "get-url", "origin", timeout=10)
             remote_label = (remote_url or "origin").strip()
+            _, _cur = self._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
+            _cur = (_cur or "").strip()
+            # Pull the CURRENT branch from ITS OWN upstream — so on 'master' you
+            # pull origin/master, not whatever origin's default HEAD points at.
+            ok_up, _up = self._git_run(
+                "rev-parse", "--abbrev-ref", "@{upstream}", timeout=10)
+            _up = (_up or "").strip()
+            _target = _up if (ok_up and _up and "fatal" not in _up.lower()) else ""
+            if not _target:
+                ok_ls, _ls = self._git_run(
+                    "ls-remote", "--heads", "origin", _cur, timeout=15)
+                _target = (f"origin/{_cur}"
+                           if (ok_ls and (_ls or "").strip() and _cur)
+                           else "origin/HEAD")
             fetch_args  = ["fetch", "origin"]
-            reset_args  = ["reset", "--hard", "origin/HEAD"]
+            reset_args  = ["reset", "--hard", _target]
             fetch_label = "git fetch origin"
-            reset_label = "git reset --hard origin/HEAD"
+            reset_label = f"git reset --hard {_target}"
 
         _, branch = self._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
         branch_label = (branch or "").strip()
+
+        # If this branch has committed work the remote target doesn't, a hard
+        # reset pull would discard it — warn loudly (the stash only covers
+        # uncommitted changes, not commits).
+        _diverge_warn = ""
+        if not is_upstream_pull:
+            _, _ahead = self._git_run(
+                "rev-list", "--count", f"{reset_args[-1]}..HEAD", timeout=10)
+            try:
+                _ahead_n = int((_ahead or "0").strip() or 0)
+            except ValueError:
+                _ahead_n = 0
+            if _ahead_n > 0:
+                _diverge_warn = (
+                    f"\n⚠ '{branch_label}' has {_ahead_n} commit(s) that are NOT "
+                    f"on {reset_args[-1]}. Pull replaces your branch with the "
+                    f"remote, so those commit(s) would be LOST — Push them first "
+                    f"if you want to keep them.\n")
 
         # For upstream pulls, preview what untracked files would be wiped
         clean_preview = ""
@@ -1838,6 +1856,7 @@ QTabBar::tab:hover:!selected {
             "Git panel → Stash section (or 'git stash pop').\n\n"
             f"  Remote: {remote_label}\n"
             + (f"  Branch: {branch_label}\n" if branch_label else "") +
+            _diverge_warn +
             "\nSaved to the stash first:\n"
             "  • Uncommitted changes to tracked files\n"
             + ("  • Untracked files (custom graphics, scripts, etc.)\n" if is_upstream_pull else "") +
@@ -2165,13 +2184,57 @@ QTabBar::tab:hover:!selected {
             act.triggered.connect(lambda checked=False, br=b: self._git_checkout_branch(br))
             menu.addAction(act)
 
-    def _git_checkout_branch(self, branch: str) -> None:
-        """Switch to a local branch and refresh the project.
+    def _git_finish_switch(self, branch: str, project_dir: str) -> None:
+        """After landing on *branch*: make it track origin/<branch> (so Push AND
+        Pull both follow it) and, if the local branch is behind the remote,
+        offer to fast-forward it to the latest. Then refresh the project."""
+        from PyQt6.QtWidgets import QMessageBox as _MB
+        # Track origin/<branch> so push/pull default here. Harmless if already set.
+        self._git_run("branch", f"--set-upstream-to=origin/{branch}", branch, timeout=10)
+        _, behind_out = self._git_run(
+            "rev-list", "--count", f"{branch}..origin/{branch}", timeout=10)
+        _, ahead_out = self._git_run(
+            "rev-list", "--count", f"origin/{branch}..{branch}", timeout=10)
+        try:
+            behind = int((behind_out or "0").strip() or 0)
+        except ValueError:
+            behind = 0
+        try:
+            ahead = int((ahead_out or "0").strip() or 0)
+        except ValueError:
+            ahead = 0
+        if behind > 0 and ahead == 0:
+            if _MB.question(
+                self, "Update to latest?",
+                f"'{branch}' is {behind} commit(s) behind the version on GitHub.\n\n"
+                f"Update it to the latest now?  (Fast-forward — nothing of yours "
+                f"is lost.)",
+                _MB.StandardButton.Yes | _MB.StandardButton.No,
+            ) == _MB.StandardButton.Yes:
+                self._git_run("merge", "--ff-only", f"origin/{branch}", timeout=60)
+        elif behind > 0 and ahead > 0:
+            _MB.warning(
+                self, "Branch has diverged",
+                f"'{branch}' has {ahead} commit(s) that GitHub doesn't, and is "
+                f"{behind} behind. They've split apart — use Pull when you're "
+                f"ready to reconcile them. I won't auto-merge and risk your work.")
+        # Align the push default with the branch you're now working on.
+        self._git_save_push_target(project_dir, branch)
+        self.statusBar().showMessage(
+            f"Now working on '{branch}' — Push and Pull both use it. Refreshing…",
+            5000)
+        QTimer.singleShot(50, self._refresh_project)
 
-        If git refuses because local files would be overwritten, show an
-        in-app dialog listing the conflicting files and offering three
-        plain-English options: Stash & Switch, Discard & Switch, Cancel.
-        The user never needs to open a terminal to resolve this.
+    def _git_checkout_branch(self, branch: str, remote_only: bool = False) -> None:
+        """Switch the working branch to *branch* and wire it to its remote.
+
+        Makes *branch* the branch you work on AND sets it to track
+        origin/<branch>, so from then on Push and Pull both target it — no
+        picking, and pull can't grab a stale different branch. If *branch* only
+        exists on the remote (remote_only), a local copy that tracks it is
+        created. A stale local copy is offered a fast-forward to the latest.
+        Conflicts with uncommitted changes use an in-app Stash/Discard prompt —
+        no terminal.
         """
         if not self.project_info:
             return
@@ -2182,19 +2245,22 @@ QTabBar::tab:hover:!selected {
         from PyQt6.QtWidgets import QMessageBox as _MB
         ans = _MB.question(
             self, "Switch Branch",
-            f"Switch to branch  '{branch}'?\n\n"
-            f"Unsaved changes will be lost.",
+            f"Switch to '{branch}' and use it for Push and Pull?\n\n"
+            f"If you have unsaved changes you'll get a Stash/Discard prompt.",
             _MB.StandardButton.Yes | _MB.StandardButton.Cancel,
         )
         if ans != _MB.StandardButton.Yes:
             return
 
-        ok, msg = self._git_run("checkout", branch, timeout=20)
+        # Refresh remote state so tracking + 'behind' checks are accurate.
+        self._git_run("fetch", "origin", timeout=90)
+        checkout_args = (
+            ["checkout", "-b", branch, "--track", f"origin/{branch}"]
+            if remote_only else ["checkout", branch])
+
+        ok, msg = self._git_run(*checkout_args, timeout=30)
         if ok:
-            self.statusBar().showMessage(
-                f"Switched to branch '{branch}' — refreshing…", 4000
-            )
-            QTimer.singleShot(50, self._refresh_project)
+            self._git_finish_switch(branch, project_dir)
             return
 
         # ── Error path: try to recover in-app ────────────────────────────
@@ -2229,10 +2295,11 @@ QTabBar::tab:hover:!selected {
         seen = set()
         conflict_files = [p for p in conflict_files if not (p in seen or seen.add(p))]
 
-        self._show_switch_branch_conflict_dialog(branch, conflict_files, msg)
+        self._show_switch_branch_conflict_dialog(branch, conflict_files, msg, remote_only)
 
     def _show_switch_branch_conflict_dialog(
-        self, branch: str, conflict_files: list[str], raw_msg: str
+        self, branch: str, conflict_files: list[str], raw_msg: str,
+        remote_only: bool = False
     ) -> None:
         """In-app recovery dialog for 'local changes would be overwritten'.
 
@@ -2375,7 +2442,10 @@ QTabBar::tab:hover:!selected {
                     return
 
         # Retry the checkout now that the working tree is clean.
-        ok, msg2 = self._git_run("checkout", branch, timeout=20)
+        checkout_args = (
+            ["checkout", "-b", branch, "--track", f"origin/{branch}"]
+            if remote_only else ["checkout", branch])
+        ok, msg2 = self._git_run(*checkout_args, timeout=30)
         if not ok:
             _MB.warning(
                 self, "Switch Branch",
@@ -2384,10 +2454,7 @@ QTabBar::tab:hover:!selected {
             )
             return
 
-        self.statusBar().showMessage(
-            f"Switched to branch '{branch}' — refreshing…", 4000
-        )
-        QTimer.singleShot(50, self._refresh_project)
+        self._git_finish_switch(branch, self.project_info.get("dir", ""))
 
     def _git_show_status(self) -> None:
         """Git → Status — show branch, changed files, ahead/behind in a dialog."""
@@ -3905,6 +3972,8 @@ QTabBar::tab:hover:!selected {
         # Add abilities to ability combo boxes
         self.ui.ability1.clear()
         self.ui.ability2.clear()
+        for _ib in self._innate_combos():
+            _ib.clear()
         abilities = self.source_data.get_pokemon_abilities()
 
         # Enrich with display names + descriptions from the C text file.
@@ -3916,6 +3985,7 @@ QTabBar::tab:hover:!selected {
         except Exception:
             pass
 
+        _innate_boxes = self._innate_combos()
         for ability in sorted(
             abilities.keys(), key=lambda x: self.source_data.get_ability_data(x, "id")
         ):
@@ -3923,10 +3993,20 @@ QTabBar::tab:hover:!selected {
                         or self.source_data.get_ability_data(ability, "name"))
             self.ui.ability1.addItem(display, ability)
             self.ui.ability2.addItem(display, ability)
+            # Innate combos carry the SAME ability list; ABILITY_NONE (id 0, sorted
+            # first) is the "no innate" choice for an empty slot.
+            for _ib in _innate_boxes:
+                _ib.addItem(display, ability)
 
         # Load abilities editor
         try:
             self.load_abilities_editor()
+        except Exception:
+            pass
+
+        # Show/hide the Innate Abilities group for this project's engine support.
+        try:
+            self._apply_innate_ui_visibility()
         except Exception:
             pass
 
@@ -5572,15 +5652,6 @@ in the game.</p>
         Clearing the modified state (passing False) always goes through —
         only spurious "mark dirty" calls during load are suppressed.
         """
-        try:
-            import traceback, os, time
-            log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-            with open(log, "a", encoding="utf-8", newline='\n') as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] setWindowModified({modified}) depth={self._loading_depth}\n")
-                for line in traceback.format_stack(limit=8)[:-1]:
-                    f.write("  " + line.rstrip() + "\n")
-        except Exception:
-            pass
         if modified and self._loading_depth > 0:
             return
         super().setWindowModified(modified)
@@ -5781,6 +5852,29 @@ in the game.</p>
         except Exception:
             pass
 
+        # Load innate abilities. Innates are a BASE-species property — the engine keys
+        # GetBattlerInnate on the base form and the codegen emits base rows only, so a
+        # form inherits its base's innates. We therefore always show the BASE species'
+        # innates (form=None) and, on a non-base form, DISABLE the group so a form-level
+        # edit can't silently no-op (it would save to the form and never reach the game).
+        # Selection is resolved by the ABILITY_* const (item userData), robust to id gaps.
+        innate_boxes = self._innate_combos()
+        if innate_boxes:
+            innates = self.source_data.get_species_info(species, "innates", None) or []
+            for idx, box in enumerate(innate_boxes):
+                const = innates[idx] if idx < len(innates) else "ABILITY_NONE"
+                if not const:
+                    const = "ABILITY_NONE"
+                j = box.findData(const)
+                box.setCurrentIndex(j if j >= 0 else 0)
+        _innate_grp = getattr(self.ui, "groupBox_innates", None)
+        if _innate_grp is not None:
+            _is_base = not form
+            _innate_grp.setEnabled(_is_base)
+            _innate_grp.setToolTip(
+                "" if _is_base
+                else "Innate abilities are set on the base form (shown here, read-only).")
+
         # Update EVs
         self.ui.evs_hp.setValue(
             self.source_data.get_species_info(species, "evYield_HP", form) or 0
@@ -5892,10 +5986,6 @@ in the game.</p>
                         except Exception:
                             pass
                         self.update_gender_ratio(gender_ratio)
-                        try:
-                            print(f"[GENDER-DIAG] label after update: {self.ui.gender_ratio_label.text()}")
-                        except Exception:
-                            pass
                     break
         except Exception:
             try:
@@ -6317,13 +6407,6 @@ in the game.</p>
             nonlocal updated
             stored = self.source_data.get_species_info(species, attribute, form)
             if _normalize(stored) != _normalize(ui_value):
-                try:
-                    import os, time
-                    log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                    with open(log, "a", encoding="utf-8", newline='\n') as f:
-                        f.write(f"[{time.strftime('%H:%M:%S')}] DIRTY {species} attr={attribute} stored={stored!r} ui={ui_value!r} norm_stored={_normalize(stored)!r} norm_ui={_normalize(ui_value)!r}\n")
-                except Exception:
-                    pass
                 self.source_data.set_species_info(
                     species, attribute, ui_value, form=form
                 )
@@ -6358,6 +6441,14 @@ in the game.</p>
         # user edited it → store in species_info so parse_to_c_code writes it
         # to the C header.  If they match but species_info already has a stale
         # value (from a previous edit), update that too.
+        def _norm_txt(s):
+            # Round-trip guard for the dirty CHECK only (the real value is still
+            # what gets written). categoryName is loaded unstripped but read back
+            # stripped, and description round-trips through setPlainText/
+            # toPlainText which can normalize line endings — so a pure view would
+            # otherwise look like an edit. Normalize both sides before comparing.
+            return (s or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
         def _dex_aware_set(attr, val):
             nonlocal updated
             fallback = self.source_data.get_species_info(species, attr, form)
@@ -6365,7 +6456,7 @@ in the game.</p>
                 raw = self.source_data.data["species_data"].data[species]["species_info"].get(attr)
             except Exception:
                 raw = None
-            if val != fallback:
+            if _norm_txt(val) != _norm_txt(fallback):
                 # User changed it — always write
                 self.source_data.set_species_info(species, attr, val, form=form)
                 updated = True
@@ -6374,7 +6465,7 @@ in the game.</p>
                 # species_info yet — write it so parse_to_c_code can
                 # persist it to the header files.
                 self.source_data.set_species_info(species, attr, val, form=form)
-            elif raw is not None and raw != val:
+            elif raw is not None and _norm_txt(raw) != _norm_txt(val):
                 self.source_data.set_species_info(species, attr, val, form=form)
                 updated = True
         _dex_aware_set("categoryName", category_text)
@@ -6458,6 +6549,28 @@ in the game.</p>
         ]
         update_if_needed("abilities", abilities)
 
+        # Innate abilities — only persisted on a project whose engine supports them (so a
+        # vanilla project never gains an "innates" key) AND only on the BASE form (form is
+        # falsy): the engine + codegen are base-species-only, so writing a form's innates
+        # would be a silent no-op. Constants (not ids), padded to 3 slots.
+        if not form and self._project_supports_innates():
+            innates = [_ab_const(b.currentData()) for b in self._innate_combos()]
+            while len(innates) < 3:
+                innates.append("ABILITY_NONE")
+            # Compare canonically: a species with no innates comes back as a
+            # missing/0/None value, but the UI always shows 3 ABILITY_NONE slots.
+            # A raw compare (update_if_needed) would read 0 != [ABILITY_NONE x3]
+            # and flag EVERY viewed species dirty. Strip ABILITY_NONE from both
+            # sides (exactly what the codegen does) so "no innates" == "all NONE".
+            def _clean_innates(v):
+                if not isinstance(v, (list, tuple)):
+                    return ()
+                return tuple(a for a in v if a and a != "ABILITY_NONE")
+            stored_innates = self.source_data.get_species_info(species, "innates", form)
+            if _clean_innates(stored_innates) != _clean_innates(innates):
+                self.source_data.set_species_info(species, "innates", innates, form=form)
+                updated = True
+
         # Check and update EV yields
         update_if_needed("evYield_HP", self.ui.evs_hp.value())
         update_if_needed("evYield_Attack", self.ui.evs_atk.value())
@@ -6505,10 +6618,6 @@ in the game.</p>
                         gr_val = cur
             except Exception:
                 pass
-        try:
-            print(f"[GENDER-DIAG] save_species_data: species={species} computed_gr={gr_val} current_gr={cur}")
-        except Exception:
-            pass
         update_if_needed("genderRatio", gr_val)
         # Ensure underlying data dictionary also reflects the value so
         # JSON serialization does not miss it if set_species_info wrappers
@@ -6533,7 +6642,7 @@ in the game.</p>
 
         update_if_needed("growthRate", self.ui.exp_growth_rate.currentData())
         update_if_needed("friendship", self.ui.base_friendship.value())
-                # Species flags: collect checked items and persist into concrete fields (in-memory only)
+        # Species flags: collect checked items and persist into concrete fields (in-memory only)
         if hasattr(self.ui, "species_flags"):
             try:
                 # Update concrete fields from flag checkboxes
@@ -6802,10 +6911,6 @@ in the game.</p>
                 except Exception:
                     pass
                 self.update_gender_ratio(eng)
-                try:
-                    print(f"[GENDER-DIAG] label after update (flag toggle): {self.ui.gender_ratio_label.text()}")
-                except Exception:
-                    pass
             except Exception:
                 pass
         try:
@@ -6842,13 +6947,6 @@ in the game.</p>
                 )
                 # Do NOT persist to disk here. Only mark in-memory changes and
                 # set the window modified flag so the user can Save explicitly.
-                try:
-                    import os, time
-                    log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                    with open(log, "a", encoding="utf-8", newline='\n') as f:
-                        f.write(f"[{time.strftime('%H:%M:%S')}] save_species_data({self.previous_selected_species}) returned updated={updated}\n")
-                except Exception:
-                    pass
                 if updated:
                     # Color the previous species amber to signal unsaved edits.
                     self._mark_list_item_dirty(
@@ -8572,15 +8670,6 @@ QTabBar::tab:hover:!selected {
         colors the currently-selected dex list entry amber so the user can
         see which entry has unsaved edits. Suppressed while a load or
         programmatic sync is in flight."""
-        try:
-            import os, time, traceback
-            log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-            with open(log, "a", encoding="utf-8", newline='\n') as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] _on_pokedex_panel_edited depth={self._loading_depth} current_dex={getattr(self, '_current_dex_const', None)!r}\n")
-                for line in traceback.format_stack(limit=10)[:-1]:
-                    f.write("  " + line.rstrip() + "\n")
-        except Exception:
-            pass
         if self._loading_depth > 0:
             return
         self.setWindowModified(True)
@@ -9287,14 +9376,16 @@ QTabBar::tab:hover:!selected {
         """Repopulate ability dropdowns on the Pokemon tab after abilities change."""
         if not self.source_data:
             return
-        # Preserve current selections
+        # Preserve current selections (abilities + innates)
         cur1 = self.ui.ability1.currentData()
         cur2 = self.ui.ability2.currentData()
+        innate_boxes = self._innate_combos()
+        innate_cur = [b.currentData() for b in innate_boxes]
 
-        self.ui.ability1.blockSignals(True)
-        self.ui.ability2.blockSignals(True)
-        self.ui.ability1.clear()
-        self.ui.ability2.clear()
+        boxes = [self.ui.ability1, self.ui.ability2] + innate_boxes
+        for b in boxes:
+            b.blockSignals(True)
+            b.clear()
 
         abilities = self.source_data.get_pokemon_abilities()
         # Abilities data is already enriched with display_name at this point
@@ -9304,8 +9395,8 @@ QTabBar::tab:hover:!selected {
         ):
             display = (abilities.get(ability, {}).get("display_name")
                         or abilities.get(ability, {}).get("name", ability))
-            self.ui.ability1.addItem(display, ability)
-            self.ui.ability2.addItem(display, ability)
+            for b in boxes:
+                b.addItem(display, ability)
 
         # Restore selections
         if cur1:
@@ -9316,9 +9407,14 @@ QTabBar::tab:hover:!selected {
             idx = self.ui.ability2.findData(cur2)
             if idx >= 0:
                 self.ui.ability2.setCurrentIndex(idx)
+        for box, cur in zip(innate_boxes, innate_cur):
+            if cur:
+                idx = box.findData(cur)
+                if idx >= 0:
+                    box.setCurrentIndex(idx)
 
-        self.ui.ability1.blockSignals(False)
-        self.ui.ability2.blockSignals(False)
+        for b in boxes:
+            b.blockSignals(False)
 
     def _on_ability_rename(self, old_const: str):
         """Rename an ability constant across the whole project."""
@@ -11656,6 +11752,16 @@ QTabBar::tab:hover:!selected {
                 else:
                     dlg.log_line("species_info.h: skipped (file not found or error)")
 
+                # Innate abilities table — only on projects with the innate system
+                # (the engine's GetBattlerInnate reads it); vanilla projects skip it.
+                n_innate = self._write_innate_abilities_header()
+                if n_innate == -2:
+                    pass  # no innate system in this project — nothing to write
+                elif n_innate >= 0:
+                    dlg.log_line(f"innate_abilities.h updated ({n_innate} species with innates)")
+                else:
+                    dlg.log_line("innate_abilities.h: skipped (error)")
+
                 # Write pokedex entries (category) and description text
                 n_dex = self._write_pokedex_entries_header()
                 if n_dex and n_dex > 0:
@@ -12087,6 +12193,87 @@ QTabBar::tab:hover:!selected {
             return -1
 
         return total
+
+    def _innate_combos(self):
+        """The three innate ability QComboBoxes, in slot order. Uses getattr so an
+        older ui stub without them degrades to an empty list instead of crashing."""
+        return [b for b in (getattr(self.ui, "innate1", None),
+                            getattr(self.ui, "innate2", None),
+                            getattr(self.ui, "innate3", None)) if b is not None]
+
+    def _project_supports_innates(self) -> bool:
+        """True if the loaded project has the engine innate system (so the innate UI
+        should show + save). Cached as (project_dir, supported) so the value can never
+        leak across projects — a different dir forces a re-read."""
+        root = self.project_info.get("dir", "")
+        cache = getattr(self, "_innates_supported_cache", None)
+        if cache is not None and cache[0] == root:
+            return cache[1]
+        supported = False
+        try:
+            from core import innate_patch
+            supported = bool(root) and innate_patch.supports_innates(root)
+        except Exception:
+            supported = False
+        self._innates_supported_cache = (root, supported)
+        return supported
+
+    def _apply_innate_ui_visibility(self):
+        """Show the Innate Abilities group only on a project whose engine supports
+        innates; hide it entirely otherwise (a vanilla project gets no innate UI).
+        Call after a project loads. Forces a fresh support re-read for this project."""
+        self._innates_supported_cache = None
+        grp = getattr(self.ui, "groupBox_innates", None)
+        if grp is not None:
+            grp.setVisible(self._project_supports_innates())
+
+    def _write_innate_abilities_header(self) -> int:
+        """Regenerate src/data/innate_abilities.h (the gSpeciesInnates table) from the
+        in-memory per-species innate lists.
+
+        Only runs on a project that supports innates (the engine has the
+        NUM_INNATE_SLOTS / GetBattlerInnate infrastructure); a vanilla project is
+        skipped and the file is never created. Returns the number of species WITH
+        innates written, -1 on error, or -2 when the project has no innate system.
+
+        Innates ride on each species' species_info["innates"] (a list of ABILITY_*
+        consts). Only top-level (base) species are emitted — form species live nested
+        under a base and their consts can exceed NUM_SPECIES, which would overflow the
+        C array's [NUM_SPECIES] first dimension."""
+        if self._plugin_data_unchanged("species_data"):
+            return 0
+        from core import innate_patch
+        root = self.project_info.get("dir", "")
+        if not root or not innate_patch.supports_innates(root):
+            return -2
+        try:
+            sp_data = self.source_data.data["species_data"]
+        except Exception:
+            return -1
+        # Alternate forms are defined as (NUM_SPECIES + N); emitting one as a designated
+        # initializer would overflow the [NUM_SPECIES] table and break the build. Forms
+        # inherit their base's row at runtime (GetBattlerInnate keys on the base), so skip
+        # them here — robust even if a form const leaked into the top-level species dict.
+        form_consts = innate_patch.form_species_consts(root)
+        rows = {}
+        for species_const, sdata in sp_data.data.items():
+            if not species_const.startswith("SPECIES_"):
+                continue
+            if species_const in form_consts or species_const == "SPECIES_EGG":
+                continue
+            info = sdata.get("species_info", {})
+            innates = info.get("innates") or []
+            clean = [a for a in innates if a and a != "ABILITY_NONE"]
+            if clean:
+                rows[species_const] = clean
+        slots = innate_patch.get_num_innate_slots(root)
+        text = innate_patch.render_innate_table(rows, slots)
+        path = os.path.join(root, innate_patch.INNATE_TABLE_REL)
+        try:
+            write_text_if_changed(path, text)
+        except Exception:
+            return -1
+        return len(rows)
 
     # ── Direct pokedex header writers ────────────────────────────────
     # Category lives in pokedex_entries.h, description in pokedex_text_fr.h.

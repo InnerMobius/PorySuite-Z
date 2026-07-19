@@ -80,6 +80,16 @@ _FORM_CHANGE_TYPES_H = '''#ifndef GUARD_CONSTANTS_FORM_CHANGE_TYPES_H
 #define FORM_CHANGE_FLAG        5   // param = a story FLAG_* id; form holds while set
 #define FORM_CHANGE_STATUS      6   // param = a STATUS1_* mask; form holds while afflicted
 #define FORM_CHANGE_HP_BELOW    7   // param = HP percent; in-battle, holds while hp% < param
+// Battle-ability form triggers (PorySuite-Z Layer C). Constants are always defined; the
+// engine hooks that read them are emitted by the patcher ONLY for abilities the project
+// has, so a project with no such data/ability never runs any of this.
+#define FORM_CHANGE_BATTLE_STANCE_BLADE  8  // Stance Change: become this form on a DAMAGING move
+#define FORM_CHANGE_BATTLE_STANCE_SHIELD 9  // Stance Change: become this form on a STATUS move
+#define FORM_CHANGE_BATTLE_WEATHER      10  // Forecast/Flower Gift: hold while in-battle weather = param (B_WEATHER_* mask)
+#define FORM_CHANGE_BATTLE_TURN         11  // Hunger Switch: toggle each end of turn
+#define FORM_CHANGE_BATTLE_KO           12  // Battle Bond: become this form once, after the holder lands a KO
+#define FORM_CHANGE_BATTLE_MOVE         13  // Gulp Missile: become this form when the holder uses the move id in param
+#define FORM_CHANGE_BATTLE_HP_ABOVE     14  // Schooling: hold while hp% >= param (and level >= 20)
 
 #endif // GUARD_CONSTANTS_FORM_CHANGE_TYPES_H
 '''
@@ -431,12 +441,14 @@ static void MorphBattlerData(u8 battler, u16 target)
 {
     struct Pokemon *mon = InBattlePartyMon(battler);
     u16 old = gBattleMons[battler].species;
+    u16 oldMaxHP = gBattleMons[battler].maxHP;
+    s32 newHp;
     u8 nick[POKEMON_NAME_LENGTH + 1];
 
     GetMonData(mon, MON_DATA_NICKNAME, nick);   // for the not-nicknamed rename check below
 
     SetMonData(mon, MON_DATA_SPECIES, &target);
-    CalculateMonStats(mon);
+    CalculateMonStats(mon);                     // recompute stats for the new form (also mutates party HP; overridden below)
     gBattleMons[battler].species   = target;
     gBattleMons[battler].maxHP     = GetMonData(mon, MON_DATA_MAX_HP, NULL);
     gBattleMons[battler].attack    = GetMonData(mon, MON_DATA_ATK, NULL);
@@ -446,8 +458,21 @@ static void MorphBattlerData(u8 battler, u16 target)
     gBattleMons[battler].spDefense = GetMonData(mon, MON_DATA_SPDEF, NULL);
     gBattleMons[battler].type1     = gSpeciesInfo[target].types[0];
     gBattleMons[battler].type2     = gSpeciesInfo[target].types[1];
-    if (gBattleMons[battler].hp > gBattleMons[battler].maxHP)
-        gBattleMons[battler].hp = gBattleMons[battler].maxHP;
+
+    // HP sync for forms whose maxHP DIFFERS (e.g. Power Construct): carry the same maxHP delta into the LIVE
+    // battle HP (a fainted mon stays at 0), clamp to the new max, write it back to the party mon so battle and
+    // party HP never diverge, and refresh the health bar. Same-maxHP forms (Stance/Forecast/Zen/…) are a no-op.
+    newHp = gBattleMons[battler].hp;
+    if (newHp != 0 && gBattleMons[battler].maxHP != oldMaxHP)
+        newHp += (s32)gBattleMons[battler].maxHP - (s32)oldMaxHP;
+    if (newHp < 1)
+        newHp = (gBattleMons[battler].hp != 0) ? 1 : 0; // a maxHP drop never faints on its own
+    if (newHp > gBattleMons[battler].maxHP)
+        newHp = gBattleMons[battler].maxHP;
+    gBattleMons[battler].hp = newHp;
+    SetMonData(mon, MON_DATA_HP, &gBattleMons[battler].hp);
+    if (gBattleMons[battler].maxHP != oldMaxHP)
+        UpdateHealthboxAttribute(gHealthboxSpriteIds[battler], mon, HEALTHBOX_HEALTH_BAR);
 
     if (StringCompare(nick, gSpeciesNames[old]) == 0)
     {
@@ -541,8 +566,8 @@ static void MorphBattlerSpecies(u8 battler, u16 target)
 {
     u8 taskId;
 
-    if (target == SPECIES_NONE || target == gBattleMons[battler].species)
-        return;
+    if (target == SPECIES_NONE || target == FORM_SPECIES_END || target == gBattleMons[battler].species)
+        return;                                 // FORM_SPECIES_END guard: never morph to the table terminator
     MorphBattlerData(battler, target);
     taskId = CreateTask(Task_FormChangeMosaic, 10);
     gTasks[taskId].data[3] = battler;
@@ -561,6 +586,8 @@ bool8 TryInBattleFormChange(u8 battler)
     u16 base, target;
     u32 i;
 
+    if (gBattleMons[battler].hp == 0)
+        return FALSE;                   // a fainted battler never morphs
     if (forms == NULL)
         return FALSE;                   // not a form-capable species
     base = forms[0];
@@ -568,9 +595,17 @@ bool8 TryInBattleFormChange(u8 battler)
     if (t == NULL)
         return FALSE;
 
-    // a form reached by USING an item is permanent; never auto-revert it
+    // A form reached by USING an item, or by an EVENT-driven battle ability (Stance Change / Battle Bond /
+    // Gulp Missile / Hunger Switch), is "sticky" — the reactive checker must never auto-revert it. Only the
+    // genuinely reactive triggers below (status / weather / HP threshold) revert when their condition ends.
     for (i = 0; t[i].method != FORM_CHANGE_END; i++)
-        if (t[i].method == FORM_CHANGE_ITEM_USE && t[i].targetSpecies == species)
+        if (t[i].targetSpecies == species
+            && (t[i].method == FORM_CHANGE_ITEM_USE
+             || t[i].method == FORM_CHANGE_BATTLE_KO
+             || t[i].method == FORM_CHANGE_BATTLE_MOVE
+             || t[i].method == FORM_CHANGE_BATTLE_TURN
+             || t[i].method == FORM_CHANGE_BATTLE_STANCE_BLADE
+             || t[i].method == FORM_CHANGE_BATTLE_STANCE_SHIELD))
             return FALSE;
 
     target = base;
@@ -582,6 +617,7 @@ bool8 TryInBattleFormChange(u8 battler)
             break;
         }
     }
+/*__REACTIVE_ABILITY_BRANCHES__*/
     if (target == base && gBattleMons[battler].maxHP != 0)
     {
         for (i = 0; t[i].method != FORM_CHANGE_END; i++)
@@ -602,11 +638,228 @@ bool8 TryInBattleFormChange(u8 battler)
     }
     return FALSE;
 }
+/*__FORM_ABILITY_HOOKS__*/
 '''
 
 
-def _create_in_battle_forms_c(path):
-    return _write_if_changed(path, _IN_BATTLE_FORMS_C)
+# The battle-ability form triggers, each keyed to the ABILITY_* constant that drives it.
+# The patcher emits a trigger's engine code ONLY when the target project defines its
+# ability (read from the project's own abilities.h) — so a vanilla decomp gets none of
+# it and its output is byte-identical. Mirrors _weather_group_funcs' "reference only what
+# exists" rule.
+_FORM_CHANGE_ABILITIES = (
+    "ABILITY_STANCE_CHANGE", "ABILITY_SCHOOLING", "ABILITY_FORECAST",
+    "ABILITY_FLOWER_GIFT", "ABILITY_HUNGER_SWITCH", "ABILITY_BATTLE_BOND",
+    "ABILITY_GULP_MISSILE",
+)
+
+
+def _split_present(project_root):
+    """True if the project has the physical/special split (a DAMAGE_CATEGORY_STATUS
+    constant). Stance Change keys off move category, so its generated hook references
+    that constant and the `.category` move field; gating on this keeps a split-less
+    project that (oddly) defines ABILITY_STANCE_CHANGE from failing to compile."""
+    for rel in (("include", "constants", "pokemon.h"),
+                ("include", "pokemon.h"),
+                ("include", "battle.h")):
+        p = os.path.join(project_root, *rel)
+        if os.path.isfile(p) and "DAMAGE_CATEGORY_STATUS" in _read(p):
+            return True
+    return False
+
+
+def _form_change_abilities(project_root):
+    """Return the subset of _FORM_CHANGE_ABILITIES that the target project actually
+    defines. Whole-token, comment-safe (a `// #define ABILITY_X` never matches, since
+    the regex requires #define at the start of the line). Empty on a vanilla decomp.
+
+    Stance Change is additionally dropped when the physical/special split is absent
+    (its generated hook references DAMAGE_CATEGORY_STATUS / the .category move field);
+    this keeps every downstream consumer — function emission, prototype, call site,
+    and the shared FindBattleFormTarget gate — consistently Stance-free so a
+    split-less project still builds."""
+    ah = os.path.join(project_root, "include", "constants", "abilities.h")
+    try:
+        with open(ah, encoding="utf-8") as f:
+            defined = set(re.findall(r"^\s*#define\s+(ABILITY_\w+)\s+\d+",
+                                     f.read(), re.MULTILINE))
+    except Exception:
+        defined = set()
+    have = {a for a in _FORM_CHANGE_ABILITIES if a in defined}
+    if "ABILITY_STANCE_CHANGE" in have and not _split_present(project_root):
+        have.discard("ABILITY_STANCE_CHANGE")
+        logging.getLogger(__name__).warning(
+            "form-change patch: ABILITY_STANCE_CHANGE is defined but no physical/"
+            "special split (DAMAGE_CATEGORY_STATUS) was detected — skipping the Stance "
+            "Change form hook so the project still compiles.")
+    return have
+
+
+def _reactive_ability_branches(have):
+    """C for the two REACTIVE ability form checks (weather / Schooling) inside
+    TryInBattleFormChange — emitted only for abilities the project has. HP-below
+    (Zen Mode / Shields Down / Power Construct) rides the always-present generic
+    block below the placeholder, so it needs nothing here."""
+    out = ""
+    if "ABILITY_HUNGER_SWITCH" in have:
+        # Hunger Switch manages its own forms via TryHungerSwitchForm's direct forms[0]<->forms[1] toggle
+        # (which ignores the table), so the reactive checker must never revert it — regardless of whether the
+        # project authored FORM_CHANGE_BATTLE_TURN rows. This ability-gated skip makes that robust.
+        out += ("    if (gBattleMons[battler].ability == ABILITY_HUNGER_SWITCH)\n"
+                "        return FALSE;\n")
+    weather = [a for a in ("ABILITY_FORECAST", "ABILITY_FLOWER_GIFT") if a in have]
+    if weather:
+        cond = " || ".join("gBattleMons[battler].ability == %s" % a for a in weather)
+        out += (
+            "    // Forecast / Flower Gift — hold the form matching the current in-battle weather.\n"
+            "    if (target == base && (%s) && WEATHER_HAS_EFFECT)\n"
+            "    {\n"
+            "        for (i = 0; t[i].method != FORM_CHANGE_END; i++)\n"
+            "            if (t[i].method == FORM_CHANGE_BATTLE_WEATHER && (gBattleWeather & t[i].param))\n"
+            "            {\n"
+            "                target = t[i].targetSpecies;\n"
+            "                break;\n"
+            "            }\n"
+            "    }\n" % cond)
+    if "ABILITY_SCHOOLING" in have:
+        out += (
+            "    // Schooling — School form while HP% >= param AND level >= 20.\n"
+            "    if (target == base && gBattleMons[battler].maxHP != 0\n"
+            "        && gBattleMons[battler].ability == ABILITY_SCHOOLING && gBattleMons[battler].level >= 20)\n"
+            "    {\n"
+            "        for (i = 0; t[i].method != FORM_CHANGE_END; i++)\n"
+            "            if (t[i].method == FORM_CHANGE_BATTLE_HP_ABOVE\n"
+            "                && (u32)gBattleMons[battler].hp * 100 / gBattleMons[battler].maxHP >= t[i].param)\n"
+            "            {\n"
+            "                target = t[i].targetSpecies;\n"
+            "                break;\n"
+            "            }\n"
+            "    }\n")
+    return out
+
+
+_HOOK_STANCE = (
+    "// ability port: Stance Change — Blade form on a DAMAGING move / Shield form on a STATUS move, BEFORE the\n"
+    "// move resolves so the new form's stats drive it. Called from Cmd_attackcanceler (past the can't-move gates).\n"
+    "bool8 TryStanceChangeForm(u8 battler, u16 move)\n"
+    "{\n"
+    "    u8 wantMethod;\n"
+    "    u16 target;\n"
+    "    if (gBattleMons[battler].hp == 0 || gBattleMons[battler].ability != ABILITY_STANCE_CHANGE)\n"
+    "        return FALSE;\n"
+    "    wantMethod = (gBattleMoves[move].category == DAMAGE_CATEGORY_STATUS)\n"
+    "        ? FORM_CHANGE_BATTLE_STANCE_SHIELD : FORM_CHANGE_BATTLE_STANCE_BLADE;\n"
+    "    target = FindBattleFormTarget(battler, wantMethod, FALSE, 0);\n"
+    "    if (target != SPECIES_NONE && target != gBattleMons[battler].species)\n"
+    "    {\n"
+    "        MorphBattlerSpecies(battler, target);\n"
+    "        return TRUE;\n"
+    "    }\n"
+    "    return FALSE;\n"
+    "}\n")
+
+_HOOK_HUNGER = (
+    "// ability port: Hunger Switch — toggle between the two forms every end of turn. Guards a 1-form (mis-\n"
+    "// authored) table so forms[1] is never read out of bounds.\n"
+    "bool8 TryHungerSwitchForm(u8 battler)\n"
+    "{\n"
+    "    u16 species = gBattleMons[battler].species;\n"
+    "    const u16 *forms = gSpeciesInfo[species].formSpeciesIdTable;\n"
+    "    u16 target;\n"
+    "    if (gBattleMons[battler].hp == 0 || gBattleMons[battler].ability != ABILITY_HUNGER_SWITCH || forms == NULL)\n"
+    "        return FALSE;\n"
+    "    if (forms[1] == FORM_SPECIES_END)   // needs two forms to toggle\n"
+    "        return FALSE;\n"
+    "    target = (species == forms[0]) ? forms[1] : forms[0];\n"
+    "    if (target != SPECIES_NONE && target != FORM_SPECIES_END && target != species)\n"
+    "    {\n"
+    "        MorphBattlerSpecies(battler, target);\n"
+    "        return TRUE;\n"
+    "    }\n"
+    "    return FALSE;\n"
+    "}\n")
+
+_HOOK_BATTLE_BOND = (
+    "// ability port: Battle Bond — morph once to the bonded form after the holder lands a KO (self-gated;\n"
+    "// naturally once-per-battle, the bonded form has no KO row back).\n"
+    "bool8 TryBattleBondForm(u8 battler)\n"
+    "{\n"
+    "    u16 target;\n"
+    "    if (gBattleMons[battler].hp == 0 || gBattleMons[battler].ability != ABILITY_BATTLE_BOND)\n"
+    "        return FALSE;\n"
+    "    target = FindBattleFormTarget(battler, FORM_CHANGE_BATTLE_KO, FALSE, 0);\n"
+    "    if (target != SPECIES_NONE && target != gBattleMons[battler].species)\n"
+    "    {\n"
+    "        MorphBattlerSpecies(battler, target);\n"
+    "        return TRUE;\n"
+    "    }\n"
+    "    return FALSE;\n"
+    "}\n")
+
+_HOOK_GULP = (
+    "// ability port: Gulp Missile — morph to the gulping form when the holder uses the move in a\n"
+    "// FORM_CHANGE_BATTLE_MOVE row's param (Surf/Dive). (Spit-on-being-hit is a separate TODO.)\n"
+    "bool8 TryGulpMissileForm(u8 battler, u16 move)\n"
+    "{\n"
+    "    u16 target;\n"
+    "    if (gBattleMons[battler].hp == 0 || gBattleMons[battler].ability != ABILITY_GULP_MISSILE)\n"
+    "        return FALSE;\n"
+    "    target = FindBattleFormTarget(battler, FORM_CHANGE_BATTLE_MOVE, TRUE, move);\n"
+    "    if (target != SPECIES_NONE && target != gBattleMons[battler].species)\n"
+    "    {\n"
+    "        MorphBattlerSpecies(battler, target);\n"
+    "        return TRUE;\n"
+    "    }\n"
+    "    return FALSE;\n"
+    "}\n")
+
+_FIND_FORM_TARGET = (
+    "// Shared lookup for the event-driven ability hooks: find the target species of the first row with\n"
+    "// `wantMethod` in this battler's (base form's) table. SPECIES_NONE if none / not form-capable.\n"
+    "static u16 FindBattleFormTarget(u8 battler, u8 wantMethod, bool8 checkParam, u16 matchParam)\n"
+    "{\n"
+    "    u16 species = gBattleMons[battler].species;\n"
+    "    const u16 *forms = gSpeciesInfo[species].formSpeciesIdTable;\n"
+    "    const struct FormChange *t;\n"
+    "    u32 i;\n"
+    "    if (forms == NULL)\n"
+    "        return SPECIES_NONE;\n"
+    "    t = gSpeciesInfo[forms[0]].formChangeTable;\n"
+    "    if (t == NULL)\n"
+    "        return SPECIES_NONE;\n"
+    "    for (i = 0; t[i].method != FORM_CHANGE_END; i++)\n"
+    "        if (t[i].method == wantMethod && (!checkParam || t[i].param == matchParam))\n"
+    "            return t[i].targetSpecies;\n"
+    "    return SPECIES_NONE;\n"
+    "}\n")
+
+
+def _form_ability_hooks(have):
+    """C for the event-driven ability hook functions — only those whose ability the
+    project has. FindBattleFormTarget is emitted only if a hook that uses it is
+    present (avoids an unused-static warning on projects that have only Hunger Switch)."""
+    out = ""
+    uses_lookup = any(a in have for a in
+                      ("ABILITY_STANCE_CHANGE", "ABILITY_BATTLE_BOND", "ABILITY_GULP_MISSILE"))
+    if uses_lookup:
+        out += "\n" + _FIND_FORM_TARGET
+    if "ABILITY_STANCE_CHANGE" in have:
+        out += "\n" + _HOOK_STANCE
+    if "ABILITY_HUNGER_SWITCH" in have:
+        out += "\n" + _HOOK_HUNGER
+    if "ABILITY_BATTLE_BOND" in have:
+        out += "\n" + _HOOK_BATTLE_BOND
+    if "ABILITY_GULP_MISSILE" in have:
+        out += "\n" + _HOOK_GULP
+    return out
+
+
+def _create_in_battle_forms_c(path, project_root):
+    have = _form_change_abilities(project_root)
+    text = (_IN_BATTLE_FORMS_C
+            .replace("/*__REACTIVE_ABILITY_BRANCHES__*/\n", _reactive_ability_branches(have))
+            .replace("/*__FORM_ABILITY_HOOKS__*/\n", _form_ability_hooks(have)))
+    return _write_if_changed(path, text)
 
 
 # DoBattlerEndTurnEffects per-battler state machine: add ENDTURN_FORM_CHANGE just before
@@ -896,6 +1149,102 @@ def _self_check(pokemon_h, types_h, form_c):
         raise RuntimeError("form-change patch self-check: form_change.c missing")
 
 
+# ── Layer C event-ability CALL sites (each gated on its ABILITY_* existing) ──
+# The hook FUNCTIONS are generated into in_battle_forms.c; these insert the CALLS at the
+# right engine points + the prototypes into pokemon.h. All idempotent and ability-gated,
+# so a vanilla decomp (no such ability) gets NO change here.
+_ABILITY_HOOK_PROTOS = {
+    "ABILITY_STANCE_CHANGE": "bool8 TryStanceChangeForm(u8 battler, u16 move);",
+    "ABILITY_HUNGER_SWITCH": "bool8 TryHungerSwitchForm(u8 battler);",
+    "ABILITY_BATTLE_BOND":   "bool8 TryBattleBondForm(u8 battler);",
+    "ABILITY_GULP_MISSILE":  "bool8 TryGulpMissileForm(u8 battler, u16 move);",
+}
+
+# Stance: insert AFTER the can't-move / PP / obedience gates so a paralyzed / asleep /
+# out-of-PP / disobedient mon does NOT flip. The `gHitMarker |= HITMARKER_OBEYS;` that
+# immediately precedes the Magic-Coat bounce check is that point, and (unlike the copy
+# inside the obedience switch) it is uniquely followed by the bounceMove check.
+_STANCE_ANCHOR = ("    gHitMarker |= HITMARKER_OBEYS;\n\n"
+                  "    if (gProtectStructs[gBattlerTarget].bounceMove")
+_STANCE_HOOKED = ("    gHitMarker |= HITMARKER_OBEYS;\n\n"
+                  "    TryStanceChangeForm(gBattlerAttacker, gCurrentMove);   // ability port: Stance Change (pre-move)\n\n"
+                  "    if (gProtectStructs[gBattlerTarget].bounceMove")
+
+# Hunger Switch: end of turn, right after the reactive form check.
+_HUNGER_ANCHOR = ("                TryInBattleFormChange(gActiveBattler);\n"
+                  "                gBattleStruct->turnEffectsTracker++;")
+_HUNGER_HOOKED = ("                TryInBattleFormChange(gActiveBattler);\n"
+                  "                TryHungerSwitchForm(gActiveBattler);   // ability port: Hunger Switch (turn toggle)\n"
+                  "                gBattleStruct->turnEffectsTracker++;")
+
+# Gulp Missile + Battle Bond: at the top of the MOVEEND_FORM_CHANGE case body, before the
+# reactive loop. Gulp self-gates on the move param; Battle Bond gets an inline KO condition.
+_MOVEEND_ABILITY_ANCHOR = (
+    "        case MOVEEND_FORM_CHANGE:  // PorySuite-Z Layer C: reactive in-battle forms\n"
+    "            {\n"
+    "                u32 i;\n")
+_GULP_LINE = ("                TryGulpMissileForm(gBattlerAttacker, gCurrentMove);   // ability port: Gulp Missile (Surf/Dive)\n")
+# Loops ALL battlers for an opposing mon this move just KO'd — not only gBattlerTarget —
+# because MOVEEND_FORM_CHANGE runs ONCE with gBattlerTarget pinned to the last target, so a
+# doubles spread move that KOs the first-processed foe but not the second would otherwise miss.
+# TryBattleBondForm self-gates on the attacker's ability + hp, so the loop only needs the KO.
+_BATTLEBOND_LINES = (
+    "                for (i = 0; i < gBattlersCount; i++)\n"
+    "                    if (gBattleMons[i].hp == 0\n"
+    "                     && GetBattlerSide(i) != GetBattlerSide(gBattlerAttacker)\n"
+    "                     && (gSpecialStatuses[i].physicalDmg != 0 || gSpecialStatuses[i].specialDmg != 0))\n"
+    "                    { TryBattleBondForm(gBattlerAttacker); break; }   // ability port: Battle Bond (KO by this move; doubles-safe)\n")
+
+
+def _patch_battle_ability_hooks(project_root):
+    """Insert the CALL sites for the event-driven form abilities the project has, plus
+    their prototypes. Each is gated on its ABILITY_* existing and is idempotent (skip if
+    the call is already present). A vanilla decomp (none present) makes NO change."""
+    have = _form_change_abilities(project_root)
+    pokemon_h = os.path.join(project_root, "include", "pokemon.h")
+    commands_c = os.path.join(project_root, "src", "battle_script_commands.c")
+    endturn_c = os.path.join(project_root, "src", "battle_util.c")
+    changed = False
+
+    # prototypes (only for the event hooks the project has)
+    if os.path.isfile(pokemon_h):
+        text = _read(pokemon_h)
+        if _PROTO_ANCHOR in text:
+            for ab, proto in _ABILITY_HOOK_PROTOS.items():
+                if ab in have and proto not in text:
+                    text = text.replace(_PROTO_ANCHOR, _PROTO_ANCHOR + proto + "\n", 1)
+            changed = _write_if_changed(pokemon_h, text) or changed
+
+    # Stance Change — attackcanceler, past the can't-move gates (F2)
+    if "ABILITY_STANCE_CHANGE" in have and os.path.isfile(commands_c):
+        text = _read(commands_c)
+        if "TryStanceChangeForm(" not in text and _STANCE_ANCHOR in text:
+            changed = _write_if_changed(
+                commands_c, text.replace(_STANCE_ANCHOR, _STANCE_HOOKED, 1)) or changed
+
+    # Gulp Missile + Battle Bond — move-end form-change case
+    if (("ABILITY_GULP_MISSILE" in have or "ABILITY_BATTLE_BOND" in have)
+            and os.path.isfile(commands_c)):
+        text = _read(commands_c)
+        add = ""
+        if "ABILITY_GULP_MISSILE" in have and "TryGulpMissileForm(" not in text:
+            add += _GULP_LINE
+        if "ABILITY_BATTLE_BOND" in have and "TryBattleBondForm(" not in text:
+            add += _BATTLEBOND_LINES
+        if add and _MOVEEND_ABILITY_ANCHOR in text:
+            changed = _write_if_changed(commands_c, text.replace(
+                _MOVEEND_ABILITY_ANCHOR, _MOVEEND_ABILITY_ANCHOR + add, 1)) or changed
+
+    # Hunger Switch — end of turn
+    if "ABILITY_HUNGER_SWITCH" in have and os.path.isfile(endturn_c):
+        text = _read(endturn_c)
+        if "TryHungerSwitchForm(" not in text and _HUNGER_ANCHOR in text:
+            changed = _write_if_changed(
+                endturn_c, text.replace(_HUNGER_ANCHOR, _HUNGER_HOOKED, 1)) or changed
+
+    return changed
+
+
 def apply_form_change_system(project_root):
     """Apply Layer B form-change infrastructure to *project_root*.
 
@@ -928,13 +1277,15 @@ def apply_form_change_system(project_root):
             os.path.join(project_root, "src", "field_weather_util.c")),
         # Layer C — live in-battle reactive forms (status / HP threshold).
         "in_battle_forms_c": _create_in_battle_forms_c(
-            os.path.join(project_root, "src", "in_battle_forms.c")),
+            os.path.join(project_root, "src", "in_battle_forms.c"), project_root),
         "battle_util_c": _patch_battle_endturn(
             os.path.join(project_root, "src", "battle_util.c")),
         "battle_script_commands_c": _patch_battle_moveend(
             os.path.join(project_root, "src", "battle_script_commands.c"),
             os.path.join(project_root, "include", "constants",
                          "battle_script_commands.h")),
+        # Layer C — event-driven form abilities (Stance/Hunger/Battle Bond/Gulp), gated.
+        "battle_ability_hooks": _patch_battle_ability_hooks(project_root),
     }
     _self_check(pokemon_h, types_h, form_c)
     result["_unhooked"] = _verify_hooks(project_root)   # visible half-wired warning

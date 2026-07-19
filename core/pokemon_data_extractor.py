@@ -786,6 +786,15 @@ class SpeciesDataExtractor(PokemonDataExtractor):
                 while len(si["abilities"]) < len(defaults["abilities"]):
                     si["abilities"].append(defaults["abilities"][len(si["abilities"])])
 
+            # Innate abilities (ability port) — extra passives beyond the main
+            # ability. Not "required" (an empty list is the normal case), just
+            # ensured so the UI/codegen always find the key. Padded to 3 slots.
+            if not isinstance(si.get("innates"), list):
+                si["innates"] = ["ABILITY_NONE", "ABILITY_NONE", "ABILITY_NONE"]
+            else:
+                while len(si["innates"]) < 3:
+                    si["innates"].append("ABILITY_NONE")
+
             valid[name] = info
 
         # Merge Pokédex information so each species has a number and constant

@@ -874,29 +874,78 @@ class GitPanel(QDialog):
         self._main.addWidget(box)
 
     def _refresh_branches(self):
+        from PyQt6.QtGui import QColor
         _, current_raw = self._mw._git_run(
             "rev-parse", "--abbrev-ref", "HEAD", timeout=5
         )
         current = (current_raw or "").strip()
 
-        _, branches_raw = self._mw._git_run(
-            "branch", "--format=%(refname:short)", timeout=5
+        # Local branches WITH their remote-tracking status ([behind N] etc.).
+        _, local_raw = self._mw._git_run(
+            "for-each-ref", "--format=%(refname:short)|%(upstream:track)",
+            "refs/heads/", timeout=5,
         )
-        branches = [b.strip() for b in (branches_raw or "").splitlines() if b.strip()]
+        local_track = {}
+        order = []
+        for line in (local_raw or "").splitlines():
+            if not line.strip():
+                continue
+            name, _, track = line.partition("|")
+            name = name.strip()
+            if name:
+                local_track[name] = track.strip()
+                order.append(name)
+
+        # Remote branches on origin that don't exist locally yet.
+        _, rem_raw = self._mw._git_run(
+            "for-each-ref", "--format=%(refname:short)",
+            "refs/remotes/origin/", timeout=5,
+        )
+        remote_only = []
+        for line in (rem_raw or "").splitlines():
+            r = line.strip()
+            # Only real remote branches (origin/<name>) — skip the bare 'origin'
+            # HEAD symref and origin/HEAD.
+            if not r.startswith("origin/") or r.endswith("/HEAD"):
+                continue
+            short = r[len("origin/"):]
+            if short and short not in local_track:
+                remote_only.append(short)
 
         self._branch_list.clear()
-        for b in branches:
+        for b in order:
             is_cur = b == current
+            track = local_track.get(b, "")
+            if is_cur:
+                status = "  ← current"
+            elif "behind" in track and "ahead" in track:
+                status = "  (diverged — use Pull to reconcile)"
+            elif "behind" in track:
+                n = track.strip("[]").replace("behind", "").strip()
+                status = f"  (update available — {n} behind GitHub)"
+            elif "ahead" in track:
+                n = track.strip("[]").replace("ahead", "").strip()
+                status = f"  ({n} unpushed)"
+            else:
+                status = ""
             item = QListWidgetItem(
-                ("  ✓  " if is_cur else "       ") + b +
-                ("  ← current" if is_cur else "")
-            )
+                ("  ✓  " if is_cur else "       ") + b + status)
             item.setData(256, b)
             item.setData(257, is_cur)
+            item.setData(258, False)  # remote_only
             if is_cur:
-                item.setForeground(
-                    __import__("PyQt6.QtGui", fromlist=["QColor"]).QColor("#7cbb5e")
-                )
+                item.setForeground(QColor("#7cbb5e"))
+            elif "behind" in track:
+                item.setForeground(QColor("#e8a44a"))
+            self._branch_list.addItem(item)
+
+        for b in sorted(remote_only):
+            item = QListWidgetItem(
+                "       " + b + "  (on GitHub — not on this PC yet)")
+            item.setData(256, b)
+            item.setData(257, False)
+            item.setData(258, True)  # remote_only → create a tracking local copy
+            item.setForeground(QColor("#7aa6d6"))
             self._branch_list.addItem(item)
 
     def _on_branch_select(self, row: int):
@@ -909,8 +958,9 @@ class GitPanel(QDialog):
         if not item:
             return
         branch = item.data(256)
-        self._mw._git_checkout_branch(branch)
-        QTimer.singleShot(500, self.refresh)
+        remote_only = bool(item.data(258))
+        self._mw._git_checkout_branch(branch, remote_only=remote_only)
+        QTimer.singleShot(800, self.refresh)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Section 6 — Stash

@@ -54,15 +54,20 @@ def _display_to_suffix(text: str) -> str:
       ♀ → _F, ♂ → _M
       apostrophes and periods → removed (Farfetch'd → FARFETCHD)
       spaces → removed (Bulba Saur → BULBASAUR, not BULBA_SAUR)
-      dashes → underscore (Ho-Oh → HO_OH)
+      dashes → removed (Bago-Bago → BAGOBAGO, Ho-Oh → HOOH)
       any remaining non-alphanumeric-non-underscore char → removed
       uppercase, collapse __ runs, strip leading/trailing underscores
+
+    A C identifier can't contain a hyphen, so a hyphenated display name must lose it. We STRIP it (like spaces)
+    rather than converting to '_': the '_' form (e.g. BAGO_BAGO) can bleed into places that render as game text -- a
+    nickname, a species-name string -- where the font has no '_' glyph and the build/encoder rejects it outright.
+    Stripping keeps the constant a clean alnum token (BAGOBAGO) that is always safe to reuse as a name.
     """
     for sym, repl in _GENDER_MAP:
         text = text.replace(sym, repl)
     text = text.replace("'", "").replace(".", "")
     text = re.sub(r"\s+", "", text)
-    text = re.sub(r"\-+", "_", text)
+    text = re.sub(r"\-+", "", text)
     text = re.sub(r"[^A-Za-z0-9_]", "", text)
     text = re.sub(r"_+", "_", text.upper()).strip("_")
     return text
@@ -255,8 +260,13 @@ class RenameDialog(QDialog):
         self._auto_sync = False
 
     def _enforce_upper(self, text: str) -> None:
-        """Keep the suffix field all-caps with underscores (no spaces)."""
-        upper = text.upper().replace(" ", "")
+        """Keep the constant-suffix field a legal C identifier token as the user types.
+
+        Guard: uppercase and DROP anything that isn't A-Z/0-9/underscore -- spaces, hyphens, apostrophes, etc. A
+        hyphen typed here would otherwise produce an illegal constant (and, if it slipped through, a '_' the game
+        font can't render). Letters/digits/underscore are the only characters a C constant may contain.
+        """
+        upper = re.sub(r"[^A-Z0-9_]", "", text.upper())
         if upper != text:
             cur = self.suffix_edit.cursorPosition()
             self.suffix_edit.blockSignals(True)

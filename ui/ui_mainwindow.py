@@ -361,6 +361,49 @@ class Ui_MainWindow(object):
         )
         # FireRed does not have Hidden Abilities; remove third ability control
         self.verticalLayout_2.addWidget(self.groupBox_abilities)
+        # Innate abilities (ability port) — extra passives assigned per species. The
+        # whole group is hidden by MainWindow when the loaded project has no innate
+        # system (see _apply_innate_ui_visibility), so a vanilla project shows nothing.
+        self.groupBox_innates = QtWidgets.QGroupBox(parent=self.tab_pokemon_stats)
+        self.groupBox_innates.setObjectName("groupBox_innates")
+        self.groupBox_innates.setTitle("Innate Abilities")
+        self.formLayout_innates = QtWidgets.QFormLayout(self.groupBox_innates)
+        self.formLayout_innates.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.formLayout_innates.setObjectName("formLayout_innates")
+        self.label_innate1 = QtWidgets.QLabel(parent=self.groupBox_innates)
+        self.label_innate1.setObjectName("label_innate1")
+        self.label_innate1.setText("Innate 1")
+        self.formLayout_innates.setWidget(
+            0, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_innate1
+        )
+        self.innate1 = QtWidgets.QComboBox(parent=self.groupBox_innates)
+        self.innate1.setObjectName("innate1")
+        self.formLayout_innates.setWidget(
+            0, QtWidgets.QFormLayout.ItemRole.FieldRole, self.innate1
+        )
+        self.label_innate2 = QtWidgets.QLabel(parent=self.groupBox_innates)
+        self.label_innate2.setObjectName("label_innate2")
+        self.label_innate2.setText("Innate 2")
+        self.formLayout_innates.setWidget(
+            1, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_innate2
+        )
+        self.innate2 = QtWidgets.QComboBox(parent=self.groupBox_innates)
+        self.innate2.setObjectName("innate2")
+        self.formLayout_innates.setWidget(
+            1, QtWidgets.QFormLayout.ItemRole.FieldRole, self.innate2
+        )
+        self.label_innate3 = QtWidgets.QLabel(parent=self.groupBox_innates)
+        self.label_innate3.setObjectName("label_innate3")
+        self.label_innate3.setText("Innate 3")
+        self.formLayout_innates.setWidget(
+            2, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_innate3
+        )
+        self.innate3 = QtWidgets.QComboBox(parent=self.groupBox_innates)
+        self.innate3.setObjectName("innate3")
+        self.formLayout_innates.setWidget(
+            2, QtWidgets.QFormLayout.ItemRole.FieldRole, self.innate3
+        )
+        self.verticalLayout_2.addWidget(self.groupBox_innates)
         self.tab_pokemon_stats_grid.addLayout(self.verticalLayout_2, 0, 1, 1, 1)
         self.verticalLayout_4 = QtWidgets.QVBoxLayout()
         self.verticalLayout_4.setSpacing(32)

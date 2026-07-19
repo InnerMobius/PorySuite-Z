@@ -22,16 +22,37 @@ PreviewEntry = Tuple[str, int, str, str]
 # Two mechanisms work together:
 #   1. Path exclusion — the region-map name data and region_map.c (100% place
 #      data, zero species symbols) are skipped entirely by the token sweep.
-#   2. Context guard — anywhere else, a token is left untouched when it is part
-#      of a map/region symbol (preceded by one of these prefixes) or is an
-#      all-caps place-name possessive (`DIGLETT'S CAVE`).
-_MAP_SYMBOL_PREFIX_RE = re.compile(
-    r'(?:sMapsecName_|MAPSEC_|MAP_|gMapPopup\w*|AreaName_|AreaDesc_)$')
+#   2. Context guard (_guarded_token_sub + _PROTECTED_CONST_PREFIXES, below) —
+#      a name token is left untouched when the identifier it sits in starts with
+#      a protected family prefix (MAP_/MAPSEC_/EGG_GROUP_/FLAG_/MUS_/TRAINER_/
+#      OBJ_EVENT_GFX_/…), or when it's an all-caps place-name possessive
+#      (`DIGLETT'S CAVE`).
 
 # Files/dirs (repo-relative, forward slash, lowercase) the SPECIES token sweep
 # must never rewrite — pure map/region-map content.
 _MAP_EXCLUDED_PREFIXES = ("src/data/region_map/",)
 _MAP_EXCLUDED_FILES = ("src/region_map.c",)
+
+# Non-species engine constant families that EMBED a mon name but are NOT the
+# mon's identity. A MON rename must never rewrite a name token inside one of
+# these — they are separate game mechanics / locations / story flags, and a
+# partial cascade breaks the build (the dodrio / gengar / diglett / DITTO class).
+# Audited from clean vanilla pokefirered — every family below actually contains a
+# vanilla mon name:
+#   EGG_GROUP_DITTO, EVO_LEVEL_SHEDINJA/NINJASK/…, FLAG_FOUGHT_DEOXYS /
+#   FLAG_HIDE_* / FLAG_GOT_EEVEE / FLAG_BOUGHT_MAGIKARP, INGAME_TRADE_ELECTRODE,
+#   MUS_JIGGLYPUFF / MUS_VS_MEWTWO / MUS_ENCOUNTER_DEOXYS, OBJ_EVENT_GFX_ARTICUNO
+#   (×39), TRAINER_RIVAL_*_BULBASAUR / TRAINER_CHAMPION_*_*, BATTLE_TYPE_KYOGRE_
+#   GROUDON, MULTICHOICE_POKEJUMP_DODRIO, PLACEHOLDER_ID_KYOGRE — plus MAP/MAPSEC/
+#   region-map place names.
+# These are handled by their own editors, or are pure engine constants; the
+# species token sweep leaves them alone. NOTE: gMon*_, SPECIES_, NATIONAL_DEX_,
+# HOENN_DEX_ are deliberately NOT here — those DO rename with the mon.
+_PROTECTED_CONST_PREFIXES = (
+    "MAP_", "MAPSEC_", "sMapsecName_", "AreaName_", "AreaDesc_", "gMapPopup",
+    "EGG_GROUP_", "EVO_", "FLAG_", "MUS_", "TRAINER_", "OBJ_EVENT_GFX_",
+    "INGAME_TRADE_", "BATTLE_TYPE_", "MULTICHOICE_", "PLACEHOLDER_ID_",
+)
 
 # App-managed JSON caches under src/data/. These get precise, structured rename
 # handling elsewhere in apply_pending (or ARE the rename mapping itself), so the
@@ -63,12 +84,27 @@ def _is_sweep_excluded_path(rel_path: str) -> bool:
 
 
 def _guarded_token_sub(match, line: str, mapping: dict) -> str:
-    """Replacement callback that leaves map/region-map identifiers and all-caps
-    place-name possessives untouched, so a species rename can't corrupt them."""
+    """Replacement callback for the species token sweep.
+
+    Leaves a name token untouched when it is embedded in a NON-species engine
+    constant (EGG_GROUP_DITTO, FLAG_FOUGHT_DEOXYS, MUS_VS_MEWTWO,
+    OBJ_EVENT_GFX_ARTICUNO, TRAINER_RIVAL_*_BULBASAUR, EVO_LEVEL_SHEDINJA,
+    MAP_/MAPSEC_ names, …) or is an all-caps place-name possessive
+    (DIGLETT'S CAVE). Those merely embed a mon/place name but are NOT the
+    species, so renaming them (partially) breaks the build.
+    """
     tok = match.group(0)
-    if _MAP_SYMBOL_PREFIX_RE.search(line[:match.start()]):
-        return tok                       # part of a MAP_/MAPSEC_/sMapsecName_ symbol
-    if line[match.end():match.end() + 1] == "'":
+    s, e = match.start(), match.end()
+    # Widen left to the start of the full surrounding C identifier so a family
+    # prefix that is several words long (FLAG_FOUGHT_, OBJ_EVENT_GFX_,
+    # TRAINER_RIVAL_SILPH_) is recognised, not just the immediate one.
+    i = s
+    while i > 0 and (line[i - 1].isalnum() or line[i - 1] == "_"):
+        i -= 1
+    ident_prefix = line[i:s]             # identifier text BEFORE the matched token
+    if ident_prefix.startswith(_PROTECTED_CONST_PREFIXES):
+        return tok
+    if line[e:e + 1] == "'":
         return tok                       # place-name possessive, e.g. DIGLETT'S CAVE
     return mapping[tok]
 
@@ -90,14 +126,23 @@ class RefactorService:
         self.pending: list[dict] = []
         self._logger = None
         self._changed_files: set[str] = set()
+        # Lazily-parsed map of SPECIES_<BASE> -> real gMonFrontPic_<Camel> symbol,
+        # read from front_pic_table.h.  Needed because a mon's real graphics symbol
+        # is NOT always reconstructible from its constant (Mr. Mime -> Mrmime,
+        # Ho-Oh -> HoOh, Farfetch'd -> Farfetchd, Unown forms, BagoBago, ...).
+        self._front_sym_cache: dict | None = None
 
     def _build_tokens(self, old_const: str, new_const: str, display: str | None) -> list[tuple[re.Pattern, str]]:
         old_base = old_const[len("SPECIES_") :] if old_const.startswith("SPECIES_") else old_const
         new_base = new_const[len("SPECIES_") :] if new_const.startswith("SPECIES_") else new_const
-        old_camel = self._camel(old_base)
+        old_camel = self._real_graphics_camel(old_base)
         new_camel = self._camel(display or new_base)
         old_slug = self._slug(old_base)
-        new_slug = self._slug(display or new_base)
+        # Folder slug MUST come from the CONSTANT, never the display name — the
+        # app resolves a mon's graphics folder via species_slug_from_const()
+        # (strip SPECIES_, lowercase).  A display name like "Bago-Bago" would
+        # inject a separator the constant BAGOBAGO doesn't have -> wrong folder.
+        new_slug = self._slug(new_base)
 
         patterns: list[tuple[re.Pattern, str]] = []
         patterns.append((re.compile(rf"\b{re.escape(old_const)}\b"), new_const))
@@ -708,7 +753,47 @@ class RefactorService:
         return "".join(part.capitalize() for part in base.split())
 
     def _slug(self, name: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        # Graphics folders in pokefirered use UNDERSCORE separators
+        # (graphics/pokemon/mr_mime/, .../bago_bago/) — matching the app's own
+        # species_slug_from_const().  A hyphen here made multi-word mons
+        # (BagoBago, Mr. Mime, Ho-Oh) miss their real folder on rename.
+        return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+    def _front_pic_symbols(self) -> dict:
+        """Parse front_pic_table.h once: SPECIES_<BASE> -> real front-pic Camel.
+
+        The table is the authoritative link between a species constant and its
+        graphics symbol, so it survives vanilla capitalisation quirks that
+        _camel() cannot reproduce.
+        """
+        if self._front_sym_cache is not None:
+            return self._front_sym_cache
+        m: dict[str, str] = {}
+        path = os.path.join(
+            self.util.repo_root(), "src", "data", "pokemon_graphics", "front_pic_table.h"
+        )
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+            for mm in re.finditer(
+                r"SPECIES_SPRITE\(\s*(\w+)\s*,\s*gMonFrontPic_(\w+)\s*\)", txt
+            ):
+                m[mm.group(1)] = mm.group(2)
+        except OSError:
+            pass
+        self._front_sym_cache = m
+        return m
+
+    def _real_graphics_camel(self, base: str) -> str:
+        """Real CamelCase graphics symbol for SPECIES_<base>.
+
+        Reads the actual symbol from front_pic_table.h so renaming a mon whose
+        symbol isn't a clean title-case of its constant (Mr. Mime -> Mrmime,
+        Ho-Oh -> HoOh, BagoBago, Unown forms) still moves its graphics.  Falls
+        back to the naive _camel() for any species not listed in the table.
+        """
+        sym = self._front_pic_symbols().get(base)
+        return sym if sym else self._camel(base)
 
     def rename_species_thorough(self, old_const: str, new_const: str, display_name: str, preview: bool = False) -> List[PreviewEntry]:
         """Rename species constant, display names, references, and assets."""
@@ -718,10 +803,10 @@ class RefactorService:
         # Derive related tokens
         old_base = old_const[len("SPECIES_") :] if old_const.startswith("SPECIES_") else old_const
         new_base = new_const[len("SPECIES_") :] if new_const.startswith("SPECIES_") else new_const
-        old_camel = self._camel(old_base)
+        old_camel = self._real_graphics_camel(old_base)
         new_camel = self._camel(display_name or new_base)
         old_slug = self._slug(old_base)
-        new_slug = self._slug(display_name or new_base)
+        new_slug = self._slug(new_base)  # constant, not display (see _build_tokens)
 
         # 1) Replace common tokens across sources
         pairs = [
@@ -840,7 +925,7 @@ class RefactorService:
         root = self.util.repo_root()
         old_base = old_const[len("SPECIES_"):] if old_const.startswith("SPECIES_") else old_const
         new_base = new_const[len("SPECIES_"):] if new_const.startswith("SPECIES_") else new_const
-        old_camel = self._camel(old_base)
+        old_camel = self._real_graphics_camel(old_base)
         new_camel = self._camel(display_name or new_base)
 
         # species_graphics.json — one preview entry per renamed key
@@ -1067,10 +1152,10 @@ class RefactorService:
                         self._logger("Rolled back plan file writes — token replacements will still run")
                 old_base = old[len("SPECIES_") :] if old.startswith("SPECIES_") else old
                 new_base = new[len("SPECIES_") :] if new.startswith("SPECIES_") else new
-                old_camel = self._camel(old_base)
+                old_camel = self._real_graphics_camel(old_base)
                 new_camel = self._camel(display or new_base)
                 old_slug = self._slug(old_base)
-                new_slug = self._slug(display or new_base)
+                new_slug = self._slug(new_base)  # constant, not display (see _build_tokens)
                 tokens = [
                     (old, new),
                     (f"NATIONAL_DEX_{old_base}", f"NATIONAL_DEX_{new_base}"),
