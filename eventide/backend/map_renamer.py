@@ -325,13 +325,17 @@ class MapRenamer:
         return exe
 
     def _generate_headers(self) -> None:
+        # RELATIVE paths, run from the project root — exactly as the Makefile
+        # invokes mapjson. It writes its directory argument verbatim into the
+        # generated `.include` lines, so an absolute Windows path produces
+        # `.include "C:\GBA\…/events.inc"` and the assembler then fails with
+        # `unexpected escape '\G' in include string`. The generated files are
+        # committed-adjacent build inputs; they must stay portable.
         exe = self._ensure_mapjson()
-        groups = os.path.join(self.root_dir, 'data', 'maps', 'map_groups.json')
         subprocess.run(
-            [exe, 'groups', 'firered', groups,
-             os.path.join(self.root_dir, 'data', 'maps'),
-             os.path.join(self.root_dir, 'include', 'constants')],
-            check=True, capture_output=True, text=True,
+            [exe, 'groups', 'firered', 'data/maps/map_groups.json',
+             'data/maps', 'include/constants'],
+            check=True, capture_output=True, text=True, cwd=self.root_dir,
         )
         map_jsons = []
         for root, dirs, files in os.walk(self.maps_dir):
@@ -342,11 +346,12 @@ class MapRenamer:
                         json.load(fh)
                 except Exception:
                     continue
-                map_jsons.append(path)
+                map_jsons.append(
+                    os.path.relpath(path, self.root_dir).replace(os.sep, '/'))
         subprocess.run(
             [exe, 'event_constants', 'firered', *map_jsons,
-             os.path.join(self.root_dir, 'include', 'constants', 'map_event_ids.h')],
-            check=True, capture_output=True, text=True,
+             'include/constants/map_event_ids.h'],
+            check=True, capture_output=True, text=True, cwd=self.root_dir,
         )
 
     def _rename_map_in_groups(self, group: str, old_map: str, new_map: str):

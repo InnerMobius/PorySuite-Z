@@ -177,7 +177,7 @@ class Ui_MainWindow(object):
         self.tab_pokemon_stats_grid = QtWidgets.QGridLayout(self.tab_pokemon_stats)
         self.tab_pokemon_stats_grid.setObjectName("tab_pokemon_stats_grid")
         self.verticalLayout_3 = QtWidgets.QVBoxLayout()
-        self.verticalLayout_3.setSpacing(32)
+        self.verticalLayout_3.setSpacing(8)
         self.verticalLayout_3.setObjectName("verticalLayout_3")
         self.groupBox_exp = QtWidgets.QGroupBox(parent=self.tab_pokemon_stats)
         self.groupBox_exp.setObjectName("groupBox_exp")
@@ -316,9 +316,10 @@ class Ui_MainWindow(object):
             2, QtWidgets.QFormLayout.ItemRole.FieldRole, self.egg_cycles
         )
         self.verticalLayout_3.addWidget(self.groupBox_gender)
+        self.verticalLayout_3.addStretch(1)
         self.tab_pokemon_stats_grid.addLayout(self.verticalLayout_3, 1, 0, 1, 1)
         self.verticalLayout_2 = QtWidgets.QVBoxLayout()
-        self.verticalLayout_2.setSpacing(32)
+        self.verticalLayout_2.setSpacing(8)
         self.verticalLayout_2.setObjectName("verticalLayout_2")
         self.groupBox_types = QtWidgets.QGroupBox(parent=self.tab_pokemon_stats)
         self.groupBox_types.setObjectName("groupBox_types")
@@ -343,7 +344,7 @@ class Ui_MainWindow(object):
             0, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_17
         )
         self.ability1 = QtWidgets.QComboBox(parent=self.groupBox_abilities)
-        self.ability1.setEditable(True)
+        self.ability1.setMinimumSize(QtCore.QSize(0, 30))
         self.ability1.setObjectName("ability1")
         self.formLayout_3.setWidget(
             0, QtWidgets.QFormLayout.ItemRole.FieldRole, self.ability1
@@ -354,7 +355,7 @@ class Ui_MainWindow(object):
             1, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_50
         )
         self.ability2 = QtWidgets.QComboBox(parent=self.groupBox_abilities)
-        self.ability2.setEditable(True)
+        self.ability2.setMinimumSize(QtCore.QSize(0, 30))
         self.ability2.setObjectName("ability2")
         self.formLayout_3.setWidget(
             1, QtWidgets.QFormLayout.ItemRole.FieldRole, self.ability2
@@ -377,6 +378,7 @@ class Ui_MainWindow(object):
             0, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_innate1
         )
         self.innate1 = QtWidgets.QComboBox(parent=self.groupBox_innates)
+        self.innate1.setMinimumSize(QtCore.QSize(0, 30))
         self.innate1.setObjectName("innate1")
         self.formLayout_innates.setWidget(
             0, QtWidgets.QFormLayout.ItemRole.FieldRole, self.innate1
@@ -388,6 +390,7 @@ class Ui_MainWindow(object):
             1, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_innate2
         )
         self.innate2 = QtWidgets.QComboBox(parent=self.groupBox_innates)
+        self.innate2.setMinimumSize(QtCore.QSize(0, 30))
         self.innate2.setObjectName("innate2")
         self.formLayout_innates.setWidget(
             1, QtWidgets.QFormLayout.ItemRole.FieldRole, self.innate2
@@ -399,14 +402,16 @@ class Ui_MainWindow(object):
             2, QtWidgets.QFormLayout.ItemRole.LabelRole, self.label_innate3
         )
         self.innate3 = QtWidgets.QComboBox(parent=self.groupBox_innates)
+        self.innate3.setMinimumSize(QtCore.QSize(0, 30))
         self.innate3.setObjectName("innate3")
         self.formLayout_innates.setWidget(
             2, QtWidgets.QFormLayout.ItemRole.FieldRole, self.innate3
         )
         self.verticalLayout_2.addWidget(self.groupBox_innates)
+        self.verticalLayout_2.addStretch(1)
         self.tab_pokemon_stats_grid.addLayout(self.verticalLayout_2, 0, 1, 1, 1)
         self.verticalLayout_4 = QtWidgets.QVBoxLayout()
-        self.verticalLayout_4.setSpacing(32)
+        self.verticalLayout_4.setSpacing(8)
         self.verticalLayout_4.setObjectName("verticalLayout_4")
         self.groupBox_heldItems = QtWidgets.QGroupBox(parent=self.tab_pokemon_stats)
         self.groupBox_heldItems.setObjectName("groupBox_heldItems")
@@ -519,13 +524,16 @@ class Ui_MainWindow(object):
             2, QtWidgets.QFormLayout.ItemRole.FieldRole, self.safari_zone_flee_rate
         )
         self.verticalLayout_4.addWidget(self.groupBox_rates)
+        self.verticalLayout_4.addStretch(1)
         self.tab_pokemon_stats_grid.addLayout(self.verticalLayout_4, 1, 1, 1, 1)
         self.horizontalLayout_2 = QtWidgets.QHBoxLayout()
         self.horizontalLayout_2.setObjectName("horizontalLayout_2")
         self.groupBox_baseStats = QtWidgets.QGroupBox(parent=self.tab_pokemon_stats)
         self.groupBox_baseStats.setObjectName("groupBox_baseStats")
         self.formLayout_baseStats = QtWidgets.QFormLayout(self.groupBox_baseStats)
-        self.formLayout_baseStats.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.formLayout_baseStats.setFormAlignment(
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop
+        )
         self.formLayout_baseStats.setObjectName("formLayout_baseStats")
         self.label = QtWidgets.QLabel(parent=self.groupBox_baseStats)
         self.label.setObjectName("label")
@@ -664,7 +672,9 @@ class Ui_MainWindow(object):
         self.groupBox_evYield = QtWidgets.QGroupBox(parent=self.tab_pokemon_stats)
         self.groupBox_evYield.setObjectName("groupBox_evYield")
         self.formLayout_evYield = QtWidgets.QFormLayout(self.groupBox_evYield)
-        self.formLayout_evYield.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.formLayout_evYield.setFormAlignment(
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop
+        )
         self.formLayout_evYield.setObjectName("formLayout_evYield")
         self.label_4 = QtWidgets.QLabel(parent=self.groupBox_evYield)
         self.label_4.setObjectName("label_4")
@@ -794,7 +804,23 @@ class Ui_MainWindow(object):
         )
         self.horizontalLayout_2.addWidget(self.groupBox_evYield)
         self.tab_pokemon_stats_grid.addLayout(self.horizontalLayout_2, 0, 0, 1, 1)
-        self.tab_pokemon_data.addTab(self.tab_pokemon_stats, "")
+        # Keep the two content rows at their natural height and let any leftover
+        # vertical space pool in an empty stretch row at the bottom, so the groups
+        # pack tightly to the top instead of being spread apart by big gaps.
+        self.tab_pokemon_stats_grid.setRowStretch(2, 1)
+        # Wrap the Stats page in a vertical scroll area so its content (which now
+        # includes the Innate Abilities group in the top-right cell) always gets
+        # its full natural height instead of being crushed/clipped when the window
+        # isn't tall enough. Only scrolls vertically; horizontal is disabled.
+        self.tab_pokemon_stats_scroll = QtWidgets.QScrollArea(parent=self.tab_pokemon_data)
+        self.tab_pokemon_stats_scroll.setWidgetResizable(True)
+        self.tab_pokemon_stats_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.tab_pokemon_stats_scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.tab_pokemon_stats_scroll.setObjectName("tab_pokemon_stats_scroll")
+        self.tab_pokemon_stats_scroll.setWidget(self.tab_pokemon_stats)
+        self.tab_pokemon_data.addTab(self.tab_pokemon_stats_scroll, "")
         self.tab_pokemon_evos = QtWidgets.QWidget()
         self.tab_pokemon_evos.setObjectName("tab_pokemon_evos")
         self.tab_pokemon_evos_grid = QtWidgets.QGridLayout(self.tab_pokemon_evos)
@@ -1006,7 +1032,18 @@ class Ui_MainWindow(object):
         self.tree_pokemon.setObjectName("tree_pokemon")
         self.pokemon_list_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, parent=self.tab_pokemon)
         self.pokemon_list_splitter.setObjectName("pokemon_list_splitter")
-        self.pokemon_list_splitter.addWidget(self.tree_pokemon)
+        # Species list column = a search box above the tree.
+        self.species_list_container = QtWidgets.QWidget(parent=self.tab_pokemon)
+        self.species_list_vbox = QtWidgets.QVBoxLayout(self.species_list_container)
+        self.species_list_vbox.setContentsMargins(0, 0, 0, 0)
+        self.species_list_vbox.setSpacing(3)
+        self.species_search = QtWidgets.QLineEdit(parent=self.species_list_container)
+        self.species_search.setPlaceholderText("Search species…")
+        self.species_search.setClearButtonEnabled(True)
+        self.species_search.setObjectName("species_search")
+        self.species_list_vbox.addWidget(self.species_search)
+        self.species_list_vbox.addWidget(self.tree_pokemon)
+        self.pokemon_list_splitter.addWidget(self.species_list_container)
         self.pokemon_list_splitter.addWidget(self.tab_pokemon_data)
         self.pokemon_list_splitter.setStretchFactor(0, 0)
         self.pokemon_list_splitter.setStretchFactor(1, 1)
@@ -1030,12 +1067,28 @@ class Ui_MainWindow(object):
             QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self.list_pokedex_national.setObjectName("list_pokedex_national")
-        self.tab_pokedex_grid.addWidget(self.list_pokedex_national, 1, 0, 1, 1)
+        # National dex column = a search box above the list.
+        self.pokedex_nat_container = QtWidgets.QWidget(parent=self.tab_pokedex)
+        self.pokedex_nat_vbox = QtWidgets.QVBoxLayout(self.pokedex_nat_container)
+        self.pokedex_nat_vbox.setContentsMargins(0, 0, 0, 0)
+        self.pokedex_nat_vbox.setSpacing(3)
+        self.pokedex_national_search = QtWidgets.QLineEdit(parent=self.pokedex_nat_container)
+        self.pokedex_national_search.setPlaceholderText("Search national dex…")
+        self.pokedex_national_search.setClearButtonEnabled(True)
+        self.pokedex_national_search.setObjectName("pokedex_national_search")
+        self.pokedex_nat_vbox.addWidget(self.pokedex_national_search)
+        self.pokedex_nat_vbox.addWidget(self.list_pokedex_national)
+        self.tab_pokedex_grid.addWidget(self.pokedex_nat_container, 1, 0, 1, 1)
         self.label_2 = QtWidgets.QLabel(parent=self.tab_pokedex)
         self.label_2.setObjectName("label_2")
         self.tab_pokedex_grid.addWidget(self.label_2, 0, 0, 1, 1)
         self.verticalLayout = QtWidgets.QVBoxLayout()
         self.verticalLayout.setObjectName("verticalLayout")
+        self.pokedex_regional_search = QtWidgets.QLineEdit(parent=self.tab_pokedex)
+        self.pokedex_regional_search.setPlaceholderText("Search regional dex…")
+        self.pokedex_regional_search.setClearButtonEnabled(True)
+        self.pokedex_regional_search.setObjectName("pokedex_regional_search")
+        self.verticalLayout.addWidget(self.pokedex_regional_search)
         self.list_pokedex_regional = QtWidgets.QListWidget(parent=self.tab_pokedex)
         self.list_pokedex_regional.setDragEnabled(True)
         self.list_pokedex_regional.setDragDropMode(
@@ -1536,7 +1589,7 @@ class Ui_MainWindow(object):
         self.label_13.setText(_translate("MainWindow", "SP.DEF"))
         self.label_14.setText(_translate("MainWindow", "SPEED"))
         self.tab_pokemon_data.setTabText(
-            self.tab_pokemon_data.indexOf(self.tab_pokemon_stats),
+            self.tab_pokemon_data.indexOf(self.tab_pokemon_stats_scroll),
             _translate("MainWindow", "Stats"),
         )
         self.groupBox_evos.setTitle(_translate("MainWindow", "Evolutions"))

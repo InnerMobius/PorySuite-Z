@@ -5,11 +5,12 @@ Ported from TriforceGUI/LayoutRenamer.py. All paths relative to root_dir.
 """
 
 import os
+import re
 import json
 import subprocess
 from typing import List, Tuple
 
-from eventide.backend.file_utils import replace_repo_wide
+from eventide.backend.file_utils import replace_repo_wide, is_text_file
 
 
 class LayoutRenamer:
@@ -60,7 +61,10 @@ class LayoutRenamer:
             layout['id'] = new_id
             layout['name'] = layout['name'].replace(
                 old_id.replace('LAYOUT_', ''), new_id.replace('LAYOUT_', ''))
-            replace_repo_wide(self.root_dir, [(old_id, new_id)])
+            # whole_word: renaming LAYOUT_HOUSE3 must not rewrite
+            # the middle of LAYOUT_HOUSE30.
+            replace_repo_wide(self.root_dir, [(old_id, new_id)],
+                              whole_word=True)
         self.save_layouts()
 
     def _ensure_mapjson(self) -> str:
@@ -75,13 +79,15 @@ class LayoutRenamer:
         return exe
 
     def _generate_headers(self) -> None:
+        # RELATIVE paths, run from the project root — see map_renamer. mapjson
+        # writes its directory argument verbatim into the generated `.include`
+        # lines, so an absolute Windows path bakes `C:\GBA\…` into them and the
+        # assembler fails on the `\G` escape.
         exe = self._ensure_mapjson()
-        layouts = os.path.join(self.root_dir, 'data', 'layouts', 'layouts.json')
         subprocess.run(
-            [exe, 'layouts', 'firered', layouts,
-             os.path.join(self.root_dir, 'data', 'layouts'),
-             os.path.join(self.root_dir, 'include', 'constants')],
-            check=True,
+            [exe, 'layouts', 'firered', 'data/layouts/layouts.json',
+             'data/layouts', 'include/constants'],
+            check=True, cwd=self.root_dir,
         )
 
     def maps_using_layout(self, layout_id: str) -> List[str]:
@@ -100,6 +106,61 @@ class LayoutRenamer:
                 continue
         return matches
 
+    def _layout_folder(self, layout: dict) -> str:
+        """The layout's own directory under data/layouts, or '' if it has none.
+
+        `os.path.basename(os.path.dirname(blockdata_filepath))` returns
+        ``"layouts"`` for any entry whose blockdata sits directly in
+        ``data/layouts/`` rather than in a subfolder — and that value used to be
+        fed to a repo-wide search-and-replace. Deleting one such layout deleted
+        the word "layouts" from every text file in the project: `data/layouts/`
+        became `data//`, `constants/layouts.h` became `constants/.h`, and the
+        `"layouts"` key in layouts.json became `""`. Anything that resolves to
+        the layouts directory itself is not a per-layout folder.
+        """
+        raw = layout.get('blockdata_filepath') or ''
+        folder = os.path.basename(os.path.dirname(raw))
+        if not folder or os.path.normcase(folder) == 'layouts':
+            return ''
+        candidate = os.path.join(self.layouts_dir, folder)
+        if not os.path.isdir(candidate):
+            return ''
+        return folder
+
+    def references_outside_generated(self, layout_id: str) -> List[str]:
+        """Files naming this layout that a regeneration will NOT rewrite.
+
+        `data/layouts/layouts.inc`, `layouts_table.inc` and
+        `include/constants/layouts.h` are produced by mapjson, so a reference
+        there disappears on its own. A reference anywhere else is real code,
+        and blanking it (as this class used to) turns it into a syntax error
+        instead of a clean removal.
+        """
+        generated = {
+            os.path.normcase(os.path.join(self.layouts_dir, 'layouts.inc')),
+            os.path.normcase(os.path.join(self.layouts_dir, 'layouts_table.inc')),
+            os.path.normcase(os.path.join(self.root_dir, 'include', 'constants',
+                                          'layouts.h')),
+            os.path.normcase(self.layouts_json),
+        }
+        hits: List[str] = []
+        pattern = re.compile(r'\b%s\b' % re.escape(layout_id))
+        for root, dirs, files in os.walk(self.root_dir):
+            dirs[:] = [d for d in dirs if d not in ('.git', 'build')]
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.normcase(path) in generated:
+                    continue
+                if not is_text_file(path):
+                    continue
+                try:
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        if pattern.search(f.read()):
+                            hits.append(os.path.relpath(path, self.root_dir))
+                except OSError:
+                    continue
+        return hits
+
     def delete_layout(self, layout_id: str):
         layout = None
         for l in self.data.get('layouts', []):
@@ -111,9 +172,15 @@ class LayoutRenamer:
         refs = self.maps_using_layout(layout_id)
         if refs:
             raise ValueError(f"Layout {layout_id} is used by {len(refs)} map(s)")
-        folder = os.path.basename(os.path.dirname(layout['blockdata_filepath']))
-        layout_path = os.path.join(self.layouts_dir, folder)
-        if os.path.isdir(layout_path):
+        code_refs = self.references_outside_generated(layout_id)
+        if code_refs:
+            raise ValueError(
+                "%s is still referred to by %d file(s), so deleting it would "
+                "break the build:\n  %s\nRemove those references first."
+                % (layout_id, len(code_refs), "\n  ".join(code_refs[:10])))
+        folder = self._layout_folder(layout)
+        if folder:
+            layout_path = os.path.join(self.layouts_dir, folder)
             for root, dirs, files in os.walk(layout_path, topdown=False):
                 for name in files:
                     os.remove(os.path.join(root, name))
@@ -122,7 +189,9 @@ class LayoutRenamer:
             os.rmdir(layout_path)
         self.data['layouts'].remove(layout)
         self.save_layouts()
-        replace_repo_wide(self.root_dir, [(layout_id, ''), (folder, '')])
+        # NO repo-wide text replacement. The only other places this id appears
+        # are the generated tables, which _generate_headers rewrites from the
+        # JSON — and every non-generated reference was refused above.
         self._generate_headers()
 
     def clean_orphaned_layouts(self) -> int:
@@ -130,17 +199,23 @@ class LayoutRenamer:
         removed_ids: List[str] = []
         removed_folders: List[str] = []
         for layout in self.data.get('layouts', [])[:]:
-            folder = os.path.basename(os.path.dirname(layout['blockdata_filepath']))
+            raw = layout.get('blockdata_filepath') or ''
+            folder = os.path.basename(os.path.dirname(raw))
+            # An entry whose blockdata sits directly in data/layouts has no
+            # folder of its own; treating "layouts" as one made this routine
+            # delete the word from every file in the project.
+            if not folder or os.path.normcase(folder) == 'layouts':
+                continue
             layout_path = os.path.join(self.layouts_dir, folder)
-            if not os.path.isdir(layout_path) and not self.maps_using_layout(layout['id']):
+            if not os.path.isdir(layout_path) \
+                    and not self.maps_using_layout(layout['id']) \
+                    and not self.references_outside_generated(layout['id']):
                 self.data['layouts'].remove(layout)
                 removed_ids.append(layout['id'])
                 removed_folders.append(folder)
         if removed_ids:
             self.save_layouts()
-            repls: List[Tuple[str, str]] = []
-            repls += [(lid, '') for lid in removed_ids]
-            repls += [(f, '') for f in removed_folders]
-            replace_repo_wide(self.root_dir, repls)
+            # NO repo-wide text replacement — see delete_layout. Regenerating
+            # the tables from the JSON is what removes these ids.
             self._generate_headers()
         return len(removed_ids)

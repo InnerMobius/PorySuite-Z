@@ -288,8 +288,41 @@ def parse_color_runs(text: str) -> tuple[str, list[tuple[int, int, str]]]:
     return "".join(plain_chars), runs
 
 
+_COLOR_SHADOW_PAIR_RE = re.compile(r"\{COLOR (\w+)\}\s*\{SHADOW (\w+)\}")
+_TRAILING_RESET_RE = re.compile(
+    r"\{COLOR DARK_GRAY\}(?:\{SHADOW LIGHT_GRAY\})?\$?\s*$")
+
+
+def color_shadow_context(raw: str) -> dict:
+    """What the ROUND TRIP would otherwise throw away.
+
+    Two pieces of the author's original that the parse discards and the emit
+    then guesses at — badly:
+
+    * **the actual SHADOW paired with each colour.** `parse_color_runs` records
+      only the foreground, and emit re-derives the shadow from a three-entry
+      table (RED/GREEN/BLUE). Any other pairing is LOST: 104 of this project's
+      labels use `{COLOR DYNAMIC_COLOR6}{SHADOW DYNAMIC_COLOR5}`, and a save
+      silently dropped the shadow.
+    * **whether the text ended with an explicit colour reset.** Emitting one
+      unconditionally added 36 characters to every string that didn't have one
+      — 23 in this project, against exactly 1 that did.
+
+    Carried through `escape_map`, which `inc_to_display` has returned empty and
+    `display_to_inc` has ignored since the line-break rework; it exists purely
+    for call-site compatibility, so it can carry this without changing any
+    signature.
+    """
+    pairs: dict = {}
+    for m in _COLOR_SHADOW_PAIR_RE.finditer(raw or ""):
+        pairs.setdefault(m.group(1), m.group(2))
+    return {"shadows": pairs,
+            "trailing_reset": bool(_TRAILING_RESET_RE.search(raw or ""))}
+
+
 def emit_color_runs(plain_text: str,
-                    color_runs: list[tuple[int, int, str]]) -> str:
+                    color_runs: list[tuple[int, int, str]],
+                    context: dict | None = None) -> str:
     """Turn a plain string + list of color runs back into a token-laden
     string suitable for ``.inc`` output.
 
@@ -310,25 +343,44 @@ def emit_color_runs(plain_text: str,
     if not color_runs:
         return plain_text
 
+    ctx = context or {}
+    observed = ctx.get("shadows") or {}
+    keep_trailing_reset = ctx.get("trailing_reset", True)
+
     out: list[str] = []
     cursor = 0
+    n = len(plain_text)
     for start, end, color in sorted(color_runs):
         if start < cursor:
             # Overlapping run — skip to maintain valid output. This
             # shouldn't happen in normal use but defends against bugs.
             continue
         out.append(plain_text[cursor:start])
-        shadow = paired_shadow.get(color)
+        # The shadow the AUTHOR wrote wins over the three-entry guess table.
+        shadow = observed.get(color) or paired_shadow.get(color)
         if shadow:
             out.append(f"{{COLOR {color}}}{{SHADOW {shadow}}}")
         else:
             out.append(f"{{COLOR {color}}}")
         out.append(plain_text[start:end])
-        if shadow:
-            out.append("{COLOR DARK_GRAY}{SHADOW LIGHT_GRAY}")
-        else:
-            out.append("{COLOR DARK_GRAY}")
-        cursor = end
+        # Put the reset AFTER any line breaks that immediately follow, which is
+        # where the source files put it: `…question?\p{COLOR DARK_GRAY}…`, not
+        # `…question?{COLOR DARK_GRAY}\p…`. Both render identically, but
+        # emitting it before the break rewrote 26 of the Fame Checker's strings
+        # on a save that changed nothing.
+        after = end
+        while after < n and plain_text[after] == "\n":
+            after += 1
+        out.append(plain_text[end:after])
+        # A reset is only needed when text FOLLOWS the run. At end-of-text it
+        # is optional, and adding one the source didn't have is a 36-character
+        # change to data nobody edited.
+        if after < n or keep_trailing_reset:
+            if shadow:
+                out.append("{COLOR DARK_GRAY}{SHADOW LIGHT_GRAY}")
+            else:
+                out.append("{COLOR DARK_GRAY}")
+        cursor = after
     out.append(plain_text[cursor:])
     return "".join(out)
 
@@ -336,7 +388,7 @@ def emit_color_runs(plain_text: str,
 # ── Conversion helpers (.inc / EVENTide internal <-> display) ──────────────
 
 
-def inc_to_display(raw: str) -> tuple[str, list[str], list[tuple[int, int, str]]]:
+def inc_to_display(raw: str) -> tuple[str, dict, list[tuple[int, int, str]]]:
     """Convert ``.inc`` text into display form for the rich editor.
 
     Returns ``(plain_text, escape_map, color_runs)``:
@@ -381,14 +433,18 @@ def inc_to_display(raw: str) -> tuple[str, list[str], list[tuple[int, int, str]]
     # Strip color tokens, capture runs.
     plain_text, color_runs = parse_color_runs(text_with_nl_emoji)
 
-    # escape_map is returned empty — kept in the tuple purely for call-site
-    # signature compatibility (set_inc_text / set_eventide_text unpack it).
-    return plain_text, [], color_runs
+    # The second slot was the old line-break `escape_map`, returned empty and
+    # ignored ever since the break kind moved into the text structure. It now
+    # carries what the colour parse would otherwise discard — the author's own
+    # SHADOW pairings and whether the text ended with a reset — so a save
+    # reproduces the source instead of re-deriving it from a guess table.
+    # Callers only ever pass it straight back to `display_to_inc`.
+    return plain_text, color_shadow_context(raw), color_runs
 
 
 def display_to_inc(plain_text: str,
                    color_runs: list[tuple[int, int, str]],
-                   escape_map: list[str] | None = None) -> str:
+                   escape_map: dict | None = None) -> str:
     """Convert display state back to ``.inc`` form.
 
     Uses ``escape_map`` (from ``inc_to_display``) to restore the
@@ -402,7 +458,8 @@ def display_to_inc(plain_text: str,
     before newline conversion so the color run positions still apply
     in the post-emoji string.
     """
-    text = emit_color_runs(plain_text, color_runs)
+    ctx = escape_map if isinstance(escape_map, dict) else None
+    text = emit_color_runs(plain_text, color_runs, ctx)
     text = _replace_emoji_glyphs(text)
 
     # Line breaks back to escapes via the blank-line convention (the inverse of
@@ -418,7 +475,7 @@ def display_to_inc(plain_text: str,
     return result
 
 
-def eventide_to_display(internal: str) -> tuple[str, list[str], list[tuple[int, int, str]]]:
+def eventide_to_display(internal: str) -> tuple[str, dict, list[tuple[int, int, str]]]:
     """Convert EVENTide's internal form (real ``\\n`` and ``\\n\\n``)
     into display state for the rich editor."""
     inc = internal.replace("\n\n", "\\p").replace("\n", "\\n")
@@ -427,7 +484,7 @@ def eventide_to_display(internal: str) -> tuple[str, list[str], list[tuple[int, 
 
 def display_to_eventide(plain_text: str,
                         color_runs: list[tuple[int, int, str]],
-                        escape_map: list[str] | None = None) -> str:
+                        escape_map: dict | None = None) -> str:
     """Convert display state back to EVENTide's internal form."""
     inc = display_to_inc(plain_text, color_runs, escape_map)
     result = inc.rstrip("$")
@@ -546,13 +603,24 @@ def _document_to_color_runs(
             it += 1
         block = block.next()
 
-    # Merge adjacent same-color runs into one.
+    # Merge same-colour runs that are adjacent, OR separated only by line
+    # breaks.
+    #
+    # The document stores each line as its own block, so a colour spanning a
+    # line break arrives as two fragments with the break's newline character
+    # sitting between them — `r[0] == last[1]` is false by exactly that one
+    # position. Without this, a four-page coloured message came back with the
+    # colour closed and re-opened around every page: 86 of the Fame Checker's
+    # 324 strings grew by a pair of colour tokens per line on a save that
+    # changed nothing.
     if not runs:
         return runs
+    plain = edit.toPlainText()
     merged: list[tuple[int, int, str]] = [runs[0]]
     for r in runs[1:]:
         last = merged[-1]
-        if r[0] == last[1] and r[2] == last[2]:
+        gap = plain[last[1]:r[0]]
+        if r[2] == last[2] and (not gap or not gap.strip("\n")):
             merged[-1] = (last[0], r[1], last[2])
         else:
             merged.append(r)
@@ -624,7 +692,12 @@ class GameTextEdit(QWidget):
         layout.addWidget(self._counter)
 
         # Escape map for round-tripping \n / \p / \l
-        self._escape_map: list[str] = []
+        self._escape_map: dict = {}
+        # Snapshot of what was loaded, so an untouched field round-trips
+        # byte-exactly. See `_remember_source`.
+        self._source_inc: Optional[str] = None
+        self._source_plain: str = ""
+        self._source_runs = None
 
         # Highlighter — only blue-bolds {COMMAND} tokens now.
         self._highlighter = _CommandHighlighter(self._edit.document())
@@ -644,18 +717,103 @@ class GameTextEdit(QWidget):
         formats; emoji tokens become Unicode glyphs."""
         plain, self._escape_map, color_runs = inc_to_display(raw)
         self._set_document_text(plain, color_runs)
+        self._remember_source(raw)
 
     def get_inc_text(self) -> str:
         """Serialize the document back to ``.inc`` form (with color
-        tokens, emoji tokens, and the trailing ``$``)."""
+        tokens, emoji tokens, and the trailing ``$``).
+
+        NOT a pure function of the visible document: when `set_inc_text`
+        seeded a snapshot and nothing has changed since, this returns that
+        original text verbatim (see `_remember_source`). A caller that builds
+        a widget and reads it WITHOUT seeding gets regeneration instead of
+        passthrough — correct, but worth knowing before relying on either.
+        """
+        unchanged = self._source_if_unchanged()
+        if unchanged is not None:
+            return unchanged
         plain = self._edit.toPlainText()
         runs = _document_to_color_runs(
             self._edit, _COLOR_PREVIEW_HEX[self._implicit_color_name])
         return display_to_inc(plain, runs, self._escape_map)
 
+    # ── "unchanged content produces unchanged bytes" ───────────────────────
+
+    def unrepresentable_reason(self) -> str:
+        """Why editing THIS text would lose something, or "".
+
+        The document model holds visible text plus the colours it has names
+        for. Anything else — a colour outside the preview table, a
+        `{HIGHLIGHT}`, load-bearing trailing spaces — survives an untouched
+        save only because the snapshot returns the original verbatim. The
+        moment the user edits, it is regenerated from the model and that
+        detail is gone.
+
+        The information is already in hand at snapshot time, so say so at the
+        moment it matters rather than leaving it as a documented footnote.
+        """
+        raw = self._source_inc
+        if not raw:
+            return ""
+        unknown = sorted({
+            m.group(2) for m in _COLOR_TOKEN_RE.finditer(raw)
+            if m.group(1) in ("COLOR", "SHADOW")
+            and m.group(2) not in _COLOR_PREVIEW_HEX})
+        if unknown:
+            return ("This text uses colours this editor can't show ("
+                    + ", ".join(unknown[:3])
+                    + ") — editing it will lose them.")
+        if "{HIGHLIGHT" in raw:
+            return ("This text uses a highlight this editor can't show — "
+                    "editing it will lose it.")
+        if raw != raw.rstrip() and raw.rstrip():
+            return ("This text ends in spaces that do something in game — "
+                    "editing it will remove them.")
+        return ""
+
+    def _remember_source(self, raw: str) -> None:
+        """Snapshot what was loaded, so an untouched field can be re-emitted
+        verbatim instead of regenerated.
+
+        The document model is deliberately LOSSY — it holds visible text plus
+        the colours it has names for, which is the right shape for editing but
+        cannot represent everything a `.string` can carry. Regenerating from it
+        therefore rewrites things nobody edited: a `{HIGHLIGHT}`, a colour the
+        preview table doesn't know (`DYNAMIC_COLOR6` came back with the colour
+        gone entirely), trailing spaces that are load-bearing, or a reset token
+        on the other side of a page break.
+
+        Chasing those one at a time is endless — each is a different way the
+        model is narrower than the format. The general answer is the same one
+        the file writer uses: if nothing changed, emit exactly what came in.
+        Any real edit — a keystroke or a colour change — falls through to
+        normal regeneration.
+        """
+        self._source_inc = raw
+        self._source_plain = self._edit.toPlainText()
+        try:
+            self._source_runs = _document_to_color_runs(
+                self._edit, _COLOR_PREVIEW_HEX[self._implicit_color_name])
+        except Exception:                            # pragma: no cover
+            self._source_runs = None
+
+    def _source_if_unchanged(self):
+        """The originally-loaded text, or None if the user has edited it."""
+        if self._source_inc is None or self._source_runs is None:
+            return None
+        if self._edit.toPlainText() != self._source_plain:
+            return None
+        try:
+            now = _document_to_color_runs(
+                self._edit, _COLOR_PREVIEW_HEX[self._implicit_color_name])
+        except Exception:                            # pragma: no cover
+            return None
+        return self._source_inc if now == self._source_runs else None
+
     def set_eventide_text(self, internal: str) -> None:
         plain, self._escape_map, color_runs = eventide_to_display(internal)
         self._set_document_text(plain, color_runs)
+        self._remember_source(None)   # EVENTide's form differs from .inc
 
     def get_eventide_text(self) -> str:
         plain = self._edit.toPlainText()

@@ -99,9 +99,30 @@ def _read(path: str) -> str:
 
 
 def _write(path: str, content: str) -> None:
-    with open(path, "w", encoding="utf-8", errors="surrogateescape",
-              newline="\n") as fh:
-        fh.write(content)
+    """Replace *path* atomically.
+
+    These are the user's GAME FILES — `src/strings.c`, `data/maps/*/text.inc`.
+    Opening with "w" truncates first, so a crash, a full disk or a killed
+    process between the truncate and the write leaves the file destroyed with
+    no copy anywhere. Write a sibling temp file and `os.replace` it, which is
+    atomic on the same filesystem. The palette writer already worked this way
+    and explained why; the text writer did not — tolerable only while nothing
+    in the app actually wrote text.
+    """
+    tmp = f"{path}.tmp{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape",
+                  newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ── strings.c parser ──────────────────────────────────────────────────────────
@@ -209,8 +230,13 @@ def _parse_strings_c(project_dir: str) -> list[TextEntry]:
 
 # ── text.inc parser (map dialogue) ────────────────────────────────────────────
 
+# A label may carry a trailing `@ 0x81AD106` address comment, and so may any
+# of its `.string` lines — decomp text files are full of them. Requiring a bare
+# newline after `::` silently skipped every commented label: 129 of the 334 in
+# fame_checker.inc alone, which is why that category listed a partial set.
 _ASM_LABEL_RE = re.compile(
-    r"^(\w+)::\s*\n((?:[ \t]+\.string\s+\"[^\"]*\"[ \t]*\n?)+)",
+    r"^(\w+)::[ \t]*(?:@[^\n]*)?\n"
+    r"((?:[ \t]+\.string\s+\"[^\"]*\"[ \t]*(?:@[^\n]*)?\n?)+)",
     re.MULTILINE,
 )
 
@@ -507,6 +533,24 @@ def _parse_all_map_dialogue(project_dir: str) -> list[TextEntry]:
 
 # ── Common scripts scanner ────────────────────────────────────────────────────
 
+# data/text/*.inc files that are plain `.string` label blocks. `fame_checker`
+# already had a character limit and a Text Editor category, but nothing ever
+# parsed the file — so that category listed nothing, and the Fame Checker tab
+# had no writer to share. Both fixed by indexing it here: one index, and the
+# existing per-label in-place writer, rather than a second writer that would
+# have to re-emit the whole file and delete the labels other systems own.
+_DATA_TEXT_INC_FILES: list[tuple[str, str, str]] = [
+    ("data/text/fame_checker.inc", "fame_checker", "Fame Checker"),
+]
+
+
+def _parse_data_text_inc(project_dir: str) -> list[TextEntry]:
+    entries: list[TextEntry] = []
+    for rel, cat, subcat in _DATA_TEXT_INC_FILES:
+        entries.extend(_parse_text_inc(project_dir, rel, cat, subcat))
+    return entries
+
+
 def _parse_common_scripts(project_dir: str) -> list[TextEntry]:
     """Scan data/scripts/*.inc for text labels."""
     scripts_dir = os.path.join(project_dir, "data", "scripts")
@@ -641,9 +685,19 @@ def _encode_gba_linebreaks(content: str) -> str:
       * each subsequent break in that para  -> ``\\l``  (scroll up one line)
     """
     s = content.replace("\r\n", "\n").replace("\r", "\n")
-    # Collapse existing literal escapes to real newlines so we re-derive the
-    # breaks from one canonical form (longest first: \p before \n/\l).
-    s = s.replace("\\p", "\n\n").replace("\\l", "\n").replace("\\n", "\n")
+
+    # NEVER re-derive breaks the author already wrote. Collapsing existing
+    # `\n`/`\l`/`\p` to newlines and re-deriving them REWRITES THE AUTHOR'S
+    # CHOICES: `a\nb\nc` came back as `a\nb\lc`, and `\l` SCROLLS where `\n`
+    # starts a line — different rendering, from a save the user did not ask
+    # for. It silently altered 77 lines of `new_game_intro.inc` and 126 of
+    # `strings.c` on a no-op rewrite.
+    #
+    # Real newlines are the only thing that needs converting: they come from a
+    # plain-text editor and cannot go into a `.string` at all.
+    if "\n" not in s:
+        return s
+
     out_paras = []
     for para in re.split(r"\n[ \t]*\n", s):           # blank line == paragraph
         lines = para.split("\n")
@@ -655,33 +709,61 @@ def _encode_gba_linebreaks(content: str) -> str:
     return "\\p".join(out_paras)
 
 
-def _save_c_string(entry: TextEntry) -> None:
+def _save_c_string(entry: TextEntry) -> bool:
     """Write back a modified C string (_("...")) to its source file."""
     text = _read(entry.file_path)
     if not text:
-        return
+        return False        # unreadable file: NOT a successful save
 
     # A GBA C string (`_("...")`) uses the same \n / \l / \p escapes — a raw
     # newline would be an unterminated string literal and fail the build.
-    content = _encode_gba_linebreaks(entry.content)
+    #
+    # Stop a caller ADDING a terminator, without removing one the file already
+    # had.
+    #
+    # `preproc` appends 0xFF to every `_()` string unconditionally
+    # (`tools/preproc/c_file.cpp`; only the `__()` form skips it, and
+    # `_C_STRING_RE` cannot match `__(`), so a `$` here is redundant — and
+    # `GameTextEdit.get_inc_text()` appends one because it generates the
+    # `.string` form. Left alone that wrote `_("NAME$")` and the `$` became
+    # part of the name. Fixing it in one tab left every other caller exposed,
+    # so the rule belongs here.
+    #
+    # But STRIPPING unconditionally broke the writer's own invariant: 13
+    # labels in this project already carry a redundant `$`, and rewriting them
+    # with unchanged content then altered the file. Unchanged content must
+    # produce unchanged bytes — so the file's existing convention wins, and it
+    # is read FROM THE FILE at the moment of writing (see the lambda below).
+    #
+    # It must NOT come from `entry.original`: that is the DIRTY-DETECTION
+    # model, and `mark_clean()` overwrites it with `content` after every
+    # successful save. It answers "has the user changed anything since the
+    # last save", which only coincides with "what convention does the file
+    # use" until the first save — after which a second edit silently dropped
+    # the terminator.
+    content = _encode_gba_linebreaks(entry.content).rstrip("$")
 
     pattern = re.compile(
         r'(\b' + re.escape(entry.label) +
         r'\s*\[\s*\]\s*=\s*_\(\s*")((?:[^"\\]|\\.)*)("\s*\)\s*;)',
     )
     new_text, n = pattern.subn(
-        lambda m: m.group(1) + content + m.group(3),
+        lambda m: (m.group(1) + content
+                   + ("$" if m.group(2).rstrip().endswith("$") else "")
+                   + m.group(3)),
         text, count=1,
     )
-    if n > 0:
-        _write(entry.file_path, new_text)
+    if n == 0:
+        return False        # nothing matched: the edit was NOT written
+    _write(entry.file_path, new_text)
+    return True
 
 
-def _save_asm_string(entry: TextEntry) -> None:
+def _save_asm_string(entry: TextEntry) -> bool:
     """Write back a modified .string block to its .inc file."""
     text = _read(entry.file_path)
     if not text:
-        return
+        return False        # unreadable file: NOT a successful save
 
     # GBA `.string` content MUST use line-break ESCAPES (\n / \l / \p), NEVER a
     # raw newline — a literal newline inside `.string "..."` is unterminated and
@@ -698,12 +780,15 @@ def _save_asm_string(entry: TextEntry) -> None:
 
     # Add GBA null-terminator
     segments[-1] = segments[-1].rstrip("$") + "$"
-    lines = "".join(f"\t.string \"{seg}\"\n" for seg in segments)
-    new_block = f"{entry.label}::\n{lines}"
 
+    # Must accept the trailing `@ 0x81AD106` address comment on the label line
+    # and on any `.string` line — the same blind spot the READER had. Without
+    # it this pattern silently matched nothing, `subn` returned 0, and the
+    # entry was still marked clean: a save that reported success and wrote
+    # nothing, for every commented label in the project.
     pattern = re.compile(
-        r"^" + re.escape(entry.label) + r"::\s*\n"
-        r"(?:[ \t]+\.string\s+\"[^\"]*\"[ \t]*\n?)+",
+        r"^" + re.escape(entry.label) + r"::[ \t]*(?:@[^\n]*)?\n"
+        r"(?:[ \t]+\.string\s+\"[^\"]*\"[ \t]*(?:@[^\n]*)?\n?)+",
         re.MULTILINE,
     )
     # IMPORTANT: pass the replacement as a FUNCTION, not a string. re.sub treats a
@@ -711,39 +796,74 @@ def _save_asm_string(entry: TextEntry) -> None:
     # so the `\n` in our `.string "...\n"` would be turned into a REAL newline
     # (the unterminated-.string build break) and a `\l` would raise "bad escape
     # \l". A function replacement is inserted VERBATIM, escapes intact.
-    new_text, n = pattern.subn(lambda _m: new_block, text, count=1)
-    if n > 0:
-        _write(entry.file_path, new_text)
+    def _replace(m):
+        # If the encoded value is what the block already says, re-emit the
+        # block VERBATIM. These files split a string across `.string` lines to
+        # their own taste — some keep a whole four-page message on one line —
+        # and re-segmenting at every escape would reformat a label nobody
+        # changed. Unchanged content must produce unchanged bytes.
+        existing = "".join(re.findall(r'\.string\s+"([^"]*)"', m.group(0)))
+        if existing.rstrip("$") == "".join(segments).rstrip("$"):
+            return m.group(0)
+
+        # Re-emit the label line EXACTLY as found rather than rebuilding it —
+        # rebuilding normalised the whitespace before the `@ 0x…` address
+        # comment, putting a spurious line in the diff.
+        block = m.group(0).split("\n")
+        head = block[0]
+
+        # ...and take the `.string` INDENT from the block being replaced rather
+        # than imposing one. Hardcoding a tab reformatted every `.string` line
+        # of the edited label in the 291 indexed `.inc` files that use four
+        # spaces — turning a one-word change into an N-line diff, in files
+        # Porymap also writes and in the user's own hand-written content. The
+        # lines under the label need the same rule as the label line itself.
+        indent = "\t"
+        for ln in block[1:]:
+            lead = ln[:len(ln) - len(ln.lstrip(" \t"))]
+            if lead and ".string" in ln:
+                indent = lead
+                break
+        body = "".join(f"{indent}.string \"{seg}\"\n" for seg in segments)
+        return f"{head}\n{body}"
+
+    new_text, n = pattern.subn(_replace, text, count=1)
+    if n == 0:
+        return False
+    _write(entry.file_path, new_text)
+    return True
 
 
-def _save_name_label(entry: TextEntry) -> None:
+def _save_name_label(entry: TextEntry) -> bool:
     """Write back a name pool label (.string "NAME$")."""
     text = _read(entry.file_path)
     if not text:
-        return
+        return False        # unreadable file: NOT a successful save
     val = entry.content.rstrip("$") + "$"
     pattern = re.compile(
         r"(" + re.escape(entry.label) + r"::\s*\n\s*\.string\s+\")[^\"]*\"",
         re.MULTILINE,
     )
     new_text, n = pattern.subn(lambda m: m.group(1) + val + '"', text, count=1)
-    if n > 0:
-        _write(entry.file_path, new_text)
+    if n == 0:
+        return False        # nothing matched: the edit was NOT written
+    _write(entry.file_path, new_text)
+    return True
 
 
-def _save_json_region_map(entries: list[TextEntry]) -> None:
+def _save_json_region_map(entries: list[TextEntry]) -> bool:
     """Write back all modified location name entries to the JSON file."""
     if not entries:
-        return
+        return False
     path = entries[0].file_path
     text = _read(path)
     if not text:
-        return
+        return False
 
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        return
+        return False
 
     # Find the list
     arr = data
@@ -755,8 +875,9 @@ def _save_json_region_map(entries: list[TextEntry]) -> None:
 
     updates = {e.label: e.content for e in entries if e.is_dirty}
     if not updates:
-        return
+        return False
 
+    wrote = 0
     if isinstance(arr, list):
         for item in arr:
             if not isinstance(item, dict):
@@ -775,30 +896,66 @@ def _save_json_region_map(entries: list[TextEntry]) -> None:
 
 # ── Save dispatcher ───────────────────────────────────────────────────────────
 
-def save_dirty_entries(entries: list[TextEntry]) -> None:
-    """Save all dirty entries back to their source files."""
+
+def save_dirty_entries(entries: list[TextEntry]) -> list[str]:
+    """Save all dirty entries back to their source files.
+
+    Returns the labels that could NOT be written. An entry is marked clean only
+    when its writer confirms it actually replaced something — a writer whose
+    pattern matches nothing used to return quietly and the entry was marked
+    clean anyway, so the edit vanished and the UI reported success.
+    """
+    failed: list[str] = []
     dirty = [e for e in entries if e.is_dirty]
     if not dirty:
-        return
+        return failed
+
+    # Every writer re-reads the file and replaces ONE occurrence, so two dirty
+    # entries naming the same label would each overwrite the other and both be
+    # marked clean — one edit silently lost. There is no correct pick between
+    # them, so refuse both and say which.
+    seen: dict[str, int] = {}
+    for e in dirty:
+        seen[e.label] = seen.get(e.label, 0) + 1
+    duplicates = {lbl for lbl, n in seen.items() if n > 1}
+    if duplicates:
+        failed.extend(sorted(duplicates))
+        dirty = [e for e in dirty if e.label not in duplicates]
 
     # Group JSON entries for batch save
     json_entries = [e for e in dirty if e.format == "json_region_map"]
     if json_entries:
-        _save_json_region_map(json_entries)
-        for e in json_entries:
-            e.mark_clean()
+        if _save_json_region_map(json_entries):
+            for e in json_entries:
+                e.mark_clean()
+        else:
+            failed.extend(e.label for e in json_entries)
 
     # Save remaining entries individually
     for entry in dirty:
         if entry.format == "json_region_map":
             continue  # already saved
-        if entry.format == "c_string":
-            _save_c_string(entry)
-        elif entry.format == "asm_string":
-            _save_asm_string(entry)
-        elif entry.format == "name_label":
-            _save_name_label(entry)
+        # `False` by DEFAULT. An unrecognised format used to fall through with
+        # ok=True and be marked clean without any writer running — the last
+        # remaining lying save, and the one that would greet whoever adds a new
+        # format next.
+        ok = False
+        try:
+            if entry.format == "c_string":
+                ok = _save_c_string(entry)
+            elif entry.format == "asm_string":
+                ok = _save_asm_string(entry)
+            elif entry.format == "name_label":
+                ok = _save_name_label(entry)
+        except OSError:
+            # Per-entry, so one unwritable file doesn't abandon the rest of the
+            # batch halfway with the caller unable to tell what reached disk.
+            ok = False
+        if not ok:
+            failed.append(entry.label)
+            continue                  # stays dirty, so the user can retry
         entry.mark_clean()
+    return failed
 
 
 # ── Master index builder ──────────────────────────────────────────────────────
@@ -823,6 +980,7 @@ class TextIndex:
         self.entries.extend(_parse_battle_messages(project_dir))
         self.entries.extend(_parse_all_map_dialogue(project_dir))
         self.entries.extend(_parse_common_scripts(project_dir))
+        self.entries.extend(_parse_data_text_inc(project_dir))
         self.entries.extend(_parse_data_text_h(project_dir))
 
         # Build label lookup

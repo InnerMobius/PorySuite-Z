@@ -2674,24 +2674,41 @@ class PokemonMoves(pokemon_data.PokemonMoves):
             except Exception:
                 tut_text = ""
             if tut_text:
-                def _rebuild_tutor_line(sp: str) -> str | None:
+                # Valid tutor moves = the RHS of the engine's sTutorMoves[] table.
+                # A move not in here has no TUTOR_MOVE_* constant, so writing
+                # TUTOR(<it>) would expand to an undefined symbol and break the
+                # build — filter those out (auto-repair of mis-saved data).
+                valid_tutor: set = set()
+                _tm = re.search(
+                    r"sTutorMoves\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", tut_text, re.DOTALL)
+                if _tm:
+                    valid_tutor = set(re.findall(r"=\s*(MOVE_[A-Z0-9_]+)", _tm.group(1)))
+
+                def _rebuild_tutor_line(sp: str) -> str:
                     entries = [e for e in species_moves.get(sp, []) if _method(e) == "TUTOR"]
-                    if not entries:
-                        return None
-                    tokens = [f"TUTOR({e.get('move')})" for e in entries if e.get('move')]
-                    if not tokens:
-                        return None
-                    return " "+"\n                         | ".join(sorted(tokens))
+                    seen: list = []
+                    for e in entries:
+                        mv = e.get("move")
+                        if mv and (not valid_tutor or mv in valid_tutor) and mv not in seen:
+                            seen.append(mv)
+                    if not seen:
+                        return " 0"   # existing line with no valid tutors -> reset to 0
+                    tokens = [f"TUTOR({mv})" for mv in sorted(seen)]
+                    return " " + "\n                         | ".join(tokens)
 
                 def _tut_sub(m):
                     sp = m.group(1)
-                    repl = _rebuild_tutor_line(sp)
-                    return f"[{sp}] ={repl}," if repl else m.group(0)
+                    return f"[{sp}] ={_rebuild_tutor_line(sp)},"
 
+                # DOTALL + non-greedy so MULTI-LINE bitmask entries
+                # ([SPECIES_X] = TUTOR(A)\n | TUTOR(B),) are matched and rewritten,
+                # not only single-line ones. species_moves holds every species read
+                # from this same file, so a matched line always has complete data.
                 tut_text = re.sub(
-                    r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*[^\n]+\,",
+                    r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*.*?,",
                     _tut_sub,
                     tut_text,
+                    flags=re.DOTALL,
                 )
                 rel_tutor, tutor_exists = self._header_for_key("TUTOR_SETS_H")
                 if tutor_exists:

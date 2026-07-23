@@ -9,14 +9,14 @@ Tree columns
 ------------
   Name      — map folder name (the code identifier; what every operation acts on)
   In-Game   — area name from region_map_sections.json, ALL CAPS as stored on disk
-  Section   — raw MAPSEC constant from map.json (what "Rename Section" changes)
+  Section   — raw MAPSEC constant from map.json (what "Change Section" sets)
   Layout    — raw layout ID from map.json (read-only reference)
 
 The In-Game column lets the user scan visually for the human-readable area
 ("S.S. ANNE", "VIRIDIAN FOREST") instead of having to recognise every folder
 name. It is read-only — it only reflects what the Section maps to in the
 region map JSON. To change it, edit the region map JSON or change the
-Section assignment with "Rename Section".
+Section assignment with "Change Section".
 """
 
 import os
@@ -159,8 +159,8 @@ class MapsTab(QWidget):
             "<b>Layout</b> = tilemap this map uses."
             "<br><br>"
             "<b>Save model:</b> "
-            "<span style='color:#9ad'>Set In-Game Name</span> and "
-            "<span style='color:#9ad'>Rename Section</span> are "
+            "<span style='color:#9ad'>Change Section</span> and "
+            "<span style='color:#9ad'>Rename Area</span> are "
             "<b>staged</b> in memory — press <b>Save</b> (or Ctrl+S) to "
             "write, <b>F5</b> to discard. "
             "<span style='color:#f99'>Rename Map, Move Map, Delete Map, "
@@ -212,28 +212,28 @@ class MapsTab(QWidget):
             "Regenerates header constants via mapjson.\n\n"
             "Not staged — confirms write directly to disk. Cannot be "
             "undone from within the app.")
-        self.btn_rename_ingame = QPushButton("Set In-Game Name")
+        self.btn_change_section = QPushButton("Change Section")
+        self.btn_change_section.setToolTip(
+            "STAGED — write on Save.\n\n"
+            "Set which section (MAPSEC) this map belongs to — move it to an "
+            "existing section (dropdown), or create a brand-new section for "
+            "it. Only this map changes; every other map keeps its section. "
+            "(To rename a section's in-game name, use 'Rename Area'.)\n\n"
+            "Held in memory until Save / Ctrl+S. F5 discards.")
+        self.btn_rename_ingame = QPushButton("Rename Area")
         self.btn_rename_ingame.setToolTip(
             "STAGED — write on Save.\n\n"
-            "Set the human-readable area name shown in-game. Three "
-            "options inside:\n"
-            "  • Assign an existing area (swap this one map only).\n"
-            "  • Create a new area just for this map (split it off).\n"
-            "  • Rename the current area globally (affects all maps "
-            "sharing the MAPSEC).\n\n"
-            "Edits are held in memory until you press Save / Ctrl+S. "
-            "Press F5 to discard.")
-        self.btn_rename_section = QPushButton("Rename Section")
-        self.btn_rename_section.setToolTip(
-            "STAGED — write on Save.\n\n"
-            "Type a MAPSEC constant directly to reassign this map's "
-            "in-game area (lower-level than 'Set In-Game Name'). Edits "
-            "the region_map_section field in map.json only.\n\n"
+            "Rename the in-game area NAME of this map's current section — "
+            "affects EVERY map that shares that section. Edits the name in "
+            "region_map_sections.json.\n\n"
+            "(To move this map to a different section, or make a new one, "
+            "use 'Change Section'.)\n\n"
             "Held in memory until Save / Ctrl+S. F5 discards.")
         self.btn_move_map = QPushButton("Move Map")
         self.btn_move_map.setToolTip(
             "IMMEDIATE WRITE.\n\n"
-            "Moves this map into a different group in map_groups.json. "
+            "Moves this map into a different GROUP in map_groups.json (not "
+            "its section — use 'Change Section' for that). "
             "If moved into an Indoor group, attempts to inherit the "
             "MAPSEC from sibling maps in that group.\n\n"
             "Not staged — confirms write directly to disk.")
@@ -245,9 +245,9 @@ class MapsTab(QWidget):
             "reference to its MAP_* constant with MAP_UNDEFINED across "
             "the project source, and regenerates headers.\n\n"
             "Not staged. Cannot be undone from within the app.")
-        for btn in (self.btn_rename_map, self.btn_rename_ingame,
-                    self.btn_rename_section, self.btn_move_map,
-                    self.btn_delete_map):
+        for btn in (self.btn_rename_map, self.btn_change_section,
+                    self.btn_rename_ingame,
+                    self.btn_move_map, self.btn_delete_map):
             btn.setEnabled(False)
             maps_box_l.addWidget(btn)
         groups_row.addWidget(maps_box, 4)
@@ -285,7 +285,7 @@ class MapsTab(QWidget):
         maint_box_l = QHBoxLayout(maint_box)
         self.btn_save = QPushButton("Save")
         self.btn_save.setToolTip(
-            "Writes all staged Set In-Game Name and Rename Section edits "
+            "Writes all staged Change Section and Rename Area edits "
             "to disk in one pass. The same flush also runs when you press "
             "Ctrl+S anywhere in the app.\n\n"
             "Has no effect on folder renames, deletes, group ops, or "
@@ -363,7 +363,7 @@ class MapsTab(QWidget):
         self.btn_rename_group.clicked.connect(self._on_rename_group)
         self.btn_create_group.clicked.connect(self._on_create_group)
         self.btn_delete_group.clicked.connect(self._on_delete_group)
-        self.btn_rename_section.clicked.connect(self._on_rename_section)
+        self.btn_change_section.clicked.connect(self._on_change_section)
         self.btn_move_map.clicked.connect(self._on_move_map)
         self.btn_delete_map.clicked.connect(self._on_delete_map)
         self.btn_save.clicked.connect(self.save)
@@ -415,7 +415,7 @@ class MapsTab(QWidget):
 
         for btn in (self.btn_rename_map, self.btn_rename_ingame,
                     self.btn_rename_group, self.btn_create_group,
-                    self.btn_delete_group, self.btn_rename_section,
+                    self.btn_delete_group, self.btn_change_section,
                     self.btn_move_map, self.btn_delete_map,
                     self.btn_clean_maps, self.btn_check_warps,
                     self.btn_clean_warps):
@@ -519,7 +519,7 @@ class MapsTab(QWidget):
 
                 # Name      — folder name (unique code identifier)
                 # In-Game   — area name driven by Section (read-only)
-                # Section   — raw MAPSEC constant (edited by Rename Section)
+                # Section   — raw MAPSEC constant (edited by Change Section)
                 # Layout    — raw layout id (read-only reference)
                 map_item = QTreeWidgetItem(group_item,
                                            [map_folder, area_name,
@@ -746,318 +746,95 @@ class MapsTab(QWidget):
             return rms_path, json.load(f)
 
     def _on_rename_ingame(self):
-        """Set the in-game area name for the selected map.
+        """Rename the in-game area NAME of the selected map's current section.
 
-        Three modes:
-          A) Assign an existing MAPSEC (swap this map into a different
-             named area; doesn't affect any other map).
-          B) Create a new MAPSEC just for this map (splits it off from
-             whatever it currently shares; gives it a unique name).
-          C) Rename the current MAPSEC globally (affects every map that
-             shares it; explicit warning + scope listed).
+        Affects EVERY map that shares this MAPSEC (the name lives once per
+        MAPSEC in region_map_sections.json). Staged; written on Save.
+        (Moving a map to a different section is done by 'Change Section'.)
         """
         data = self._selected_item_data()
         if not data or data.get("type") != "map":
-            QMessageBox.information(self, "Set In-Game Name",
+            QMessageBox.information(self, "Rename Area",
                                     "Select a map in the tree first.")
             return
-
         folder = data["folder"]
-        cur_section = data.get("section", "") or "MAPSEC_NONE"
+        cur_section = self._effective_section(
+            folder, self._read_disk_section(folder)) or "MAPSEC_NONE"
         cur_name = self._mapsec_names.get(cur_section, "")
         shared = self._maps_sharing_section(cur_section)
-        # Existing sections sorted by display name for the dropdown.
-        all_sections = sorted(self._mapsec_names.items(),
-                              key=lambda kv: (kv[1], kv[0]))
+        if not cur_name:
+            QMessageBox.information(
+                self, "Rename Area",
+                f"This map's section ({cur_section}) has no in-game name "
+                f"entry in region_map_sections.json yet.\n\nUse 'Change "
+                f"Section' to move it to a named section or create a new one.")
+            return
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Set In-Game Name")
-        dlg.setMinimumWidth(580)
+        dlg.setWindowTitle("Rename Area")
+        dlg.setMinimumWidth(560)
         outer = QVBoxLayout(dlg)
-
-        # Header: which map, current state.
         header = QLabel(
-            f"<b>Map:</b> <code>{folder}</code><br>"
-            f"<b>Currently:</b> "
-            f"{cur_name + ' ' if cur_name else ''}"
-            f"<small><code>({cur_section})</code></small>"
-        )
+            f"<b>Section:</b> <small><code>{cur_section}</code></small><br>"
+            f"<b>Current in-game name:</b> {cur_name}")
         header.setTextFormat(Qt.TextFormat.RichText)
         outer.addWidget(header)
-
-        # Up-front explainer of what "in-game name" means and how the three
-        # options differ — beginners shouldn't have to infer this from
-        # radio labels alone.
         intro = QLabel(
-            "<small>"
-            "The <b>in-game name</b> is the area label the player sees "
-            "(e.g. <i>VIRIDIAN FOREST</i>, <i>S.S. ANNE</i>). It is "
-            "stored once per <b>MAPSEC constant</b> in "
-            "<code>region_map_sections.json</code>, and many maps can "
-            "share the same MAPSEC — which is why renaming one shared "
-            "name renames it everywhere unless you split it off first."
-            "</small>"
-        )
+            f"<small>Renames the in-game area name for <b>every map sharing "
+            f"this section</b> ({len(shared)} map(s)). Edits the name field "
+            f"of <code>{cur_section}</code> in region_map_sections.json."
+            f"<br><i>To move THIS map to a different section instead, use "
+            f"'Change Section'.</i></small>")
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#bbb; padding: 2px 0 6px 0;")
         outer.addWidget(intro)
 
-        # ── Mode group ──────────────────────────────────────────────────────
-        mode_group = QButtonGroup(dlg)
-
-        _MODE_DESC_SS = "color:#9aa0a6; padding: 0 0 4px 22px;"
-
-        # MODE A: assign existing
-        a_box = QGroupBox()
-        a_box_l = QVBoxLayout(a_box)
-        a_radio = QRadioButton(
-            "Pick an existing in-game area for this map only")
-        a_radio.setChecked(True)
-        mode_group.addButton(a_radio, 0)
-        a_box_l.addWidget(a_radio)
-        a_desc = QLabel(
-            "<small>"
-            "Reassigns this map's MAPSEC to point at one of the areas "
-            "already defined in the region map. <b>Only this single map "
-            "changes</b> — every other map keeps its current area. The "
-            "in-game text already exists, so nothing new is added to the "
-            "region map data."
-            "<br><i>Use this when you want this map to display the same "
-            "area name as some other existing area.</i>"
-            "</small>"
-        )
-        a_desc.setWordWrap(True)
-        a_desc.setStyleSheet(_MODE_DESC_SS)
-        a_box_l.addWidget(a_desc)
-        a_combo = QComboBox()
-        # Prevent wheel scrolling per CLAUDE.md UI rules.
-        a_combo.wheelEvent = lambda e: e.ignore()
-        for sec_id, sec_name in all_sections:
-            label = f"{sec_name}   —   {sec_id}" if sec_name else sec_id
-            a_combo.addItem(label, sec_id)
-        # Pre-select current
-        for i in range(a_combo.count()):
-            if a_combo.itemData(i) == cur_section:
-                a_combo.setCurrentIndex(i)
-                break
-        a_box_l.addWidget(a_combo)
-        outer.addWidget(a_box)
-
-        # MODE B: create new
-        b_box = QGroupBox()
-        b_box_l = QVBoxLayout(b_box)
-        b_radio = QRadioButton(
-            "Make this map its own brand-new area")
-        mode_group.addButton(b_radio, 1)
-        b_box_l.addWidget(b_radio)
-        b_desc = QLabel(
-            "<small>"
-            "Adds a fresh entry to <code>region_map_sections.json</code> "
-            "with a new MAPSEC constant and the name you give it, then "
-            "points this map at it. <b>Splits this map off</b> from any "
-            "MAPSEC it currently shares with others — those other maps "
-            "are not touched."
-            "<br>The new area will not be placed on the world map "
-            "automatically — open the Region Map editor afterwards if "
-            "you want it visible there."
-            "<br><i>Use this when you want this map to have a "
-            "<b>unique</b> in-game name nothing else uses.</i>"
-            "</small>"
-        )
-        b_desc.setWordWrap(True)
-        b_desc.setStyleSheet(_MODE_DESC_SS)
-        b_box_l.addWidget(b_desc)
-        b_form = QFormLayout()
-
-        # Name field with counter (max 18 — engine buffer is mapName[19]).
-        b_name = QLineEdit()
-        b_name.setPlaceholderText("e.g. NORTH WING")
-        b_name.setToolTip(
-            "Convention: ALL CAPS to match the project's in-game text. "
-            f"Hard limit: {INGAME_NAME_LENGTH} characters "
+        form = QFormLayout()
+        edit = QLineEdit(cur_name)
+        edit.setToolTip(
+            "The new in-game name every map sharing this section will "
+            f"display.\n\nHard limit: {INGAME_NAME_LENGTH} characters "
             "(engine buffer is u8 mapName[19]).")
-        b_name_counter = QLabel()
-        b_name_row = QHBoxLayout()
-        b_name_row.setContentsMargins(0, 0, 0, 0)
-        b_name_row.setSpacing(6)
-        b_name_row.addWidget(b_name)
-        b_name_row.addWidget(b_name_counter)
-        _attach_char_counter(b_name, b_name_counter, INGAME_NAME_LENGTH)
-        b_form.addRow("New name:", b_name_row)
-
-        # MAPSEC constant field. Auto-syncs to the name as the user types,
-        # but stops as soon as they manually edit the constant — and
-        # resumes if they clear it back to empty (sensible recovery).
-        taken = set(self._mapsec_names.keys())
-        initial_const = self._suggest_mapsec_const(folder, taken)
-        b_const = QLineEdit(initial_const)
-        b_const.setToolTip(
-            "MAPSEC_* constant identifier. Auto-fills from the name as "
-            "you type — edit it manually to override (auto-fill stops "
-            "until you clear the field).\n\n"
-            f"Soft limit: {MAPSEC_CONST_LENGTH} characters.")
-        b_const_counter = QLabel()
-        b_const_row = QHBoxLayout()
-        b_const_row.setContentsMargins(0, 0, 0, 0)
-        b_const_row.setSpacing(6)
-        b_const_row.addWidget(b_const)
-        b_const_row.addWidget(b_const_counter)
-        _attach_char_counter(b_const, b_const_counter, MAPSEC_CONST_LENGTH)
-        b_form.addRow("MAPSEC constant:", b_const)
-
-        # Auto-sync state machine: tracks whether the user has overridden
-        # the auto-fill. Suppresses the const→state guard during our own
-        # programmatic writes so we don't see them as user edits.
-        b_state = {"auto": True, "suppress": False}
-
-        def _const_from_name() -> str:
-            txt = b_name.text()
-            base = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', txt)
-            base = re.sub(r'[^A-Za-z0-9]+', '_', base).strip('_').upper()
-            cand = f"MAPSEC_{base}" if base else ""
-            if not cand:
-                return ""
-            # Ensure uniqueness against existing MAPSECs.
-            if cand not in taken:
-                return cand
-            n = 2
-            while f"{cand}_{n}" in taken:
-                n += 1
-            return f"{cand}_{n}"
-
-        def _on_name_changed(_text=None):
-            if not b_state["auto"]:
-                return
-            new_const = _const_from_name()
-            if new_const and new_const != b_const.text():
-                b_state["suppress"] = True
-                b_const.setText(new_const[:MAPSEC_CONST_LENGTH])
-                b_state["suppress"] = False
-
-        def _on_const_changed(_text=None):
-            if b_state["suppress"]:
-                return
-            # Manual edit detected → leave auto-fill mode.
-            # If the user clears the field back to empty, resume auto-fill.
-            if b_const.text() == "":
-                b_state["auto"] = True
-                _on_name_changed()
-            else:
-                b_state["auto"] = False
-
-        b_name.textChanged.connect(_on_name_changed)
-        b_const.textChanged.connect(_on_const_changed)
-
-        b_box_l.addLayout(b_form)
-        outer.addWidget(b_box)
-
-        # MODE C: rename current globally
-        c_box = QGroupBox()
-        c_box_l = QVBoxLayout(c_box)
-        c_radio = QRadioButton(
-            f"Rename the current area for everyone "
-            f"({len(shared)} map(s) share this MAPSEC)")
-        mode_group.addButton(c_radio, 2)
-        c_box_l.addWidget(c_radio)
-        c_desc = QLabel(
-            "<small>"
-            "Edits the <i>name</i> field of the current MAPSEC entry in "
-            f"<code>region_map_sections.json</code>. <b>Every map "
-            f"sharing <code>{cur_section}</code> will start displaying "
-            "the new name</b> — listed below so you can see the scope "
-            "before applying."
-            "<br><i>Use this when you want to rename the area itself "
-            "(e.g. you decided <i>PALLET TOWN</i> should now be called "
-            "<i>HYRULE FIELD</i> across the whole project).</i>"
-            "</small>"
-        )
-        c_desc.setWordWrap(True)
-        c_desc.setStyleSheet(_MODE_DESC_SS)
-        c_box_l.addWidget(c_desc)
-        c_form = QFormLayout()
-        c_edit = QLineEdit(cur_name)
-        c_edit.setToolTip(
-            "The new global name — every map sharing the current MAPSEC "
-            "will display this.\n\n"
-            f"Hard limit: {INGAME_NAME_LENGTH} characters "
-            "(engine buffer is u8 mapName[19]).")
-        c_counter = QLabel()
-        c_row = QHBoxLayout()
-        c_row.setContentsMargins(0, 0, 0, 0)
-        c_row.setSpacing(6)
-        c_row.addWidget(c_edit)
-        c_row.addWidget(c_counter)
-        _attach_char_counter(c_edit, c_counter, INGAME_NAME_LENGTH)
-        c_form.addRow("New name:", c_row)
+        counter = QLabel()
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        row.addWidget(edit)
+        row.addWidget(counter)
+        _attach_char_counter(edit, counter, INGAME_NAME_LENGTH)
+        form.addRow("New name:", row)
         if len(shared) > 1:
-            others = ', '.join(shared[:8]) + (
-                ' …' if len(shared) > 8 else '')
-            c_scope = QLabel(
-                f"<small><b>Will rename for:</b> {others}</small>")
-            c_scope.setWordWrap(True)
-            c_form.addRow(c_scope)
-        c_box_l.addLayout(c_form)
-        if not cur_name:
-            c_radio.setEnabled(False)
-            c_radio.setToolTip(
-                "Disabled — the current MAPSEC has no entry in "
-                "region_map_sections.json yet.")
-        outer.addWidget(c_box)
-
-        # Enable/disable inputs based on selected mode.
-        def _sync():
-            a_combo.setEnabled(a_radio.isChecked())
-            b_name.setEnabled(b_radio.isChecked())
-            b_const.setEnabled(b_radio.isChecked())
-            c_edit.setEnabled(c_radio.isChecked() and c_radio.isEnabled())
-        for r in (a_radio, b_radio, c_radio):
-            r.toggled.connect(_sync)
-        _sync()
+            others = ', '.join(shared[:8]) + (' …' if len(shared) > 8 else '')
+            scope = QLabel(f"<small><b>Will rename for:</b> {others}</small>")
+            scope.setWordWrap(True)
+            form.addRow(scope)
+        outer.addLayout(form)
 
         note = QLabel(
-            "<small>"
-            "<b>Save model:</b> all three options are <b>staged in "
-            "memory</b> when you click OK — nothing is written to disk "
-            "yet. Press <b>Save</b> on the Map Manager (or Ctrl+S "
-            "anywhere in the app) to flush all staged edits. Press "
-            "<b>F5</b> to discard them and reload from disk."
-            "</small>"
-        )
+            "<small><b>Staged</b> when you click OK — press <b>Save</b> "
+            "(Ctrl+S) to write, <b>F5</b> to discard.</small>")
         note.setStyleSheet("color:#8fc; padding: 4px;")
         note.setWordWrap(True)
         outer.addWidget(note)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
-        )
+            QDialogButtonBox.StandardButton.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         outer.addWidget(btns)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-
-        try:
-            mode = mode_group.checkedId()
-            if mode == 0:
-                self._apply_ingame_assign(folder, a_combo.currentData(),
-                                          cur_section)
-            elif mode == 1:
-                self._apply_ingame_create(folder,
-                                          b_name.text().strip(),
-                                          b_const.text().strip(),
-                                          cur_section)
-            elif mode == 2:
-                self._apply_ingame_rename_global(cur_section,
-                                                 c_edit.text().strip(),
-                                                 cur_name, shared)
-            else:
-                return
-        except Exception as e:
-            QMessageBox.critical(self, "Set In-Game Name", str(e))
+        new_name = edit.text().strip()
+        if not new_name or new_name == cur_name:
             return
-
+        try:
+            self._apply_ingame_rename_global(cur_section, new_name,
+                                             cur_name, shared)
+        except Exception as e:
+            QMessageBox.critical(self, "Rename Area", str(e))
+            return
         self._populate_tree()
         self._apply_dirty_styling()
         self.data_changed.emit()
@@ -1277,31 +1054,187 @@ class MapsTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Delete Group", str(e))
 
-    def _on_rename_section(self):
-        """Reassign a map's MAPSEC by typing the constant directly.
-
-        Lower-level than 'Set In-Game Name' — useful when you already know
-        the constant. Stages the change in memory like the other section
-        ops; nothing is written until Save.
+    def _on_change_section(self):
+        """Set which section (MAPSEC) a map belongs to — move it to an existing
+        section, or create a brand-new one for it. Only this map changes.
+        Staged; nothing is written until Save.
         """
         data = self._selected_item_data()
         if not data or data.get("type") != "map":
-            QMessageBox.information(self, "Rename Section",
+            QMessageBox.information(self, "Change Section",
                                     "Select a map in the tree first.")
             return
         folder = data["folder"]
-        old_section = self._effective_section(folder,
-                                              self._read_disk_section(folder))
-        new_section, ok = QInputDialog.getText(
-            self, "Rename Section",
-            f"New region_map_section for '{folder}':", text=old_section)
-        if not ok or not new_section.strip() or new_section == old_section:
+        old_section = self._effective_section(
+            folder, self._read_disk_section(folder))
+        cur_name = self._mapsec_names.get(old_section, "")
+        sections = sorted(self._mapsec_names.items(),
+                          key=lambda kv: (kv[1] or kv[0], kv[0]))
+        taken = set(self._mapsec_names.keys())
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Change Section")
+        dlg.setMinimumWidth(560)
+        outer = QVBoxLayout(dlg)
+        header = QLabel(
+            f"<b>Map:</b> <code>{folder}</code><br>"
+            f"<b>Currently:</b> {cur_name + ' ' if cur_name else ''}"
+            f"<small><code>({old_section})</code></small>")
+        header.setTextFormat(Qt.TextFormat.RichText)
+        outer.addWidget(header)
+
+        mode_group = QButtonGroup(dlg)
+        _MODE_DESC_SS = "color:#9aa0a6; padding: 0 0 4px 22px;"
+
+        # MODE A: move to an existing section
+        a_box = QGroupBox()
+        a_box_l = QVBoxLayout(a_box)
+        a_radio = QRadioButton("Move this map to an existing section")
+        a_radio.setChecked(True)
+        mode_group.addButton(a_radio, 0)
+        a_box_l.addWidget(a_radio)
+        a_desc = QLabel(
+            "<small>Reassigns this map to one of the project's existing "
+            "sections. <b>Only this map changes</b> — every other map keeps "
+            "its section.</small>")
+        a_desc.setWordWrap(True)
+        a_desc.setStyleSheet(_MODE_DESC_SS)
+        a_box_l.addWidget(a_desc)
+        a_combo = QComboBox()
+        a_combo.wheelEvent = lambda e: e.ignore()   # no wheel-scroll (CLAUDE.md)
+        for sec_id, sec_name in sections:
+            a_combo.addItem(
+                f"{sec_name}   —   {sec_id}" if sec_name else sec_id, sec_id)
+        for i in range(a_combo.count()):
+            if a_combo.itemData(i) == old_section:
+                a_combo.setCurrentIndex(i)
+                break
+        a_box_l.addWidget(a_combo)
+        if not sections:
+            a_radio.setEnabled(False)
+            a_radio.setToolTip("Disabled — no existing sections were found.")
+        outer.addWidget(a_box)
+
+        # MODE B: create a new section
+        b_box = QGroupBox()
+        b_box_l = QVBoxLayout(b_box)
+        b_radio = QRadioButton("Create a new section for this map")
+        mode_group.addButton(b_radio, 1)
+        b_box_l.addWidget(b_radio)
+        b_desc = QLabel(
+            "<small>Adds a fresh entry to region_map_sections.json with a new "
+            "MAPSEC constant and the in-game name you give it, then points "
+            "this map at it. <b>Splits this map off</b> from any section it "
+            "currently shares. The new area isn't placed on the world map "
+            "automatically — use the Region Map editor for that.</small>")
+        b_desc.setWordWrap(True)
+        b_desc.setStyleSheet(_MODE_DESC_SS)
+        b_box_l.addWidget(b_desc)
+        b_form = QFormLayout()
+        b_name = QLineEdit()
+        b_name.setPlaceholderText("e.g. NORTH WING")
+        b_name.setToolTip(
+            "Convention: ALL CAPS to match the project's in-game text. "
+            f"Hard limit: {INGAME_NAME_LENGTH} characters.")
+        b_name_counter = QLabel()
+        b_name_row = QHBoxLayout()
+        b_name_row.setContentsMargins(0, 0, 0, 0)
+        b_name_row.setSpacing(6)
+        b_name_row.addWidget(b_name)
+        b_name_row.addWidget(b_name_counter)
+        _attach_char_counter(b_name, b_name_counter, INGAME_NAME_LENGTH)
+        b_form.addRow("New name:", b_name_row)
+        b_const = QLineEdit(self._suggest_mapsec_const(folder, taken))
+        b_const.setToolTip(
+            "MAPSEC_* constant identifier. Auto-fills from the name as you "
+            "type — edit it manually to override (auto-fill resumes if you "
+            f"clear it).\n\nSoft limit: {MAPSEC_CONST_LENGTH} characters.")
+        b_const_counter = QLabel()
+        b_const_row = QHBoxLayout()
+        b_const_row.setContentsMargins(0, 0, 0, 0)
+        b_const_row.setSpacing(6)
+        b_const_row.addWidget(b_const)
+        b_const_row.addWidget(b_const_counter)
+        _attach_char_counter(b_const, b_const_counter, MAPSEC_CONST_LENGTH)
+        b_form.addRow("MAPSEC constant:", b_const)
+
+        b_state = {"auto": True, "suppress": False}
+
+        def _const_from_name():
+            txt = b_name.text()
+            base = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', txt)
+            base = re.sub(r'[^A-Za-z0-9]+', '_', base).strip('_').upper()
+            cand = f"MAPSEC_{base}" if base else ""
+            if not cand:
+                return ""
+            if cand not in taken:
+                return cand
+            n = 2
+            while f"{cand}_{n}" in taken:
+                n += 1
+            return f"{cand}_{n}"
+
+        def _on_name_changed(_t=None):
+            if not b_state["auto"]:
+                return
+            nc = _const_from_name()
+            if nc and nc != b_const.text():
+                b_state["suppress"] = True
+                b_const.setText(nc[:MAPSEC_CONST_LENGTH])
+                b_state["suppress"] = False
+
+        def _on_const_changed(_t=None):
+            if b_state["suppress"]:
+                return
+            if b_const.text() == "":
+                b_state["auto"] = True
+                _on_name_changed()
+            else:
+                b_state["auto"] = False
+
+        b_name.textChanged.connect(_on_name_changed)
+        b_const.textChanged.connect(_on_const_changed)
+        b_box_l.addLayout(b_form)
+        outer.addWidget(b_box)
+
+        if not sections:
+            b_radio.setChecked(True)   # nothing to move to -> default to create
+
+        def _sync():
+            a_combo.setEnabled(a_radio.isChecked() and a_radio.isEnabled())
+            b_name.setEnabled(b_radio.isChecked())
+            b_const.setEnabled(b_radio.isChecked())
+        for r in (a_radio, b_radio):
+            r.toggled.connect(_sync)
+        _sync()
+
+        note = QLabel(
+            "<small><b>Staged</b> when you click OK — press <b>Save</b> "
+            "(Ctrl+S) to write, <b>F5</b> to discard.</small>")
+        note.setStyleSheet("color:#8fc; padding: 4px;")
+        note.setWordWrap(True)
+        outer.addWidget(note)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        outer.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_section = new_section.strip()
         try:
-            self._apply_ingame_assign(folder, new_section, old_section)
+            if mode_group.checkedId() == 1:
+                self._apply_ingame_create(folder, b_name.text().strip(),
+                                          b_const.text().strip(), old_section)
+            else:
+                new_section = a_combo.currentData()
+                if not new_section or new_section == old_section:
+                    return
+                self._apply_ingame_assign(folder, new_section, old_section)
         except Exception as e:
-            QMessageBox.critical(self, "Rename Section", str(e))
+            QMessageBox.critical(self, "Change Section", str(e))
             return
         self._populate_tree()
         self._apply_dirty_styling()

@@ -26,7 +26,8 @@ from suppress_dialog import SUPPRESSIBLE, suppress, is_suppressed, clear_all
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, project_info: dict = None):
+    def __init__(self, parent=None, project_info: dict = None,
+                 tabs: list = None, hidden_tabs=None):
         super().__init__(parent)
         self.setWindowTitle("Settings — PorySuite-Z")
         self.setModal(True)
@@ -34,6 +35,11 @@ class SettingsDialog(QDialog):
         self.setMinimumSize(640, 480)
 
         self._project_info = project_info or {}
+        # [(icon_name, label), …] for the Tabs page, and the set currently
+        # hidden. Empty when the caller doesn't supply them (older callers).
+        self._tab_defs = tabs or []
+        self._tab_hidden_initial = set(hidden_tabs or [])
+        self._tab_checks = {}
 
         os.makedirs(os.path.dirname(get_settings_path()), exist_ok=True)
         self.settings = QSettings(get_settings_path(), QSettings.Format.IniFormat)
@@ -79,6 +85,8 @@ class SettingsDialog(QDialog):
         self._build_build_page()
         self._build_trainer_defaults_page()
         self._build_editor_page()
+        if self._tab_defs:
+            self._build_tabs_page()
         self._build_event_colors_page()
         self._build_notifications_page()
         self._build_sound_page()
@@ -416,6 +424,33 @@ class SettingsDialog(QDialog):
         self._add_page("Editor", scroll)
 
     # ═════════════════════════════════════════════════════════════════════════
+    # Page: Tabs
+    # ═════════════════════════════════════════════════════════════════════════
+
+    def _build_tabs_page(self):
+        scroll, layout = self._make_page_scroll()
+        box = QGroupBox("Toolbar Tabs")
+        inner = QVBoxLayout(box)
+        inner.addWidget(QLabel(
+            "Tick the editor tabs you want on the toolbar. Unticked tabs are "
+            "hidden until you turn them back on here.\n"
+            "(Some tabs also stay hidden if the current project doesn't have "
+            "that feature.)"))
+        for name, label in self._tab_defs:
+            cb = QCheckBox(label)
+            cb.setChecked(name not in self._tab_hidden_initial)
+            inner.addWidget(cb)
+            self._tab_checks[name] = cb
+        layout.addWidget(box)
+        layout.addStretch(1)
+        self._add_page("Tabs", scroll)
+
+    def hidden_tabs(self) -> list:
+        """The tabs the user unticked (to be hidden)."""
+        return [name for name, cb in self._tab_checks.items()
+                if not cb.isChecked()]
+
+    # ═════════════════════════════════════════════════════════════════════════
     # Page: Notifications
     # ═════════════════════════════════════════════════════════════════════════
 
@@ -717,6 +752,9 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
         self.settings.setValue("advanced_diagnostics", bool(self.adv_checkbox.isChecked()))
+        # Tabs page — persist the hidden set (the main window applies it on OK).
+        if self._tab_checks:
+            self.settings.setValue("tabs/hidden", sorted(self.hidden_tabs()))
         self.settings.setValue("crashlog/keep_days",
                                self._crashlog_day_values[self.crashlog_days_combo.currentIndex()])
         self.settings.setValue("crashlog/max_size_mb",

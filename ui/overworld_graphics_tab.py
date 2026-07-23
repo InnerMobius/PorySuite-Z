@@ -391,10 +391,43 @@ class PalettePool:
         self.sprites: List[SpriteEntry] = []
 
 
-def build_overworld_data(root: str) -> Tuple[List[PalettePool], Dict[str, SpriteEntry]]:
+_READONLY_CACHE: Dict[str, Tuple[List["PalettePool"], Dict[str, "SpriteEntry"]]] = {}
+
+
+def read_overworld_data(root: str):
+    """Cached, side-effect-free overworld model for OTHER tabs to read.
+
+    Two reasons this exists rather than calling `build_overworld_data`:
+
+    * that call **writes** (it self-heals `.pal` siblings), which no read-only
+      viewer should trigger;
+    * it costs 26-67 ms, and a viewer would pay that on every `load()`/F5.
+
+    Cleared by `clear_overworld_cache()` wherever the project changes, next to
+    the sprite bus's own `clear()`.
+    """
+    key = os.path.normcase(os.path.abspath(root or ""))
+    hit = _READONLY_CACHE.get(key)
+    if hit is None:
+        hit = build_overworld_data(root, heal=False)
+        _READONLY_CACHE[key] = hit
+    return hit
+
+
+def clear_overworld_cache() -> None:
+    _READONLY_CACHE.clear()
+
+
+def build_overworld_data(root: str, heal: bool = True
+                         ) -> Tuple[List[PalettePool], Dict[str, SpriteEntry]]:
     """Parse all C headers and build the complete data model.
 
     Returns (palette_pools sorted by name, all_sprites dict by gfx_const).
+
+    `heal=False` makes this a PURE READ. The default path repairs missing
+    `.pal` siblings on the way through, which is correct for the tab that owns
+    those files but is a side effect no other caller should cause — reading a
+    model must never write to the user's game repo.
     """
     # 1. Palette tag → symbol → file path chain.
     # The INCBIN entry in object_event_graphics.h gives us the binary
@@ -444,10 +477,17 @@ def build_overworld_data(root: str) -> Tuple[List[PalettePool], Dict[str, Sprite
             # Project-open self-heal: create missing .pal sibling and
             # repair any .gbapal corrupted by an earlier save-path bug
             # (JASC text written into the binary file).
-            try:
-                ensure_pal_sibling(abs_gbapal)
-            except Exception:
-                pass
+            #
+            # Gated on `heal`, because this WRITES into the game repo. That is
+            # right for the tab that owns these files and wrong for anyone else
+            # who only wants to read the model — a read-only preview elsewhere
+            # in the app must not create dozens of files under
+            # graphics/object_events/ as a side effect of opening a page.
+            if heal:
+                try:
+                    ensure_pal_sibling(abs_gbapal)
+                except Exception:
+                    pass
         elif os.path.isfile(sibling_pal):
             # Pre-build state: only .pal exists.  Register without the
             # .gbapal path; the reader uses .pal as the source of truth
@@ -6322,6 +6362,11 @@ class OverworldGraphicsTab(QWidget):
         fe_ok, fe_errors = self._fe_tab.flush_to_disk()
         ok += fe_ok
         errors.extend(fe_errors)
+
+        # The on-disk model just changed, so the shared read-only copy other
+        # tabs hold is now stale. Without this a viewer keeps drawing icons
+        # from the pre-save parse for the rest of the session.
+        clear_overworld_cache()
 
         return ok, errors
 

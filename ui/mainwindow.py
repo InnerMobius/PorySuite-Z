@@ -253,6 +253,8 @@ from ui.trainer_graphics_tab import TrainerGraphicsTab
 from ui.trainer_back_sprite_tab import TrainerBackSpriteTab
 from ui.overworld_graphics_tab import OverworldGraphicsTab
 from ui.battle_anim_tab import BattleAnimTab
+from ui.fame_checker_tab import FameCheckerTab
+from ui.encounters_tab import EncountersTab
 from ui.pokedex_detail_panel import PokedexDetailPanel
 from ui.dex_description_edit import attach_dex_limit_ui
 from ui.moves_tab_widget import MovesTabWidget
@@ -535,6 +537,24 @@ QTabBar::tab:hover:!selected {
         except Exception:
             self.battle_anim_tab_index = -1
 
+        # ── Fame Checker page ────────────────────────────────────────────────
+        # Built here, but NOT added to mainTabs — UnifiedMainWindow adopts it as
+        # a toolbar page. See _sync_fame_checker_tab().
+        try:
+            self.fame_checker_tab = FameCheckerTab()
+        except Exception:
+            self.fame_checker_tab = None
+        self.fame_checker_supported = False
+
+        # ── Wild Encounters page ─────────────────────────────────────────────
+        # Same adoption pattern as Fame Checker: built here, shown as a toolbar
+        # page by UnifiedMainWindow. See _sync_encounters_tab().
+        try:
+            self.encounters_tab = EncountersTab(self)
+        except Exception:
+            self.encounters_tab = None
+        self.encounters_supported = False
+
         # ── Config tab ───────────────────────────────────────────────────────
         self.config_tab = ConfigTabWidget(self.ui.tab_config)
         self.ui.tab_config_grid.addWidget(self.config_tab, 0, 0, 1, 1)
@@ -600,6 +620,25 @@ QTabBar::tab:hover:!selected {
         except Exception as _e:
             logging.exception("Failed to build GraphicsTabWidget: %s", _e)
             self.graphics_tab_widget = None
+
+        # "Normalize this species…" button on the Info (main) tab. Hidden unless
+        # the selected species is a multi-form mon that can be collapsed.
+        self._normalize_btn = None
+        try:
+            self._normalize_btn = QPushButton("Normalize this species…")
+            self._normalize_btn.setToolTip(
+                "Collapse this multi-form species (Unown, Deoxys, Castform) down "
+                "to ONE normal, editable sprite and stop it producing different "
+                "forms. Edits the game source; rebuild afterward.")
+            self._normalize_btn.setStyleSheet("QPushButton { color: #ffb74d; }")
+            self._normalize_btn.setVisible(False)
+            self._normalize_btn.clicked.connect(self._on_normalize_species)
+            _ig = self.ui.tab_pokemon_info_grid
+            _ig.addWidget(self._normalize_btn, _ig.rowCount(), 0,
+                          1, max(1, _ig.columnCount()))
+        except Exception:
+            logging.exception("Failed to add Normalize button")
+            self._normalize_btn = None
 
         # Monitor tab changes
         self.ui.mainTabs.currentChanged.connect(self.on_main_tab_changed)
@@ -753,8 +792,6 @@ QTabBar::tab:hover:!selected {
 
         # Install event filters
         self.ui.species_description.installEventFilter(self)
-        self.ui.ability1.installEventFilter(self)
-        self.ui.ability2.installEventFilter(self)
         self.ui.held_item_common.installEventFilter(self)
         self.ui.held_item_rare.installEventFilter(self)
         self.ui.evo_species.installEventFilter(self)
@@ -866,6 +903,15 @@ QTabBar::tab:hover:!selected {
         self.ui.list_pokedex_regional.itemSelectionChanged.connect(
             self.update_pokedex_entry
         )
+        # Search boxes above the Species tree and the two Pokédex lists.
+        try:
+            self.ui.species_search.textChanged.connect(self._filter_species_tree)
+            self.ui.pokedex_national_search.textChanged.connect(
+                lambda t: self._filter_list_widget(self.ui.list_pokedex_national, t))
+            self.ui.pokedex_regional_search.textChanged.connect(
+                lambda t: self._filter_list_widget(self.ui.list_pokedex_regional, t))
+        except Exception:
+            logging.getLogger(__name__).exception("search box wiring failed")
         # Drag-to-reorder on either dex list must trip the dirty flag.
         # QListWidget uses its internal model's rowsMoved signal — there is
         # no widget-level equivalent. Connecting the model signal catches
@@ -988,6 +1034,60 @@ QTabBar::tab:hover:!selected {
                 self.graphics_tab_widget.set_project_root(self.project_info["dir"])
         except Exception:
             pass
+        # Which multi-form species can be normalized in this project (drives the
+        # "Normalize this species…" button on the Info tab).
+        self._normalizable_species = set()
+        self._known_multiform_species = set()
+        try:
+            from core.normalize_forms_patch import (
+                normalizable_species, known_multiform_species)
+            self._known_multiform_species = set(known_multiform_species())
+            root = self.project_info.get("dir")
+            if root:
+                self._normalizable_species = set(normalizable_species(root))
+        except Exception:
+            logging.exception("normalizable_species failed")
+
+    def _on_normalize_species(self):
+        """Collapse the current multi-form species to a single sprite (patcher)."""
+        species = getattr(self, "previous_selected_species", None)
+        root = (self.project_info or {}).get("dir")
+        if not species or not root:
+            return
+        friendly = species.replace("SPECIES_", "").replace("_", " ").title()
+        reply = QMessageBox.warning(
+            self, "Normalize species",
+            f"Collapse {friendly} down to a single, normal sprite?\n\n"
+            "Its base form becomes the one sprite set; other forms are repointed "
+            "to it so none can render differently, and it stops producing forms "
+            "in-game (Unown/Deoxys also delete the extra art).\n\n"
+            "This edits the game source directly and isn't auto-undoable — use "
+            "Git to revert if needed. Rebuild afterward to see it in-game.\n\nProceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            from core.normalize_forms_patch import normalize_species
+            res = normalize_species(root, species)
+        except Exception as e:
+            QMessageBox.critical(self, "Normalize failed", f"An error occurred:\n{e}")
+            return
+        if not res.get("ok"):
+            QMessageBox.warning(self, "Normalize",
+                                res.get("message") or "Could not normalize this species.")
+            return
+        self._normalizable_species.discard(species)
+        self._species_formes = {}  # drop the cached forme detection for this project
+        if getattr(self, "_normalize_btn", None) is not None:
+            self._normalize_btn.setVisible(False)
+        deleted = len(res.get("deleted", []))
+        QMessageBox.information(
+            self, "Species normalized",
+            (res.get("message", "Done.")
+             + (f"\n\nDeleted {deleted} extra file(s)/folder(s)." if deleted else "")
+             + "\n\nReload the project (or restart) to see the new sprite in the "
+               "app, and rebuild (Make) to see it in-game."))
 
     def _open_crashlogs_folder(self):
         """Open the project's crashlogs folder in the host OS file browser.
@@ -1087,6 +1187,71 @@ QTabBar::tab:hover:!selected {
         # Emit the load signal — this handles unsaved-changes prompt and loads data
         self.loadAndSaveProjectSignal.emit(new_entry | p_info)
 
+    def _sync_fame_checker_tab(self, project_dir: str) -> None:
+        """Load the Fame Checker page and record whether this project has one.
+
+        NOTE: this does NOT touch `self.ui.mainTabs`. In the shipping app that
+        tab widget is never shown — `UnifiedMainWindow` pulls each page out of
+        it into its own icon toolbar — so adding a tab here would be invisible.
+        The unified window reads `fame_checker_supported` and shows or hides the
+        toolbar button, because plenty of hacks strip the Fame Checker out and
+        must not be offered a button for a feature they do not have.
+        """
+        tab = getattr(self, "fame_checker_tab", None)
+        if tab is None:
+            self.fame_checker_supported = False
+            return
+        # Deliberately NOT a bare `except Exception: supported = False`. That
+        # swallows a typo in this very call and the feature then never appears,
+        # with nothing anywhere saying why — the same silent-nothing failure the
+        # diagnostics panel exists to prevent. Only file/parse errors are
+        # tolerated, and they are logged.
+        supported = False
+        if project_dir:
+            try:
+                supported = FameCheckerTab.is_supported(project_dir)
+            except (OSError, ValueError):
+                logging.getLogger("PorySuite").warning(
+                    "Could not determine Fame Checker support for %s",
+                    project_dir, exc_info=True)
+
+        self.fame_checker_supported = supported
+        try:
+            if supported:
+                tab.load(project_dir)
+            else:
+                # Forget the old project, so switching to one that HAS the
+                # feature can't briefly show the previous project's people.
+                tab.clear_project()
+        except Exception:
+            logging.getLogger("PorySuite").warning(
+                "Fame Checker page failed to load", exc_info=True)
+
+    def _sync_encounters_tab(self, project_dir: str) -> None:
+        """Load the Wild Encounters page and record whether this project has
+        encounter data. Same shape as _sync_fame_checker_tab."""
+        tab = getattr(self, "encounters_tab", None)
+        if tab is None:
+            self.encounters_supported = False
+            return
+        supported = False
+        if project_dir:
+            try:
+                supported = EncountersTab.is_supported(project_dir)
+            except (OSError, ValueError):
+                logging.getLogger("PorySuite").warning(
+                    "Could not determine encounters support for %s",
+                    project_dir, exc_info=True)
+        self.encounters_supported = supported
+        try:
+            if supported:
+                tab.load(project_dir)
+            else:
+                tab.clear_project()
+        except Exception:
+            logging.getLogger("PorySuite").warning(
+                "Wild Encounters page failed to load", exc_info=True)
+
     def _refresh_project(self):
         """
         Full project refresh — equivalent to Tools → Rebuild Caches plus the
@@ -1115,6 +1280,17 @@ QTabBar::tab:hover:!selected {
         try:
             from core.sprite_palette_bus import get_bus as _spbus
             _spbus().clear()
+        except Exception:
+            pass
+        # Same class of cross-tab cache, so it is cleared in the same place:
+        # the overworld sprite/palette model that read-only viewers share.
+        # Without this a viewer keeps drawing icons from the PRE-EDIT parse
+        # after an overworld palette is saved, or after F5 on the same project
+        # — the cache is keyed per project directory, so a switch is safe but a
+        # reload of the same directory is not.
+        try:
+            from ui.overworld_graphics_tab import clear_overworld_cache
+            clear_overworld_cache()
         except Exception:
             pass
         try:
@@ -1190,6 +1366,13 @@ QTabBar::tab:hover:!selected {
                 _ba_dir = str(self.project_info.get("dir", "") or "")
                 if _ba_dir:
                     self.battle_anim_tab.load(_ba_dir)
+        except Exception:
+            pass
+        try:
+            if self.project_info:
+                _fc_dir = str(self.project_info.get("dir", "") or "")
+                self._sync_fame_checker_tab(_fc_dir)
+                self._sync_encounters_tab(_fc_dir)
         except Exception:
             pass
 
@@ -2564,6 +2747,52 @@ QTabBar::tab:hover:!selected {
         btns.rejected.connect(dlg.reject)
         vlay.addWidget(btns)
 
+        from PyQt6.QtCore import QThread, pyqtSignal as _sig
+
+        class _CommitWorker(QThread):
+            """Stage + commit off the UI thread so a big commit can't freeze the
+            app. Stages ALL paths in ONE `git add` (NUL-separated via stdin — no
+            per-file process spawn, no command-line length limit), with a chunked
+            fallback for git older than 2.25."""
+            done = _sig(bool, str)
+
+            def __init__(self, git, cwd, paths, message):
+                super().__init__()
+                self._git = git
+                self._cwd = cwd
+                self._paths = list(paths)
+                self._msg = message
+
+            def _run(self, args, timeout, data=None):
+                return subprocess.run(
+                    [self._git, "-C", self._cwd, *args],
+                    capture_output=True, timeout=timeout, input=data,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+            def run(self):
+                try:
+                    blob = ("\0".join(self._paths) + "\0").encode("utf-8")
+                    r = self._run(["add", "--pathspec-from-file=-",
+                                   "--pathspec-file-nul"], 300, data=blob)
+                    if r.returncode != 0:
+                        for i in range(0, len(self._paths), 100):
+                            rr = self._run(["add", "--",
+                                            *self._paths[i:i + 100]], 300)
+                            if rr.returncode != 0:
+                                self.done.emit(False, "Staging failed: " + (
+                                    rr.stdout + rr.stderr).decode(
+                                    "utf-8", "replace").strip()[:200])
+                                return
+                    rc = self._run(["commit", "-m", self._msg], 300)
+                    out = (rc.stdout + rc.stderr).decode("utf-8", "replace").strip()
+                    self.done.emit(rc.returncode == 0, out)
+                except subprocess.TimeoutExpired:
+                    self.done.emit(False, "git timed out.")
+                except FileNotFoundError:
+                    self.done.emit(False, "git not found — install Git for Windows.")
+                except Exception as exc:
+                    self.done.emit(False, str(exc))
+
         def _do_commit():
             msg = msg_edit.toPlainText().strip()
             if not msg:
@@ -2575,30 +2804,30 @@ QTabBar::tab:hover:!selected {
             if not checked:
                 status_lbl.setText("⚠  No files checked.")
                 return
-            # Stage each checked file. `--` guards paths that start with '-';
-            # the path is verbatim (from -z) so spaces/special chars are fine.
-            # A file shown in this list is never .gitignored (status omits ignored
-            # files), so a plain add stages it — but if any add DOES fail, surface
-            # it loudly instead of marching on to a commit that stages nothing.
-            failed = []
-            for path in checked:
-                ok, out = self._git_run("add", "--", path, timeout=15)
-                if not ok:
-                    failed.append((path, out))
-            if failed:
-                p, err = failed[0]
-                more = f"  (+{len(failed) - 1} more)" if len(failed) > 1 else ""
-                status_lbl.setText(
-                    f"✗  Could not stage '{p}'{more}: {(err or '').splitlines()[0][:140]}")
-                return
-            ok, out = self._git_run("commit", "-m", msg, timeout=30)
-            if ok:
-                self.statusBar().showMessage(
-                    f"Committed {len(checked)} file(s).", 5000)
-                self._git_refresh_status_bar()
-                dlg.accept()
-            else:
-                status_lbl.setText(f"✗  {(out or 'commit failed').splitlines()[0][:180]}")
+
+            ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
+            ok_btn.setEnabled(False)
+            file_list.setEnabled(False)
+            status_lbl.setText(f"⏳  Committing {len(checked)} file(s)…")
+
+            worker = _CommitWorker(self._git_exe(), project_dir, checked, msg)
+            self._git_commit_worker = worker    # keep a ref so it isn't GC'd
+
+            def _on_done(success: bool, out: str):
+                if success:
+                    self.statusBar().showMessage(
+                        f"Committed {len(checked)} file(s).", 5000)
+                    self._git_refresh_status_bar()
+                    dlg.accept()
+                else:
+                    ok_btn.setEnabled(True)
+                    file_list.setEnabled(True)
+                    status_lbl.setText(
+                        "✗  " + ((out or "commit failed").splitlines()[0][:180]
+                                 if out else "commit failed"))
+
+            worker.done.connect(_on_done)
+            worker.start()
 
         btns.accepted.connect(_do_commit)
         dlg.exec()
@@ -3684,6 +3913,18 @@ QTabBar::tab:hover:!selected {
         except Exception:
             logging.exception("graphics_tab_widget.flush_to_disk failed")
 
+        # Flush Wild Encounters tab edits (wild_encounters.json + the
+        # time-of-day engine scaffolding). Held in RAM until this Save, like
+        # every other tab.
+        try:
+            if getattr(self, "encounters_tab", None) is not None:
+                ok, errs = self.encounters_tab.flush_to_disk()
+                if ok or errs:
+                    logging.info("Encounters tab: wrote %d file(s); errors: %s",
+                                 ok, errs or "none")
+        except Exception:
+            logging.exception("encounters_tab.flush_to_disk failed")
+
         # Save the source data
         self.source_data.save()
         # Persist any generated C code (headers) back to the project's source files
@@ -3936,6 +4177,14 @@ QTabBar::tab:hover:!selected {
                             pass
         except Exception:
             pass
+
+        # Reset the list search boxes so a stale filter from the previous project
+        # doesn't hide rows in the freshly loaded one.
+        for _sb in ("species_search", "pokedex_national_search", "pokedex_regional_search"):
+            try:
+                getattr(self.ui, _sb).clear()
+            except Exception:
+                pass
 
         # Add Pokemon species — clear everything that add_species() populates so
         # re-loading a project doesn't accumulate duplicate entries.
@@ -4263,6 +4512,8 @@ QTabBar::tab:hover:!selected {
                     self.battle_anim_tab.load(_project_dir)
             except Exception:
                 pass
+            self._sync_fame_checker_tab(_project_dir)
+            self._sync_encounters_tab(_project_dir)
 
         # Enable Refresh, Open in EVENTide, and all Git menu actions now that a project is loaded
         if hasattr(self, "_refresh_action"):
@@ -4306,6 +4557,14 @@ QTabBar::tab:hover:!selected {
         # Clear the modified flag — UI population fires signals that incorrectly
         # mark the window as dirty before the user touches anything.
         self.setWindowModified(False)
+
+        # Auto-repair invalid move-tutor data left by the old free-form Tutor editor.
+        # Runs AFTER the baseline snapshot + modified-flag clear so the cleaned data
+        # registers as a real (savable) change the user is prompted to persist.
+        try:
+            self._repair_invalid_tutor_moves()
+        except Exception:
+            pass
 
     @staticmethod
     def _stable_default(value):
@@ -5678,6 +5937,19 @@ in the game.</p>
         af = getattr(self, "_active_forme", None)
         af = af if (af and af.get("species") == species) else None
         af_stats = af.get("stats") if af else None
+        # The "Normalize this species…" button shows for any species this tool
+        # knows how to collapse (Unown/Deoxys/Castform), so it stays discoverable:
+        # enabled + normalize label when it still needs it, disabled + a "done"
+        # label once collapsed. Hidden for ordinary single-sprite mons.
+        if getattr(self, "_normalize_btn", None) is not None:
+            known = species in getattr(self, "_known_multiform_species", set())
+            self._normalize_btn.setVisible(known)
+            if known:
+                can = species in getattr(self, "_normalizable_species", set())
+                self._normalize_btn.setEnabled(can)
+                self._normalize_btn.setText(
+                    "Normalize this species…" if can
+                    else "✓ Already a single sprite")
         # Update species information
         self.ui.species_name.setText(
             self.source_data.get_species_info(species, "speciesName", form) or ""
@@ -6383,6 +6655,19 @@ in the game.</p>
         """
         updated = False
 
+        def _diag(tag, stored, ui):
+            # TEMP diagnostic (false-dirty hunt) — logs WHICH field the dirty-check
+            # flags so we stop guessing. Remove once confirmed clean.
+            try:
+                p = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "diag_dirty.log")
+                with open(p, "a", encoding="utf-8") as _f:
+                    _f.write(f"{species} form={form} DIRTY[{tag}] "
+                             f"stored={stored!r} ui={ui!r}\n")
+            except Exception:
+                pass
+
         def _normalize(v):
             # Normalize for comparison: strip, coerce numeric-looking strings to int,
             # normalize None/missing to a sentinel, compare lists element-wise via
@@ -6407,6 +6692,7 @@ in the game.</p>
             nonlocal updated
             stored = self.source_data.get_species_info(species, attribute, form)
             if _normalize(stored) != _normalize(ui_value):
+                _diag(attribute, stored, ui_value)
                 self.source_data.set_species_info(
                     species, attribute, ui_value, form=form
                 )
@@ -6458,6 +6744,7 @@ in the game.</p>
                 raw = None
             if _norm_txt(val) != _norm_txt(fallback):
                 # User changed it — always write
+                _diag(attr + "/fallback", fallback, val)
                 self.source_data.set_species_info(species, attr, val, form=form)
                 updated = True
             elif raw is None and val:
@@ -6466,6 +6753,7 @@ in the game.</p>
                 # persist it to the header files.
                 self.source_data.set_species_info(species, attr, val, form=form)
             elif raw is not None and _norm_txt(raw) != _norm_txt(val):
+                _diag(attr + "/raw", raw, val)
                 self.source_data.set_species_info(species, attr, val, form=form)
                 updated = True
         _dex_aware_set("categoryName", category_text)
@@ -6568,6 +6856,7 @@ in the game.</p>
                 return tuple(a for a in v if a and a != "ABILITY_NONE")
             stored_innates = self.source_data.get_species_info(species, "innates", form)
             if _clean_innates(stored_innates) != _clean_innates(innates):
+                _diag("innates", stored_innates, innates)
                 self.source_data.set_species_info(species, "innates", innates, form=form)
                 updated = True
 
@@ -6729,6 +7018,7 @@ in the game.</p>
                                 # reported every species in the natdex as "edited" on
                                 # every tab switch.
                                 if changed_natdex:
+                                    _diag("national_dex", "(list changed)", checked)
                                     pdata['national_dex'] = lst
                                     updated = True
                             # Regional Dex membership
@@ -6772,6 +7062,7 @@ in the game.</p>
                                 # Only mark as updated if the list actually changed
                                 # (see IN_NATDEX note above).
                                 if changed_regdex:
+                                    _diag("regional_dex", "(list changed)", checked)
                                     pdata['regional_dex'] = lst
                                     updated = True
                         else:
@@ -6790,13 +7081,21 @@ in the game.</p>
             item = self.ui.evolutions.topLevelItem(i)
             if item.text(0) == "Add New Evolution...":
                 continue
-            method_name = item.text(1)
+            # Prefer the method CONST stashed in UserRole when the row was built;
+            # fall back to reverse-looking-up the display name.
             method_const = None
-            for const, info in evo_types.items():
-                name = info.get("name") if isinstance(info, dict) else info
-                if name == method_name:
-                    method_const = const
-                    break
+            try:
+                method_const = item.data(1, Qt.ItemDataRole.UserRole)
+            except Exception:
+                method_const = None
+            if not method_const:
+                method_name = item.text(1)
+                for const, info in evo_types.items():
+                    name = info.get("name") if isinstance(info, dict) else info
+                    if name == method_name:
+                        method_const = const
+                        break
+                method_const = method_const or method_name
             param_txt = item.text(2)
             try:
                 param_val = int(param_txt)
@@ -6805,18 +7104,34 @@ in the game.</p>
             evolutions.append(
                 {
                     "targetSpecies": item.text(0),
-                    "method": method_const or method_name,
+                    "method": method_const,
                     "param": param_val,
                 }
             )
         current = self.source_data.get_evolutions(species) or []
-        # Normalize both sides so `[] != None` doesn't falsely report an edit
-        # for species with no evolutions. `or []` above handles the None case;
-        # the explicit list() coerces any iterable-but-not-list result too.
-        if list(evolutions) != list(current):
+        # Compare CANONICALLY on the meaningful fields (targetSpecies, method,
+        # param) so representation/order differences don't falsely flag an edit:
+        #  * a null param renders as the string "None" and reads back as "None",
+        #    which an exact compare sees as != the stored None → false dirty;
+        #  * the stored dict may carry extra keys the UI read-back doesn't;
+        #  * evolution order isn't meaningful.
+        # The WRITE below still persists the freshly-read `evolutions` list.
+        def _canon_evos(lst):
+            out = []
+            for e in (lst or []):
+                if not isinstance(e, dict):
+                    continue
+                p = e.get("param")
+                ps = "" if p in (None, "", "None") else str(p)
+                out.append((str(e.get("targetSpecies", "")),
+                            str(e.get("method", "")), ps))
+            return sorted(out)
+        if _canon_evos(evolutions) != _canon_evos(current):
+            _diag("evolutions", current, evolutions)
             updated = True
             self.source_data.set_evolutions(species, evolutions)
         if self.save_species_learnset_table(species):
+            _diag("learnset", "(moves changed)", species)
             updated = True
 
         if updated:
@@ -6917,6 +7232,61 @@ in the game.</p>
             self.setWindowModified(True)
         except Exception:
             pass
+
+    def _species_item_matches(self, item, q: str) -> bool:
+        """True if a species tree item matches the query (name, SPECIES_ constant,
+        or dex number). Empty query matches everything."""
+        if not q:
+            return True
+        hay = (item.text(0) or "").lower() + " " + (item.text(1) or "").lower()
+        try:
+            sp = item.text(1)
+            if sp and self.source_data:
+                dex = self.source_data.get_species_data(sp, "dex_num")
+                if isinstance(dex, int):
+                    hay += f" #{dex} {dex}"
+        except Exception:
+            pass
+        return q in hay
+
+    def _filter_species_tree(self, text: str = "") -> None:
+        """Hide species/form rows that don't match the Species search box. A base
+        row shows if it OR any of its forms match; a matching base shows all forms.
+
+        Signals are BLOCKED while hiding rows: hiding the currently-selected row
+        makes Qt fire itemSelectionChanged → update_tree_pokemon → save_species_data,
+        which would falsely mark the species amber just from searching/clearing.
+        Filtering must be selection-neutral."""
+        q = (text or "").strip().lower()
+        tree = self.ui.tree_pokemon
+        _blocked = tree.blockSignals(True)
+        try:
+            for i in range(tree.topLevelItemCount()):
+                top = tree.topLevelItem(i)
+                top_match = self._species_item_matches(top, q)
+                any_child = False
+                for j in range(top.childCount()):
+                    ch = top.child(j)
+                    ch_match = top_match or self._species_item_matches(ch, q)
+                    ch.setHidden(not ch_match)
+                    any_child = any_child or ch_match
+                top.setHidden(not (top_match or any_child))
+        finally:
+            tree.blockSignals(_blocked)
+
+    def _filter_list_widget(self, list_widget, text: str = "") -> None:
+        """Hide rows of a QListWidget whose visible text doesn't contain the query
+        (used by the Pokédex national/regional search boxes). Signals are blocked
+        so hiding the selected row can't fire a spurious selection-changed save."""
+        q = (text or "").strip().lower()
+        _blocked = list_widget.blockSignals(True)
+        try:
+            for i in range(list_widget.count()):
+                it = list_widget.item(i)
+                if it is not None:
+                    it.setHidden(bool(q) and q not in (it.text() or "").lower())
+        finally:
+            list_widget.blockSignals(_blocked)
 
     def update_tree_pokemon(self):
         """
@@ -9750,6 +10120,20 @@ QTabBar::tab:hover:!selected {
         # ── Tab 2: TM / HM ───────────────────────────────────────────
         tab_tmhm = QWidget()
         vbox2 = QVBoxLayout(tab_tmhm)
+        # Search + bulk-toggle controls for the (often long) TM/HM list.
+        tmhm_ctrl = QHBoxLayout()
+        self._tmhm_search = QLineEdit()
+        self._tmhm_search.setPlaceholderText("Search TM/HM or move name…")
+        self._tmhm_search.setClearButtonEnabled(True)
+        self._tmhm_search.textChanged.connect(self._tmhm_apply_filter)
+        tmhm_ctrl.addWidget(self._tmhm_search, 1)
+        btn_tmhm_check_all = QPushButton("Check All")
+        btn_tmhm_uncheck_all = QPushButton("Uncheck All")
+        btn_tmhm_check_all.clicked.connect(lambda: self._tmhm_set_all_checked(True))
+        btn_tmhm_uncheck_all.clicked.connect(lambda: self._tmhm_set_all_checked(False))
+        tmhm_ctrl.addWidget(btn_tmhm_check_all)
+        tmhm_ctrl.addWidget(btn_tmhm_uncheck_all)
+        vbox2.addLayout(tmhm_ctrl)
         self._tmhm_table = QTableWidget(0, 3)
         self._tmhm_table.setHorizontalHeaderLabels(["", "TM/HM", "Move"])
         # Use Interactive so resizes don't scan all rows on every insertRow()
@@ -9769,21 +10153,33 @@ QTabBar::tab:hover:!selected {
         # ── Tab 3: Tutor ─────────────────────────────────────────────
         tab_tutor = QWidget()
         vbox3 = QVBoxLayout(tab_tutor)
-        self._tutor_table = QTableWidget(0, 1)
-        self._tutor_table.setHorizontalHeaderLabels(["Move"])
+        # Tutor moves are a FIXED engine set (sTutorMoves[]) — a checkbox list of
+        # the valid tutor moves, checked per species (bitfield), NOT a free-form
+        # pick-any-move list (which could write moves the engine can't compile).
+        tutor_ctrl = QHBoxLayout()
+        self._tutor_search = QLineEdit()
+        self._tutor_search.setPlaceholderText("Search tutor move name…")
+        self._tutor_search.setClearButtonEnabled(True)
+        self._tutor_search.textChanged.connect(self._tutor_apply_filter)
+        tutor_ctrl.addWidget(self._tutor_search, 1)
+        btn_tutor_check_all = QPushButton("Check All")
+        btn_tutor_uncheck_all = QPushButton("Uncheck All")
+        btn_tutor_check_all.clicked.connect(lambda: self._tutor_set_all_checked(True))
+        btn_tutor_uncheck_all.clicked.connect(lambda: self._tutor_set_all_checked(False))
+        tutor_ctrl.addWidget(btn_tutor_check_all)
+        tutor_ctrl.addWidget(btn_tutor_uncheck_all)
+        vbox3.addLayout(tutor_ctrl)
+        self._tutor_table = QTableWidget(0, 2)
+        self._tutor_table.setHorizontalHeaderLabels(["", "Move"])
         self._tutor_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch)
+            0, QHeaderView.ResizeMode.Interactive)
+        self._tutor_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch)
+        self._tutor_table.horizontalHeader().setDefaultSectionSize(80)
         self._tutor_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._tutor_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._tutor_table.itemChanged.connect(self._tutor_item_changed)
         vbox3.addWidget(self._tutor_table)
-        hbox3 = QHBoxLayout()
-        btn_tutor_add = QPushButton("+ Add Move")
-        btn_tutor_rem = QPushButton("− Remove")
-        btn_tutor_add.clicked.connect(self._tutor_add_row)
-        btn_tutor_rem.clicked.connect(self._tutor_remove_row)
-        hbox3.addWidget(btn_tutor_add)
-        hbox3.addWidget(btn_tutor_rem)
-        hbox3.addStretch()
-        vbox3.addLayout(hbox3)
         self._learnset_tabs.addTab(tab_tutor, "Tutor")
 
         # ── Tab 4: Egg Moves ─────────────────────────────────────────
@@ -9887,31 +10283,150 @@ QTabBar::tab:hover:!selected {
             table.removeRow(row)
             self.setWindowModified(True)
 
-    def _tutor_add_row(self) -> None:
-        table = self._tutor_table
-        row = table.rowCount()
-        table.insertRow(row)
-        combo = QComboBox()
-        combo.setEditable(True)
-        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        for m in self.learnset_move_options:
-            combo.addItem(self._move_display_name(m), m)
-        idx = combo.findData("MOVE_NONE")
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
-        combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
-        self._learnset_set_cell_widget(table, row, 0, combo)
-        table.scrollToBottom()
-        self.setWindowModified(True)
-
-    def _tutor_remove_row(self) -> None:
-        table = self._tutor_table
-        row = self._focused_row(table)
-        if row >= 0:
-            table.removeRow(row)
+    def _tutor_item_changed(self, item) -> None:
+        if item.column() == 0:
             self.setWindowModified(True)
+
+    def _tutor_apply_filter(self, text=None) -> None:
+        """Show only tutor rows whose move name contains the search text. Called on
+        each keystroke and re-applied after repopulation (persists across species)."""
+        table = getattr(self, "_tutor_table", None)
+        if table is None:
+            return
+        if text is None:
+            search = getattr(self, "_tutor_search", None)
+            text = search.text() if search is not None else ""
+        q = (text or "").strip().lower()
+        for row in range(table.rowCount()):
+            move_item = table.item(row, 1)
+            move = move_item.text().lower() if move_item else ""
+            table.setRowHidden(row, bool(q) and q not in move)
+
+    def _tutor_set_all_checked(self, checked: bool) -> None:
+        """Check/uncheck every VISIBLE tutor row (respects the search filter, so you
+        can filter to a subset and toggle just those)."""
+        table = getattr(self, "_tutor_table", None)
+        if table is None:
+            return
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        changed = False
+        with QSignalBlocker(table):
+            for row in range(table.rowCount()):
+                if table.isRowHidden(row):
+                    continue
+                item = table.item(row, 0)
+                if item is not None and item.checkState() != state:
+                    item.setCheckState(state)
+                    changed = True
+        if changed:
+            self.setWindowModified(True)
+
+    def _repair_invalid_tutor_moves(self) -> None:
+        """One-time on project load: drop any per-species tutor assignment whose move
+        isn't in the engine's sTutorMoves[] table. Such entries come from the old
+        free-form Tutor editor and break the build (no TUTOR_MOVE_* constant). Cleans
+        the in-memory data and marks the project modified so the user can Save to
+        persist the repair; shows a one-time notice of what was removed."""
+        if not getattr(self, "source_data", None):
+            return
+        try:
+            self._refresh_learnset_option_cache()
+        except Exception:
+            return
+        valid = set(getattr(self, "learnset_tutor_moves", []) or [])
+        if not valid:
+            return  # no tutor table found in this project → nothing to validate against
+        pm = getattr(self.source_data, "data", {}).get("pokemon_moves")
+        species_map = getattr(pm, "data", {}).get("species_moves") if pm is not None else None
+        if not isinstance(species_map, dict):
+            return
+        removed = []  # (species_const, move_const)
+        for sp, entries in list(species_map.items()):
+            if not isinstance(entries, list):
+                continue
+            kept = []
+            for e in entries:
+                if (str(e.get("method") or "").upper() == "TUTOR"
+                        and str(e.get("move") or "") not in valid):
+                    removed.append((sp, str(e.get("move") or "")))
+                else:
+                    kept.append(e)
+            if len(kept) != len(entries):
+                species_map[sp] = kept
+        if not removed:
+            return
+        try:
+            self.source_data.pending_changes = True
+        except Exception:
+            pass
+        self.setWindowModified(True)
+        lines = [
+            f"• {self._move_display_name(mv)}  "
+            f"({sp[len('SPECIES_'):] if sp.startswith('SPECIES_') else sp})"
+            for sp, mv in removed[:30]
+        ]
+        extra = len(removed) - 30
+        if extra > 0:
+            lines.append(f"…and {extra} more.")
+        text = (
+            f"Found and removed {len(removed)} invalid move-tutor assignment(s) in "
+            f"this project.\n\nThese moves aren't in the engine's tutor table, so the "
+            f"game could not build with them. They've been cleared automatically:\n\n"
+            + "\n".join(lines)
+            + "\n\nSave the project to write the repair to disk."
+        )
+
+        def _show():
+            try:
+                QMessageBox.information(self, "Move Tutors repaired", text)
+            except Exception:
+                pass
+        try:
+            QTimer.singleShot(0, _show)
+        except Exception:
+            _show()
 
     def _tmhm_item_changed(self, item) -> None:
         if item.column() == 0:
+            self.setWindowModified(True)
+
+    def _tmhm_apply_filter(self, text=None) -> None:
+        """Show only TM/HM rows whose code or move name contains the search text.
+        Called on every keystroke and re-applied after the table is repopulated
+        (so the filter persists across species switches)."""
+        table = getattr(self, "_tmhm_table", None)
+        if table is None:
+            return
+        if text is None:
+            search = getattr(self, "_tmhm_search", None)
+            text = search.text() if search is not None else ""
+        q = (text or "").strip().lower()
+        for row in range(table.rowCount()):
+            code_item = table.item(row, 1)
+            move_item = table.item(row, 2)
+            code = code_item.text().lower() if code_item else ""
+            move = move_item.text().lower() if move_item else ""
+            match = (not q) or (q in code) or (q in move)
+            table.setRowHidden(row, not match)
+
+    def _tmhm_set_all_checked(self, checked: bool) -> None:
+        """Check or uncheck every TM/HM row currently VISIBLE — so a search filter
+        lets you bulk-toggle just the subset you've narrowed to (with no filter,
+        that's every row)."""
+        table = getattr(self, "_tmhm_table", None)
+        if table is None:
+            return
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        changed = False
+        with QSignalBlocker(table):
+            for row in range(table.rowCount()):
+                if table.isRowHidden(row):
+                    continue
+                item = table.item(row, 0)
+                if item is not None and item.checkState() != state:
+                    item.setCheckState(state)
+                    changed = True
+        if changed:
             self.setWindowModified(True)
 
     def _refresh_learnset_option_cache(self) -> None:
@@ -9941,7 +10456,6 @@ QTabBar::tab:hover:!selected {
         self.learnset_moves_map = moves_map  # kept for display-name lookup
 
         tmhm_map: dict = {}   # "TM06" → "MOVE_TOXIC"
-        tutor_set: set = set()
         try:
             pm = getattr(self.source_data, "data", {}).get("pokemon_moves")
             if pm and getattr(pm, "data", None):
@@ -9954,8 +10468,6 @@ QTabBar::tab:hover:!selected {
                         if method in {"TM", "HM"} and value and move:
                             if value not in tmhm_map:
                                 tmhm_map[value] = move
-                        elif method == "TUTOR" and move:
-                            tutor_set.add(move)
         except Exception:
             pass
         if not tmhm_map:
@@ -9976,8 +10488,42 @@ QTabBar::tab:hover:!selected {
 
         self.learnset_tmhm_options = sorted(tmhm_map.keys(), key=sort_key)
         self.learnset_tmhm_move_map = tmhm_map
-        self.learnset_tutor_moves = sorted(tutor_set)
+        # Tutor moves are a FIXED engine set (sTutorMoves[]), not free-form — parse
+        # the project's own table so the list is dynamic per project, never hardcoded.
+        self.learnset_tutor_moves = self._parse_tutor_move_options()
         self._learnset_cache_valid = True
+
+    def _parse_tutor_move_options(self) -> list:
+        """Parse the engine's sTutorMoves[] table → ordered list of the valid tutor
+        move constants for THIS project. Dynamic (per project), never hardcoded.
+        Returns [] if the table can't be found."""
+        proj = (self.project_info or {}).get("dir")
+        if not proj:
+            return []
+        candidates = [
+            os.path.join(proj, "src", "data", "pokemon", "tutor_learnsets.h"),
+            os.path.join(proj, "src", "data", "tutor_learnsets.h"),
+            os.path.join(proj, "data", "pokemon", "tutor_learnsets.h"),
+            os.path.join(proj, "data", "tutor_learnsets.h"),
+        ]
+        path = next((p for p in candidates if os.path.isfile(p)), None)
+        if not path:
+            return []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except OSError:
+            return []
+        m = re.search(r"sTutorMoves\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", text, re.DOTALL)
+        if not m:
+            return []
+        moves, seen = [], set()
+        for mm in re.finditer(r"=\s*(MOVE_[A-Z0-9_]+)", m.group(1)):
+            mv = mm.group(1)
+            if mv not in seen:
+                seen.add(mv)
+                moves.append(mv)
+        return moves
 
     def _move_display_name(self, const: str) -> str:
         """Return a human-readable name for a move constant (e.g. 'Tackle' for 'MOVE_TACKLE')."""
@@ -10299,23 +10845,31 @@ QTabBar::tab:hover:!selected {
                 tm_table.setItem(row, 2, move_item)
         tm_table.resizeColumnToContents(0)
         tm_table.resizeColumnToContents(1)
+        # Re-apply any active search filter to the freshly rebuilt rows.
+        self._tmhm_apply_filter()
 
         # ── Tutor tab ────────────────────────────────────────────────
+        # Checkbox list of the fixed engine tutor moves; checked = this species can
+        # be taught it. Invalid moves (not in the table) simply never appear.
         tutor_table = self._tutor_table
         with QSignalBlocker(tutor_table):
             tutor_table.setRowCount(0)
-            for move_const in sorted(tutor_checked):
+            for move_const in self.learnset_tutor_moves:
                 row = tutor_table.rowCount()
                 tutor_table.insertRow(row)
-                combo = QComboBox()
-                combo.setEditable(True)
-                combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-                for m in self.learnset_move_options:
-                    combo.addItem(self._move_display_name(m), m)
-                idx = combo.findData(move_const)
-                combo.setCurrentIndex(idx if idx >= 0 else 0)
-                combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
-                self._learnset_set_cell_widget(tutor_table, row, 0, combo)
+                check_item = QTableWidgetItem()
+                check_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+                check_item.setCheckState(
+                    Qt.CheckState.Checked if move_const in tutor_checked else Qt.CheckState.Unchecked)
+                check_item.setData(Qt.ItemDataRole.UserRole, move_const)
+                tutor_table.setItem(row, 0, check_item)
+                name_item = QTableWidgetItem(self._move_display_name(move_const))
+                name_item.setData(Qt.ItemDataRole.UserRole, move_const)
+                name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                tutor_table.setItem(row, 1, name_item)
+        tutor_table.resizeColumnToContents(0)
+        # Re-apply any active search filter to the freshly rebuilt rows.
+        self._tutor_apply_filter()
 
         # ── Egg Moves tab ────────────────────────────────────────────
         egg_table = self._egg_table
@@ -10378,13 +10932,16 @@ QTabBar::tab:hover:!selected {
                     method = "HM" if code.upper().startswith("HM") else "TM"
                     moves.append({"move": move, "method": method, "value": code})
 
-        # Tutor moves
+        # Tutor moves — checked rows only (fixed engine tutor set; can never save a
+        # move the engine has no TUTOR_MOVE_* constant for).
         tutor_table = self._tutor_table
+        valid_tutor = set(getattr(self, "learnset_tutor_moves", []) or [])
         for row in range(tutor_table.rowCount()):
-            combo = tutor_table.cellWidget(row, 0)
-            move = (combo.currentData() or combo.currentText()).strip() if isinstance(combo, QComboBox) else ""
-            if move and move != "MOVE_NONE":
-                moves.append({"move": move, "method": "TUTOR", "value": ""})
+            check_item = tutor_table.item(row, 0)
+            if check_item and check_item.checkState() == Qt.CheckState.Checked:
+                move = str(check_item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                if move and (not valid_tutor or move in valid_tutor):
+                    moves.append({"move": move, "method": "TUTOR", "value": ""})
 
         # Egg moves
         egg_table = self._egg_table
@@ -10398,7 +10955,19 @@ QTabBar::tab:hover:!selected {
             current = self.source_data.get_species_moves(species) or []
         except Exception:
             current = []
-        if current != moves:
+        # Compare CANONICALLY (order-insensitive): a mon's TM/tutor/egg moves are
+        # SETS, and the Tutor tab now lists them in the engine's sTutorMoves order
+        # rather than the stored order — an exact list compare would flag every
+        # species that has tutor moves as "edited" just by viewing it. Sort both
+        # sides by (method, move, value) so only a genuine add/remove/level-change
+        # differs. The WRITE below still uses the collected order.
+        def _canon_moves(lst):
+            return sorted(
+                (str(e.get("method", "")), str(e.get("move", "")),
+                 str(e.get("value", "")))
+                for e in (lst or []) if isinstance(e, dict)
+            )
+        if _canon_moves(current) != _canon_moves(moves):
             try:
                 self.source_data.set_species_moves(species, moves)
             except Exception:
@@ -12850,6 +13419,15 @@ QTabBar::tab:hover:!selected {
                 with open(tut_path, "r", encoding="utf-8") as f:
                     tut_text = f.read()
 
+                # Valid tutor moves = the RHS of the engine's sTutorMoves[] table. A
+                # move without a TUTOR_MOVE_* constant can't be written as TUTOR(<it>)
+                # (undefined symbol → build break), so filter those out.
+                valid_tutor = set()
+                _tm = re.search(
+                    r"sTutorMoves\s*\[[^\]]*\]\s*=\s*\{(.*?)\}\s*;", tut_text, re.DOTALL)
+                if _tm:
+                    valid_tutor = set(re.findall(r"=\s*(MOVE_[A-Z0-9_]+)", _tm.group(1)))
+
                 # Only patch the sTutorLearnsets array, not sTutorMoves
                 # Split at the array declaration
                 tut_arr_start = tut_text.find("sTutorLearnsets[]")
@@ -12859,26 +13437,34 @@ QTabBar::tab:hover:!selected {
 
                     def _rebuild_tutor_line(sp):
                         entries = [e for e in species_moves.get(sp, []) if _method(e) == "TUTOR"]
-                        if not entries:
-                            return None
-                        tokens = [f"TUTOR({e.get('move')})" for e in entries if e.get("move")]
-                        return (" " + "\n                         | ".join(sorted(tokens))) if tokens else None
+                        seen = []
+                        for e in entries:
+                            mv = e.get("move")
+                            if mv and (not valid_tutor or mv in valid_tutor) and mv not in seen:
+                                seen.append(mv)
+                        if not seen:
+                            return " 0"   # existing line, no valid tutors -> reset to 0
+                        return " " + "\n                         | ".join(
+                            f"TUTOR({mv})" for mv in sorted(seen))
 
                     def _tut_sub(m):
                         sp = m.group(1)
-                        repl = _rebuild_tutor_line(sp)
-                        if repl:
+                        new_line = f"[{sp}] ={_rebuild_tutor_line(sp)},"
+                        if new_line != m.group(0):
                             nonlocal total
                             total += 1
-                            return f"[{sp}] ={repl},"
-                        return m.group(0)
+                        return new_line
 
-                    # Match multi-line tutor entries: [SPECIES_X] = TUTOR(...)
-                    #                                              | TUTOR(...),
+                    # Match EVERY species entry in the bitfield array — single-line,
+                    # multi-line (DOTALL, non-greedy to the terminating comma), AND
+                    # `= 0,` — so a newly-checked tutor on a previously-empty species
+                    # is written and an emptied species is reset to 0. tut_body starts
+                    # at sTutorLearnsets[], so this never touches the sTutorMoves table.
                     tut_body = re.sub(
-                        r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*(?:TUTOR\([^)]*\)\s*\|?\s*)+,",
+                        r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*.*?,",
                         _tut_sub,
                         tut_body,
+                        flags=re.DOTALL,
                     )
                     tut_text = tut_header + tut_body
 
@@ -13348,9 +13934,7 @@ QTabBar::tab:hover:!selected {
                             return True
         # Handle events on other watched objects
         elif (
-            watched == self.ui.ability1
-            or watched == self.ui.ability2
-            or watched == self.ui.held_item_common
+            watched == self.ui.held_item_common
             or watched == self.ui.held_item_rare
             or watched == self.ui.evo_species
             or watched == self.ui.starter1_species

@@ -33,6 +33,17 @@ PreviewEntry = Tuple[str, int, str, str]
 _MAP_EXCLUDED_PREFIXES = ("src/data/region_map/",)
 _MAP_EXCLUDED_FILES = ("src/region_map.c",)
 
+# Map / layout DATA subtrees (repo-relative, forward slash, lowercase). Inside
+# these a SPECIES rename applies ONLY its QUALIFIED tokens (SPECIES_ /
+# NATIONAL_DEX_ / HOENN_DEX_ / gMon* / CRY_ / graphics-path) — NEVER its BARE
+# name tokens (base-UPPER / CamelCase / slug). A map literally called "Faron", a
+# LOCALID_LUGIA / EventScript_Lugia symbol, or a data/maps/<Name>/ folder merely
+# CONTAINS the species word; the bare tokens would corrupt those. Renaming a
+# monster must NEVER rename a map. Legit SPECIES_ references in a map's scripts
+# (a static / gift / wild encounter) still rename via the qualified token, so the
+# build stays valid.
+_MAP_DATA_PREFIXES = ("data/maps/", "data/layouts/")
+
 # Non-species engine constant families that EMBED a mon name but are NOT the
 # mon's identity. A MON rename must never rewrite a name token inside one of
 # these — they are separate game mechanics / locations / story flags, and a
@@ -294,8 +305,15 @@ class RefactorService:
             if self._logger:
                 self._logger(f"Updated {rel}")
 
-    def _multi_search_and_replace(self, pairs: "List[Tuple[str, str]]", preview_only: bool) -> List[PreviewEntry]:
+    def _multi_search_and_replace(self, pairs: "List[Tuple[str, str]]", preview_only: bool,
+                                  bare_keys: "frozenset[str]" = frozenset()) -> List[PreviewEntry]:
         """Scan the source tree once, applying ALL (old, new) pairs atomically per line.
+
+        *bare_keys* is the set of token KEYS that are BARE species-name words
+        (base-UPPER / CamelCase / slug). These are NOT applied inside the map /
+        layout data subtrees (``_MAP_DATA_PREFIXES``) — only qualified tokens are —
+        so renaming a monster can never corrupt a map name, folder, LOCALID_* or
+        EventScript_* symbol that merely contains the same word.
 
         This is the cascade-safe alternative to calling :meth:`_search_and_replace`
         repeatedly in a loop.  The old behaviour was:
@@ -349,6 +367,12 @@ class RefactorService:
         combined = re.compile(
             "(?<![A-Za-z0-9])(?:" + "|".join(re.escape(a) for a, _ in clean)
             + ")(?![A-Za-z0-9_])")
+        # Map-data-safe regex: the SAME tokens MINUS the bare species-name words,
+        # so map / layout files only ever get qualified (SPECIES_/gMon*/…) hits.
+        map_clean = [(a, b) for a, b in clean if a not in bare_keys]
+        combined_map = re.compile(
+            "(?<![A-Za-z0-9])(?:" + "|".join(re.escape(a) for a, _ in map_clean)
+            + ")(?![A-Za-z0-9_])") if map_clean else None
 
         root = self.util.repo_root()
         preview: List[PreviewEntry] = []
@@ -378,8 +402,18 @@ class RefactorService:
                     if not any(name.endswith(ext) for ext in exts):
                         continue
                     file_path = os.path.join(dirpath, name)
+                    rel_path = os.path.relpath(file_path, root)
                     # Never rewrite map / region-map name data with a MON rename.
-                    if _is_sweep_excluded_path(os.path.relpath(file_path, root)):
+                    if _is_sweep_excluded_path(rel_path):
+                        continue
+                    # Inside map / layout data, use the map-safe regex (bare
+                    # species-name tokens excluded) so a map/folder/LOCALID_/
+                    # EventScript_ that merely contains the word isn't corrupted.
+                    rel_lower = rel_path.replace("\\", "/").lower()
+                    use_re = (combined_map
+                              if any(rel_lower.startswith(p) for p in _MAP_DATA_PREFIXES)
+                              else combined)
+                    if use_re is None:
                         continue
                     try:
                         with open(file_path, "r", encoding="utf-8", errors="surrogateescape") as f:
@@ -389,9 +423,9 @@ class RefactorService:
                     changed = False
                     new_lines = list(lines)
                     for idx, ln in enumerate(lines):
-                        if not combined.search(ln):
+                        if not use_re.search(ln):
                             continue
-                        new_ln = combined.sub(
+                        new_ln = use_re.sub(
                             lambda m, _ln=ln: _guarded_token_sub(m, _ln, mapping), ln)
                         if new_ln != ln:
                             preview.append((os.path.relpath(file_path, root), idx + 1, ln.rstrip(), new_ln.rstrip()))
@@ -651,6 +685,30 @@ class RefactorService:
             return False
         return True
 
+    def _species_graphics_slug(self, camel: str, fallback_slug: str) -> str:
+        """Return the folder a species' sprites ACTUALLY live in, read from its
+        front/back/icon PNG path in species_graphics.json. This can be a FOREIGN
+        folder (a leftover vanilla folder like ``nidoran_f`` that an earlier setup
+        never moved) that does NOT match the constant-derived *fallback_slug*. The
+        rename uses this as the true move source so a mon's graphics always end up
+        in its own folder. Falls back to *fallback_slug* when nothing is found."""
+        sg_path = os.path.join(self.util.repo_root(), "src", "data", "species_graphics.json")
+        try:
+            with open(sg_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return fallback_slug
+        if not isinstance(data, dict):
+            return fallback_slug
+        for prefix in ("gMonFrontPic_", "gMonBackPic_", "gMonIcon_"):
+            entry = data.get(prefix + camel)
+            png = entry.get("png") if isinstance(entry, dict) else None
+            if isinstance(png, str):
+                m = re.search(r"graphics/pokemon/([^/]+)/", png)
+                if m:
+                    return m.group(1)
+        return fallback_slug
+
     def _rename_in_species_graphics_json(self, path: str, old_camel: str, new_camel: str, old_slug: str, new_slug: str) -> bool:
         """Rename graphic symbol keys and path values in species_graphics.json.
 
@@ -690,11 +748,20 @@ class RefactorService:
             segs = p.split("/")
             return "/".join(new_slug if s == old_slug else s for s in segs)
 
+        # For the RENAMED species' OWN entries, FORCE the graphics/pokemon/<folder>/
+        # segment to the new slug no matter what it currently is — even a FOREIGN
+        # folder (nidoran_f/) that doesn't equal old_slug. This is what fixes a mon
+        # whose sprites were left pointing at someone else's folder after a rename.
+        def _force_png_folder(p: str) -> str:
+            m = re.match(r"^(.*graphics/pokemon/)[^/]+(/.*)$", p)
+            return (m.group(1) + new_slug + m.group(2)) if m else _rewrite_path(p)
+
         updated = {}
         changed = False
         for k, v in data.items():
             new_k = _rewrite_key(k)
-            if new_k != k:
+            is_renamed = new_k != k          # this entry belongs to the renamed species
+            if is_renamed:
                 changed = True
             new_v = {}
             if isinstance(v, dict):
@@ -704,6 +771,8 @@ class RefactorService:
                         # anchored key rewrite; otherwise treat as a path.
                         if vv.endswith(camel_suffix) or vv == old_camel:
                             new_vv = vv[: -len(old_camel)] + new_camel if vv.endswith(camel_suffix) else new_camel
+                        elif is_renamed:
+                            new_vv = _force_png_folder(vv)
                         else:
                             new_vv = _rewrite_path(vv)
                         if new_vv != vv:
@@ -1156,6 +1225,10 @@ class RefactorService:
                 new_camel = self._camel(display or new_base)
                 old_slug = self._slug(old_base)
                 new_slug = self._slug(new_base)  # constant, not display (see _build_tokens)
+                # The folder the sprites ACTUALLY live in (may be a foreign folder
+                # like nidoran_f/ that doesn't match old_slug — an earlier setup
+                # never moved it). Used as the real move source + INCBIN-path token.
+                actual_old_slug = self._species_graphics_slug(old_camel, old_slug)
                 tokens = [
                     (old, new),
                     (f"NATIONAL_DEX_{old_base}", f"NATIONAL_DEX_{new_base}"),
@@ -1170,13 +1243,26 @@ class RefactorService:
                     (old_base.upper(), new_base.upper()),
                     (old_slug, new_slug),
                 ]
+                # If the sprites live in a FOREIGN folder, also rewrite any INCBIN /
+                # path reference to it so front_pic_table etc. follow the moved
+                # folder to the new slug.
+                if actual_old_slug and actual_old_slug != old_slug:
+                    tokens.insert(9, (f"graphics/pokemon/{actual_old_slug}",
+                                      f"graphics/pokemon/{new_slug}"))
+                # The BARE species-name tokens (CamelCase / base-UPPER / slug).
+                # These must not run inside map/layout data — a map named "Faron",
+                # a data/maps/<slug>/ folder, or a LOCALID_/EventScript_ symbol
+                # merely CONTAINS the word and would be corrupted. Renaming a
+                # monster must never rename a map.
+                bare_keys = frozenset({old_camel, old_base.upper(), old_slug})
                 # Atomic multi-token sweep.  Each file is scanned once with a
                 # combined regex; longer tokens win at overlap; no pass can
                 # re-match the output of an earlier pass.  This kills the
                 # cascade bug where renaming e.g. Octo → Octorock produced
                 # SPECIES_OCTOROCKROCK because the later OCTO→OCTOROCK token
                 # was finding OCTO inside the just-written OCTOROCK.
-                self._multi_search_and_replace(tokens, preview_only=False)
+                self._multi_search_and_replace(tokens, preview_only=False,
+                                               bare_keys=bare_keys)
 
                 # Re-assert the human-readable display name LAST. The
                 # (old_base.upper() -> new_base.upper()) token above is needed
@@ -1205,8 +1291,9 @@ class RefactorService:
                     if self._logger:
                         self._logger("Updated src/data/trainers.json")
 
-                # 3) Rename graphics folder now
-                old_dir = os.path.join(root, "graphics", "pokemon", old_slug)
+                # 3) Rename graphics folder now — move the folder the sprites
+                # ACTUALLY live in (foreign folder included), not the constant slug.
+                old_dir = os.path.join(root, "graphics", "pokemon", actual_old_slug)
                 new_dir = os.path.join(root, "graphics", "pokemon", new_slug)
                 if os.path.isdir(old_dir) and old_dir != new_dir:
                     # Remove stale destination if it exists (e.g. leftover compiled

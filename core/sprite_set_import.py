@@ -38,6 +38,14 @@ def _to_indexed(img: Optional[QImage]) -> Optional[QImage]:
     if img is None or img.isNull():
         return None
     if img.format() != QImage.Format.Format_Indexed8:
+        # Flatten any alpha channel to plain RGB FIRST, so a sprite exported as
+        # RGBA (even with a redundant, fully-opaque alpha) reduces to Indexed8
+        # exactly like its RGB siblings. Without this, an RGBA front paired with
+        # RGB back yields inconsistent border-BG detection and a broken shared
+        # palette. Discarding the alpha keeps the RGB values (Qt sets alpha=255),
+        # and the transparent slot is recovered from the border by _bg_color.
+        if img.hasAlphaChannel():
+            img = img.convertToFormat(QImage.Format.Format_RGB32)
         img = img.convertToFormat(QImage.Format.Format_Indexed8)
     return img
 

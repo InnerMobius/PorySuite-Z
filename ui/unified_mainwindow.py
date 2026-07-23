@@ -181,6 +181,15 @@ class UnifiedMainWindow(QMainWindow):
         # Base (clean) QIcon for each toolbar button — used to repaint the
         # amber dirty-dot overlay on top without losing the original art.
         self._page_base_icons: dict[str, QIcon] = {}
+        # The QWidgetAction QToolBar.addWidget() returns for each page button.
+        # Visibility must be toggled through this, not through the button.
+        self._page_button_actions: dict = {}
+        # icon_name -> human label, for the Settings → Tabs checkbox list.
+        self._page_labels: dict = {}
+        # Tabs the user has hidden (persisted). Loaded lazily in
+        # _load_hidden_tabs(); these three are hidden on first run.
+        self._hidden_tabs = None
+        self._default_hidden_tabs = ("encounters", "fame_checker", "labels")
         # Per-page dirty section count.  Multiple logical sections share a
         # single toolbar button (e.g. "species" + "pokedex" → "pokemon").
         self._page_dirty_counts: dict[str, int] = {}
@@ -193,12 +202,13 @@ class UnifiedMainWindow(QMainWindow):
             "abilities": "abilities",
             "trainers": "trainers",
             "starters": "starters",
-            "encounters": "trainers",
             "credits": "credits",
             "title": "settings",
             "sound": "sound",
             "overworld": "overworld",
             "battle_anim": "battle_anim",
+            "fame_checker": "fame_checker",
+            "encounters": "encounters",
             "trainer_graphics": "trainers",
             "events":    "events",
             "maps":      "maps",
@@ -214,6 +224,10 @@ class UnifiedMainWindow(QMainWindow):
         # ── Build toolbar and menus ──────────────────────────────────────────
         self._build_toolbar()
         self._build_menus()
+        # Apply the saved tab-visibility choices (defaults hide Wild Encounters,
+        # Fame Checker, and Label Manager) now that all buttons + menu entries
+        # exist.
+        self._apply_tab_visibility()
 
         # ── Status bar ───────────────────────────────────────────────────────
         self._git_bar_label = QLabel("")
@@ -277,13 +291,16 @@ class UnifiedMainWindow(QMainWindow):
             ("trainers",   "Trainers"),
             ("starters",   "Starters"),
             ("overworld",  "Overworld Graphics"),
-            ("battle_anim", "Battle Animations"),
+            ("shops",      "Shop Editor"),
+            ("fame_checker", "Fame Checker"),
+            ("encounters", "Wild Encounters"),
             ("credits",    "Credits"),
             ("sound",      "Sound Editor"),
         ]
         for icon_name, tooltip in porysuite_pages:
-            btn = self._make_page_button(icon_name, tooltip)
-            tb.addWidget(btn)
+            self._add_page_button(tb, icon_name, tooltip)
+        # Initial visibility (hidden set + support gating) is applied centrally
+        # by _apply_tab_visibility() once the toolbar and View menu exist.
 
         # ── SECOND ROW ───────────────────────────────────────────────────────
         # The single row overflowed (icons clipped behind the ">>" extension) on a
@@ -307,22 +324,16 @@ class UnifiedMainWindow(QMainWindow):
             ("labels",    "Label Manager"),
         ]
         for icon_name, tooltip in eventide_pages:
-            btn = self._make_page_button(icon_name, tooltip)
-            tb2.addWidget(btn)
+            self._add_page_button(tb2, icon_name, tooltip)
 
         _add_separator(tb2)
 
-        # ── Tilemap Editor ───────────────────────────────────────────────────
-        btn = self._make_page_button("tilesets", "Tilemap Editor")
-        tb2.addWidget(btn)
-
-        # ── Shop Editor ──────────────────────────────────────────────────────
-        btn = self._make_page_button("shops", "Shop Editor")
-        tb2.addWidget(btn)
+        # ── Tilemap Editor, then Battle Animations right after it ────────────
+        self._add_page_button(tb2, "tilesets", "Tilemap Editor")
+        self._add_page_button(tb2, "battle_anim", "Battle Animations")
 
         # ── Map Transfer ─────────────────────────────────────────────────────
-        btn = self._make_page_button("maptransfer", "Map Transfer")
-        tb2.addWidget(btn)
+        self._add_page_button(tb2, "maptransfer", "Map Transfer")
 
         _add_separator(tb2)
 
@@ -333,8 +344,7 @@ class UnifiedMainWindow(QMainWindow):
             ("config",      "Config"),
         ]
         for icon_name, tooltip in settings_pages:
-            btn = self._make_page_button(icon_name, tooltip)
-            tb2.addWidget(btn)
+            self._add_page_button(tb2, icon_name, tooltip)
 
         _add_separator(tb2)
 
@@ -366,6 +376,58 @@ class UnifiedMainWindow(QMainWindow):
         self._page_base_icons[icon_name] = base
         btn.clicked.connect(lambda checked, name=icon_name: self._switch_page(name))
         return btn
+
+    def _add_page_button(self, toolbar, icon_name: str, tooltip: str):
+        """Create a page button, add it to `toolbar`, and STORE its action so
+        its visibility can be toggled (hiding the button alone doesn't stick —
+        the toolbar re-shows it through the action)."""
+        btn = self._make_page_button(icon_name, tooltip)
+        self._page_button_actions[icon_name] = toolbar.addWidget(btn)
+        self._page_labels[icon_name] = tooltip
+        return btn
+
+    # ── tab show/hide (Settings → Tabs) ─────────────────────────────────────
+
+    def _load_hidden_tabs(self) -> set:
+        if self._hidden_tabs is None:
+            s = QSettings(get_settings_path(), QSettings.Format.IniFormat)
+            val = s.value("tabs/hidden", None)
+            if val is None:                       # first run → sensible defaults
+                self._hidden_tabs = set(self._default_hidden_tabs)
+            elif isinstance(val, str):            # single-item INI list
+                self._hidden_tabs = {val} if val else set()
+            else:
+                self._hidden_tabs = set(val)
+        return self._hidden_tabs
+
+    def _tab_supported(self, name: str) -> bool:
+        """A gated tab is only ever shown when the project actually has it."""
+        ps = self._porysuite_window
+        if name == "fame_checker":
+            return bool(getattr(ps, "fame_checker_supported", False))
+        if name == "encounters":
+            return bool(getattr(ps, "encounters_supported", False))
+        return True
+
+    def _apply_tab_visibility(self) -> None:
+        """Reflect the hidden set (and support gating) on every page button and
+        its View-menu entry."""
+        hidden = self._load_hidden_tabs()
+        for name, act in self._page_button_actions.items():
+            if act is not None:
+                act.setVisible(name not in hidden and self._tab_supported(name))
+        for name, act in getattr(self, "_view_actions", {}).items():
+            act.setVisible(name not in hidden and self._tab_supported(name))
+        # If the user is standing on a page that just got hidden, move off it.
+        cur = getattr(self, "_current_page_name", "")
+        if cur in hidden or (cur and not self._tab_supported(cur)):
+            self._switch_page("pokemon")
+
+    def _tab_defs(self) -> list:
+        """[(icon_name, label), …] for the Settings → Tabs checkbox list, in
+        toolbar order."""
+        return [(name, self._page_labels.get(name, name))
+                for name in self._page_button_actions]
 
     def _icon_with_dirty_dot(self, base: QIcon) -> QIcon:
         """Return a 32×32 QIcon with an amber 8×8 dot in the bottom-right."""
@@ -493,37 +555,39 @@ class UnifiedMainWindow(QMainWindow):
 
         # ── View ─────────────────────────────────────────────────────────────
         view_menu = menubar.addMenu("&View")
+        self._view_actions = {}
 
-        # Data editors
-        for icon_name, label in [
+        def _view_group(pairs):
+            for icon_name, label in pairs:
+                act = QAction(label, self)
+                act.triggered.connect(
+                    lambda checked, n=icon_name: self._switch_to_page(n))
+                view_menu.addAction(act)
+                self._view_actions[icon_name] = act
+
+        # Data editors (Shop Editor now sits with them; Battle Animations moved
+        # next to the Tilemap Editor).
+        _view_group([
             ("pokemon", "Pokemon"), ("pokedex", "Pokedex"), ("moves", "Moves"),
             ("items", "Items"), ("trainers", "Trainers"), ("starters", "Starters"),
-            ("overworld", "Overworld Graphics"),
-            ("battle_anim", "Battle Animations"),
-        ]:
-            act = QAction(label, self)
-            act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
-            view_menu.addAction(act)
+            ("overworld", "Overworld Graphics"), ("shops", "Shop Editor"),
+            ("fame_checker", "Fame Checker"),
+            ("encounters", "Wild Encounters"),
+        ])
+        self._fame_checker_action = self._view_actions.get("fame_checker")
+        self._encounters_action = self._view_actions.get("encounters")
 
         view_menu.addSeparator()
 
-        # Map/script editors
-        for icon_name, label in [
+        _view_group([
             ("events", "EVENTide"), ("maps", "Maps"),
-            ("regionmap", "Region Map"),
-            ("labels", "Label Manager"),
-        ]:
-            act = QAction(label, self)
-            act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
-            view_menu.addAction(act)
+            ("regionmap", "Region Map"), ("labels", "Label Manager"),
+            ("tilesets", "Tilemap Editor"), ("battle_anim", "Battle Animations"),
+        ])
 
         view_menu.addSeparator()
 
-        # Settings/config
-        for icon_name, label in [("ui", "Text Editor"), ("config", "Config")]:
-            act = QAction(label, self)
-            act.triggered.connect(lambda checked, n=icon_name: self._switch_to_page(n))
-            view_menu.addAction(act)
+        _view_group([("ui", "Text Editor"), ("config", "Config")])
 
         view_menu.addSeparator()
 
@@ -765,6 +829,16 @@ class UnifiedMainWindow(QMainWindow):
             ba_widget = porysuite_main.battle_anim_tab
             idx = self.stack.addWidget(ba_widget)
             self._page_indices["battle_anim"] = idx
+
+        # ── Fame Checker (standalone page pulled from MainWindow) ────────────
+        if getattr(porysuite_main, "fame_checker_tab", None) is not None:
+            idx = self.stack.addWidget(porysuite_main.fame_checker_tab)
+            self._page_indices["fame_checker"] = idx
+
+        # ── Wild Encounters (standalone page pulled from MainWindow) ─────────
+        if getattr(porysuite_main, "encounters_tab", None) is not None:
+            idx = self.stack.addWidget(porysuite_main.encounters_tab)
+            self._page_indices["encounters"] = idx
 
         # ── Credits editor (standalone page) ─────────────────────────────────
         try:
@@ -1126,17 +1200,6 @@ class UnifiedMainWindow(QMainWindow):
             # unified title bar can't light up while the child's own override
             # is correctly blocking a spurious dirty mark (loading, flushing,
             # bulk combo population, etc.).
-            try:
-                import os, time
-                log = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diag_dirty.log")
-                with open(log, "a", encoding="utf-8", newline='\n') as f:
-                    f.write(
-                        f"[{time.strftime('%H:%M:%S')}] _unified_set_modified({modified}) "
-                        f"suppress={self._suppress_dirty} "
-                        f"ps_suppress={getattr(porysuite_main, '_ps_suppress_dirty', False)} "
-                        f"depth={getattr(porysuite_main, '_loading_depth', 0)}\n")
-            except Exception:
-                pass
             if modified and (self._suppress_dirty
                              or getattr(porysuite_main, '_ps_suppress_dirty', False)
                              or getattr(porysuite_main, '_loading_depth', 0) > 0):
@@ -1164,6 +1227,17 @@ class UnifiedMainWindow(QMainWindow):
     # Project loading
     # ═════════════════════════════════════════════════════════════════════════
 
+    def _sync_fame_checker_button(self) -> None:
+        """Re-apply visibility once the project's Fame Checker support is known.
+
+        A gated tab shows only when it's BOTH supported by the project AND not
+        hidden in Settings → Tabs; `_apply_tab_visibility` combines the two."""
+        self._apply_tab_visibility()
+
+    def _sync_encounters_button(self) -> None:
+        """Re-apply visibility once encounter support is known (see above)."""
+        self._apply_tab_visibility()
+
     def load_data(self, project_info: dict):
         """Store project info and update window title."""
         self.project_info = project_info
@@ -1173,6 +1247,9 @@ class UnifiedMainWindow(QMainWindow):
 
         # Enable git actions
         self._git_set_all_enabled(True)
+
+        self._sync_fame_checker_button()
+        self._sync_encounters_button()
 
         # Load credits editor data
         project_dir = project_info.get("dir", "")
@@ -2336,7 +2413,9 @@ class UnifiedMainWindow(QMainWindow):
     def _open_settings(self):
         """Open the settings dialog."""
         from settingsdialog import SettingsDialog
-        dlg = SettingsDialog(self, project_info=self.project_info)
+        dlg = SettingsDialog(self, project_info=self.project_info,
+                             tabs=self._tab_defs(),
+                             hidden_tabs=self._load_hidden_tabs())
         if dlg.exec():
             # If project name changed, update window title + projects.json
             if dlg.project_name_changed and self.project_info:
@@ -2344,6 +2423,10 @@ class UnifiedMainWindow(QMainWindow):
                 self.project_info["name"] = new_name
                 self.setWindowTitle(f"PorySuite-Z — {new_name}[*]")
                 self._save_project_name(new_name)
+
+            # Apply the chosen tab visibility (Settings → Tabs).
+            self._hidden_tabs = set(dlg.hidden_tabs())
+            self._apply_tab_visibility()
 
             # Reload all event editor settings (colors, tooltips, etc.)
             if (self._eventide_window

@@ -245,6 +245,7 @@ class LayoutsTab(QWidget):
         layout.addStretch()
 
         # ── Button connections ───────────────────────────────────────────────
+        self.layout_combo.currentIndexChanged.connect(self._on_layout_selected)
         self.btn_rename_layout.clicked.connect(self._on_rename_layout)
         self.btn_delete_layout.clicked.connect(self._on_delete_layout)
         self.btn_clean_layouts.clicked.connect(self._on_clean_layouts)
@@ -278,12 +279,15 @@ class LayoutsTab(QWidget):
         self._mw.log_message(f"Layouts tab: loaded {project_dir}")
 
     def _populate_combos(self):
-        # Layout combo
+        # Layout combo. Block its signal during (re)population so the
+        # layout-selection handler doesn't fire before the tileset combos exist.
+        _blocked = self.layout_combo.blockSignals(True)
         self.layout_combo.clear()
         if self._layout_renamer:
             for layout in self._layout_renamer.get_layouts():
                 lid = layout.get('id', '')
                 self.layout_combo.addItem(lid, layout)
+        self.layout_combo.blockSignals(_blocked)
 
         # Tileset combos — parse from tileset headers
         self.tileset_combo.clear()
@@ -308,6 +312,33 @@ class LayoutsTab(QWidget):
                     primaries.add(pt)
             for pt in sorted(primaries):
                 self.primary_combo.addItem(pt, pt)
+
+        # Now that every combo is populated, sync the tileset dropdowns to the
+        # currently-selected layout's actual tilesets.
+        self._on_layout_selected()
+
+    def _on_layout_selected(self, _idx=None):
+        """Set the Primary/Secondary tileset dropdowns to the selected layout's
+        current tilesets, so picking a layout shows its real data."""
+        layout = self._selected_layout()
+        if not isinstance(layout, dict):
+            return
+        primary = layout.get('primary_tileset', '')
+        secondary = layout.get('secondary_tileset', '')
+        # Primary combo stores the full gTileset_* symbol as item data.
+        if primary:
+            i = self.primary_combo.findData(primary)
+            if i >= 0:
+                self.primary_combo.setCurrentIndex(i)
+        # Secondary combo stores (label, folder); the layout value is the full
+        # gTileset_<label> symbol.
+        if secondary:
+            for i in range(self.secondary_combo.count()):
+                data = self.secondary_combo.itemData(i)
+                if isinstance(data, tuple) and data and (
+                        f"gTileset_{data[0]}" == secondary or data[0] == secondary):
+                    self.secondary_combo.setCurrentIndex(i)
+                    break
 
     def _selected_layout(self):
         idx = self.layout_combo.currentIndex()

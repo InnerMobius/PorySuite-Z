@@ -47,13 +47,13 @@ The Project Selector keeps a recent-projects list — hover any entry for a path
 
 ## Editor Pages
 
-PorySuite-Z has 19 toolbar pages accessible from the RPG Maker XP-style icon toolbar:
+PorySuite-Z's editor pages are accessible from the RPG Maker XP-style icon toolbar:
 
 ### Pokemon
 
 Full species editor with three sub-tabs:
 
-- **Info** -- Species name, Dex number, category, description, types, abilities (including hidden), held items, gender ratio, egg groups/cycles, catch rate, friendship, growth rate, EXP yield, flags (Legendary, Mythical, etc.) with front sprite and animated icon preview
+- **Info** -- Species name, Dex number, category, description, types, abilities (including hidden), held items, gender ratio, egg groups/cycles, catch rate, friendship, growth rate, EXP yield, flags (Legendary, Mythical, etc.) with front sprite and animated icon preview. On projects whose engine supports it, an **Innate Abilities** group lets you assign up to three extra passive abilities per species. Multi-form species (Unown, Deoxys, Castform) get a **Normalize this species…** button that collapses them to a single, normal, editable sprite so they can be edited like any other mon
 - **Stats** -- Base stats (HP/ATK/DEF/SP.ATK/SP.DEF/SPEED) and EV yields
 - **Graphics** -- Battle scene preview (front/back sprites over background with shadow), Player Y/Enemy Y/Enemy Altitude, Normal and Shiny palette editors (16-swatch rows with color picker AND **drag-to-reorder** — drop on the leftmost slot to choose which color is transparent; the front/back PNGs are reindexed automatically on save), Import Palette from PNG, **Import .pal File**, Menu Icon with animated preview and palette index selector, footprint preview, Open Graphics Folder
 
@@ -95,12 +95,13 @@ Searchable ability browser with detail panel:
 
 ### Trainers
 
-Four sub-tabs:
+Five sub-tabs:
 
 - **Trainers** -- Searchable trainer list grouped by trainer class. Detail editor includes: class, name, trainer pic (with visual preview), encounter music, AI flags, party type, and a full party editor with per-member level, species, held item, moves, and ability. VS Seeker rematch tier support with dynamic tier labels that refresh in-place when you edit a rematch party.
 - **Trainer Classes** -- Searchable class list with sprite thumbnails. Edit class display name (12-character limit), prize money multiplier, and default sprite (dropdown with thumbnails of all trainer pics). **Rename...** button writes the new `TRAINER_CLASS_*` constant across source files (opponents.h, trainers.h, battle_main.c, trainer_class_names.h, data/trainers.json, scripts, maps). Create new classes with a button that writes to three files. View battle info, encounter music, facility class mappings, and usage counts. Inline note under the class-level Trainer Pic explains it's scoped to Battle Tower / Trainer Tower / Union Room facility battles only.
 - **Graphics** -- Scrollable card grid of every trainer pic (thumbnail + name + `TRAINER_PIC_*` constant) with a live search filter, amber border on unsaved cards, and blue border on the selected card. Right panel has a 192x192 sprite preview, the same drag-to-reorder 16-swatch palette row used on Pokemon Graphics (drop on the leftmost slot to pick the transparent index — the sprite PNG is reindexed automatically on save), **Import PNG as Sprite...** (replaces pixels AND palette), **Import Palette from PNG**, **Import .pal File**, **Save Sprite as PNG**, **Save Palette as .pal**, and **Open Palettes Folder**. The **Add Trainer Pic** button takes a name and a PNG and registers a brand-new trainer pic across all four engine source files in one operation — the new constant is immediately available in the trainer detail panel and the trainer-class default-sprite dropdown without a restart. The body uses a draggable splitter so the grid and editor can be rebalanced, and both panels stay visible when the window isn't maximized.
 - **Back Sprites** -- Dedicated editor for trainer **back** sprites (the throwing pose shown when a trainer sends out a Pokemon). Same PNG-import and drag-to-reorder palette toolkit as the front Graphics tab, plus the animated throwing sequence previewed with a play button and frame scrubber. **Add Back Sprite** registers a brand-new back sprite (name + PNG) across the engine source files in one operation.
+- **Dialogue** -- Edit the trainer's Intro / Defeat / Post-battle text, discovered from wherever the battle is scripted — a per-map `scripts.inc` OR the vanilla global `data/scripts/trainers.inc` — and saved back to the real source. A **Move battle to another map…** button relocates the whole battle (script + dialogue + NPC) to a different map in one action, renaming every map-scoped label so the two maps never clash.
 
 ![Trainers](trainers.png)
 
@@ -336,6 +337,14 @@ Beyond the standard build flags, the Config tab also exposes new-game setup and 
 
 ![Config](config.png)
 
+### Shop Editor
+
+Edit every mart's contents. Each shop is a list of items sold; add, remove, and reorder entries with a searchable item picker. Create and delete whole shops, and jump straight to the NPC/script that opens a given shop so you can see where it's used in-game. Writes back to the shop-data source so `make` stays stable.
+
+### Map Transfer
+
+Move whole maps **between two pokefirered decomp projects** — something porymap/AdvanceMap import can't do for a map you already have in another decomp. Tick the maps to move; the tab shows every layout and tileset they drag along, bundles them into a self-contained `.zip`, and imports that bundle into the target project (renaming `MAP_`/`LAYOUT_` constants to avoid collisions). After an import, press **F5** in Maps/Tilesets to see the new data.
+
 ---
 
 ## Menus
@@ -391,6 +400,8 @@ Beyond the standard build flags, the Config tab also exposes new-game setup and 
 | Push to Origin | Ctrl+Shift+U |
 | Commit | Ctrl+Shift+K |
 | Configure Remotes... | -- |
+
+The **Git Panel** also lists your branches (local and remote-tracking) with ahead/behind status and a **Switch to Branch** button that swaps all your files to the chosen branch, sets upstream, and offers a safe fast-forward when it's behind. Push remembers the branch you last pushed to, per project, so publishing to a fixed branch (e.g. `master`) is one click.
 
 All git push and pull operations show a confirmation dialog warning about data that will be overwritten. These cannot be suppressed.
 

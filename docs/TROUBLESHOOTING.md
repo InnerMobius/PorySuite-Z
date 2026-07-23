@@ -2,6 +2,14 @@
 
 This guide covers common setup issues and how to reset the application if something goes wrong. Written in plain English.
 
+## Pokemon graphics
+
+### "Import Normal + Shiny Set" gives a smeared/wrong palette
+This happens when one sprite in the set was exported as **RGBA** (with an alpha channel) while its siblings are RGB — the two convert to indexed colours differently and the shared palette comes out wrong. The importer now flattens any alpha channel to plain RGB first, so it's handled automatically. If you still see it, re-export the odd sprite as RGB (or indexed) so the whole set matches.
+
+### Unown / Deoxys / Castform can't be edited as one mon
+They ship as multi-form bundles (letter/weather/version forms). Select the species on the **Info tab** and use the **Normalize this species…** button to collapse it to a single normal, editable sprite. Rebuild afterward (Make) to see it in-game. Once done, the button shows "✓ Already a single sprite".
+
 ## Region Map editor
 
 ### I cloned a region and now the new region's tilemap shows up in-game when the player is in the source region's territory
