@@ -11242,12 +11242,29 @@ QTabBar::tab:hover:!selected {
                 trainers = self.source_data.get_pokemon_trainers() or {}
                 root     = self.project_info.get("dir", "") if self.project_info else ""
 
-                # Build species list
+                # Build species list — national-dex order (the order the rest
+                # of the app uses), not the data manager's raw parse order.
                 species_list = [("SPECIES_NONE", "None")]
                 try:
-                    for k, v in self.source_data.get_pokemon_data().items():
-                        name = v.get("name") or k.replace("SPECIES_", "").replace("_", " ").title()
-                        species_list.append((k, name))
+                    data = self.source_data.get_pokemon_data() or {}
+
+                    def _sp_name(const, sp=None):
+                        if sp is None:
+                            sp = data.get(const)
+                        return (sp.get("name") if isinstance(sp, dict) else None) \
+                            or const.replace("SPECIES_", "").replace("_", " ").title()
+
+                    seen = {"SPECIES_NONE"}
+                    for entry in (self.source_data.get_national_dex() or []):
+                        const = entry.get("species") if isinstance(entry, dict) \
+                            else None
+                        if not const or const in seen:
+                            continue
+                        seen.add(const)
+                        species_list.append((const, _sp_name(const)))
+                    for k, v in data.items():
+                        if k not in seen:
+                            species_list.append((k, _sp_name(k, v)))
                 except Exception:
                     pass
 

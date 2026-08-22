@@ -857,6 +857,26 @@ class FourDirectionPreview(QWidget):
 
         # ── Dispatch by animation type ──────────────────────────────────
 
+        # No-mirror directional table: each facing draws its OWN frame, and the
+        # preview must NOT fake Right by mirroring — show the real per-direction
+        # frames the generated table points at.
+        _dirmap = None
+        try:
+            from core.anim_table_upgrade import directional_preset_frame_map
+            _dirmap = directional_preset_frame_map(anim_table)
+        except Exception:
+            _dirmap = None
+        if _dirmap is not None:
+            # self._dirs order is [Down, Left, Up, Right].
+            order = [("Down", "SOUTH"), ("Left", "WEST"),
+                     ("Up", "NORTH"), ("Right", "EAST")]
+            for i, (name, facing) in enumerate(order):
+                idx = _dirmap.get(facing, 0)
+                self._dirs[i].set_frames(
+                    [extract(idx)] if idx < total else [])
+                self._dir_labels[i].setText(name)
+            return
+
         if anim_table in self._ANIM_TYPE_INANIMATE:
             # Static object — show single frame in first slot only
             self._dirs[0].set_frames([extract(0)])
@@ -3472,6 +3492,7 @@ class OverworldGraphicsTab(QWidget):
             try:
                 from core.anim_table_upgrade import (
                     scan_anim_tables, ensure_generic_loop_tables,
+                    ensure_directional_anim_tables,
                 )
                 # Install (or refresh) the project-wide generic loop presets
                 # before scanning so the dropdown picks them up.  Idempotent
@@ -3481,6 +3502,10 @@ class OverworldGraphicsTab(QWidget):
                 # tables for 2-8 frame idle cycles.
                 try:
                     ensure_generic_loop_tables(project_root)
+                    # And the no-mirror directional (facing) tables, so the
+                    # dropdown offers a "faces 4 ways, never flips" option for
+                    # head-turner NPCs whose left isn't a mirror of their right.
+                    ensure_directional_anim_tables(project_root)
                 except Exception:
                     # Non-fatal — the dropdown will simply not show the
                     # generic presets if the install ever fails.

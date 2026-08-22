@@ -30,7 +30,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QFrame, QGroupBox,
-    QHBoxLayout, QInputDialog, QLabel, QMenu, QMessageBox, QPushButton,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton,
     QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter, QVBoxLayout,
     QWidget,
 )
@@ -53,6 +53,10 @@ from ui.palette_utils import Color, clamp_to_gba, read_jasc_pal, write_jasc_pal
 # ---------------------------------------------------------------------------
 #  No-scroll combo and spin -- MANDATORY for all combo/spin in this file
 # ---------------------------------------------------------------------------
+
+# Last folder the .pszt import/export dialogs used, remembered per session
+# (starts at the project folder). Module-level so it survives widget reloads.
+_LAST_PSZT_DIR = None
 
 class _NoScrollCombo(QComboBox):
     """QComboBox that ignores wheel events when the popup isn't showing."""
@@ -852,6 +856,22 @@ class TileAnimEditorWidget(QWidget):
         self._btn_cleanup_frames.clicked.connect(self._cleanup_frames)
         header.addWidget(self._btn_cleanup_frames)
 
+        self._btn_export_anim = QPushButton("Export…")
+        self._btn_export_anim.setFixedWidth(70)
+        self._btn_export_anim.setToolTip(
+            "Save the selected animation as a portable .pszt package (its\n"
+            "frames + timing) that can be imported into another tileset.")
+        self._btn_export_anim.clicked.connect(self._export_animation)
+        header.addWidget(self._btn_export_anim)
+
+        self._btn_import_anim = QPushButton("Import…")
+        self._btn_import_anim.setFixedWidth(70)
+        self._btn_import_anim.setToolTip(
+            "Import a .pszt animation package into the selected tileset —\n"
+            "you choose the name and start tile; it wires up everything else.")
+        self._btn_import_anim.clicked.connect(self._import_animation)
+        header.addWidget(self._btn_import_anim)
+
         sep1 = QLabel("|")
         sep1.setStyleSheet("color: #555;")
         header.addWidget(sep1)
@@ -906,7 +926,7 @@ class TileAnimEditorWidget(QWidget):
         # instead of clipping it (the "buttons cut off, can't click" bug).
         left_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        left_scroll.setMinimumWidth(220)
+        left_scroll.setMinimumWidth(300)
 
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
@@ -1020,6 +1040,8 @@ class TileAnimEditorWidget(QWidget):
         self._pal_row.colors_changed.connect(self._on_palette_changed)
         pal_layout.addWidget(self._pal_row)
 
+        # Two buttons per row — four in one row overflowed the narrow left
+        # panel and got clipped ("can't see the options").
         pal_btns = QHBoxLayout()
         pal_btns.setSpacing(4)
         btn_import_pal = QPushButton("Import .pal")
@@ -1031,11 +1053,14 @@ class TileAnimEditorWidget(QWidget):
         btn_export_pal.setToolTip("Export the current palette as JASC .pal")
         btn_export_pal.clicked.connect(self._export_pal)
         pal_btns.addWidget(btn_export_pal)
+        pal_layout.addLayout(pal_btns)
 
+        pal_btns_png = QHBoxLayout()
+        pal_btns_png.setSpacing(4)
         btn_import_png_pal = QPushButton("Import from PNG")
         btn_import_png_pal.setToolTip("Extract palette from an indexed PNG")
         btn_import_png_pal.clicked.connect(self._import_palette_from_png)
-        pal_btns.addWidget(btn_import_png_pal)
+        pal_btns_png.addWidget(btn_import_png_pal)
 
         btn_import_png_manual = QPushButton("Import PNG Manually")
         btn_import_png_manual.setToolTip(
@@ -1044,9 +1069,8 @@ class TileAnimEditorWidget(QWidget):
         )
         btn_import_png_manual.clicked.connect(
             self._import_palette_from_png_manual)
-        pal_btns.addWidget(btn_import_png_manual)
-
-        pal_layout.addLayout(pal_btns)
+        pal_btns_png.addWidget(btn_import_png_manual)
+        pal_layout.addLayout(pal_btns_png)
 
         pal_btns2 = QHBoxLayout()
         pal_btns2.setSpacing(4)
@@ -1320,7 +1344,18 @@ class TileAnimEditorWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _load_data(self):
-        """Parse tilesets and animations from project."""
+        """Parse tilesets and animations, PRESERVING the current selection.
+
+        Every edit (add/delete/resize/load frame) re-parses via this, and the
+        selection must survive it. Restore is BY NAME, not index: the tileset
+        combo repopulates with signals blocked (so nothing refreshes the anim
+        list on its own), and restoring by index broke — a no-op
+        setCurrentIndex(0) left the anim list stale and snapped back to the
+        first animation (the "booted back to Flower" bug)."""
+        prev = getattr(self, "_current_anim", None)
+        prev_ts = prev.tileset_name if prev else None
+        prev_anim = prev.name if prev else None
+
         self._all_tilesets = parse_tilesets_from_headers(self._project_dir)
         self._animations = parse_tileset_anims(self._project_dir)
 
@@ -1333,6 +1368,30 @@ class TileAnimEditorWidget(QWidget):
             self._anims_by_tileset[key].append(anim)
 
         self._populate_tileset_combo()
+        self._select_ts_and_anim(prev_ts, prev_anim)
+
+    def _select_ts_and_anim(self, ts_dir, anim_name):
+        """Select a tileset (by dir name) + animation (by name) after a
+        (re)load, ALWAYS refreshing the anim list. Falls back to the first
+        tileset / first animation when the name isn't found (fresh load)."""
+        ts_idx = next(
+            (i for i, ts in enumerate(self._tileset_order)
+             if ts is not None and ts.get("dir_name") == ts_dir), None)
+        if ts_idx is None:
+            ts_idx = next((i for i, ts in enumerate(self._tileset_order)
+                           if ts is not None), 0)
+        self._tileset_combo.blockSignals(True)
+        self._tileset_combo.setCurrentIndex(ts_idx)
+        self._tileset_combo.blockSignals(False)
+        # Always run the handler so the anim combo + palettes refresh even when
+        # the tileset index didn't change.
+        self._on_tileset_selected(ts_idx)
+        anims = getattr(self, "_current_tileset_anims", [])
+        a_idx = next((i for i, a in enumerate(anims)
+                      if a.name == anim_name), 0)
+        if 0 <= a_idx < self._anim_combo.count():
+            self._anim_combo.setCurrentIndex(a_idx)
+            self._on_anim_selected(a_idx)
 
     def _populate_tileset_combo(self):
         """Fill tileset combo. Tilesets WITH animations listed first."""
@@ -1379,11 +1438,8 @@ class TileAnimEditorWidget(QWidget):
         self._status_label.setText(
             f"{total} animation{'s' if total != 1 else ''} across "
             f"{len(with_anims)} tileset{'s' if len(with_anims) != 1 else ''}")
-
-        # Select first tileset (should have animations)
-        if self._tileset_order:
-            self._tileset_combo.setCurrentIndex(0)
-            self._on_tileset_selected(0)
+        # Selection is done by the caller (_load_data → _select_ts_and_anim),
+        # which restores the previous tileset+animation by name.
 
     def _on_tileset_selected(self, idx: int):
         """Tileset changed -- populate animation combo."""
@@ -1675,6 +1731,7 @@ class TileAnimEditorWidget(QWidget):
         base = (f"Uses VRAM tiles <b>0x{dest:X}–0x{last:X}</b> "
                 f"({dest}–{last}, {count} tile{'s' if count != 1 else ''}).")
 
+        warns: List[str] = []
         # Warnings, most important first. VRAM tile numbering is CONTINUOUS:
         # primary tileset = 0x000..0x27F, secondary continues 0x280..0x3FF
         # (NUM_TILES_IN_PRIMARY = 640). An animation SUPPLIES its own tiles to
@@ -2224,39 +2281,60 @@ class TileAnimEditorWidget(QWidget):
     def _write_frame_from_source(self, src_path: str, dest_png: str) -> bool:
         """Copy/convert a chosen image file into a frame's indexed PNG.
 
-        A ``.png`` is copied verbatim (keeps its exact bytes + embedded
-        palette). A ``.bmp`` (legacy tile-anim tools used indexed BMPs) is
-        REMAPPED onto the tab's current palette by matching each pixel's colour
-        to the nearest palette slot — see :meth:`_remap_image_to_palette` for
-        why raw indices can't be trusted. Returns False on a load failure."""
+        gbagfx only accepts indexed (palette-mode) PNGs, so every imported frame
+        must end up indexed against the palette this animation is drawn with:
+
+        * An already-indexed ``.png`` is copied verbatim — keeps its exact bytes
+          and slot order. This is how preset-tileset frames and frames re-exported
+          from a ``.pszt`` stay byte-identical, and why re-importing them never
+          disturbs a preset tileset.
+        * An RGB/RGBA ``.png`` or a ``.bmp`` is REMAPPED onto the tab's current
+          working palette by matching each pixel's colour to the nearest slot
+          (fully transparent pixels go to slot 0) — see
+          :meth:`_remap_image_to_palette`. Returns False if there is no usable
+          palette to match against, so the caller can tell the user to load one
+          (matching onto an empty/black palette would silently blacken the frame).
+        """
         ext = os.path.splitext(src_path)[1].lower()
-        if ext == ".png":
-            shutil.copy2(src_path, dest_png)
-            return True
         img = QImage(src_path)
         if img.isNull():
+            # A valid .png Qt still can't decode as an image is unusual; keep it
+            # verbatim rather than losing the frame. Anything else is a failure.
+            if ext == ".png":
+                shutil.copy2(src_path, dest_png)
+                return True
             return False
+        if ext == ".png" and img.format() == QImage.Format.Format_Indexed8:
+            shutil.copy2(src_path, dest_png)
+            return True
         return self._remap_image_to_palette(img, dest_png)
 
     def _remap_image_to_palette(self, img: QImage, dest_png: str) -> bool:
         """Write *img* into *dest_png* as an indexed PNG whose indices are the
-        tab's CURRENT palette slots, chosen by matching each pixel's colour.
+        tab's CURRENT working palette slots, chosen by matching each pixel's
+        colour (a fully transparent pixel goes to slot 0).
 
-        Why not keep the source's own indices? A legacy indexed BMP stores the
-        same colours but often in a DIFFERENT slot order than this tileset's
-        palette (and some legacy BMP variants Qt reads as RGB, dropping indices
-        entirely). Keeping the raw indices then renders every colour against the
-        wrong slot — the scrambled import. Matching by COLOUR instead lands each
-        pixel on the right slot regardless of the source's index order, so the
-        frame comes in looking exactly like it should under the live palette."""
+        Why match by colour instead of keeping the source's own indices? An
+        RGB/RGBA source has no usable indices at all, and a legacy indexed BMP
+        stores the same colours but often in a DIFFERENT slot order than this
+        tileset's palette. Matching by COLOUR lands each pixel on the right slot
+        regardless, so the frame comes in looking exactly like it should under
+        the live palette — and slot order matches what the tile is drawn with
+        in-game, which is what gbagfx needs.
+
+        Returns False (writing nothing) if there is no usable palette to match
+        against — an empty palette, or one whose colour slots are all black.
+        Remapping onto black would silently turn the whole frame black (the exact
+        breakage that damaged the flower animation before), so instead we refuse
+        and let the caller prompt the user to load the animation's palette."""
         pal = list(self._palette_colors or [])
-        if not pal:
-            # No palette loaded — best-effort straight indexed save.
-            if img.format() != QImage.Format.Format_Indexed8:
-                img = img.convertToFormat(QImage.Format.Format_Indexed8)
-            img.save(dest_png, "PNG")
-            return True
         pal = (pal + [(0, 0, 0)] * 16)[:16]
+        if not any(c != (0, 0, 0) for c in pal[1:]):
+            return False  # nothing but slot-0 to match onto → refuse
+
+        # Work in ARGB so we can read per-pixel alpha for transparency.
+        if img.format() != QImage.Format.Format_ARGB32:
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
 
         # Exact-match table on GBA-quantised (5-bit) colour, so an 8-bit source
         # colour like 255 matches a 5-bit palette 248; nearest as the fallback.
@@ -2274,6 +2352,9 @@ class TileAnimEditorWidget(QWidget):
         for y in range(img.height()):
             for x in range(img.width()):
                 px = img.pixel(x, y)
+                if ((px >> 24) & 0xFF) < 128:
+                    out.setPixel(x, y, 0)      # transparent → slot 0
+                    continue
                 r, g, b = (px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF
                 idx = exact.get((_q(r), _q(g), _q(b)))
                 if idx is None:
@@ -2414,6 +2495,117 @@ class TileAnimEditorWidget(QWidget):
     #  Add / Remove Animation
     # ------------------------------------------------------------------
 
+    def _pszt_dir(self) -> str:
+        """Where the .pszt file dialogs start: the last folder used this session,
+        else the project folder, else home."""
+        return (_LAST_PSZT_DIR or self._project_dir or os.path.expanduser("~"))
+
+    def _export_animation(self):
+        """Save the selected animation as a .pszt package."""
+        global _LAST_PSZT_DIR
+        anim = self._current_anim
+        if anim is None:
+            QMessageBox.information(self, "Export Animation",
+                                    "Select an animation to export first.")
+            return
+        from core.tileset_anim_package import export_animation, PSZT_EXT
+        default = os.path.join(
+            self._pszt_dir(),
+            "%s_%s%s" % (anim.tileset_name, anim.name, PSZT_EXT))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Animation", default,
+            "PorySuite Tileset Animation (*%s)" % PSZT_EXT)
+        if not path:
+            return
+        try:
+            written = export_animation(anim, path)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Animation",
+                                 "Could not export:\n%s" % e)
+            return
+        _LAST_PSZT_DIR = os.path.dirname(written)
+        self._status_label.setText("Exported → %s" % os.path.basename(written))
+
+    def _import_animation(self):
+        """Import a .pszt package into the selected tileset."""
+        global _LAST_PSZT_DIR
+        if not self._project_dir:
+            return
+        ts_idx = self._tileset_combo.currentIndex()
+        if ts_idx < 0 or ts_idx >= len(self._tileset_order) \
+                or self._tileset_order[ts_idx] is None:
+            QMessageBox.information(self, "Import Animation",
+                                    "Pick a destination tileset first.")
+            return
+        ts = self._tileset_order[ts_idx]
+        from core.tileset_anim_package import (import_animation, read_package,
+                                               PSZT_EXT)
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Animation Package", self._pszt_dir(),
+            "PorySuite Tileset Animation (*%s)" % PSZT_EXT)
+        if not path:
+            return
+        _LAST_PSZT_DIR = os.path.dirname(path)
+        try:
+            info = read_package(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Animation",
+                                 "Not a valid .pszt package:\n%s" % e)
+            return
+
+        ts_type = "secondary" if ts["is_secondary"] else "primary"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import Animation")
+        form = QFormLayout(dlg)
+        form.addRow(QLabel("Into tileset:  <b>%s</b> (%s)"
+                           % (ts["name"], ts_type)))
+        name_edit = QLineEdit(info.get("name", "animation"))
+        form.addRow("Animation name:", name_edit)
+        # Hex, with a 0x prefix — the same field the Start Tile property uses,
+        # so a value typed here means the same thing everywhere (a decimal box
+        # here silently reinterpreted the user's hex tile index).
+        tile_spin = _HexSpinBox()
+        tile_spin.setRange(0, 1023)
+        tile_spin.setValue(0)
+        tile_spin.setToolTip(
+            "Tile index (HEX, e.g. 0x112) in this tileset where the animated "
+            "tiles live — the base tiles you painted in Porymap. The package "
+            "can't know this; set it to match your tiles.")
+        form.addRow("Start tile:", tile_spin)
+        note = QLabel("Frames: %d · %d tile(s) · every %d frames.\nPlace the "
+                      "matching base tiles + metatiles in Porymap at the start "
+                      "tile." % (info.get("frame_count", 0),
+                                 info.get("tile_count", 1),
+                                 info.get("divisor", 1)))
+        note.setStyleSheet("color:#888; font-size:11px;")
+        note.setWordWrap(True)
+        form.addRow(note)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = name_edit.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Import Animation",
+                                "Give the animation a name.")
+            return
+        try:
+            anim = import_animation(self._project_dir, path, ts["dir_name"],
+                                    ts_type, name, tile_spin.value())
+        except Exception as e:
+            QMessageBox.critical(self, "Import Animation",
+                                 "Import failed:\n%s" % e)
+            return
+        if anim is None:
+            QMessageBox.warning(self, "Import Animation",
+                                "Import failed — see the log.")
+            return
+        self._load_data()
+        self._status_label.setText("Imported '%s' into %s" % (name, ts["name"]))
+
     def _add_animation(self):
         """Add a new animation to the currently selected tileset."""
         if not self._project_dir:
@@ -2531,10 +2723,7 @@ class TileAnimEditorWidget(QWidget):
         if ok:
             self._dirty = True
             self.modified.emit()
-            ts_idx = self._tileset_combo.currentIndex()
             self._load_data()
-            if ts_idx < self._tileset_combo.count():
-                self._tileset_combo.setCurrentIndex(ts_idx)
             QMessageBox.information(
                 self, "Animation Removed",
                 f"'{anim.display_name}' removed from tileset_anims.c.\n"
@@ -2553,14 +2742,9 @@ class TileAnimEditorWidget(QWidget):
         from ui.dialogs.tile_anim_cleanup_dialog import TileAnimCleanupDialog
         dlg = TileAnimCleanupDialog(self._project_dir, parent=self)
         dlg.exec()
-        # Reload in case whole animation folders were removed.
-        ts_idx = self._tileset_combo.currentIndex()
-        anim_idx = self._anim_combo.currentIndex()
+        # Reload in case whole animation folders were removed. _load_data
+        # keeps the current tileset+animation (or falls back if it was deleted).
         self._load_data()
-        if ts_idx < self._tileset_combo.count():
-            self._tileset_combo.setCurrentIndex(ts_idx)
-        if anim_idx < self._anim_combo.count():
-            self._anim_combo.setCurrentIndex(anim_idx)
 
     def _rename_animation(self):
         """Rename the currently selected animation everywhere."""
@@ -2593,10 +2777,9 @@ class TileAnimEditorWidget(QWidget):
         self._dirty = True
         self.modified.emit()
 
-        ts_idx = self._tileset_combo.currentIndex()
+        # _load_data keeps the tileset; the anim's name changed so it lands on
+        # the tileset's first anim — then we re-select the renamed one below.
         self._load_data()
-        if ts_idx < self._tileset_combo.count():
-            self._tileset_combo.setCurrentIndex(ts_idx)
 
         # Re-select the renamed animation by its new source id.
         anims = getattr(self, "_current_tileset_anims", [])
@@ -2825,14 +3008,8 @@ class TileAnimEditorWidget(QWidget):
         self.modified.emit()
 
         # Reload so the preview, tile grid and Info panel pick up the new size.
-        ts_idx = self._tileset_combo.currentIndex()
-        anim_idx = self._anim_combo.currentIndex()
+        # _load_data preserves the current tileset + animation.
         self._load_data()
-        if ts_idx < self._tileset_combo.count():
-            self._tileset_combo.setCurrentIndex(ts_idx)
-        if anim_idx < self._anim_combo.count():
-            self._anim_combo.setCurrentIndex(anim_idx)
-            self._on_anim_selected(anim_idx)
 
         msg = (f"Resized {done} frame(s) to {new_w}×{new_h}.\n"
                f"Tile Amount set to {new_tiles} tiles per frame.")
@@ -2902,7 +3079,15 @@ class TileAnimEditorWidget(QWidget):
 
         try:
             if not self._write_frame_from_source(path, frame.png_path):
-                raise RuntimeError("could not read the source image")
+                QMessageBox.warning(
+                    self, "Palette needed",
+                    "This image isn't an indexed PNG, so its colours have to be "
+                    "matched to this animation's palette — but the current "
+                    "preview palette is empty or all black.\n\nLoad the palette "
+                    "this animation uses first (the palette buttons on the left: "
+                    "'Import from PNG' or 'Import JASC .pal'), then replace the "
+                    "frame again.")
+                return
         except Exception as e:
             QMessageBox.warning(self, "Replace Failed",
                                 f"Could not import file:\n{e}")
@@ -2967,23 +3152,27 @@ class TileAnimEditorWidget(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # A BMP source (legacy anim tools) is converted to an indexed PNG in a
-        # temp file first, since the backend expects a .png to INCBIN.
-        add_src = path
-        _tmp_png = None
-        if os.path.splitext(path)[1].lower() != ".png":
-            import tempfile
-            _tmp_png = os.path.join(
-                tempfile.gettempdir(),
-                os.path.splitext(os.path.basename(path))[0] + "_anim.png")
-            if not self._write_frame_from_source(path, _tmp_png):
-                QMessageBox.warning(self, "Import Failed",
-                                    f"Could not read the source image:\n{path}")
-                return
-            add_src = _tmp_png
+        # Normalise EVERY source (png or bmp) to an indexed PNG matching this
+        # animation's palette first — gbagfx only converts indexed PNGs, so a
+        # raw RGB/RGBA png would break the build. An already-indexed png passes
+        # through byte-for-byte; an unindexed one is remapped onto the palette.
+        import tempfile
+        _tmp_png = os.path.join(
+            tempfile.gettempdir(),
+            os.path.splitext(os.path.basename(path))[0] + "_anim.png")
+        if not self._write_frame_from_source(path, _tmp_png):
+            QMessageBox.warning(
+                self, "Palette needed",
+                "This image isn't an indexed PNG, so its colours have to be "
+                "matched to this animation's palette — but the current "
+                "preview palette is empty or all black.\n\nLoad the palette this "
+                "animation uses first (the palette buttons on the left: 'Import "
+                "from PNG' or 'Import JASC .pal'), then add the frame again.")
+            return
+        add_src = _tmp_png
 
         result = add_frame_to_anim(self._project_dir, anim, add_src)
-        if _tmp_png and os.path.isfile(_tmp_png):
+        if os.path.isfile(_tmp_png):
             try:
                 os.remove(_tmp_png)
             except OSError:
@@ -2991,14 +3180,7 @@ class TileAnimEditorWidget(QWidget):
         if result:
             self._dirty = True
             self.modified.emit()
-            old_ts = self._tileset_combo.currentIndex()
-            old_anim = self._anim_combo.currentIndex()
-            self._load_data()
-            if old_ts < self._tileset_combo.count():
-                self._tileset_combo.setCurrentIndex(old_ts)
-            if old_anim < self._anim_combo.count():
-                self._anim_combo.setCurrentIndex(old_anim)
-                self._on_anim_selected(old_anim)
+            self._load_data()   # preserves the tileset + animation selection
             size_note = self._sync_tile_amount_after_import()
             QMessageBox.information(
                 self, "Frame Added",
@@ -3049,14 +3231,7 @@ class TileAnimEditorWidget(QWidget):
         if ok:
             self._dirty = True
             self.modified.emit()
-            old_ts = self._tileset_combo.currentIndex()
-            old_anim = self._anim_combo.currentIndex()
-            self._load_data()
-            if old_ts < self._tileset_combo.count():
-                self._tileset_combo.setCurrentIndex(old_ts)
-            if old_anim < self._anim_combo.count():
-                self._anim_combo.setCurrentIndex(old_anim)
-                self._on_anim_selected(old_anim)
+            self._load_data()   # preserves the tileset + animation selection
             QMessageBox.information(
                 self, "Frame Removed",
                 f"Frame {frame_idx} removed from tileset_anims.c.\n"

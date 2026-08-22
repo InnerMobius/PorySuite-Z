@@ -173,6 +173,43 @@ class EncounterProject:
     def category_slot_count(self, cat_key: str) -> int:
         return len(self.field_ratios(cat_key))
 
+    def fishing_rod_labels(self) -> List[str]:
+        """Which rod catches each fishing slot, in slot order.
+
+        The rod is POSITIONAL in the engine — Old/Good/Super Rod each own a
+        fixed run of the fishing slots. Read straight from the project's own
+        `gFishingSlotWeights[]`, whose entries name their rod
+        (``..._OLD_ROD_SLOT_0``, ``..._SUPER_ROD_SLOT_9``), so a project that
+        redistributed the slots is reflected exactly. Falls back to the stock
+        firered split (Old 2 / Good 3 / Super 5) sized to the actual slot count
+        if the array can't be read.
+        """
+        import re as _re
+        n = self.category_slot_count("fishing_mons")
+        try:
+            path = os.path.join(self.root, "src", "wild_encounter.c")
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+            m = _re.search(r"gFishingSlotWeights\s*\[[^\]]*\]\s*=\s*\{(.*?)\};",
+                           src, _re.DOTALL)
+            if m:
+                # A weight entry may mention two slot ids (SLOT_n and SLOT_n-1,
+                # for the difference); key by unique slot number so each slot is
+                # labelled once, then read them back in slot order.
+                slots = {}
+                for t in _re.finditer(
+                        r"_(OLD|GOOD|SUPER)_ROD_SLOT_(\d+)", m.group(1)):
+                    slots[int(t.group(2))] = "%s Rod" % t.group(1).title()
+                if slots:
+                    return [slots[i] for i in sorted(slots)][:n]
+        except Exception:
+            pass
+        # Fallback: stock 2 / 3 / 5, clipped/extended to the real slot count.
+        stock = (["Old Rod"] * 2 + ["Good Rod"] * 3 + ["Super Rod"] * 5)
+        if n <= len(stock):
+            return stock[:n]
+        return stock + ["Super Rod"] * (n - len(stock))
+
     # -- time-of-day shape --------------------------------------------------
 
     @classmethod
@@ -279,6 +316,35 @@ class EncounterProject:
         entry[cat_key] = {k: block[k] for k in block if k != "phase"}
         self._sync_phases_key(entry)
 
+    def copy_phase_to_all(self, entry: dict, cat_key: str,
+                          source_phase_key: str) -> bool:
+        """Overwrite every OTHER phase of a split category with a deep copy of
+        `source_phase_key`'s table (encounter_rate + mons), so one loadout can be
+        filled in once and stamped across all times of day. Each phase keeps its
+        own `phase` key and field order. False if the category isn't split or the
+        source phase is missing.
+        """
+        cv = entry.get(cat_key)
+        if not self.is_category_split(cv):
+            return False
+        src = None
+        for ph in cv[TIME_KEY]:
+            if ph.get("phase") == source_phase_key:
+                src = ph
+                break
+        if src is None:
+            return False
+        for ph in cv[TIME_KEY]:
+            if ph.get("phase") == source_phase_key:
+                continue
+            pk = ph.get("phase")
+            ph.clear()
+            ph["phase"] = pk
+            for k in src:
+                if k != "phase":
+                    ph[k] = json.loads(json.dumps(src[k]))   # deep copy
+        return True
+
     def _sync_phases_key(self, entry: dict) -> None:
         """Keep `PHASES_KEY` present iff the entry has any split category. Placed
         at the end so a split→merge round-trip removes it and restores the exact
@@ -312,3 +378,22 @@ class EncounterProject:
     def remove_category(self, entry: dict, cat_key: str) -> None:
         """Remove a category entirely (constant or split)."""
         entry.pop(cat_key, None)
+
+    def add_map_entry(self, map_const: str, base_label: str) -> Optional[dict]:
+        """Create an empty encounter entry for a map that has none yet.
+
+        Appended to the first `for_maps` group with no categories — the caller
+        adds those next. Returns the new entry, or None if the file has no
+        for-maps group to hold it (a malformed wild_encounters.json).
+        """
+        entry = {"map": map_const, "base_label": base_label}
+        for group in self.map_groups():
+            if group.get("for_maps"):
+                group.setdefault("encounters", []).append(entry)
+                return entry
+        return None
+
+    def base_labels(self) -> set:
+        """Every base_label in the file — so a new one can be made unique."""
+        return {e.get("base_label") for e in self.entries()
+                if e.get("base_label")}

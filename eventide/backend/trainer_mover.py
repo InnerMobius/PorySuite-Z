@@ -238,6 +238,66 @@ class TrainerMover:
         _write_json(dst_json, dd)
         return True
 
+    # ── event_scripts.s include registration ────────────────────────────────
+    # A map's scripts.inc and text.inc are each hand-listed in event_scripts.s
+    # (two separate include blocks). A moved battle writes the destination map's
+    # text.inc — and CREATES it if the map had no text before — so if that
+    # text.inc isn't registered here, every moved dialogue label is undefined at
+    # link time (`undefined reference to Map_Text_XIntro`). Same shape as the
+    # map-import registration in core/map_transfer.py.
+
+    def _event_scripts_path(self) -> Path | None:
+        p = self.root / 'data' / 'event_scripts.s'
+        if p.is_file():
+            return p
+        data = self.root / 'data'
+        if data.is_dir():
+            for f in sorted(data.glob('*.s')):
+                t = _read(f)
+                if 'data/maps/' in t and 'scripts.inc' in t:
+                    return f
+        return None
+
+    @staticmethod
+    def _add_include(es_text: str, map_folder: str, kind: str):
+        """Add `.include "data/maps/<map>/<kind>"` after the last include of the
+        SAME kind (so scripts and text stay in their own blocks). Idempotent."""
+        inc_key = f'data/maps/{map_folder}/{kind}'
+        if inc_key in es_text:
+            return es_text, False
+        line = f'\t.include "{inc_key}"'
+        lines = es_text.split('\n')
+        pat = re.compile(r'\.include\s+"data/maps/.+?/' + re.escape(kind) + '"')
+        last = max((i for i, ln in enumerate(lines) if pat.search(ln)),
+                   default=-1)
+        if last >= 0:
+            lines.insert(last + 1, line)
+        else:
+            lines.append(line)
+        return '\n'.join(lines), True
+
+    def ensure_map_includes(self, map_folder: str) -> list[str]:
+        """Make event_scripts.s include the map's scripts.inc and (if present)
+        text.inc. Idempotent — safe to call every move and as a repair."""
+        es = self._event_scripts_path()
+        if es is None:
+            return [f"Could not find event_scripts.s — add the includes for "
+                    f"data/maps/{map_folder}/scripts.inc and text.inc yourself."]
+        text = _read(es)
+        notes, changed = [], False
+        kinds = ['scripts.inc']
+        if (self.maps_dir / map_folder / 'text.inc').is_file():
+            kinds.append('text.inc')
+        for kind in kinds:
+            text, added = self._add_include(text, map_folder, kind)
+            if added:
+                changed = True
+                notes.append(f"Registered data/maps/{map_folder}/{kind} in "
+                             f"event_scripts.s.")
+        if changed:
+            _write(es, text)
+        return notes
+
     def move(self, trainer_const: str, src_folder: str, dst_folder: str,
              x: int = 1, y: int = 1, ignore_ref_warnings: bool = False) -> dict:
         """Perform (or preflight) the move. Returns a dict:
@@ -380,6 +440,12 @@ class TrainerMover:
         _append_blocks(dst_scripts, [new_script_block])
         if new_text_blocks:
             _append_blocks(dst_text, new_text_blocks)
+
+        # Wire the destination map into event_scripts.s so its scripts.inc and
+        # (newly-written) text.inc actually assemble. Without this the moved
+        # dialogue labels are undefined at link time.
+        res.setdefault('notes', [])
+        res['notes'] += self.ensure_map_includes(dst_folder)
 
         stripped_scripts, _ = _strip_blocks(src_scripts_txt, {script_label})
         _write(script_src, stripped_scripts)

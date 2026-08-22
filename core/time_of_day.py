@@ -72,6 +72,12 @@ _FN_HEAD_RE = re.compile(
 # are ordinary C. A numeric stub (`return 0xFF;`) still can't match: the capture
 # requires an identifier start, and `0` isn't one.
 _RETURN_IDENT_RE = re.compile(r"\breturn\s*\(*\s*([A-Za-z_]\w*)\s*\)*\s*;")
+# A clock that DELEGATES — `return PhaseForMinute(VarGet(...));` — returns a
+# helper CALL, not a phase constant, so _RETURN_IDENT_RE never fires on it. This
+# captures the called helper's name so its body can be followed for the real
+# `return TIME_*;` statements. (VarGet-style nested calls aren't captured: only
+# the identifier immediately after `return`.)
+_RETURN_CALL_RE = re.compile(r"\breturn\s+([A-Za-z_]\w*)\s*\(")
 # A weak stub is not the project's real clock even if it returns an identifier;
 # the strong override is. Recognise the common spellings, not just the canonical
 # one the tool emits — a hand-rolled weak default is common in decomps.
@@ -163,12 +169,54 @@ def _balanced_body(text: str, open_brace_pos: int) -> str:
     return text[open_brace_pos + 1:]
 
 
+def _find_function_body(project_dir: str, fn_name: str) -> str:
+    """Body of the first STRONG definition of *fn_name* in the .c sources, or ''.
+
+    Used to follow a clock that delegates — the real `return TIME_*;` statements
+    live in the helper, not in PorySuite_GetTimeOfDay itself."""
+    head_re = re.compile(r"\b" + re.escape(fn_name) + r"\s*\([^;{}]*\)\s*\{")
+    for _path, _name, raw in _iter_source(project_dir, (".c",), needle=fn_name):
+        text = _clean(raw)
+        for m in head_re.finditer(text):
+            prev_end = max(text.rfind(";", 0, m.start()),
+                           text.rfind("}", 0, m.start()))
+            if _WEAK_RE.search(text[prev_end + 1:m.start()]):
+                continue
+            return _balanced_body(text, m.end() - 1)
+    return ""
+
+
+def _phase_idents_in_body(body: str, project_dir: str, seen_fns: set,
+                          depth: int) -> set:
+    """Phase-name identifiers returned by *body*, following a returned helper
+    call (`return Helper(...);`) into that helper's own body.
+
+    Bounded by *depth* and *seen_fns* so a delegating clock resolves without
+    risking runaway recursion on mutually-recursive helpers. Over-collecting is
+    harmless: non-phase identifiers (VarGet, etc.) are dropped later when the
+    names are matched against the phase enum."""
+    names = {r.group(1) for r in _RETURN_IDENT_RE.finditer(body)}
+    if depth <= 0:
+        return names
+    for c in _RETURN_CALL_RE.finditer(body):
+        helper = c.group(1)
+        if helper in seen_fns:
+            continue
+        seen_fns.add(helper)
+        hbody = _find_function_body(project_dir, helper)
+        if hbody:
+            names |= _phase_idents_in_body(hbody, project_dir, seen_fns,
+                                           depth - 1)
+    return names
+
+
 def _returned_phase_names(project_dir: str) -> set:
     """Identifiers returned by any STRONG PorySuite_GetTimeOfDay definition.
 
     A numeric stub (`return 0xFF;`) contributes nothing — it doesn't match the
     identifier pattern. A weak definition is skipped even if it returns a name,
-    because the strong override is the real clock.
+    because the strong override is the real clock. A clock that delegates to a
+    helper (`return PhaseForMinute(...);`) is followed into that helper.
     """
     names = set()
     for _path, _name, raw in _iter_source(project_dir, (".c",),
@@ -185,8 +233,8 @@ def _returned_phase_names(project_dir: str) -> set:
             if _WEAK_RE.search(declarator):
                 continue
             body = _balanced_body(text, m.end() - 1)
-            for r in _RETURN_IDENT_RE.finditer(body):
-                names.add(r.group(1))
+            names |= _phase_idents_in_body(
+                body, project_dir, {"PorySuite_GetTimeOfDay"}, depth=3)
     return names
 
 

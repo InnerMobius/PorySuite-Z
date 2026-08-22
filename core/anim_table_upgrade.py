@@ -300,6 +300,9 @@ def _classify_anim_table(sym: str) -> Tuple[int, str, str]:
         return (0, "", "")
     if sym == "sAnimTable_StandardWithEmote":
         return (1, "", "")
+    for i, (suffix, _l, _f) in enumerate(_DIRECTIONAL_PRESETS):
+        if directional_table_symbol(suffix) == sym:
+            return (2, f"0-dir-{i}", "")     # sorts just before generic loops
     m = _GENERIC_LOOP_RE.match(sym)
     if m:
         n = int(m.group("n"))
@@ -322,6 +325,11 @@ def _label_for_anim_table(sym: str, frame_count: int) -> str:
     else falls back to the prettified symbol.  ``frame_count`` is the highest
     ``ANIMCMD_FRAME`` index referenced + 1 (i.e. how many sheet frames the
     table touches)."""
+    # No-mirror directional (facing) tables.
+    for suffix, label, _f in _DIRECTIONAL_PRESETS:
+        if directional_table_symbol(suffix) == sym:
+            return f"Directional · {label}"
+
     # Generic loop presets.
     m = _GENERIC_LOOP_RE.match(sym)
     if m:
@@ -1352,6 +1360,101 @@ def ensure_generic_loop_tables(root: str) -> Tuple[bool, List[str]]:
         f"({len(GENERIC_LOOP_FRAME_COUNTS)} frame counts × 2 orderings)"
     )
     return True, msgs
+
+
+# ──────────────── no-mirror directional (facing) tables ─────────────────────
+#
+# The stock "Walk Cycle" table fakes East by hFlipping the side/West frame, so
+# a sprite whose left graphic differs from its right (drawn, not mirrored) shows
+# the wrong thing facing one way. These tables give every facing its OWN frame
+# and NEVER hFlip — for static head-turner NPCs (e.g. MOVEMENT_TYPE_WATCHFUL).
+# They appear in the Animation dropdown alongside the generic loops.
+
+_DIRECTIONAL_SENTINEL_OPEN = "// >>> PorySuite-Z no-mirror directional tables >>>"
+_DIRECTIONAL_SENTINEL_CLOSE = "// <<< PorySuite-Z no-mirror directional tables <<<"
+
+# (symbol suffix, dropdown label, {facing: frame index}). Frame order follows
+# the FACE slots: South=Down, North=Up, West=Left, East=Right.
+_DIRECTIONAL_PRESETS = (
+    ("Face4", "no mirror · 4 frames (Down · Up · Left · Right)",
+     {"SOUTH": 0, "NORTH": 1, "WEST": 2, "EAST": 3}),
+    ("Face3RightSharesUp", "no mirror · 3 frames (Right shares the Up frame)",
+     {"SOUTH": 0, "NORTH": 1, "WEST": 2, "EAST": 1}),
+)
+
+
+def directional_table_symbol(suffix: str) -> str:
+    return f"sAnimTable_NoFlip{suffix}"
+
+
+def directional_preset_frame_map(symbol: str):
+    """{facing: frame} for a generated directional table symbol, else None —
+    lets the preview show the real per-direction frame instead of mirroring."""
+    for suffix, _label, fmap in _DIRECTIONAL_PRESETS:
+        if directional_table_symbol(suffix) == symbol:
+            return dict(fmap)
+    return None
+
+
+def _generate_directional_block() -> str:
+    parts: List[str] = [_DIRECTIONAL_SENTINEL_OPEN]
+    parts.append(
+        "// Facing NPCs that NEVER hFlip — each direction draws its own frame,\n"
+        "// so a hand-drawn left that differs from the right shows correctly.\n"
+        "// Walk slots reuse the matching face frame (a watchful/stationary NPC\n"
+        "// never plays them). Assign a sprite's .anims to one of these and give\n"
+        "// it a facing movement type (e.g. MOVEMENT_TYPE_WATCHFUL)."
+    )
+    dirs = ("SOUTH", "NORTH", "WEST", "EAST")
+    short = {"SOUTH": "S", "NORTH": "N", "WEST": "W", "EAST": "E"}
+    for suffix, _label, fmap in _DIRECTIONAL_PRESETS:
+        anim_of = {}
+        defs = []
+        for d in dirs:
+            an = f"sAnim_NoFlip{suffix}_{short[d]}"
+            anim_of[d] = an
+            defs.append(
+                f"static const union AnimCmd {an}[] = {{\n"
+                f"    ANIMCMD_FRAME({fmap[d]}, 16),\n"
+                f"    ANIMCMD_JUMP(0),\n"
+                f"}};")
+        slot_lines = []
+        for slot in _STANDARD_ANIM_SLOTS:
+            d = next((x for x in dirs if slot.endswith("_" + x)), "SOUTH")
+            slot_lines.append(f"    [{slot}] = {anim_of[d]},")
+        parts.append(
+            "\n".join(defs) + "\n"
+            f"static const union AnimCmd *const "
+            f"{directional_table_symbol(suffix)}[] = {{\n"
+            + "\n".join(slot_lines) + "\n};")
+    parts.append(_DIRECTIONAL_SENTINEL_CLOSE)
+    return "\n\n".join(parts)
+
+
+def ensure_directional_anim_tables(root: str) -> Tuple[bool, List[str]]:
+    """Install/refresh the no-mirror directional tables (sentinel-fenced,
+    idempotent) — same install model as ensure_generic_loop_tables."""
+    anims_path = os.path.join(
+        root, "src", "data", "object_events", "object_event_anims.h")
+    if not os.path.isfile(anims_path):
+        return False, [f"missing {anims_path}"]
+    text = _read(anims_path)
+    block = _generate_directional_block()
+    existing = re.compile(
+        re.escape(_DIRECTIONAL_SENTINEL_OPEN) + r".*?"
+        + re.escape(_DIRECTIONAL_SENTINEL_CLOSE), re.DOTALL)
+    if existing.search(text):
+        new_text = existing.sub(lambda _m: block, text, count=1)
+        action = "Refreshed"
+    else:
+        new_text = text.rstrip() + "\n\n" + block + "\n"
+        action = "Installed"
+    if new_text == text:
+        return True, []
+    if not _atomic_write_text(anims_path, new_text):
+        return False, [f"failed to write {anims_path}"]
+    return True, [f"{action} no-mirror directional tables "
+                  f"({len(_DIRECTIONAL_PRESETS)} presets)"]
 
 
 # ──────────────────── frame-cycle movement type ─────────────────────────────
