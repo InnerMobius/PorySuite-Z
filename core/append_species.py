@@ -56,6 +56,49 @@ def _insert_after_line(text, anchor_regex, insertion):
     return text[:eol + 1] + insertion + text[eol + 1:]
 
 
+# Appended-species #define: `#define SPECIES_X (NUM_SPECIES + N)`.
+_APPENDED_SPECIES_RE = re.compile(
+    r"^[ \t]*#define[ \t]+SPECIES_\w+[ \t]+\(NUM_SPECIES[ \t]*\+[ \t]*\d+\)", re.M)
+# A plain numeric species define: `#define SPECIES_EGG 412`.
+_NUMERIC_SPECIES_RE = re.compile(
+    r"^[ \t]*#define[ \t]+SPECIES_\w+[ \t]+\d+[ \t]*\r?$", re.M)
+
+
+def _insert_species_define(text, insertion):
+    """Insert a new appended-species #define into species.h at a spot that
+    exists in BOTH vanilla (Unown present) and de-unowned projects.
+
+    NEVER anchor on an Unown-specific define — de-unowning a project deletes
+    `SPECIES_UNOWN_QMARK` (and the rest), which used to crash every form append.
+    Cascade instead:
+      1. after the LAST `#define SPECIES_x (NUM_SPECIES + N)` line, else
+      2. immediately before `#define NUM_TOTAL_SPECIES`, else
+      3. after the last plain numeric `#define SPECIES_x N`.
+
+    On a vanilla project the last `(NUM_SPECIES + N)` line IS SPECIES_UNOWN_QMARK
+    — the exact spot the old anchor resolved to — so vanilla insertions stay
+    byte-identical.
+    """
+    appended = list(_APPENDED_SPECIES_RE.finditer(text))
+    if appended:
+        m = appended[-1]
+        nl = text.find("\n", m.end())
+        at = len(text) if nl == -1 else nl + 1
+        return text[:at] + insertion + text[at:]
+    m = re.search(r"^[ \t]*#define[ \t]+NUM_TOTAL_SPECIES\b", text, re.M)
+    if m:
+        return text[:m.start()] + insertion + text[m.start():]
+    numeric = list(_NUMERIC_SPECIES_RE.finditer(text))
+    if numeric:
+        m = numeric[-1]
+        nl = text.find("\n", m.end())
+        at = len(text) if nl == -1 else nl + 1
+        return text[:at] + insertion + text[at:]
+    raise RuntimeError(
+        "append_species: no species.h insertion anchor found (no appended "
+        "defines, no NUM_TOTAL_SPECIES, no numeric SPECIES defines)")
+
+
 def _insert_after_block(text, block_start_regex, insertion):
     """Insert after a multi-line `[SPECIES_X] = { ... },` block — i.e. after the
     first `    },` that follows the block-start anchor."""
@@ -137,13 +180,13 @@ def append_species(project_root, spec):
     w, h, yoff = spec["coords"]
     changed = {}
 
-    # 1. species.h — the constant, after SPECIES_UNOWN_QMARK
+    # 1. species.h — the constant, in the appended-species block. Anchored on
+    # the last appended define (NOT SPECIES_UNOWN_QMARK, which de-unowning
+    # deletes); on vanilla that's UNOWN_QMARK, so the spot is unchanged.
     p = pf("include", "constants", "species.h")
     t = _read(p)
     if not _has(t, const):
-        t = _insert_after_line(
-            t, r"#define SPECIES_UNOWN_QMARK \(NUM_SPECIES \+ 27\)",
-            f"#define {const} {spec['id_expr']}\n")
+        t = _insert_species_define(t, f"#define {const} {spec['id_expr']}\n")
         _write(p, t); changed["species.h"] = True
 
     # 2. graphics/pokemon.h — INCBIN decls, after the base species' #endif blocks
@@ -444,8 +487,10 @@ def _set_num_total_species(species_h):
     if "NUM_TOTAL_SPECIES" in t:
         new = re.sub(r"#define NUM_TOTAL_SPECIES \([^)]*\)", define, t, count=1)
     else:
-        new = _insert_after_line(t, r"#define SPECIES_UNOWN_QMARK ",
-                                 "\n" + define + "\n")
+        # No NUM_TOTAL_SPECIES yet (fresh install). Place it after the appended
+        # block via the cascade — NOT anchored on SPECIES_UNOWN_QMARK, which a
+        # de-unowned project lacks. On vanilla that's UNOWN_QMARK, unchanged.
+        new = _insert_species_define(t, "\n" + define + "\n")
     if new == t:
         return False
     _write(species_h, new)

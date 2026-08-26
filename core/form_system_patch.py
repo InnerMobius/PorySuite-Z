@@ -35,8 +35,6 @@ _STRUCT_CLOSE_PATCHED = (
 )
 _FIELD_LINE_THEN_CLOSE = "    const u16 *formSpeciesIdTable;\n};\n"
 
-_UNOWN_QMARK = "#define SPECIES_UNOWN_QMARK (NUM_SPECIES + 27)\n"
-
 _FORM_SPECIES_C = '''#include "global.h"
 #include "pokemon.h"
 #include "constants/species.h"
@@ -130,14 +128,18 @@ def _patch_pokemon_h(pokemon_h):
 
 
 def _patch_species_h(species_h):
-    """Add the FORM_SPECIES_END sentinel after the Unown form range. Idempotent."""
+    """Add the FORM_SPECIES_END sentinel into the appended-species block.
+
+    Idempotent. Anchored via the append_species cascade on the LAST appended
+    define (NOT SPECIES_UNOWN_QMARK, which de-unowning deletes — that used to
+    crash form-system install on a de-unowned project). On vanilla the last
+    appended define IS UNOWN_QMARK, so the sentinel lands in the same place and
+    the write is byte-identical."""
+    from core.append_species import _insert_species_define
     text = _read(species_h)
     if _END_MARKER in text:
         return False
-    if _UNOWN_QMARK not in text:
-        raise RuntimeError("form patch: SPECIES_UNOWN_QMARK not found in species.h")
-    text = text.replace(
-        _UNOWN_QMARK, _UNOWN_QMARK + "\n#define FORM_SPECIES_END 0xFFFF\n", 1)
+    text = _insert_species_define(text, "\n#define FORM_SPECIES_END 0xFFFF\n")
     _write_if_changed(species_h, text)
     return True
 

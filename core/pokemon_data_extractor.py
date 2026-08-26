@@ -32,6 +32,31 @@ def _find_abilities_header(root: str) -> str | None:
     return None
 
 
+def _parse_innate_abilities(root: str) -> dict:
+    """Read ``src/data/innate_abilities.h`` → ``{SPECIES_X: [a0, a1, a2]}``.
+
+    Innate abilities (the ability-port passives) live ONLY in this generated
+    header — species_info.h has no innate field — so the extractor must read
+    them back from here, or every re-extract resets innates to ABILITY_NONE and
+    the next save writes an empty gSpeciesInnates table. Returns an empty dict
+    for a project that has no such header (no ability port installed).
+    """
+    path = os.path.join(root, "src", "data", "innate_abilities.h")
+    out: dict = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return out
+    # `[SPECIES_X] = { ABILITY_A, ABILITY_B, ABILITY_C },` — the array's own
+    # `[NUM_TOTAL_SPECIES]` dimension isn't a SPECIES_ token, so it can't match.
+    for m in re.finditer(r"\[\s*(SPECIES_\w+)\s*\]\s*=\s*\{([^}]*)\}", text):
+        vals = [t.strip() for t in m.group(2).split(",") if t.strip()]
+        if vals:
+            out[m.group(1)] = vals
+    return out
+
+
 def _order_learnset_entries(entries):
     """Return learnset entries sorted like FireRed headers."""
     if not entries:
@@ -761,6 +786,10 @@ class SpeciesDataExtractor(PokemonDataExtractor):
             "types": ["TYPE_NORMAL", "TYPE_NONE"],
             "abilities": ["ABILITY_NONE", "ABILITY_NONE", "ABILITY_NONE"],
         }
+        # Innate abilities live ONLY in innate_abilities.h (not species_info.h),
+        # so read them back here — otherwise every extract wipes them to NONE.
+        innate_map = _parse_innate_abilities(self.local_util.repo_root())
+
         valid = {}
         defaulted = 0
         for name, info in species.items():
@@ -787,13 +816,17 @@ class SpeciesDataExtractor(PokemonDataExtractor):
                     si["abilities"].append(defaults["abilities"][len(si["abilities"])])
 
             # Innate abilities (ability port) — extra passives beyond the main
-            # ability. Not "required" (an empty list is the normal case), just
-            # ensured so the UI/codegen always find the key. Padded to 3 slots.
-            if not isinstance(si.get("innates"), list):
+            # ability. These live ONLY in innate_abilities.h, so restore them
+            # from there (authoritative): without this a re-extract dropped every
+            # innate to NONE and the next save wrote an empty gSpeciesInnates.
+            # A species with a header row takes it; one without keeps whatever
+            # it had (normally none). Always padded to 3 slots.
+            header_innates = innate_map.get(name)
+            if header_innates is not None:
+                si["innates"] = header_innates
+            elif not isinstance(si.get("innates"), list):
                 si["innates"] = ["ABILITY_NONE", "ABILITY_NONE", "ABILITY_NONE"]
-            else:
-                while len(si["innates"]) < 3:
-                    si["innates"].append("ABILITY_NONE")
+            si["innates"] = (list(si["innates"]) + ["ABILITY_NONE"] * 3)[:3]
 
             valid[name] = info
 

@@ -648,6 +648,15 @@ class UnifiedMainWindow(QMainWindow):
         heal_loc_action.triggered.connect(self._open_heal_locations)
         tools_menu.addAction(heal_loc_action)
 
+        deunown_action = QAction("Remove Unown Letter-Form System…", self)
+        deunown_action.setToolTip(
+            "Strip the Unown letter-form mechanism from this project's game\n"
+            "source, turning the mon that used it into a normal single-sprite\n"
+            "mon. For projects that don't want Unown-style forms. Does nothing\n"
+            "on a project that doesn't use the Unown system.")
+        deunown_action.triggered.connect(self._on_deunown)
+        tools_menu.addAction(deunown_action)
+
         tools_menu.addSeparator()
 
         open_terminal_action = QAction("Open Terminal", self)
@@ -1737,6 +1746,76 @@ class UnifiedMainWindow(QMainWindow):
                 self.log_message(f"Pre-build .s protection warning: {e}")
 
         self._porysuite_window._run_make(extra_args)
+
+    def _on_deunown(self):
+        """Remove the Unown letter-form mechanism from the project's game source.
+
+        Gated on `has_unown_mechanism` (a project without it is never touched),
+        confirmed loudly (it's a one-way engine change), then applied and the
+        user is nudged to rebuild. Mirrors the other project-level tool actions.
+        """
+        if not self.project_info:
+            QMessageBox.information(self, 'Remove Unown System', 'No project is open.')
+            return
+        root = self.project_info.get('dir', '')
+        try:
+            from core.deunown_patch import (
+                has_unown_mechanism, apply_deunown, DeUnownError)
+        except Exception as e:
+            QMessageBox.critical(self, 'Remove Unown System',
+                                 f'Could not load the de-unown module:\n{e}')
+            return
+
+        if not has_unown_mechanism(root):
+            QMessageBox.information(
+                self, 'Nothing to remove',
+                "This project doesn't use the Unown letter-form system, so "
+                "there's nothing to remove.")
+            return
+
+        reply = QMessageBox.warning(
+            self, 'Remove Unown letter-form system?',
+            "This permanently removes the Unown letter-form mechanism from this "
+            "project's game source — the 27 letter-form slots, the "
+            "letter-from-personality machinery, and every engine special-case "
+            "that referenced them.\n\n"
+            "The mon that used the mechanism becomes a normal single-sprite mon. "
+            "The base Unown species and the numeric OLD_UNOWN slots are kept.\n\n"
+            "This edits the game engine and can't be undone from the app "
+            "(use Git to revert if needed). Proceed?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            res = apply_deunown(root)
+        except DeUnownError as e:
+            QMessageBox.critical(
+                self, 'De-unown failed',
+                "The Unown system was NOT changed — the tool hit source it "
+                "couldn't safely edit and stopped before writing anything, so "
+                "your project is untouched.\n\n"
+                f"Details:\n{e}")
+            return
+        except Exception as e:
+            QMessageBox.critical(self, 'De-unown failed',
+                                 f'An unexpected error occurred:\n{e}')
+            return
+
+        n = len(res.get('changed', [])) if isinstance(res, dict) else 0
+        QMessageBox.information(
+            self, 'Unown system removed',
+            f"Done — updated {n} source file(s). The mon that used the Unown "
+            "mechanism is now a normal single-sprite mon.\n\n"
+            "Build with Make (or Make Modern) to compile the change, then check "
+            "it in-game. If the build fails, use Git to revert.")
+        # The species set / engine changed — drop caches so the app re-reads.
+        try:
+            self._refresh_project()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("post-deunown refresh failed")
 
     def _on_expand_rom(self):
         """Patch the project's Makefile to allow 32 MB ROMs."""

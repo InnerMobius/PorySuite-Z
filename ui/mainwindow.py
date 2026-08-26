@@ -821,12 +821,20 @@ QTabBar::tab:hover:!selected {
         # Starter widgets get their own handler so changes light up the
         # Starters sidebar dot, not the Pokemon dot.
         _STARTER_PREFIXES = ("starter1_", "starter2_", "starter3_")
-        # Display-only widgets that accept programmatic text from the app
-        # but are NOT user-editable species fields.  Connecting their
-        # textChanged to _dirty causes every self.log() call to mark the
-        # current species dirty — e.g. pre-build log output during a Make
-        # would light up Bulbasaur amber even though nothing was edited.
-        _NON_FIELD_TEXT_WIDGETS = {"logOutput"}
+        # Display-only / non-field widgets that are NOT user-editable species
+        # fields. Connecting their change signals to _dirty falsely marks the
+        # currently-selected species dirty:
+        #   * logOutput — every self.log() line (e.g. pre-build Make output)
+        #     would light up the current species amber.
+        #   * the search/filter boxes — TYPING A SEARCH is not an edit, but each
+        #     keystroke fired _dirty and painted the selected species amber
+        #     (you'd only notice once the row was filtered out and back in).
+        _NON_FIELD_TEXT_WIDGETS = {
+            "logOutput",
+            "species_search",
+            "pokedex_national_search",
+            "pokedex_regional_search",
+        }
         for attr_name in dir(self.ui):
             if attr_name.startswith('_'):
                 continue
@@ -6617,6 +6625,44 @@ in the game.</p>
             self.ui.evolutions.resizeColumnToContents(i)
 
         self.load_species_learnset_table(species)
+
+        # Snapshot the values the fields were JUST loaded with. save_species_data
+        # compares against this first, so a widget still holding its loaded value
+        # is never counted as an edit. This kills the "view = amber" false-dirty
+        # for species that OMIT fields in the source (a de-shared OLD_UNOWN slot,
+        # say): an omitted field loads as the widget's clamped/default value,
+        # which differs from the missing-sentinel the source reads back — the old
+        # compare-vs-source then flagged a phantom edit on every click-through.
+        # A genuine change (current != snapshot) still falls through and saves.
+        # Read expressions MUST mirror save_species_data's exactly.
+        try:
+            _u = self.ui
+            _snap = {
+                "baseHP": _u.base_hp.value(), "baseAttack": _u.base_atk.value(),
+                "baseDefense": _u.base_def.value(), "baseSpeed": _u.base_speed.value(),
+                "baseSpAttack": _u.base_spatk.value(), "baseSpDefense": _u.base_spdef.value(),
+                "evYield_HP": _u.evs_hp.value(), "evYield_Attack": _u.evs_atk.value(),
+                "evYield_Defense": _u.evs_def.value(), "evYield_Speed": _u.evs_speed.value(),
+                "evYield_SpAttack": _u.evs_spatk.value(), "evYield_SpDefense": _u.evs_spdef.value(),
+                "catchRate": _u.catch_rate.value(), "expYield": _u.exp_yield.value(),
+                "eggCycles": _u.egg_cycles.value(), "friendship": _u.base_friendship.value(),
+                "growthRate": _u.exp_growth_rate.currentData(),
+                "eggGroups": [_u.egg_group_1.currentData(), _u.egg_group_2.currentData()],
+                "itemCommon": _u.held_item_common.currentData(),
+                "itemRare": _u.held_item_rare.currentData(),
+                "types": [_u.type1.currentData(), _u.type2.currentData()],
+            }
+            if hasattr(_u, "species_flags"):
+                for _i in range(_u.species_flags.count()):
+                    _it = _u.species_flags.item(_i)
+                    if _it.data(Qt.ItemDataRole.UserRole) == "NO_FLIP":
+                        _snap["noFlip"] = ("TRUE"
+                            if _it.checkState() == Qt.CheckState.Checked else "FALSE")
+                        break
+            self._species_ui_snapshot = _snap
+        except Exception:
+            self._species_ui_snapshot = {}
+
         self.ui.tab_pokemon_data.setEnabled(True)
 
     def update_gender_ratio(self, value):
@@ -6690,6 +6736,14 @@ in the game.</p>
 
         def update_if_needed(attribute, ui_value):
             nonlocal updated
+            # A widget still holding its just-loaded value is NOT a user edit —
+            # even when the source omits the field (so `stored` is the missing
+            # sentinel and differs from the widget's loaded default). Compare
+            # against the load snapshot first so a plain view never dirties.
+            _snap = getattr(self, "_species_ui_snapshot", None)
+            if (_snap is not None and attribute in _snap
+                    and _normalize(ui_value) == _normalize(_snap[attribute])):
+                return
             stored = self.source_data.get_species_info(species, attribute, form)
             if _normalize(stored) != _normalize(ui_value):
                 _diag(attribute, stored, ui_value)
@@ -6962,7 +7016,12 @@ in the game.</p>
                                                   "EGG_GROUP_UNDISCOVERED"])
                             else:
                                 orig = item.data(1000)
-                                if isinstance(orig, list):
+                                # Only restore a REAL original egg-group pair.
+                                # An empty list means the source had none (the
+                                # field is omitted) — writing [] there just
+                                # oscillated the value and re-flagged the species
+                                # dirty on every view.
+                                if isinstance(orig, list) and orig:
                                     update_if_needed("eggGroups", orig)
                         elif key in ("IN_NATDEX", "IN_REGDEX"):
                             pd = getattr(self.source_data, 'data', {}).get('pokedex')

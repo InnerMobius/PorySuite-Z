@@ -408,8 +408,9 @@ class DiagnosticsTab(QWidget):
                 for line in f:
                     if line.strip().startswith('#define SPECIES_'):
                         name = line.split()[1]
-                        if name not in ('SPECIES_NONE', 'SPECIES_EGG',
-                                        'SPECIES_UNOWN_B'):
+                        # Excludes only the two sentinels. (Formerly also skipped
+                        # SPECIES_UNOWN_B — an arbitrary de-unown-fragile no-op.)
+                        if name not in ('SPECIES_NONE', 'SPECIES_EGG'):
                             count += 1
                 return count
         except Exception:
