@@ -56,21 +56,23 @@ dist/
 # ── Release notes (live on the GitHub Releases page, not in the source tree) ──
 docs/RELEASE_v*.md
 
-# ── Dev-only docs (Claude context, bug tracking, phase plans) ──
-# These stay on disk for development but aren't shipped with the app.
+# ── Dev-only docs: plans, roadmaps, changelogs, bug tracking, handoffs ──
+# These stay on disk for development but aren't shipped with the app. Only
+# user-facing docs (READMEs, guides, troubleshooting, screenshots) are tracked.
+docs/*_PLAN.md
+docs/*_ROADMAP.md
+docs/*_FACTS.md
+docs/*_REPORT.md
+docs/*_LOG.md
+docs/*_AUDIT.md
+docs/HANDOFF.md
 docs/AGENTS.md
 docs/BUGS.md
 docs/CHANGELOG.md
 docs/CLAUDECONTEXT.md
 docs/DATAFLOW.md
 docs/renameplan.md
-docs/SOUND_EDITOR_PLAN.md
 docs/SOUND_ENGINE_DEBUG_LOG.md
-docs/UNIFIED_EDITOR_PLAN.md
-docs/POST_RELEASE_AUDIT_PLAN.md
-docs/ALT_FORMS_PLAN.md
-docs/INBATTLE_FORMS_PLAN.md
-docs/REGION_MAP_ROADMAP.md
 docs/RELEASING.md
 eventide/docs/CLAUDECONTEXT.md
 eventide/docs/eventide_whitelist.md

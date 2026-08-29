@@ -2349,6 +2349,9 @@ class GraphicsTabWidget(QWidget):
         if self._loading or not self._current_species or not self._data:
             return
         self._data.set_icon_idx(self._current_species, v)
+        # Bake the newly-chosen palette into THIS species' icon.png on Save, so
+        # the on-disk PNG matches the palette the dropdown now points at.
+        self._icon_png_dirty.add(self._current_species)
         self._mark_modified()
 
     def _on_icon_pal_changed(self, idx: int) -> None:
@@ -2793,6 +2796,21 @@ class GraphicsTabWidget(QWidget):
             except Exception:
                 pass
         return 0
+
+    def _reindex_existing_icon(self, sp: str, path: str):
+        """Re-bake an EXISTING icon.png: keep its art (pixel indices) but pair it
+        with the shared icon palette this species now uses, so a palette edit
+        rewrites the PNG's colour table. Returns (indexed_img, palette) or
+        (None, None). Used when there's no pending import to remap."""
+        from PyQt6.QtGui import QImage
+        img = QImage(path)
+        if img.isNull():
+            return None, None
+        if img.format() != QImage.Format.Format_Indexed8:
+            img = img.convertToFormat(QImage.Format.Format_Indexed8)
+        pal = list(self._icon_palettes.get(self._icon_target_slot(sp))
+                   or [(0, 0, 0)] * 16)
+        return img, pal
 
     def _remapped_imported_icon(self, sp: str):
         """Fit a pending imported icon's raw artwork onto this species' shared
@@ -3345,8 +3363,14 @@ class GraphicsTabWidget(QWidget):
             # PNG matches what the game will render.
             for sp in list(self._icon_png_dirty):
                 path = (self._sprite_paths.get(sp, {}) or {}).get("icon", "")
+                if not path:
+                    continue
+                # A pending import remaps its raw art; otherwise re-bake the
+                # EXISTING icon.png so a plain palette edit still rewrites it.
                 rem, pal = self._remapped_imported_icon(sp)
-                if rem is None or not path:
+                if rem is None:
+                    rem, pal = self._reindex_existing_icon(sp, path)
+                if rem is None:
                     continue
                 if export_indexed_png(rem, pal, path, transparent_index=0):
                     total_ok += 1

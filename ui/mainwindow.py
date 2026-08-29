@@ -8955,9 +8955,17 @@ QTabBar::tab:hover:!selected {
             nat_page.setStyleSheet("background: transparent;")
             nat_vbox = QVBoxLayout(nat_page)
             nat_vbox.setContentsMargins(4, 4, 4, 4)
-            nat_vbox.setSpacing(0)
+            nat_vbox.setSpacing(4)
+            # Reparent the search box out of its old grid container (which now
+            # sits hidden behind the splitter) into the tab, above the list.
+            nat_vbox.addWidget(self.ui.pokedex_national_search)
             nat_vbox.addWidget(self.ui.list_pokedex_national)
             list_tabs.addTab(nat_page, "National Dex")
+            # The old national container is now empty (both its children moved
+            # into the tab pages). Pull it out of the grid so it stops painting
+            # behind the splitter.
+            self.ui.tab_pokedex_grid.removeWidget(self.ui.pokedex_nat_container)
+            self.ui.pokedex_nat_container.hide()
 
             # ── Regional Dex tab ─────────────────────────────────────────────────
             reg_page = QWidget()
@@ -8965,6 +8973,9 @@ QTabBar::tab:hover:!selected {
             reg_vbox = QVBoxLayout(reg_page)
             reg_vbox.setContentsMargins(4, 4, 4, 4)
             reg_vbox.setSpacing(4)
+            # Reparent the regional search box out of the old grid layout into
+            # the tab, above the list (it was left orphaned behind the splitter).
+            reg_vbox.addWidget(self.ui.pokedex_regional_search)
             reg_vbox.addWidget(self.ui.list_pokedex_regional)
             reg_vbox.addWidget(self.ui.pushButton_4)    # "Add"
             reg_vbox.addWidget(self.ui.pushButton_5)    # "Remove"
