@@ -389,8 +389,21 @@ def _fix_species_clamps(project_root):
     NUM_TOTAL_SPECIES. pokefirered sanitizes any ``species > NUM_SPECIES`` to
     SPECIES_NONE in the name / icon / front-pic getters (it shows the ?-sprite
     and a blank ``??????????`` name), which garbles every appended form-species
-    in the party / summary / battle. Idempotent — ``NUM_TOTAL_SPECIES`` does not
-    contain the ``NUM_SPECIES`` token, so a re-run finds nothing to replace."""
+    in the party / summary / battle.
+
+    One guard does NOT use the ``NUM_SPECIES`` token: the battle-palette getter
+    ``GetMonSpritePalFromSpeciesAndPersonality`` in pokemon.c writes it as
+    ``species > SPECIES_EGG`` (NUM_SPECIES is #defined to SPECIES_EGG, so the two
+    are numerically equal but textually different). Missing it means every
+    appended species falls through to ``gMonPaletteTable[0]`` — the default
+    palette — so its BATTLE sprite renders in the wrong colours even though the
+    on-disk palette and every in-tool preview are correct. Raise that form too.
+
+    Both rewrites keep ``>`` (not ``>=``): SPECIES_EGG (412) stays < the new bound
+    so the egg keeps its own graphic, exactly as vanilla's ``>`` intends.
+
+    Idempotent — ``NUM_TOTAL_SPECIES`` contains neither ``NUM_SPECIES`` nor
+    ``SPECIES_EGG`` as the guarded token, so a re-run finds nothing to replace."""
     pf = lambda *a: os.path.join(project_root, *a)
     changed = {}
     for rel in ("src/battle_anim_mons.c", "src/battle_main.c", "src/decompress.c",
@@ -400,6 +413,7 @@ def _fix_species_clamps(project_root):
             continue
         t = _read(p)
         nt = t.replace("species > NUM_SPECIES", "species > NUM_TOTAL_SPECIES")
+        nt = nt.replace("species > SPECIES_EGG", "species > NUM_TOTAL_SPECIES")
         if nt != t:
             _write(p, nt); changed[rel] = True
     return changed
