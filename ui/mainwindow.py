@@ -5559,6 +5559,15 @@ in the game.</p>
             entries = read_form_changes(proj, species) if proj else []
         except Exception:
             entries = []
+        # Auto-populate the table with the forms this species ALREADY has: any form in
+        # the family that doesn't yet have a rule gets a pre-filled row (Becomes = that
+        # form, trigger blank for the user to set) — so an existing form is never absent
+        # from the table and never has to be re-added by hand. Blank-trigger rows aren't
+        # saved (entries() skips them) until a trigger is chosen.
+        covered = {e.get("target") for e in entries}
+        for fc in (data.get(species, {}).get("forms") or {}):
+            if fc not in covered:
+                entries.append({"method": "", "target": fc, "param": ""})
         opts = self._form_change_param_options(proj) if proj else {}
         methods = self._form_change_methods(proj)   # project-parsed triggers (+ 'Undefined:' extras)
         panel.load(who, choices, opts, entries, methods)   # load() is _loading-guarded

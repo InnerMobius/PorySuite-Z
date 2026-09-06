@@ -118,8 +118,11 @@ class FormChangePanel(QWidget):
 
     def _method_choices(self, current):
         """The project-parsed trigger options, plus the row's existing method if it
-        isn't in the list (so an already-saved rule still displays + round-trips)."""
-        out = list(self._methods)
+        isn't in the list (so an already-saved rule still displays + round-trips).
+        Leads with a blank placeholder so an auto-listed form (no rule yet) shows
+        '(set a trigger…)' instead of defaulting to a real trigger it never chose;
+        such rows aren't saved until a real trigger is picked."""
+        out = [("(set a trigger…)", "")] + list(self._methods)
         if current and current not in [c for _, c in out]:
             nice = (current[len("FORM_CHANGE_"):].replace("_", " ").title()
                     if current.startswith("FORM_CHANGE_") else current)
