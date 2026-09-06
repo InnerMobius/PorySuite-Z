@@ -4951,7 +4951,8 @@ QTabBar::tab:hover:!selected {
             QMessageBox.critical(self, "Add Form", f"Could not open Add Form:\n\n{e}")
             return
         dlg = AddFormDialog(self, base_name.replace("_", " ").title(), choices,
-                            self._form_change_param_options(proj))
+                            self._form_change_param_options(proj),
+                            self._form_change_methods(proj))
         if not dlg.exec():
             return
         if dlg.is_existing():
@@ -5245,6 +5246,52 @@ QTabBar::tab:hover:!selected {
         opts["FORM_CHANGE_TIME_OF_DAY"] = [("0", "Morning"), ("1", "Day"), ("2", "Night")]
         return opts
 
+    # Triggers PorySuite has a dedicated, guided UI for (friendly label + a real
+    # Parameter dropdown). Everything else the project's engine defines is offered
+    # generically as "Undefined: …" with a free-typed parameter.
+    _FORM_METHOD_FRIENDLY = [
+        ("FORM_CHANGE_ITEM_HOLD", "Holds an item"),
+        ("FORM_CHANGE_TIME_OF_DAY", "Time of day"),
+        ("FORM_CHANGE_WEATHER", "Overworld weather"),
+        ("FORM_CHANGE_FLAG", "After a story flag is set"),
+        ("FORM_CHANGE_STATUS", "Has a status condition"),
+    ]
+    # Not offered for NEW rules: END is the list terminator; ITEM_USE has no in-game
+    # dispatch hook yet (a dead option).
+    _FORM_METHOD_EXCLUDE = {"FORM_CHANGE_END", "FORM_CHANGE_ITEM_USE"}
+
+    def _form_change_methods(self, proj):
+        """Trigger choices for the form-rule dropdowns, PARSED from THIS project's
+        include/constants/form_change_types.h — so a hack only ever sees the triggers
+        its own engine actually defines (nothing PorySuite-specific is forced on a
+        vanilla project). The ones we have a guided UI for get a friendly label; any
+        other FORM_CHANGE_* the engine defines is still offered, labelled
+        'Undefined: NAME' with a free-typed parameter, so a code-only trigger can be
+        selected instead of being unusable. Returns [(label, const)]."""
+        import os, re
+        friendly = dict(self._FORM_METHOD_FRIENDLY)
+        present = []
+        try:
+            path = os.path.join(proj or "", "include", "constants", "form_change_types.h")
+            with open(path, encoding="utf-8") as f:
+                for m in re.finditer(r"#define\s+(FORM_CHANGE_[A-Z0-9_]+)", f.read()):
+                    if m.group(1) not in present:
+                        present.append(m.group(1))
+        except Exception:
+            present = []
+        out = []
+        for const, label in self._FORM_METHOD_FRIENDLY:      # guided ones first, in order
+            if const in present:
+                out.append((label, const))
+        for const in present:                                # engine-defined extras
+            if const in self._FORM_METHOD_EXCLUDE or const in friendly:
+                continue
+            nice = const[len("FORM_CHANGE_"):].replace("_", " ").title()
+            out.append((f"Undefined: {nice}", const))
+        if not out:                                          # parse failed → guided set
+            out = [(label, const) for const, label in self._FORM_METHOD_FRIENDLY]
+        return out
+
     def _edit_form_changes(self, species_const):
         """Open the in-game form-change editor for *species_const* — its rules for
         turning into ANOTHER species under a trigger (the expansion model: a form
@@ -5279,7 +5326,8 @@ QTabBar::tab:hover:!selected {
         # dedicated diag file + show the cause instead of "nothing happens".
         try:
             dlg = FormChangeDialog(self, who, choices,
-                                   self._form_change_param_options(proj), entries)
+                                   self._form_change_param_options(proj), entries,
+                                   self._form_change_methods(proj))
             accepted = dlg.exec()
         except Exception as exc:
             import traceback
@@ -5512,7 +5560,8 @@ in the game.</p>
         except Exception:
             entries = []
         opts = self._form_change_param_options(proj) if proj else {}
-        panel.load(who, choices, opts, entries)   # load() is _loading-guarded
+        methods = self._form_change_methods(proj)   # project-parsed triggers (+ 'Undefined:' extras)
+        panel.load(who, choices, opts, entries, methods)   # load() is _loading-guarded
         self._forms_tab_species = species
         self._form_rules_dirty = False            # freshly loaded = clean
 

@@ -50,11 +50,15 @@ class AddFormDialog(QDialog):
                      trigger Parameter dropdown.
     """
 
-    def __init__(self, parent, base_label, species_choices, param_options):
+    def __init__(self, parent, base_label, species_choices, param_options, methods=None):
         super().__init__(parent)
         self.setWindowTitle(f"Add Form — {base_label}")
         self.setMinimumWidth(480)
         self._param_options = param_options or {}
+        # Trigger choices: "no automatic trigger" first, then the project-parsed set
+        # (host reads the engine's form_change_types.h). Fall back to the built-ins.
+        self._trigger_defs = ([("No automatic trigger (set it later)", "")] + list(methods)
+                              if methods else list(_TRIGGERS))
 
         v = QVBoxLayout(self)
         v.addWidget(QLabel(
@@ -95,7 +99,7 @@ class AddFormDialog(QDialog):
 
         # Trigger
         self._trig = QComboBox()
-        for label, const in _TRIGGERS:
+        for label, const in self._trigger_defs:
             self._trig.addItem(label, const)
         install_scroll_guard(self._trig)
         form.addRow("Appears when:", self._trig)
@@ -125,16 +129,24 @@ class AddFormDialog(QDialog):
             w.setVisible(not new)
 
     def _rebuild_param(self):
-        opts = self._param_options.get(self._trig.currentData() or "", [])
+        method = self._trig.currentData()
+        opts = self._param_options.get(method or "", [])
         self._param.blockSignals(True)
         self._param.clear()
-        if not opts:
-            self._param.addItem("—", "0")
-            self._param.setEnabled(False)
-        else:
+        if opts:
+            self._param.setEditable(False)
             self._param.setEnabled(True)
             for val, label in opts:
                 self._param.addItem(label, val)
+        elif method:
+            # an 'Undefined:' engine trigger with no guided options → type the value
+            self._param.setEditable(True)
+            self._param.setEnabled(True)
+            self._param.setEditText("")
+        else:
+            self._param.setEditable(False)
+            self._param.addItem("—", "0")
+            self._param.setEnabled(False)
         self._param.blockSignals(False)
 
     def _on_ok(self):
@@ -168,5 +180,9 @@ class AddFormDialog(QDialog):
         method = self._trig.currentData()
         if not method:
             return (None, None)
-        param = self._param.currentData() if self._param.isEnabled() else "0"
+        if self._param.isEnabled():
+            param = (self._param.currentText().strip() if self._param.isEditable()
+                     else self._param.currentData())
+        else:
+            param = "0"
         return (method, param or "0")

@@ -54,6 +54,7 @@ class FormChangePanel(QWidget):
         super().__init__(parent)
         self._choices = []
         self._param_options = {}
+        self._methods = list(_METHODS)   # replaced by load() with the project-parsed set
         self._loading = False
 
         v = QVBoxLayout(self)
@@ -79,9 +80,12 @@ class FormChangePanel(QWidget):
         bar.addStretch(1)
         v.addLayout(bar)
 
-    def load(self, who_label, species_choices, param_options, entries):
+    def load(self, who_label, species_choices, param_options, entries, methods=None):
         self._choices = species_choices or []
         self._param_options = param_options or {}
+        # Trigger choices are project-parsed and passed in (host reads the engine's
+        # form_change_types.h). Fall back to the built-in friendly list if none given.
+        self._methods = list(methods) if methods else list(_METHODS)
         self._intro.setText(
             f"Rules for what makes <b>{who_label}</b> turn into another species "
             f"in-game — the target can be any mon in the dex. The change holds "
@@ -112,11 +116,21 @@ class FormChangePanel(QWidget):
         install_scroll_guard(c)
         return c
 
+    def _method_choices(self, current):
+        """The project-parsed trigger options, plus the row's existing method if it
+        isn't in the list (so an already-saved rule still displays + round-trips)."""
+        out = list(self._methods)
+        if current and current not in [c for _, c in out]:
+            nice = (current[len("FORM_CHANGE_"):].replace("_", " ").title()
+                    if current.startswith("FORM_CHANGE_") else current)
+            out.append((f"Undefined: {nice}", current))
+        return out
+
     def _add_row(self, entry=None):
         e = entry if isinstance(entry, dict) else {}
         r = self.table.rowCount()
         self.table.insertRow(r)
-        trig = self._combo(_methods_for(e.get("method")), e.get("method"))
+        trig = self._combo(self._method_choices(e.get("method")), e.get("method"))
         self.table.setCellWidget(r, 0, trig)
         target = self._combo(self._choices, e.get("target"))
         self.table.setCellWidget(r, 1, target)
@@ -155,13 +169,12 @@ class FormChangePanel(QWidget):
         param = self.table.cellWidget(row, 2)
         if trig is None or param is None:
             return
-        opts = self._param_options.get(trig.currentData() or "", [])
+        method = trig.currentData()
+        opts = self._param_options.get(method or "", [])
         param.blockSignals(True)
         param.clear()
-        if not opts:
-            param.addItem("—", "0")
-            param.setEnabled(False)
-        else:
+        if opts:
+            param.setEditable(False)
             param.setEnabled(True)
             for val, label in opts:
                 param.addItem(label, val)
@@ -169,6 +182,16 @@ class FormChangePanel(QWidget):
                 i = param.findData(preselect)
                 if i >= 0:
                     param.setCurrentIndex(i)
+        elif method:
+            # A trigger with no guided options (e.g. an 'Undefined:' engine trigger) —
+            # let the user TYPE its parameter (a percent, an id, 0 if it takes none).
+            param.setEditable(True)
+            param.setEnabled(True)
+            param.setEditText(str(preselect) if preselect is not None else "")
+        else:
+            param.setEditable(False)
+            param.addItem("—", "0")
+            param.setEnabled(False)
         param.blockSignals(False)
 
     def _remove_row(self):
@@ -186,7 +209,11 @@ class FormChangePanel(QWidget):
             if tw is None or sw is None:
                 continue
             method, target = tw.currentData(), sw.currentData()
-            pval = param.currentData() if (param and param.isEnabled()) else "0"
+            if param and param.isEnabled():
+                # editable = a free-typed param (Undefined trigger); else a dropdown value
+                pval = param.currentText().strip() if param.isEditable() else param.currentData()
+            else:
+                pval = "0"
             if method and target:
                 out.append({"method": method, "target": target, "param": pval or "0"})
         return out
@@ -195,13 +222,13 @@ class FormChangePanel(QWidget):
 class FormChangeDialog(QDialog):
     """Thin dialog wrapper around FormChangePanel (used by the tree right-click)."""
 
-    def __init__(self, parent, who_label, species_choices, param_options, entries):
+    def __init__(self, parent, who_label, species_choices, param_options, entries, methods=None):
         super().__init__(parent)
         self.setWindowTitle(f"Form Changes — {who_label}")
         self.resize(760, 360)
         v = QVBoxLayout(self)
         self.panel = FormChangePanel(self)
-        self.panel.load(who_label, species_choices, param_options, entries)
+        self.panel.load(who_label, species_choices, param_options, entries, methods)
         v.addWidget(self.panel)
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
                               | QDialogButtonBox.StandardButton.Cancel)
