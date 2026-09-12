@@ -4866,6 +4866,8 @@ QTabBar::tab:hover:!selected {
             menu.addAction("Add Form…", lambda *_: self._add_form(const))
             menu.addAction("Form Change Triggers…",
                            lambda *_: self._edit_form_changes(const))
+            menu.addAction("Set Female Art…",
+                           lambda *_: self._set_female_art_ui(const))
         elif item.text(2):                        # form child row
             menu.addAction("Delete Form",
                            lambda *_: self._delete_form(item.text(2), const))
@@ -4874,6 +4876,48 @@ QTabBar::tab:hover:!selected {
         else:
             return
         menu.exec(tree.viewport().mapToGlobal(pos))
+
+    def _set_female_art_ui(self, species_const):
+        """Give a species FEMALE-different art (same stats): the game shows a
+        different sprite/palette when the mon is female. Imports the female
+        front/back (and optional palettes) the user picks — anything skipped is
+        seeded from the male art as a starting point they can replace on disk."""
+        from PyQt6.QtWidgets import QMessageBox, QFileDialog
+        proj = (self.project_info or {}).get("dir")
+        if not proj:
+            return
+        short = species_const[len("SPECIES_"):].title()
+        QMessageBox.information(
+            self, "Set Female Art",
+            f"Pick {short}'s FEMALE sprites next. They must be the same kind of "
+            f"indexed PNG as its normal sprites (same size / colour count).\n\n"
+            f"You can Cancel any picker to keep the normal art as a placeholder in "
+            f"that slot and drop the file in later.")
+        png = "PNG image (*.png)"
+        pal = "Palette (*.pal *.png)"
+        front, _ = QFileDialog.getOpenFileName(self, f"{short} — female FRONT sprite", proj, png)
+        back, _ = QFileDialog.getOpenFileName(self, f"{short} — female BACK sprite", proj, png)
+        npal, _ = QFileDialog.getOpenFileName(self, f"{short} — female palette (optional)", proj, pal)
+        spal, _ = QFileDialog.getOpenFileName(self, f"{short} — female SHINY palette (optional)", proj, pal)
+        try:
+            from core.female_art import set_female_art, female_slug
+            set_female_art(proj, species_const,
+                           front_png=front or None, back_png=back or None,
+                           normal_pal=npal or None, shiny_pal=spal or None)
+        except Exception as e:
+            import traceback
+            QMessageBox.critical(self, "Set Female Art",
+                                 f"Could not set female art:\n\n{e}")
+            self._log_diag("female_art", traceback.format_exc()) if hasattr(self, "_log_diag") else None
+            return
+        folder = f"graphics/pokemon/{female_slug(species_const)}"
+        QMessageBox.information(
+            self, "Set Female Art",
+            f"Female art wired for {short}.\n\n"
+            f"Its female files live in:\n  {folder}/\n"
+            f"(front.png, back.png, normal.pal, shiny.pal — replace any of them "
+            f"anytime with your female art).\n\nBuild with Make to see it in-game: "
+            f"a female {short} will use these; a male one uses the normal art. Same stats.")
 
     @staticmethod
     def _gender_ratio_macro(val):
