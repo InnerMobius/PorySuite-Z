@@ -6652,15 +6652,32 @@ in the game.</p>
         self._update_species_info_sprites(front_pic, icon_pic, species=species)
 
         # Update Graphics tab widget with sprites + per-species data
+        # Key the Graphics tab by the FORM's own const for an OWN-IMAGE form (its
+        # sprites live in its own folder, e.g. graphics/pokemon/<form_slug>/). If
+        # such a form were keyed by the BASE const, its staging would share the
+        # base's key — editing the form and the base back-to-back without saving
+        # could bake the form's sprite into the base's file. A stacked-frame form
+        # (Deoxys-style: a frame of the base's SHARED sheet, folder == base slug)
+        # stays keyed by base + frame.
+        gfx_key = species
+        gfx_frame = form_frame
+        try:
+            from ui.graphics_data import species_slug_from_const as _slug
+            if form and front_pic and os.path.dirname(front_pic):
+                if os.path.basename(os.path.dirname(front_pic)) == _slug(form):
+                    gfx_key = form
+                    gfx_frame = 0  # its own sheet is a single frame at index 0
+        except Exception:
+            pass
         try:
             if getattr(self, "graphics_tab_widget", None) is not None:
                 self.graphics_tab_widget.load_species(
-                    species,
+                    gfx_key,
                     front_path=front_pic or "",
                     back_path=back_pic or "",
                     icon_path=icon_pic or "",
                     footprint_path=footprint_pic or "",
-                    frame=form_frame,
+                    frame=gfx_frame,
                 )
         except Exception:
             logging.exception("graphics_tab_widget.load_species failed")
@@ -13046,36 +13063,19 @@ QTabBar::tab:hover:!selected {
 
         Returns number of entries updated, or -1 on error.
         """
-        # Skip if no edit in species_data since load.
-        if self._plugin_data_unchanged("species_data"):
-            return 0
+        # Always reconcile pokedex_entries.h against the in-memory model on save.
+        # Do NOT gate on _plugin_data_unchanged: categoryName comes from
+        # species_data, but the six numeric fields come from the pokedex plugin's
+        # national_dex, and a pokedex-only edit (a scale/weight change) must still
+        # write. The .h can also be stale relative to pokedex.json from a PRIOR
+        # session — gating would skip that forever. write_text_if_changed below
+        # makes this a true no-op when the file already matches, so always running
+        # is cheap and correct.
         import re
         root = self.project_info.get("dir", "")
         path = os.path.join(root, "src", "data", "pokemon", "pokedex_entries.h")
         if not os.path.isfile(path):
             return -1
-
-        try:
-            sp_data = self.source_data.data["species_data"]
-        except Exception:
-            return -1
-
-        # Build lookup: NATIONAL_DEX_XXX -> categoryName from species_info
-        # species_info is the authoritative source — it's what the UI writes to.
-        cat_map: dict[str, str] = {}
-        for species_const, sdata in sp_data.data.items():
-            if not species_const.startswith("SPECIES_"):
-                continue
-            info = sdata.get("species_info", {})
-            cat = info.get("categoryName")
-            if not cat:
-                continue
-            # Derive NATIONAL_DEX_XXX from SPECIES_XXX
-            nat_const = "NATIONAL_DEX_" + species_const[len("SPECIES_"):]
-            cat_map[nat_const] = cat
-
-        if not cat_map:
-            return 0
 
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -13084,16 +13084,57 @@ QTabBar::tab:hover:!selected {
             return -1
 
         total = 0
-        for dc, cat in cat_map.items():
-            # Find the [NATIONAL_DEX_XXX] block and replace .categoryName
-            block_pat = re.compile(
-                rf"(\[{re.escape(dc)}\]\s*=\s*\{{[^}}]*?\.categoryName\s*=\s*_\(\")([^\"]*)(\")",
-                re.S,
-            )
-            new_text = block_pat.sub(lambda m: m.group(1) + cat + m.group(3), text)
-            if new_text != text:
-                text = new_text
-                total += 1
+
+        # 1) .categoryName — from species_info (the authoritative source the UI
+        #    writes category edits to).
+        try:
+            sp_data = self.source_data.data["species_data"]
+            for species_const, sdata in sp_data.data.items():
+                if not species_const.startswith("SPECIES_"):
+                    continue
+                cat = (sdata.get("species_info", {}) or {}).get("categoryName")
+                if not cat:
+                    continue
+                dc = "NATIONAL_DEX_" + species_const[len("SPECIES_"):]
+                block_pat = re.compile(
+                    rf"(\[{re.escape(dc)}\]\s*=\s*\{{[^}}]*?\.categoryName\s*=\s*_\(\")([^\"]*)(\")",
+                    re.S,
+                )
+                new_text = block_pat.sub(lambda m: m.group(1) + cat + m.group(3), text)
+                if new_text != text:
+                    text = new_text
+                    total += 1
+        except Exception:
+            pass
+
+        # 2) Numeric size/dex fields — from the pokedex national_dex data, where
+        #    the Pokédex panel's scale/weight/offset edits are committed. Each is a
+        #    plain `.field = <int>,` line inside the [NATIONAL_DEX_X] block. Without
+        #    this, those edits reached pokedex.json but never pokedex_entries.h and
+        #    the build saw no change.
+        try:
+            natdex = self.source_data.data["pokedex"].data.get("national_dex", [])
+        except Exception:
+            natdex = []
+        _NUM_FIELDS = ("height", "weight", "pokemonScale", "pokemonOffset",
+                       "trainerScale", "trainerOffset")
+        for entry in natdex:
+            dc = entry.get("dex_constant")
+            if not dc:
+                continue
+            for field in _NUM_FIELDS:
+                val = entry.get(field)
+                if not isinstance(val, int):
+                    continue
+                npat = re.compile(
+                    rf"(\[{re.escape(dc)}\]\s*=\s*\{{[^}}]*?\.{field}\s*=\s*)(-?\d+)",
+                    re.S,
+                )
+                new_text = npat.sub(
+                    lambda m, v=val: m.group(1) + str(v), text, count=1)
+                if new_text != text:
+                    text = new_text
+                    total += 1
 
         try:
             write_text_if_changed(path, text)

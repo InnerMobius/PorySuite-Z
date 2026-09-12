@@ -464,14 +464,21 @@ def _parse_location_names(project_dir: str) -> list[TextEntry]:
 
 _BATTLE_STRING_RE = re.compile(
     r'^(?:static\s+)?const\s+u8\s+'
-    r'(sText_\w+)\s*\[\s*\]\s*=\s*'
+    r'((?:s|g)Text_\w+)\s*\[\s*\]\s*=\s*'
     r'_\(\s*"((?:[^"\\]|\\.)*)"\s*\)\s*;',
     re.MULTILINE,
 )
 
 
 def _parse_battle_messages(project_dir: str) -> list[TextEntry]:
-    """Parse sText_* from src/battle_message.c."""
+    """Parse sText_* AND gText_* from src/battle_message.c.
+
+    The scrolling battle log is `sText_*`, but the action menu
+    (`gText_BattleMenu` — Attack/Items/Party/Escape), the PP label
+    (`gText_MoveInterfacePP`), the Safari menu, and other fixed UI labels are
+    `gText_*`. Indexing only `sText_*` left all of those un-searchable and
+    un-editable. `_save_c_string` rewrites by label in the entry's own file, so
+    `gText_*` here round-trips exactly like `sText_*`."""
     rel = "src/battle_message.c"
     path = os.path.join(project_dir, rel)
     text = _read(path)
@@ -487,7 +494,7 @@ def _parse_battle_messages(project_dir: str) -> list[TextEntry]:
         line = text[:m.start()].count("\n") + 1
 
         display = var_name
-        if var_name.startswith("sText_"):
+        if var_name.startswith(("sText_", "gText_")):
             display = var_name[6:]
             display = re.sub(r"([a-z])([A-Z])", r"\1 \2", display)
 
@@ -507,6 +514,67 @@ def _parse_battle_messages(project_dir: str) -> list[TextEntry]:
             owning_tab="",
             display_label=display,
         ))
+    return entries
+
+
+# ── general UI-string scanner (every other src/*.c) ───────────────────────────
+# strings.c and battle_message.c have dedicated parsers. keyboard_text.c (per-key
+# letter tables) and debug_menu.c (developer-only) are skipped as noise. Every
+# OTHER src/*.c `const u8 x[] = _("...")` is a player-facing UI label — option
+# menu, evolution/trade screens, the project's own custom menus, etc. — indexed
+# here under the existing "game_ui" category, grouped by source file. Saves via
+# _save_c_string (by label+file), so no save-path change is needed.
+_MISC_UI_STRING_RE = re.compile(
+    r'^(?:static\s+)?const\s+u8\s+'
+    r'((?:s|g)Text_\w+)\s*\[\s*\]\s*=\s*'
+    r'_\(\s*"((?:[^"\\]|\\.)*)"\s*\)\s*;',
+    re.MULTILINE,
+)
+_MISC_UI_SKIP_FILES = {
+    "strings.c", "battle_message.c",    # dedicated parsers above
+    "keyboard_text.c", "debug_menu.c",  # curated out: keyboard tables / dev-only
+}
+
+
+def _parse_misc_ui_c(project_dir: str) -> list[TextEntry]:
+    """Index player-facing _() UI strings from every other src/*.c file."""
+    entries: list[TextEntry] = []
+    char_lim, max_lines = _get_limits("game_ui")
+    src_root = os.path.join(project_dir, "src")
+    if not os.path.isdir(src_root):
+        return entries
+    for dirpath, _dirs, files in os.walk(src_root):
+        for fn in sorted(files):
+            if not fn.endswith(".c") or fn in _MISC_UI_SKIP_FILES:
+                continue
+            path = os.path.join(dirpath, fn)
+            text = _read(path)
+            if not text or "_(" not in text:
+                continue
+            rel = os.path.relpath(path, project_dir).replace("\\", "/")
+            subcat = fn[:-2].replace("_", " ").title()  # option_menu.c -> "Option Menu"
+            for m in _MISC_UI_STRING_RE.finditer(text):
+                var_name = m.group(1)
+                value = m.group(2)
+                line = text[:m.start()].count("\n") + 1
+                display = var_name[6:]  # strip sText_/gText_ (both 6 chars)
+                display = re.sub(r"([a-z])([A-Z])", r"\1 \2", display)
+                entries.append(TextEntry(
+                    label=var_name,
+                    content=value,
+                    original=value,
+                    file_path=path,
+                    file_rel=rel,
+                    line_number=line,
+                    category="game_ui",
+                    subcategory=subcat,
+                    char_limit=char_lim,
+                    max_lines=max_lines,
+                    is_multiline=any(c in value for c in ("\\n", "\\p", "\\l")),
+                    format="c_string",
+                    owning_tab="",
+                    display_label=display,
+                ))
     return entries
 
 
@@ -978,6 +1046,7 @@ class TextIndex:
         self.entries.extend(_parse_new_game_intro(project_dir))
         self.entries.extend(_parse_location_names(project_dir))
         self.entries.extend(_parse_battle_messages(project_dir))
+        self.entries.extend(_parse_misc_ui_c(project_dir))
         self.entries.extend(_parse_all_map_dialogue(project_dir))
         self.entries.extend(_parse_common_scripts(project_dir))
         self.entries.extend(_parse_data_text_inc(project_dir))

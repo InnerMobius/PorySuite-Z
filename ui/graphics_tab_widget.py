@@ -1507,8 +1507,8 @@ class GraphicsTabWidget(QWidget):
         left = QVBoxLayout()
         left.setSpacing(8)
 
-        self._front_thumb = self._make_thumb(64, "Front", "front")
-        self._back_thumb = self._make_thumb(64, "Back", "back")
+        self._front_thumb = self._make_thumb(64, "Front", "front", export=True)
+        self._back_thumb = self._make_thumb(64, "Back", "back", export=True)
         self._foot_thumb = self._make_thumb(64, "Footprint", "footprint")
 
         for group in (self._front_thumb[0], self._back_thumb[0],
@@ -1774,7 +1774,8 @@ class GraphicsTabWidget(QWidget):
             self._import_palette_from_png_manual)
         self._import_pal_btn.clicked.connect(self._import_palette_from_pal)
 
-    def _make_thumb(self, display_size: int, title: str, slot: str = ""):
+    def _make_thumb(self, display_size: int, title: str, slot: str = "",
+                    export: bool = False):
         box = QGroupBox(title)
         bl = QVBoxLayout(box)
         bl.setContentsMargins(6, 14, 6, 6)
@@ -1785,7 +1786,20 @@ class GraphicsTabWidget(QWidget):
         lbl.setStyleSheet("background: #181818; border: 1px solid #333;")
         bl.addWidget(lbl, 0, Qt.AlignmentFlag.AlignHCenter)
         btn = None
-        if slot:
+        if slot and export:
+            # Front/Back: import is handled by "Import Normal + Shiny Set" on the
+            # right, so this per-box button EXPORTS instead — the sprite as it is
+            # currently previewed (normal, or shiny when Preview Shiny is ticked).
+            btn = QPushButton("Export…")
+            btn.setToolTip(
+                f"Export this species' {title.lower()} sprite as a PNG.\n"
+                f"Uses the NORMAL palette, or the SHINY palette when the\n"
+                f"'Preview Shiny' box is ticked. (Import is handled by the\n"
+                f"'Import Normal + Shiny Set' button on the right.)")
+            btn.clicked.connect(
+                lambda _=False, s=slot: self._export_sprite(s))
+            bl.addWidget(btn)
+        elif slot:
             btn = QPushButton("Import…")
             btn.setToolTip(
                 f"Replace this species' {title.lower()} image with a PNG you "
@@ -1796,6 +1810,59 @@ class GraphicsTabWidget(QWidget):
                 lambda _=False, s=slot: self._import_graphic(s))
             bl.addWidget(btn)
         return box, lbl, btn
+
+    def _export_sprite(self, slot: str) -> None:
+        """Export the front or back sprite as a standalone PNG, coloured by the
+        currently-previewed palette — normal, or shiny when 'Preview Shiny' is on.
+        Prefers the in-memory (unsaved-import) pixels, else the on-disk PNG, so it
+        matches exactly what the tab is showing. Transparent background preserved."""
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        sp = self._current_species
+        if not sp:
+            QMessageBox.information(
+                self, "Export Sprite", "Select a species first.")
+            return
+        path = (self._sprite_paths.get(sp) or {}).get(slot, "")
+        if not path:
+            QMessageBox.information(
+                self, "Export Sprite",
+                f"No {slot} sprite is loaded for this species.")
+            return
+        is_shiny = bool(getattr(self, "_preview_shiny", False))
+        pals = self._palettes.get(sp, {})
+        palette = pals.get("shiny" if is_shiny else "normal")
+        pix = None
+        img = (self._sprite_imgs.get(sp) or {}).get(slot)
+        if palette:
+            if img is not None and not img.isNull():
+                pix = _reskin_indexed_image(img, palette)
+            else:
+                pix = _reskin_indexed_png(path, palette)
+        if pix is None or pix.isNull():
+            pix = QPixmap(path)   # last resort: whatever is on disk
+        if pix is None or pix.isNull():
+            QMessageBox.warning(
+                self, "Export Sprite", "Could not build the sprite image.")
+            return
+        slug = species_slug_from_const(sp)
+        tag = "shiny" if is_shiny else "normal"
+        start = os.path.join(
+            self._last_import_dir or self._project_root or "",
+            f"{slug}_{slot}_{tag}.png")
+        dest, _ = QFileDialog.getSaveFileName(
+            self, f"Export {slot} sprite ({tag})", start, "PNG Image (*.png)")
+        if not dest:
+            return
+        if not dest.lower().endswith(".png"):
+            dest += ".png"
+        if pix.save(dest, "PNG"):
+            self._last_import_dir = os.path.dirname(dest)
+            QMessageBox.information(
+                self, "Export Sprite",
+                f"Exported the {tag} {slot} sprite to:\n{dest}")
+        else:
+            QMessageBox.warning(
+                self, "Export Sprite", f"Failed to write:\n{dest}")
 
     def _wrap(self, title: str, inner: QWidget) -> QGroupBox:
         g = QGroupBox(title)

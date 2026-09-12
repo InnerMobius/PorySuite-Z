@@ -406,16 +406,79 @@ def _fix_species_clamps(project_root):
     ``SPECIES_EGG`` as the guarded token, so a re-run finds nothing to replace."""
     pf = lambda *a: os.path.join(project_root, *a)
     changed = {}
-    for rel in ("src/battle_anim_mons.c", "src/battle_main.c", "src/decompress.c",
-                "src/pokemon.c", "src/pokemon_icon.c"):
+
+    # ── pokemon.c — the two mon-palette getters get TABLE-MEMBERSHIP guards ──
+    # A pure range test (`species >= NUM_TOTAL_SPECIES`) is not enough: a de-unown
+    # project leaves a permanent HOLE of ids whose gMonPaletteTable entry is
+    # {NULL,0}, and a hole id passes a range test but then LZ77-decompresses NULL
+    # → crash. Testing `.data == NULL` rejects both out-of-range AND hole ids.
+    p = pf("src", "pokemon.c")
+    if os.path.isfile(p):
+        t = _read(p); orig = t
+        # A. GetMonSpritePalFromSpeciesAndPersonality — upgrade the range check
+        #    sitting above `return gMonPaletteTable[0].data;` (vanilla writes it
+        #    `> SPECIES_EGG`). Indentation of the return line is preserved.
+        t = re.sub(
+            r"if \(species > (?:SPECIES_EGG|NUM_TOTAL_SPECIES|NUM_SPECIES)\)\n"
+            r"(?P<ind>[ \t]*)return gMonPaletteTable\[0\]\.data;",
+            "if (species >= NUM_TOTAL_SPECIES || gMonPaletteTable[species].data "
+            "== NULL)\n\\g<ind>return gMonPaletteTable[0].data;",
+            t, count=1)
+        # B. GetMonSpritePalStructFromOtIdPersonality — no vanilla bounds check;
+        #    insert one after its `u32 shinyValue;` decl. Skipped once present.
+        if "return &gMonPaletteTable[0];" not in t:
+            t = re.sub(
+                r"(GetMonSpritePalStructFromOtIdPersonality\([^)]*\)\n\{\n"
+                r"    u32 shinyValue;\n)",
+                r"\1\n"
+                "    if (species >= NUM_TOTAL_SPECIES || "
+                "gMonPaletteTable[species].data == NULL)\n"
+                "        return &gMonPaletteTable[0];\n",
+                t, count=1)
+        if t != orig:
+            _write(p, t); changed["src/pokemon.c"] = True
+
+    # ── pokemon_icon.c — membership guards + the crash chokepoint + paletteTag ──
+    p = pf("src", "pokemon_icon.c")
+    if os.path.isfile(p):
+        t = _read(p); orig = t
+        # (a) every `if (species > NUM_SPECIES/NUM_TOTAL_SPECIES)` icon guard →
+        #     off-by-one-correct membership form.
+        t = re.sub(
+            r"if \(species > (?:NUM_TOTAL_SPECIES|NUM_SPECIES)\)",
+            "if (species >= NUM_TOTAL_SPECIES || gMonIconTable[species] == NULL)",
+            t)
+        # (b) GetMonIconTiles has NO guard for (a) to catch, yet it is THE
+        #     chokepoint every icon-tile fetch flows through and returns the NULL
+        #     that crashes RequestSpriteCopy. Guard it before it indexes.
+        t = re.sub(
+            r"const u8 \*iconSprite = gMonIconTable\[species\];",
+            "const u8 *iconSprite;\n"
+            "    if (species >= NUM_TOTAL_SPECIES || gMonIconTable[species] == NULL)\n"
+            "        species = SPECIES_NONE;\n"
+            "    iconSprite = gMonIconTable[species];",
+            t, count=1)
+        # (c) both icon-template paletteTag initializers read
+        #     gMonIconPaletteIndices[species] BEFORE any guard — route through the
+        #     guarded GetValidMonIconPalIndex (returns index 0 == SPECIES_NONE's
+        #     for an invalid id, matching vanilla's post-hoc override).
+        t = t.replace(
+            ".paletteTag = POKE_ICON_BASE_PAL_TAG + gMonIconPaletteIndices[species],",
+            ".paletteTag = POKE_ICON_BASE_PAL_TAG + GetValidMonIconPalIndex(species),")
+        if t != orig:
+            _write(p, t); changed["src/pokemon_icon.c"] = True
+
+    # ── front/back-PIC range guards — raise to the range form only (keeps `>` so
+    #    the egg still passes; membership upgrade for these is a separate pass).
+    for rel in ("src/battle_anim_mons.c", "src/battle_main.c", "src/decompress.c"):
         p = pf(*rel.split("/"))
         if not os.path.isfile(p):
             continue
         t = _read(p)
         nt = t.replace("species > NUM_SPECIES", "species > NUM_TOTAL_SPECIES")
-        nt = nt.replace("species > SPECIES_EGG", "species > NUM_TOTAL_SPECIES")
         if nt != t:
             _write(p, nt); changed[rel] = True
+
     return changed
 
 
