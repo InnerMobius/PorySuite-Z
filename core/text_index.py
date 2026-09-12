@@ -36,9 +36,10 @@ class TextEntry:
     char_limit: int               # max chars per line
     max_lines: int                # max display lines
     is_multiline: bool            # True for dialogue, False for single-line labels
-    format: str                   # "c_string" | "asm_string" | "name_label"
+    format: str                   # "c_string" | "asm_string" | "name_label" | "item_name"/"item_desc"/"dex_desc"/"dex_category"
     owning_tab: str               # "" = this tab owns it, else "items", "moves", etc.
     display_label: str            # human-friendly label for the tree
+    model_key: str = ""           # for item_*/dex_* formats: the ITEM_/NATIONAL_DEX_ const to push into the model
 
     @property
     def is_dirty(self) -> bool:
@@ -578,6 +579,110 @@ def _parse_misc_ui_c(project_dir: str) -> list[TextEntry]:
     return entries
 
 
+# ── item + pokedex text (from JSON; saved THROUGH the shared model) ───────────
+# These live in items.json / pokedex.json and have their own Items / Pokédex
+# editors, so they are NOT written to disk by save_dirty_entries (that would
+# race source_data.save()). Instead they carry a model_* format and are pushed
+# into source_data by mainwindow at the safe point in update_save, after every
+# editor flush and before source_data.save() serialises the JSON. Content is
+# stored/round-tripped VERBATIM (items keep their literal `\n`; dex descriptions
+# keep real newlines) so no lossy re-encoding can corrupt them.
+_MODEL_FORMATS = {"item_name", "item_desc", "dex_desc", "dex_category"}
+
+
+def _parse_items_text(project_dir: str) -> list[TextEntry]:
+    """Item names + descriptions from src/data/items.json."""
+    import json
+    entries: list[TextEntry] = []
+    path = os.path.join(project_dir, "src", "data", "items.json")
+    if not os.path.isfile(path):
+        return entries
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return entries
+    items = raw.get("items", []) if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return entries
+    name_lim, _ = _get_limits("game_ui")
+    desc_lim, _ = _get_limits("pokedex")
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        const = it.get("itemId")
+        if not const or const == "ITEM_NONE":
+            continue
+        pretty = (const[len("ITEM_"):].replace("_", " ").title()
+                  if const.startswith("ITEM_") else const)
+        name = it.get("english")
+        if name is not None:
+            entries.append(TextEntry(
+                label=f"{const}.name", content=name, original=name,
+                file_path=path, file_rel="src/data/items.json", line_number=0,
+                category="items", subcategory="Item Names",
+                char_limit=name_lim, max_lines=1, is_multiline=False,
+                format="item_name", owning_tab="", display_label=pretty,
+                model_key=const))
+        desc = it.get("description_english")
+        if desc is not None:
+            entries.append(TextEntry(
+                label=f"{const}.desc", content=desc, original=desc,
+                file_path=path, file_rel="src/data/items.json", line_number=0,
+                category="items", subcategory="Item Descriptions",
+                char_limit=desc_lim, max_lines=3,
+                is_multiline=any(c in desc for c in ("\\n", "\\p", "\\l", "\n")),
+                format="item_desc", owning_tab="", display_label=pretty,
+                model_key=const))
+    return entries
+
+
+def _parse_pokedex_text(project_dir: str) -> list[TextEntry]:
+    """Pokédex flavor descriptions + category names from src/data/pokedex.json."""
+    import json
+    entries: list[TextEntry] = []
+    path = os.path.join(project_dir, "src", "data", "pokedex.json")
+    if not os.path.isfile(path):
+        return entries
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return entries
+    natdex = raw.get("national_dex", []) if isinstance(raw, dict) else []
+    if not isinstance(natdex, list):
+        return entries
+    desc_lim, _ = _get_limits("pokedex")
+    cat_lim, _ = _get_limits("game_ui")
+    for e in natdex:
+        if not isinstance(e, dict):
+            continue
+        dc = e.get("dex_constant")
+        if not dc:
+            continue
+        pretty = (dc[len("NATIONAL_DEX_"):].replace("_", " ").title()
+                  if dc.startswith("NATIONAL_DEX_") else dc)
+        desc = e.get("descriptionText")
+        if desc is not None:
+            entries.append(TextEntry(
+                label=f"{dc}.desc", content=desc, original=desc,
+                file_path=path, file_rel="src/data/pokedex.json", line_number=0,
+                category="pokedex", subcategory="Descriptions",
+                char_limit=desc_lim, max_lines=6,
+                is_multiline=True, format="dex_desc", owning_tab="",
+                display_label=pretty, model_key=dc))
+        cat = e.get("categoryName")
+        if cat is not None:
+            entries.append(TextEntry(
+                label=f"{dc}.category", content=cat, original=cat,
+                file_path=path, file_rel="src/data/pokedex.json", line_number=0,
+                category="pokedex", subcategory="Categories",
+                char_limit=cat_lim, max_lines=1, is_multiline=False,
+                format="dex_category", owning_tab="", display_label=pretty,
+                model_key=dc))
+    return entries
+
+
 # ── Map dialogue scanner ──────────────────────────────────────────────────────
 
 def _parse_all_map_dialogue(project_dir: str) -> list[TextEntry]:
@@ -1003,6 +1108,12 @@ def save_dirty_entries(entries: list[TextEntry]) -> list[str]:
     for entry in dirty:
         if entry.format == "json_region_map":
             continue  # already saved
+        if entry.format in _MODEL_FORMATS:
+            # item_*/dex_* text is NOT written to disk here — it is pushed into
+            # the shared model (source_data) by mainwindow at the safe point in
+            # update_save and persisted by source_data.save(). Leave it dirty so
+            # that pusher sees it; it marks the entry clean after pushing.
+            continue
         # `False` by DEFAULT. An unrecognised format used to fall through with
         # ok=True and be marked clean without any writer running — the last
         # remaining lying save, and the one that would greet whoever adds a new
@@ -1051,6 +1162,8 @@ class TextIndex:
         self.entries.extend(_parse_common_scripts(project_dir))
         self.entries.extend(_parse_data_text_inc(project_dir))
         self.entries.extend(_parse_data_text_h(project_dir))
+        self.entries.extend(_parse_items_text(project_dir))
+        self.entries.extend(_parse_pokedex_text(project_dir))
 
         # Build label lookup
         for e in self.entries:

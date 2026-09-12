@@ -109,6 +109,10 @@ _CATEGORY_ORDER: list[tuple[str, str, str]] = [
      "Display names for trainer classes (Youngster, Lass, etc.)"),
     ("nature_names",    "Nature Names",
      "Pokémon nature display names"),
+    ("items",           "Item Text",
+     "Item names and descriptions (from items.json — saved via the Items data)"),
+    ("pokedex",         "Pokédex Text",
+     "Pokédex flavor descriptions and category names (from pokedex.json)"),
 ]
 
 
@@ -1033,3 +1037,21 @@ class TextEditorTab(QWidget):
         self._index.save()
         # Refresh tree to clear dirty indicators
         self._populate_tree()
+
+    def flush_editor(self) -> None:
+        """Commit the currently-open editor's text into its TextEntry.
+
+        Called by mainwindow BEFORE it pulls model entries, so an in-progress
+        item/dex edit is captured even if the user hasn't switched entries."""
+        self._flush_editor()
+
+    def iter_model_entries(self):
+        """Yield the DIRTY item/dex TextEntry objects (format in _MODEL_FORMATS).
+
+        mainwindow pushes these into source_data at the safe point in update_save
+        (they are deliberately NOT written to disk by save_dirty_entries). The
+        caller marks each clean after a successful push."""
+        from core.text_index import _MODEL_FORMATS
+        for e in self._index.entries:
+            if e.format in _MODEL_FORMATS and e.is_dirty:
+                yield e

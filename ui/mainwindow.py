@@ -12504,6 +12504,20 @@ QTabBar::tab:hover:!selected {
                 except Exception:
                     pass
 
+                # Push the Text Editor's item/dex text edits INTO the shared model
+                # HERE — after the Items/Pokédex editors' own flushes earlier in
+                # this method (save_items_table replaces pi.data; _flush_pokedex_
+                # panel writes national_dex), and BEFORE save_data() serialises the
+                # JSON below. So the Text Editor's values win and are not clobbered.
+                # These entries are model-backed (never file-written by the Text
+                # Editor's own save), which is why this push is required.
+                try:
+                    n_pushed = self._push_text_editor_model_edits()
+                    if n_pushed:
+                        dlg.log_line(f"Item/Pokédex text: {n_pushed} field(s) from Text Editor")
+                except Exception:
+                    logging.exception("push_text_editor_model_edits failed")
+
                 # Save JSON + write C headers BEFORE renames, so that fields
                 # like categoryName/description are written into species_info.h
                 # first.  Rename operations modify those headers in place, and the
@@ -13053,6 +13067,60 @@ QTabBar::tab:hover:!selected {
     # ── Direct pokedex header writers ────────────────────────────────
     # Category lives in pokedex_entries.h, description in pokedex_text_fr.h.
     # Both bypass the broken plugin pipeline.
+
+    def _push_text_editor_model_edits(self) -> int:
+        """Apply the Text Editor's dirty item/dex text edits into source_data so
+        the following source_data.save() persists them to items.json / pokedex.json
+        (and the header writers pick up category/description). Field-granular — only
+        a field the user actually edited in the Text Editor is written, so it can't
+        clobber a sibling field or an untouched entry. Returns the count pushed.
+
+        Item name -> get_item(const)["english"]; item desc -> ["description_english"].
+        Dex desc -> national_dex entry["descriptionText"] (reaches the ROM via
+        _write_pokedex_text_header). Dex category -> entry["categoryName"] AND
+        set_species_info(species,"categoryName",...) — the latter is what
+        _write_pokedex_entries_header / _write_species_info_header actually read, so
+        the category reaches the ROM (the national_dex field alone only hits JSON)."""
+        tab = getattr(self, "ui_tab", None)
+        sd = getattr(self, "source_data", None)
+        if tab is None or sd is None or not hasattr(tab, "iter_model_entries"):
+            return 0
+        try:
+            tab.flush_editor()
+        except Exception:
+            pass
+        natdex = None
+        n = 0
+        for e in list(tab.iter_model_entries()):
+            try:
+                fmt, key, val = e.format, e.model_key, e.content
+                if fmt == "item_name":
+                    it = sd.get_item(key)
+                    if isinstance(it, dict):
+                        it["english"] = val; n += 1
+                elif fmt == "item_desc":
+                    it = sd.get_item(key)
+                    if isinstance(it, dict):
+                        it["description_english"] = val; n += 1
+                elif fmt in ("dex_desc", "dex_category"):
+                    if natdex is None:
+                        natdex = sd.get_national_dex() or []
+                    entry = next(
+                        (x for x in natdex if x.get("dex_constant") == key), None)
+                    if entry is not None:
+                        if fmt == "dex_desc":
+                            entry["descriptionText"] = val; n += 1
+                        else:
+                            entry["categoryName"] = val
+                            sp = entry.get("species")
+                            if sp:
+                                sd.set_species_info(sp, "categoryName", val)
+                            n += 1
+                e.mark_clean()
+            except Exception:
+                logging.exception(
+                    "push model edit failed for %s", getattr(e, "label", "?"))
+        return n
 
     def _write_pokedex_entries_header(self) -> int:
         """Patch .categoryName in pokedex_entries.h from in-memory species data.
