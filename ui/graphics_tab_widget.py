@@ -2707,6 +2707,43 @@ class GraphicsTabWidget(QWidget):
             idx_img = idx_img.convertToFormat(QImage.Format.Format_Indexed8)
         return colors, idx_img
 
+    def _detect_transparent_index(self, idx_img: QImage,
+                                  colors: List[Color]) -> int:
+        """Which index in *colors* is the sprite's transparent/background slot.
+
+        Trusting palette slot 0 is wrong: editors reorder the palette (GIMP often
+        puts black first), which makes opaque black outlines map onto the
+        transparent slot and disappear. Detect it instead:
+          1. an explicit tRNS / alpha-0 entry in the picked PNG's own colour
+             table (the artist/editor marked it transparent) — wins;
+          2. else the colour dominating the image BORDER (the reliable
+             background signal — mon sprites never fill the 64×64 frame to the
+             edge), matched back to the palette;
+          3. else fall back to slot 0.
+        """
+        # 1) explicit transparent slot in the picked PNG's colour table
+        try:
+            if idx_img.format() == QImage.Format.Format_Indexed8:
+                ct = idx_img.colorTable()
+                for i in range(min(len(ct), len(colors))):
+                    if ((ct[i] >> 24) & 0xFF) < 128:
+                        return i
+        except Exception:
+            pass
+        # 2) border-dominant colour (same detection the Set importer uses),
+        #    matched to the NEAREST palette entry so a GBA-clamp rounding
+        #    difference between the read pixel and the stored palette can't
+        #    defeat the match.
+        try:
+            from core.sprite_set_import import _bg_color
+            bgc = _bg_color(idx_img)
+            if bgc is not None and colors:
+                return find_closest_color(clamp_to_gba(*bgc), list(colors))
+        except Exception:
+            pass
+        # 3) fallback
+        return 0
+
     @staticmethod
     def _distinct_used_colors(true_img: Optional[QImage]) -> List[Color]:
         """Ordered list of distinct opaque colours used by an ARGB/indexed
@@ -2761,13 +2798,20 @@ class GraphicsTabWidget(QWidget):
         # old code recoloured the other sprite with normal.pal and pulled the
         # WRONG colours into the shared palette (the "where did these colours
         # come from" bug).
-        imported_true = _rebuild_color_table(idx_img, imported_colors, 0)
+        # Detect the REAL transparent/background slot — do NOT trust slot 0.
+        # Editors (GIMP especially) reorder an indexed palette on export, often
+        # putting black first; trusting slot 0 then made opaque BLACK artwork
+        # (outlines) get treated as the transparent background and VANISH on
+        # import. Detect it instead (same reliable signal the Normal+Shiny Set
+        # importer uses).
+        bg_idx = self._detect_transparent_index(idx_img, imported_colors)
+        imported_true = _rebuild_color_table(idx_img, imported_colors, bg_idx)
         other_true = self._true_color_sprite(sp, other)
 
         # Build the shared palette: slot 0 = the imported sprite's transparent
         # colour, then the imported sprite's colours (it wins on overflow since
         # it's the one being imported), then the other sprite's colours.
-        bg = imported_colors[0] if imported_colors else (0, 0, 0)
+        bg = imported_colors[bg_idx] if imported_colors else (0, 0, 0)
         shared: List[Color] = [bg]
         seen = {bg}
         for c in (self._distinct_used_colors(imported_true)
