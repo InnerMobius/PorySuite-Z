@@ -2721,17 +2721,11 @@ class GraphicsTabWidget(QWidget):
                                   colors: List[Color]) -> int:
         """Which index in *colors* is the sprite's transparent/background slot.
 
-        Trusting palette slot 0 is wrong: editors reorder the palette (GIMP often
-        puts black first), which makes opaque black outlines map onto the
-        transparent slot and disappear. Detect it instead:
-          1. an explicit tRNS / alpha-0 entry in the picked PNG's own colour
-             table (the artist/editor marked it transparent) — wins;
-          2. else the colour dominating the image BORDER (the reliable
-             background signal — mon sprites never fill the 64×64 frame to the
-             edge), matched back to the palette;
-          3. else fall back to slot 0.
-        """
-        # 1) explicit transparent slot in the picked PNG's colour table
+        Honour the image's OWN transparency: the slot the editor marked
+        transparent (tRNS / alpha 0) IS the background. Do NOT guess by colour
+        (e.g. "the border colour") — that wrongly treats opaque BLACK artwork as
+        the background and erases outlines. When the image carries no explicit
+        transparent slot, fall back to slot 0 (the GBA 4bpp convention)."""
         try:
             if idx_img.format() == QImage.Format.Format_Indexed8:
                 ct = idx_img.colorTable()
@@ -2740,18 +2734,6 @@ class GraphicsTabWidget(QWidget):
                         return i
         except Exception:
             pass
-        # 2) border-dominant colour (same detection the Set importer uses),
-        #    matched to the NEAREST palette entry so a GBA-clamp rounding
-        #    difference between the read pixel and the stored palette can't
-        #    defeat the match.
-        try:
-            from core.sprite_set_import import _bg_color
-            bgc = _bg_color(idx_img)
-            if bgc is not None and colors:
-                return find_closest_color(clamp_to_gba(*bgc), list(colors))
-        except Exception:
-            pass
-        # 3) fallback
         return 0
 
     @staticmethod
@@ -2808,42 +2790,48 @@ class GraphicsTabWidget(QWidget):
         # old code recoloured the other sprite with normal.pal and pulled the
         # WRONG colours into the shared palette (the "where did these colours
         # come from" bug).
-        # Detect the REAL transparent/background slot — do NOT trust slot 0.
-        # Editors (GIMP especially) reorder an indexed palette on export, often
-        # putting black first; trusting slot 0 then made opaque BLACK artwork
-        # (outlines) get treated as the transparent background and VANISH on
-        # import. Detect it instead (same reliable signal the Normal+Shiny Set
-        # importer uses).
+        # Transparency goes to slot 0 (the GBA convention) — honour the image's
+        # OWN transparent slot; black is a real colour and keeps a real slot.
         bg_idx = self._detect_transparent_index(idx_img, imported_colors)
         imported_true = _rebuild_color_table(idx_img, imported_colors, bg_idx)
-        other_true = self._true_color_sprite(sp, other)
 
-        # Build the shared palette: slot 0 = the imported sprite's transparent
-        # colour, then the imported sprite's colours (it wins on overflow since
-        # it's the one being imported), then the other sprite's colours.
-        bg = imported_colors[bg_idx] if imported_colors else (0, 0, 0)
-        shared: List[Color] = [bg]
-        seen = {bg}
-        for c in (self._distinct_used_colors(imported_true)
-                  + self._distinct_used_colors(other_true)):
-            if c in seen:
-                continue
-            if len(shared) >= 16:
-                break
-            seen.add(c)
-            shared.append(c)
-        while len(shared) < 16:
-            shared.append((0, 0, 0))
+        # Does the species already have an established normal palette?
+        established = (old_normal[0] != (0, 0, 0)
+                       or any(c != (0, 0, 0) for c in old_normal[1:]))
 
-        # Re-index BOTH sprites onto the shared palette (bg -> slot 0).
+        if established:
+            # Keep the EXISTING palette and remap ONLY the sprite being imported
+            # onto it. The OTHER sprite is NOT touched — importing the back can no
+            # longer re-index the front. Slot 0 stays the established transparent
+            # colour; the imported sprite's transparent pixels route there, and
+            # its opaque BLACK outlines map to the nearest real (near-black) slot,
+            # so they keep a real slot instead of vanishing. (Colours the import
+            # introduces that aren't in the shared palette map to their nearest
+            # existing colour — use "Import Normal + Shiny Set" to rebuild the
+            # palette from scratch when a sprite genuinely needs new colours.)
+            target: List[Color] = list(old_normal)
+        else:
+            # No palette yet — build one FROM THIS SPRITE: slot 0 = its
+            # transparent background, then its opaque colours (BLACK included)
+            # each in their own slot.
+            bg = imported_colors[bg_idx] if imported_colors else (0, 0, 0)
+            target = [bg]
+            seen = {bg}
+            for c in self._distinct_used_colors(imported_true):
+                if c in seen or len(target) >= 16:
+                    continue
+                seen.add(c)
+                target.append(c)
+            while len(target) < 16:
+                target.append((0, 0, 0))
+
+        # Re-index ONLY the imported sprite (bg -> slot 0). The other sprite's
+        # cached pixels are left exactly as they are.
         self._sprite_imgs.setdefault(sp, {})[slot] = remap_to_palette(
-            imported_true, shared, bg_transparent=True)
-        if other_true is not None:
-            self._sprite_imgs[sp][other] = remap_to_palette(
-                other_true, shared, bg_transparent=True)
+            imported_true, target, bg_transparent=True)
 
         # Normal channel only — shiny is preserved untouched.
-        self._palettes.setdefault(sp, {"normal": [], "shiny": []})["normal"] = shared
+        self._palettes.setdefault(sp, {"normal": [], "shiny": []})["normal"] = target
         self._normal_pal_dirty.add(sp)
         self._sprite_png_dirty.add(sp)
 
