@@ -2837,6 +2837,15 @@ class GraphicsTabWidget(QWidget):
                                    path: str, img: QImage) -> None:
         """Import a front or back sprite.
 
+        TRANSPARENCY RULE (recurring regression — guarded by
+        tests/test_sprite_import_transparency.py; re-read it before changing this
+        or _detect_transparent_index / _extract_small_palette): the background is
+        an alpha/tRNS slot OR a green-screen KEY colour on the border → it goes to
+        slot 0 and renders transparent. BLACK is a real artwork colour (outlines),
+        keeps its own opaque slot, and is NEVER routed to the transparent slot.
+        Importing ONE sprite must not re-index the OTHER (keep the existing
+        palette; remap only the imported sprite onto it).
+
         Front and back share ONE normal palette, so a shared 16-colour palette
         is built that covers BOTH sprites (their combined colours — lossless
         when front+back were authored to fit 16 colours, which is the norm),
