@@ -2687,11 +2687,67 @@ class GraphicsTabWidget(QWidget):
             "The footprint preview is updated. Click File → Save to write it "
             "to the species' footprint.png.")
 
+    def _extract_small_palette(self, img: QImage):
+        """If *img* already fits in 16 distinct (GBA-clamped) colours, return
+        (colors[16], indexed_img) — no manual picker needed. Handles a plain
+        RGBA/RGB sprite of the common kind: a green-screen key colour around the
+        mon plus a handful of flat colours. If the image carries real alpha
+        transparency, slot 0 is reserved for it (so it is recovered as the
+        transparent slot); otherwise colours are kept in first-seen order and the
+        green-screen key is resolved later from the border. Returns None when the
+        image has more than 16 distinct colours (then the picker must choose)."""
+        src = img.convertToFormat(QImage.Format.Format_ARGB32)
+        w, h = src.width(), src.height()
+        has_alpha = False
+        order: List[Color] = []
+        index: dict = {}
+        for y in range(h):
+            for x in range(w):
+                p = src.pixel(x, y)
+                if ((p >> 24) & 0xFF) < 128:
+                    has_alpha = True
+                    continue
+                c = clamp_to_gba((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF)
+                if c not in index:
+                    if len(order) + (1 if has_alpha else 0) >= 16:
+                        # keep scanning only to see if we overflow 16 total
+                        if len(order) >= 16:
+                            return None
+                    index[c] = None
+                    order.append(c)
+        if not order:
+            return None
+        colors: List[Color] = []
+        if has_alpha:
+            colors.append((0, 0, 0))        # reserved transparent slot 0 (tRNS)
+        for c in order:
+            if len(colors) >= 16:
+                return None                 # too many colours for one palette
+            index[c] = len(colors)
+            colors.append(c)
+        while len(colors) < 16:
+            colors.append((0, 0, 0))
+        out = QImage(w, h, QImage.Format.Format_Indexed8)
+        ctab = []
+        for i, (r, g, b) in enumerate(colors):
+            a = 0 if (has_alpha and i == 0) else 255
+            ctab.append((a << 24) | (r << 16) | (g << 8) | b)
+        out.setColorTable(ctab)
+        for y in range(h):
+            for x in range(w):
+                p = src.pixel(x, y)
+                if ((p >> 24) & 0xFF) < 128:
+                    out.setPixel(x, y, 0)   # alpha-transparent -> slot 0
+                    continue
+                c = clamp_to_gba((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF)
+                out.setPixel(x, y, index[c])
+        return colors, out
+
     def _extract_or_pick_palette(self, path: str, img: QImage):
         """Return (colors, indexed_img) for a picked PNG: use an already
-        project-format indexed ≤16-colour image directly, else open the manual
-        colour picker to choose/order 16 colours and remap. Returns None if
-        the user cancels the picker."""
+        project-format indexed ≤16-colour image directly, else extract a small
+        (≤16-colour) palette directly, else open the manual colour picker to
+        choose/order 16 colours and remap. Returns None if the user cancels."""
         ct = (img.colorTable()
               if img.format() == QImage.Format.Format_Indexed8 else [])
         if (img.format() == QImage.Format.Format_Indexed8
@@ -2703,6 +2759,12 @@ class GraphicsTabWidget(QWidget):
             while len(colors) < 16:
                 colors.append((0, 0, 0))
             idx_img = img
+        elif self._extract_small_palette(img) is not None:
+            # Any image (RGBA/RGB, any slot order) that already fits in 16
+            # colours is imported DIRECTLY — no manual picker. This is the common
+            # green-screen sprite: a solid key colour around the mon (detected as
+            # transparent later), opaque black outlines kept as a real colour.
+            colors, idx_img = self._extract_small_palette(img)
         else:
             from ui.dialogs.manual_palette_pick_dialog import (
                 import_image_manually_from_path,
@@ -2721,11 +2783,17 @@ class GraphicsTabWidget(QWidget):
                                   colors: List[Color]) -> int:
         """Which index in *colors* is the sprite's transparent/background slot.
 
-        Honour the image's OWN transparency: the slot the editor marked
-        transparent (tRNS / alpha 0) IS the background. Do NOT guess by colour
-        (e.g. "the border colour") — that wrongly treats opaque BLACK artwork as
-        the background and erases outlines. When the image carries no explicit
-        transparent slot, fall back to slot 0 (the GBA 4bpp convention)."""
+        These sprites use a GREEN-SCREEN background (a solid key colour — e.g.
+        teal — filling the frame around the mon), OR an explicit alpha/tRNS slot.
+        Detect it, do NOT assume slot 0:
+          1. an explicit tRNS / alpha-0 entry in the colour table wins;
+          2. else the colour that DOMINATES THE BORDER (the green-screen key —
+             the mon never reaches the 64x64 edge, so the frame is background),
+             matched to the nearest palette entry. Black outlines are interior,
+             never the border, so this never picks black;
+          3. else slot 0.
+        """
+        # 1) explicit transparent slot
         try:
             if idx_img.format() == QImage.Format.Format_Indexed8:
                 ct = idx_img.colorTable()
@@ -2734,6 +2802,15 @@ class GraphicsTabWidget(QWidget):
                         return i
         except Exception:
             pass
+        # 2) border-dominant (green-screen) colour → nearest palette slot
+        try:
+            from core.sprite_set_import import _bg_color
+            bgc = _bg_color(idx_img)
+            if bgc is not None and colors:
+                return find_closest_color(clamp_to_gba(*bgc), list(colors))
+        except Exception:
+            pass
+        # 3) fallback
         return 0
 
     @staticmethod
