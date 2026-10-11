@@ -1786,28 +1786,38 @@ class GraphicsTabWidget(QWidget):
         lbl.setStyleSheet("background: #181818; border: 1px solid #333;")
         bl.addWidget(lbl, 0, Qt.AlignmentFlag.AlignHCenter)
         btn = None
-        if slot and export:
-            # Front/Back: import is handled by "Import Normal + Shiny Set" on the
-            # right, so this per-box button EXPORTS instead — the sprite as it is
-            # currently previewed (normal, or shiny when Preview Shiny is ticked).
-            btn = QPushButton("Export…")
-            btn.setToolTip(
-                f"Export this species' {title.lower()} sprite as a PNG.\n"
-                f"Uses the NORMAL palette, or the SHINY palette when the\n"
-                f"'Preview Shiny' box is ticked. (Import is handled by the\n"
-                f"'Import Normal + Shiny Set' button on the right.)")
-            btn.clicked.connect(
-                lambda _=False, s=slot: self._export_sprite(s))
-            bl.addWidget(btn)
-        elif slot:
-            btn = QPushButton("Import…")
-            btn.setToolTip(
+
+        def _make_import_btn() -> QPushButton:
+            b = QPushButton("Import…")
+            b.setToolTip(
                 f"Replace this species' {title.lower()} image with a PNG you "
                 f"pick.\nAn indexed (≤16-colour) PNG is used directly; any "
                 f"other\nPNG opens the colour picker to remap it. Nothing is "
                 f"written\nto disk until you click File → Save.")
-            btn.clicked.connect(
-                lambda _=False, s=slot: self._import_graphic(s))
+            b.clicked.connect(lambda _=False, s=slot: self._import_graphic(s))
+            return b
+
+        if slot and export:
+            # Front/Back: BOTH buttons side by side — Import (replace this one
+            # sprite) and Export (save it out as a PNG, normal or shiny per the
+            # 'Preview Shiny' box). The "Import Normal + Shiny Set" button on the
+            # right is a convenience for doing front+back+shiny at once; these
+            # per-box buttons stay for importing/exporting a single sprite.
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(4)
+            btn = _make_import_btn()           # returned as the box's button
+            exp = QPushButton("Export…")
+            exp.setToolTip(
+                f"Export this species' {title.lower()} sprite as a PNG.\n"
+                f"Uses the NORMAL palette, or the SHINY palette when the\n"
+                f"'Preview Shiny' box is ticked.")
+            exp.clicked.connect(lambda _=False, s=slot: self._export_sprite(s))
+            row.addWidget(btn)
+            row.addWidget(exp)
+            bl.addLayout(row)
+        elif slot:
+            btn = _make_import_btn()
             bl.addWidget(btn)
         return box, lbl, btn
 
