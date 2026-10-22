@@ -39,7 +39,6 @@ from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
 from ui.draggable_palette_row import DraggablePaletteRow
 from core.gba_image_utils import (
     swap_palette_entries, export_indexed_png, _rebuild_color_table,
-    remap_to_palette, find_closest_color,
 )
 from core.sprite_palette_bus import get_bus as _get_palette_bus
 
@@ -1786,38 +1785,25 @@ class GraphicsTabWidget(QWidget):
         lbl.setStyleSheet("background: #181818; border: 1px solid #333;")
         bl.addWidget(lbl, 0, Qt.AlignmentFlag.AlignHCenter)
         btn = None
-
-        def _make_import_btn() -> QPushButton:
-            b = QPushButton("Import…")
-            b.setToolTip(
-                f"Replace this species' {title.lower()} image with a PNG you "
-                f"pick.\nAn indexed (≤16-colour) PNG is used directly; any "
-                f"other\nPNG opens the colour picker to remap it. Nothing is "
-                f"written\nto disk until you click File → Save.")
-            b.clicked.connect(lambda _=False, s=slot: self._import_graphic(s))
-            return b
-
         if slot and export:
-            # Front/Back: BOTH buttons side by side — Import (replace this one
-            # sprite) and Export (save it out as a PNG, normal or shiny per the
-            # 'Preview Shiny' box). The "Import Normal + Shiny Set" button on the
-            # right is a convenience for doing front+back+shiny at once; these
-            # per-box buttons stay for importing/exporting a single sprite.
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(4)
-            btn = _make_import_btn()           # returned as the box's button
-            exp = QPushButton("Export…")
-            exp.setToolTip(
+            # Front/Back: EXPORT only. Importing a single front/back sprite is done
+            # with the "Import Normal + Shiny Set" button below, which matches the
+            # artwork onto the species' shared palette — the thing a lone per-box
+            # import cannot do correctly.
+            btn = QPushButton("Export…")
+            btn.setToolTip(
                 f"Export this species' {title.lower()} sprite as a PNG.\n"
                 f"Uses the NORMAL palette, or the SHINY palette when the\n"
                 f"'Preview Shiny' box is ticked.")
-            exp.clicked.connect(lambda _=False, s=slot: self._export_sprite(s))
-            row.addWidget(btn)
-            row.addWidget(exp)
-            bl.addLayout(row)
+            btn.clicked.connect(lambda _=False, s=slot: self._export_sprite(s))
+            bl.addWidget(btn)
         elif slot:
-            btn = _make_import_btn()
+            # Footprint: a single Import (no Set path for it).
+            btn = QPushButton("Import…")
+            btn.setToolTip(
+                f"Replace this species' {title.lower()} image with a PNG you "
+                f"pick.\nNothing is written to disk until you click File → Save.")
+            btn.clicked.connect(lambda _=False, s=slot: self._import_graphic(s))
             bl.addWidget(btn)
         return box, lbl, btn
 
@@ -2604,22 +2590,20 @@ class GraphicsTabWidget(QWidget):
             Qt.TransformationMode.FastTransformation))
 
     def _import_graphic(self, slot: str) -> None:
-        """Replace one of this species' graphics (front / back / icon /
-        footprint) with a user-picked PNG. Nothing is written to disk until
-        the user clicks File → Save — the imported image lives in memory and
-        flows through flush_to_disk, so it's undoable via a no-save reload."""
+        """Replace this species' menu ICON or FOOTPRINT with a user-picked PNG.
+        (Front/back sprites are imported via "Import Normal + Shiny Set", which
+        matches the art onto the shared palette.) Nothing is written to disk until
+        File → Save — the imported image lives in memory and flows through
+        flush_to_disk, so it's undoable via a no-save reload."""
         if not self._current_species:
             QMessageBox.information(
                 self, "No Species Selected",
                 "Select a species first, then import a graphic.")
             return
         sp = self._current_species
-        LABELS = {"front": "front sprite", "back": "back sprite",
-                  "icon": "menu icon", "footprint": "footprint"}
-        # GBA hardware frame sizes (front/back & icon may be vertical multi-
-        # frame sheets — height a multiple of the per-frame height).
-        FRAME = {"front": (64, 64), "back": (64, 64),
-                 "icon": (32, 32), "footprint": (16, 16)}
+        LABELS = {"icon": "menu icon", "footprint": "footprint"}
+        # GBA hardware frame sizes (the icon may be a vertical 2-frame sheet).
+        FRAME = {"icon": (32, 32), "footprint": (16, 16)}
         label = LABELS[slot]
         ew, eh = FRAME[slot]
 
@@ -2636,7 +2620,7 @@ class GraphicsTabWidget(QWidget):
         # Size sanity check — wrong dimensions can break the build, so warn
         # (but let the user override for genuinely custom setups).
         w, h = img.width(), img.height()
-        multiframe = slot in ("front", "back", "icon")
+        multiframe = slot == "icon"
         bad = (w != ew) or (h == 0) or (h % eh != 0) or (not multiframe and h != eh)
         if bad:
             per = " per frame (stacked vertically)" if multiframe else ""
@@ -2656,8 +2640,6 @@ class GraphicsTabWidget(QWidget):
             self._apply_imported_footprint(sp, img)
         elif slot == "icon":
             self._apply_imported_icon(sp, path, img)
-        else:
-            self._apply_imported_front_back(sp, slot, path, img)
 
     def _apply_imported_footprint(self, sp: str, img: QImage) -> None:
         """Convert any picked image to a 2-colour footprint (white bg = index
@@ -2686,348 +2668,6 @@ class GraphicsTabWidget(QWidget):
             self, "Footprint Imported",
             "The footprint preview is updated. Click File → Save to write it "
             "to the species' footprint.png.")
-
-    def _extract_small_palette(self, img: QImage):
-        """If *img* already fits in 16 distinct (GBA-clamped) colours, return
-        (colors[16], indexed_img) — no manual picker needed. Handles a plain
-        RGBA/RGB sprite of the common kind: a green-screen key colour around the
-        mon plus a handful of flat colours. If the image carries real alpha
-        transparency, slot 0 is reserved for it (so it is recovered as the
-        transparent slot); otherwise colours are kept in first-seen order and the
-        green-screen key is resolved later from the border. Returns None when the
-        image has more than 16 distinct colours (then the picker must choose)."""
-        src = img.convertToFormat(QImage.Format.Format_ARGB32)
-        w, h = src.width(), src.height()
-        has_alpha = False
-        order: List[Color] = []
-        index: dict = {}
-        for y in range(h):
-            for x in range(w):
-                p = src.pixel(x, y)
-                if ((p >> 24) & 0xFF) < 128:
-                    has_alpha = True
-                    continue
-                c = clamp_to_gba((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF)
-                if c not in index:
-                    if len(order) + (1 if has_alpha else 0) >= 16:
-                        # keep scanning only to see if we overflow 16 total
-                        if len(order) >= 16:
-                            return None
-                    index[c] = None
-                    order.append(c)
-        if not order:
-            return None
-        colors: List[Color] = []
-        if has_alpha:
-            colors.append((0, 0, 0))        # reserved transparent slot 0 (tRNS)
-        for c in order:
-            if len(colors) >= 16:
-                return None                 # too many colours for one palette
-            index[c] = len(colors)
-            colors.append(c)
-        while len(colors) < 16:
-            colors.append((0, 0, 0))
-        out = QImage(w, h, QImage.Format.Format_Indexed8)
-        ctab = []
-        for i, (r, g, b) in enumerate(colors):
-            a = 0 if (has_alpha and i == 0) else 255
-            ctab.append((a << 24) | (r << 16) | (g << 8) | b)
-        out.setColorTable(ctab)
-        for y in range(h):
-            for x in range(w):
-                p = src.pixel(x, y)
-                if ((p >> 24) & 0xFF) < 128:
-                    out.setPixel(x, y, 0)   # alpha-transparent -> slot 0
-                    continue
-                c = clamp_to_gba((p >> 16) & 0xFF, (p >> 8) & 0xFF, p & 0xFF)
-                out.setPixel(x, y, index[c])
-        return colors, out
-
-    def _extract_or_pick_palette(self, path: str, img: QImage):
-        """Return (colors, indexed_img) for a picked PNG: use an already
-        project-format indexed ≤16-colour image directly, else extract a small
-        (≤16-colour) palette directly, else open the manual colour picker to
-        choose/order 16 colours and remap. Returns None if the user cancels."""
-        ct = (img.colorTable()
-              if img.format() == QImage.Format.Format_Indexed8 else [])
-        if (img.format() == QImage.Format.Format_Indexed8
-                and ct and len(set(ct)) <= 16):
-            colors: List[Color] = []
-            for entry in ct[:16]:
-                colors.append(clamp_to_gba(
-                    (entry >> 16) & 0xFF, (entry >> 8) & 0xFF, entry & 0xFF))
-            while len(colors) < 16:
-                colors.append((0, 0, 0))
-            idx_img = img
-        elif self._extract_small_palette(img) is not None:
-            # Any image (RGBA/RGB, any slot order) that already fits in 16
-            # colours is imported DIRECTLY — no manual picker. This is the common
-            # green-screen sprite: a solid key colour around the mon (detected as
-            # transparent later), opaque black outlines kept as a real colour.
-            colors, idx_img = self._extract_small_palette(img)
-        else:
-            from ui.dialogs.manual_palette_pick_dialog import (
-                import_image_manually_from_path,
-            )
-            result = import_image_manually_from_path(
-                path, target_colors=16, parent=self)
-            if result is None:
-                return None
-            colors, idx_img = result
-            colors = list(colors)
-        if idx_img.format() != QImage.Format.Format_Indexed8:
-            idx_img = idx_img.convertToFormat(QImage.Format.Format_Indexed8)
-        return colors, idx_img
-
-    def _detect_transparent_index(self, idx_img: QImage,
-                                  colors: List[Color]) -> int:
-        """Which index in *colors* is the sprite's transparent/background slot.
-
-        These sprites use a GREEN-SCREEN background (a solid key colour — e.g.
-        teal — filling the frame around the mon), OR an explicit alpha/tRNS slot.
-        Detect it, do NOT assume slot 0:
-          1. an explicit tRNS / alpha-0 entry in the colour table wins;
-          2. else the colour that DOMINATES THE BORDER (the green-screen key —
-             the mon never reaches the 64x64 edge, so the frame is background),
-             matched to the nearest palette entry. Black outlines are interior,
-             never the border, so this never picks black;
-          3. else slot 0.
-        """
-        # 1) explicit transparent slot
-        try:
-            if idx_img.format() == QImage.Format.Format_Indexed8:
-                ct = idx_img.colorTable()
-                for i in range(min(len(ct), len(colors))):
-                    if ((ct[i] >> 24) & 0xFF) < 128:
-                        return i
-        except Exception:
-            pass
-        # 2) border-dominant (green-screen) colour → nearest palette slot
-        try:
-            from core.sprite_set_import import _bg_color
-            bgc = _bg_color(idx_img)
-            if bgc is not None and colors:
-                return find_closest_color(clamp_to_gba(*bgc), list(colors))
-        except Exception:
-            pass
-        # 3) fallback
-        return 0
-
-    @staticmethod
-    def _distinct_used_colors(true_img: Optional[QImage]) -> List[Color]:
-        """Ordered list of distinct opaque colours used by an ARGB/indexed
-        image (skips fully-transparent pixels, i.e. the background)."""
-        out: List[Color] = []
-        if true_img is None or true_img.isNull():
-            return out
-        seen = set()
-        w, h = true_img.width(), true_img.height()
-        for y in range(h):
-            for x in range(w):
-                px = true_img.pixel(x, y)
-                if ((px >> 24) & 0xFF) < 128:
-                    continue
-                c = ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF)
-                if c not in seen:
-                    seen.add(c)
-                    out.append(c)
-        return out
-
-    def _apply_imported_front_back(self, sp: str, slot: str,
-                                   path: str, img: QImage) -> None:
-        """Import a front or back sprite.
-
-        TRANSPARENCY RULE (recurring regression — guarded by
-        tests/test_sprite_import_transparency.py; re-read it before changing this
-        or _detect_transparent_index / _extract_small_palette): the background is
-        an alpha/tRNS slot OR a green-screen KEY colour on the border → it goes to
-        slot 0 and renders transparent. BLACK is a real artwork colour (outlines),
-        keeps its own opaque slot, and is NEVER routed to the transparent slot.
-        Importing ONE sprite must not re-index the OTHER (keep the existing
-        palette; remap only the imported sprite onto it).
-
-        Front and back share ONE normal palette, so a shared 16-colour palette
-        is built that covers BOTH sprites (their combined colours — lossless
-        when front+back were authored to fit 16 colours, which is the norm),
-        and both sprites are re-indexed onto it. Importing the back therefore
-        keeps the front looking right instead of stealing its colours.
-
-        The SHINY palette is deliberately left ALONE — importing a sprite must
-        not touch shiny (only the normal channel is marked dirty). Set the shiny
-        colours separately with the shiny palette import, after the sprites are
-        in place."""
-        picked = self._extract_or_pick_palette(path, img)
-        if picked is None:
-            return
-        imported_colors, idx_img = picked
-        other = "back" if slot == "front" else "front"
-
-        cur = self._palettes.get(sp) or {}
-        old_normal = list(cur.get("normal") or [(0, 0, 0)] * 16)
-        while len(old_normal) < 16:
-            old_normal.append((0, 0, 0))
-
-        # True-colour views of both sprites (their own colours), so we can
-        # union their palettes and remap without depending on stale index order.
-        # The OTHER sprite is read via _true_color_sprite, which uses the disk
-        # PNG's OWN baked palette when reading from disk — NOT the loaded
-        # normal.pal. That matters when the on-disk front/back are desynced from
-        # normal.pal (front baked one palette, normal.pal holding another): the
-        # old code recoloured the other sprite with normal.pal and pulled the
-        # WRONG colours into the shared palette (the "where did these colours
-        # come from" bug).
-        # Transparency goes to slot 0 (the GBA convention) — honour the image's
-        # OWN transparent slot; black is a real colour and keeps a real slot.
-        bg_idx = self._detect_transparent_index(idx_img, imported_colors)
-        imported_true = _rebuild_color_table(idx_img, imported_colors, bg_idx)
-
-        # Does the species already have an established normal palette?
-        established = (old_normal[0] != (0, 0, 0)
-                       or any(c != (0, 0, 0) for c in old_normal[1:]))
-
-        if established:
-            # Keep the EXISTING palette and remap ONLY the sprite being imported
-            # onto it. The OTHER sprite is NOT touched — importing the back can no
-            # longer re-index the front. Slot 0 stays the established transparent
-            # colour; the imported sprite's transparent pixels route there, and
-            # its opaque BLACK outlines map to the nearest real (near-black) slot,
-            # so they keep a real slot instead of vanishing. (Colours the import
-            # introduces that aren't in the shared palette map to their nearest
-            # existing colour — use "Import Normal + Shiny Set" to rebuild the
-            # palette from scratch when a sprite genuinely needs new colours.)
-            target: List[Color] = list(old_normal)
-        else:
-            # No palette yet — build one FROM THIS SPRITE: slot 0 = its
-            # transparent background, then its opaque colours (BLACK included)
-            # each in their own slot.
-            bg = imported_colors[bg_idx] if imported_colors else (0, 0, 0)
-            target = [bg]
-            seen = {bg}
-            for c in self._distinct_used_colors(imported_true):
-                if c in seen or len(target) >= 16:
-                    continue
-                seen.add(c)
-                target.append(c)
-            while len(target) < 16:
-                target.append((0, 0, 0))
-
-        # Re-index ONLY the imported sprite (bg -> slot 0). The other sprite's
-        # cached pixels are left exactly as they are.
-        self._sprite_imgs.setdefault(sp, {})[slot] = remap_to_palette(
-            imported_true, target, bg_transparent=True)
-
-        # Normal channel only — shiny is preserved untouched.
-        self._palettes.setdefault(sp, {"normal": [], "shiny": []})["normal"] = target
-        self._normal_pal_dirty.add(sp)
-        self._sprite_png_dirty.add(sp)
-
-        self._loading = True
-        try:
-            self._normal_row.set_colors(shared)
-        finally:
-            self._loading = False
-        _frame = getattr(self, "_form_frame", 0)
-        for kind, thumb in (("front", self._front_thumb),
-                            ("back", self._back_thumb)):
-            cimg = self._sprite_imgs[sp].get(kind)
-            if cimg is not None and not cimg.isNull():
-                self._thumb_from_image(thumb[1], cimg, shared, frame=_frame)
-        self._refresh_preview_sprites()
-
-        self.modified.emit()
-        QMessageBox.information(
-            self, "Sprite Imported",
-            f"Loaded {slot} from:\n{os.path.basename(path)}\n\n"
-            f"Front and back share one normal palette, so a combined palette was "
-            f"built and the {other} sprite kept its colours. The shiny palette "
-            f"was left untouched — set it with the shiny palette import.\n\n"
-            f"Click File → Save to write the PNGs + normal.pal.")
-
-    def _true_color_sprite(self, sp: str, slot: str) -> Optional[QImage]:
-        """Return a sprite slot as an image showing its REAL colours.
-
-        - In-memory imported image → it's indexed to this species' current
-          normal palette, so apply that palette.
-        - On-disk PNG → use the PNG's OWN baked colour table (its true colours),
-          NOT the loaded normal.pal, so a front/back that's baked out of sync
-          with normal.pal is still read correctly.
-        Returns None if the slot has no image."""
-        cached = (self._sprite_imgs.get(sp) or {}).get(slot)
-        if cached is not None and not cached.isNull():
-            pal = (self._palettes.get(sp) or {}).get("normal") or [(0, 0, 0)] * 16
-            return _rebuild_color_table(cached, pal, 0)
-        path = (self._sprite_paths.get(sp) or {}).get(slot, "")
-        if path and os.path.isfile(path):
-            disk = QImage(path)
-            if not disk.isNull():
-                return disk   # its own baked colour table = its true colours
-        return None
-
-    def _current_indexed_for(self, sp: str, slot: str,
-                             fallback_pal: List[Color]):
-        """Return the current in-memory Indexed8 QImage for a sprite slot,
-        loading it from disk (as Indexed8) when it hasn't been imported yet."""
-        cached = (self._sprite_imgs.get(sp) or {}).get(slot)
-        if cached is not None and not cached.isNull():
-            return cached
-        path = (self._sprite_paths.get(sp) or {}).get(slot, "")
-        if path and os.path.isfile(path):
-            disk = QImage(path)
-            if not disk.isNull():
-                if disk.format() != QImage.Format.Format_Indexed8:
-                    disk = disk.convertToFormat(QImage.Format.Format_Indexed8)
-                return disk
-        return None
-
-    def _icon_target_slot(self, sp: str) -> int:
-        """Which of the three shared icon palettes this species uses. Respects
-        a live combo edit for the currently-selected species, else the stored
-        gMonIconPaletteIndices value."""
-        if sp == self._current_species:
-            return self._icon_pal_combo.currentIndex()
-        if self._data:
-            try:
-                return int(self._data.get_icon_idx(sp))
-            except Exception:
-                pass
-        return 0
-
-    def _reindex_existing_icon(self, sp: str, path: str):
-        """Re-bake an EXISTING icon.png: keep its art (pixel indices) but pair it
-        with the shared icon palette this species now uses, so a palette edit
-        rewrites the PNG's colour table. Returns (indexed_img, palette) or
-        (None, None). Used when there's no pending import to remap."""
-        from PyQt6.QtGui import QImage
-        img = QImage(path)
-        if img.isNull():
-            return None, None
-        if img.format() != QImage.Format.Format_Indexed8:
-            img = img.convertToFormat(QImage.Format.Format_Indexed8)
-        pal = list(self._icon_palettes.get(self._icon_target_slot(sp))
-                   or [(0, 0, 0)] * 16)
-        return img, pal
-
-    def _remapped_imported_icon(self, sp: str):
-        """Fit a pending imported icon's raw artwork onto this species' shared
-        icon palette. Returns (indexed_img, palette) or (None, None)."""
-        src = self._icon_import_src.get(sp)
-        if src is None or src.isNull():
-            return None, None
-        pal = list(self._icon_palettes.get(self._icon_target_slot(sp))
-                   or [(0, 0, 0)] * 16)
-        rem = remap_to_palette(src, pal, bg_transparent=True)
-        if rem.format() != QImage.Format.Format_Indexed8:
-            rem = rem.convertToFormat(QImage.Format.Format_Indexed8)
-        return rem, pal
-
-    def _refresh_imported_icon_preview(self, sp: str) -> None:
-        rem, pal = self._remapped_imported_icon(sp)
-        if rem is None:
-            return
-        self._icon_src = QPixmap.fromImage(_rebuild_color_table(rem, pal, 0))
-        self._icon_recoloured = None
-        self._icon_frame = 0
-        self._render_icon_frame()
 
     def _apply_imported_icon(self, sp: str, path: str, img: QImage) -> None:
         """Import a menu icon (mini). Icons don't own their palette — every
