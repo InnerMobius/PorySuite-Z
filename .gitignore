@@ -66,6 +66,7 @@ docs/*_REPORT.md
 docs/*_LOG.md
 docs/*_AUDIT.md
 docs/HANDOFF.md
+docs/*_HANDOFF.md
 docs/AGENTS.md
 docs/BUGS.md
 docs/CHANGELOG.md

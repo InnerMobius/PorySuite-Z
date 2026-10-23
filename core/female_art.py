@@ -12,7 +12,9 @@ four standard graphics tables, it:
   * declares the female INCBIN symbols  gMon{Front,Back}Pic_<Sym>F /
     gMon{,Shiny}Palette_<Sym>F  in src/data/graphics/pokemon.h,
   * inserts one row into src/data/pokemon/female_pic_overrides.h (with its own
-    externs, since that table compiles in a TU that doesn't include graphics.h).
+    externs, since that table compiles in a TU that doesn't include graphics.h,
+    plus the CompressedSpriteSheet / CompressedSpritePalette records the row
+    points at -- see update_override_text).
 
 Everything is idempotent. A species with no female art — and any project that
 never calls this — is completely unaffected (the override table stays empty).
@@ -37,6 +39,56 @@ def has_female_art(project_root, species_const):
     if not os.path.isfile(p):
         return False
     return ("{ " + species_const + "," ) in _read(p).replace("  ", " ")
+
+
+def update_override_text(t, species_const, fsym):
+    """Return female_pic_overrides.h text *t* with *species_const*'s override in place.
+
+    The engine's GenderPicOverride row holds POINTERS TO RECORDS -- CompressedSpriteSheet (data, size, tag) for the
+    front/back sprites and CompressedSpritePalette (data, tag) for the palettes -- exactly like the standard
+    gMonFrontPicTable / gMonPaletteTable entries (src/data.c SPECIES_SPRITE / SPECIES_PAL / SPECIES_SHINY_PAL:
+    size 0x800, tag = species, shiny tag = species + SPECIES_SHINY_TAG). So this writes those four records and points
+    the row at them. (Pointing the row at the raw INCBIN arrays does not compile, and if forced, the game would read
+    the graphics bytes as a record and crash.) Idempotent; an existing row in the old raw-array form is REPLACED.
+    """
+    if not _has(t, f"gMonFrontPic_{fsym}"):
+        externs = (
+            f"extern const u32 gMonFrontPic_{fsym}[];\n"
+            f"extern const u32 gMonBackPic_{fsym}[];\n"
+            f"extern const u32 gMonPalette_{fsym}[];\n"
+            f"extern const u32 gMonShinyPalette_{fsym}[];\n"
+        )
+        anchor = "const struct GenderPicOverride gFemalePicOverrides[]"
+        i = t.index(anchor)
+        t = t[:i] + externs + "\n" + t[i:]
+    if not _has(t, f"sFemaleFrontPic_{fsym}"):
+        records = (
+            f"static const struct CompressedSpriteSheet sFemaleFrontPic_{fsym} = "
+            f"{{ gMonFrontPic_{fsym}, 0x800, {species_const} }};\n"
+            f"static const struct CompressedSpriteSheet sFemaleBackPic_{fsym} = "
+            f"{{ gMonBackPic_{fsym}, 0x800, {species_const} }};\n"
+            f"static const struct CompressedSpritePalette sFemalePalette_{fsym} = "
+            f"{{ gMonPalette_{fsym}, {species_const} }};\n"
+            f"static const struct CompressedSpritePalette sFemaleShinyPalette_{fsym} = "
+            f"{{ gMonShinyPalette_{fsym}, {species_const} + SPECIES_SHINY_TAG }};\n"
+        )
+        anchor = "const struct GenderPicOverride gFemalePicOverrides[]"
+        i = t.index(anchor)
+        t = t[:i] + records + "\n" + t[i:]
+    row = (f"    {{ {species_const}, &sFemaleFrontPic_{fsym}, &sFemaleBackPic_{fsym}, "
+           f"&sFemalePalette_{fsym}, &sFemaleShinyPalette_{fsym} }},\n")
+    key = f"{{ {species_const},"
+    if key in t:
+        i = t.index(key)
+        line_start = t.rindex("\n", 0, i) + 1
+        line_end = t.index("\n", i) + 1
+        t = t[:line_start] + row + t[line_end:]
+    else:
+        term = "{ SPECIES_NONE }"
+        i = t.index(term)
+        line_start = t.rindex("\n", 0, i) + 1
+        t = t[:line_start] + row + t[line_start:]
+    return t
 
 
 def set_female_art(project_root, species_const, front_png=None, back_png=None,
@@ -88,27 +140,9 @@ def set_female_art(project_root, species_const, front_png=None, back_png=None,
         _write(p, t)
         changed["pokemon.h"] = True
 
-    # 3. female_pic_overrides.h — self-contained externs + the override row.
+    # 3. female_pic_overrides.h — self-contained externs, sheet/palette records + the override row.
     p = pf("src", "data", "pokemon", "female_pic_overrides.h")
-    t = _read(p)
-    if not _has(t, f"gMonFrontPic_{fsym}"):
-        externs = (
-            f"extern const u32 gMonFrontPic_{fsym}[];\n"
-            f"extern const u32 gMonBackPic_{fsym}[];\n"
-            f"extern const u32 gMonPalette_{fsym}[];\n"
-            f"extern const u32 gMonShinyPalette_{fsym}[];\n"
-        )
-        anchor = "const struct GenderPicOverride gFemalePicOverrides[]"
-        i = t.index(anchor)
-        t = t[:i] + externs + "\n" + t[i:]
-    row = (f"    {{ {species_const}, &gMonFrontPic_{fsym}, &gMonBackPic_{fsym}, "
-           f"&gMonPalette_{fsym}, &gMonShinyPalette_{fsym} }},\n")
-    if f"{{ {species_const}," not in t:
-        term = "{ SPECIES_NONE }"
-        i = t.index(term)
-        line_start = t.rindex("\n", 0, i) + 1
-        t = t[:line_start] + row + t[line_start:]
-    _write(p, t)
+    _write(p, update_override_text(_read(p), species_const, fsym))
     changed["female_pic_overrides.h"] = True
 
     # 4. species_graphics.json — editor manifest for the female sources.
