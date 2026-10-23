@@ -657,6 +657,14 @@ class UnifiedMainWindow(QMainWindow):
         deunown_action.triggered.connect(self._on_deunown)
         tools_menu.addAction(deunown_action)
 
+        fulldex_action = QAction("Export Full Dex Sheet…", self)
+        fulldex_action.setToolTip(
+            "Write one big PNG to the project folder showing every species —\n"
+            "front sprite, back sprite, menu icon and type badges — in a grid\n"
+            "that reads left to right in dex order.")
+        fulldex_action.triggered.connect(self._on_export_fulldex)
+        tools_menu.addAction(fulldex_action)
+
         tools_menu.addSeparator()
 
         open_terminal_action = QAction("Open Terminal", self)
@@ -1746,6 +1754,89 @@ class UnifiedMainWindow(QMainWindow):
                 self.log_message(f"Pre-build .s protection warning: {e}")
 
         self._porysuite_window._run_make(extra_args)
+
+    def _on_export_fulldex(self):
+        """Export one big PNG of every species — front, back, icon, types.
+
+        Everything drawn comes from the open project: the species order and
+        names from its data, the sprites through the shared palette pipeline
+        (so unsaved Graphics-tab palette edits show up), and the type badges
+        from the sheet and palette the project's own engine code uses.
+        """
+        if not self.project_info:
+            QMessageBox.information(self, "Export Full Dex Sheet",
+                                    "No project is open.")
+            return
+        root = self.project_info.get("dir", "")
+        ps = getattr(self, "_porysuite_window", None)
+        source_data = getattr(ps, "source_data", None) if ps else None
+        if not root or source_data is None:
+            QMessageBox.information(
+                self, "Export Full Dex Sheet",
+                "The project's species data isn't loaded yet.")
+            return
+
+        gcache = None
+        try:
+            if ps is not None and hasattr(ps, "_graphics_cache"):
+                gcache = ps._graphics_cache()
+        except Exception:
+            gcache = None
+
+        from PyQt6.QtWidgets import QProgressDialog, QApplication
+        from core.fulldex_sheet import export_fulldex, DEFAULT_FILENAME
+
+        prog = QProgressDialog("Collecting species…", None, 0, 1, self)
+        prog.setWindowTitle("Exporting Full Dex Sheet")
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        def cb(i, total, msg):
+            prog.setMaximum(max(1, total))
+            prog.setValue(min(i, total))
+            prog.setLabelText(msg)
+            QApplication.processEvents()
+
+        try:
+            res = export_fulldex(root, source_data, gcache, progress=cb)
+        except Exception as e:
+            prog.close()
+            import logging
+            logging.getLogger(__name__).exception(
+                "full dex sheet export failed")
+            QMessageBox.critical(self, "Export Full Dex Sheet",
+                                 f"The export failed:\n\n{e}")
+            return
+        prog.setValue(prog.maximum())
+        prog.close()
+
+        if not res.get("path"):
+            QMessageBox.critical(
+                self, "Export Full Dex Sheet",
+                "Nothing was written.\n\n" + "\n".join(res.get("warnings", [])))
+            return
+
+        msg = (f"Wrote {DEFAULT_FILENAME} to the project folder.\n\n"
+               f"{res['count']} species in {res['columns']} columns "
+               f"× {res['rows']} rows\n"
+               f"{res['width']} × {res['height']} pixels\n\n"
+               f"{res['path']}")
+        if res.get("warnings"):
+            msg += "\n\nNotes:\n• " + "\n• ".join(res["warnings"])
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Export Full Dex Sheet")
+        box.setText(msg)
+        open_btn = box.addButton("Open Folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        if box.clickedButton() is open_btn:
+            try:
+                from ui.open_folder_util import open_folder
+                open_folder(root)
+            except Exception:
+                pass
 
     def _on_deunown(self):
         """Remove the Unown letter-form mechanism from the project's game source.

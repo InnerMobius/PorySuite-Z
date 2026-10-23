@@ -99,6 +99,42 @@ def reskin_indexed_png(path: str,
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+def reskin_indexed_png_rgba(path: str,
+                            rgba: List[Tuple[int, int, int, int]]
+                            ) -> Optional[QPixmap]:
+    """Recolour an indexed PNG with an explicit per-slot RGBA table.
+
+    The two variants above cover the sprite conventions (slot 0 transparent,
+    or keep the source's alpha). Some indexed art needs neither: a FONT sheet,
+    for instance, has SEVERAL slots that the engine treats as background and
+    must therefore render transparent, while the ink and shadow slots take
+    colours the caller chooses. Pass one ``(r, g, b, a)`` per source index.
+
+    Slots past the end of *rgba* are left fully transparent, so a caller only
+    has to describe the slots it cares about. Returns ``None`` on failure.
+    """
+    try:
+        if not path or not rgba:
+            return None
+        img = QImage(path)
+        if img.isNull():
+            return None
+        if img.format() != QImage.Format.Format_Indexed8:
+            img = img.convertToFormat(QImage.Format.Format_Indexed8)
+        ct: List[int] = []
+        for (r, g, b, a) in rgba[:256]:
+            ct.append((a << 24) | (r << 16) | (g << 8) | b)
+        while len(ct) < 256:
+            ct.append(0)
+        out = img.copy()
+        out.setColorTable(ct)
+        return QPixmap.fromImage(
+            out.convertToFormat(QImage.Format.Format_ARGB32)
+        )
+    except Exception:
+        return None
+
+
 def reskin_indexed_png_preserve_alpha(path: str,
                                       palette: List[Color]) -> Optional[QPixmap]:
     """Overworld-style reskin: keep the source PNG's per-slot alpha bits.
