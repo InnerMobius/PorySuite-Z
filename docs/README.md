@@ -57,6 +57,14 @@ Full species editor with three sub-tabs:
 - **Stats** -- Base stats (HP/ATK/DEF/SP.ATK/SP.DEF/SPEED) and EV yields
 - **Graphics** -- Battle scene preview (front/back sprites over background with shadow), Player Y/Enemy Y/Enemy Altitude, Normal and Shiny palette editors (16-swatch rows with color picker AND **drag-to-reorder** — drop on the leftmost slot to choose which color is transparent; the front/back PNGs are reindexed automatically on save), Import Palette from PNG, **Import .pal File**, Menu Icon with animated preview and palette index selector, footprint preview, Open Graphics Folder
 
+**Right-click a species** in the list for the form and artwork tools:
+
+- **Add Form...** -- Create an alternate form, either with its own artwork (its own graphics folder, edited independently of the base species) or sharing the base species' sprite sheet as an extra frame.
+- **Form Change Triggers...** -- Rules table for how and when the species changes form. The table fills in with the species' existing forms, and the trigger list is read from the project's own form-change types, so a project that added its own triggers sees them. Rules that don't have a trigger yet show as **Undefined**.
+- **Set Female Art...** -- Give the species different female artwork, so male and female look different in battle. Pick the female front sprite, back sprite, and optionally the normal and shiny palettes; they must be the same kind of indexed PNG as the species' normal sprites. Cancel any picker to keep the normal art as a placeholder in that slot and drop the real file in later. Re-running it on a species repairs an existing entry rather than adding a second one. Species without female artwork are completely unaffected.
+
+Right-clicking a **form** row instead offers **Delete Form** and the same **Form Change Triggers...**.
+
 Evolution chain editor with species, method, and parameter fields. Play Cry button for audio preview.
 
 ![Pokemon Info](pokemon.png)
@@ -210,7 +218,7 @@ Visual region map editor with actual tileset graphics as background. Click a cel
 
 **Engine codegen** — `src/region_map.c` is rewritten between `// PORYSUITE-REGIONS-START / END` markers on every save with region changes. Eight blocks managed: enum, INCBINs, includes, decompress dispatch, player-region lookup table, player-region detect, get_section dispatch, story-flag visibility gates. First-time edit warning fires before the first staging op so you can back up to git first. Atomic write via temp + rename — no `.bak` files.
 
-**Live name sanitizer** — typing `Hyrule Overworld` becomes `hyrule_overworld` as you type. Reserved C keywords, name collisions, and invalid characters are blocked.
+**Live name sanitizer** — typing `Northern Caves` becomes `northern_caves` as you type. Reserved C keywords, name collisions, and invalid characters are blocked.
 
 **Open in Tilemap Editor** button jumps to the Tilemap Editor with the current region's `.bin`, `.png`, and `.gbapal` pre-loaded.
 
@@ -381,15 +389,24 @@ Move whole maps **between two pokefirered decomp projects** — something poryma
 
 ### Tools
 
-| Action | Shortcut |
-|--------|----------|
-| Install Porymap | -- |
-| Open in Porymap | Ctrl+F7 |
-| Sound Editor | F8 |
-| Open Terminal | Ctrl+T |
-| Rename Species | -- |
-| Open Crashlogs Folder | -- |
-| Settings | -- |
+| Action | Shortcut | Description |
+|--------|----------|-------------|
+| Make | Ctrl+M | Build the ROM. |
+| Make Modern | Ctrl+Shift+M | Build the ROM with the modern toolchain. |
+| Play | F9 | Launch the built ROM in the configured emulator. |
+| Expand ROM to 32 MB... | -- | Patch the Makefile so the ROM may grow past the default 16 MB. Needed once new voicegroups, samples, or other data push it over the limit. |
+| Clean Up Sound Files... | -- | Scan for orphaned samples, song files, and voicegroups that nothing uses but every build still compiles. |
+| Variables & Flags... | -- | Name and reuse the game's variable and flag slots, RPG Maker style. Create new ones or repurpose the vanilla ones you don't need, with no file editing. |
+| Heal Locations... | -- | Set where the player heals and respawns after a blackout — trigger map and coordinates, respawn map, respawn NPC. Flags any entry pointing at a renamed or missing map. |
+| Remove Unown Letter-Form System... | -- | Strip the Unown letter-form mechanism from the project's game source, turning the mon that used it into a normal single-sprite mon. Does nothing on a project that doesn't use the system. |
+| Export Full Dex Sheet... | -- | Write one large PNG of every species — front sprite, back sprite, menu icon, type badges, and name, twenty to a row — into the project folder. See below. |
+| Open Terminal | Ctrl+T | Open a terminal in the project directory. |
+| Settings... | -- | Open the settings dialog (see **Settings** below). |
+| Install / Update Porymap... | -- | Download, patch, and build the bundled Porymap (see **Porymap Integration** below). Label changes to **Re-patch Porymap** if an existing install lost its patches. |
+| Open in Porymap | Ctrl+F7 | Open the current project in Porymap. Disabled until Porymap is installed. |
+| Check for Porymap Updates | -- | Check whether a newer Porymap build is available. Disabled until Porymap is installed. |
+
+**Export Full Dex Sheet** builds a contact sheet of the whole roster in dex order, twenty cells to a row, and writes it to the project folder as `fulldex.png`. Everything is read from the open project rather than assumed: sprites are drawn at the game's own size through the same palette pipeline the editor pages use (so unsaved palette edits appear in the sheet), labels use the project's own in-game font, and the type badges use the palette the game actually draws them with. Each sprite sits on the green normally used as a transparency key inside a thin border, so it is obvious where a sprite's pixels stop. Progress is shown while the sheet builds.
 
 ### Git
 
