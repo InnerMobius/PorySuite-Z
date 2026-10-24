@@ -24,7 +24,7 @@ from core.sound.song_table_manager import (
     _backdate_midi_cfg, voicegroup_index_from_name,
 )
 
-_NAMES = ("se_heart", "se_rupee", "se_small_item")
+_NAMES = ("se_heart", "se_coin", "se_small_item")
 
 
 class MidiCfgMtimeTest(unittest.TestCase):
@@ -113,7 +113,7 @@ class MidiCfgMtimeTest(unittest.TestCase):
         self.assertIn("-R50", line, "-R must be preserved when passed")
         # every OTHER song's line is untouched (surgical, one-line update)
         others = [l for l in open(self.cfg, encoding="utf-8")
-                  if l.startswith("se_heart.mid") or l.startswith("se_rupee.mid")]
+                  if l.startswith("se_heart.mid") or l.startswith("se_coin.mid")]
         for l in others:
             self.assertIn("-G013", l)
 

@@ -148,7 +148,7 @@ class EnsureSubspriteTest(_GenTestBase):
             self.assertEqual(self.subs_text(), before)
 
     def test_composite_generates_even_at_a_vanilla_size(self):
-        # The King Zora regression: vanilla ships 48x48 / 128x64 tables,
+        # The oversized-NPC regression: vanilla ships 48x48 / 128x64 tables,
         # but they are hand-tuned non-grid layouts.  A composite of those
         # sizes must still generate its OWN Ps-named grid table — never
         # bind to the incompatible vanilla one.

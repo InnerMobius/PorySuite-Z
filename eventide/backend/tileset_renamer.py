@@ -1,7 +1,7 @@
 """
 Tileset Renamer — rename secondary tilesets with repo-wide reference updates.
 
-Ported from TriforceGUI/TilesetRenamer.py. All paths relative to root_dir.
+Ported from the standalone TilesetRenamer.py. All paths relative to root_dir.
 """
 
 import os

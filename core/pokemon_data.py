@@ -1973,7 +1973,7 @@ class PokemonTrainers(pokemon_data.PokemonTrainers):
         This runs on every save, before any file is written, so the
         trainer data self-heals: a dead class is followed through the
         recorded rename history to its current name when a rename is on
-        file (e.g. BEAUTY -> GERUDO), otherwise it falls back to
+        file (e.g. BEAUTY -> SOCIALITE), otherwise it falls back to
         TRAINER_CLASS_NONE.
         """
         defined = self._defined_trainer_classes()

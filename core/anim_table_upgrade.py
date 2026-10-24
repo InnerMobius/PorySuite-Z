@@ -1367,7 +1367,7 @@ def ensure_generic_loop_tables(root: str) -> Tuple[bool, List[str]]:
 # The stock "Walk Cycle" table fakes East by hFlipping the side/West frame, so
 # a sprite whose left graphic differs from its right (drawn, not mirrored) shows
 # the wrong thing facing one way. These tables give every facing its OWN frame
-# and NEVER hFlip — for static head-turner NPCs (e.g. MOVEMENT_TYPE_WATCHFUL).
+# and NEVER hFlip — for static head-turner NPCs (e.g. MOVEMENT_TYPE_LOOK_AROUND).
 # They appear in the Animation dropdown alongside the generic loops.
 
 _DIRECTIONAL_SENTINEL_OPEN = "// >>> PorySuite-Z no-mirror directional tables >>>"
@@ -1403,7 +1403,7 @@ def _generate_directional_block() -> str:
         "// so a hand-drawn left that differs from the right shows correctly.\n"
         "// Walk slots reuse the matching face frame (a watchful/stationary NPC\n"
         "// never plays them). Assign a sprite's .anims to one of these and give\n"
-        "// it a facing movement type (e.g. MOVEMENT_TYPE_WATCHFUL)."
+        "// it a facing movement type (e.g. MOVEMENT_TYPE_LOOK_AROUND)."
     )
     dirs = ("SOUTH", "NORTH", "WEST", "EAST")
     short = {"SOUTH": "S", "NORTH": "N", "WEST": "W", "EAST": "E"}

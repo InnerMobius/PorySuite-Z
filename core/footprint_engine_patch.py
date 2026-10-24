@@ -32,7 +32,7 @@ the game:
       4. A second fenced insertion inside ``DoesObjectCollideWithObjectAt``
          that calls the same helper so the player physically cannot
          walk into a painted cell -- this is the tile-locked movement
-         collision extension.  (Projects using the Zeldamon-style
+         collision extension.  (Projects using a free-pixel-movement
          free-pixel movement need the optional player-avatar edits
          below as well; the vanilla path does NOT go through their
          FreeStepNpc*Blocked checks.)
@@ -65,7 +65,7 @@ _DATA_HEADER_REL = os.path.join(
 )
 _MOVEMENT_C_REL = os.path.join("src", "event_object_movement.c")
 # Optional: only present on projects that have replaced the vanilla
-# tile-locked movement with a free-pixel-movement system (Zeldamon-style).
+# tile-locked movement with a free-pixel-movement system.
 # Vanilla pokefirered's player avatar goes through
 # DoesObjectCollideWithObjectAt (already patched in _MOVEMENT_C_REL),
 # so vanilla projects don't need this file touched.
@@ -367,7 +367,7 @@ def ensure_footprint_engine_support(
         movement_msg = _patch_movement_c(project_root)
         if movement_msg:
             messages.append(movement_msg)
-        # Optional: projects with a Zeldamon-style free-pixel-movement
+        # Optional: projects with a free-pixel-movement
         # system have a SEPARATE NPC collision pipeline that bypasses
         # DoesObjectCollideWithObjectAt entirely.  If those functions
         # are present, patch them too; otherwise this is a silent no-op
@@ -545,7 +545,7 @@ def _patch_movement_c(project_root: str) -> str:
 
 # ─────────────────────────────────── free-movement collision (optional) ──
 
-# Anchor that flags a project as having the Zeldamon-style free-pixel
+# Anchor that flags a project as having a free-pixel
 # movement collision pipeline.  Vanilla pokefirered does not have this
 # function and the patcher's player-avatar edits are skipped.
 _FREE_HELPER_ANCHOR = "static bool8 FreeStepNpcXBlocked(s8 dx)"
@@ -632,7 +632,7 @@ def _patch_player_avatar_c(project_root: str) -> str:
     """Patch the free-pixel-movement NPC collision -- only if present.
 
     Vanilla pokefirered has no ``FreeStepNpcXBlocked`` / ``YBlocked`` --
-    those belong to a Zeldamon-style pixel-movement system that
+    those belong to a free-pixel-movement system that
     bypasses ``DoesObjectCollideWithObjectAt`` entirely.  If they're
     absent the function returns ``""`` and the vanilla
     event_object_movement.c patches are sufficient.
@@ -863,7 +863,7 @@ def _patch_field_control_avatar_c(project_root: str) -> str:
     # (the link-cable multiplayer path).  An earlier draft used
     # ``replace(..., 1)`` and only patched the FIRST occurrence -- which
     # happens to be the link-cable function -- leaving single-player
-    # interactions un-marked and the schule softlock unfixed.
+    # interactions un-marked and the large-NPC softlock unfixed.
     #
     # Idempotency is subtle here: ``_PATCHED_GET_INTERACTED`` STARTS
     # with the same 3-line vanilla block (the patched form keeps the

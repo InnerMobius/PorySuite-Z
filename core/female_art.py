@@ -99,9 +99,9 @@ def set_female_art(project_root, species_const, front_png=None, back_png=None,
     can replace files later). Returns a dict of what changed."""
     pf = lambda *a: os.path.join(project_root, *a)
     base = _parse_base(project_root, species_const)
-    bsym = base["base_sym"]                 # e.g. "Royalblob"
-    fsym = bsym + "F"                        # "RoyalblobF"
-    slug = female_slug(species_const)        # "royalblob_female"
+    bsym = base["base_sym"]                 # e.g. "Flarewing"
+    fsym = bsym + "F"                        # "FlarewingF"
+    slug = female_slug(species_const)        # "flarewing_female"
     changed = {}
 
     # 1. Seed the female source folder (imports win; else copy the male art).

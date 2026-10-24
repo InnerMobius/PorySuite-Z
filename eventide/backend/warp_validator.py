@@ -1,7 +1,7 @@
 """
 Warp Validator — find and clean invalid warp destinations.
 
-Ported from TriforceGUI/WarpValidator.py. All paths relative to root_dir.
+Ported from the standalone WarpValidator.py. All paths relative to root_dir.
 """
 
 import os

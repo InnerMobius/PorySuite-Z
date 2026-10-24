@@ -7,7 +7,7 @@ Vanilla pokefirered hardcodes the trainer prize multiplier as the literal
                 * (gBattleTypeFlags & BATTLE_TYPE_DOUBLE ? 2 : 1)
                 * gTrainerMoneyTable[i].value;
 
-Hacks with non-standard economies (e.g. small-number "rupee" currencies
+Hacks with non-standard economies (e.g. small-number custom currencies
 where 200 is a meaningful payout) need a way to scale that base
 multiplier without hand-editing the engine source on every commit.
 

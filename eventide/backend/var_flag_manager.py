@@ -170,7 +170,7 @@ def scan(root, kind: str) -> list:
 def normalize_name(kind: str, friendly: str) -> str:
     """Turn whatever the user typed into a valid ``VAR_``/``FLAG_`` C identifier.
 
-    ``'Cucco Quest'`` → ``'VAR_CUCCO_QUEST'``. A leading digit is prefixed with
+    ``'Side Quest'`` → ``'VAR_SIDE_QUEST'``. A leading digit is prefixed with
     ``N`` so the macro is legal. An already-prefixed name is kept as-is.
     """
     prefix = 'VAR_' if kind == 'var' else 'FLAG_'

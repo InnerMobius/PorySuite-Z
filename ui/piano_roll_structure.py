@@ -76,7 +76,7 @@ class SongStructurePanel(QWidget):
         self._labels: list[str] = []   # available section names
         self._total_ticks: int = 0
         self._cursor_tick: int = 0     # current playback/ruler position
-        self._track0_prefix: str = ''  # e.g. 'mus_kakariko_1_' for stripping
+        self._track0_prefix: str = ''  # e.g. 'mus_myroute_1_' for stripping
         self._build_ui()
 
     def set_cursor_tick(self, tick: int):
@@ -173,8 +173,8 @@ class SongStructurePanel(QWidget):
     def _strip_track_prefix(self, asm_label: str) -> str:
         """Strip the track label prefix from an assembly label.
 
-        e.g. 'mus_kakariko_1_intro' → 'intro' when _track0_prefix
-        is 'mus_kakariko_1_'.  Falls back to the full label if no
+        e.g. 'mus_myroute_1_intro' → 'intro' when _track0_prefix
+        is 'mus_myroute_1_'.  Falls back to the full label if no
         prefix matches.
         """
         if self._track0_prefix and asm_label.startswith(self._track0_prefix):
@@ -189,7 +189,7 @@ class SongStructurePanel(QWidget):
 
         # Remember track 0's label prefix so we can strip it from
         # assembly labels to show the user's friendly name.
-        # e.g. track 0 label = 'mus_kakariko_1' → prefix 'mus_kakariko_1_'
+        # e.g. track 0 label = 'mus_myroute_1' → prefix 'mus_myroute_1_'
         self._track0_prefix = ''
         if song_data.tracks:
             self._track0_prefix = song_data.tracks[0].label + '_'

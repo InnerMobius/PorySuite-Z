@@ -639,7 +639,7 @@ class EncountersTab(QWidget):
 
     def _new_base_label(self, map_const) -> str:
         """A unique C label for a newly-created map entry, from its real folder
-        name where known (e.g. MAP_CASTLE_TOWN → 'sCastleTown')."""
+        name where known (e.g. MAP_VIRIDIAN_CITY → 'sViridianCity')."""
         folder = self._map_name.get(map_const)
         if folder:
             stem = folder.replace("_", "")

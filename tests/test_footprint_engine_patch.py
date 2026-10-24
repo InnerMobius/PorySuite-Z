@@ -471,7 +471,7 @@ class FootprintEnginePatchTests(unittest.TestCase):
         # path) and GetInteractedLinkPlayerScript (the link-cable
         # multiplayer path).  An earlier draft used replace(..., 1) and
         # only patched the first occurrence -- which happens to be the
-        # link-cable function -- leaving the single-player schule
+        # link-cable function -- leaving the single-player large-NPC
         # softlock unfixed.  The corrected patcher must extend BOTH.
         control_path = os.path.join(
             self.tmp, "src", "field_control_avatar.c",
@@ -588,7 +588,7 @@ class FootprintEnginePatchTests(unittest.TestCase):
         )
 
     def test_free_movement_install_is_idempotent(self):
-        # Same Zeldamon-style fixture as above; re-running the patcher
+        # Same free-pixel-movement fixture as above; re-running the patcher
         # must not duplicate the helper or the BEGIN sentinels.
         player_path = os.path.join(
             self.tmp, "src", "field_player_avatar.c",

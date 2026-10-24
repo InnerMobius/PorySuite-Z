@@ -194,7 +194,7 @@ def _remove_spritesheet_rule(
     """Remove the per-sprite rule block from ``spritesheet_rules.mk``.
 
     ``rel_4bpp_path`` is the path as it appears in the rules file
-    (e.g. ``$(OBJEVENTGFXDIR)/people/gravekid.4bpp``).  Returns
+    (e.g. ``$(OBJEVENTGFXDIR)/people/townsfolk.4bpp``).  Returns
     ``True`` if a rule was found and removed.
     """
     rules_path = os.path.join(root, "spritesheet_rules.mk")
@@ -1678,8 +1678,8 @@ def ensure_all_overworld_spritesheet_rules(
         return rules_added, invalidated, errors
 
     # Map pic_symbol -> (category, slug)  from INCBIN lines like
-    #   const u16 gObjectEventPic_Gravekid[] =
-    #       INCBIN_U16("graphics/object_events/pics/people/gravekid.4bpp");
+    #   const u16 gObjectEventPic_Townsfolk[] =
+    #       INCBIN_U16("graphics/object_events/pics/people/townsfolk.4bpp");
     pic_to_path: Dict[str, Tuple[str, str]] = {}
     for m in re.finditer(
         r"const\s+u16\s+(gObjectEventPic_\w+)\s*\[\]\s*=\s*"

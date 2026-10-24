@@ -401,7 +401,7 @@ class TrainerMover:
         # 3) new names — only source-prefixed labels are renamed
         rename = [script_label] if script_label.startswith(prefix) else []
         rename += move_texts
-        # new prefix keeps the separating underscore: ViridianForest_X -> HyruleField_X
+        # new prefix keeps the separating underscore: ViridianForest_X -> PewterCity_X
         label_map = {l: dst_folder + '_' + l[len(prefix):] for l in rename}
         new_script_label = label_map.get(script_label, script_label)
 

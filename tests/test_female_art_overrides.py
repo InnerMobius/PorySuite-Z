@@ -1,7 +1,7 @@
 """Regression guard: the female-art generator must write sprite-sheet RECORDS, not raw arrays.
 
-THE BUG (v0.1.47b-era Royalblob female art): `set_female_art` wrote override rows like
-    { SPECIES_ROYALBLOB, &gMonFrontPic_RoyalblobF, &gMonBackPic_RoyalblobF, ... }
+THE BUG (v0.1.47b-era Flarewing female art): `set_female_art` wrote override rows like
+    { SPECIES_FLAREWING, &gMonFrontPic_FlarewingF, &gMonBackPic_FlarewingF, ... }
 but the engine's `struct GenderPicOverride` (include/pokemon.h) holds pointers to
 `CompressedSpriteSheet` / `CompressedSpritePalette` records. A pointer to the raw INCBIN
 array is the wrong type -- GCC 14+ rejects it (-Wincompatible-pointer-types), and if forced,
@@ -36,54 +36,54 @@ const struct GenderPicOverride gFemalePicOverrides[] =
 
 # The exact broken form the old generator produced.
 OLD_ROW_FILE = """// header comment
-extern const u32 gMonFrontPic_RoyalblobF[];
-extern const u32 gMonBackPic_RoyalblobF[];
-extern const u32 gMonPalette_RoyalblobF[];
-extern const u32 gMonShinyPalette_RoyalblobF[];
+extern const u32 gMonFrontPic_FlarewingF[];
+extern const u32 gMonBackPic_FlarewingF[];
+extern const u32 gMonPalette_FlarewingF[];
+extern const u32 gMonShinyPalette_FlarewingF[];
 
 const struct GenderPicOverride gFemalePicOverrides[] =
 {
-    { SPECIES_ROYALBLOB, &gMonFrontPic_RoyalblobF, &gMonBackPic_RoyalblobF, &gMonPalette_RoyalblobF, &gMonShinyPalette_RoyalblobF },
+    { SPECIES_FLAREWING, &gMonFrontPic_FlarewingF, &gMonBackPic_FlarewingF, &gMonPalette_FlarewingF, &gMonShinyPalette_FlarewingF },
     { SPECIES_NONE }, // terminator
 };
 """
 
-GOOD_ROW = ("    { SPECIES_ROYALBLOB, &sFemaleFrontPic_RoyalblobF, &sFemaleBackPic_RoyalblobF, "
-            "&sFemalePalette_RoyalblobF, &sFemaleShinyPalette_RoyalblobF },\n")
+GOOD_ROW = ("    { SPECIES_FLAREWING, &sFemaleFrontPic_FlarewingF, &sFemaleBackPic_FlarewingF, "
+            "&sFemalePalette_FlarewingF, &sFemaleShinyPalette_FlarewingF },\n")
 
 
 def _check(t):
-    assert "static const struct CompressedSpriteSheet sFemaleFrontPic_RoyalblobF = " \
-           "{ gMonFrontPic_RoyalblobF, 0x800, SPECIES_ROYALBLOB };" in t
-    assert "static const struct CompressedSpriteSheet sFemaleBackPic_RoyalblobF = " \
-           "{ gMonBackPic_RoyalblobF, 0x800, SPECIES_ROYALBLOB };" in t
-    assert "static const struct CompressedSpritePalette sFemalePalette_RoyalblobF = " \
-           "{ gMonPalette_RoyalblobF, SPECIES_ROYALBLOB };" in t
-    assert "static const struct CompressedSpritePalette sFemaleShinyPalette_RoyalblobF = " \
-           "{ gMonShinyPalette_RoyalblobF, SPECIES_ROYALBLOB + SPECIES_SHINY_TAG };" in t
+    assert "static const struct CompressedSpriteSheet sFemaleFrontPic_FlarewingF = " \
+           "{ gMonFrontPic_FlarewingF, 0x800, SPECIES_FLAREWING };" in t
+    assert "static const struct CompressedSpriteSheet sFemaleBackPic_FlarewingF = " \
+           "{ gMonBackPic_FlarewingF, 0x800, SPECIES_FLAREWING };" in t
+    assert "static const struct CompressedSpritePalette sFemalePalette_FlarewingF = " \
+           "{ gMonPalette_FlarewingF, SPECIES_FLAREWING };" in t
+    assert "static const struct CompressedSpritePalette sFemaleShinyPalette_FlarewingF = " \
+           "{ gMonShinyPalette_FlarewingF, SPECIES_FLAREWING + SPECIES_SHINY_TAG };" in t
     assert GOOD_ROW in t
-    assert "&gMonFrontPic_RoyalblobF" not in t          # the row never points at a raw array
-    assert t.count("{ SPECIES_ROYALBLOB,") == 1
+    assert "&gMonFrontPic_FlarewingF" not in t          # the row never points at a raw array
+    assert t.count("{ SPECIES_FLAREWING,") == 1
     # records are defined before the table that takes their address
-    assert t.index("sFemaleFrontPic_RoyalblobF =") < t.index("gFemalePicOverrides[]")
+    assert t.index("sFemaleFrontPic_FlarewingF =") < t.index("gFemalePicOverrides[]")
     assert t.rstrip().endswith("};") and "{ SPECIES_NONE }" in t
 
 
 def test_fresh_insert():
-    _check(update_override_text(EMPTY, "SPECIES_ROYALBLOB", "RoyalblobF"))
+    _check(update_override_text(EMPTY, "SPECIES_FLAREWING", "FlarewingF"))
 
 
 def test_repairs_old_raw_array_row():
-    _check(update_override_text(OLD_ROW_FILE, "SPECIES_ROYALBLOB", "RoyalblobF"))
+    _check(update_override_text(OLD_ROW_FILE, "SPECIES_FLAREWING", "FlarewingF"))
 
 
 def test_idempotent():
-    once = update_override_text(OLD_ROW_FILE, "SPECIES_ROYALBLOB", "RoyalblobF")
-    assert update_override_text(once, "SPECIES_ROYALBLOB", "RoyalblobF") == once
+    once = update_override_text(OLD_ROW_FILE, "SPECIES_FLAREWING", "FlarewingF")
+    assert update_override_text(once, "SPECIES_FLAREWING", "FlarewingF") == once
 
 
 def test_other_species_untouched():
-    t = update_override_text(EMPTY, "SPECIES_ROYALBLOB", "RoyalblobF")
+    t = update_override_text(EMPTY, "SPECIES_FLAREWING", "FlarewingF")
     t = update_override_text(t, "SPECIES_PIKACHU", "PikachuF")
     _check(t)
     assert "{ SPECIES_PIKACHU, &sFemaleFrontPic_PikachuF," in t

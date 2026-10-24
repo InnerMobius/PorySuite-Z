@@ -159,7 +159,7 @@ def _prompt_text(parent, title: str, label: str, current: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RegionMapView — matches TriforceGUI's RegionMapView exactly
+# RegionMapView — matches the standalone RegionMapView exactly
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RegionMapView(QGraphicsView):
@@ -685,7 +685,7 @@ class RegionMapTab(QWidget):
             self._load_grid()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Grid rendering — tileset image + transparent overlay, matching TriforceGUI
+    # Grid rendering — tileset image + transparent overlay, matching the standalone tool
     # ─────────────────────────────────────────────────────────────────────────
 
     def _load_grid(self):

@@ -1,7 +1,7 @@
 """
 Layout Renamer — rename, delete, clean layouts and apply tilesets.
 
-Ported from TriforceGUI/LayoutRenamer.py. All paths relative to root_dir.
+Ported from the standalone LayoutRenamer.py. All paths relative to root_dir.
 """
 
 import os

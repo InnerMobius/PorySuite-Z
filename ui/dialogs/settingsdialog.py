@@ -170,7 +170,7 @@ class SettingsDialog(QDialog):
         self._project_name_edit = QLineEdit()
         current_name = self._project_info.get("name", "")
         self._project_name_edit.setText(current_name)
-        self._project_name_edit.setPlaceholderText("e.g. My Hack, Zeldamon, etc.")
+        self._project_name_edit.setPlaceholderText("e.g. My Hack, My Project, etc.")
         proj_lay.addRow("Display Name:", self._project_name_edit)
         if not self._project_info:
             self._project_name_edit.setEnabled(False)

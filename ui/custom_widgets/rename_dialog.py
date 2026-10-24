@@ -54,14 +54,14 @@ def _display_to_suffix(text: str) -> str:
       ♀ → _F, ♂ → _M
       apostrophes and periods → removed (Farfetch'd → FARFETCHD)
       spaces → removed (Bulba Saur → BULBASAUR, not BULBA_SAUR)
-      dashes → removed (Bago-Bago → BAGOBAGO, Ho-Oh → HOOH)
+      dashes → removed (Dusk-Dusk → DUSKDUSK, Ho-Oh → HOOH)
       any remaining non-alphanumeric-non-underscore char → removed
       uppercase, collapse __ runs, strip leading/trailing underscores
 
     A C identifier can't contain a hyphen, so a hyphenated display name must lose it. We STRIP it (like spaces)
     rather than converting to '_': the '_' form (e.g. BAGO_BAGO) can bleed into places that render as game text -- a
     nickname, a species-name string -- where the font has no '_' glyph and the build/encoder rejects it outright.
-    Stripping keeps the constant a clean alnum token (BAGOBAGO) that is always safe to reuse as a name.
+    Stripping keeps the constant a clean alnum token (DUSKDUSK) that is always safe to reuse as a name.
     """
     for sym, repl in _GENDER_MAP:
         text = text.replace(sym, repl)

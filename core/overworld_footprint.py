@@ -32,21 +32,21 @@ edited only by PorySuite.  Per-sprite blocks sit inside sentinel
 fences so the writer can refresh one entry without touching the rest;
 the lookup table at the bottom is regenerated in full on every save::
 
-    // PORYSUITE-GEN BEGIN footprint OBJ_EVENT_GFX_KING_ZORA
-    static const u8 sFootprintCells_KingZora[] = {
+    // PORYSUITE-GEN BEGIN footprint OBJ_EVENT_GFX_OLD_WOMAN
+    static const u8 sFootprintCells_OldWoman[] = {
         /* row 0 */ 0, 0, 1, 1, 0, 0,
         ...
     };
-    static const struct ObjectFootprint sFootprint_KingZora = {
+    static const struct ObjectFootprint sFootprint_OldWoman = {
         .width = 6,
         .height = 6,
-        .cells = sFootprintCells_KingZora,
+        .cells = sFootprintCells_OldWoman,
     };
-    // PORYSUITE-GEN END footprint OBJ_EVENT_GFX_KING_ZORA
+    // PORYSUITE-GEN END footprint OBJ_EVENT_GFX_OLD_WOMAN
 
     // PORYSUITE-GEN BEGIN table
     const struct ObjectFootprint *const gObjectEventFootprints[] = {
-        [OBJ_EVENT_GFX_KING_ZORA] = &sFootprint_KingZora,
+        [OBJ_EVENT_GFX_OLD_WOMAN] = &sFootprint_OldWoman,
         ...
     };
     // PORYSUITE-GEN END table
@@ -63,10 +63,10 @@ C99 sizes a designated-initializer array to ``max(designator) + 1`` when
 no explicit size is given.  If we emit::
 
     const struct ObjectFootprint *const gObjectEventFootprints[] = {
-        [OBJ_EVENT_GFX_SCHULE] = &sFootprint_Schule,
+        [OBJ_EVENT_GFX_CUSTOM_NPC] = &sFootprint_CustomNpc,
     };
 
-…and ``OBJ_EVENT_GFX_SCHULE = 159`` is the highest-numbered footprint,
+…and ``OBJ_EVENT_GFX_CUSTOM_NPC = 159`` is the highest-numbered footprint,
 the array is sized to 160 slots (indexes 0..159).  Any ``OBJ_EVENT_GFX_*``
 with a numeric value >= 160 (e.g. ``OBJ_EVENT_GFX_SCARECROW = 160``) then
 indexes off the end — undefined behaviour.  The engine reads garbage
@@ -189,7 +189,7 @@ def empty_footprint(
 # ───────────────────────────────────────────────────────────── pascalize ──
 
 def _pascalize_gfx_const(gfx_const: str) -> str:
-    """``OBJ_EVENT_GFX_KING_ZORA`` -> ``KingZora`` for use in C symbols.
+    """``OBJ_EVENT_GFX_OLD_WOMAN`` -> ``OldWoman`` for use in C symbols.
 
     Falls back to the raw constant (just the prefix stripped) when the
     input doesn't follow the prefix convention, so a project that has

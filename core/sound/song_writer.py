@@ -771,7 +771,7 @@ def notes_to_track_commands(
     # a tick before the user's last note, push it to AFTER that note
     # so the user-added notes survive the writer's break-on-FINE/GOTO
     # loop logic. Tracks that originally ended early (e.g. a single-note
-    # ocarina drone track in mus_ocarina_soaring_full) had FINE at the
+    # flute drone track in mus_theme_overture_full) had FINE at the
     # vanilla note's end-tick; without this auto-extend, any new note
     # the user adds past that tick gets silently dropped.
     for cmd in all_structure:
@@ -997,7 +997,7 @@ def write_song(song: SongData) -> str:
     lines.append('\t.end')
     lines.append('')
 
-    # Zeldamon 2026-06-09: guarantee file-global label uniqueness so a loop tag
+    # 2026-06-09: guarantee file-global label uniqueness so a loop tag
     # the user named the same on multiple tracks (e.g. 'intro') still assembles
     # ("symbol already defined" otherwise). No-op for already-unique songs.
     return _uniquify_colliding_labels('\n'.join(lines), prefix)

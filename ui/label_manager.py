@@ -102,7 +102,7 @@ class LabelManagerWidget(QWidget):
         action_row = QHBoxLayout()
         self._btn_new_var = QPushButton("New Variable…")
         self._btn_new_var.setToolTip(
-            "Create a new variable: type a plain name (e.g. \"Cucco Quest\") "
+            "Create a new variable: type a plain name (e.g. \"Side Quest\") "
             "and it claims a free slot. Safe — nothing else uses it.")
         self._btn_new_var.clicked.connect(lambda: self._on_new(_TYPE_VAR))
         action_row.addWidget(self._btn_new_var)
@@ -511,7 +511,7 @@ class LabelManagerWidget(QWidget):
         text, ok = QInputDialog.getText(
             self, f"New {noun.title()}",
             f"Name for this {noun} (plain words are fine, e.g. "
-            f"\"Cucco Quest\"):")
+            f"\"Side Quest\"):")
         if not ok:
             return
         new = vf.normalize_name(kind, text)

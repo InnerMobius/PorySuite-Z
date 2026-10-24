@@ -1,7 +1,7 @@
 """
 Map Renamer — manages map groups, renaming, moving, deleting maps.
 
-Ported from TriforceGUI/MapRenamer.py. All paths are relative to root_dir.
+Ported from the standalone MapRenamer.py. All paths are relative to root_dir.
 """
 
 import os

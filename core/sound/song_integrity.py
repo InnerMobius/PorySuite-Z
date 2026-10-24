@@ -20,13 +20,13 @@ on the filesystem.  Two scenarios catastrophically destroy the user's work:
      .mid and overwrites the .s with a 0-track empty header.  All hand work
      is gone.
 
-  B) **Stale committed .mid restored by git.**  Project A has a soaring
-     song that started as a copy of Epona's MIDI.  User hand-composes new
-     notes in soaring's .s.  Only the .s is local; the .mid in git still
-     holds Epona's content.  `git reset --hard FETCH_HEAD` (or any pull
+  B) **Stale committed .mid restored by git.**  Project A has a overture
+     song that started as a copy of another song's MIDI.  User hand-composes new
+     notes in overture's .s.  Only the .s is local; the .mid in git still
+     holds that other song's content.  `git reset --hard FETCH_HEAD` (or any pull
      that restores the .mid) sets the .mid mtime to "now", and the next
-     `make` runs mid2agb on Epona's notes — wiping soaring's hand work
-     and replacing it with Epona's music.
+     `make` runs mid2agb on that other song's notes — wiping overture's hand work
+     and replacing it with the other song's music.
 
 This module closes both holes by walking every song at project-open time
 (and on demand via the Sound Editor menu) and ensuring two invariants:

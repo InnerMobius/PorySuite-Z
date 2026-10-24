@@ -13,8 +13,8 @@ PreviewEntry = Tuple[str, int, str, str]
 # ── Map / region-map protection for SPECIES renames ────────────────────────────
 # A MON rename must never rewrite MAP, MAPSEC, or region-map identifiers, nor
 # in-game PLACE names — those are not species data, and touching them breaks the
-# build (e.g. a Diglett→Acheman rename turning `sMapsecName_DIGLETT_S_CAVE` into
-# an undeclared `sMapsecName_ACHEMAN_S_CAVE`) or mangles the region map / signs.
+# build (e.g. a Diglett→Emberine rename turning `sMapsecName_DIGLETT_S_CAVE` into
+# an undeclared `sMapsecName_EMBERINE_S_CAVE`) or mangles the region map / signs.
 # This is the same class of exemption as the dodrio_berry_picking minigame folder
 # and the intro cutscene assets: things that merely share a species' name but are
 # NOT that species.
@@ -36,7 +36,7 @@ _MAP_EXCLUDED_FILES = ("src/region_map.c",)
 # Map / layout DATA subtrees (repo-relative, forward slash, lowercase). Inside
 # these a SPECIES rename applies ONLY its QUALIFIED tokens (SPECIES_ /
 # NATIONAL_DEX_ / HOENN_DEX_ / gMon* / CRY_ / graphics-path) — NEVER its BARE
-# name tokens (base-UPPER / CamelCase / slug). A map literally called "Faron", a
+# name tokens (base-UPPER / CamelCase / slug). A map literally called "Summit", a
 # LOCALID_LUGIA / EventScript_Lugia symbol, or a data/maps/<Name>/ folder merely
 # CONTAINS the species word; the bare tokens would corrupt those. Renaming a
 # monster must NEVER rename a map. Legit SPECIES_ references in a map's scripts
@@ -140,7 +140,7 @@ class RefactorService:
         # Lazily-parsed map of SPECIES_<BASE> -> real gMonFrontPic_<Camel> symbol,
         # read from front_pic_table.h.  Needed because a mon's real graphics symbol
         # is NOT always reconstructible from its constant (Mr. Mime -> Mrmime,
-        # Ho-Oh -> HoOh, Farfetch'd -> Farfetchd, Unown forms, BagoBago, ...).
+        # Ho-Oh -> HoOh, Farfetch'd -> Farfetchd, Unown forms, DuskDusk, ...).
         self._front_sym_cache: dict | None = None
 
     def _build_tokens(self, old_const: str, new_const: str, display: str | None) -> list[tuple[re.Pattern, str]]:
@@ -152,7 +152,7 @@ class RefactorService:
         # Folder slug MUST come from the CONSTANT, never the display name — the
         # app resolves a mon's graphics folder via species_slug_from_const()
         # (strip SPECIES_, lowercase).  A display name like "Bago-Bago" would
-        # inject a separator the constant BAGOBAGO doesn't have -> wrong folder.
+        # inject a separator the constant DUSKDUSK doesn't have -> wrong folder.
         new_slug = self._slug(new_base)
 
         patterns: list[tuple[re.Pattern, str]] = []
@@ -337,7 +337,7 @@ class RefactorService:
         A TRAILING identifier boundary ``(?![A-Za-z0-9_])`` is applied so a
         token can never match the PREFIX of a longer identifier: renaming
         ``PARAS`` must NOT touch ``PARASECT`` (which is how ``SPECIES_PARASECT``
-        became the corrupt ``SPECIES_GREATFAIRYECT`` when PARAS→GREATFAIRY ran).
+        became the corrupt ``SPECIES_SPARKLINGECT`` when PARAS→SPARKLING ran).
         No LEADING boundary is used, so names embedded at the END of a longer
         identifier still match (``gMonFrontPic_Paras`` → the ``Paras`` suffix is
         replaced) — that is the substring behaviour callers rely on. The
@@ -360,7 +360,7 @@ class RefactorService:
         #   trailing (?![A-Za-z0-9_]) — PARAS can't match the front of PARASECT,
         #       and dodrio can't match the front of dodrio_berry_picking.
         #   leading  (?<![A-Za-z0-9]) — ABRA can't match the END of KADABRA
-        #       (that's how renaming ABRA→GORIYA corrupted KADABRA→KADGORIYA).
+        #       (that's how renaming ABRA→VOLTARIX corrupted KADABRA→KADVOLTARIX).
         # The leading boundary allows a preceding underscore (so `_BULBASAUR` in
         # a trainer const and `gMonFrontPic_Paras` still rename), but NOT a
         # preceding letter/digit (KADABRA, where ABRA continues the same word).
@@ -604,7 +604,7 @@ class RefactorService:
         #    must repoint every OTHER species' evolution targetSpecies that
         #    referenced it — otherwise species.json keeps a dangling
         #    targetSpecies (e.g. OCTO -> SPECIES_IVYSAUR after IVYSAUR was
-        #    renamed to OCTOROK), which on the post-rename reload leaves the
+        #    renamed to REEFCLAW), which on the post-rename reload leaves the
         #    save-progress dialog stranded on "Reloading project…".
         def _repoint_evos(si) -> None:
             nonlocal changed
@@ -825,7 +825,7 @@ class RefactorService:
         # Graphics folders in pokefirered use UNDERSCORE separators
         # (graphics/pokemon/mr_mime/, .../bago_bago/) — matching the app's own
         # species_slug_from_const().  A hyphen here made multi-word mons
-        # (BagoBago, Mr. Mime, Ho-Oh) miss their real folder on rename.
+        # (DuskDusk, Mr. Mime, Ho-Oh) miss their real folder on rename.
         return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
     def _front_pic_symbols(self) -> dict:
@@ -858,7 +858,7 @@ class RefactorService:
 
         Reads the actual symbol from front_pic_table.h so renaming a mon whose
         symbol isn't a clean title-case of its constant (Mr. Mime -> Mrmime,
-        Ho-Oh -> HoOh, BagoBago, Unown forms) still moves its graphics.  Falls
+        Ho-Oh -> HoOh, DuskDusk, Unown forms) still moves its graphics.  Falls
         back to the naive _camel() for any species not listed in the table.
         """
         sym = self._front_pic_symbols().get(base)
@@ -1250,7 +1250,7 @@ class RefactorService:
                     tokens.insert(9, (f"graphics/pokemon/{actual_old_slug}",
                                       f"graphics/pokemon/{new_slug}"))
                 # The BARE species-name tokens (CamelCase / base-UPPER / slug).
-                # These must not run inside map/layout data — a map named "Faron",
+                # These must not run inside map/layout data — a map named "Summit",
                 # a data/maps/<slug>/ folder, or a LOCALID_/EventScript_ symbol
                 # merely CONTAINS the word and would be corrupted. Renaming a
                 # monster must never rename a map.
@@ -1267,7 +1267,7 @@ class RefactorService:
                 # Re-assert the human-readable display name LAST. The
                 # (old_base.upper() -> new_base.upper()) token above is needed
                 # for bare-base references (trainer constants etc.) but it also
-                # rewrites the NAME STRING _("SEEL") -> _("PIKIT"), capping it.
+                # rewrites the NAME STRING _("SEEL") -> _("SNOWPUP"), capping it.
                 # Force the name back to the exact display the user typed so it
                 # is never left ALL-CAPS. Single source of truth for the name.
                 if display:

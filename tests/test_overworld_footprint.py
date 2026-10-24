@@ -115,17 +115,17 @@ def test_set_cell_out_of_range_is_silently_ignored():
 # ───────────────────────────────────────────────────────── codegen ──
 
 def test_encode_footprint_block_round_trips():
-    fp = empty_footprint("OBJ_EVENT_GFX_KING_ZORA", 48, 48)
+    fp = empty_footprint("OBJ_EVENT_GFX_OLD_WOMAN", 48, 48)
     # Plus-shaped footprint at the centre.
     for c, r in [(2, 2), (3, 2), (2, 3), (3, 3)]:
         fp.set_cell(c, r, True)
     block = encode_footprint_block(fp)
 
     # Sentinels + symbol names look right.
-    assert "PORYSUITE-GEN BEGIN footprint OBJ_EVENT_GFX_KING_ZORA" in block
-    assert "PORYSUITE-GEN END footprint OBJ_EVENT_GFX_KING_ZORA" in block
-    assert "sFootprintCells_KingZora" in block
-    assert "sFootprint_KingZora" in block
+    assert "PORYSUITE-GEN BEGIN footprint OBJ_EVENT_GFX_OLD_WOMAN" in block
+    assert "PORYSUITE-GEN END footprint OBJ_EVENT_GFX_OLD_WOMAN" in block
+    assert "sFootprintCells_OldWoman" in block
+    assert "sFootprint_OldWoman" in block
     assert ".width = 6," in block
     assert ".height = 6," in block
 
@@ -133,7 +133,7 @@ def test_encode_footprint_block_round_trips():
     parsed = parse_footprints(block)
     assert len(parsed) == 1
     rt = parsed[0]
-    assert rt.gfx_const == "OBJ_EVENT_GFX_KING_ZORA"
+    assert rt.gfx_const == "OBJ_EVENT_GFX_OLD_WOMAN"
     assert rt.width == 6 and rt.height == 6
     assert rt.solid_count == 4
     assert rt.is_solid(2, 2) and rt.is_solid(3, 3)
@@ -189,7 +189,7 @@ def test_lookup_table_explicit_size_prevents_out_of_range_reads():
     #
     # The fix forces the explicit size NUM_OBJ_EVENT_GFX so every
     # graphics ID has a defined slot (NULL unless explicitly assigned).
-    # Real-world reproducer: OBJ_EVENT_GFX_SCHULE = 159 (had footprint),
+    # Real-world reproducer: OBJ_EVENT_GFX_CUSTOM_NPC = 159 (had footprint),
     # OBJ_EVENT_GFX_SCARECROW = 160 (no footprint) -- without the
     # explicit size the engine indexed slot 160 in a 160-slot array.
     fp = empty_footprint("OBJ_EVENT_GFX_TEST", 16, 16)

@@ -566,10 +566,10 @@ def run_mid2agb(
     # If midi_dest exists with >30 bytes (i.e. it's not a placeholder
     # stub) AND the incoming source has different content, bail out
     # with a clear error. The classic failure mode this prevents: the
-    # user picks the wrong source file in the import dialog (e.g. epona's
-    # MIDI when intending soaring's), and shutil.copy2 silently destroys
-    # the existing soaring .mid. Subsequent builds then regenerate
-    # soaring.s from epona's notes, corrupting hand-edited work.
+    # user picks the wrong source file in the import dialog (e.g. another song's
+    # MIDI when intending overture's), and shutil.copy2 silently destroys
+    # the existing overture .mid. Subsequent builds then regenerate
+    # overture.s from that other song's notes, corrupting hand-edited work.
     if os.path.isfile(midi_dest):
         try:
             existing_size = os.path.getsize(midi_dest)

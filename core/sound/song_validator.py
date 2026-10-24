@@ -120,7 +120,7 @@ def validate_song_voices(song, project_root: Optional[str],
                          vg_data=None) -> list[str]:
     """Validate that every VOICE number exists in the song's voicegroup.
 
-    Catches the se_rupee class of bug: a sound stranded on voicegroup000 whose
+    Catches the stranded-SE class of bug: a sound stranded on voicegroup000 whose
     VOICE 127 doesn't exist there. Needs voicegroup data — pass ``vg_data`` if
     already loaded, else give ``project_root`` and it loads on demand. If the
     voicegroup can't be resolved, that itself is reported.

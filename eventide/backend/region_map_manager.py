@@ -1,7 +1,7 @@
 """
 Region Map Manager — visual region map editor backend.
 
-Ported from TriforceGUI/RegionMapManager.py. All paths relative to root_dir.
+Ported from the standalone RegionMapManager.py. All paths relative to root_dir.
 """
 
 import os

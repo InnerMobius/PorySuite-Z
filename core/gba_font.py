@@ -15,8 +15,8 @@ correctly with no changes here. Nothing about the stock FireRed font is assumed.
 Typical use::
 
     font = load_gba_font(project_root)          # the body font
-    w = font.measure("Miniblin")
-    pm = font.render("Miniblin")                # transparent background
+    w = font.measure("Example")
+    pm = font.render("Example")                # transparent background
 
 The glyph sheet is read through :mod:`core.sprite_render`, as the project's
 sprite-rendering rule requires — the PNG's own colour table supplies the

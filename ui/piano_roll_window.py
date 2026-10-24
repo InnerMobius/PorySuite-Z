@@ -1308,8 +1308,8 @@ class PianoRollWindow(QMainWindow):
             # Determine loop label for this track.
             # The user's friendly name (e.g. "intro") is stored once in
             # track 0.  Every track gets a UNIQUE assembly label by
-            # prefixing the track label (e.g. mus_kakariko_1_intro,
-            # mus_kakariko_2_intro).  Assembly labels must be file-global
+            # prefixing the track label (e.g. mus_myroute_1_intro,
+            # mus_myroute_2_intro).  Assembly labels must be file-global
             # unique — using the bare name in every track causes
             # "symbol already defined" errors.
             structure_label = self._structure_panel.get_loop_label()

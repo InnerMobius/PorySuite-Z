@@ -41,7 +41,7 @@ SAFETY
 
 NOTE ON PROJECT VARIANTS
     Vanilla pokefirered branches its special-cases on ``SPECIES_UNOWN`` (the base
-    #201); a repurposed hack may branch on its own mon (e.g. ``SPECIES_ZIRRO``).
+    #201); a repurposed hack may branch on its own mon (e.g. ``SPECIES_CUSTOM_MON``).
     The structural code edits capture the branch species generically
     (``SPECIES_\\w+``) so they work either way; the appended slots keep the
     ``SPECIES_UNOWN_*`` names in both. Only the vanilla tree is build-verifiable

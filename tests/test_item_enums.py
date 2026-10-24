@@ -83,7 +83,7 @@ class ItemEnumParseTest(unittest.TestCase):
 
     def test_discovers_nonstandard_location(self):
         # Pockets defined in an unexpected header — still found by the walk.
-        self._write("include/zeldamon/bag.h", "#define POCKET_ITEMS 1\n#define POCKET_EQUIPMENT 6\n")
+        self._write("include/myhack/bag.h", "#define POCKET_ITEMS 1\n#define POCKET_EQUIPMENT 6\n")
         self.assertEqual(dict(parse_pockets(self.root)).get("POCKET_EQUIPMENT"), 6)
 
     def test_empty_when_no_include(self):

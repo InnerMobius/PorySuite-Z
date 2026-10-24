@@ -1080,7 +1080,7 @@ def _register_map_scripts_include(root: str, map_name: str,
     Map HEADERS are auto-generated, but scripts.inc and text.inc are each
     hand-listed in event_scripts.s (separate include blocks). Miss the
     scripts.inc line and *_MapScripts won't link; miss the text.inc line and
-    every text label the map defines is undefined (e.g. Faron_Text_1)."""
+    every text label the map defines is undefined (e.g. Summit_Text_1)."""
     path = _find_event_scripts_file(root)
     if not path:
         rep.warnings.append(

@@ -664,7 +664,7 @@ def rename_song(
             # Refuse to silently destroy an existing populated .mid at
             # the destination. The earlier `os.remove(new_mid)`
             # unconditional delete caused the
-            # mus_ocarina_soaring_full.mid corruption — a rename moved
+            # mus_theme_overture_full.mid corruption — a rename moved
             # one song's .mid over another's, the build then read the
             # surviving .mid and produced a wrong .s. If new_mid exists
             # with non-stub content (>30 bytes — placeholders are 26),

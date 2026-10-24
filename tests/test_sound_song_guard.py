@@ -53,19 +53,19 @@ class SongGuardTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         # 4 songs on disk: indices 0..3
-        labels = ["mus_a", "se_b", "se_rupee", "se_rupee_big"]
+        labels = ["mus_a", "se_b", "se_coin", "se_coin_big"]
         table = "gSongTable::\n" + "".join(
             f"\tsong {l}, {0 if i == 0 else 4}, 0\n" for i, l in enumerate(labels)
         ) + "\ndummy_song_header:\n\t.byte 0, 0, 0, 0\n"
         _write(os.path.join(self.root, "sound", "song_table.inc"), table)
-        consts = ["MUS_A", "SE_B", "SE_RUPEE", "SE_RUPEE_BIG"]
+        consts = ["MUS_A", "SE_B", "SE_COIN", "SE_COIN_BIG"]
         songs_h = ("#ifndef GUARD_CONSTANTS_SONGS_H\n#define GUARD_CONSTANTS_SONGS_H\n\n"
                    + "".join(f"#define {c} {i}\n" for i, c in enumerate(consts))
                    + "\n#define MUS_NONE 0xFFFF\n\n#endif\n")
         _write(os.path.join(self.root, "include", "constants", "songs.h"), songs_h)
         _write(os.path.join(self.root, "sound", "songs", "midi", "midi.cfg"),
-               "se_rupee.mid:                  -R05 -G013 -V100\n"
-               "se_rupee_big.mid:              -G013 -V100 -P50\n")
+               "se_coin.mid:                  -R05 -G013 -V100\n"
+               "se_coin_big.mid:              -G013 -V100 -P50\n")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -79,15 +79,15 @@ class SongGuardTest(unittest.TestCase):
     def test_guard_blocks_stale_shrink(self):
         data = load_song_table(self.root)
         self.assertEqual(len(data.entries), 4)
-        # Simulate a stale model missing the two rupees.
+        # Simulate a stale model missing the two coins.
         data.entries = [e for e in data.entries
-                        if "rupee" not in e.label]
+                        if "coin" not in e.label]
         self.assertEqual(len(data.entries), 2)
         write_song_table(self.root, data)          # default: no allow_shrink
         write_songs_h(self.root, data)
         # On-disk files must be untouched — all 4 songs still present.
         self.assertEqual(self._table_labels(),
-                         ["mus_a", "se_b", "se_rupee", "se_rupee_big"])
+                         ["mus_a", "se_b", "se_coin", "se_coin_big"])
         self.assertTrue(os.path.isfile(
             os.path.join(self.root, "sound", "song_table.inc.prewrite_backup")))
 
@@ -97,7 +97,7 @@ class SongGuardTest(unittest.TestCase):
         for i, e in enumerate(data.entries):
             e.index = i
         write_song_table(self.root, data, allow_shrink=True)
-        self.assertEqual(self._table_labels(), ["mus_a", "se_b", "se_rupee"])
+        self.assertEqual(self._table_labels(), ["mus_a", "se_b", "se_coin"])
 
     def test_guard_allows_growth(self):
         # Adding a song (more than on disk) is always fine.
@@ -110,19 +110,19 @@ class SongGuardTest(unittest.TestCase):
         self.assertIn("se_lift_up", self._table_labels())
 
     def test_midi_cfg_surgical_update(self):
-        ok = update_midi_cfg_flags(self.root, "se_rupee",
+        ok = update_midi_cfg_flags(self.root, "se_coin",
                                    priority=77, reverb=20, volume=120)
         self.assertTrue(ok)
         with open(os.path.join(self.root, "sound", "songs", "midi", "midi.cfg"),
                   encoding="utf-8") as f:
             lines = f.read().splitlines()
-        rupee = [l for l in lines if l.startswith("se_rupee.mid:")][0]
-        self.assertIn("-P77", rupee)
-        self.assertIn("-R20", rupee)
-        self.assertIn("-V120", rupee)
-        self.assertIn("-G013", rupee, "must preserve the voicegroup flag")
+        coin = [l for l in lines if l.startswith("se_coin.mid:")][0]
+        self.assertIn("-P77", coin)
+        self.assertIn("-R20", coin)
+        self.assertIn("-V120", coin)
+        self.assertIn("-G013", coin, "must preserve the voicegroup flag")
         # The other song's line is untouched.
-        big = [l for l in lines if l.startswith("se_rupee_big.mid:")][0]
+        big = [l for l in lines if l.startswith("se_coin_big.mid:")][0]
         self.assertIn("-P50", big)
         self.assertIn("-V100", big)
 

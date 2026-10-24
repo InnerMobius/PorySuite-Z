@@ -557,7 +557,7 @@ def parse_song_file(filepath: str) -> SongData:
             # silent update of `pending_velocity`, and the run of repeated
             # notes vanishes from the parsed song — a "missing notes" bug
             # for any imported MIDI with sustained-decay tails (Sun Song,
-            # ocarina notes, drone instruments).
+            # flute notes, drone instruments).
             if token.startswith('v') and token[1:].isdigit():
                 velocity = int(token[1:])
                 pending_velocity = velocity

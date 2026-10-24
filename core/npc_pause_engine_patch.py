@@ -419,7 +419,7 @@ def ensure_npc_pause_engine_support(
 
     **Vanilla pokefirered users get a silent no-op for the NpcTakeStep
     edit.**  The pause block uses ``gPlayerAvatar.pixelX``/``pixelY``
-    which only exist on free-pixel-movement mod projects (Zeldamon-style
+    which only exist on free-pixel-movement mod projects (free-pixel-movement
     overhauls); installing it on a vanilla project would break the
     build with "no field 'pixelX' in struct PlayerAvatar".  The probe
     in ``_project_has_free_pixel_movement`` gates the install.  Vanilla

@@ -169,10 +169,10 @@ class ItemsEditorEnumTest(unittest.TestCase):
         panel = self._panel()
         data = {"itemId": "ITEM_Y", "english": "Y", "price": 5,
                 "pocket": "POCKET_ITEMS", "type": 0,
-                "zeldamon_custom_flag": 7}
+                "custom_project_flag": 7}
         panel.load_item("ITEM_Y", data)
         out = panel.collect(data)
-        self.assertEqual(out.get("zeldamon_custom_flag"), 7)
+        self.assertEqual(out.get("custom_project_flag"), 7)
 
 
 if __name__ == "__main__":

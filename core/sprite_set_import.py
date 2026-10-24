@@ -61,7 +61,7 @@ def _bg_color(idx: Optional[QImage]) -> Optional[Color]:
 
     Do NOT trust palette index 0 — artists don't always put the background
     there, and a sprite can contain several near-identical colours (e.g.
-    Tektite has two teals; the body teal sits at index 0 while the real
+    Spiderling has two teals; the body teal sits at index 0 while the real
     green-screen teal fills the border). The border is the reliable signal:
     whatever colour dominates the outer frame is the background.
     """
