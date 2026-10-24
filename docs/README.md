@@ -399,14 +399,14 @@ Move whole maps **between two pokefirered decomp projects** — something poryma
 | Variables & Flags... | -- | Name and reuse the game's variable and flag slots, RPG Maker style. Create new ones or repurpose the vanilla ones you don't need, with no file editing. |
 | Heal Locations... | -- | Set where the player heals and respawns after a blackout — trigger map and coordinates, respawn map, respawn NPC. Flags any entry pointing at a renamed or missing map. |
 | Remove Unown Letter-Form System... | -- | Strip the Unown letter-form mechanism from the project's game source, turning the mon that used it into a normal single-sprite mon. Does nothing on a project that doesn't use the system. |
-| Export Full Dex Sheet... | -- | Write one large PNG of every species — front sprite, back sprite, menu icon, type badges, and name, twenty to a row — into the project folder. See below. |
+| Export Full Dex Sheet... | -- | Write one large PNG of every species — front sprite, back sprite, menu icon, type badges, and name — into the project folder. Asks how many species to put in each row. See below. |
 | Open Terminal | Ctrl+T | Open a terminal in the project directory. |
 | Settings... | -- | Open the settings dialog (see **Settings** below). |
 | Install / Update Porymap... | -- | Download, patch, and build the bundled Porymap (see **Porymap Integration** below). Label changes to **Re-patch Porymap** if an existing install lost its patches. |
 | Open in Porymap | Ctrl+F7 | Open the current project in Porymap. Disabled until Porymap is installed. |
 | Check for Porymap Updates | -- | Check whether a newer Porymap build is available. Disabled until Porymap is installed. |
 
-**Export Full Dex Sheet** builds a contact sheet of the whole roster in dex order, twenty cells to a row, and writes it to the project folder as `fulldex.png`. Everything is read from the open project rather than assumed: sprites are drawn at the game's own size through the same palette pipeline the editor pages use (so unsaved palette edits appear in the sheet), labels use the project's own in-game font, and the type badges use the palette the game actually draws them with. Each sprite sits on the green normally used as a transparency key inside a thin border, so it is obvious where a sprite's pixels stop. Progress is shown while the sheet builds.
+**Export Full Dex Sheet** builds a contact sheet of the whole roster in dex order and writes it to the project folder as `fulldex.png`. It asks how many species to put in each row first — anything from 5 to 15, defaulting to 10 — so the sheet can be made narrow and tall or wide and short to suit the project's size. Everything is read from the open project rather than assumed: sprites are drawn at the game's own size through the same palette pipeline the editor pages use (so unsaved palette edits appear in the sheet), labels use the project's own in-game font, and the type badges use the palette the game actually draws them with. Each sprite sits on the green normally used as a transparency key inside a thin border, so it is obvious where a sprite's pixels stop. Progress is shown while the sheet builds.
 
 ### Git
 

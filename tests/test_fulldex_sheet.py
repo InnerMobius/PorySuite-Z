@@ -33,7 +33,8 @@ for _p in (_ROOT, os.path.join(_ROOT, "core"), os.path.join(_ROOT, "ui")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from core.fulldex_sheet import (_badge_palette_symbol, _incbin_path,
+from core.fulldex_sheet import (DEFAULT_COLUMNS, MAX_COLUMNS, MIN_COLUMNS,
+                                _badge_palette_symbol, _incbin_path,
                                 collect_entries)
 from core.gba_font import (SLOT_BG, SLOT_FG, SLOT_SHADOW, parse_charmap,
                            parse_glyph_value_slots)
@@ -256,6 +257,22 @@ class CharmapTest(unittest.TestCase):
         """The project's own mapping wins; never assume ASCII."""
         got = self._map("'A' = 01\n")
         self.assertEqual(got["A"], 0x01)
+
+
+class ColumnRangeTest(unittest.TestCase):
+    """The export dialog offers MIN..MAX and starts on DEFAULT.
+
+    If DEFAULT ever drifts outside the range, the spinbox silently clamps it
+    and the user gets a different default than the code claims.
+    """
+
+    def test_default_is_inside_the_offered_range(self):
+        self.assertLessEqual(MIN_COLUMNS, DEFAULT_COLUMNS)
+        self.assertLessEqual(DEFAULT_COLUMNS, MAX_COLUMNS)
+
+    def test_range_is_a_real_range(self):
+        self.assertGreater(MAX_COLUMNS, MIN_COLUMNS)
+        self.assertGreaterEqual(MIN_COLUMNS, 1)
 
 
 if __name__ == "__main__":

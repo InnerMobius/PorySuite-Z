@@ -35,7 +35,11 @@ from core.sprite_render import load_sprite_pixmap, mon_sheet_frame
 
 Progress = Optional[Callable[[int, int, str], None]]
 
-DEFAULT_COLUMNS = 20
+DEFAULT_COLUMNS = 10
+# The range the export dialog offers. Wider than ~15 gives a sheet too wide to
+# read comfortably; narrower than 5 makes it absurdly tall.
+MIN_COLUMNS = 5
+MAX_COLUMNS = 15
 # 1 = the game's own pixels, nothing scaled up.
 DEFAULT_SCALE = 1
 DEFAULT_FILENAME = "fulldex.png"

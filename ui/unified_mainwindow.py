@@ -661,7 +661,8 @@ class UnifiedMainWindow(QMainWindow):
         fulldex_action.setToolTip(
             "Write one big PNG to the project folder showing every species —\n"
             "front sprite, back sprite, menu icon and type badges — in a grid\n"
-            "that reads left to right in dex order.")
+            "that reads left to right in dex order. Asks how many species\n"
+            "to put in each row before it builds the sheet.")
         fulldex_action.triggered.connect(self._on_export_fulldex)
         tools_menu.addAction(fulldex_action)
 
@@ -1783,8 +1784,31 @@ class UnifiedMainWindow(QMainWindow):
         except Exception:
             gcache = None
 
-        from PyQt6.QtWidgets import QProgressDialog, QApplication
-        from core.fulldex_sheet import export_fulldex, DEFAULT_FILENAME
+        from PyQt6.QtWidgets import (QProgressDialog, QApplication,
+                                     QInputDialog, QSpinBox)
+        from core.fulldex_sheet import (export_fulldex, DEFAULT_FILENAME,
+                                        DEFAULT_COLUMNS, MIN_COLUMNS,
+                                        MAX_COLUMNS)
+
+        # How wide should the sheet be? Asked every time rather than
+        # remembered — the right width depends on how many species the
+        # project has and what the sheet is being used for.
+        ask = QInputDialog(self)
+        ask.setWindowTitle("Export Full Dex Sheet")
+        ask.setLabelText(
+            "How many species per row?\n\n"
+            "Fewer columns give a narrower, taller sheet; more give a "
+            "wider, shorter one.\n\n"
+            f"Allowed: {MIN_COLUMNS}–{MAX_COLUMNS}.")
+        ask.setInputMode(QInputDialog.InputMode.IntInput)
+        ask.setIntRange(MIN_COLUMNS, MAX_COLUMNS)
+        ask.setIntValue(DEFAULT_COLUMNS)
+        spin = ask.findChild(QSpinBox)
+        if spin is not None:
+            spin.wheelEvent = lambda e: e.ignore()   # RDP scroll safety
+        if not ask.exec():
+            return
+        columns = max(MIN_COLUMNS, min(MAX_COLUMNS, ask.intValue()))
 
         prog = QProgressDialog("Collecting species…", None, 0, 1, self)
         prog.setWindowTitle("Exporting Full Dex Sheet")
@@ -1799,7 +1823,8 @@ class UnifiedMainWindow(QMainWindow):
             QApplication.processEvents()
 
         try:
-            res = export_fulldex(root, source_data, gcache, progress=cb)
+            res = export_fulldex(root, source_data, gcache,
+                                 columns=columns, progress=cb)
         except Exception as e:
             prog.close()
             import logging
