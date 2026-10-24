@@ -157,6 +157,70 @@ Fixed (2026-04-05). Previously, switching to another tab and back to the Trainer
 
 Fixed (2026-04-05). The decapitalizer was updating the in-memory `speciesName` field and the PorySuite tree widget, so the app looked correct — but the compiled ROM still showed ALL CAPS names (BULBASAUR, CHARMANDER, etc.). The root cause was that the game reads species display names from `src/data/text/species_names.h` (`gSpeciesNames[]`), and that file was never written by the decapitalizer. Only the individual Rename tool (`core/refactor_service.py`) ever touched it. Fix: added `_write_species_names_header()` to `ui/name_decapitalizer.py` — on Apply, it patches `species_names.h` directly. Species names now persist to the ROM without needing a separate save step.
 
+### Saving a map in EVENTide changed scripts I never touched (or broke the build)
+
+Fixed (2026-10-24). Saving a map used to rewrite more than the map, in five different ways. If a project was saved
+through EVENTide before that date, re-check it against git — the damage is already on disk and a newer build of
+PorySuite-Z will not undo it.
+
+- **The build stopped working with an error on a `delay` line.** Movement timing steps (`delay_4`, `delay_8`,
+  `delay_16`) were split in two and written back as `delay _16`, which is not a command.
+- **Some dialogue started behaving differently.** The `message` command was rewritten as `msgbox`. They look alike
+  but `msgbox` waits for a button press and closes the window, so anything that needed the window left open —
+  a multichoice list, for instance — broke.
+- **A warp sent the player to the wrong tile.** Warps written with four values lost the last one.
+- **Scripts gained `lock`, `release` or `end` lines nobody added.** The worst case is a `lock` added to a map's
+  on-entry script, which freezes the player as soon as they walk in.
+- **Shared script files lost their comments.** Opening a map whose NPCs call a shared script and pressing Save
+  rewrote that shared file too, even though nothing in it was edited.
+
+All five are now covered by an automatic check that re-saves every map in the test project and fails if a single
+script line changes.
+
+**How much of your project could be affected is bounded.** A save only rewrites the map's own event scripts, its
+`*_MapScripts::` table, scene scripts the editor generates, and any move route you edited in the Move Route dialog.
+Every other block in the file is copied through untouched. So anything living in a block a save never writes —
+movement routes in particular — was never at risk, whatever the list above says.
+
+**How to check your own project.** The reliable marker that a map was saved through an affected build is a stray
+`end` line on its map-script table, after the `.byte 0` that terminates it. A clean copy of the game has none, so
+any you find are from this bug. Skip blank lines when you look — there can be several between the two. Those same
+maps will also have lost their tab indentation.
+
+For the damage that actually matters — `message` turned into `msgbox` — the tell is a bare `waitmessage` line
+directly under an `msgbox`. `msgbox` already waits internally, so that `waitmessage` is a leftover from a `message`
+command and the text box is now closing earlier than the script intended. Compare against a clean copy of the game
+to confirm before changing anything.
+
+**Repairing it.** Use **Tools → Repair Map Script Damage…**. It checks every map in the project and shows you what
+it found — counts, which maps, which lines, and what each one is — before changing anything. Back up or commit your
+game project first, then press Repair. Running it twice is safe; the second run finds nothing.
+
+Restoring the lost indentation is a separate checkbox. It's cosmetic — the game builds and plays the same either
+way — but it's what makes those files readable in git again. Only maps with real damage are touched; maps that were
+simply written without tabs upstream are left alone.
+
+Two things it deliberately will not do. It won't touch an `end` that follows a `goto`, because that's normal and a
+clean copy of the game has 432 of them. And it never adds back a command that's missing compared to a clean copy —
+anything absent is treated as your own edit, not damage, so stripping a vanilla system out of your hack stays
+stripped. It also lists any `lock` or `release` lines that look like they were added for you, but never changes
+them: those can't be told apart from your own edits, so they're yours to look at.
+
+### Saving in EVENTide wiped a change something else had made
+
+Fixed (2026-10-24). EVENTide loads a whole map into memory and writes all of it back when you save. If anything
+else had changed those files in between — Porymap saving, a git pull, a text editor, Tools → Repair Map Script
+Damage, or a second copy of the app — saving in EVENTide wrote its older copy straight over the top, with no
+warning at all.
+
+EVENTide now remembers exactly what each file looked like when it read it, and checks again before writing. If
+something changed underneath it you get a dialog naming the files, with three choices: **Reload from disk** (take
+the other change and lose your unsaved edits here), **Save anyway** (keep yours and lose theirs), or **Cancel**.
+Cancel is the default, and nothing is written until you pick.
+
+This matters most when you have Porymap open at the same time, or just after running the script repair. If you see
+that dialog, it is telling you something real — read which files it lists before choosing.
+
 ### External changes from Porymap wiped my unsaved work
 Fixed (2026-04-05). Previously, if Porymap saved a map (or any external tool modified `map.json`/`scripts.inc`) while you had unsaved Event Editor edits, the file watcher silently reloaded from disk and your edits were gone. Now you get a Save / Discard / Cancel dialog when an external change is detected during unsaved edits.
 
@@ -283,7 +347,7 @@ Fixed (2026-04-08). Two issues: (1) The Instruments tab edited instrument object
 Fixed (2026-04-08). The rate/size picker dialog was only shown for WAVs above 13379 Hz. Lower-rate WAVs got a simple yes/no confirmation even when the file was 30+ KB. Now the rate picker always shows, with downsample options including 8000 Hz. Same fix applied to the Replace button.
 
 ### Build error: "symbol 'intro' is already defined" after piano roll save
-Fixed (2026-04-08). When you named a loop section (e.g. "intro"), the same bare label was written into every track in the .s file. Assembly labels are file-global, so this caused duplicate symbol errors. The save now generates unique per-track labels (e.g. `mus_kakariko_1_intro`, `mus_kakariko_2_intro`). The Song Structure panel strips these prefixes when displaying, so you still see your friendly name.
+Fixed (2026-04-08). When you named a loop section (e.g. "intro"), the same bare label was written into every track in the .s file. Assembly labels are file-global, so this caused duplicate symbol errors. The save now generates unique per-track labels (e.g. `mus_myroute_1_intro`, `mus_myroute_2_intro`). The Song Structure panel strips these prefixes when displaying, so you still see your friendly name.
 
 ### Settings dialog looks different
 The settings dialog was rebuilt with a sidebar. All your old settings (diagnostics, notification preferences) are still there under the same INI keys. Autosave and Porymap path settings were removed (they were dead code that never did anything).

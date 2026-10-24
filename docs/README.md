@@ -182,12 +182,15 @@ RMXP-style visual script editor. Key features:
 - RMXP-style color scheme (customizable via Settings > Event Colors), conditions box, Set Move Route editor with 6 category tabs
 - Position overrides from OnTransition scripts, cross-reference links, Set Flag → Page linking
 - Script Lookup (Ctrl+Shift+F) -- project-wide search across 5,300+ labels
-- 84+ command widgets, drag-to-reorder, right-click context menu, Go To navigation
+- 93 command widgets, drag-to-reorder, right-click context menu, Go To navigation
 - Go To button in command edit dialogs -- double-click a call/goto/conditional and navigate directly to the target script
 - Plain English display names for all constants (flags, vars, weather, sounds, fade types)
 - Move Camera cutscene tool -- pan, slide, screen effects, weather, sound, timing in one 6-tab dialog
 - Sound preview buttons on playbgm/playse/playfanfare commands (plays in background without switching tabs), with "Open in Sound Editor" button
 - Script templates (NPC, Sign, Map Script, Standard Wrapper, Field Object)
+- Message render modes -- Normal (`msgbox`), Braille, or Text Only (the bare `message` command, which leaves the window open for a following multichoice)
+- Warp commands expose the engine's optional warp-ID argument alongside the destination coordinates
+- Save writes the edited map's scripts, text and map data, plus any shared script file whose commands actually changed -- comments, blank lines and label decorations are preserved verbatim
 - Comprehensive tooltips on all controls, command dialogs, and command selector palette (toggleable in Settings)
 
 ![EVENTide](eventide.png)
@@ -400,6 +403,7 @@ Move whole maps **between two pokefirered decomp projects** — something poryma
 | Heal Locations... | -- | Set where the player heals and respawns after a blackout — trigger map and coordinates, respawn map, respawn NPC. Flags any entry pointing at a renamed or missing map. |
 | Remove Unown Letter-Form System... | -- | Strip the Unown letter-form mechanism from the project's game source, turning the mon that used it into a normal single-sprite mon. Does nothing on a project that doesn't use the system. |
 | Export Full Dex Sheet... | -- | Write one large PNG of every species — front sprite, back sprite, menu icon, type badges, and name — into the project folder. Asks how many species to put in each row. See below. |
+| Repair Map Script Damage... | -- | Check every map's `scripts.inc` for damage left by older EVENTide builds and offer to repair it. Lists exactly what it found, and which lines, before anything is written. Safe to run twice. See below. |
 | Open Terminal | Ctrl+T | Open a terminal in the project directory. |
 | Settings... | -- | Open the settings dialog (see **Settings** below). |
 | Install / Update Porymap... | -- | Download, patch, and build the bundled Porymap (see **Porymap Integration** below). Label changes to **Re-patch Porymap** if an existing install lost its patches. |
@@ -407,6 +411,10 @@ Move whole maps **between two pokefirered decomp projects** — something poryma
 | Check for Porymap Updates | -- | Check whether a newer Porymap build is available. Disabled until Porymap is installed. |
 
 **Export Full Dex Sheet** builds a contact sheet of the whole roster in dex order and writes it to the project folder as `fulldex.png`. It asks how many species to put in each row first — anything from 5 to 15, defaulting to 10 — so the sheet can be made narrow and tall or wide and short to suit the project's size. Everything is read from the open project rather than assumed: sprites are drawn at the game's own size through the same palette pipeline the editor pages use (so unsaved palette edits appear in the sheet), labels use the project's own in-game font, and the type badges use the palette the game actually draws them with. Each sprite sits on the green normally used as a transparency key inside a thin border, so it is obvious where a sprite's pixels stop. Progress is shown while the sheet builds.
+
+**Repair Map Script Damage** finds and fixes four things older EVENTide builds could leave in a map's `scripts.inc`: a `message` command rewritten as `msgbox` (which closes the text box earlier than the script intended), a stray `end` written past a map-script table's terminator, an `end` written where it can never run, and lost tab indentation. It scans first and shows the counts, the affected maps and every individual line before changing anything; nothing is written until Repair is pressed, and running it again afterwards finds nothing.
+
+Every check was calibrated against a clean copy of the decomp, and only patterns a clean copy never produces are treated as damage — so, for example, an `end` after a `goto` is left alone, because that is ordinary. It also never adds back a command that is missing compared to a clean copy: anything absent is treated as a deliberate edit, so systems removed from a hack stay removed. Restoring indentation is a separate checkbox, and injected `lock`/`release` lines are listed for review but never changed, since they cannot be distinguished from hand-written ones.
 
 ### Git
 

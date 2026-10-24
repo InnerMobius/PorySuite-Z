@@ -21,8 +21,15 @@ The centrepiece. A visual script editor modeled after RPG Maker XP's event edito
 - **Editable conditions box**: Flag/var conditions above Event Properties with searchable pickers
 - **▶ Preview (Play Pokémon Cry)**: The `playmoncry` command widget has a Preview button that plays the selected species' cry from `sound/direct_sound_samples/cries/*.wav`.
 - **▶ Preview / ■ Stop / 🔊 Open (Sound commands)**: The `playbgm`, `playse`, and `playfanfare` command widgets have three integration buttons. ▶ renders and plays the selected song in the background without leaving the Event Editor. ■ stops playback. 🔊 switches to the Sound Editor tab and selects the song.
-- **100+ command widgets**: Searchable constant pickers, context-aware dropdowns, scroll-wheel guarded. The 3-page command palette is laid out everyday-use-first — page 1 has lock/faceplayer/applymovement/trainerbattle/message/giveitem/setflag/wildbattle at the top.
+- **93 command widgets**: Searchable constant pickers, context-aware dropdowns, scroll-wheel guarded. The 3-page command palette is laid out everyday-use-first — page 1 has lock/faceplayer/applymovement/trainerbattle/message/giveitem/setflag/wildbattle at the top.
 - **Display overhaul**: Human-readable names for trainers, items, species, moves, flags, vars
+- **Message render modes**: the message dialog's Render dropdown picks *Normal* (`.string` + `msgbox` — the full show /
+  wait / button / close routine), *Braille* (`.braille` + `braillemessage`), or *Text Only* (the bare `message`
+  command — puts the words on screen and nothing else, so the script decides what happens next; use it before a
+  multichoice, which needs the window left open). The MSGBOX-type combo is disabled in the two non-Normal modes
+  because neither command takes a type.
+- **Warp ID**: warp commands expose the engine's optional warp-ID argument. `(none)` writes the shorter
+  `warp MAP, x, y` form; a number writes `warp MAP, warpId, x, y`.
 - **Full save**: Writes scripts.inc + text.inc + map.json
 
 ### Color scheme (RMXP-style)
@@ -68,7 +75,7 @@ Only specific categories get colored — plain text/choices/structure stays defa
 
 ## Architecture
 
-- **`ui/event_editor_tab.py`** — Main editor (~9200+ lines). Stringizer, command widgets, edit dialogs, page building, load/save, color scheme, position overrides, cross-references, hidden item editor, tooltips.
+- **`ui/event_editor_tab.py`** — Main editor (~12,400 lines). Stringizer, command widgets, edit dialogs, page building, load/save, color scheme, position overrides, cross-references, hidden item editor, tooltips.
 - **`ui/script_search_dialog.py`** — Project-wide script label search dialog (Ctrl+Shift+F).
 - **`backend/script_index.py`** — Label index. Scans all scripts.inc + data/scripts/ on project load (~5,300 labels, <1 second).
 - **`backend/eventide_utils.py`** — Script parser, text parser, save writers.
@@ -86,11 +93,24 @@ Only specific categories get colored — plain text/choices/structure stays defa
 
 All saves are manual — only the Save button (or Ctrl+S) writes to disk. `_collect_current()` syncs UI fields to memory when switching between objects/pages but never writes to disk. Save/Discard/Cancel dialog on close, map switch, or refresh. External file watchers (Porymap saves, other tools modifying `map.json`/`scripts.inc`) also trigger a Save/Discard/Cancel prompt before clobbering unsaved edits — see `reload_current_map(force=False)`.
 
+**Save will not write over a file that changed underneath it.** `_load_map` and `_resolve_external_scripts` record a content hash of every file they read into `_disk_state`; `_on_save` calls `_changed_on_disk()` before any writer runs and, if anything differs, offers Reload from disk / Save anyway / Cancel (default Cancel). This is deliberately NOT delegated to the file watcher — a watcher is a best-effort notification that can be missed, and its own prompt offers Save, which lands back in `_on_save`. The check belongs at the point of writing and is keyed on what was actually read. See the 2026-10-24 `docs/BUGS.md` entry before changing it.
+
+**What a save is allowed to touch.** The map's own `scripts.inc` / `text.inc` / `map.json`, and — only when their
+commands actually differ from what was read off disk — the shared files holding external labels the map references
+(`data/scripts/*.inc`, `data/event_scripts.s`). Resolving a shared label so the editor can DISPLAY it is not editing
+it; `_save_external_scripts` compares against `_external_baseline` and skips everything unchanged.
+
+**What the writer is NOT allowed to do.** `lines_from_commands` emits exactly what the command list holds. It does not
+add a `lock` it thinks is missing, does not terminate a data table, and does not terminate a block that fell through
+into the next label in the original file. Comments and blank lines are replayed through `merge_hidden_lines`.
+`_parse_script_lines` matches on the first token (`head == 'name'`), never on a prefix. All of this is guarded by
+`tests/test_eventide_script_roundtrip.py` — see the five 2026-10-24 entries in `docs/BUGS.md` for what happened the
+last time any of it was not true.
+
 ## Docs
-- `CLAUDECONTEXT.md` — Context for new Claude threads (EVENTide-specific)
 - `GUIDE.md` — User guide for the PorySuite/Porymap/EVENTide workflow
-- `eventide_whitelist.md` — Friendly command labels by category
 - `script_commands.md` — Full FireRed bytecode reference
+- `TROUBLESHOOTING.md` — EVENTide-specific troubleshooting
 
 ## Test project
 `porysuite/pokefirered` is the test copy. Never touch `C:\GBA\pokefirered` during porysuite work.

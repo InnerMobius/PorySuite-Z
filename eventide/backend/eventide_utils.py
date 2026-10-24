@@ -1,13 +1,14 @@
 """
 EVENTide utilities — script parsing, constant loading, friendly labels.
 
-Ported from ProjectZeldamon/eventide_utils.py. All paths are relative to a
+Ported from the standalone eventide_utils.py. All paths are relative to a
 project root directory passed as a parameter, NOT derived from __file__.
 
 Module-level constants (FRIENDLY_COMMANDS, etc.) are initialized empty and
 populated when load_project_constants(root_dir) is called.
 """
 
+import hashlib
 import re
 from pathlib import Path
 from collections import OrderedDict
@@ -248,6 +249,25 @@ def load_command_categories(root_dir: str) -> dict[str, list[tuple[str, str]]]:
 # ═════════════════════════════════════════════════════════════════════════════
 # Script parsing
 # ═════════════════════════════════════════════════════════════════════════════
+
+def file_fingerprint(path: Path) -> str | None:
+    """Return a content hash for *path*, or None if it does not exist.
+
+    Content, not mtime+size: a same-size edit landing inside one filesystem
+    timestamp tick is exactly the case a staleness check must not miss, and
+    these files are a few KB each so hashing them is free. ``None`` is a real
+    state meaning "absent", so a file that is deleted or created under the
+    editor compares as changed.
+    """
+    try:
+        return hashlib.sha1(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        # Unreadable is not the same as unchanged — report a value that can
+        # never match a real hash, so the caller treats it as changed.
+        return 'unreadable'
+
 
 def parse_text_inc(path: Path) -> OrderedDict:
     """Return an OrderedDict mapping labels to message strings.
@@ -841,8 +861,19 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
             i += 1
             continue
 
+        # The command NAME is the first whitespace-delimited token. Every
+        # branch below matches on `head`, never on `stripped.startswith(name)`.
+        #
+        # DO NOT go back to startswith(). A prefix match has no word boundary,
+        # so `delay` swallowed the movement macros `delay_1/_4/_8/_16/_32` and
+        # re-emitted them as `delay _16` — not a command, and the project would
+        # no longer assemble (241 lines in the live project sit on this fault). The same
+        # hazard hid `applymovementat` behind `applymovement`. See
+        # docs/BUGS.md → "EVENTide: delay_16 mangled into `delay _16`".
+        head = stripped.split(None, 1)[0]
+
         # ── Messages ─────────────────────────────────────────────────
-        if stripped.startswith('msgbox'):
+        if head == 'msgbox':
             # NOTE: the character class is [^"\\] (single char), NOT [^"]* — a
             # nested unbounded quantifier here caused catastrophic backtracking
             # (an app freeze) on an unterminated quote, e.g. a msgbox whose text
@@ -872,7 +903,7 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
         # used between parse_text_inc and write_text_inc to remember
         # which directive to emit, and shouldn't leak into the command
         # tuple the dialog reads.
-        if stripped.startswith('braillemessage'):
+        if head == 'braillemessage':
             m = re.match(r'braillemessage\s+([^,\s]+)', stripped)
             if m:
                 label = m.group(1).rstrip(',')
@@ -884,13 +915,24 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
                 continue
 
         # ── Warp variants ────────────────────────────────────────────
+        # The engine's `formatwarp map, a, b, c` accepts FOUR arities:
+        #   warp MAP                  -> dummy warp id and coords
+        #   warp MAP, warpId          -> named warp, dummy coords
+        #   warp MAP, x, y            -> dummy warp id, explicit coords
+        #   warp MAP, warpId, x, y    -> everything explicit
+        # A fixed three-capture regex only understood the third form and
+        # silently dropped the Y of the fourth, landing the player on the
+        # wrong tile. Capture whatever is actually there instead.
+        # See docs/BUGS.md → "EVENTide: 4-argument warp loses its Y".
         _warp_matched = False
         for warp_cmd in ('warpteleport', 'warpsilent', 'warpdoor', 'warphole', 'warp'):
-            if stripped.startswith(warp_cmd):
-                m = re.match(rf'{warp_cmd}\s+([^,]+),\s*(\d+),\s*(\d+)', stripped)
-                if m:
-                    cmds.append((warp_cmd, m.group(1).strip(),
-                                 int(m.group(2)), int(m.group(3))))
+            if head == warp_cmd:
+                rest = stripped[len(warp_cmd):].strip()
+                if rest:
+                    parts_w = [p.strip() for p in rest.split(',')]
+                    args_w = [int(p) if p.lstrip('-').isdigit() else p
+                              for p in parts_w if p != '']
+                    cmds.append((warp_cmd, *args_w))
                     i += 1
                     _warp_matched = True
                 break
@@ -898,7 +940,7 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
             continue
 
         # ── Sound ────────────────────────────────────────────────────
-        if stripped.startswith('playse'):
+        if head == 'playse':
             # playse can have 1 or 3 args
             m = re.match(r'playse\s+([^,]+?)(?:\s*,\s*(\d+)\s*,\s*(\d+))?$', stripped)
             if m:
@@ -906,13 +948,13 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
                 cmds.append(('playse', sfx))
                 i += 1
                 continue
-        elif stripped.startswith('playfanfare'):
+        elif head == 'playfanfare':
             m = re.match(r'playfanfare\s+(\S+)', stripped)
             if m:
                 cmds.append(('playfanfare', m.group(1)))
                 i += 1
                 continue
-        elif stripped.startswith('playbgm'):
+        elif head == 'playbgm':
             m = re.match(r'playbgm\s+([^,]+),\s*(\d+)', stripped)
             if m:
                 cmds.append(('playbgm', m.group(1).strip(), int(m.group(2))))
@@ -920,7 +962,7 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
                 continue
 
         # ── Trainer battle (multi-arg) ───────────────────────────────
-        elif stripped.startswith('trainerbattle'):
+        elif head == 'trainerbattle':
             # Handle variants: trainerbattle_single, trainerbattle_no_intro, etc.
             parts = stripped.split(None, 1)
             tb_cmd = parts[0]  # e.g. 'trainerbattle_single'
@@ -930,7 +972,7 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
             continue
 
         # ── Wild battle (setwildbattle + optional shiny + dowildbattle) ──
-        elif stripped.startswith('setwildbattle'):
+        elif head == 'setwildbattle':
             m = re.match(r'setwildbattle\s+([^,]+),\s*(\d+)', stripped)
             if m:
                 species = m.group(1).strip()
@@ -940,388 +982,388 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
                 if j < len(lines) and lines[j].strip() == 'setflag FLAG_SHINY_SPECIAL':
                     shiny = True
                     j += 1
-                if j < len(lines) and lines[j].strip().startswith('dowildbattle'):
+                if j < len(lines) and lines[j].split(None, 1)[:1] == ['dowildbattle']:
                     cmds.append(('wildbattle', species, level, shiny))
                     i = j + 1
                     continue
 
         # ── Items (with optional quantity) ───────────────────────────
-        elif stripped.startswith('additem'):
+        elif head == 'additem':
             args = stripped[len('additem'):].strip()
             cmds.append(('additem', args))
             i += 1
             continue
-        elif stripped.startswith('removeitem'):
+        elif head == 'removeitem':
             args = stripped[len('removeitem'):].strip()
             cmds.append(('removeitem', args))
             i += 1
             continue
-        elif stripped.startswith('checkitem '):
+        elif head == 'checkitem':
             args = stripped[len('checkitem'):].strip()
             cmds.append(('checkitem', args))
             i += 1
             continue
-        elif stripped.startswith('checkitemspace'):
+        elif head == 'checkitemspace':
             args = stripped[len('checkitemspace'):].strip()
             cmds.append(('checkitemspace', args))
             i += 1
             continue
 
         # ── Pokemon ──────────────────────────────────────────────────
-        elif stripped.startswith('givemon'):
+        elif head == 'givemon':
             args = stripped[len('givemon'):].strip()
             cmds.append(('givemon', args))
             i += 1
             continue
-        elif stripped.startswith('giveegg'):
+        elif head == 'giveegg':
             args = stripped[len('giveegg'):].strip()
             cmds.append(('giveegg', args))
             i += 1
             continue
-        elif stripped.startswith('checkpartymove'):
+        elif head == 'checkpartymove':
             args = stripped[len('checkpartymove'):].strip()
             cmds.append(('checkpartymove', args))
             i += 1
             continue
 
         # ── Movement ─────────────────────────────────────────────────
-        elif stripped.startswith('applymovement'):
+        elif head == 'applymovement':
             m = re.match(r'applymovement\s+([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('applymovement', m.group(1).strip(), m.group(2).strip()))
                 i += 1
                 continue
-        elif stripped.startswith('applymovementat'):
+        elif head == 'applymovementat':
             args = stripped[len('applymovementat'):].strip()
             cmds.append(('applymovementat', args))
             i += 1
             continue
 
         # ── NPC / Object control ─────────────────────────────────────
-        elif stripped.startswith('removeobject'):
+        elif head == 'removeobject':
             args = stripped[len('removeobject'):].strip()
             cmds.append(('removeobject', args))
             i += 1
             continue
-        elif stripped.startswith('addobject'):
+        elif head == 'addobject':
             args = stripped[len('addobject'):].strip()
             cmds.append(('addobject', args))
             i += 1
             continue
-        elif stripped.startswith('showobjectat'):
+        elif head == 'showobjectat':
             args = stripped[len('showobjectat'):].strip()
             cmds.append(('showobjectat', args))
             i += 1
             continue
-        elif stripped.startswith('hideobjectat'):
+        elif head == 'hideobjectat':
             args = stripped[len('hideobjectat'):].strip()
             cmds.append(('hideobjectat', args))
             i += 1
             continue
-        elif stripped.startswith('turnobject'):
+        elif head == 'turnobject':
             args = stripped[len('turnobject'):].strip()
             cmds.append(('turnobject', args))
             i += 1
             continue
-        elif stripped.startswith('setobjectxy '):
+        elif head == 'setobjectxy':
             args = stripped[len('setobjectxy'):].strip()
             cmds.append(('setobjectxy', args))
             i += 1
             continue
-        elif stripped.startswith('setobjectxyperm'):
+        elif head == 'setobjectxyperm':
             args = stripped[len('setobjectxyperm'):].strip()
             cmds.append(('setobjectxyperm', args))
             i += 1
             continue
 
         # ── Flags & Variables ────────────────────────────────────────
-        elif stripped.startswith('setflag'):
+        elif head == 'setflag':
             args = stripped[len('setflag'):].strip()
             cmds.append(('setflag', args))
             i += 1
             continue
-        elif stripped.startswith('clearflag'):
+        elif head == 'clearflag':
             args = stripped[len('clearflag'):].strip()
             cmds.append(('clearflag', args))
             i += 1
             continue
-        elif stripped.startswith('checkflag'):
+        elif head == 'checkflag':
             args = stripped[len('checkflag'):].strip()
             cmds.append(('checkflag', args))
             i += 1
             continue
-        elif stripped.startswith('setvar'):
+        elif head == 'setvar':
             args = stripped[len('setvar'):].strip()
             cmds.append(('setvar', args))
             i += 1
             continue
-        elif stripped.startswith('addvar'):
+        elif head == 'addvar':
             args = stripped[len('addvar'):].strip()
             cmds.append(('addvar', args))
             i += 1
             continue
-        elif stripped.startswith('subvar'):
+        elif head == 'subvar':
             args = stripped[len('subvar'):].strip()
             cmds.append(('subvar', args))
             i += 1
             continue
-        elif stripped.startswith('copyvar'):
+        elif head == 'copyvar':
             args = stripped[len('copyvar'):].strip()
             cmds.append(('copyvar', args))
             i += 1
             continue
-        elif stripped.startswith('compare_var_to_value'):
+        elif head == 'compare_var_to_value':
             args = stripped[len('compare_var_to_value'):].strip()
             cmds.append(('compare_var_to_value', args))
             i += 1
             continue
-        elif stripped.startswith('compare_var_to_var'):
+        elif head == 'compare_var_to_var':
             args = stripped[len('compare_var_to_var'):].strip()
             cmds.append(('compare_var_to_var', args))
             i += 1
             continue
 
         # ── Conditional branches (must be before generic goto/call) ──
-        elif stripped.startswith('goto_if_eq '):
+        elif head == 'goto_if_eq':
             m = re.match(r'goto_if_eq\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_eq', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('goto_if_ne '):
+        elif head == 'goto_if_ne':
             m = re.match(r'goto_if_ne\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_ne', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('goto_if_lt '):
+        elif head == 'goto_if_lt':
             m = re.match(r'goto_if_lt\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_lt', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('goto_if_ge '):
+        elif head == 'goto_if_ge':
             m = re.match(r'goto_if_ge\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_ge', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('goto_if_le '):
+        elif head == 'goto_if_le':
             m = re.match(r'goto_if_le\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_le', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('goto_if_gt '):
+        elif head == 'goto_if_gt':
             m = re.match(r'goto_if_gt\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_gt', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('goto_if_set '):
+        elif head == 'goto_if_set':
             m = re.match(r'goto_if_set\s+([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_set', m.group(1).strip(), m.group(2).strip()))
                 i += 1; continue
-        elif stripped.startswith('goto_if_unset '):
+        elif head == 'goto_if_unset':
             m = re.match(r'goto_if_unset\s+([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('goto_if_unset', m.group(1).strip(), m.group(2).strip()))
                 i += 1; continue
-        elif stripped.startswith('call_if_eq '):
+        elif head == 'call_if_eq':
             m = re.match(r'call_if_eq\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('call_if_eq', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('call_if_ne '):
+        elif head == 'call_if_ne':
             m = re.match(r'call_if_ne\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('call_if_ne', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('call_if_lt '):
+        elif head == 'call_if_lt':
             m = re.match(r'call_if_lt\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('call_if_lt', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('call_if_ge '):
+        elif head == 'call_if_ge':
             m = re.match(r'call_if_ge\s+([^,]+),\s*([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('call_if_ge', m.group(1).strip(), m.group(2).strip(), m.group(3).strip()))
                 i += 1; continue
-        elif stripped.startswith('call_if_set '):
+        elif head == 'call_if_set':
             m = re.match(r'call_if_set\s+([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('call_if_set', m.group(1).strip(), m.group(2).strip()))
                 i += 1; continue
-        elif stripped.startswith('call_if_unset '):
+        elif head == 'call_if_unset':
             m = re.match(r'call_if_unset\s+([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('call_if_unset', m.group(1).strip(), m.group(2).strip()))
                 i += 1; continue
 
         # ── Flow control ─────────────────────────────────────────────
-        elif stripped.startswith('goto ') or stripped == 'goto':
+        elif head == 'goto':
             args = stripped[len('goto'):].strip()
             cmds.append(('goto', args) if args else ('goto',))
             i += 1
             continue
-        elif stripped.startswith('call ') or stripped == 'call':
+        elif head == 'call':
             args = stripped[len('call'):].strip()
             cmds.append(('call', args) if args else ('call',))
             i += 1
             continue
-        elif stripped.startswith('specialvar '):
+        elif head == 'specialvar':
             args = stripped[len('specialvar'):].strip()
             cmds.append(('specialvar', args))
             i += 1
             continue
-        elif stripped.startswith('special'):
+        elif head == 'special':
             args = stripped[len('special'):].strip()
             cmds.append(('special', args))
             i += 1
             continue
 
         # ── Weather ──────────────────────────────────────────────────
-        elif stripped.startswith('setweather'):
+        elif head == 'setweather':
             args = stripped[len('setweather'):].strip()
             cmds.append(('setweather', args))
             i += 1
             continue
 
         # ── Screen effects ───────────────────────────────────────────
-        elif stripped.startswith('fadescreenspeed'):
+        elif head == 'fadescreenspeed':
             args = stripped[len('fadescreenspeed'):].strip()
             cmds.append(('fadescreenspeed', args))
             i += 1
             continue
-        elif stripped.startswith('fadescreen'):
+        elif head == 'fadescreen':
             args = stripped[len('fadescreen'):].strip()
             cmds.append(('fadescreen', args))
             i += 1
             continue
-        elif stripped.startswith('setflashlevel'):
+        elif head == 'setflashlevel':
             args = stripped[len('setflashlevel'):].strip()
             cmds.append(('setflashlevel', args))
             i += 1
             continue
 
         # ── Timing ───────────────────────────────────────────────────
-        elif stripped.startswith('delay'):
+        elif head == 'delay':
             args = stripped[len('delay'):].strip()
             cmds.append(('delay', args))
             i += 1
             continue
 
         # ── Money & Coins ────────────────────────────────────────────
-        elif stripped.startswith('addmoney'):
+        elif head == 'addmoney':
             args = stripped[len('addmoney'):].strip()
             cmds.append(('addmoney', args))
             i += 1
             continue
-        elif stripped.startswith('removemoney'):
+        elif head == 'removemoney':
             args = stripped[len('removemoney'):].strip()
             cmds.append(('removemoney', args))
             i += 1
             continue
-        elif stripped.startswith('checkmoney'):
+        elif head == 'checkmoney':
             args = stripped[len('checkmoney'):].strip()
             cmds.append(('checkmoney', args))
             i += 1
             continue
-        elif stripped.startswith('addcoins'):
+        elif head == 'addcoins':
             args = stripped[len('addcoins'):].strip()
             cmds.append(('addcoins', args))
             i += 1
             continue
-        elif stripped.startswith('removecoins'):
+        elif head == 'removecoins':
             args = stripped[len('removecoins'):].strip()
             cmds.append(('removecoins', args))
             i += 1
             continue
 
         # ── Buffers ──────────────────────────────────────────────────
-        elif stripped.startswith('bufferspeciesname'):
+        elif head == 'bufferspeciesname':
             args = stripped[len('bufferspeciesname'):].strip()
             cmds.append(('bufferspeciesname', args))
             i += 1
             continue
-        elif stripped.startswith('bufferitemname'):
+        elif head == 'bufferitemname':
             args = stripped[len('bufferitemname'):].strip()
             cmds.append(('bufferitemname', args))
             i += 1
             continue
-        elif stripped.startswith('buffermovename'):
+        elif head == 'buffermovename':
             args = stripped[len('buffermovename'):].strip()
             cmds.append(('buffermovename', args))
             i += 1
             continue
-        elif stripped.startswith('buffernumberstring'):
+        elif head == 'buffernumberstring':
             args = stripped[len('buffernumberstring'):].strip()
             cmds.append(('buffernumberstring', args))
             i += 1
             continue
-        elif stripped.startswith('bufferstring'):
+        elif head == 'bufferstring':
             args = stripped[len('bufferstring'):].strip()
             cmds.append(('bufferstring', args))
             i += 1
             continue
 
         # ── Respawn / misc ───────────────────────────────────────────
-        elif stripped.startswith('setrespawn'):
+        elif head == 'setrespawn':
             args = stripped[len('setrespawn'):].strip()
             cmds.append(('setrespawn', args))
             i += 1
             continue
-        elif stripped.startswith('playmoncry'):
+        elif head == 'playmoncry':
             args = stripped[len('playmoncry'):].strip()
             cmds.append(('playmoncry', args))
             i += 1
             continue
 
         # ── Doors ────────────────────────────────────────────────────
-        elif stripped.startswith('opendoor'):
+        elif head == 'opendoor':
             args = stripped[len('opendoor'):].strip()
             cmds.append(('opendoor', args))
             i += 1
             continue
-        elif stripped.startswith('closedoor'):
+        elif head == 'closedoor':
             args = stripped[len('closedoor'):].strip()
             cmds.append(('closedoor', args))
             i += 1
             continue
-        elif stripped.startswith('waitdooranim'):
+        elif head == 'waitdooranim':
             cmds.append(('waitdooranim',))
             i += 1
             continue
 
         # ── Decorations ──────────────────────────────────────────────
-        elif stripped.startswith('adddecoration'):
+        elif head == 'adddecoration':
             args = stripped[len('adddecoration'):].strip()
             cmds.append(('adddecoration', args))
             i += 1
             continue
-        elif stripped.startswith('removedecoration'):
+        elif head == 'removedecoration':
             args = stripped[len('removedecoration'):].strip()
             cmds.append(('removedecoration', args))
             i += 1
             continue
 
         # ── Pokemart ─────────────────────────────────────────────────
-        elif stripped.startswith('pokemart'):
+        elif head == 'pokemart':
             args = stripped[len('pokemart'):].strip()
             cmds.append(('pokemart', args))
             i += 1
             continue
 
         # ── Metatile ─────────────────────────────────────────────────
-        elif stripped.startswith('setmetatile'):
+        elif head == 'setmetatile':
             args = stripped[len('setmetatile'):].strip()
             cmds.append(('setmetatile', args))
             i += 1
             continue
 
         # ── Map setup commands ───────────────────────────────────────
-        elif stripped.startswith('map_script ') or stripped.startswith('map_script_2 '):
+        elif head == 'map_script' or head == 'map_script_2':
             # These are map header script entries — pass through as generic
             parts_m = stripped.split(None, 1)
             cmds.append((parts_m[0], parts_m[1] if len(parts_m) > 1 else ''))
             i += 1
             continue
-        elif stripped.startswith('.equ ') or stripped.startswith('.byte ') or stripped.startswith('.2byte '):
+        elif head == '.equ' or head == '.byte' or head == '.2byte':
             # Assembler directives — pass through as generic
             parts_m = stripped.split(None, 1)
             cmds.append((parts_m[0], parts_m[1] if len(parts_m) > 1 else ''))
@@ -1329,39 +1371,51 @@ def _parse_script_lines(lines: list[str], texts: dict) -> list[tuple]:
             continue
 
         # ── Text display ─────────────────────────────────────────────
-        elif stripped.startswith('message '):
+        elif head == 'message':
+            # `message` is NOT `msgbox`. The engine macros differ:
+            #   message = .byte 0x67 + .4byte <text>   (loads the text only)
+            #   msgbox  = loadword 0, <text> + callstd <type>
+            #             (the full show / wait / button / close routine)
+            # Conflating them used to rewrite every `message` line as
+            # `msgbox`, which changed in-game behaviour in 112 places (e.g. a
+            # `message` + `waitmessage` + `multichoice` sequence had the box
+            # closed out from under the multichoice). The 5th tuple element —
+            # the same render slot braille uses — keeps them apart.
+            # See docs/BUGS.md → "EVENTide: `message` rewritten as `msgbox`".
             m = re.match(r'message\s+(\S+)', stripped)
             if m:
                 label = m.group(1)
-                cmds.append(('message', label, texts.get(label, ''), ''))
+                cmds.append(('message', label,
+                             _strip_braille_prefix(texts.get(label, '')),
+                             '', 'raw'))
                 i += 1
                 continue
-        elif stripped.startswith('textcolor '):
+        elif head == 'textcolor':
             args = stripped[len('textcolor'):].strip()
             cmds.append(('textcolor', args))
             i += 1
             continue
 
         # ── Special variants ─────────────────────────────────────────
-        elif stripped.startswith('famechecker '):
+        elif head == 'famechecker':
             args = stripped[len('famechecker'):].strip()
             cmds.append(('famechecker', args))
             i += 1
             continue
 
         # ── Object control (extended) ────────────────────────────────
-        elif stripped.startswith('copyobjectxytoperm '):
+        elif head == 'copyobjectxytoperm':
             args = stripped[len('copyobjectxytoperm'):].strip()
             cmds.append(('copyobjectxytoperm', args))
             i += 1
             continue
-        elif stripped.startswith('setobjectmovementtype '):
+        elif head == 'setobjectmovementtype':
             m = re.match(r'setobjectmovementtype\s+([^,]+),\s*(\S+)', stripped)
             if m:
                 cmds.append(('setobjectmovementtype', m.group(1).strip(), m.group(2).strip()))
                 i += 1
                 continue
-        elif stripped.startswith('setworldmapflag '):
+        elif head == 'setworldmapflag':
             args = stripped[len('setworldmapflag'):].strip()
             cmds.append(('setworldmapflag', args))
             i += 1
@@ -1541,11 +1595,19 @@ _CHOICE_MARKERS = ('choice_yesno', 'when_yes', 'when_no', 'branch_end')
 
 def _retype_message_yesno(msg: tuple) -> tuple:
     """Return a copy of a ('message', label, text, type, [render]) tuple with
-    its MSGBOX type set to MSGBOX_YESNO."""
+    its MSGBOX type set to MSGBOX_YESNO.
+
+    A yes/no box is by definition `msgbox ..., MSGBOX_YESNO`, so this also
+    forces the render mode back to normal: the bare `message` command and
+    `braillemessage` take no MSGBOX type, and leaving either in place would
+    make the writer emit a command that drops the YESNO and breaks the branch.
+    """
     parts = list(msg)
     while len(parts) < 4:
         parts.append('' if len(parts) != 1 else None)
     parts[3] = 'MSGBOX_YESNO'
+    if len(parts) > 4:
+        parts[4] = 'normal'
     return tuple(parts)
 
 
@@ -1724,9 +1786,16 @@ def lines_from_commands(
     """Convert a list of command tuples back to script lines.
 
     *conditions*: page condition dict — inserts checkflag / compare_var_to_value.
-    *hidden*: non-visible lines from the original script, scanned to avoid
-    duplicating auto-inserted lock/release.
+    *hidden*: non-visible lines from the original script, scanned so an
+    ``nop`` filler is not added to a block that already has one.
     *texts*: mutable dict of label->text; message commands with labels update it.
+
+    This writer emits ONLY what the command list holds. It does not guess at
+    missing ``lock`` / ``release``: that guess adds 289 locks and 197 releases
+    when every label is re-rendered, and a ``lock`` added to
+    an On Transition map script freezes the player on map entry. If a script
+    looks like it is missing a lock, say so in the UI — do not rewrite it.
+    See docs/BUGS.md → "EVENTide: lock/release/end injected into scripts".
     """
     visible: list[str] = []
 
@@ -1742,8 +1811,8 @@ def lines_from_commands(
             value = conditions.get('var_value', '0')
             visible.append(f'compare_var_to_value {var}, {value}\n')
 
-    # Build set of commands already present (both visible and hidden) to
-    # avoid injecting duplicates of lock/release/end.
+    # Build the set of commands already present (visible and hidden) so the
+    # empty-script `nop` filler below is not duplicated.
     cmd_names: set[str] = set()
     for data in commands:
         if data:
@@ -1753,18 +1822,6 @@ def lines_from_commands(
             token = line.strip().split()
             if token:
                 cmd_names.add(token[0])
-
-    # Don't inject lock into sub-scripts (those ending with 'return')
-    # or scripts that already have lock/lockall.
-    needs_lock = (
-        'lock' not in cmd_names and 'lockall' not in cmd_names and
-        'return' not in cmd_names and
-        any(cmd and cmd[0] in {'applymovement', 'call', 'wildbattle'}
-            for cmd in commands)
-    )
-
-    if needs_lock:
-        visible.append('lock\n')
 
     for data in commands:
         if not data:
@@ -1789,8 +1846,20 @@ def lines_from_commands(
             msg_type = data[3] if len(data) > 3 else ''
             # 5th element (optional) selects render mode. 'braille'
             # means emit `braillemessage <label>` and tell the text
-            # writer to use `.braille` instead of `.string`.
+            # writer to use `.braille` instead of `.string`. 'raw' means
+            # emit the bare `message <label>` command — a DIFFERENT engine
+            # opcode from msgbox (see the reader's `message` branch).
             render = data[4] if len(data) > 4 else 'normal'
+
+            if render == 'raw':
+                # `message` takes a text POINTER, so there is no inline-string
+                # form. Synthesise a label if one is somehow missing, the same
+                # way braille does, so the data still round-trips.
+                if not label_name:
+                    label_name = f'Text_{abs(hash(text)) & 0xFFFFFF:06X}'
+                visible.append(f'message {label_name}\n')
+                texts[label_name] = text
+                continue
 
             if render == 'braille':
                 # Braille MUST use a label — `braillemessage` doesn't
@@ -1827,13 +1896,17 @@ def lines_from_commands(
                     line += f', {msg_type}'
                 visible.append(line + '\n')
 
-        # ── Warps (all have map, x, y as positional args) ────────────
+        # ── Warps (map plus 0-3 further positional args) ─────────────
+        # Emit exactly the arguments the tuple carries — the engine macro
+        # takes anywhere from one to four, and hard-coding three used to
+        # truncate `warp MAP, warpId, x, y` to `warp MAP, warpId, x`.
         elif cmd in ('warp', 'warpsilent', 'warpdoor', 'warphole', 'warpteleport'):
-            if len(data) >= 4:
-                visible.append(f'{cmd} {data[1]}, {data[2]}, {data[3]}\n')
+            if len(data) > 2:
+                visible.append(
+                    f'{cmd} ' + ', '.join(str(a) for a in data[1:]) + '\n')
             else:
                 args = data[1] if len(data) > 1 else ''
-                visible.append(f'{cmd} {args}\n')
+                visible.append((f'{cmd} {args}' if args else cmd) + '\n')
 
         # ── Movement (target, label as positional) ───────────────────
         elif cmd == 'applymovement':
@@ -1895,14 +1968,6 @@ def lines_from_commands(
             line = cmd if not args else f'{cmd} {args}'
             visible.append(line + '\n')
 
-    needs_release = (
-        needs_lock and
-        'release' not in cmd_names and 'releaseall' not in cmd_names
-    )
-
-    if needs_release:
-        visible.append('release\n')
-
     if not commands and 'nop' not in cmd_names and 'nop1' not in cmd_names:
         visible.append('nop\n')
 
@@ -1941,9 +2006,21 @@ def _render_label_block(
     data,
     hidden_lines: dict[str, list],
     texts: dict,
+    fallthrough: set[str] | None = None,
 ) -> list[str]:
-    """Render a single label's script lines from command data."""
+    """Render a single label's script lines from command data.
+
+    *fallthrough*: labels whose block in the ORIGINAL file deliberately ran
+    on into the next label instead of terminating. Vanilla uses that idiom
+    (``..._TrySetDayCareManPos::`` falls into ``..._EndSetDayCareManPos::``,
+    which does the ``return``). Appending an `end` to such a block severs the
+    fall-through and changes what the script does, so those labels are left
+    exactly as they are. Labels NOT in this set are either real terminating
+    scripts or brand-new ones EVENTide just created — several New Script
+    templates rely on the `end` being supplied here, so it still is.
+    """
     out: list[str] = []
+    falls = fallthrough or frozenset()
 
     if data and isinstance(data, list) and data and isinstance(data[0], dict):
         # Legacy format: list of page dicts
@@ -1961,12 +2038,7 @@ def _render_label_block(
                 page.get('hidden_lines') or hidden_lines.get(page_label, []),
             )
             out.extend(merged)
-            # Only append end if the commands don't already TERMINATE the
-            # script. releaseall is NOT a terminator — in vanilla it is always
-            # followed by `end` — so a script ending in releaseall still needs
-            # one, or execution runs past it into the next block.
-            last_cmd = _last_nonblank(merged)
-            if last_cmd not in ('end', 'return', 'step_end'):
+            if page_label not in falls and _needs_end_terminator(merged):
                 out.append('end\n')
             out.append('\n')
     else:
@@ -1980,23 +2052,50 @@ def _render_label_block(
             cmd_lines, hidden_lines.get(label, []),
         )
         out.extend(merged)
-        # releaseall is NOT a terminator (vanilla always follows it with `end`),
-        # so a script ending in releaseall still needs an appended `end`.
-        last_cmd = _last_nonblank(merged)
-        if last_cmd not in ('end', 'return', 'step_end'):
+        if label not in falls and _needs_end_terminator(merged):
             out.append('end\n')
         out.append('\n')
 
     return out
 
 
-def _last_nonblank(lines: list[str]) -> str:
-    """Return the stripped last non-blank line, or empty string."""
-    for line in reversed(lines):
+# Commands after which execution never falls through to the next label, so
+# the writer must not append an `end`. `releaseall` is deliberately NOT here:
+# in vanilla it is always followed by `end`, and a script ending on it really
+# does run past into the next block.
+_SCRIPT_TERMINATORS = frozenset({
+    'end', 'return', 'step_end', 'goto', 'gotostd',
+})
+
+
+def _needs_end_terminator(merged: list[str]) -> bool:
+    """True if a rendered label block should get an `end` appended.
+
+    Two cases say no:
+      * the block already terminates (see ``_SCRIPT_TERMINATORS``);
+      * the block is DATA, not code — a ``<Map>_MapScripts::`` table is a
+        list of ``map_script`` entries closed by ``.byte 0``, and appending
+        `end` to it writes a stray opcode byte past the table terminator.
+        Any block whose last line is an assembler directive is data.
+
+    Blank lines and ``@`` comments are skipped when looking for the last
+    command. They come back in through ``merge_hidden_lines``, and a trailing
+    comment that really belongs to the NEXT label used to be mistaken for a
+    non-terminating command, which put an `end` after it — 86 of them across
+    the project even once the lock/release injection was gone.
+    See docs/BUGS.md → "EVENTide: lock/release/end injected into scripts".
+    """
+    last = ''
+    for line in reversed(merged):
         s = line.strip()
-        if s:
-            return s
-    return ''
+        if s and not s.startswith('@'):
+            last = s
+            break
+    if not last:
+        return True
+    if last.startswith('.'):
+        return False
+    return last.split(None, 1)[0] not in _SCRIPT_TERMINATORS
 
 
 def write_scripts_inc(
@@ -2060,6 +2159,17 @@ def write_scripts_inc(
     if current_lines or current_label is not None:
         blocks.append((current_label, current_lines))
 
+    # Which blocks deliberately fall through into the next label? Anything
+    # whose own last command is not a terminator did, and re-rendering it must
+    # not quietly staple an `end` on and cut the fall-through. The original
+    # file is the only place that knows, which is why this is computed here and
+    # handed down rather than guessed at inside _render_label_block.
+    fallthrough: set[str] = set()
+    for block_label, block_lines in blocks:
+        body = block_lines[1:]  # drop the `Label::` line itself
+        if block_label and body and _needs_end_terminator(body):
+            fallthrough.add(block_label)
+
     # Build the output: for labels in pages, replace with rendered
     # version.  For everything else, keep the original lines.
     written_labels: set[str] = set()
@@ -2069,7 +2179,14 @@ def write_scripts_inc(
         if block_label and block_label in pages:
             rendered = _render_label_block(
                 block_label, pages[block_label], hidden_lines, texts,
+                fallthrough,
             )
+            # Keep the ORIGINAL `Label::` line verbatim. _render_label_block
+            # rebuilds it as a bare `Label::`, which drops anything the author
+            # wrote after it — vanilla decorates several with a ROM address
+            # (`Label:: @ 8169002`), and that is the user's text to keep.
+            if rendered and block_lines:
+                rendered[0] = block_lines[0]
             out_lines.extend(rendered)
             written_labels.add(block_label)
         else:

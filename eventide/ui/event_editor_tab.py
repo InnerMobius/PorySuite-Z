@@ -797,12 +797,12 @@ def _stringize(cmd_tuple: tuple) -> str:
     if cmd == 'message':
         label = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         text = cmd_tuple[2] if len(cmd_tuple) > 2 else ''
-        # 5th element selects render mode (Normal vs Braille). The
-        # command-list shows a "Braille:" prefix on braille messages
-        # so the user can spot them at a glance — they compile through
-        # a different path and have different in-game appearance.
+        # 5th element selects render mode (Normal / Braille / Text Only).
+        # The command list labels the non-normal ones so the user can spot
+        # them at a glance — they compile through different engine paths
+        # and behave differently in game.
         render = cmd_tuple[4] if len(cmd_tuple) > 4 else 'normal'
-        prefix = 'Braille' if render == 'braille' else 'Text'
+        prefix = {'braille': 'Braille', 'raw': 'Text Only'}.get(render, 'Text')
         if text:
             # Strip trailing $ (end-of-string marker in pokefirered)
             display = text.rstrip('$')
@@ -914,9 +914,15 @@ def _stringize(cmd_tuple: tuple) -> str:
     # ── Warps ───────────────────────────────────────────────────────────
     if cmd in ('warp', 'warpsilent', 'warpdoor', 'warphole', 'warpteleport'):
         dest = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
-        x = cmd_tuple[2] if len(cmd_tuple) > 2 else ''
-        y = cmd_tuple[3] if len(cmd_tuple) > 3 else ''
-        return f'@>{friendly}: {dest} ({x}, {y})'
+        # 5 elements carry an explicit warp ID before the coordinates.
+        if len(cmd_tuple) >= 5:
+            return (f'@>{friendly}: {dest} '
+                    f'(warp {cmd_tuple[2]} — {cmd_tuple[3]}, {cmd_tuple[4]})')
+        if len(cmd_tuple) == 4:
+            return f'@>{friendly}: {dest} ({cmd_tuple[2]}, {cmd_tuple[3]})'
+        if len(cmd_tuple) == 3:
+            return f'@>{friendly}: {dest} (warp {cmd_tuple[2]})'
+        return f'@>{friendly}: {dest}'
 
     # ── Movement ────────────────────────────────────────────────────────
     if cmd == 'applymovement':
@@ -1353,16 +1359,24 @@ class _MessageWidget(_CommandWidget):
         # render as actual dot patterns in the game window.
         top.addWidget(QLabel('Render:'))
         self.render_combo = QComboBox()
-        self.render_combo.addItems(['Normal', 'Braille'])
-        if str(render).lower() == 'braille':
+        self.render_combo.addItems(['Normal', 'Braille', 'Text Only'])
+        _render = str(render).lower()
+        if _render == 'braille':
             self.render_combo.setCurrentIndex(1)
-        self.render_combo.setMaximumWidth(110)
+        elif _render == 'raw':
+            self.render_combo.setCurrentIndex(2)
+        self.render_combo.setMaximumWidth(130)
         self.render_combo.setToolTip(_tt(
-            'Normal — regular dialogue (.string + msgbox).\n'
+            'Normal — regular dialogue (.string + msgbox). Shows the box, '
+            'waits for the player, then closes it.\n'
             'Braille — compiles via .braille + braillemessage. Plain '
             'letters only; colors and tokens are disabled because the '
             'braille font has its own glyph table that doesn\'t share '
-            'character codes with normal text.'))
+            'character codes with normal text.\n'
+            'Text Only — the bare `message` command. Puts the words on '
+            'screen and nothing else: no waiting and no closing, so the '
+            'script decides what happens next. Use it before a choice box '
+            'or a multichoice, which need the window left open.'))
         top.addWidget(self.render_combo)
 
         layout.addLayout(top)
@@ -1389,7 +1403,9 @@ class _MessageWidget(_CommandWidget):
         def _on_render_changed(idx: int) -> None:
             is_braille = (idx == 1)
             self.text_edit.set_braille_mode(is_braille)
-            self.type_combo.setEnabled(not is_braille)
+            # Neither braillemessage nor the bare `message` command takes a
+            # MSGBOX_TYPE argument, so the type combo is dead in both modes.
+            self.type_combo.setEnabled(idx == 0)
         self.render_combo.currentIndexChanged.connect(_on_render_changed)
         # Apply the initial state once.
         _on_render_changed(self.render_combo.currentIndex())
@@ -1434,12 +1450,14 @@ class _MessageWidget(_CommandWidget):
         label = self.label_combo.currentText().strip() or None
         text = self.text_edit.get_eventide_text()
         msg_type = self.type_combo.currentText().strip()
-        render = ('braille' if self.render_combo.currentIndex() == 1
-                  else 'normal')
+        render = {1: 'braille', 2: 'raw'}.get(
+            self.render_combo.currentIndex(), 'normal')
         # Tuple stays 4-element for normal messages so existing readers
-        # don't change. Braille messages add a 5th render token.
-        if render == 'braille':
-            return ('message', label, text, msg_type, 'braille')
+        # don't change. Braille and Text Only add a 5th render token.
+        if render != 'normal':
+            # Neither mode carries a MSGBOX type — drop it rather than
+            # round-tripping a value the writer would ignore.
+            return ('message', label, text, '', render)
         return ('message', label, text, msg_type)
 
     def friendly_name(self):
@@ -2123,8 +2141,15 @@ class _WaitbuttonWidget(_CommandWidget):
 # ═════════════════════════════════════════════════════════════════════════════
 
 class _WarpWidget(_CommandWidget):
-    """Warp Player — map picker + coordinates."""
-    def __init__(self, warp_cmd='warp', dest_map='', x=0, y=0, parent=None):
+    """Warp Player — map picker + optional warp ID + coordinates.
+
+    The engine's warp macro takes the destination map plus up to three more
+    arguments: an optional warp ID and an optional x/y pair. Warp ID -1 in
+    the spinner means "not given", which reproduces the shorter
+    ``warp MAP, x, y`` form exactly.
+    """
+    def __init__(self, warp_cmd='warp', dest_map='', x=0, y=0, parent=None,
+                 warp_id=None):
         super().__init__(parent)
         self._cmd = warp_cmd
         layout = QVBoxLayout(self)
@@ -2139,7 +2164,28 @@ class _WarpWidget(_CommandWidget):
         self.map_picker.set_values(dest_map, x, y)
         layout.addWidget(self.map_picker)
 
+        id_row = QHBoxLayout()
+        id_row.setContentsMargins(0, 0, 0, 0)
+        id_row.addWidget(QLabel('Warp ID:'))
+        self.warp_id_spin = QSpinBox()
+        self.warp_id_spin.setRange(-1, 255)
+        self.warp_id_spin.setSpecialValueText('(none)')
+        self.warp_id_spin.setValue(
+            int(warp_id) if warp_id is not None and str(warp_id).lstrip('-').isdigit()
+            else -1)
+        self.warp_id_spin.setToolTip(_tt(
+            'Which numbered warp on the destination map to arrive at.\n'
+            'Leave it on "(none)" to land on the X/Y tile above instead —\n'
+            'that writes the shorter warp form with no ID.'))
+        id_row.addWidget(self.warp_id_spin)
+        id_row.addStretch()
+        layout.addLayout(id_row)
+
     def to_tuple(self):
+        wid = self.warp_id_spin.value()
+        if wid >= 0:
+            return (self._cmd, self.map_picker.map_name(), wid,
+                    self.map_picker.x(), self.map_picker.y())
         return (self._cmd, self.map_picker.map_name(),
                 self.map_picker.x(), self.map_picker.y())
 
@@ -5155,7 +5201,8 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         label = cmd_tuple[1] if len(cmd_tuple) > 1 else None
         text = cmd_tuple[2] if len(cmd_tuple) > 2 else ''
         msg_type = cmd_tuple[3] if len(cmd_tuple) > 3 else ''
-        # 5th element is the optional render type ('normal' | 'braille').
+        # 5th element is the optional render type ('normal' | 'braille' |
+        # 'raw' — the bare `message` command).
         # Defaults to 'normal' so old 4-tuples continue to work unchanged.
         render = cmd_tuple[4] if len(cmd_tuple) > 4 else 'normal'
         return _MessageWidget(label, text, msg_type, render=render)
@@ -5241,10 +5288,18 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
 
     # ── World & Characters (Page 2) ──────────────────────────────────────
     if cmd in ('warp', 'warpsilent', 'warpdoor', 'warphole', 'warpteleport'):
-        if len(cmd_tuple) >= 4:
-            return _WarpWidget(cmd, cmd_tuple[1], cmd_tuple[2], cmd_tuple[3])
+        # 5 elements = map, warpId, x, y.  4 = map, x, y.  Fewer = partial.
+        if len(cmd_tuple) >= 5:
+            return _WarpWidget(cmd, cmd_tuple[1], _safe_int(cmd_tuple[3]),
+                               _safe_int(cmd_tuple[4]), warp_id=cmd_tuple[2])
+        if len(cmd_tuple) == 4:
+            return _WarpWidget(cmd, cmd_tuple[1], _safe_int(cmd_tuple[2]),
+                               _safe_int(cmd_tuple[3]))
+        if len(cmd_tuple) == 3:
+            return _WarpWidget(cmd, cmd_tuple[1], 0, 0, warp_id=cmd_tuple[2])
         parts = _split_args(args)
-        return _WarpWidget(cmd, parts[0], _safe_int(parts[1]) if len(parts) > 1 else 0,
+        return _WarpWidget(cmd, parts[0] if parts else '',
+                           _safe_int(parts[1]) if len(parts) > 1 else 0,
                            _safe_int(parts[2]) if len(parts) > 2 else 0)
 
     if cmd == 'applymovement':
@@ -6235,6 +6290,15 @@ class EventEditorTab(QWidget):
         self._local_text_labels: set[str] = set()
         self._external_script_labels: set[str] = set()  # labels from data/scripts/
         self._external_script_files: dict[str, Path] = {}  # label → source file path
+        # Comments / blank lines inside each external block, and the commands
+        # exactly as read. _save_external_scripts needs both so it can replay
+        # the comments and skip shared scripts the user never touched.
+        self._external_hidden_lines: dict[str, list] = {}
+        self._external_baseline: dict[str, list] = {}
+        # Content hash of every file this tab READ, taken at read time. Save
+        # re-checks them and refuses to write over a file something else has
+        # changed since. See _changed_on_disk().
+        self._disk_state: dict[Path, str | None] = {}
         self._hidden_lines = {}
         self._pages = {}
         self._page_types = {}
@@ -6293,6 +6357,86 @@ class EventEditorTab(QWidget):
             cmds = page.get('commands', [])
             if isinstance(cmds, list):
                 self._all_scripts[label] = list(cmds)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # External-change detection
+    #
+    # The editor holds a whole map parsed in memory and rewrites it wholesale
+    # on Save. If anything else changes one of those files in the meantime —
+    # Porymap, a git pull or checkout, a text editor, Tools > Repair Map
+    # Script Damage, another PorySuite window — then saving writes the
+    # editor's older copy straight over it and the other change is gone with
+    # no warning. There IS a file watcher wired to reload_current_map(), but a
+    # watcher is a best-effort notification, not a guarantee: it can be missed
+    # while the app is backgrounded, on a network or VM filesystem, or when
+    # two writes land inside its debounce window. Worse, the watcher's own
+    # "External Changes Detected" prompt offers Save, which lands right back
+    # in _on_save().
+    #
+    # So the check belongs at the point of writing, where it cannot be
+    # bypassed, and it is based on what was actually READ rather than on
+    # having been told. Never remove this in favour of trusting the watcher.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _remember_disk_state(self, *paths) -> None:
+        """Record the on-disk content hash of each file just read."""
+        from eventide.backend.eventide_utils import file_fingerprint
+        for p in paths:
+            if p is not None:
+                self._disk_state[Path(p)] = file_fingerprint(Path(p))
+
+    def _changed_on_disk(self) -> list[Path]:
+        """Files this tab read that something else has changed since.
+
+        Pure and side-effect free so it can be tested directly — the Save
+        path's dialog is not what needs covering, this is.
+        """
+        from eventide.backend.eventide_utils import file_fingerprint
+        return [p for p, seen in sorted(self._disk_state.items())
+                if file_fingerprint(p) != seen]
+
+    def _confirm_overwrite_external(self, stale: list[Path]) -> bool:
+        """Ask what to do about externally-changed files. True = go on saving."""
+        from PyQt6.QtWidgets import QMessageBox
+        names = '\n'.join(f'  • {p.name}  (in {p.parent.name})'
+                          for p in stale[:12])
+        if len(stale) > 12:
+            names += f'\n  … and {len(stale) - 12} more'
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle('Changed Outside the Event Editor')
+        box.setText(
+            'These files have changed on disk since this map was opened '
+            'here:\n\n' + names)
+        box.setInformativeText(
+            'Something else edited them — Porymap, a git pull, a text '
+            'editor, or Tools → Repair Map Script Damage.\n\n'
+            'Saving now would replace those changes with the version this '
+            'editor loaded earlier, and they would be lost.\n\n'
+            'Reload from disk   — take what is on disk and lose unsaved edits here.\n'
+            'Save anyway        — keep this editor’s version and lose the other change.\n'
+            'Cancel             — change nothing.')
+        reload_btn = box.addButton('Reload from disk',
+                                   QMessageBox.ButtonRole.AcceptRole)
+        force_btn = box.addButton('Save anyway',
+                                  QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(box.button(QMessageBox.StandardButton.Cancel))
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is reload_btn:
+            self._mw.log_message(
+                'Event Editor: reloading from disk — the save was abandoned '
+                'so the external changes stay.')
+            self._load_map(self._map_dir)
+            return False
+        if clicked is force_btn:
+            self._mw.log_message(
+                f'Event Editor: WARNING — overwriting {len(stale)} externally '
+                f'changed file(s) at the user’s request.')
+            return True
+        self._mw.log_message('Event Editor: save cancelled, nothing written.')
+        return False
 
     def has_unsaved_changes(self) -> bool:
         """Return True if the window has been marked as modified."""
@@ -7064,6 +7208,17 @@ class EventEditorTab(QWidget):
 
         Found labels are tracked in ``_external_script_labels`` so the save
         logic knows not to write them into the map's scripts.inc.
+
+        Two things are recorded alongside the commands, both for
+        ``_save_external_scripts``:
+
+        * ``_external_hidden_lines`` — the blank lines and ``@`` comments
+          inside each block, positioned the same way ``parse_scripts_inc``
+          records them. Without these the save path rewrote shared files with
+          every comment stripped out.
+        * ``_external_baseline`` — the commands exactly as they were read, so
+          the save path can tell an untouched shared script from an edited one
+          and leave the untouched ones alone.
         """
         from eventide.backend.eventide_utils import _parse_script_lines
 
@@ -7101,32 +7256,48 @@ class EventEditorTab(QWidget):
             # Parse label blocks from this file
             current_label = None
             current_lines: list[str] = []
+            hidden_buf: list[tuple[int, str]] = []
+
+            def _adopt(label, lines, hidden):
+                """Record one resolved external label."""
+                cmds = _parse_script_lines(lines, self._texts)
+                self._all_scripts[label] = cmds
+                self._external_script_labels.add(label)
+                self._external_script_files[label] = src_file
+                self._external_hidden_lines[label] = list(hidden)
+                # Shared files are written back by _save_external_scripts, so
+                # they need the same protection as the map's own files.
+                self._remember_disk_state(src_file)
+                # Deep-copy the baseline: _all_scripts[label] is handed around
+                # live, so a shallow alias would compare equal to itself and
+                # every shared script would look untouched.
+                self._external_baseline[label] = [tuple(c) for c in cmds]
+                missing.discard(label)
 
             for line in text.splitlines():
                 m = label_re.match(line.strip())
                 if m:
                     # Flush previous label
                     if current_label and current_label in missing:
-                        cmds = _parse_script_lines(current_lines, self._texts)
-                        self._all_scripts[current_label] = cmds
-                        self._external_script_labels.add(current_label)
-                        self._external_script_files[current_label] = src_file
-                        missing.discard(current_label)
+                        _adopt(current_label, current_lines, hidden_buf)
                         found += 1
                     current_label = m.group(1)
                     current_lines = []
+                    hidden_buf = []
                     continue
                 stripped = line.strip()
-                if current_label and stripped and not stripped.startswith('@'):
+                if not current_label:
+                    continue
+                if stripped and not stripped.startswith('@'):
                     current_lines.append(line)
+                else:
+                    # Blank line or comment — remember WHERE it sat so the
+                    # save path can put it back between the same commands.
+                    hidden_buf.append((len(current_lines), line))
 
             # Flush final label
             if current_label and current_label in missing:
-                cmds = _parse_script_lines(current_lines, self._texts)
-                self._all_scripts[current_label] = cmds
-                self._external_script_labels.add(current_label)
-                self._external_script_files[current_label] = src_file
-                missing.discard(current_label)
+                _adopt(current_label, current_lines, hidden_buf)
                 found += 1
 
         if found:
@@ -7140,7 +7311,14 @@ class EventEditorTab(QWidget):
         # can corrupt new map data by writing stale UI values from the
         # previous map into the new _objects list at the old index.
         self._current_obj_idx = -1
+        # Every external-script record is per-map — clear all four together or
+        # a shared script resolved for the PREVIOUS map stays eligible for
+        # write-back while editing this one.
         self._external_script_labels = set()
+        self._external_script_files = {}
+        self._external_hidden_lines = {}
+        self._external_baseline = {}
+        self._disk_state = {}
 
         self._map_dir = map_dir
         map_json = map_dir / 'map.json'
@@ -7280,8 +7458,8 @@ class EventEditorTab(QWidget):
                 obj['_pages'] = self._build_script_pages(script, self._all_scripts)
             else:
                 # SELF-HEAL: an object whose script field is NULL/empty but whose
-                # derived script (from its local_id, e.g. LOCALID_KAKARIKO_ANJU →
-                # Kakariko_EventScript_Anju) still exists in scripts.inc got its
+                # derived script (from its local_id, e.g. LOCALID_PEWTERCITY_JOE →
+                # PewterCity_EventScript_Joe) still exists in scripts.inc got its
                 # link severed (a bad save wrote NULL while the script block stayed
                 # behind, orphaned). Re-adopt it so the NPC's pages/tabs come back
                 # instead of showing empty — and so the next save writes the link
@@ -7438,6 +7616,12 @@ class EventEditorTab(QWidget):
             f'Event Editor: loaded {name} — '
             f'{n_npc} NPC(s), {n_trig} trigger(s), {n_bg} sign(s), '
             f'{n_ms} map script(s)')
+
+        # Snapshot what we just read, so Save can tell if anything else
+        # changes these files in the meantime. External script files are
+        # recorded separately as _resolve_external_scripts adopts them.
+        self._remember_disk_state(map_json, map_dir / 'scripts.inc',
+                                  map_dir / 'text.inc')
 
         # ── Self-verification: warn about problems the user should know ──
         self._verify_loaded_events(name)
@@ -8281,8 +8465,8 @@ class EventEditorTab(QWidget):
             self._update_sprite(gfx)
             # Movement type (fill the dropdown once, then select this NPC's).
             # Keep the header/Porymap order — do NOT sort. That order is
-            # meaningful (vanilla first, this project's custom types like CUCCO /
-            # MOBLIN_CHARGE / RAISE_HAND_AND_JUMP grouped at the bottom).
+            # meaningful (vanilla first, then whatever custom MOVEMENT_TYPE_*
+            # the project has added, grouped at the bottom).
             if self.movement_combo.count() == 0:
                 mts = list(ConstantsManager.MOVEMENT_TYPES)
                 self.movement_combo.addItems(mts)
@@ -9196,7 +9380,7 @@ class EventEditorTab(QWidget):
         The build turns an object's local_id into `#define <local_id> <index>`,
         so a macro name that starts with a digit or has punctuation (e.g. the
         user typing `001`) breaks the compile. This lets the user type a plain
-        word — `Jim` → `LOCALID_KAKARIKO_JIM`, `001` → `LOCALID_KAKARIKO_001` —
+        word — `Jim` → `LOCALID_PEWTERCITY_JIM`, `001` → `LOCALID_PEWTERCITY_001` —
         and keeps an already-valid `LOCALID_*` unchanged."""
         raw = (raw or '').strip()
         if not raw:
@@ -10626,7 +10810,7 @@ class EventEditorTab(QWidget):
 
     def _derived_script_name(self, obj) -> str:
         """The CANONICAL script label an object's local_id maps to
-        (LOCALID_KAKARIKO_ANJU → Kakariko_EventScript_Anju), with NO uniqueness
+        (LOCALID_PEWTERCITY_JOE → PewterCity_EventScript_Joe), with NO uniqueness
         suffix. Used by the load-time self-heal to re-adopt an orphaned script.
         Returns '' if there's no usable local_id."""
         map_name = self._map_dir.name if self._map_dir else 'Map'
@@ -10646,8 +10830,8 @@ class EventEditorTab(QWidget):
         map_name = self._map_dir.name if self._map_dir else 'Map'
         existing = getattr(self, '_all_scripts', set()) or set()
 
-        # Prefer a name derived from the event's local_id (LOCALID_KAKARIKO_ANJU
-        # → Kakariko_EventScript_Anju) — far friendlier than "NPC1".
+        # Prefer a name derived from the event's local_id (LOCALID_PEWTERCITY_JOE
+        # → PewterCity_EventScript_Joe) — far friendlier than "NPC1".
         lid = str(obj.get('local_id', '') or '')
         if lid.startswith('LOCALID_'):
             tail = lid[len('LOCALID_'):]
@@ -11847,6 +12031,15 @@ class EventEditorTab(QWidget):
             QMessageBox.information(self, 'Save', 'No map loaded.')
             return
 
+        # Refuse to write over anything that changed under us since it was
+        # read. This runs BEFORE _collect_current and before any writer, so a
+        # Cancel or a Reload leaves every file exactly as it is. See the
+        # External-change detection block above for why this lives here and
+        # not in the file watcher.
+        stale = self._changed_on_disk()
+        if stale and not self._confirm_overwrite_external(stale):
+            return
+
         self._collect_current()
         # Inline message text can't assemble (the msgbox macro needs a label);
         # convert any to real text.inc labels before writing.
@@ -12061,16 +12254,23 @@ class EventEditorTab(QWidget):
             QMessageBox.critical(self, 'Save', str(e))
 
     def _save_external_scripts(self):
-        """Write modified external scripts back to their source files.
+        """Write CHANGED external scripts back to their source files.
 
-        For each external script label (e.g. item ball scripts), collect
-        the current commands, convert them back to script text, and update
-        the label block in the original .inc file.
+        External labels live in shared files (``data/scripts/*.inc``,
+        ``data/event_scripts.s``) that the whole project uses. Opening a map
+        resolves every label its events reference so the editor can display
+        them, which is NOT the same as the user editing them — so each label's
+        current commands are compared against the baseline captured at resolve
+        time and only genuine edits are written. Writing all of them used to
+        rewrite project-wide files on any save, stripping their comments.
+        See docs/BUGS.md → "EVENTide: saving a map rewrites shared scripts".
         """
         if not self._external_script_labels:
             return
 
-        from eventide.backend.eventide_utils import lines_from_commands
+        from eventide.backend.eventide_utils import (
+            lines_from_commands, merge_hidden_lines,
+        )
 
         # Collect current external script commands from loaded objects
         ext_pages: dict[str, list] = {}
@@ -12083,8 +12283,20 @@ class EventEditorTab(QWidget):
                 if label in self._external_script_labels:
                     ext_pages[label] = page.get('commands', [])
 
+        # Drop every label that still matches what was read from disk.
+        unchanged = [
+            label for label, cmds in ext_pages.items()
+            if label in self._external_baseline
+            and [tuple(c) for c in cmds] == self._external_baseline[label]
+        ]
+        for label in unchanged:
+            del ext_pages[label]
+
         if not ext_pages:
             return
+        self._mw.log_message(
+            f'Event Editor: {len(ext_pages)} shared script(s) changed, '
+            f'{len(unchanged)} left untouched.')
 
         # Group labels by source file
         by_file: dict[Path, dict[str, list]] = {}
@@ -12114,6 +12326,13 @@ class EventEditorTab(QWidget):
                 if m:
                     existing_labels.add(m.group(1))
 
+            def _render(label):
+                """Rebuild one label's body, comments and blank lines included."""
+                hidden = self._external_hidden_lines.get(label, [])
+                cmd_lines = lines_from_commands(
+                    labels_to_update[label], self._texts, None, hidden)
+                return merge_hidden_lines(cmd_lines, hidden)
+
             # Rebuild the file, replacing existing label blocks
             output: list[str] = []
             current_label = None
@@ -12125,9 +12344,7 @@ class EventEditorTab(QWidget):
                     lbl = m.group(1)
                     if skipping and current_label in labels_to_update:
                         # Emit replacement content for previous label
-                        cmds = labels_to_update[current_label]
-                        cmd_lines = lines_from_commands(cmds, self._texts)
-                        output.extend(cmd_lines)
+                        output.extend(_render(current_label))
 
                     current_label = lbl
                     output.append(line)
@@ -12140,16 +12357,13 @@ class EventEditorTab(QWidget):
 
             # Flush final label
             if skipping and current_label in labels_to_update:
-                cmds = labels_to_update[current_label]
-                cmd_lines = lines_from_commands(cmds, self._texts)
-                output.extend(cmd_lines)
+                output.extend(_render(current_label))
 
             # Append new labels that weren't in the original file
-            for label, cmds in labels_to_update.items():
+            for label in labels_to_update:
                 if label not in existing_labels:
                     output.append(f'\n{label}::\n')
-                    cmd_lines = lines_from_commands(cmds, self._texts)
-                    output.extend(cmd_lines)
+                    output.extend(_render(label))
 
             try:
                 src_file.parent.mkdir(parents=True, exist_ok=True)

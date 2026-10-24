@@ -666,6 +666,15 @@ class UnifiedMainWindow(QMainWindow):
         fulldex_action.triggered.connect(self._on_export_fulldex)
         tools_menu.addAction(fulldex_action)
 
+        repair_action = QAction("Repair Map Script Damage…", self)
+        repair_action.setToolTip(
+            "Check the project's map scripts for damage left by older\n"
+            "EVENTide builds, and offer to repair it. Shows you\n"
+            "exactly what it found and what it would change before touching\n"
+            "anything — and nothing is written unless you say so.")
+        repair_action.triggered.connect(self._on_repair_map_scripts)
+        tools_menu.addAction(repair_action)
+
         tools_menu.addSeparator()
 
         open_terminal_action = QAction("Open Terminal", self)
@@ -1862,6 +1871,174 @@ class UnifiedMainWindow(QMainWindow):
                 open_folder(root)
             except Exception:
                 pass
+
+    def _on_repair_map_scripts(self):
+        """Find and offer to repair damage left by older EVENTide saves.
+
+        Read-only until the user presses Repair. Everything it would change is
+        listed first, grouped and counted, and the one class of damage that
+        cannot be told apart from the user's own edits is listed separately as
+        review-only. See `core/eventide_repair.py` for how each detector was
+        calibrated against a clean copy of the game.
+        """
+        if not self.project_info:
+            QMessageBox.information(self, "Repair Map Script Damage",
+                                    "No project is open.")
+            return
+        root = self.project_info.get("dir", "")
+        if not root:
+            QMessageBox.information(self, "Repair Map Script Damage",
+                                    "No project folder is set.")
+            return
+
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QCheckBox,
+                                     QPlainTextEdit, QDialogButtonBox)
+        from core.eventide_repair import (
+            scan, repair, summarize, damaged_maps, title_for,
+            KIND_INDENT, REPAIRABLE)
+
+        try:
+            findings = scan(root)
+        except Exception as exc:
+            QMessageBox.critical(self, "Repair Map Script Damage",
+                                 f"Could not read the map scripts:\n{exc}")
+            return
+
+        if not findings:
+            QMessageBox.information(
+                self, "Repair Map Script Damage",
+                "Nothing to repair — none of the project's map scripts show "
+                "the damage older EVENTide builds left behind.")
+            return
+
+        counts = summarize(findings)
+        maps = damaged_maps(findings)
+
+        report = [
+            f"{len(maps)} map(s) were saved by an older EVENTide build and "
+            f"still carry its damage.", ""]
+        for kind in REPAIRABLE:
+            if counts.get(kind):
+                report.append(f"  {counts[kind]:>5}  {title_for(kind)}")
+        report += ["", "Where:", ""]
+        for name in maps:
+            lines = sorted(f.line for f in findings
+                           if f.map_name == name and f.kind != KIND_INDENT)
+            report.append(f"  {name} — line(s) {', '.join(map(str, lines))}")
+        report += ["", "Detail:", ""]
+        for f in findings:
+            if f.kind != KIND_INDENT:
+                report.append(f"  {f.map_name}:{f.line}  {f.detail}")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Repair Map Script Damage")
+        dlg.resize(820, 560)
+        v = QVBoxLayout(dlg)
+
+        head = QLabel(
+            "<b>Back up or commit your game project before repairing.</b><br>"
+            "This edits your map scripts. Nothing is written until you press "
+            "Repair, and the repair can be run again safely.")
+        head.setWordWrap(True)
+        v.addWidget(head)
+
+        box = QPlainTextEdit()
+        box.setPlainText("\n".join(report))
+        box.setReadOnly(True)
+        from PyQt6.QtGui import QFont
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono.setPointSize(9)
+        box.setFont(mono)
+        v.addWidget(box, 1)
+
+        # Indentation is a big, purely cosmetic change — let the user decide.
+        n_indent = counts.get(KIND_INDENT, 0)
+        chk_indent = QCheckBox(
+            f"Also restore the lost tab indentation ({n_indent} line(s) across "
+            f"the same {len(maps)} map(s))")
+        chk_indent.setChecked(True)
+        chk_indent.setToolTip(
+            "Purely cosmetic — the game builds and plays the same either way.\n"
+            "Worth doing: it is what makes these files readable in git again.\n"
+            "Only the maps listed above are touched; maps that were simply\n"
+            "written unindented upstream are left alone.")
+        v.addWidget(chk_indent)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel)
+        do_btn = buttons.addButton("Repair",
+                                   QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.rejected.connect(dlg.reject)
+        do_btn.clicked.connect(dlg.accept)
+        v.addWidget(buttons)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self.log_message("Repair Map Script Damage: cancelled, "
+                             "nothing was written.")
+            return
+
+        # Convenience, NOT the safety mechanism. EVENTide's own save path now
+        # fingerprints every file it reads and refuses to write over one that
+        # changed underneath it (see EventEditorTab._changed_on_disk), so a
+        # repair can no longer be silently undone even if this check is
+        # skipped. Asking here just keeps the user out of a confusing state —
+        # repair, then hit a "changed outside the editor" prompt they did not
+        # expect — rather than being what prevents the data loss.
+        ev_tab = getattr(self._eventide_window, "event_editor_tab", None)
+        open_map = getattr(ev_tab, "_current_map", "") if ev_tab else ""
+        if (open_map and open_map in maps
+                and self._eventide_window
+                and self._eventide_window.isWindowModified()):
+            QMessageBox.warning(
+                self, "Repair Map Script Damage",
+                f"EVENTide has unsaved changes to '{open_map}', which is one "
+                f"of the maps that needs repairing.\n\n"
+                f"Save or discard those changes in EVENTide first, then run "
+                f"the repair again — otherwise saving in EVENTide afterwards "
+                f"would write its older copy back over the repair.\n\n"
+                f"Nothing has been changed.")
+            self.log_message(
+                "Repair Map Script Damage: stopped — EVENTide has unsaved "
+                f"edits to {open_map}. Nothing was written.")
+            return
+
+        kinds = set(REPAIRABLE)
+        if not chk_indent.isChecked():
+            kinds.discard(KIND_INDENT)
+
+        try:
+            result = repair(root, kinds=kinds, findings=findings)
+        except Exception as exc:
+            QMessageBox.critical(self, "Repair Map Script Damage",
+                                 f"The repair failed:\n{exc}")
+            return
+
+        done = summarize(result.repaired)
+        lines = [f"Repaired {len(result.files_written)} file(s)."]
+        for kind in REPAIRABLE:
+            if done.get(kind):
+                lines.append(f"  {done[kind]} × {title_for(kind)}")
+        if result.errors:
+            lines += ["", "Problems:"] + [f"  {e}" for e in result.errors]
+
+        # Pull the repaired file back into EVENTide if it is showing one of
+        # the maps we just rewrote, so its view matches disk. The guarded
+        # reload prompts if there are unsaved edits rather than discarding.
+        if ev_tab and open_map and open_map in maps:
+            try:
+                ev_tab.reload_current_map()
+                lines.append("")
+                lines.append(f"EVENTide reloaded '{open_map}' from disk.")
+            except Exception as exc:
+                lines.append("")
+                lines.append(f"Could not reload '{open_map}' in EVENTide "
+                             f"({exc}) — press F5 before saving there.")
+
+        lines += ["", "Rebuild the game to pick up the changes."]
+        self.log_message("Repair Map Script Damage: " + lines[0])
+        QMessageBox.information(self, "Repair Map Script Damage",
+                                "\n".join(lines))
 
     def _on_deunown(self):
         """Remove the Unown letter-form mechanism from the project's game source.
