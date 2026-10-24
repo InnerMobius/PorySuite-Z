@@ -250,6 +250,75 @@ def load_command_categories(root_dir: str) -> dict[str, list[tuple[str, str]]]:
 # Script parsing
 # ═════════════════════════════════════════════════════════════════════════════
 
+def parse_script_snippet(text: str, texts: dict | None = None) -> list[tuple]:
+    """Parse a loose chunk of pasted script text into command tuples.
+
+    This is for the Paste button: the user copies a few lines out of a wiki, a
+    reference `.inc`, or another map and drops them straight into the command
+    list. Unlike :func:`parse_raw_script_text`, which is the whole-script
+    editor's parser and needs well-formed ``Label::`` blocks, this accepts
+    whatever was on the clipboard:
+
+    * bare command lines with no label at all (the common case);
+    * a leading ``Label::`` line, which is dropped — pasting INTO a page means
+      the page already has its own label;
+    * further ``Label::`` lines, kept as `_label_marker` so a multi-block
+      paste still splits into sub-labels on save, the same as a loaded script;
+    * blank lines and ``@`` comments, which are skipped;
+    * leading indentation, which is irrelevant.
+
+    *texts* is the map's label->string store, so a pasted ``msgbox Some_Text``
+    shows its real wording in the command list instead of "(empty)".
+
+    Returns [] when nothing parsed, so a caller can fall back to its own
+    clipboard rather than inserting garbage. Never raises — the worst a
+    nonsense paste produces is a generic ``(word, rest)`` command, which is
+    what the file parser would have made of the same line.
+    """
+    if not text or not text.strip():
+        return []
+    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+
+    out: list[tuple] = []
+    pending: list[str] = []
+    seen_label = False
+
+    def _flush():
+        if pending:
+            out.extend(_parse_script_lines(pending, texts or {}))
+            pending.clear()
+
+    label_re = re.compile(r'^([A-Za-z0-9_]+)::')
+    for raw in lines:
+        stripped = raw.strip()
+        m = label_re.match(stripped)
+        if m:
+            _flush()
+            # The FIRST label is the snippet's own heading and is redundant —
+            # it is being pasted into a page that already has a label. Later
+            # ones are real sub-labels worth keeping.
+            if seen_label:
+                out.append(('_label_marker', m.group(1)))
+            seen_label = True
+            continue
+        if not stripped or stripped.startswith('@'):
+            continue
+        # Drop a trailing inline comment; the command parser would otherwise
+        # fold it into the arguments. Scan for an `@` OUTSIDE quotes —
+        # `msgbox "mail me @ home"` is text, not a comment.
+        code, in_quote = stripped, False
+        for i, ch in enumerate(stripped):
+            if ch == '"':
+                in_quote = not in_quote
+            elif ch == '@' and not in_quote:
+                code = stripped[:i].rstrip()
+                break
+        if code:
+            pending.append(code)
+    _flush()
+    return out
+
+
 def file_fingerprint(path: Path) -> str | None:
     """Return a content hash for *path*, or None if it does not exist.
 

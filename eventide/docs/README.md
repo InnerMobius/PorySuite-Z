@@ -21,7 +21,11 @@ The centrepiece. A visual script editor modeled after RPG Maker XP's event edito
 - **Editable conditions box**: Flag/var conditions above Event Properties with searchable pickers
 - **▶ Preview (Play Pokémon Cry)**: The `playmoncry` command widget has a Preview button that plays the selected species' cry from `sound/direct_sound_samples/cries/*.wav`.
 - **▶ Preview / ■ Stop / 🔊 Open (Sound commands)**: The `playbgm`, `playse`, and `playfanfare` command widgets have three integration buttons. ▶ renders and plays the selected song in the background without leaving the Event Editor. ■ stops playback. 🔊 switches to the Sound Editor tab and selects the song.
-- **93 command widgets**: Searchable constant pickers, context-aware dropdowns, scroll-wheel guarded. The 3-page command palette is laid out everyday-use-first — page 1 has lock/faceplayer/applymovement/trainerbattle/message/giveitem/setflag/wildbattle at the top.
+- **94 command widgets**: Searchable constant pickers, context-aware dropdowns, scroll-wheel guarded. The 3-page command palette is laid out everyday-use-first — page 1 has lock/faceplayer/applymovement/trainerbattle/message/giveitem/setflag/wildbattle at the top.
+- **Written for people who don't write code**: every command carries a one-sentence description, shown at the top
+  of its edit dialog and in a hint strip at the bottom of the command picker that follows the mouse. Every field
+  has a tooltip. Comparisons read **is exactly / is NOT / is less than / is at least / is at most / is more than**
+  rather than `==` `!=` `<` `>=` `<=` `>`.
 - **Display overhaul**: Human-readable names for trainers, items, species, moves, flags, vars
 - **Message render modes**: the message dialog's Render dropdown picks *Normal* (`.string` + `msgbox` — the full show /
   wait / button / close routine), *Braille* (`.braille` + `braillemessage`), or *Text Only* (the bare `message`
@@ -89,6 +93,55 @@ Every patch is another C++ anchor that can drift when Porymap updates upstream, 
 dialog. If this is ever revisited, test whether sending the existing `openMap` for the already-open map makes
 Porymap re-read it, before adding a new patch.
 
+### Pickers instead of typing
+Nothing in a command dialog has to be typed as a raw constant, bar one deliberate exception.
+
+- **Value fields** (Set Variable, Add/Sub, both compares, both conditional compares) offer every enum-style
+  constant **your project** defines, read out of `include/constants/`, with the prefix stripped for reading and
+  the raw constant kept underneath. A project that invents its own families of constants gets them listed like
+  any other; nothing in EVENTide knows the name of a single game constant. Plain numbers and TRUE/FALSE sit at
+  the top of the list, and anything can still be typed if it is not offered.
+- **"Which character?" fields** (all ten object commands) list *This event*, *The player*, and then every
+  character on the map by who they are and what sprite they use — `Joe — Man`, `Item ball — Potion` — rather
+  than a bare local id. Wait for Movement's `0` entry reads *Everyone who is moving*, which is what it means.
+- **Buffer Number** offers your variables. **Buffer String** offers the text this map already has.
+  **Multi-Choice** offers your `MULTICHOICE_*` option lists. **Set Metatile** offers your `METATILE_*` tiles.
+- **An id or constant EVENTide doesn't recognise is written back exactly as you typed it.** Nothing is quietly
+  respelled, so a hand-written script keeps its own wording after a round trip through the editor.
+- The one field left as free text is the fallback editor for commands that have no dialog of their own. It takes
+  the arguments verbatim, the way the script file spells them, and its tooltip says so.
+
+### Picking a sprite by looking at it
+Both places that choose an overworld graphic — the NPC's **Graphic** field and the **Change Graphic** command —
+have a **Browse…** button beside them. It opens a searchable grid of every `OBJ_EVENT_GFX_*` the project defines,
+drawn as thumbnails, with the selected tile's raw constant shown underneath so what reaches the script is never a
+mystery. A constant the project defines but ships no picture for is still listed; it is a valid choice, it just
+has no tile.
+
+Thumbnails are the first frame of each sheet, rendered through `core.sprite_render` (never a flat `QPixmap`).
+Overworld palettes live apart from the PNG, keyed by palette tag, so the gallery shows the sheet's own baked
+palette rather than an unsaved palette edit from the Overworld Graphics tab.
+
+### Choosing a map
+**Graphic is the first row of Event Properties**, and the animated sprite preview sits in that row rather than
+at the bottom of the column, with **Open PNG** and **OW Graphics** beneath the picker. The preview is fixed at
+70x72 and scales anything larger down to fit, so a 64x64 sheet cannot stretch the row.
+
+The **Map** box sits on the Event Editor's own toolbar — no dialog. Type any part of a name and the list
+narrows; press Enter or pick from the drop-down to open it. It matches anywhere in the name, not just the start,
+so "cave" finds a map whose name ends in one. The wheel does nothing unless the list is open, so scrolling the
+page over it cannot swap your map. Cancel an unsaved-changes prompt and the box snaps back to the map you are
+really editing.
+
+### Templates that include a message
+A `message` command saved in a **My Templates** entry can leave its label blank. On Save, EVENTide names it
+`<Map>_Text_<n>`, picking a number that is not already taken, and writes the text into the map's `text.inc`.
+That means one template can be applied to several events on the same map without their text labels colliding —
+each gets its own, and each is edited in the normal Show Message dialog with the usual line-limit counter.
+
+Templates can also carry `$UNUSED_FLAG$`, which is swapped for a real spare flag each time the template is
+applied.
+
 ### Script creation
 - **New Script templates**: NPC Scripts, Signs, Map Scripts, Standard Wrappers, Field Objects, Item Balls
 - **New Hidden Item**: Creates a data-only hidden item (no script) with auto-found unused flag
@@ -96,9 +149,21 @@ Porymap re-read it, before adding a new patch.
 - **Find Unused Flag**: Scans the project for available `FLAG_UNUSED_*` constants
 
 ### Command list interaction
+- **Keyboard**: `Del` delete, `Ctrl+C` / `Ctrl+X` / `Ctrl+V` copy / cut / paste, `Ctrl+D` duplicate,
+  `Alt+Up` / `Alt+Down` move, `Ctrl+Z` undo, `Ctrl+Shift+Z` (or `Ctrl+Y`) redo, `Ctrl+F` find.
+- **Select several commands** with Ctrl-click or Shift-click. Delete, Copy and Cut act on the whole selection;
+  structural rows (label markers, the inner When / Branch-End markers) are skipped rather than breaking a block.
+- **Undo / redo**: 50 levels, covering add, edit, delete, duplicate, paste, move and drag-reorder. The history
+  belongs to the page you are looking at and resets when you switch page, event or map.
 - **Drag-to-reorder**: InternalMove drag-drop
 - **Right-click context menu**: Edit, Cut, Copy, Paste, Duplicate, Move Up/Down, Insert, Delete, Go To →
-- **Command selector**: 3-page tabbed dialog with search bar and "Recent" row
+- **Command selector**: 3-page tabbed dialog with search bar, a "Recent" row, and a heading over every section.
+  Page 1 leads with an **Everyday** shortcut (Show Message, Give Item, Set Flag, If Flag, Set Move Route, Wait
+  for Movement, Play Sound Effect, Change Graphic); the commands in it also appear under their own headings
+  further down. Lock/Release sit at the bottom, since EVENTide adds them for you. Hovering a button shows its
+  description in the strip along the bottom.
+- **Give Item vs Add Item**: *Give Item* (`giveitem`) plays the jingle and prints "You got the X!"; *Add Item*
+  (`additem`) puts it in the bag in silence, for when the script says something of its own.
 - **Tooltips**: Descriptive hover tooltips on all controls, edit dialogs, and command palette. Toggleable in Settings.
 
 ## Architecture

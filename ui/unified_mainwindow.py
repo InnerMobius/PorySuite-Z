@@ -675,6 +675,25 @@ class UnifiedMainWindow(QMainWindow):
         repair_action.triggered.connect(self._on_repair_map_scripts)
         tools_menu.addAction(repair_action)
 
+        sprite_swap_action = QAction("Install Sprite Swap Command…", self)
+        sprite_swap_action.setToolTip(
+            "Add a `setobjectgraphics` script command to this project, so a\n"
+            "script can change any event's sprite mid-scene — the player's\n"
+            "included. Vanilla pokefirered has no way to do this from a\n"
+            "script at all. Shows what it would change before writing.")
+        sprite_swap_action.triggered.connect(self._on_install_sprite_swap)
+        tools_menu.addAction(sprite_swap_action)
+
+        pose_action = QAction("Add Player Pose…", self)
+        pose_action.setToolTip(
+            "Register a new player sprite pose from a red/green pair of\n"
+            "sheets — a carry pose, an emotion, a get-item hold. The engine\n"
+            "picks the right one by gender on its own. Add New Sprite cannot\n"
+            "do this: it writes NPC graphics and knows nothing about the\n"
+            "player's avatar states.")
+        pose_action.triggered.connect(self._on_add_player_pose)
+        tools_menu.addAction(pose_action)
+
         tools_menu.addSeparator()
 
         open_terminal_action = QAction("Open Terminal", self)
@@ -2039,6 +2058,190 @@ class UnifiedMainWindow(QMainWindow):
         self.log_message("Repair Map Script Damage: " + lines[0])
         QMessageBox.information(self, "Repair Map Script Damage",
                                 "\n".join(lines))
+
+    def _on_install_sprite_swap(self):
+        """Add the `setobjectgraphics` script command to the open project.
+
+        Engine work, so it says what it will touch and waits for a yes. The
+        patcher itself is idempotent and refuses rather than guessing, but the
+        user should still get a chance to commit their game repo first.
+        """
+        if not self.project_info:
+            QMessageBox.information(self, "Install Sprite Swap Command",
+                                    "No project is open.")
+            return
+        root = self.project_info.get("dir", "")
+        if not root:
+            QMessageBox.information(self, "Install Sprite Swap Command",
+                                    "No project folder is set.")
+            return
+
+        from core.sprite_swap_patch import (
+            ensure_sprite_swap_support, is_installed, describe,
+            SpriteSwapPatchError)
+
+        if is_installed(root):
+            QMessageBox.information(
+                self, "Install Sprite Swap Command",
+                "This project already has the `setobjectgraphics` command.\n\n"
+                "It is in EVENTide's command list as \"Change Graphic\".")
+            return
+
+        try:
+            summary = describe(root)
+        except Exception as exc:
+            QMessageBox.critical(self, "Install Sprite Swap Command",
+                                 f"Could not read the project:\n{exc}")
+            return
+
+        ret = QMessageBox.question(
+            self, "Install Sprite Swap Command",
+            "<b>Back up or commit your game project first.</b><br><br>"
+            "This adds a new script command to the game's own source:"
+            "<ul>"
+            "<li><code>asm/macros/event.inc</code> — the command itself</li>"
+            "<li><code>src/scrcmd.c</code> — what it does</li>"
+            "<li><code>data/script_cmd_table.inc</code> — registers it</li>"
+            "</ul>"
+            f"{summary}<br><br>"
+            "Afterwards EVENTide's command list gains <b>Change Graphic</b>, "
+            "which can swap any event's sprite — including the player's, for "
+            "carry poses and emotions.<br><br>Go ahead?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            self.log_message("Install Sprite Swap Command: cancelled.")
+            return
+
+        try:
+            result = ensure_sprite_swap_support(root)
+        except SpriteSwapPatchError as exc:
+            QMessageBox.warning(
+                self, "Install Sprite Swap Command",
+                f"Nothing was changed.\n\n{exc}")
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Install Sprite Swap Command",
+                                 f"The install failed:\n{exc}")
+            return
+
+        self.log_message("Install Sprite Swap Command: " +
+                         result.splitlines()[0])
+        QMessageBox.information(self, "Install Sprite Swap Command", result)
+
+    def _on_add_player_pose(self):
+        """Register a player avatar pose from a red/green sprite pair.
+
+        Offers the pairs already sitting in the project's people/ folder that
+        are not registered yet — which is how the two hands-up sheets were
+        found in the first place: drawn, dropped in, and referenced by nothing.
+        """
+        if not self.project_info:
+            QMessageBox.information(self, "Add Player Pose", "No project is open.")
+            return
+        root = self.project_info.get("dir", "")
+        if not root:
+            QMessageBox.information(self, "Add Player Pose",
+                                    "No project folder is set.")
+            return
+
+        import os as _os
+        import re as _re
+        from PyQt6.QtWidgets import QInputDialog
+        from core.player_pose_patch import (
+            ensure_player_pose, describe, project_supports_poses,
+            PlayerPosePatchError)
+
+        if not project_supports_poses(root):
+            QMessageBox.information(
+                self, "Add Player Pose",
+                "This project doesn't use the player avatar-state table, so "
+                "there's nothing to add a pose to.")
+            return
+
+        # Find red_*/green_* pairs whose sheets exist but which nothing
+        # references yet.
+        pics = _os.path.join(root, "graphics", "object_events", "pics", "people")
+        try:
+            names = {f[:-4] for f in _os.listdir(pics) if f.endswith(".png")}
+        except OSError:
+            names = set()
+        try:
+            with open(_os.path.join(root, "src", "data", "object_events",
+                                    "object_event_graphics.h"),
+                      encoding="utf-8") as fh:
+                registered = fh.read()
+        except OSError:
+            registered = ""
+        pairs = sorted(
+            n[len("red_"):] for n in names
+            if n.startswith("red_") and f"green_{n[4:]}" in names
+            and f"{n}.4bpp" not in registered)
+
+        if not pairs:
+            QMessageBox.information(
+                self, "Add Player Pose",
+                "No unregistered red_*/green_* sprite pairs found in\n"
+                "graphics/object_events/pics/people.\n\n"
+                "Put both sheets there first, named red_<pose>.png and\n"
+                "green_<pose>.png, 16px wide with frames stacked vertically.")
+            return
+
+        pair, ok = QInputDialog.getItem(
+            self, "Add Player Pose",
+            "Which sprite pair? (unregistered red_*/green_* pairs)",
+            pairs, editable=False)
+        if not ok or not pair:
+            return
+
+        default_state = _re.sub(r"[^A-Za-z0-9]+", "_", pair).upper().strip("_")
+        state, ok = QInputDialog.getText(
+            self, "Add Player Pose",
+            "Name for this pose state (becomes PLAYER_AVATAR_GFX_…):",
+            text=default_state)
+        state = (state or "").strip().upper()
+        if not ok or not state:
+            return
+
+        try:
+            summary = describe(root, state, f"red_{pair}", f"green_{pair}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Add Player Pose", str(exc))
+            return
+
+        ret = QMessageBox.question(
+            self, "Add Player Pose",
+            "<b>Back up or commit your game project first.</b><br><br>"
+            f"{summary}<br><br>"
+            "Registering the pose doesn't make anything use it — afterwards "
+            "you can reach it from a script with <b>Change Graphic</b>, or "
+            "point a cutscene at it.<br><br>Go ahead?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ret != QMessageBox.StandardButton.Yes:
+            self.log_message("Add Player Pose: cancelled.")
+            return
+
+        try:
+            result = ensure_player_pose(root, state, f"red_{pair}",
+                                        f"green_{pair}")
+        except PlayerPosePatchError as exc:
+            QMessageBox.warning(self, "Add Player Pose",
+                                f"Nothing was changed.\n\n{exc}")
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Add Player Pose",
+                                 f"The install failed:\n{exc}")
+            return
+
+        self.log_message("Add Player Pose: " + result.splitlines()[0])
+        QMessageBox.information(self, "Add Player Pose", result)
+        try:
+            from eventide.backend.constants_manager import ConstantsManager
+            ConstantsManager.load(root)
+            self._refresh_eventide_constants()
+        except Exception:
+            pass
 
     def _on_deunown(self):
         """Remove the Unown letter-form mechanism from the project's game source.

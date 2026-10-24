@@ -859,6 +859,20 @@ Fixed (2026-04-06). The GBA stores voicegroups back-to-back in memory. Drum kits
 
 ---
 
+## EVENTide (Event Editor)
+
+EVENTide has its own, longer troubleshooting file at `eventide/docs/TROUBLESHOOTING.md`. The entries added on
+2026-10-24 cover the three most-asked questions after that day's changes:
+
+- **An item appears with no "You got it!" message.** *Add Item* (`additem`) is the silent one; *Give Item*
+  (`giveitem`) is the one with the jingle and the message. Both are in the palette now.
+- **A sprite in the Browse grid has no picture.** The grid lists every `OBJ_EVENT_GFX_*` the project defines,
+  including ones with no sheet registered. Still a valid choice.
+- **A map is missing from Open Map.** A folder with no `map.json` is not a map. A map no group claims appears at
+  the bottom under *Not in any group*.
+
+---
+
 ## Potential Improvements
 
 Future versions of PorySuite may offer clearer error messages and an option in the UI to reset the configuration.

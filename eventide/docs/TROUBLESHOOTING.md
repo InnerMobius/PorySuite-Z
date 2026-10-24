@@ -68,6 +68,26 @@
 **Cause**: EVENTide saved files with Windows CRLF line endings. The build tools run in MSYS2/Linux and choke on the `\r` characters.
 **Fix**: All EVENTide file writes now force Unix LF line endings via `newline='\n'`.
 
+### The comparison dropdown no longer shows `==`, `!=` or `<`
+**Not a fault.** Comparisons read "is exactly", "is NOT", "is less than", "is at least", "is at most" and
+"is more than". The command written into the script file is unchanged — only the wording you read changed, so
+existing scripts are unaffected and nothing needs re-saving.
+
+### The "which character?" dropdown shows names instead of ids
+**Not a fault.** Object commands list *This event*, *The player*, and then every character on the map by who
+they are and what sprite they use. The script still gets the raw local id. If a command points at a character
+that is not on this map, its id shows as plain text — that is correct, and it is written back exactly as it was.
+
+### A value dropdown doesn't offer the constant I want
+The list is built from the `#define NAME <number>` lines in your project's `include/constants/` headers, so a
+constant defined somewhere else, or written in hex, will not appear. Type it in instead — every one of these
+boxes accepts typed text and writes it through unchanged. (Metatile names are the one exception that gets its own
+scan, because they are hex and mixed-case.)
+
+### Set Metatile offers no tiles
+Your project has no `include/constants/metatile_labels.h`, or none of its tiles are named there. Type the
+metatile number in instead.
+
 ## Log Panel
 The log panel at the bottom of the EVENTide window shows:
 - Load counts for each event type when a map opens
@@ -96,3 +116,23 @@ The `*` now only appears when you actually edit something — type in a field, c
 ### Rematches tab showed nothing for rematchable trainers
 **Cause**: Fixed bug where the rematch lookup only matched the base trainer constant (tiers[0]). If you somehow selected a variant constant, or if the selected trainer was the base but the lookup key didn't match, the tab showed "not in the VS Seeker rematch table."
 **Fix**: `_build_rematch_map()` now builds a reverse lookup that maps ANY tier constant back to its rematch entry. The separate Rematches tab was removed entirely — rematch tiers are now shown in the Party tab as a dropdown.
+
+### The item I give shows no "You got it!" message
+**Not a fault.** There are two commands and they do different things. *Add Item* (`additem`) puts the item in the
+bag and says nothing — it is for scripts that print their own line. *Give Item* (`giveitem`) is the normal one:
+jingle, "You got the X!", straight into the bag. Before 2026-10-24 the palette offered only `additem`, under the
+name "Give Item"; both are listed now.
+
+### A sprite I know exists has no picture in the Browse grid
+**Not a fault.** The grid lists every `OBJ_EVENT_GFX_*` constant the project defines, including ones with no PNG
+registered — they are still valid choices for a script. A missing tile means no sprite sheet is wired to that
+constant yet, not that the constant is broken.
+
+### Sprite colours in the Browse grid don't match an edit I just made
+Expected, for now. Overworld palettes are keyed by palette tag and stored apart from the sprite sheet, so the
+gallery renders the sheet's own baked palette. An unsaved palette edit in the Overworld Graphics tab will not
+show there until it is saved and the sheet is re-baked.
+
+### A map is missing from the Map box
+A folder under `data/maps` with no `map.json` is not a map and is not offered. Everything else with a `map.json`
+is in the list regardless of whether `map_groups.json` mentions it — type any part of the name to find it.

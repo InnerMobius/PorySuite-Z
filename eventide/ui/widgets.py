@@ -100,6 +100,96 @@ class ConstantPicker(QComboBox):
         self.setEditText(raw)
 
 
+class ValuePicker(QComboBox):
+    """Searchable picker for "what value goes here" — a number OR a constant.
+
+    Variables in a script hold plain numbers, but the number almost always
+    MEANS something: an item, a species, a step in a cutscene, an entry in
+    whatever table the project has invented. Offering a bare
+    ``0 1 2 3 4 5 TRUE FALSE`` list, which is what this replaced, meant the
+    only way to put a real constant in was to know its exact spelling and
+    type it — which is not something somebody who does not write code can do.
+
+    So the list is built from the PROJECT: every enum-style constant it
+    defines, whatever they are called, with the prefix stripped for reading.
+    Nothing here knows the name of a single game constant, so a project that
+    invents its own shows them like any other.
+
+    ``selected_value()`` gives back the raw constant, or the number as typed.
+    """
+
+    #: Small numbers come first — still the common case.
+    _NUMBERS = [str(n) for n in range(0, 11)]
+    _BOOLEANS = ["TRUE", "FALSE"]
+
+    def __init__(self, choices: list[str] | None = None, value: str = "0",
+                 parent: QWidget | None = None, *,
+                 include_numbers: bool = True):
+        """``include_numbers`` adds the small numbers and TRUE/FALSE at the
+        top of the list. Turn it off where a bare number would be
+        meaningless, such as a field that names a block of text."""
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setMaxVisibleItems(20)
+        # Deliberately NOT width-capped. The old value box was 100px, which
+        # truncated its own contents — you could not read what you had picked.
+        self.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+
+        self._display_to_raw: dict[str, str] = {}
+        items: list[str] = []
+        if include_numbers:
+            for n in self._NUMBERS + self._BOOLEANS:
+                self._display_to_raw[n] = n
+                items.append(n)
+        for const in (choices or []):
+            pretty = _prettify_constant(const)
+            display = f"{pretty}  ({const})" if pretty != const else const
+            if display not in self._display_to_raw:
+                self._display_to_raw[display] = const
+                items.append(display)
+
+        self.addItems(items)
+        completer = QCompleter(items, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setMaxVisibleItems(20)
+        self.setCompleter(completer)
+        self.set_value(value)
+
+    def set_value(self, value) -> None:
+        value = "" if value is None else str(value).strip()
+        if not value:
+            self.setCurrentIndex(0)
+            return
+        for display, raw in self._display_to_raw.items():
+            if raw == value:
+                idx = self.findText(display)
+                if idx >= 0:
+                    self.setCurrentIndex(idx)
+                    return
+        self.setEditText(value)
+
+    def selected_value(self) -> str:
+        text = self.currentText().strip()
+        return self._display_to_raw.get(text, text)
+
+
+def _prettify_constant(const: str) -> str:
+    """``ITEM_GREAT_BALL`` -> ``Great Ball``; ``SOME_THING`` -> ``Some Thing``.
+
+    Splits on the FIRST underscore group that looks like a prefix, so it works
+    for constant families this code has never heard of. A constant with no
+    underscore is returned unchanged rather than mangled.
+    """
+    if "_" not in const:
+        return const
+    head, _, tail = const.partition("_")
+    body = tail if tail else head
+    return body.replace("_", " ").title()
+
+
 class MapPicker(QWidget):
     """Widget for selecting a map destination — combo + X/Y spinners.
 
@@ -159,6 +249,27 @@ class MapPicker(QWidget):
         return self.y_spin.value()
 
 
+def overworld_frame_width(sheet_w: int, h: int) -> int:
+    """How wide one frame is on an overworld sprite sheet.
+
+    Sheets are horizontal strips and carry no frame size anywhere, so it has
+    to be inferred from the proportions:
+
+    * square sheet -> the whole thing is one frame (16x16, 32x32, 64x64)
+    * a sheet that divides into 1-4 frames as wide as it is tall -> those
+      (64x32 is two 32px frames, not four 16px ones)
+    * everything else -> 16px frames, which covers 48x32, 144x32, 160x32
+
+    Shared by the animated preview and the sprite gallery so the two cannot
+    disagree about where a frame ends.
+    """
+    if sheet_w == h:
+        return sheet_w
+    if h >= 32 and sheet_w % h == 0 and (sheet_w // h) in (1, 2, 3, 4):
+        return h
+    return 16
+
+
 class SpritePreview(QLabel):
     """Animated overworld sprite preview for the Event Editor.
 
@@ -182,14 +293,16 @@ class SpritePreview(QLabel):
     Qt doesn't reliably handle tRNS in 4-bit indexed PNGs.
     """
 
-    _SCALE = 3        # 3× nearest-neighbor zoom
+    _SCALE = 2        # 2× nearest-neighbor zoom
     _FRAME_MS = 150   # ~GBA speed (8 ticks @ 60fps ≈ 133ms)
+    #: Nothing may grow past this. Sheets run from 16x16 up to 64x64, and at
+    #: a fixed zoom the big ones would set the height of the whole row.
+    _MAX_BOX = (64, 64)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(64, 100)
-        self.setMaximumHeight(128)
+        self.setFixedSize(70, 72)
         self.setObjectName('spritePreview')
         self.setStyleSheet(
             '#spritePreview { background: palette(base); '
@@ -208,8 +321,14 @@ class SpritePreview(QLabel):
         frame = img.copy(index * w, 0, w, h)
         if mirror:
             frame = frame.mirrored(True, False)  # horizontal flip
+        tw, th = w * self._SCALE, h * self._SCALE
+        # Shrink rather than clip when the zoomed frame is bigger than the box.
+        bw, bh = self._MAX_BOX
+        if tw > bw or th > bh:
+            ratio = min(bw / tw, bh / th)
+            tw, th = max(1, int(tw * ratio)), max(1, int(th * ratio))
         scaled = frame.scaled(
-            w * self._SCALE, h * self._SCALE,
+            tw, th,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation)
         return QPixmap.fromImage(scaled)
@@ -259,17 +378,7 @@ class SpritePreview(QLabel):
         # If the sheet is square (w == h), it's a single frame (e.g. 32×32)
         # If sheet_w / h gives a clean integer and h >= 16, try h as frame width
         # Otherwise default to 16px frame width (standard for most walk sheets)
-        if sheet_w == h:
-            # Square image = single frame (16×16, 32×32, 64×64)
-            w = sheet_w
-        elif h >= 32 and sheet_w % h == 0 and (sheet_w // h) in (1, 2, 3, 4):
-            # Frame width matches height — e.g. 64×32 with 2 square frames
-            # But only if it gives a small number of frames (1-4)
-            # For 144×32, 144/32=4.5 so this won't trigger (correct)
-            w = h
-        else:
-            # Standard: 16px wide frames (covers 48×32, 144×32, 160×32, etc.)
-            w = 16
+        w = overworld_frame_width(sheet_w, h)
 
         total_frames = sheet_w // w if w > 0 else 1
 

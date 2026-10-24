@@ -26,8 +26,8 @@ import re
 from pathlib import Path
 from collections import OrderedDict
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap, QColor
+from PyQt6.QtCore import QEvent, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QIcon, QPixmap, QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QScrollArea,
     QTreeWidget, QTreeWidgetItem, QComboBox, QPushButton,
@@ -40,7 +40,8 @@ from PyQt6.QtWidgets import (
 )
 
 from eventide.backend.constants_manager import ConstantsManager
-from eventide.ui.widgets import ConstantPicker, MapPicker, SpritePreview
+from eventide.ui.widgets import (ConstantPicker, MapPicker, SpritePreview,
+                                 ValuePicker)
 from ui.custom_widgets.scroll_guard import install_scroll_guard_recursive
 
 
@@ -172,9 +173,19 @@ _CATEGORY_COLORS = {
 # dropdowns of objects/labels from the current map without dependency injection.
 _SCRIPT_LABELS: list[str] = []     # All script labels in the current file
 _OBJECT_LOCAL_IDS: list[str] = []  # Local IDs from current map's object_events
+# Same objects, paired with a label saying who each one is, so the command
+# dialogs can offer "Joe — Man" instead of a bare "LOCALID_PEWTER_JOE".
+_OBJECT_CHOICES: list[tuple[str, str]] = []
 _MOVEMENT_LABELS: list[str] = []   # Movement labels from the current script file
 _ALL_SCRIPTS: dict[str, list] = {} # label → [cmd_tuples] for movement step lookup
 _CURRENT_PAGES: list[dict] = []    # Current object's pages — for setflag→page linking
+
+# Set by the editor tab so command widgets built inside a modal dialog can ask
+# it for a spare flag. A widget has no parent pointer back to the tab — the
+# dialog owns it — and threading one through every widget constructor to serve
+# one button would be worse than a single module-level hook, which is the same
+# shape as _CURRENT_PAGES and _DIALOG_CONTEXT above.
+_FIND_UNUSED_FLAG_CB = None
 
 # ── Display name resolution ─────────────────────────────────────────────────
 # Populated by EventEditorTab.set_display_names() when the unified window
@@ -269,6 +280,36 @@ def _set_display_data(species: list[tuple], items: list[tuple],
                 _DISPLAY_TYPES[const] = 'var'
 
 
+def _two_args(cmd_tuple: tuple) -> tuple:
+    """The first two arguments of a command, whichever shape it arrived in.
+
+    Commands reach the UI two ways: the parser and most widgets emit the whole
+    argument list as one comma-joined string, ``('setvar', 'VAR_X, 3')``, while
+    some callers build one element per argument, ``('setvar', 'VAR_X', '3')``.
+    Reading ``cmd_tuple[1]`` and ``cmd_tuple[2]`` blindly puts the entire
+    string in the first field and leaves the second empty, so the line renders
+    as ``Set Variable: [0X8004, Great Ball] =`` — both arguments crammed into
+    the variable slot, nothing after the equals sign.
+
+    Returns ``(first, second)``, both stripped, second ``''`` when absent.
+    """
+    if len(cmd_tuple) > 2:
+        return str(cmd_tuple[1]).strip(), str(cmd_tuple[2]).strip()
+    raw = str(cmd_tuple[1]) if len(cmd_tuple) > 1 else ''
+    first, _, second = raw.partition(',')
+    return first.strip(), second.strip()
+
+
+def _smart_title(text: str) -> str:
+    """Title-case a constant's tail without capitalising after a digit.
+
+    ``str.title()`` turns ``0x8004`` into ``0X8004``, which shows up on every
+    VAR_0x80xx the editor displays.
+    """
+    return re.sub(r"(?<![0-9A-Za-z])[A-Za-z]+",
+                  lambda m: m.group(0).capitalize(), text)
+
+
 def _resolve_name(const: str) -> str:
     """Get the best display name for a constant.
 
@@ -287,7 +328,7 @@ def _resolve_name(const: str) -> str:
     for prefix in ('FLAG_', 'VAR_', 'TRAINER_', 'ITEM_', 'SPECIES_', 'MOVE_',
                    'SE_', 'MUS_', 'WEATHER_', 'OBJ_EVENT_GFX_'):
         if const.startswith(prefix):
-            return const[len(prefix):].replace('_', ' ').title()
+            return _smart_title(const[len(prefix):].replace('_', ' '))
     return const
 
 
@@ -440,7 +481,8 @@ def _primary_const_in_cmd(cmd_tuple: tuple) -> str:
         parts = [p.strip() for p in str(arg1).split(',')]
         return parts[0] if parts else ''
     # Items
-    if cmd in ('finditem', 'additem', 'removeitem', 'checkitem', 'checkitemspace'):
+    if cmd in ('finditem', 'additem', 'giveitem', 'removeitem',
+               'checkitem', 'checkitemspace'):
         parts = [p.strip() for p in str(arg1).split(',')]
         return parts[0] if parts else ''
     # Play cry — species
@@ -578,6 +620,7 @@ def _category_for_cmd(cmd: str) -> str:
                'removeobject', 'addobject',
                'showobjectat', 'hideobjectat', 'faceplayer', 'turnobject',
                'setobjectxy', 'setobjectxyperm', 'setobjectmovementtype',
+               'setobjectgraphics',
                'copyobjectxytoperm',
                'lock', 'lockall', 'release', 'releaseall',
                'opendoor', 'closedoor', 'waitdooranim'):
@@ -641,6 +684,7 @@ _FRIENDLY_NAMES: dict[str, str] = {
     'showobjectat': 'Show Object', 'hideobjectat': 'Hide Object',
     'faceplayer': 'Face Player', 'turnobject': 'Turn Object',
     'setobjectxy': 'Move Object', 'setobjectmovementtype': 'Set Movement Type',
+    'setobjectgraphics': 'Change Graphic',
     'lock': 'Lock', 'lockall': 'Lock All',
     'release': 'Release', 'releaseall': 'Release All',
     'fadescreen': 'Fade Screen', 'fadescreenspeed': 'Fade Screen (Speed)',
@@ -669,7 +713,8 @@ _FRIENDLY_NAMES: dict[str, str] = {
     'wildbattle': 'Wild Battle',
     'givemon': 'Give Pokémon', 'giveegg': 'Give Egg',
     'finditem': 'Find Item',
-    'additem': 'Give Item', 'removeitem': 'Remove Item', 'checkitem': 'Check Item',
+    'additem': 'Add Item (no message)', 'giveitem': 'Give Item',
+    'removeitem': 'Remove Item', 'checkitem': 'Check Item',
     'checkitemspace': 'Check Item Space',
     'addmoney': 'Give Money', 'removemoney': 'Take Money', 'checkmoney': 'Check Money',
     'addcoins': 'Give Coins', 'removecoins': 'Take Coins',
@@ -692,12 +737,224 @@ _FRIENDLY_NAMES: dict[str, str] = {
     'dotrainerbattle': 'Do Trainer Battle',
 }
 
+# ── What each command does, in plain English ────────────────────────
+# Shown as a one-line description at the top of every command's edit dialog
+# and under the command picker, so somebody who has never written a script
+# can tell what they are about to add. Keyed by the raw command name. Keep
+# these to one sentence, no code words, and never name a specific game's
+# content.
+_COMMAND_HELP: dict[str, str] = {
+    # Dialogue
+    'message': 'Shows a text box and waits for the player to read it.',
+    'yesnobox': 'Advanced: puts a bare Yes/No box on screen at the given '
+                'corner and remembers the answer. It shows no question of '
+                'its own — for the normal “ask something, then Yes or No”, '
+                'use Show Choices: Yes/No.',
+    'multichoice': 'Shows a list of options and remembers which one the player picked.',
+    'waitmessage': 'Pauses until the text on screen has finished printing.',
+    'closemessage': 'Closes the text box that is open.',
+    'waitbuttonpress': 'Waits for the player to press a button before carrying on.',
+    'textcolor': 'Changes the colour the next text box is printed in.',
+    'signmsg': 'Makes the next text boxes look like a sign instead of speech.',
+    'normalmsg': 'Goes back to normal speech-style text boxes.',
+
+    # Flags and variables
+    'setflag': 'Turns a flag on. A flag remembers one yes-or-no fact forever, '
+               'like "this chest has been opened".',
+    'clearflag': 'Turns a flag back off.',
+    'checkflag': 'Looks at whether a flag is on, so the next command can branch on it.',
+    'setvar': 'Stores a number in a variable. Variables remember counts and choices.',
+    'addvar': 'Adds a number to whatever a variable already holds.',
+    'subvar': 'Subtracts a number from whatever a variable already holds.',
+    'copyvar': 'Copies one variable into another.',
+    'compare_var_to_value': 'Compares a variable with a value, so the next '
+                            'command can branch on the result.',
+    'compare_var_to_var': 'Compares two variables with each other, so the next '
+                          'command can branch on the result.',
+    'random': 'Picks a random number and stores it, for things that should not '
+              'happen the same way every time.',
+    'setworldmapflag': 'Marks a place as discovered on the world map.',
+    'incrementgamestat': 'Adds one to one of the game’s running totals.',
+
+    # Flow
+    'goto': 'Jumps to another part of the script and does not come back.',
+    'call': 'Runs another script, then carries on from here when it finishes.',
+    'end': 'Stops the script here.',
+    'return': 'Ends a called script and goes back to whatever called it.',
+    'special': 'Runs a piece of built-in game code by name.',
+    'specialvar': 'Runs a piece of built-in game code and stores its answer in a variable.',
+    'callstd': 'Runs one of the game’s standard shared scripts.',
+    'gotostd': 'Jumps to one of the game’s standard shared scripts and does not come back.',
+    'switch': 'Picks which branch to run based on a variable’s value.',
+    'case': 'One branch of a switch — runs when the variable equals this value.',
+    'goto_if_questlog': 'Jumps somewhere else only while the game is replaying '
+                        'a quest-log memory.',
+    'map_script': 'Attaches a script to the map so it runs on its own at a chosen moment.',
+    'map_script_2': 'Attaches a script to the map that only runs while a variable '
+                    'has a certain value.',
+    '.byte': 'Marks the end of a list of map scripts.',
+    '.2byte': 'A raw number in a data list.',
+
+    # Conditional jumps
+    'goto_if_eq': 'Jumps somewhere else only when the variable matches the value.',
+    'goto_if_ne': 'Jumps somewhere else only when the variable does not match the value.',
+    'goto_if_lt': 'Jumps somewhere else only when the variable is below the value.',
+    'goto_if_le': 'Jumps somewhere else only when the variable is at or below the value.',
+    'goto_if_gt': 'Jumps somewhere else only when the variable is above the value.',
+    'goto_if_ge': 'Jumps somewhere else only when the variable is at or above the value.',
+    'call_if_eq': 'Runs another script only when the variable matches the value, '
+                  'then carries on.',
+    'call_if_ne': 'Runs another script only when the variable does not match the '
+                  'value, then carries on.',
+    'call_if_lt': 'Runs another script only when the variable is below the value, '
+                  'then carries on.',
+    'call_if_le': 'Runs another script only when the variable is at or below the '
+                  'value, then carries on.',
+    'call_if_gt': 'Runs another script only when the variable is above the value, '
+                  'then carries on.',
+    'call_if_ge': 'Runs another script only when the variable is at or above the '
+                  'value, then carries on.',
+    'goto_if_set': 'Jumps somewhere else only when a flag is on.',
+    'goto_if_unset': 'Jumps somewhere else only when a flag is off.',
+    'call_if_set': 'Runs another script only when a flag is on, then carries on.',
+    'call_if_unset': 'Runs another script only when a flag is off, then carries on.',
+
+    # Movement and warps
+    'warp': 'Sends the player to another map, with the usual screen fade.',
+    'warpsilent': 'Sends the player to another map with no fade or sound.',
+    'warpdoor': 'Sends the player to another map using the door-opening animation.',
+    'warphole': 'Sends the player to another map as if they fell through a hole.',
+    'warpteleport': 'Sends the player to another map with the teleport animation.',
+    'applymovement': 'Makes a character walk, turn or act out a set of steps.',
+    'waitmovement': 'Pauses until a character has finished the steps you gave them.',
+    'setobjectxy': 'Picks a character up and puts them down somewhere else on this map.',
+    'setobjectxyperm': 'Changes where a character stands from now on, even after '
+                       'leaving the map.',
+    'setobjectmovementtype': 'Changes how a character wanders about when nobody '
+                             'is talking to them.',
+    'turnobject': 'Turns a character to face a direction.',
+    'faceplayer': 'Turns this character to face the player.',
+    'getplayerxy': 'Stores where the player is standing into two variables.',
+
+    # Characters on the map
+    'removeobject': 'Makes a character vanish from the map for the rest of this visit.',
+    'addobject': 'Brings a character back onto the map.',
+    'showobjectat': 'Makes a character on another map visible again.',
+    'hideobjectat': 'Hides a character on another map.',
+    'setobjectgraphics': 'Swaps a character’s sprite for a different one — '
+                         'use it for poses and reactions.',
+    'lock': 'Freezes the player and this character so the scene can play out.',
+    'lockall': 'Freezes the player and every character on the map.',
+    'release': 'Gives the player and this character control back.',
+    'releaseall': 'Gives the player and every character control back.',
+
+    # Screen and weather
+    'fadescreen': 'Fades the screen to or from black or white.',
+    'fadescreenspeed': 'Fades the screen to or from black or white at a speed you choose.',
+    'setflashlevel': 'Changes how much of a dark room the player can see.',
+    'setweather': 'Queues up a weather change — follow it with Do Weather to start it.',
+    'doweather': 'Starts the weather change that was queued up.',
+    'resetweather': 'Puts the weather back to whatever the map normally has.',
+
+    # Sound
+    'playse': 'Plays a short sound effect.',
+    'waitse': 'Pauses until the sound effect has finished.',
+    'playfanfare': 'Plays a short piece of music over the top of the background music.',
+    'waitfanfare': 'Pauses until that short piece of music has finished.',
+    'playbgm': 'Changes the background music.',
+    'fadeoutbgm': 'Fades the background music out to silence.',
+    'fadeinbgm': 'Fades the background music back in.',
+    'savebgm': 'Remembers the music that is playing so it can be brought back later.',
+    'fadedefaultbgm': 'Fades back to the music the map normally plays.',
+    'playmoncry': 'Plays a creature’s cry.',
+
+    # Timing
+    'delay': 'Pauses the script for a moment.',
+    'waitstate': 'Pauses until whatever the game is doing in the background has finished.',
+
+    # Doors and tiles
+    'opendoor': 'Plays the opening animation on a door at a spot you pick.',
+    'closedoor': 'Plays the closing animation on a door at a spot you pick.',
+    'waitdooranim': 'Pauses until the door animation has finished.',
+    'setmetatile': 'Changes one tile of the map while the player is here.',
+
+    # Battles
+    'trainerbattle': 'Starts a battle against an opponent you pick.',
+    'trainerbattle_single': 'Starts a one-on-one battle against an opponent you pick.',
+    'trainerbattle_no_intro': 'Starts a battle with no approach or challenge text.',
+    'trainerbattle_earlyrival': 'Starts the special early-game rival battle.',
+    'trainerbattle_double': 'Starts a two-on-two battle against an opponent you pick.',
+    'trainerbattle_rematch': 'Starts a rematch against an opponent the player has '
+                             'already beaten.',
+    'trainerbattle_rematch_double': 'Starts a two-on-two rematch.',
+    'dotrainerbattle': 'Starts the battle that the commands above have set up.',
+    'wildbattle': 'Starts a battle against a single wild creature you pick.',
+    'healplayerteam': 'Fully heals the player’s party.',
+
+    # Party
+    'givemon': 'Puts a creature into the player’s party, or the storage boxes '
+               'when the party is full.',
+    'giveegg': 'Gives the player an egg.',
+    'setmonmove': 'Overwrites one of a party member’s moves.',
+    'checkpartymove': 'Looks for a party member that knows a move, and stores which one.',
+    'getpartysize': 'Stores how many creatures are in the player’s party.',
+    'showmonpic': 'Shows a creature’s picture in a window on screen.',
+    'hidemonpic': 'Closes the creature picture window.',
+
+    # Items and money
+    'finditem': 'Gives the player an item with the "found an item" message and jingle.',
+    'additem': 'Puts an item straight into the player’s bag, with no '
+               'sound and no message — use it when the script says '
+               'something of its own.',
+    'giveitem': 'Hands the player an item the normal way: the jingle plays, '
+                '“You got the X!” appears, and it goes in the bag. '
+                'This is what an item ball or a chest wants.',
+    'removeitem': 'Takes an item out of the player’s bag.',
+    'checkitem': 'Checks whether the player already has an item, and stores the answer.',
+    'checkitemspace': 'Checks whether the bag has room for an item before you give it.',
+    'addmoney': 'Gives the player money.',
+    'removemoney': 'Takes money off the player.',
+    'checkmoney': 'Checks whether the player can afford an amount, and stores the answer.',
+    'addcoins': 'Gives the player game-corner coins.',
+    'removecoins': 'Takes game-corner coins off the player.',
+    'pokemart': 'Opens a shop selling the items you list.',
+    'adddecoration': 'Gives the player a decoration.',
+    'removedecoration': 'Takes a decoration off the player.',
+
+    # Text buffers
+    'buffernumberstring': 'Puts a number into a text slot so a later message can print it.',
+    'bufferstring': 'Puts some stored text into a text slot so a later message can print it.',
+    'bufferspeciesname': 'Puts a species name into a text slot so a later message '
+                         'can print it.',
+    'bufferitemname': 'Puts an item name into a text slot so a later message can print it.',
+    'buffermovename': 'Puts a move name into a text slot so a later message can print it.',
+
+    # Editor-only helpers (not real script commands)
+    'choice_yesno': 'Asks the player a yes-or-no question and gives you a '
+                    'branch to fill in for each answer.',
+    'movecamera': 'Slides the camera away from the player and back again.',
+
+    # Misc
+    'setrespawn': 'Changes where the player wakes up after a blackout.',
+    'checkplayergender': 'Stores whether the player chose the boy or the girl.',
+    'famechecker': 'Unlocks a Fame Checker entry.',
+}
+
+
+def _command_help(cmd: str) -> str:
+    """The one-line plain-English description of a command, or '' if we have
+    nothing better to say than the command's own name."""
+    return _COMMAND_HELP.get(cmd, '')
+
+
 # Comparison operator display names
 _OP_DISPLAY = {
-    'goto_if_eq': '==', 'goto_if_ne': '!=', 'goto_if_lt': '<',
-    'goto_if_ge': '>=', 'goto_if_le': '<=', 'goto_if_gt': '>',
-    'call_if_eq': '==', 'call_if_ne': '!=', 'call_if_lt': '<',
-    'call_if_ge': '>=', 'call_if_le': '<=', 'call_if_gt': '>',
+    'goto_if_eq': 'is exactly', 'goto_if_ne': 'is NOT',
+    'goto_if_lt': 'is less than', 'goto_if_ge': 'is at least',
+    'goto_if_le': 'is at most', 'goto_if_gt': 'is more than',
+    'call_if_eq': 'is exactly', 'call_if_ne': 'is NOT',
+    'call_if_lt': 'is less than', 'call_if_ge': 'is at least',
+    'call_if_le': 'is at most', 'call_if_gt': 'is more than',
 }
 
 # Map script type constants → friendly names
@@ -838,11 +1095,13 @@ def _stringize(cmd_tuple: tuple) -> str:
 
     # ── Variables ───────────────────────────────────────────────────────
     if cmd in ('setvar', 'addvar', 'subvar', 'compare_var_to_value'):
-        var = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
-        val = cmd_tuple[2] if len(cmd_tuple) > 2 else ''
+        var, val = _two_args(cmd_tuple)
         op = {'setvar': '=', 'addvar': '+=', 'subvar': '-=',
               'compare_var_to_value': '?='}
-        text = f'@>{friendly}: [{_resolve_name(var)}] {op.get(cmd, "=")} {val}'
+        # The value gets resolved too, so a constant shows its readable name
+        # rather than its raw spelling.
+        shown = _resolve_name(val) if val else ''
+        text = f'@>{friendly}: [{_resolve_name(var)}] {op.get(cmd, "=")} {shown}'
         # Check if this var assignment activates a condition page
         if cmd == 'setvar' and var and val and _CURRENT_PAGES:
             for pi, pg in enumerate(_CURRENT_PAGES):
@@ -1072,7 +1331,8 @@ def _stringize(cmd_tuple: tuple) -> str:
         return header
 
     # ── Items ───────────────────────────────────────────────────────────
-    if cmd in ('finditem', 'additem', 'removeitem', 'checkitem', 'checkitemspace'):
+    if cmd in ('finditem', 'additem', 'giveitem', 'removeitem',
+               'checkitem', 'checkitemspace'):
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         parts = [p.strip() for p in str(args).split(',')]
         item_const = parts[0] if parts else args
@@ -1162,6 +1422,12 @@ def _stringize(cmd_tuple: tuple) -> str:
         return f'@>{friendly}: {args}'
 
     # ── Object control — resolve constant names ────────────────────────
+    if cmd == 'setobjectgraphics':
+        parts = [p.strip() for p in str(cmd_tuple[1] if len(cmd_tuple) > 1
+                                        else '').split(',')]
+        who = _resolve_name(parts[0]) if parts else '?'
+        what = _resolve_name(parts[1]) if len(parts) > 1 else '?'
+        return f'@>Change Graphic: {who} → {what}'
     if cmd in ('setobjectmovementtype',):
         args = cmd_tuple[1] if len(cmd_tuple) > 1 else ''
         parts = [p.strip() for p in str(args).split(',')]
@@ -1223,12 +1489,29 @@ class _CommandEditDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
+        # Plain-English "what this does" line at the top. Someone who has
+        # never written a script should be able to open any command and know
+        # what it is for without reading the field names.
+        blurb = _command_help(cmd)
+        if blurb:
+            desc = QLabel(blurb)
+            desc.setWordWrap(True)
+            desc.setStyleSheet(
+                'color: #cfd8dc; background: #2b3034; border: 1px solid #3a4046;'
+                ' border-radius: 4px; padding: 6px 8px;')
+            layout.addWidget(desc)
+
         # Create the parameter widget
         self._widget = _widget_for_tuple(cmd_tuple)
 
         # If it's a header-only (no-arg) command, just show a label
         if getattr(self._widget, '_header_only', False):
-            layout.addWidget(QLabel(f'This command has no parameters: {friendly}'))
+            if not blurb:
+                layout.addWidget(
+                    QLabel(f'This command has no parameters: {friendly}'))
+            else:
+                layout.addWidget(QLabel('There is nothing to fill in — '
+                                        'press OK to add it.'))
         else:
             # Apply scroll guard to prevent accidental scroll changes
             install_scroll_guard_recursive(self._widget)
@@ -1505,11 +1788,12 @@ class _MultiChoiceWidget(_CommandWidget):
         self.y_spin = QSpinBox(); self.y_spin.setRange(0, 19); self.y_spin.setValue(y)
         self.y_spin.setToolTip(_tt('Vertical position of the choice box (0–19 tiles)'))
         layout.addWidget(self.y_spin)
-        layout.addWidget(QLabel('List ID:'))
-        self.list_edit = QLineEdit(str(list_id))
-        self.list_edit.setToolTip(_tt('Index of the multichoice list defined in the game data'))
-        self.list_edit.setMaximumWidth(60)
-        layout.addWidget(self.list_edit)
+        layout.addWidget(QLabel('Choices:'))
+        self.list_edit = _make_constant_combo(
+            'MULTICHOICE_', list_id,
+            tip='Which set of options to show. These are the option lists the '
+                'project defines.')
+        layout.addWidget(self.list_edit, 1)
         self.cancel_check = QCheckBox('Allow Cancel')
         self.cancel_check.setToolTip(_tt('If checked, pressing B closes the menu and returns a cancel value'))
         self.cancel_check.setChecked(str(cancel) != '0')
@@ -1519,14 +1803,19 @@ class _MultiChoiceWidget(_CommandWidget):
     def to_tuple(self):
         cancel = '1' if self.cancel_check.isChecked() else '0'
         return ('multichoice', f'{self.x_spin.value()}, {self.y_spin.value()}, '
-                f'{self.list_edit.text()}, {cancel}')
+                f'{self.list_edit.selected_value()}, {cancel}')
 
     def friendly_name(self):
         return 'Multi-Choice Box'
 
 
 class _SetFlagWidget(_CommandWidget):
-    """Set Flag — searchable flag picker."""
+    """Set Flag — searchable flag picker, plus a shortcut to a spare flag.
+
+    Picking a flag by hand means scrolling a list of thousands and hoping the
+    one chosen is not already doing a job somewhere else in the project. The
+    Find unused button does that search instead.
+    """
     def __init__(self, flag='', parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
@@ -1537,6 +1826,30 @@ class _SetFlagWidget(_CommandWidget):
         if flag:
             self.picker.set_constant(flag)
         layout.addWidget(self.picker, 1)
+
+        self._btn_find = QPushButton('Find unused')
+        self._btn_find.setMaximumWidth(92)
+        self._btn_find.setToolTip(_tt(
+            'Pick a flag nothing else in the project uses.\n'
+            'Saves scrolling the list and hoping.'))
+        self._btn_find.clicked.connect(self._on_find_unused)
+        layout.addWidget(self._btn_find)
+        # No tab to ask when the editor has not registered its hook (tests,
+        # or a widget built before a project is open) — hide rather than
+        # offer a button that cannot do anything.
+        self._btn_find.setVisible(_FIND_UNUSED_FLAG_CB is not None)
+
+    def _on_find_unused(self):
+        if _FIND_UNUSED_FLAG_CB is None:
+            return
+        found = _FIND_UNUSED_FLAG_CB(1)
+        if not found:
+            QMessageBox.information(
+                self, 'Find Unused Flag',
+                'No unused flag constants are left in the project.\n\n'
+                'Use Variables & Flags to add more, or free one up.')
+            return
+        self.picker.set_constant(found[0])
 
     def to_tuple(self):
         return ('setflag', self.picker.selected_constant())
@@ -1603,7 +1916,7 @@ class _SetVarWidget(_CommandWidget):
         layout.addWidget(self.value_combo)
 
     def to_tuple(self):
-        return ('setvar', f'{self.picker.selected_constant()}, {self.value_combo.currentText()}')
+        return ('setvar', f'{self.picker.selected_constant()}, {self.value_combo.selected_value()}')
 
     def friendly_name(self):
         return 'Set Variable'
@@ -1627,7 +1940,7 @@ class _AddVarWidget(_CommandWidget):
         layout.addWidget(self.value_combo)
 
     def to_tuple(self):
-        return ('addvar', f'{self.picker.selected_constant()}, {self.value_combo.currentText()}')
+        return ('addvar', f'{self.picker.selected_constant()}, {self.value_combo.selected_value()}')
 
     def friendly_name(self):
         return 'Add to Variable'
@@ -1651,7 +1964,7 @@ class _SubVarWidget(_CommandWidget):
         layout.addWidget(self.value_combo)
 
     def to_tuple(self):
-        return ('subvar', f'{self.picker.selected_constant()}, {self.value_combo.currentText()}')
+        return ('subvar', f'{self.picker.selected_constant()}, {self.value_combo.selected_value()}')
 
     def friendly_name(self):
         return 'Subtract from Variable'
@@ -1677,7 +1990,7 @@ class _CompareVarWidget(_CommandWidget):
         layout.addWidget(self.value_combo)
 
     def to_tuple(self):
-        return ('compare_var_to_value', f'{self.picker.selected_constant()}, {self.value_combo.currentText()}')
+        return ('compare_var_to_value', f'{self.picker.selected_constant()}, {self.value_combo.selected_value()}')
 
     def friendly_name(self):
         return 'Compare Variable to Value'
@@ -1708,42 +2021,214 @@ def _make_label_combo(value=''):
     return combo
 
 
-def _make_object_combo(value=''):
-    """Create a searchable combo populated with object local IDs from the current map."""
-    combo = QComboBox()
-    combo.setEditable(True)
-    combo.setMaximumWidth(200)
-    if _OBJECT_LOCAL_IDS:
-        combo.addItems(_OBJECT_LOCAL_IDS)
-    if value:
-        idx = combo.findText(value)
+def _object_choice_label(raw: str, obj: dict) -> str:
+    """A readable one-line label for an object-event dropdown entry.
+
+    Says who the character is and what sprite they use, e.g.
+    ``Joe — Man`` or ``Object 4 — Item Ball``, so the user is not asked
+    to recognise a bare local id.
+    """
+    gfx = str(obj.get('graphics_id') or '')
+    sprite = ''
+    if gfx:
+        sprite = gfx.replace('OBJ_EVENT_GFX_', '').replace('_', ' ').title()
+
+    # Item balls read better as the item they hold.
+    if gfx == 'OBJ_EVENT_GFX_ITEM_BALL':
+        for page in obj.get('_pages', []) or []:
+            for cmd in page.get('commands', []) or []:
+                if cmd and cmd[0] == 'finditem' and len(cmd) > 1:
+                    item = cmd[1].strip().split(',')[0].strip()
+                    if item:
+                        return f'Item ball — {_resolve_name(item)}'
+    name = raw
+    if name.startswith('LOCALID_'):
+        name = name[len('LOCALID_'):].replace('_', ' ').title()
+    elif name.isdigit():
+        name = f'Object {name}'
+    return f'{name} — {sprite}' if sprite else name
+
+
+class _ObjectPicker(QComboBox):
+    """Pick which character a command acts on.
+
+    Shows a readable label for every object on the current map and hands
+    back the raw local id the script needs. Stays editable so an id that
+    is not on this map (another map's object, a constant from somewhere
+    else) can still be typed in by hand.
+    """
+
+    def __init__(self, value='', parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setMinimumWidth(240)
+        self.setToolTip(_tt(
+            'Which character this acts on. Pick one from this map, or type an '
+            'id by hand if it lives on another map.'))
+        for raw, label in (_OBJECT_CHOICES or
+                           [(r, r) for r in _OBJECT_LOCAL_IDS]):
+            self.addItem(label, raw)
+        completer = QCompleter([self.itemText(i) for i in range(self.count())],
+                               self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.setCompleter(completer)
+        self.set_object(value)
+
+    def set_object(self, raw: str):
+        """Select the entry for a raw local id, or show the id as typed text."""
+        raw = (raw or '').strip()
+        if not raw:
+            return
+        idx = self.findData(raw)
+        if idx < 0:
+            idx = self.findText(raw)
         if idx >= 0:
-            combo.setCurrentIndex(idx)
+            self.setCurrentIndex(idx)
         else:
-            combo.setEditText(value)
+            self.setEditText(raw)
+
+    def selected_object(self) -> str:
+        """The raw local id to write into the script.
+
+        Reads the id off the entry that is selected rather than looking the
+        text up again, so two entries sharing a label can't hand back the
+        wrong constant. Text the user typed by hand is returned as typed —
+        an id this editor doesn't recognise is still written back unchanged.
+        """
+        text = self.currentText().strip()
+        idx = self.currentIndex()
+        if idx >= 0 and self.itemText(idx).strip() == text:
+            data = self.itemData(idx)
+            if data:
+                return str(data)
+        return text
+
+
+_METATILE_CHOICES_CACHE: list[str] | None = None
+
+
+def _metatile_choices() -> list[str]:
+    """Every metatile name the project defines.
+
+    These live in their own header and are written in hex with mixed-case
+    names, so the general constant scanner used by the value picker does not
+    see them. Nothing here knows the name of a single tileset — whatever the
+    project calls its tiles is what shows up.
+    """
+    global _METATILE_CHOICES_CACHE
+    if _METATILE_CHOICES_CACHE is not None:
+        return _METATILE_CHOICES_CACHE
+    names: list[str] = []
+    root = ConstantsManager.root()
+    if root:
+        header = Path(root) / 'include' / 'constants' / 'metatile_labels.h'
+        try:
+            text = header.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            text = ''
+        names = sorted(set(re.findall(
+            r'^[ \t]*#define[ \t]+(METATILE_\w+)[ \t]', text, re.M)))
+    _METATILE_CHOICES_CACHE = names
+    return names
+
+
+def _make_constant_combo(prefix: str, value='', *, tip='', choices=None,
+                         numbers=True):
+    """An editable picker over every constant in the project whose name starts
+    with ``prefix``.
+
+    The point is that the user picks a name they can read instead of typing a
+    number nobody can remember. It stays editable so a raw number still works
+    for anything the project has not given a name to.
+    """
+    pool = choices if choices is not None else [
+        c for c in _value_choices() if c.startswith(prefix)]
+    combo = ValuePicker(pool, str(value), include_numbers=numbers)
+    if tip:
+        combo.setToolTip(_tt(tip))
     return combo
+
+
+def _text_labels() -> list[str]:
+    """The text labels in the current map's script file, for commands that
+    point at a block of text rather than carrying it inline."""
+    texts = _ALL_SCRIPTS.get('__texts__') or {}
+    try:
+        return sorted(texts.keys())
+    except AttributeError:
+        return []
+
+
+def _make_object_combo(value=''):
+    """Create a who-is-this picker for the current map's object events."""
+    return _ObjectPicker(value)
+
+
+_VALUE_CHOICES_CACHE: list[str] | None = None
+
+
+def _value_choices() -> list[str]:
+    """Constants a script variable might sensibly be SET to.
+
+    Scanned from the project's own headers rather than listed here, so a
+    project's invented constant families show up like any other and nothing
+    in this file names a single game constant.
+
+    Excluded on purpose:
+      * ``FLAG_*`` and ``VAR_*`` — those are ADDRESSES of storage, not values.
+        Offering them as values is how you get a script that sets a variable
+        to the number 0x4000 and nobody can work out why.
+      * Anything defined as a hex literal or an expression, which is almost
+        always an address, a bitmask or a struct offset rather than a value
+        somebody would pick from a list.
+    """
+    global _VALUE_CHOICES_CACHE
+    if _VALUE_CHOICES_CACHE is not None:
+        return _VALUE_CHOICES_CACHE
+
+    found: set[str] = set()
+    root = ConstantsManager.root()
+    if root:
+        # MULTILINE matters: without it ^ and $ anchor to the whole file and
+        # only the very first line could ever match.
+        pat = re.compile(
+            r'^[ \t]*#define[ \t]+([A-Z][A-Z0-9_]{2,})[ \t]+(\d+)[ \t]*'
+            r'(?://.*|/\*.*)?$', re.M)
+        inc = Path(root) / 'include' / 'constants'
+        if inc.is_dir():
+            for header in inc.rglob('*.h'):
+                try:
+                    text = header.read_text(encoding='utf-8', errors='replace')
+                except Exception:
+                    continue
+                for m in pat.finditer(text):
+                    name = m.group(1)
+                    if name.startswith(('FLAG_', 'VAR_')):
+                        continue
+                    if name.endswith(('_COUNT', '_MAX', '_NONE', '_START',
+                                      '_END')):
+                        continue
+                    found.add(name)
+    # The curated lists the editor already loads, in case a project keeps
+    # these somewhere the scan above does not reach.
+    for extra in (ConstantsManager.ITEMS, ConstantsManager.SPECIES,
+                  ConstantsManager.MOVES):
+        found.update(extra or [])
+
+    _VALUE_CHOICES_CACHE = sorted(found)
+    return _VALUE_CHOICES_CACHE
 
 
 def _make_value_combo(value='0'):
-    """Create an editable combo for script values (numbers, TRUE/FALSE, constants).
+    """A searchable picker of numbers AND the project's own constants.
 
-    Pre-populated with common values used in pokefirered scripting.
-    User can type any custom value since it's editable.
+    Replaced a hardcoded ``0 1 2 3 4 5 TRUE FALSE`` list in a 100px box. That
+    box could not show its own contents, and for any value that was not a
+    single digit the only way in was to type the constant from memory —
+    which is exactly what somebody who does not write code cannot do.
     """
-    combo = QComboBox()
-    combo.setEditable(True)
-    combo.setMaximumWidth(100)
-    common = ['0', '1', '2', '3', '4', '5', 'TRUE', 'FALSE']
-    combo.addItems(common)
-    if value:
-        idx = combo.findText(str(value))
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
-        else:
-            combo.setEditText(str(value))
-    else:
-        combo.setCurrentIndex(0)
-    return combo
+    return ValuePicker(_value_choices(), value)
 
 
 class _GotoIfCompareWidget(_CommandWidget):
@@ -1753,13 +2238,16 @@ class _GotoIfCompareWidget(_CommandWidget):
       Row 1: Variable picker | comparison operator | value
       Row 2: → Target label picker
     """
+    # Spelled out rather than ==/!=/<, which only read as anything
+    # to someone who already writes code. The command written to
+    # the script is unchanged — this is just the label.
     _COMPARE_OPS = [
-        ('goto_if_eq', '=='),
-        ('goto_if_ne', '!='),
-        ('goto_if_lt', '<'),
-        ('goto_if_ge', '>='),
-        ('goto_if_le', '<='),
-        ('goto_if_gt', '>'),
+        ('goto_if_eq', 'is exactly'),
+        ('goto_if_ne', 'is NOT'),
+        ('goto_if_lt', 'is less than'),
+        ('goto_if_ge', 'is at least'),
+        ('goto_if_le', 'is at most'),
+        ('goto_if_gt', 'is more than'),
     ]
 
     def __init__(self, cmd='goto_if_eq', var='', value='', label='', parent=None):
@@ -1779,7 +2267,6 @@ class _GotoIfCompareWidget(_CommandWidget):
         row1.addWidget(self.var_picker, 1)
         self.op_combo = QComboBox()
         self.op_combo.setToolTip(_tt('Comparison: jump only when this condition is true'))
-        self.op_combo.setMaximumWidth(60)
         for raw, pretty in self._COMPARE_OPS:
             self.op_combo.addItem(pretty, raw)
         idx = self.op_combo.findData(cmd)
@@ -1802,7 +2289,7 @@ class _GotoIfCompareWidget(_CommandWidget):
     def to_tuple(self):
         op = self.op_combo.currentData() or self._cmd
         return (op, self.var_picker.selected_constant(),
-                self.value_combo.currentText().strip(),
+                self.value_combo.selected_value(),
                 self.label_combo.currentText().strip())
 
     def friendly_name(self):
@@ -1867,13 +2354,16 @@ class _CallIfCompareWidget(_CommandWidget):
       Row 1: Variable picker | comparison operator | value
       Row 2: → Target label picker
     """
+    # Spelled out rather than ==/!=/<, which only read as anything
+    # to someone who already writes code. The command written to
+    # the script is unchanged — this is just the label.
     _COMPARE_OPS = [
-        ('call_if_eq', '=='),
-        ('call_if_ne', '!='),
-        ('call_if_lt', '<'),
-        ('call_if_gt', '>'),
-        ('call_if_le', '<='),
-        ('call_if_ge', '>='),
+        ('call_if_eq', 'is exactly'),
+        ('call_if_ne', 'is NOT'),
+        ('call_if_lt', 'is less than'),
+        ('call_if_gt', 'is more than'),
+        ('call_if_le', 'is at most'),
+        ('call_if_ge', 'is at least'),
     ]
 
     def __init__(self, cmd='call_if_eq', var='', value='', label='', parent=None):
@@ -1893,7 +2383,6 @@ class _CallIfCompareWidget(_CommandWidget):
         row1.addWidget(self.var_picker, 1)
         self.op_combo = QComboBox()
         self.op_combo.setToolTip(_tt('Comparison: call only when this condition is true'))
-        self.op_combo.setMaximumWidth(60)
         for raw, pretty in self._COMPARE_OPS:
             self.op_combo.addItem(pretty, raw)
         idx = self.op_combo.findData(cmd)
@@ -1902,7 +2391,6 @@ class _CallIfCompareWidget(_CommandWidget):
         row1.addWidget(self.op_combo)
         self.value_combo = _make_value_combo(value)
         self.value_combo.setToolTip(_tt('The value to compare against'))
-        self.value_combo.setMaximumWidth(100)
         row1.addWidget(self.value_combo)
         outer.addLayout(row1)
 
@@ -1917,7 +2405,7 @@ class _CallIfCompareWidget(_CommandWidget):
     def to_tuple(self):
         op = self.op_combo.currentData() or self._cmd
         return (op, self.var_picker.selected_constant(),
-                self.value_combo.currentText().strip(),
+                self.value_combo.selected_value(),
                 self.label_combo.currentText().strip())
 
     def friendly_name(self):
@@ -3185,7 +3673,7 @@ class _ApplyMovementWidget(_CommandWidget):
         return None
 
     def to_tuple(self):
-        return ('applymovement', self.target_combo.currentText().strip(),
+        return ('applymovement', self.target_combo.selected_object(),
                 self.move_combo.currentText().strip())
 
     def friendly_name(self):
@@ -3200,18 +3688,20 @@ class _WaitMovementWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Wait for:'))
         self.target_combo = _make_object_combo(target)
-        self.target_combo.setToolTip(_tt('Which object to wait for — 0 waits for all moving objects to finish'))
-        # Add "0" as a special entry meaning "wait for all"
-        if self.target_combo.findText('0') < 0:
-            self.target_combo.insertItem(0, '0')
+        self.target_combo.setToolTip(_tt(
+            'Which character to wait for. "Everyone who is moving" waits '
+            'until every character has finished their steps.'))
+        zero = self.target_combo.findData('0')
+        if zero >= 0:
+            self.target_combo.setItemText(zero, 'Everyone who is moving')
+        else:
+            self.target_combo.insertItem(0, 'Everyone who is moving', '0')
         if not target or target == '0':
-            self.target_combo.setCurrentIndex(self.target_combo.findText('0'))
-        layout.addWidget(self.target_combo)
-        layout.addWidget(QLabel('(0 = all objects)'))
-        layout.addStretch()
+            self.target_combo.set_object('0')
+        layout.addWidget(self.target_combo, 1)
 
     def to_tuple(self):
-        t = self.target_combo.currentText().strip()
+        t = self.target_combo.selected_object()
         return ('waitmovement', t) if t and t != '0' else ('waitmovement',)
 
     def friendly_name(self):
@@ -3230,7 +3720,7 @@ class _RemoveObjectWidget(_CommandWidget):
         layout.addStretch()
 
     def to_tuple(self):
-        return ('removeobject', self.id_combo.currentText().strip())
+        return ('removeobject', self.id_combo.selected_object())
 
     def friendly_name(self):
         return 'Remove NPC/Object'
@@ -3248,7 +3738,7 @@ class _AddObjectWidget(_CommandWidget):
         layout.addStretch()
 
     def to_tuple(self):
-        return ('addobject', self.id_combo.currentText().strip())
+        return ('addobject', self.id_combo.selected_object())
 
     def friendly_name(self):
         return 'Add NPC/Object'
@@ -3265,12 +3755,14 @@ class _ShowObjectWidget(_CommandWidget):
         layout.addWidget(self.id_combo)
         layout.addWidget(QLabel('on Map:'))
         self.map_combo = ConstantPicker(ConstantsManager.MAP_CONSTANTS, prefix='MAP_')
+        self.map_combo.setToolTip(_tt(
+            'Which map that character lives on — usually this one'))
         if map_id:
             self.map_combo.set_constant(map_id)
         layout.addWidget(self.map_combo, 1)
 
     def to_tuple(self):
-        return ('showobjectat', f'{self.id_combo.currentText()}, {self.map_combo.selected_constant()}')
+        return ('showobjectat', f'{self.id_combo.selected_object()}, {self.map_combo.selected_constant()}')
 
     def friendly_name(self):
         return 'Show NPC/Object'
@@ -3287,12 +3779,14 @@ class _HideObjectWidget(_CommandWidget):
         layout.addWidget(self.id_combo)
         layout.addWidget(QLabel('on Map:'))
         self.map_combo = ConstantPicker(ConstantsManager.MAP_CONSTANTS, prefix='MAP_')
+        self.map_combo.setToolTip(_tt(
+            'Which map that character lives on — usually this one'))
         if map_id:
             self.map_combo.set_constant(map_id)
         layout.addWidget(self.map_combo, 1)
 
     def to_tuple(self):
-        return ('hideobjectat', f'{self.id_combo.currentText()}, {self.map_combo.selected_constant()}')
+        return ('hideobjectat', f'{self.id_combo.selected_object()}, {self.map_combo.selected_constant()}')
 
     def friendly_name(self):
         return 'Hide NPC/Object'
@@ -3336,6 +3830,7 @@ class _TurnObjectWidget(_CommandWidget):
         layout.addWidget(self.id_combo)
         layout.addWidget(QLabel('Direction:'))
         self.dir_combo = QComboBox()
+        self.dir_combo.setToolTip(_tt('Which way they end up facing'))
         for raw, pretty in ConstantsManager.DIRECTIONS:
             self.dir_combo.addItem(f'{pretty}  ({raw})', raw)
         idx = self.dir_combo.findData(direction)
@@ -3345,7 +3840,7 @@ class _TurnObjectWidget(_CommandWidget):
         layout.addStretch()
 
     def to_tuple(self):
-        return ('turnobject', f'{self.id_combo.currentText()}, {self.dir_combo.currentData()}')
+        return ('turnobject', f'{self.id_combo.selected_object()}, {self.dir_combo.currentData()}')
 
     def friendly_name(self):
         return 'Turn NPC'
@@ -3363,14 +3858,18 @@ class _SetObjectXYWidget(_CommandWidget):
         layout.addWidget(self.id_combo)
         layout.addWidget(QLabel('X:'))
         self.x_spin = QSpinBox(); self.x_spin.setRange(0, 999); self.x_spin.setValue(x)
+        self.x_spin.setToolTip(_tt(
+            'How far across the map to put them — the same X Porymap shows'))
         layout.addWidget(self.x_spin)
         layout.addWidget(QLabel('Y:'))
         self.y_spin = QSpinBox(); self.y_spin.setRange(0, 999); self.y_spin.setValue(y)
+        self.y_spin.setToolTip(_tt(
+            'How far down the map to put them — the same Y Porymap shows'))
         layout.addWidget(self.y_spin)
         layout.addStretch()
 
     def to_tuple(self):
-        return (self._cmd, f'{self.id_combo.currentText()}, {self.x_spin.value()}, {self.y_spin.value()}')
+        return (self._cmd, f'{self.id_combo.selected_object()}, {self.x_spin.value()}, {self.y_spin.value()}')
 
     def friendly_name(self):
         return 'Set NPC Position (Permanent)' if self._cmd == 'setobjectxyperm' else 'Move NPC'
@@ -3626,6 +4125,9 @@ class _FadeOutBGMWidget(_CommandWidget):
         self.speed_spin = QSpinBox()
         self.speed_spin.setRange(0, 16)
         self.speed_spin.setValue(speed)
+        self.speed_spin.setToolTip(_tt(
+            'How quickly the music fades out. Higher is faster; 4 is '
+            'the usual choice.'))
         layout.addWidget(self.speed_spin)
         layout.addStretch()
 
@@ -3646,6 +4148,9 @@ class _FadeInBGMWidget(_CommandWidget):
         self.speed_spin = QSpinBox()
         self.speed_spin.setRange(0, 16)
         self.speed_spin.setValue(speed)
+        self.speed_spin.setToolTip(_tt(
+            'How quickly the music fades in. Higher is faster; 4 is '
+            'the usual choice.'))
         layout.addWidget(self.speed_spin)
         layout.addStretch()
 
@@ -3664,6 +4169,9 @@ class _SetWeatherWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Weather:'))
         self.picker = ConstantPicker(ConstantsManager.WEATHER, prefix='WEATHER_')
+        self.picker.setToolTip(_tt(
+            'The weather to switch to. Nothing changes on screen until a '
+            'Do Weather command runs.'))
         if weather:
             self.picker.set_constant(weather)
         layout.addWidget(self.picker, 1)
@@ -3916,6 +4424,8 @@ class _TrainerBattleWidget(_CommandWidget):
             # Only defeat text
             combo = _make_label_combo(defeat_text)
             combo.setPlaceholderText('defeat text label')
+            combo.setToolTip(_tt(
+                'The text this opponent says after losing. Type the words in the box underneath.'))
             grp, self.defeat_combo, self._defeat_edit = _make_text_field(
                 combo, self._texts, 'Defeat:')
             layout.addWidget(grp)
@@ -3926,17 +4436,23 @@ class _TrainerBattleWidget(_CommandWidget):
             flags_row.addWidget(QLabel('Flags:'))
             self.extra1_combo = _make_label_combo(intro_text)
             self.extra1_combo.setPlaceholderText('battle flags constant')
+            self.extra1_combo.setToolTip(_tt(
+                'The battle-type flags this fight uses. Leave this as it came unless you know what you are changing.'))
             flags_row.addWidget(self.extra1_combo, 1)
             layout.addLayout(flags_row)
             # Defeat text
             combo = _make_label_combo(defeat_text)
             combo.setPlaceholderText('defeat text label')
+            combo.setToolTip(_tt(
+                'The text this opponent says after losing. Type the words in the box underneath.'))
             grp, self.defeat_combo, self._defeat_edit = _make_text_field(
                 combo, self._texts, 'Defeat:')
             layout.addWidget(grp)
             # Victory text
             combo2 = _make_label_combo(extra1)
             combo2.setPlaceholderText('victory text label')
+            combo2.setToolTip(_tt(
+                'The text this opponent says after winning. Type the words in the box underneath.'))
             grp2, self.extra2_combo, _ = _make_text_field(
                 combo2, self._texts, 'Victory:')
             layout.addWidget(grp2)
@@ -3945,12 +4461,16 @@ class _TrainerBattleWidget(_CommandWidget):
             # Single & Double: INTRO + DEFEAT with text editors
             combo_i = _make_label_combo(intro_text)
             combo_i.setPlaceholderText('intro text label')
+            combo_i.setToolTip(_tt(
+                'The text this opponent says when they spot the player. Type the words in the box underneath.'))
             grp_i, self.intro_combo, self._intro_edit = _make_text_field(
                 combo_i, self._texts, 'Intro:')
             layout.addWidget(grp_i)
 
             combo_d = _make_label_combo(defeat_text)
             combo_d.setPlaceholderText('defeat text label')
+            combo_d.setToolTip(_tt(
+                'The text this opponent says after losing. Type the words in the box underneath.'))
             grp_d, self.defeat_combo, self._defeat_edit = _make_text_field(
                 combo_d, self._texts, 'Defeat:')
             layout.addWidget(grp_d)
@@ -3959,6 +4479,8 @@ class _TrainerBattleWidget(_CommandWidget):
                 # Not enough pokemon text
                 combo_ne = _make_label_combo(extra1)
                 combo_ne.setPlaceholderText('not enough pokemon text')
+                combo_ne.setToolTip(_tt(
+                    'The text shown when the player does not have enough party members for this battle.'))
                 grp_ne, self.extra1_combo, _ = _make_text_field(
                     combo_ne, self._texts, 'Not Enough Pokémon:')
                 layout.addWidget(grp_ne)
@@ -3970,6 +4492,8 @@ class _TrainerBattleWidget(_CommandWidget):
             cont_val = extra1 if variant == 'trainerbattle_single' else extra2
             self.extra2_combo = _make_label_combo(cont_val)
             self.extra2_combo.setPlaceholderText('(optional continue script)')
+            self.extra2_combo.setToolTip(_tt(
+                'A script to run straight after the battle. Leave it blank to carry on with the commands below.'))
             cont_row.addWidget(self.extra2_combo, 1)
             layout.addLayout(cont_row)
 
@@ -4018,6 +4542,7 @@ class _WildBattleWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Species:'))
         self.species_picker = ConstantPicker(ConstantsManager.SPECIES, prefix='SPECIES_')
+        self.species_picker.setToolTip(_tt('What the player will fight'))
         if species:
             self.species_picker.set_constant(species)
         layout.addWidget(self.species_picker, 1)
@@ -4025,6 +4550,7 @@ class _WildBattleWidget(_CommandWidget):
         self.level_spin = QSpinBox()
         self.level_spin.setRange(1, 100)
         self.level_spin.setValue(level)
+        self.level_spin.setToolTip(_tt('What level it will be'))
         layout.addWidget(self.level_spin)
         self.shiny_check = QCheckBox('Shiny')
         self.shiny_check.setChecked(shiny)
@@ -4173,14 +4699,23 @@ class _CheckItemSpaceWidget(_CommandWidget):
 
 
 class _GiveItemWidget(_CommandWidget):
-    """Give Item — item picker + quantity."""
-    def __init__(self, item='', quantity=1, parent=None):
+    """Give Item — item picker + quantity, for both ways of handing one over.
+
+    `giveitem` plays the fanfare and prints "You got the X!"; `additem` puts
+    it in the bag in silence. Same two fields either way, so one widget does
+    both and remembers which command it came from.
+    """
+    def __init__(self, item='', quantity=1, parent=None, *, cmd='additem'):
         super().__init__(parent)
+        self._cmd = cmd if cmd in ('additem', 'giveitem') else 'additem'
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Item:'))
         self.item_picker = ConstantPicker(ConstantsManager.ITEMS, prefix='ITEM_')
-        self.item_picker.setToolTip(_tt('Item to give the player — added to their bag'))
+        self.item_picker.setToolTip(_tt(
+            'Which item the player ends up with.'
+            if self._cmd == 'giveitem' else
+            'Item to put in the bag — nothing is shown or played.'))
         if item:
             self.item_picker.set_constant(item)
         layout.addWidget(self.item_picker, 1)
@@ -4195,11 +4730,12 @@ class _GiveItemWidget(_CommandWidget):
         item = self.item_picker.selected_constant()
         qty = self.qty_spin.value()
         if qty > 1:
-            return ('additem', f'{item}, {qty}')
-        return ('additem', item)
+            return (self._cmd, f'{item}, {qty}')
+        return (self._cmd, item)
 
     def friendly_name(self):
-        return 'Give Item'
+        return ('Give Item' if self._cmd == 'giveitem'
+                else 'Add Item (no message)')
 
 
 class _RemoveItemWidget(_CommandWidget):
@@ -4376,6 +4912,8 @@ class _SetRespawnWidget(_CommandWidget):
         layout.addWidget(QLabel('Respawn:'))
         self.picker = ConstantPicker(
             ConstantsManager.HEAL_LOCATIONS, prefix='HEAL_LOCATION_')
+        self.picker.setToolTip(_tt(
+            'Where the player wakes up if the whole party faints'))
         if location:
             self.picker.set_constant(location)
         layout.addWidget(self.picker, 1)
@@ -4476,6 +5014,7 @@ class _BufferMoveWidget(_CommandWidget):
         layout.addWidget(self.slot_spin)
         layout.addWidget(QLabel('Move:'))
         self.picker = ConstantPicker(ConstantsManager.MOVES, prefix='MOVE_')
+        self.picker.setToolTip(_tt('Which move’s name to put in the slot'))
         if move:
             self.picker.set_constant(move)
         layout.addWidget(self.picker, 1)
@@ -4499,9 +5038,13 @@ class _OpenDoorWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Open Door — X:'))
         self.x_spin = QSpinBox(); self.x_spin.setRange(0, 999); self.x_spin.setValue(x)
+        self.x_spin.setToolTip(_tt(
+            'How far across the map the door is — the same X Porymap shows'))
         layout.addWidget(self.x_spin)
         layout.addWidget(QLabel('Y:'))
         self.y_spin = QSpinBox(); self.y_spin.setRange(0, 999); self.y_spin.setValue(y)
+        self.y_spin.setToolTip(_tt(
+            'How far down the map the door is — the same Y Porymap shows'))
         layout.addWidget(self.y_spin)
         layout.addStretch()
 
@@ -4520,9 +5063,13 @@ class _CloseDoorWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Close Door — X:'))
         self.x_spin = QSpinBox(); self.x_spin.setRange(0, 999); self.x_spin.setValue(x)
+        self.x_spin.setToolTip(_tt(
+            'How far across the map the door is — the same X Porymap shows'))
         layout.addWidget(self.x_spin)
         layout.addWidget(QLabel('Y:'))
         self.y_spin = QSpinBox(); self.y_spin.setRange(0, 999); self.y_spin.setValue(y)
+        self.y_spin.setToolTip(_tt(
+            'How far down the map the door is — the same Y Porymap shows'))
         layout.addWidget(self.y_spin)
         layout.addStretch()
 
@@ -4558,6 +5105,7 @@ class _AddDecorationWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Decoration:'))
         self.picker = ConstantPicker(ConstantsManager.DECORATIONS, prefix='DECOR_')
+        self.picker.setToolTip(_tt('Which decoration to give the player'))
         if decor:
             self.picker.set_constant(decor)
         layout.addWidget(self.picker, 1)
@@ -4577,6 +5125,7 @@ class _RemoveDecorationWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Decoration:'))
         self.picker = ConstantPicker(ConstantsManager.DECORATIONS, prefix='DECOR_')
+        self.picker.setToolTip(_tt('Which decoration to take off the player'))
         if decor:
             self.picker.set_constant(decor)
         layout.addWidget(self.picker, 1)
@@ -4665,16 +5214,21 @@ class _SetMonMoveWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Party Slot:'))
         self.slot_spin = QSpinBox()
+        self.slot_spin.setToolTip(_tt(
+            'Which party member to change — 0 is the one at the front'))
         self.slot_spin.setRange(0, 5)
         self.slot_spin.setValue(int(parts[0]) if parts and parts[0].isdigit() else 0)
         layout.addWidget(self.slot_spin)
         layout.addWidget(QLabel('Move Slot:'))
         self.move_slot_spin = QSpinBox()
+        self.move_slot_spin.setToolTip(_tt(
+            'Which of their four moves gets replaced — 0 is the first'))
         self.move_slot_spin.setRange(0, 3)
         self.move_slot_spin.setValue(int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0)
         layout.addWidget(self.move_slot_spin)
         layout.addWidget(QLabel('Move:'))
         self.picker = ConstantPicker(ConstantsManager.MOVES, prefix='MOVE_')
+        self.picker.setToolTip(_tt('The move to put in that slot'))
         if len(parts) > 2:
             self.picker.set_constant(parts[2])
         layout.addWidget(self.picker, 1)
@@ -4695,14 +5249,19 @@ class _ShowMonPicWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Species:'))
         self.picker = ConstantPicker(ConstantsManager.SPECIES, prefix='SPECIES_')
+        self.picker.setToolTip(_tt('Whose picture to show'))
         if species:
             self.picker.set_constant(species)
         layout.addWidget(self.picker, 1)
         layout.addWidget(QLabel('X:'))
         self.x_spin = QSpinBox(); self.x_spin.setRange(0, 29); self.x_spin.setValue(x)
+        self.x_spin.setToolTip(_tt(
+            'Where the window sits across the screen, in tiles (0–29)'))
         layout.addWidget(self.x_spin)
         layout.addWidget(QLabel('Y:'))
         self.y_spin = QSpinBox(); self.y_spin.setRange(0, 19); self.y_spin.setValue(y)
+        self.y_spin.setToolTip(_tt(
+            'Where the window sits down the screen, in tiles (0–19)'))
         layout.addWidget(self.y_spin)
 
     def to_tuple(self):
@@ -4747,7 +5306,10 @@ class _PokeMartWidget(_CommandWidget):
         top = QHBoxLayout()
         top.addWidget(QLabel('Items Label:'))
         self.label_combo = _make_label_combo(items_label)
-        self.label_combo.setPlaceholderText('data label (e.g. MyMart_Items)')
+        self.label_combo.setToolTip(_tt(
+            'The name of an existing list of items for sale. Leave it blank '
+            'and fill in the rows below to build a new list here.'))
+        self.label_combo.setPlaceholderText('leave blank to list items below')
         top.addWidget(self.label_combo, 1)
         layout.addLayout(top)
 
@@ -4801,13 +5363,15 @@ class _CopyVarWidget(_CommandWidget):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.addWidget(QLabel('Dest:'))
+        layout.addWidget(QLabel('Copy into:'))
         self.dest_picker = ConstantPicker(ConstantsManager.VARS, prefix='VAR_')
+        self.dest_picker.setToolTip(_tt('The variable that gets overwritten'))
         if dest:
             self.dest_picker.set_constant(dest)
         layout.addWidget(self.dest_picker, 1)
-        layout.addWidget(QLabel('Source:'))
+        layout.addWidget(QLabel('Copy from:'))
         self.src_picker = ConstantPicker(ConstantsManager.VARS, prefix='VAR_')
+        self.src_picker.setToolTip(_tt('The variable to read. It is left alone.'))
         if src:
             self.src_picker.set_constant(src)
         layout.addWidget(self.src_picker, 1)
@@ -4827,11 +5391,15 @@ class _CompareVarToVarWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Var 1:'))
         self.var1_picker = ConstantPicker(ConstantsManager.VARS, prefix='VAR_')
+        self.var1_picker.setToolTip(_tt('The first variable to compare'))
         if var1:
             self.var1_picker.set_constant(var1)
         layout.addWidget(self.var1_picker, 1)
         layout.addWidget(QLabel('Var 2:'))
         self.var2_picker = ConstantPicker(ConstantsManager.VARS, prefix='VAR_')
+        self.var2_picker.setToolTip(_tt(
+            'The second variable. The next command can branch on whether the '
+            'two match.'))
         if var2:
             self.var2_picker.set_constant(var2)
         layout.addWidget(self.var2_picker, 1)
@@ -4867,18 +5435,23 @@ class _GetPlayerXYWidget(_CommandWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('Store X in:'))
-        self.var_x_edit = QLineEdit(var_x)
-        self.var_x_edit.setPlaceholderText('variable for X')
-        self.var_x_edit.setToolTip(_tt('Variable to store the player\'s X (horizontal) position'))
+        self.var_x_edit = ConstantPicker(ConstantsManager.VARS, prefix='VAR_')
+        self.var_x_edit.setToolTip(_tt(
+            'The variable that will hold how far across the map the player '
+            'is standing'))
+        self.var_x_edit.set_constant(var_x)
         layout.addWidget(self.var_x_edit, 1)
         layout.addWidget(QLabel('Store Y in:'))
-        self.var_y_edit = QLineEdit(var_y)
-        self.var_y_edit.setPlaceholderText('variable for Y')
-        self.var_y_edit.setToolTip(_tt('Variable to store the player\'s Y (vertical) position'))
+        self.var_y_edit = ConstantPicker(ConstantsManager.VARS, prefix='VAR_')
+        self.var_y_edit.setToolTip(_tt(
+            'The variable that will hold how far down the map the player '
+            'is standing'))
+        self.var_y_edit.set_constant(var_y)
         layout.addWidget(self.var_y_edit, 1)
 
     def to_tuple(self):
-        return ('getplayerxy', f'{self.var_x_edit.text().strip()}, {self.var_y_edit.text().strip()}')
+        return ('getplayerxy', f'{self.var_x_edit.selected_constant()}, '
+                               f'{self.var_y_edit.selected_constant()}')
 
     def friendly_name(self):
         return 'Get Player Position'
@@ -4976,13 +5549,18 @@ class _BufferNumberWidget(_CommandWidget):
         self.slot_spin.setToolTip(_tt('Buffer slot (0–2) — use {STR_VAR_1/2/3} in text to display it'))
         layout.addWidget(self.slot_spin)
         layout.addWidget(QLabel('Number:'))
-        self.value_edit = QLineEdit(str(value))
-        self.value_edit.setPlaceholderText('number or variable')
-        self.value_edit.setToolTip(_tt('Number to convert to text in the buffer'))
+        # Usually a variable, so variables are offered alongside plain
+        # numbers and the project's own constants.
+        self.value_edit = ValuePicker(
+            list(ConstantsManager.VARS or []) + _value_choices(), str(value))
+        self.value_edit.setToolTip(_tt(
+            'The number to print. Pick a variable to print whatever it is '
+            'holding at the time, or a plain number for a fixed one.'))
         layout.addWidget(self.value_edit, 1)
 
     def to_tuple(self):
-        return ('buffernumberstring', f'{self.slot_spin.value()}, {self.value_edit.text().strip()}')
+        return ('buffernumberstring',
+                f'{self.slot_spin.value()}, {self.value_edit.selected_value()}')
 
     def friendly_name(self):
         return 'Buffer Number'
@@ -5001,14 +5579,16 @@ class _BufferStringWidget(_CommandWidget):
         self.slot_spin.setMaximumWidth(50)
         self.slot_spin.setToolTip(_tt('Buffer slot (0–2) — use {STR_VAR_1/2/3} in text to display it'))
         layout.addWidget(self.slot_spin)
-        layout.addWidget(QLabel('Text label:'))
-        self.label_edit = QLineEdit(str(label))
-        self.label_edit.setPlaceholderText('text label from strings')
-        self.label_edit.setToolTip(_tt('Script label pointing to the text to store'))
+        layout.addWidget(QLabel('Text:'))
+        self.label_edit = _make_constant_combo(
+            '', label, choices=_text_labels(), numbers=False,
+            tip='Which block of text to put in the slot. The list is the text '
+                'this map already has.')
         layout.addWidget(self.label_edit, 1)
 
     def to_tuple(self):
-        return ('bufferstring', f'{self.slot_spin.value()}, {self.label_edit.text().strip()}')
+        return ('bufferstring',
+                f'{self.slot_spin.value()}, {self.label_edit.selected_value()}')
 
     def friendly_name(self):
         return 'Buffer String'
@@ -5022,13 +5602,19 @@ class _SetMetatileWidget(_CommandWidget):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.addWidget(QLabel('X:'))
         self.x_spin = QSpinBox(); self.x_spin.setRange(0, 999); self.x_spin.setValue(x)
+        self.x_spin.setToolTip(_tt(
+            'How far across the map the tile is — the same X Porymap shows'))
         layout.addWidget(self.x_spin)
         layout.addWidget(QLabel('Y:'))
         self.y_spin = QSpinBox(); self.y_spin.setRange(0, 999); self.y_spin.setValue(y)
+        self.y_spin.setToolTip(_tt(
+            'How far down the map the tile is — the same Y Porymap shows'))
         layout.addWidget(self.y_spin)
         layout.addWidget(QLabel('Tile:'))
-        self.tile_edit = QLineEdit(str(tile_id))
-        self.tile_edit.setPlaceholderText('metatile ID or constant')
+        self.tile_edit = _make_constant_combo(
+            'METATILE_', tile_id, choices=_metatile_choices(),
+            tip='Which tile to put down. The list is every tile the project '
+                'has given a name to.')
         layout.addWidget(self.tile_edit, 1)
         self.impass_check = QCheckBox('Impassable')
         self.impass_check.setChecked(impassable)
@@ -5037,13 +5623,53 @@ class _SetMetatileWidget(_CommandWidget):
     def to_tuple(self):
         impass = '1' if self.impass_check.isChecked() else '0'
         return ('setmetatile', f'{self.x_spin.value()}, {self.y_spin.value()}, '
-                f'{self.tile_edit.text()}, {impass}')
+                f'{self.tile_edit.selected_value()}, {impass}')
 
     def friendly_name(self):
         return 'Set Metatile'
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+class _SetObjectGraphicsWidget(_CommandWidget):
+    """Change Graphic — swap any event's overworld sprite mid-script.
+
+    Needs the `setobjectgraphics` command, which vanilla pokefirered does not
+    have. Tools → Install Sprite Swap Command adds it. The widget does not
+    check for that: a project may legitimately have added the command another
+    way, and refusing to show the editor for a command the user can see in
+    their own script would be worse than letting them edit it.
+    """
+    def __init__(self, target='', graphic='', parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.addWidget(QLabel('Event:'))
+        self.target_combo = _make_object_combo(target or 'LOCALID_PLAYER')
+        self.target_combo.setToolTip(_tt(
+            'Whose sprite changes.\n'
+            'OBJ_EVENT_ID_PLAYER for the player — use it for carry poses,\n'
+            'emotions, or any temporary look. Remember to change it back\n'
+            'before the script ends, or the player stays in that pose.'))
+        layout.addWidget(self.target_combo, 1)
+        layout.addWidget(QLabel('becomes:'))
+        self.gfx_picker = ConstantPicker(ConstantsManager.OBJECT_GFX,
+                                         prefix='OBJ_EVENT_GFX_')
+        self.gfx_picker.setToolTip(_tt(
+            'The sprite to switch to — any OBJ_EVENT_GFX_* in the project.\n'
+            'Browse shows them as pictures if you would rather look than type.'))
+        if graphic:
+            self.gfx_picker.set_constant(graphic)
+        layout.addWidget(self.gfx_picker, 1)
+        layout.addWidget(_make_browse_button(
+            self.gfx_picker.selected_constant,
+            self.gfx_picker.set_constant))
+
+    def to_tuple(self):
+        return ('setobjectgraphics',
+                f'{self.target_combo.selected_object()}, '
+                f'{self.gfx_picker.selected_constant()}')
+
+
 class _SetObjectMovementTypeWidget(_CommandWidget):
     """Set Object Movement Type — object local ID + MOVEMENT_TYPE picker."""
     def __init__(self, obj_id='', movement_type='', parent=None):
@@ -5057,13 +5683,16 @@ class _SetObjectMovementTypeWidget(_CommandWidget):
         self.movement_picker = ConstantPicker(
             ConstantsManager.MOVEMENT_TYPES, prefix='MOVEMENT_TYPE_',
             keep_order=True)  # header/Porymap order, matching Event Properties
+        self.movement_picker.setToolTip(_tt(
+            'How they move about from now on — standing still, pacing, '
+            'wandering, and so on'))
         if movement_type:
             self.movement_picker.set_constant(movement_type)
         layout.addWidget(self.movement_picker, 1)
 
     def to_tuple(self):
         return ('setobjectmovementtype',
-                f'{self.obj_combo.currentText().strip()}, '
+                f'{self.obj_combo.selected_object()}, '
                 f'{self.movement_picker.selected_constant()}')
 
     def friendly_name(self):
@@ -5084,7 +5713,12 @@ class _GenericWidget(_CommandWidget):
         label = cmd.replace('_', ' ').title()
         layout.addWidget(QLabel(f'{label}:'))
         self.args_edit = QLineEdit(args)
-        self.args_edit.setPlaceholderText('arguments')
+        self.args_edit.setPlaceholderText('arguments, separated by commas')
+        self.args_edit.setToolTip(_tt(
+            'This command has no editor of its own yet, so its settings are '
+            'typed here exactly as the script file spells them, separated by '
+            'commas. Leave it alone unless you know what this command '
+            'expects.'))
         layout.addWidget(self.args_edit, 1)
 
     def to_tuple(self):
@@ -5331,6 +5965,11 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         return _SetObjectXYWidget(parts[0], _safe_int(parts[1]) if len(parts) > 1 else 0,
                                   _safe_int(parts[2]) if len(parts) > 2 else 0,
                                   cmd=cmd)
+    if cmd == 'setobjectgraphics':
+        parts = _split_args(args)
+        return _SetObjectGraphicsWidget(
+            parts[0] if parts else '',
+            parts[1] if len(parts) > 1 else '')
     if cmd == 'setobjectmovementtype':
         parts = _split_args(args)
         return _SetObjectMovementTypeWidget(
@@ -5452,10 +6091,11 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         parts = _split_args(args)
         return _CheckItemSpaceWidget(parts[0] if parts else '',
                                       _safe_int(parts[1], 1) if len(parts) > 1 else 1)
-    if cmd == 'additem':
+    if cmd in ('additem', 'giveitem'):
         parts = _split_args(args)
         return _GiveItemWidget(parts[0] if parts else '',
-                               _safe_int(parts[1], 1) if len(parts) > 1 else 1)
+                               _safe_int(parts[1], 1) if len(parts) > 1 else 1,
+                               cmd=cmd)
     if cmd == 'removeitem':
         parts = _split_args(args)
         return _RemoveItemWidget(parts[0] if parts else '',
@@ -5596,12 +6236,18 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
 # trainer encounters, and item hand-outs.  "Open palette → click" with
 # zero page-switching for the 80% case.
 _PAGE_1_COMMANDS = [
-    ('NPC Basics', [
-        ('Lock Player', 'lock'),
-        ('Lock All', 'lockall'),
-        ('Face Player', 'faceplayer'),
-        ('Release Player', 'release'),
-        ('Release All', 'releaseall'),
+    # "Everyday" is a shortcut, not a category: every command in it also
+    # appears under its own heading further down. Two buttons for one command
+    # is fine — they are the same command, and search matches both.
+    ('Everyday', [
+        ('Show Message', 'message'),
+        ('Give Item', 'giveitem'),
+        ('Set Flag', 'setflag'),
+        ('If Flag \u2192 Goto', 'goto_if_set'),
+        ('Set Move Route', 'applymovement'),
+        ('Wait for Movement', 'waitmovement'),
+        ('Play Sound Effect', 'playse'),
+        ('Change Graphic', 'setobjectgraphics'),
     ]),
     ('Dialogue', [
         ('Show Message', 'message'),
@@ -5609,7 +6255,7 @@ _PAGE_1_COMMANDS = [
         ('Multi-Choice Box', 'multichoice'),
         ('Wait for Message', 'waitmessage'),
         ('Close Message', 'closemessage'),
-        ('Yes/No Box — position only (advanced)', 'yesnobox'),
+        ('Yes/No Box (advanced)', 'yesnobox'),
     ]),
     ('Movement', [
         ('Set Move Route', 'applymovement'),
@@ -5624,7 +6270,8 @@ _PAGE_1_COMMANDS = [
         ('Wild Battle', 'wildbattle'),
     ]),
     ('Items & Rewards', [
-        ('Give Item', 'additem'),
+        ('Give Item', 'giveitem'),
+        ('Add Item (no message)', 'additem'),
         ('Find Item (Item Ball)', 'finditem'),
         ('Check for Item', 'checkitem'),
         ('Check Item Space', 'checkitemspace'),
@@ -5650,6 +6297,15 @@ _PAGE_1_COMMANDS = [
         ('End Script', 'end'),
         ('Return', 'return'),
     ]),
+    # Last on purpose: EVENTide already brackets a script with these, so
+    # reaching for one by hand is the exception.
+    ('Freeze & Release (usually automatic)', [
+        ('Lock Player', 'lock'),
+        ('Lock All', 'lockall'),
+        ('Face Player', 'faceplayer'),
+        ('Release Player', 'release'),
+        ('Release All', 'releaseall'),
+    ]),
 ]
 
 # ── Page 2: World, Characters & Effects ─────────────────────────────────────
@@ -5664,6 +6320,7 @@ _PAGE_2_COMMANDS = [
         ('Set NPC Position', 'setobjectxy'),
         ('Set NPC Position (Permanent)', 'setobjectxyperm'),
         ('Set NPC Movement Type', 'setobjectmovementtype'),
+        ('Change Graphic', 'setobjectgraphics'),
         ('Get Player Position', 'getplayerxy'),
     ]),
     ('Warps & Teleportation', [
@@ -5964,6 +6621,9 @@ _CMD_TOOLTIPS: dict[str, str] = {
     'setobjectxy': 'Move an NPC to a new position instantly\nOnly lasts until the map reloads',
     'setobjectxyperm': 'Move an NPC to a new position permanently\nPersists across map reloads until flag/var resets it',
     'setobjectmovementtype': 'Change an NPC\'s movement behavior\n(e.g. from standing still to walking a route)',
+    'setobjectgraphics': 'Swap any event\'s sprite mid-script — the player too.\n'
+                         'Use it for carry poses, emotions, a chest opening.\n'
+                         'Needs Tools > Install Sprite Swap Command once per project.',
     'getplayerxy': 'Store the player\'s X and Y position into two variables',
     'random': 'Generate a random number from 0 to (max-1)\nResult stored in VAR_RESULT',
     'savebgm': 'Save the currently playing music so it can be restored later',
@@ -5972,6 +6632,166 @@ _CMD_TOOLTIPS: dict[str, str] = {
     'buffernumberstring': 'Store a number as text in a buffer\nUse {STR_VAR_1}, {STR_VAR_2}, or {STR_VAR_3} in messages',
     'bufferstring': 'Store a raw text string in a buffer\nUse {STR_VAR_1}, {STR_VAR_2}, or {STR_VAR_3} in messages',
 }
+
+
+_GFX_THUMB_CACHE: dict = {}
+
+
+def _gfx_thumbnail(gfx_const: str):
+    """A transparent-backed thumbnail of a sprite's first frame, or None.
+
+    Goes through ``core.sprite_render`` rather than a flat ``QPixmap(path)``,
+    per the project's sprite rule. Overworld palettes are not siblings of the
+    PNG — they live under graphics/object_events/palettes keyed by palette
+    tag — so this renders the PNG's own baked palette, which is what the
+    sheet on disk looks like.
+    """
+    if gfx_const in _GFX_THUMB_CACHE:
+        return _GFX_THUMB_CACHE[gfx_const]
+    pm = None
+    path = ConstantsManager.OBJECT_GFX_PATHS.get(gfx_const)
+    if path:
+        from core.sprite_render import load_sprite_pixmap
+        sheet = load_sprite_pixmap(str(path), None)
+        if sheet is not None and not sheet.isNull():
+            from eventide.ui.widgets import overworld_frame_width
+            fw = overworld_frame_width(sheet.width(), sheet.height())
+            frame = sheet.copy(0, 0, min(fw, sheet.width()), sheet.height())
+            # GBA palette slot 0 is the background, and that is the top-left
+            # pixel. Indexed PNGs here carry no tRNS, so without this every
+            # tile sits in a coloured box.
+            bg = frame.toImage().pixel(0, 0)
+            frame.setMask(frame.createMaskFromColor(
+                bg, Qt.MaskMode.MaskInColor))
+            pm = frame.scaled(frame.width() * 2, frame.height() * 2,
+                              Qt.AspectRatioMode.KeepAspectRatio,
+                              Qt.TransformationMode.FastTransformation)
+    _GFX_THUMB_CACHE[gfx_const] = pm
+    return pm
+
+
+def _gfx_label(gfx_const: str) -> str:
+    """OBJ_EVENT_GFX_CUTTABLE_TREE -> 'Cuttable Tree'."""
+    return (gfx_const.replace('OBJ_EVENT_GFX_', '')
+            .replace('_', ' ').title() or gfx_const)
+
+
+class _SpriteGalleryDialog(QDialog):
+    """Choose an overworld sprite by looking at it.
+
+    A dropdown of OBJ_EVENT_GFX_* names tells you what a sprite is called,
+    which is only useful to someone who already knows what the name looks
+    like. This is the same list as a grid of pictures.
+
+    Sprites the project defines but ships no picture for are still listed —
+    they are valid choices, they just show as a name with no tile.
+    """
+
+    _ICON = 72
+
+    def __init__(self, current: str = '', parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Choose a Sprite')
+        self.resize(640, 560)
+        self.selected = None
+
+        layout = QVBoxLayout(self)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText('Type part of a sprite name...')
+        self.search.setToolTip(_tt('Filter the sprites below.'))
+        self.search.textChanged.connect(self._filter)
+        layout.addWidget(self.search)
+
+        self.list = QListWidget()
+        self.list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list.setIconSize(QSize(self._ICON, self._ICON))
+        self.list.setGridSize(QSize(self._ICON + 40, self._ICON + 34))
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list.setMovement(QListWidget.Movement.Static)
+        self.list.setWordWrap(True)
+        self.list.setSpacing(2)
+        self.list.itemDoubleClicked.connect(lambda *_: self._accept())
+        self.list.currentItemChanged.connect(self._on_current)
+        layout.addWidget(self.list, 1)
+
+        # Shows the real constant, so what goes into the script is never a
+        # mystery — the tiles are labelled with the readable name.
+        self._const_lbl = QLabel('')
+        self._const_lbl.setStyleSheet('color: #8fb7d4;')
+        layout.addWidget(self._const_lbl)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                   QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._populate(current)
+        self.search.setFocus()
+
+    def _populate(self, current: str):
+        for gfx in sorted(ConstantsManager.OBJECT_GFX):
+            item = QListWidgetItem(_gfx_label(gfx))
+            item.setData(Qt.ItemDataRole.UserRole, gfx)
+            item.setToolTip(gfx)
+            pm = _gfx_thumbnail(gfx)
+            if pm is not None:
+                item.setIcon(QIcon(pm))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter |
+                                  Qt.AlignmentFlag.AlignTop)
+            self.list.addItem(item)
+            if gfx == current:
+                self.list.setCurrentItem(item)
+        cur = self.list.currentItem()
+        if cur is not None:
+            self.list.scrollToItem(cur)
+
+    def _on_current(self, item, _prev=None):
+        self._const_lbl.setText(
+            item.data(Qt.ItemDataRole.UserRole) if item else '')
+
+    def _filter(self, text: str):
+        text = text.lower().strip()
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            raw = str(item.data(Qt.ItemDataRole.UserRole)).lower()
+            item.setHidden(bool(text) and text not in item.text().lower()
+                           and text not in raw)
+
+    def _accept(self):
+        item = self.list.currentItem()
+        if item is None or item.isHidden():
+            return
+        self.selected = item.data(Qt.ItemDataRole.UserRole)
+        self.accept()
+
+    @staticmethod
+    def get_sprite(current='', parent=None):
+        dlg = _SpriteGalleryDialog(current, parent)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return dlg.selected
+        return None
+
+
+def _make_browse_button(getter, setter, parent=None):
+    """A small Browse button that opens the sprite gallery beside a picker.
+
+    *getter* returns the currently chosen constant, *setter* takes the one
+    the user picked. Kept as a factory so both the NPC's Graphic field and
+    the Change Graphic command get exactly the same button.
+    """
+    btn = QPushButton('Browse\u2026')
+    btn.setFixedWidth(84)
+    btn.setToolTip(_tt('Pick a sprite by looking at it, instead of by name.'))
+
+    def _open():
+        chosen = _SpriteGalleryDialog.get_sprite(getter() or '', btn.window())
+        if chosen:
+            setter(chosen)
+
+    btn.clicked.connect(_open)
+    return btn
 
 
 class _CommandSelectorDialog(QDialog):
@@ -5985,8 +6805,41 @@ class _CommandSelectorDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Event Commands')
-        self.resize(520, 580)
+        self.resize(560, 620)
         self.selected = None
+        # Which command each button stands for, so hovering one can show its
+        # description in the hint strip at the bottom.
+        self._btn_cmd: dict = {}
+        # (heading label, its buttons) per section, so search can hide a
+        # heading whose commands have all been filtered out.
+        self._sections: list = []
+
+        # Buttons are left-aligned and low-contrast on purpose. A wall of
+        # 125 centred high-contrast buttons is the thing that was hard to
+        # read: centring makes every label start in a different place, so
+        # there is no edge for the eye to run down.
+        self.setStyleSheet('''
+            QPushButton[cmdBtn="true"] {
+                text-align: left;
+                padding: 3px 10px;
+                border: 1px solid #3a4046;
+                border-radius: 4px;
+                background: #31363b;
+                color: #d6dbe0;
+            }
+            QPushButton[cmdBtn="true"]:hover {
+                background: #3c4349;
+                border-color: #6ba3d6;
+                color: #ffffff;
+            }
+            QLabel#cmdSection {
+                color: #7fb0d8;
+                font-weight: 600;
+                font-size: 11px;
+                padding: 10px 2px 1px 2px;
+                border-bottom: 1px solid #343a40;
+            }
+        ''')
 
         layout = QVBoxLayout(self)
 
@@ -6028,25 +6881,41 @@ class _CommandSelectorDialog(QDialog):
             page_layout = QVBoxLayout(page_widget)
             page_layout.setSpacing(4)
 
-            # Flatten all commands from all sections into a single list
-            # and lay them out in a 2-column grid
+            # One grid per page, but each section gets a heading row spanning
+            # both columns and restarts the column counter, so a section
+            # always begins at the left edge instead of wherever the previous
+            # one happened to stop.
             from PyQt6.QtWidgets import QGridLayout
             grid = QGridLayout()
             grid.setSpacing(4)
-            row_idx = 0
+            grid.setColumnStretch(0, 1)
+            grid.setColumnStretch(1, 1)
+            row = 0
 
             for section_name, cmds in sections:
-                for friendly, raw in cmds:
-                    col = row_idx % 2
+                hdr = QLabel(section_name)
+                hdr.setObjectName('cmdSection')
+                grid.addWidget(hdr, row, 0, 1, 2)
+                row += 1
+                section_btns = []
+                for i, (friendly, raw) in enumerate(cmds):
                     btn = QPushButton(f'{friendly}...' if friendly[-3:] != '...' else friendly)
                     btn.setMinimumHeight(26)
-                    tip = _CMD_TOOLTIPS.get(raw, '')
+                    btn.setProperty('cmdBtn', True)
+                    tip = _CMD_TOOLTIPS.get(raw, '') or _command_help(raw)
                     if tip:
                         btn.setToolTip(_tt(tip))
                     btn.clicked.connect(lambda _, c=raw: self._choose(c))
-                    grid.addWidget(btn, row_idx // 2, col)
+                    btn.installEventFilter(self)
+                    self._btn_cmd[btn] = raw
+                    grid.addWidget(btn, row + i // 2, i % 2)
                     self._all_buttons.append((btn, friendly.lower(), raw))
-                    row_idx += 1
+                    section_btns.append(btn)
+                row += (len(cmds) + 1) // 2
+                # Remembered so a search that matches nothing in this section
+                # can hide its heading too, instead of leaving a label with
+                # empty space under it.
+                self._sections.append((hdr, section_btns))
 
             page_layout.addLayout(grid)
             page_layout.addStretch()
@@ -6057,9 +6926,32 @@ class _CommandSelectorDialog(QDialog):
 
         layout.addWidget(self.tabs, 1)
 
+        # Hint strip: always-visible plain-English description of whichever
+        # command the mouse is over, so nobody has to hover and wait.
+        self._hint = QLabel('Point at a command to see what it does.')
+        self._hint.setWordWrap(True)
+        self._hint.setMinimumHeight(38)
+        self._hint.setStyleSheet(
+            'color: #cfd8dc; background: #2b3034; border: 1px solid #3a4046;'
+            ' border-radius: 4px; padding: 5px 8px;')
+        layout.addWidget(self._hint)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def eventFilter(self, obj, event):
+        """Show a hovered command's description in the hint strip."""
+        if event.type() == QEvent.Type.Enter:
+            cmd = self._btn_cmd.get(obj)
+            if cmd:
+                text = (_command_help(cmd)
+                        or _CMD_TOOLTIPS.get(cmd, '').replace('\n', ' ')
+                        or 'No description yet.')
+                self._hint.setText(text)
+        elif event.type() == QEvent.Type.Leave and obj in self._btn_cmd:
+            self._hint.setText('Point at a command to see what it does.')
+        return super().eventFilter(obj, event)
 
     def _populate_recent(self):
         """Build buttons for recently used commands."""
@@ -6072,10 +6964,12 @@ class _CommandSelectorDialog(QDialog):
             btn = QPushButton(friendly)
             btn.setMinimumHeight(24)
             btn.setStyleSheet('font-size: 11px;')
-            tip = _CMD_TOOLTIPS.get(cmd, '')
+            tip = _CMD_TOOLTIPS.get(cmd, '') or _command_help(cmd)
             if tip:
                 btn.setToolTip(_tt(tip))
             btn.clicked.connect(lambda _, c=cmd: self._choose(c))
+            btn.installEventFilter(self)
+            self._btn_cmd[btn] = cmd
             self._recent_btn_layout.addWidget(btn)
             self._recent_buttons.append((btn, friendly.lower(), cmd))
         self._recent_btn_layout.addStretch()
@@ -6094,6 +6988,12 @@ class _CommandSelectorDialog(QDialog):
         for btn, friendly, raw in self._recent_buttons:
             visible = not text or text in friendly or text in raw
             btn.setVisible(visible)
+        # A heading with nothing left under it is noise — hide it with its
+        # commands.
+        # isHidden(), not isVisible(): a button on a tab that is not the
+        # front one is not visible, but it has not been filtered out either.
+        for hdr, btns in self._sections:
+            hdr.setVisible(any(not b.isHidden() for b in btns))
         # Show/hide the recent section based on whether any match
         if text:
             any_visible = any(btn.isVisible() for btn, _, _ in self._recent_buttons)
@@ -6112,6 +7012,13 @@ class _CommandSelectorDialog(QDialog):
 # ═════════════════════════════════════════════════════════════════════════════
 # Hidden Item property panel (replaces command list for hidden_item bg_events)
 # ═════════════════════════════════════════════════════════════════════════════
+
+#: The two small sprite buttons that sit under the Graphic picker.
+_SPRITE_BTN_SS = (
+    "background: #2a2a3a; color: #aac; border: 1px solid #3a3a4a; "
+    "padding: 3px 6px; border-radius: 3px; font-size: 10px;"
+)
+
 
 class _HiddenItemPanel(QWidget):
     """Property editor shown instead of the command list when a hidden item
@@ -6247,6 +7154,9 @@ class _DraggableCommandList(QListWidget):
     ``_cmd_tuples`` from the new visual order.
     """
     rows_reordered = pyqtSignal()
+    #: Emitted BEFORE a drop changes anything, so the parent can snapshot the
+    #: order for undo. After the drop the old order is already gone.
+    rows_about_to_move = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -6254,6 +7164,7 @@ class _DraggableCommandList(QListWidget):
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
 
     def dropEvent(self, event):
+        self.rows_about_to_move.emit()
         super().dropEvent(event)
         # After the drop completes, emit so the data layer can sync
         self.rows_reordered.emit()
@@ -6307,6 +7218,10 @@ class EventEditorTab(QWidget):
         self._cmd_tuples: list[tuple] = []
         self._loading = False  # True while populating UI fields (suppress dirty)
         self._script_index = None  # Built in load_project()
+        # Let command widgets inside modal dialogs reach the project's flag
+        # search without every widget needing a pointer back here.
+        global _FIND_UNUSED_FLAG_CB
+        _FIND_UNUSED_FLAG_CB = self._find_unused_flags
         self._build_ui()
 
     def _mark_dirty(self):
@@ -6502,11 +7417,32 @@ class EventEditorTab(QWidget):
 
         # ── Top bar: map selector ────────────────────────────────────────
         top = QHBoxLayout()
-        self.btn_open = QPushButton('Open Map')
-        self.btn_open.setToolTip(_tt('Choose a map to edit its events and scripts'))
-        self.btn_open.setEnabled(False)
-        self.btn_open.clicked.connect(self._on_open_map)
-        top.addWidget(self.btn_open)
+        top.addWidget(QLabel('Map:'))
+        self.map_combo = QComboBox()
+        self.map_combo.setEditable(True)
+        self.map_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.map_combo.setMinimumWidth(320)
+        self.map_combo.setEnabled(False)
+        self.map_combo.lineEdit().setPlaceholderText(
+            'Type any part of a map name\u2026')
+        self.map_combo.setToolTip(_tt(
+            'The map being edited.\n'
+            'Type any part of a name to narrow the list, then press Enter or\n'
+            'pick from the drop-down.'))
+        # A stray scroll here would load a different map and lose your place,
+        # so the wheel does nothing unless the list is actually open.
+        self.map_combo.wheelEvent = lambda e: e.ignore()
+        _map_completer = QCompleter(self.map_combo.model(), self.map_combo)
+        _map_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        # Contains, not starts-with: nobody remembers which prefix a map got.
+        _map_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        _map_completer.setCompletionMode(
+            QCompleter.CompletionMode.PopupCompletion)
+        self.map_combo.setCompleter(_map_completer)
+        self.map_combo.activated.connect(self._on_map_combo_chosen)
+        self.map_combo.lineEdit().returnPressed.connect(
+            self._on_map_combo_entered)
+        top.addWidget(self.map_combo)
         self.map_label = QLabel('No map loaded')
         self.map_label.setToolTip(_tt('Currently loaded map name'))
         top.addWidget(self.map_label, 1)
@@ -6592,6 +7528,7 @@ class EventEditorTab(QWidget):
         left = QWidget()
         ll = QVBoxLayout(left)
         ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(4)
 
         obj_row = QHBoxLayout()
         obj_row.addWidget(QLabel('Event:'))
@@ -6660,11 +7597,14 @@ class EventEditorTab(QWidget):
         self._cond_var_picker.currentTextChanged.connect(self._on_cond_changed)
         var_row.addWidget(self._cond_var_picker, 1)
         self._cond_var_op = QComboBox()
-        self._cond_var_op.addItems(['==', '!=', '<', '>=', '<=', '>'])
+        # Order must stay eq/ne/lt/ge/le/gt — op_cmds and op_map
+        # below read this combo by index.
+        self._cond_var_op.addItems(['is exactly', 'is NOT',
+                                    'is less than', 'is at least',
+                                    'is at most', 'is more than'])
         self._cond_var_op.setToolTip(_tt('Comparison operator — how the variable is compared to the value'))
         self._cond_var_op.wheelEvent = lambda e: e.ignore()
         self._cond_var_op.setEnabled(False)
-        self._cond_var_op.setMaximumWidth(60)
         self._cond_var_op.currentIndexChanged.connect(self._on_cond_changed)
         var_row.addWidget(self._cond_var_op)
         self._cond_var_val = QSpinBox()
@@ -6776,6 +7716,68 @@ class EventEditorTab(QWidget):
         props = QGroupBox('Event Properties')
         props.setToolTip(_tt('Properties of the currently selected event object'))
         pf = QFormLayout(props)
+        # Rows were far enough apart that the sprite preview fell below the
+        # fold on a normal window.
+        pf.setVerticalSpacing(3)
+        pf.setHorizontalSpacing(6)
+        pf.setContentsMargins(8, 4, 8, 4)
+        pf.setLabelAlignment(Qt.AlignmentFlag.AlignRight
+                             | Qt.AlignmentFlag.AlignVCenter)
+        self.gfx_combo = QComboBox()
+        self.gfx_combo.setEditable(True)
+        self.gfx_combo.setToolTip(_tt(
+            'The sprite graphic for this NPC\n'
+            'OBJ_EVENT_GFX constants — type to search'))
+        self.gfx_combo.wheelEvent = lambda e: e.ignore()
+        # It now shares its row with the preview and a Browse button, so it
+        # needs a floor or a narrow panel squeezes it to nothing.
+        self.gfx_combo.setMinimumWidth(150)
+        self.gfx_combo.currentTextChanged.connect(self._on_gfx_changed)
+        # Sprite preview sits IN this row, not at the bottom of the column:
+        # the picture is the whole point of the field and it was the one thing
+        # you had to scroll for.
+        self.sprite_preview = SpritePreview()
+        self.sprite_preview.setToolTip(_tt(
+            'Animated preview of the selected NPC sprite'))
+
+        # Short labels: these two sit side by side under the picker now,
+        # and the tooltips carry the full wording.
+        self._open_sprite_btn = QPushButton('Open PNG')
+        self._open_sprite_btn.setToolTip(_tt(
+            'Open the sprite PNG file in your file manager for manual editing'))
+        self._open_sprite_btn.setStyleSheet(_SPRITE_BTN_SS)
+        self._open_sprite_btn.clicked.connect(self._open_sprite_folder)
+
+        self._open_ow_graphics_btn = QPushButton('OW Graphics')
+        self._open_ow_graphics_btn.setToolTip(_tt(
+            'Select this sprite in the Overworld Graphics editor tab'))
+        self._open_ow_graphics_btn.setStyleSheet(_SPRITE_BTN_SS)
+        self._open_ow_graphics_btn.clicked.connect(self._open_sprite_in_ow_tab)
+
+        gfx_right = QVBoxLayout()
+        gfx_right.setContentsMargins(0, 0, 0, 0)
+        gfx_right.setSpacing(3)
+        gfx_pick = QHBoxLayout()
+        gfx_pick.setContentsMargins(0, 0, 0, 0)
+        gfx_pick.addWidget(self.gfx_combo, 1)
+        gfx_pick.addWidget(_make_browse_button(
+            self.gfx_combo.currentText, self.gfx_combo.setCurrentText))
+        gfx_right.addLayout(gfx_pick)
+        gfx_btns = QHBoxLayout()
+        gfx_btns.setContentsMargins(0, 0, 0, 0)
+        gfx_btns.setSpacing(3)
+        gfx_btns.addWidget(self._open_sprite_btn)
+        gfx_btns.addWidget(self._open_ow_graphics_btn)
+        gfx_right.addLayout(gfx_btns)
+
+        gfx_row = QHBoxLayout()
+        gfx_row.setContentsMargins(0, 0, 0, 0)
+        gfx_row.setSpacing(6)
+        gfx_row.addWidget(self.sprite_preview, 0,
+                          Qt.AlignmentFlag.AlignTop)
+        gfx_row.addLayout(gfx_right, 1)
+        pf.addRow('Graphic:', gfx_row)
+
         self.obj_id_edit = QLineEdit()
         self.obj_id_edit.setPlaceholderText('a name, e.g. Jim (or leave blank)')
         self.obj_id_edit.setToolTip(_tt(
@@ -6804,14 +7806,6 @@ class EventEditorTab(QWidget):
             'Type a name here to give a scriptless event a script.'))
         self.script_edit.editingFinished.connect(self._on_script_edit_finished)
         pf.addRow('Script:', self.script_edit)
-        self.gfx_combo = QComboBox()
-        self.gfx_combo.setEditable(True)
-        self.gfx_combo.setToolTip(_tt(
-            'The sprite graphic for this NPC\n'
-            'OBJ_EVENT_GFX constants — type to search'))
-        self.gfx_combo.wheelEvent = lambda e: e.ignore()
-        self.gfx_combo.currentTextChanged.connect(self._on_gfx_changed)
-        pf.addRow('Graphic:', self.gfx_combo)
 
         self.movement_combo = QComboBox()
         self.movement_combo.setEditable(True)
@@ -6824,6 +7818,47 @@ class EventEditorTab(QWidget):
         self.movement_combo.currentTextChanged.connect(
             lambda: self._mark_dirty())
         pf.addRow('Movement:', self.movement_combo)
+        # ── Visibility flag ─────────────────────────────────────────────
+        # map.json's own `flag` field: while it is SET the engine does not
+        # spawn this event at all. It is how a collected chest stays open and
+        # a one-off NPC stays gone, and it is NOT the same as a flag a script
+        # checks — this one hides the object itself. Porymap has always been
+        # able to set it; EVENTide could not, which meant the project's own
+        # documented chest workflow needed a trip to Porymap halfway through.
+        flag_row = QHBoxLayout()
+        flag_row.setContentsMargins(0, 0, 0, 0)
+        self.obj_flag_combo = ConstantPicker(ConstantsManager.FLAGS,
+                                             prefix='FLAG_')
+        self.obj_flag_combo.setToolTip(_tt(
+            "Hide this event once the flag is SET.\n"
+            "The engine skips spawning it entirely — use it for a chest that\n"
+            "stays open, an item already taken, or an NPC who has left.\n"
+            "Leave blank for an event that is always there.\n"
+            "This is the OBJECT's own flag, not a flag your script checks."))
+        self.obj_flag_combo.currentTextChanged.connect(lambda: self._mark_dirty())
+        flag_row.addWidget(self.obj_flag_combo, 1)
+        self._btn_obj_flag_find = QPushButton('Find unused')
+        self._btn_obj_flag_find.setMaximumWidth(92)
+        self._btn_obj_flag_find.setToolTip(_tt(
+            'Pick the next flag nothing else in the project uses.'))
+        self._btn_obj_flag_find.clicked.connect(self._on_pick_unused_object_flag)
+        flag_row.addWidget(self._btn_obj_flag_find)
+        self._btn_obj_flag_clear = QPushButton('✕')
+        self._btn_obj_flag_clear.setMaximumWidth(28)
+        self._btn_obj_flag_clear.setToolTip(_tt('Clear — always show this event'))
+        self._btn_obj_flag_clear.clicked.connect(
+            lambda: (self.obj_flag_combo.setEditText(''), self._mark_dirty()))
+        flag_row.addWidget(self._btn_obj_flag_clear)
+        pf.addRow('Hide when flag:', flag_row)
+
+        self.elev_spin = QSpinBox()
+        self.elev_spin.setRange(0, 15)
+        self.elev_spin.setToolTip(_tt(
+            'Height layer. 3 is normal ground level; 0 means "same level as\n'
+            'whatever tile it stands on". Used for bridges and raised floors.'))
+        self.elev_spin.valueChanged.connect(lambda: self._mark_dirty())
+        pf.addRow('Elevation:', self.elev_spin)
+
         # A gentle inline warning when the selected type can't face the player.
         self.movement_warn_lbl = QLabel('')
         self.movement_warn_lbl.setStyleSheet(
@@ -6854,29 +7889,6 @@ class EventEditorTab(QWidget):
         self._xref_label.linkActivated.connect(self._on_xref_clicked)
         self._xref_label.hide()
         ll.addWidget(self._xref_label)
-
-        # Sprite preview
-        self.sprite_preview = SpritePreview()
-        self.sprite_preview.setToolTip(_tt('Animated preview of the selected NPC sprite'))
-        ll.addWidget(self.sprite_preview)
-
-        self._open_sprite_btn = QPushButton("Open Sprite in Folder")
-        self._open_sprite_btn.setToolTip(_tt('Open the sprite PNG file in your file manager for manual editing'))
-        self._open_sprite_btn.setStyleSheet(
-            "background: #2a2a3a; color: #aac; border: 1px solid #3a3a4a; "
-            "padding: 4px 12px; border-radius: 3px; font-size: 10px;"
-        )
-        self._open_sprite_btn.clicked.connect(self._open_sprite_folder)
-        ll.addWidget(self._open_sprite_btn)
-
-        self._open_ow_graphics_btn = QPushButton("Open in OW Graphics")
-        self._open_ow_graphics_btn.setToolTip(_tt('Select this sprite in the Overworld Graphics editor tab'))
-        self._open_ow_graphics_btn.setStyleSheet(
-            "background: #2a2a3a; color: #aac; border: 1px solid #3a3a4a; "
-            "padding: 4px 12px; border-radius: 3px; font-size: 10px;"
-        )
-        self._open_ow_graphics_btn.clicked.connect(self._open_sprite_in_ow_tab)
-        ll.addWidget(self._open_ow_graphics_btn)
 
         ll.addStretch()
         # Wrap the properties column in a scroll area so it NEVER squishes its
@@ -6934,6 +7946,25 @@ class EventEditorTab(QWidget):
         find_shortcut = QShortcut(QKeySequence('Ctrl+F'), self)
         find_shortcut.activated.connect(self._toggle_search)
         # Ctrl+Shift+F shortcut (project-wide script search)
+        # The command list is a list; it should behave like one. These are
+        # scoped to this tab so they cannot fire while another tab has focus.
+        for keys, slot in (
+                # StandardKey.Delete only -- registering 'Del' as well makes
+                # Qt call the pair ambiguous and fire NEITHER.
+                (QKeySequence.StandardKey.Delete, self._on_del_command),
+                ('Ctrl+C', self._on_copy),
+                ('Ctrl+X', self._on_cut),
+                ('Ctrl+V', self._on_paste),
+                ('Ctrl+D', self._on_duplicate),
+                ('Ctrl+Z', self._on_undo),
+                ('Ctrl+Shift+Z', self._on_redo),
+                ('Ctrl+Y', self._on_redo),
+                ('Alt+Up', self._on_move_up),
+                ('Alt+Down', self._on_move_down)):
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(slot)
+
         find_script_shortcut = QShortcut(QKeySequence('Ctrl+Shift+F'), self)
         find_script_shortcut.activated.connect(self._on_find_script)
 
@@ -6941,11 +7972,16 @@ class EventEditorTab(QWidget):
         self._cmd_list.setToolTip(_tt(
             'Script commands for this event page\n'
             'Double-click to edit • Right-click for context menu • Drag to reorder'))
-        self._cmd_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # Ctrl-click and Shift-click to pick several commands. Delete, Copy
+        # and Cut all act on the whole selection.
+        self._cmd_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self._cmd_list.setWordWrap(True)
         self._cmd_list.itemDoubleClicked.connect(self._on_edit_command)
         self._cmd_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._cmd_list.customContextMenuRequested.connect(self._on_cmd_context_menu)
+        self._cmd_list.rows_about_to_move.connect(
+            self._on_rows_about_to_move)
         self._cmd_list.rows_reordered.connect(self._on_rows_moved)
         self._cmd_list.setObjectName('cmdList')
         self._cmd_list.setStyleSheet(
@@ -6998,9 +8034,26 @@ class EventEditorTab(QWidget):
         btn_cut.clicked.connect(self._on_cut)
         cmd_btns2.addWidget(btn_cut)
         btn_paste = QPushButton('Paste')
-        btn_paste.setToolTip(_tt('Paste a previously copied command below the selection'))
+        btn_paste.setToolTip(_tt(
+            'Paste below the selection.\n'
+            'Script text on the clipboard is parsed into commands — copy lines\n'
+            'out of a .inc file, a wiki or another map and paste them straight\n'
+            'in. Otherwise pastes the command you last copied here.'))
         btn_paste.clicked.connect(self._on_paste)
         cmd_btns2.addWidget(btn_paste)
+        btn_copy_script = QPushButton('Copy as Script')
+        btn_copy_script.setToolTip(_tt(
+            'Copy this event as real .inc text — exactly what Save would\n'
+            'write. Paste it into a file, a wiki, or another event.'))
+        btn_copy_script.clicked.connect(self._on_copy_script)
+        cmd_btns2.addWidget(btn_copy_script)
+        btn_open_file = QPushButton('Open .inc')
+        btn_open_file.setToolTip(_tt(
+            "Open this map's scripts.inc in your usual editor.\n"
+            'Warns first if you have unsaved changes, since the file on disk\n'
+            'would not show them yet.'))
+        btn_open_file.clicked.connect(self._on_open_script_file)
+        cmd_btns2.addWidget(btn_open_file)
         btn_find = QPushButton('Find (Ctrl+F)')
         btn_find.setToolTip(_tt('Search within the current command list\nHighlights matching commands with Next/Prev navigation'))
         btn_find.clicked.connect(self._toggle_search)
@@ -7047,7 +8100,7 @@ class EventEditorTab(QWidget):
         # GFX combo
         self._refresh_gfx_combo()
 
-        self.btn_open.setEnabled(True)
+        self._populate_map_combo()
 
         # If a map was already open, reload it from disk to pick up any
         # on-disk changes and discard unsaved in-memory edits.
@@ -7056,9 +8109,9 @@ class EventEditorTab(QWidget):
                 self._load_map(self._map_dir)
             except Exception as e:
                 self._mw.log_message(f'Event Editor: map reload error: {e}')
-                self.map_label.setText('No map loaded — click Open Map')
+                self.map_label.setText('No map loaded')
         else:
-            self.map_label.setText('No map loaded — click Open Map')
+            self.map_label.setText('No map loaded')
 
         # Build project-wide script label index
         from eventide.backend.script_index import ScriptIndex
@@ -7106,28 +8159,81 @@ class EventEditorTab(QWidget):
     # Map loading
     # ─────────────────────────────────────────────────────────────────────
 
-    def _on_open_map(self):
+    def _map_names(self) -> list:
+        """Every map folder that actually holds a map.json, sorted."""
         if not self._root_dir:
-            return
-        # Check for unsaved changes before switching maps
-        if not self._check_unsaved_before_map_switch():
-            return
+            return []
         maps_dir = self._root_dir / 'data' / 'maps'
         if not maps_dir.is_dir():
-            QMessageBox.warning(self, 'Open Map', f'Maps directory not found:\n{maps_dir}')
+            return []
+        return sorted(name for name in os.listdir(maps_dir)
+                      if (maps_dir / name / 'map.json').is_file())
+
+    def _populate_map_combo(self):
+        """Fill the toolbar's map box, keeping whatever is open selected."""
+        names = self._map_names()
+        self.map_combo.blockSignals(True)
+        self.map_combo.clear()
+        self.map_combo.addItems(names)
+        self.map_combo.blockSignals(False)
+        self._sync_map_combo()
+        self.map_combo.setEnabled(bool(names))
+
+    def _sync_map_combo(self):
+        """Point the box at the map that is actually open.
+
+        Called after a load and after a cancelled switch, because a box
+        showing a map you are not editing is worse than no box at all.
+        """
+        self.map_combo.blockSignals(True)
+        current = self._map_dir.name if self._map_dir else ''
+        idx = self.map_combo.findText(current) if current else -1
+        self.map_combo.setCurrentIndex(idx)
+        if idx < 0:
+            self.map_combo.setEditText('')
+        self.map_combo.blockSignals(False)
+
+    def _on_map_combo_chosen(self, index: int):
+        """A map was picked from the drop-down."""
+        if index >= 0:
+            self._open_map_named(self.map_combo.itemText(index))
+
+    def _on_map_combo_entered(self):
+        """Enter pressed in the box — take the first map that matches."""
+        text = self.map_combo.currentText().strip()
+        if not text:
             return
-        folders = sorted(
-            name for name in os.listdir(maps_dir)
-            if (maps_dir / name / 'map.json').is_file()
-        )
-        if not folders:
-            QMessageBox.information(self, 'Open Map', 'No maps with map.json found.')
+        idx = self.map_combo.findText(text, Qt.MatchFlag.MatchFixedString)
+        if idx < 0:
+            # Half a name is enough; the completer shows what will be taken.
+            lowered = text.lower()
+            for i in range(self.map_combo.count()):
+                if lowered in self.map_combo.itemText(i).lower():
+                    idx = i
+                    break
+        if idx < 0:
+            QMessageBox.information(
+                self, 'Open Map', f'No map name contains "{text}".')
+            self._sync_map_combo()
             return
-        choice, ok = QInputDialog.getItem(
-            self, 'Open Map', 'Select a map:', folders, editable=False)
-        if not ok:
+        self._open_map_named(self.map_combo.itemText(idx))
+
+    def _open_map_named(self, name: str):
+        """Load a map by folder name, honouring the unsaved-changes guard."""
+        if not name or not self._root_dir:
             return
-        self._load_map(maps_dir / choice)
+        if self._map_dir and name == self._map_dir.name:
+            return  # already open; don't reload over unsaved edits
+        if not self._check_unsaved_before_map_switch():
+            self._sync_map_combo()   # cancelled — the box must not lie
+            return
+        map_dir = self._root_dir / 'data' / 'maps' / name
+        if not (map_dir / 'map.json').is_file():
+            QMessageBox.warning(self, 'Open Map',
+                                f'{name} has no map.json.')
+            self._sync_map_combo()
+            return
+        self._load_map(map_dir)
 
     def open_map_and_select(self, map_name: str, local_id: str = '',
                             trainer_const: str = '',
@@ -7363,15 +8469,26 @@ class EventEditorTab(QWidget):
         global _SCRIPT_LABELS, _OBJECT_LOCAL_IDS, _MOVEMENT_LABELS, _ALL_SCRIPTS
         _SCRIPT_LABELS = sorted(set(list(scripts.keys()) + list(self._pages.keys())))
 
-        # Collect object local IDs (both LOCALID_ constants and raw strings)
-        obj_ids = set()
-        for obj in self._map_data.get('object_events', []):
+        # Collect this map's object events, each with a readable label, so
+        # the command dialogs can ask "which character?" in plain words.
+        # The two fixed entries come first because they are what scripts use
+        # most: the event being edited, and the player.
+        global _OBJECT_CHOICES
+        choices: list[tuple[str, str]] = [
+            ('0', 'This event (the one you are editing)'),
+            ('LOCALID_PLAYER', 'The player'),
+        ]
+        seen = {raw for raw, _ in choices}
+        for obj in sorted(self._map_data.get('object_events', []),
+                          key=lambda o: str(o.get('local_id') or '')):
             lid = obj.get('local_id')
-            if lid:
-                obj_ids.add(str(lid))
-        # Also add LOCALID_PLAYER which is commonly used
-        obj_ids.add('LOCALID_PLAYER')
-        _OBJECT_LOCAL_IDS = sorted(obj_ids)
+            raw = str(lid) if lid else ''
+            if not raw or raw in seen:
+                continue
+            seen.add(raw)
+            choices.append((raw, _object_choice_label(raw, obj)))
+        _OBJECT_CHOICES = choices
+        _OBJECT_LOCAL_IDS = [raw for raw, _ in choices]
 
         # Collect movement labels (labels containing "Movement" in their name)
         _MOVEMENT_LABELS = sorted(
@@ -7616,6 +8733,7 @@ class EventEditorTab(QWidget):
         self.obj_combo.blockSignals(False)
 
         self.map_label.setText(f'Map: {name}')
+        self._sync_map_combo()
         n_npc = len(self._map_data.get('object_events', []))
         n_trig = len(self._map_data.get('coord_events', []))
         n_bg = len(self._map_data.get('bg_events', []))
@@ -7742,7 +8860,7 @@ class EventEditorTab(QWidget):
 
         Produces text like:
             Flag: [Temp 2] is ON
-            Variable: [Map Scene] == 2
+            Variable: [Map Scene] is exactly 2
         """
         if not cmd_tuple:
             return ''
@@ -7755,10 +8873,9 @@ class EventEditorTab(QWidget):
             return f'Flag: [{name}] is OFF'
         if cmd in ('goto_if_eq', 'goto_if_ne', 'goto_if_lt',
                     'goto_if_ge', 'goto_if_le', 'goto_if_gt'):
-            op_map = {'goto_if_eq': '==', 'goto_if_ne': '!=',
-                      'goto_if_lt': '<', 'goto_if_ge': '>=',
-                      'goto_if_le': '<=', 'goto_if_gt': '>'}
-            op = op_map.get(cmd, '?')
+            # _OP_DISPLAY is the one place the comparison wording lives,
+            # so the condition summary reads the same as the dropdowns.
+            op = _OP_DISPLAY.get(cmd, '?')
             var = _resolve_name(str(cmd_tuple[1])) if len(cmd_tuple) > 1 else '?'
             val = _resolve_name(str(cmd_tuple[2])) if len(cmd_tuple) > 2 else '?'
             return f'Variable: [{var}] {op} {val}'
@@ -8527,6 +9644,21 @@ class EventEditorTab(QWidget):
                 comp.setFilterMode(Qt.MatchFlag.MatchContains)
                 self.movement_combo.setCompleter(comp)
             self.movement_combo.setEnabled(True)
+            # map.json stores "no flag" as the literal "0"; show that as blank
+            # rather than as a flag called 0.
+            raw_flag = str(obj.get('flag', '') or '')
+            self.obj_flag_combo.blockSignals(True)
+            self.obj_flag_combo.set_constant(
+                '' if raw_flag in ('', '0', '0x0') else raw_flag)
+            self.obj_flag_combo.blockSignals(False)
+            self.obj_flag_combo.setEnabled(True)
+            self._btn_obj_flag_find.setEnabled(True)
+            self._btn_obj_flag_clear.setEnabled(True)
+            self.elev_spin.blockSignals(True)
+            self.elev_spin.setValue(int(obj.get('elevation', 3) or 0))
+            self.elev_spin.blockSignals(False)
+            self.elev_spin.setEnabled(True)
+
             mv = obj.get('movement_type', '') or ''
             self.movement_combo.blockSignals(True)
             midx = self.movement_combo.findText(mv)
@@ -8550,6 +9682,7 @@ class EventEditorTab(QWidget):
             self.gfx_combo.setEnabled(False)
             self.movement_combo.setEditText('')
             self.movement_combo.setEnabled(False)
+            self._set_object_only_fields_enabled(False)
             self.movement_warn_lbl.setText('')
             self.sprite_preview.set_sprite(None)
             self.script_edit.setText('')
@@ -8570,6 +9703,7 @@ class EventEditorTab(QWidget):
             self.gfx_combo.setEnabled(False)
             self.movement_combo.setEditText('')
             self.movement_combo.setEnabled(False)
+            self._set_object_only_fields_enabled(False)
             self.movement_warn_lbl.setText('')
             self.sprite_preview.set_sprite(None)
         else:  # map_script
@@ -8583,6 +9717,7 @@ class EventEditorTab(QWidget):
             self.gfx_combo.setEnabled(False)
             self.movement_combo.setEditText('')
             self.movement_combo.setEnabled(False)
+            self._set_object_only_fields_enabled(False)
             self.movement_warn_lbl.setText('')
             self.sprite_preview.set_sprite(None)
 
@@ -9337,6 +10472,9 @@ class EventEditorTab(QWidget):
 
     def _display_page(self, page: dict):
         from eventide.backend.eventide_utils import resugar_choices
+        # A new page means a new history: replaying an undo onto a different
+        # page's commands would be silent corruption.
+        self._clear_undo()
         self._cmd_list.clear()
         self._cmd_tuples: list[tuple] = []
 
@@ -9494,6 +10632,12 @@ class EventEditorTab(QWidget):
             mv = self.movement_combo.currentText().strip()
             if mv:
                 obj['movement_type'] = mv
+
+            # Visibility flag. "0" is how map.json spells "no flag" — write
+            # that rather than an empty string, which the build rejects.
+            flag = self.obj_flag_combo.selected_constant().strip()
+            obj['flag'] = flag if flag else '0'
+            obj['elevation'] = self.elev_spin.value()
         elif etype == 'bg' and obj.get('type') == 'hidden_item':
             data = self._hidden_item_panel.collect()
             obj['item'] = data['item']
@@ -9519,31 +10663,41 @@ class EventEditorTab(QWidget):
     def _on_cmd_context_menu(self, pos):
         """Right-click context menu on the command list — Edit, Cut, Copy, Paste, Delete."""
         item = self._cmd_list.itemAt(pos)
-        if item:
+        # Only move the selection when the click lands OUTSIDE it. Calling
+        # setCurrentItem unconditionally collapses a multi-selection, so
+        # right-clicking three selected rows to delete them deleted one.
+        if item and not item.isSelected():
             self._cmd_list.setCurrentItem(item)
         idx = self._selected_cmd_idx()
         has_cmd = idx >= 0
+        n_sel = len(self._selected_cmd_rows())
+        many = f' ({n_sel})' if n_sel > 1 else ''
 
         menu = QMenu(self)
+        act_undo = menu.addAction('Undo\tCtrl+Z')
+        act_undo.setEnabled(bool(getattr(self, '_undo_stack', None)))
+        act_redo = menu.addAction('Redo\tCtrl+Shift+Z')
+        act_redo.setEnabled(bool(getattr(self, '_redo_stack', None)))
+        menu.addSeparator()
         act_edit = menu.addAction('Edit')
         act_edit.setEnabled(has_cmd)
         menu.addSeparator()
-        act_cut = menu.addAction('Cut')
+        act_cut = menu.addAction(f'Cut{many}\tCtrl+X')
         act_cut.setEnabled(has_cmd)
-        act_copy = menu.addAction('Copy')
+        act_copy = menu.addAction(f'Copy{many}\tCtrl+C')
         act_copy.setEnabled(has_cmd)
-        act_paste = menu.addAction('Paste')
-        act_paste.setEnabled(EventEditorTab._clipboard is not None)
-        act_dup = menu.addAction('Duplicate')
+        act_paste = menu.addAction('Paste\tCtrl+V')
+        act_paste.setEnabled(bool(EventEditorTab._clipboard))
+        act_dup = menu.addAction('Duplicate\tCtrl+D')
         act_dup.setEnabled(has_cmd)
         menu.addSeparator()
-        act_up = menu.addAction('Move Up')
+        act_up = menu.addAction('Move Up\tAlt+Up')
         act_up.setEnabled(has_cmd and idx > 0)
-        act_down = menu.addAction('Move Down')
+        act_down = menu.addAction('Move Down\tAlt+Down')
         act_down.setEnabled(has_cmd and idx < len(self._cmd_tuples) - 1)
         menu.addSeparator()
         act_insert = menu.addAction('Insert Command...')
-        act_del = menu.addAction('Delete')
+        act_del = menu.addAction(f'Delete{many}\tDel')
         act_del.setEnabled(has_cmd)
         menu.addSeparator()
         act_goto = menu.addAction('Go To →')
@@ -9574,7 +10728,11 @@ class EventEditorTab(QWidget):
                 f'Open in Sound Editor ({sound_const})')
 
         action = menu.exec(self._cmd_list.mapToGlobal(pos))
-        if action == act_edit and has_cmd:
+        if action == act_undo:
+            self._on_undo()
+        elif action == act_redo:
+            self._on_redo()
+        elif action == act_edit and has_cmd:
             self._on_edit_command(self._cmd_list.currentItem())
         elif action == act_cut:
             self._on_cut()
@@ -9640,9 +10798,11 @@ class EventEditorTab(QWidget):
         # Direct flag commands
         if cmd in ('setflag', 'clearflag', 'checkflag'):
             return str(cmd_tuple[1])
-        # Direct var commands
+        # Direct var commands — the variable is the FIRST argument; with the
+        # joined shape str(cmd_tuple[1]) is "VAR_X, value", which matches no
+        # variable at all.
         if cmd in ('setvar', 'addvar', 'subvar', 'compare_var_to_value'):
-            return str(cmd_tuple[1])
+            return _two_args(cmd_tuple)[0]
         # Conditional flag checks
         if cmd in ('goto_if_set', 'goto_if_unset', 'call_if_set', 'call_if_unset'):
             return str(cmd_tuple[1])
@@ -9690,6 +10850,7 @@ class EventEditorTab(QWidget):
         if result_code in (QDialog.DialogCode.Accepted,
                            _CommandEditDialog.GoToResult):
             result = dlg.result_tuple()
+            self._push_undo()
             self._cmd_tuples[idx] = result
             # Check if movement steps were modified
             widget = dlg._widget
@@ -9703,7 +10864,9 @@ class EventEditorTab(QWidget):
                             self._modified_movements = {}
                         self._modified_movements[label] = new_steps
             self._refresh_item(idx)
+            self._reindent_list()
             self._mark_dirty()
+            self._maybe_offer_condition_page(result)
 
             # Go To: navigate to the target label after saving
             if result_code == _CommandEditDialog.GoToResult:
@@ -9714,8 +10877,66 @@ class EventEditorTab(QWidget):
                     self._navigate_to_script_label(
                         target, current_map)
 
+    def _maybe_offer_condition_page(self, cmd_tuple) -> None:
+        """After a Set Flag edit, offer the obvious follow-up page.
+
+        Setting a flag is almost always "this happened" — and the next thing
+        the author wants is a page that runs once it has. Building that by
+        hand means New Page, then tick Flag, then find the same flag again in
+        a list of thousands. Offering it here is the whole difference between
+        the two-page idiom being obvious and being folklore.
+
+        Only fires when the flag is not already driving a page, so it cannot
+        nag on a re-edit.
+        """
+        if (not cmd_tuple or cmd_tuple[0] != 'setflag'
+                or len(cmd_tuple) < 2 or not cmd_tuple[1]):
+            return
+        flag = str(cmd_tuple[1]).strip()
+        if not flag or self._current_obj_idx < 0:
+            return
+        obj = self._objects[self._current_obj_idx]
+        pages = obj.get('_pages', [])
+
+        # Already wired? Any page whose conditions mention this flag.
+        for pg in pages:
+            for cond in _pg_cond_tuples(pg):
+                if len(cond) > 1 and str(cond[1]) == flag:
+                    return
+
+        ret = QMessageBox.question(
+            self, 'Add a page for after this?',
+            f'{_resolve_name(flag)} is now set by this script.\n\n'
+            f'Add a new page that runs once that flag is ON — the "you have '
+            f'already done this" version of this event?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        self._collect_current_page()
+        script = obj.get('script', '') or self._suggest_script_name(obj)
+        new_label = f'{script}_{len(pages) + 1}'
+        pages.append({
+            'commands': [],
+            '_label': new_label,
+            '_short_label': f'Page {len(pages) + 1}',
+            # The condition the page runs under. Target-less tuples under
+            # `_conditions` — the shape _page_conditions / _pg_cond_tuples
+            # read and _lower_page_conditions turns into real gotos on save.
+            '_conditions': [('goto_if_set', flag)],
+        })
+        obj['_pages'] = pages
+        self._display_object(self._current_obj_idx)
+        self.page_tabs.setCurrentIndex(len(pages) - 1)
+        self._mark_dirty()
+        self._mw.log_message(
+            f'Event Editor: added page {len(pages)} for {flag}')
+
     def _on_add_command(self):
         cmd = _CommandSelectorDialog.get_command(self)
+        if cmd:
+            self._push_undo()
         if not cmd:
             return
 
@@ -9889,14 +11110,111 @@ class EventEditorTab(QWidget):
                 return (cmd, f'TRAINER_NONE, {intro_label}, {defeat_label}, {not_enough_label}')
             return (cmd, f'TRAINER_NONE, {intro_label}, {defeat_label}')
 
+    # ─────────────────────────────────────────────────────────────────
+    # Undo / redo for the command list
+    #
+    # Snapshot-based: a page's commands are a list of small tuples, so a copy
+    # per edit costs nothing and cannot drift out of step with the widget the
+    # way a stack of command objects can. History belongs to ONE page — it is
+    # dropped whenever a different page, event or map is displayed, because an
+    # undo that replayed onto someone else's page would be silent corruption.
+    # ─────────────────────────────────────────────────────────────────────
+
+    _UNDO_DEPTH = 50
+
+    def _push_undo(self):
+        """Remember the command list as it is right now, before changing it."""
+        if not hasattr(self, '_undo_stack'):
+            self._undo_stack, self._redo_stack = [], []
+        self._undo_stack.append([tuple(t) for t in self._cmd_tuples])
+        if len(self._undo_stack) > self._UNDO_DEPTH:
+            self._undo_stack.pop(0)
+        # Any fresh edit invalidates the redo branch.
+        self._redo_stack.clear()
+
+    def _clear_undo(self):
+        self._undo_stack, self._redo_stack = [], []
+
+    def _rebuild_cmd_list(self, tuples: list):
+        """Repaint the list from a plain list of display tuples.
+
+        _display_page() does the same job from the PAGE dict, which means
+        re-running resugar_choices; a snapshot already holds the resugared
+        display tuples, so only the second half of that work applies.
+        """
+        self._cmd_list.clear()
+        self._cmd_tuples = [tuple(t) for t in tuples]
+        for cmd_tuple in self._cmd_tuples:
+            item = QListWidgetItem(_stringize(cmd_tuple))
+            item.setData(Qt.ItemDataRole.UserRole, cmd_tuple)
+            _apply_cmd_color(item, cmd_tuple)
+            self._cmd_list.addItem(item)
+        empty = QListWidgetItem('@>')
+        empty.setData(Qt.ItemDataRole.UserRole, None)
+        self._cmd_list.addItem(empty)
+        self._reindent_list()
+
+    def _on_undo(self):
+        if not getattr(self, '_undo_stack', None):
+            self._mw.log_message('Event Editor: nothing to undo')
+            return
+        self._redo_stack.append([tuple(t) for t in self._cmd_tuples])
+        self._rebuild_cmd_list(self._undo_stack.pop())
+        self._mark_dirty()
+        self._mw.log_message('Event Editor: undo')
+
+    def _on_redo(self):
+        if not getattr(self, '_redo_stack', None):
+            self._mw.log_message('Event Editor: nothing to redo')
+            return
+        self._undo_stack.append([tuple(t) for t in self._cmd_tuples])
+        self._rebuild_cmd_list(self._redo_stack.pop())
+        self._mark_dirty()
+        self._mw.log_message('Event Editor: redo')
+
+    def _selected_cmd_rows(self) -> list:
+        """Every selected row that is a real command, lowest index first.
+
+        The trailing empty "@>" line is a drop target, not a command, so it is
+        filtered out — otherwise Select-All then Delete would try to delete it.
+        """
+        rows = sorted(self._cmd_list.row(i)
+                      for i in self._cmd_list.selectedItems())
+        return [r for r in rows if 0 <= r < len(self._cmd_tuples)]
+
     def _on_del_command(self):
+        rows = self._selected_cmd_rows()
+        if len(rows) > 1:
+            self._push_undo()
+            # Highest first so each removal cannot shift the ones still to go.
+            removed = 0
+            for r in reversed(rows):
+                if self._delete_one_row(r):
+                    removed += 1
+            self._mark_dirty()
+            self._mw.log_message(
+                f'Event Editor: deleted {removed} command(s)')
+            return
+        self._push_undo()
         idx = self._selected_cmd_idx()
         if idx < 0 or idx >= len(self._cmd_tuples):
             return
+        self._delete_one_row(idx)
+
+    def _delete_one_row(self, idx: int) -> bool:
+        """Delete the command at *idx*, honouring the structural rules.
+
+        Returns True if something was removed. Shared by the single-row path
+        and the multi-selection path so both obey the same rules: a label
+        marker is structural, a Show Choices header takes its whole block with
+        it, and the inner When/Branch-End markers cannot go on their own.
+        """
+        if idx < 0 or idx >= len(self._cmd_tuples):
+            return False
         head = self._cmd_tuples[idx][0] if self._cmd_tuples[idx] else None
         # Label markers are structural — can't be deleted
         if head == '_label_marker':
-            return
+            return False
         # Deleting the Show Choices header removes the WHOLE branch block
         # (header + both branches + their bodies + Branch End).
         if head == 'choice_yesno':
@@ -9909,13 +11227,13 @@ class EventEditorTab(QWidget):
                 self._cmd_list.setCurrentRow(new_idx)
             self._reindent_list()
             self._mark_dirty()
-            return
+            return True
         # The inner When/Branch-End markers can't be deleted on their own —
         # they'd unbalance the block. Delete the Show Choices header instead.
         if head in ('when_yes', 'when_no', 'branch_end'):
             self._mw.log_message(
                 'Delete the "Show Choices" line to remove the whole Yes/No block.')
-            return
+            return False
         self._cmd_tuples.pop(idx)
         self._cmd_list.takeItem(idx)
         new_idx = min(idx, len(self._cmd_tuples) - 1)
@@ -9923,6 +11241,7 @@ class EventEditorTab(QWidget):
             self._cmd_list.setCurrentRow(new_idx)
         self._reindent_list()
         self._mark_dirty()
+        return True
 
     def _choice_block_end(self, start: int) -> int:
         """Index of the branch_end matching the choice_yesno at *start*."""
@@ -9936,6 +11255,10 @@ class EventEditorTab(QWidget):
                     return j
                 depth -= 1
         return len(self._cmd_tuples) - 1
+
+    def _on_rows_about_to_move(self, *_args):
+        """Snapshot the order before a drag rewrites it."""
+        self._push_undo()
 
     def _on_rows_moved(self, *_args):
         """Rebuild _cmd_tuples from list widget items after drag-and-drop reorder."""
@@ -9975,6 +11298,7 @@ class EventEditorTab(QWidget):
         self._mark_dirty()
 
     def _on_duplicate(self):
+        self._push_undo()
         idx = self._selected_cmd_idx()
         if idx < 0 or idx >= len(self._cmd_tuples):
             return
@@ -10073,9 +11397,10 @@ class EventEditorTab(QWidget):
             return
 
         # setvar → jump to the condition page that checks this var == value
-        if cmd == 'setvar' and len(cmd_tuple) > 2:
-            var = cmd_tuple[1]
-            val = str(cmd_tuple[2])
+        if cmd == 'setvar':
+            var, val = _two_args(cmd_tuple)
+            if not (var and val):
+                return
             obj = self._objects[self._current_obj_idx]
             pages = obj.get('_pages', [])
             for pi, pg in enumerate(pages):
@@ -10167,32 +11492,72 @@ class EventEditorTab(QWidget):
         self._mw.log_message(
             f'Event Editor: target "{target}" not found in any loaded script')
 
-    _clipboard: tuple | None = None  # Class-level clipboard for copy/paste
+    #: Commands copied inside the editor. A LIST, because a selection can be
+    #: more than one row; paste already handled a list.
+    _clipboard: list | None = None
 
     def _on_copy(self):
-        idx = self._selected_cmd_idx()
-        if idx < 0 or idx >= len(self._cmd_tuples):
+        rows = self._selected_cmd_rows()
+        if not rows:
             return
-        EventEditorTab._clipboard = self._cmd_tuples[idx]
-        self._mw.log_message('Event Editor: copied command')
+        EventEditorTab._clipboard = [self._cmd_tuples[r] for r in rows]
+        self._mw.log_message(
+            f'Event Editor: copied {len(rows)} command(s)' if len(rows) > 1
+            else 'Event Editor: copied command')
 
     def _on_cut(self):
-        idx = self._selected_cmd_idx()
-        if idx < 0 or idx >= len(self._cmd_tuples):
+        rows = self._selected_cmd_rows()
+        if not rows:
             return
-        EventEditorTab._clipboard = self._cmd_tuples[idx]
+        EventEditorTab._clipboard = [self._cmd_tuples[r] for r in rows]
         self._on_del_command()
-        self._mw.log_message('Event Editor: cut command')
+        self._mw.log_message(
+            f'Event Editor: cut {len(rows)} command(s)' if len(rows) > 1
+            else 'Event Editor: cut command')
 
     def _on_paste(self):
-        if EventEditorTab._clipboard is None:
-            return
+        """Paste a command — or a whole chunk of script text.
+
+        The system clipboard wins when it holds something that parses as
+        script, so copying lines out of a reference `.inc`, a wiki or another
+        map and pressing Paste just turns them into commands. Falls back to
+        the single command copied inside the editor otherwise.
+        """
+        from PyQt6.QtWidgets import QApplication
+        from eventide.backend.eventide_utils import parse_script_snippet
+
+        pasted: list[tuple] = []
+        try:
+            text = QApplication.clipboard().text()
+        except Exception:
+            text = ''
+        # Only treat the clipboard as script when the editor's own Copy was
+        # not the last thing to touch it — otherwise a plain command copy
+        # would be re-parsed from whatever text happened to be there.
+        if text and text.strip():
+            pasted = parse_script_snippet(text, self._texts)
+
+        if not pasted:
+            if not EventEditorTab._clipboard:
+                self._mw.log_message(
+                    'Event Editor: nothing to paste — copy a command first, '
+                    'or put some script text on the clipboard.')
+                return
+            clip = EventEditorTab._clipboard
+            # Tolerate the old single-tuple clipboard shape.
+            pasted = list(clip) if isinstance(clip, list) else [clip]
+
+        self._push_undo()
         idx = self._selected_cmd_idx()
         insert_at = idx + 1 if idx >= 0 else len(self._cmd_tuples)
-        self._add_list_item(EventEditorTab._clipboard, insert_at)
-        self._cmd_list.setCurrentRow(insert_at)
+        for i, cmd in enumerate(pasted):
+            self._add_list_item(cmd, insert_at + i)
+        self._cmd_list.setCurrentRow(insert_at + len(pasted) - 1)
+        self._reindent_list()
         self._mark_dirty()
-        self._mw.log_message('Event Editor: pasted command')
+        self._mw.log_message(
+            f'Event Editor: pasted {len(pasted)} command(s)'
+            if len(pasted) > 1 else 'Event Editor: pasted command')
 
     def _renumber_page_tabs(self):
         """Keep page tabs labeled 1, 2, 3, … by position (they were a mix of
@@ -10306,6 +11671,112 @@ class EventEditorTab(QWidget):
             self.script_edit.setText(new_label)
         self._mark_dirty()
 
+    def _render_event_raw(self, obj) -> str | None:
+        """Render one event back to real `.inc` text — scripts then texts.
+
+        Exactly what Save would write for this event, which is what makes it
+        safe to show, copy out, and (via the Raw Code editor) parse back in.
+        Shared by Edit Raw Code and Copy Script so the two can never drift.
+        Returns None when the event has nothing to render.
+        """
+        from eventide.backend.eventide_utils import (
+            _BRAILLE_PREFIX, _render_label_block)
+
+        self._collect_current()
+        save_pages = self._object_to_save_pages(obj)
+        if not save_pages:
+            return None
+
+        render_texts: dict = {}
+        script_lines: list[str] = []
+        for label, cmds in save_pages.items():
+            script_lines.extend(
+                _render_label_block(label, cmds, self._hidden_lines,
+                                    render_texts))
+
+        text_lines: list[str] = []
+        for tlabel in render_texts:
+            content = self._texts.get(tlabel, render_texts.get(tlabel, ''))
+            braille = content.startswith(_BRAILLE_PREFIX)
+            if braille:
+                content = content[len(_BRAILLE_PREFIX):]
+            esc = (content.replace('\n\n', '\\p').replace('\n', '\\n')
+                          .replace('"', '\\"'))
+            directive = '.braille' if braille else '.string'
+            text_lines.append(f'{tlabel}::\n')
+            text_lines.append(f'    {directive} "{esc}"\n\n')
+
+        raw = ''.join(script_lines)
+        if text_lines:
+            raw += ('\n@ ==== Text (edit message wording / remove {COLOR} '
+                    'blocks here) ====\n\n')
+            raw += ''.join(text_lines)
+        return raw
+
+    def _on_copy_script(self):
+        """Put this event's real `.inc` text on the clipboard.
+
+        The other half of pasting script in: take what is on the page and hand
+        back something you can drop in a file, a wiki, or another event.
+        """
+        if self._current_obj_idx < 0:
+            QMessageBox.information(self, 'Copy Script',
+                                    'Select an event first.')
+            return
+        obj = self._objects[self._current_obj_idx]
+        raw = self._render_event_raw(obj)
+        if not raw:
+            QMessageBox.information(self, 'Copy Script',
+                                    'This event has no script to copy.')
+            return
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(raw)
+        n = len(raw.splitlines())
+        self._mw.log_message(
+            f'Event Editor: copied {n} line(s) of script to the clipboard.')
+
+    def _on_open_script_file(self):
+        """Open the map's scripts.inc in whatever the OS uses for .inc files.
+
+        Unsaved edits are still in memory, so say so rather than letting the
+        user read a stale file and conclude the editor lost their work.
+        """
+        if not self._map_dir:
+            QMessageBox.information(self, 'Open Script File',
+                                    'No map is open.')
+            return
+        path = self._map_dir / 'scripts.inc'
+        if not path.is_file():
+            QMessageBox.information(
+                self, 'Open Script File',
+                f'{self._map_dir.name} has no scripts.inc yet. Save once and '
+                f'it will be created.')
+            return
+        if self._mw.isWindowModified():
+            from PyQt6.QtWidgets import QMessageBox as _QMB
+            ret = _QMB.question(
+                self, 'Open Script File',
+                'You have unsaved changes, so the file on disk will not show '
+                'them yet.\n\nOpen it anyway?',
+                _QMB.StandardButton.Open | _QMB.StandardButton.Cancel,
+                _QMB.StandardButton.Cancel)
+            if ret != _QMB.StandardButton.Open:
+                return
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            # No handler registered for .inc — show it in the file manager
+            # instead of failing silently.
+            try:
+                from ui.open_folder_util import open_folder
+                open_folder(str(self._map_dir))
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, 'Open Script File',
+                    f'Could not open the file:\n{exc}\n\n{path}')
+                return
+        self._mw.log_message(f'Event Editor: opened {path}')
+
     def _on_edit_raw_code(self):
         """Open the current script as raw .inc text (commands + message strings)
         in a pop-up for hand-editing — e.g. to strip {COLOR}/{SHADOW} blocks the
@@ -10329,43 +11800,12 @@ class EventEditorTab(QWidget):
                 'first, then you can edit its raw code here.')
             return
 
-        # Flush the current UI edits into the object's pages, then flatten the
-        # object to label blocks exactly as Save would.
-        self._collect_current()
-        entry_label = obj.get('script', '')
-        save_pages = self._object_to_save_pages(obj)
-        if not save_pages:
+        raw = self._render_event_raw(obj)
+        if raw is None:
             QMessageBox.information(self, 'Edit Raw Code',
                                    'Nothing to edit for this event.')
             return
-
-        # Render script blocks; collect the message labels they reference.
-        render_texts: dict = {}
-        script_lines: list[str] = []
-        for label, cmds in save_pages.items():
-            script_lines.extend(
-                _render_label_block(label, cmds, self._hidden_lines, render_texts))
-
-        # Emit .string / .braille blocks for the referenced texts, preferring
-        # the authoritative store (faithful to text.inc, incl. $ and {COLOR}).
-        from eventide.backend.eventide_utils import _BRAILLE_PREFIX
-        text_lines: list[str] = []
-        for tlabel in render_texts:
-            content = self._texts.get(tlabel, render_texts.get(tlabel, ''))
-            if content.startswith(_BRAILLE_PREFIX):
-                actual = content[len(_BRAILLE_PREFIX):]
-                esc = actual.replace('\n\n', '\\p').replace('\n', '\\n').replace('"', '\\"')
-                text_lines.append(f'{tlabel}::\n')
-                text_lines.append(f'    .braille "{esc}"\n\n')
-            else:
-                esc = content.replace('\n\n', '\\p').replace('\n', '\\n').replace('"', '\\"')
-                text_lines.append(f'{tlabel}::\n')
-                text_lines.append(f'    .string "{esc}"\n\n')
-
-        raw = ''.join(script_lines)
-        if text_lines:
-            raw += '\n@ ==== Text (edit message wording / remove {COLOR} blocks here) ====\n\n'
-            raw += ''.join(text_lines)
+        entry_label = obj.get('script', '')
 
         # ── Build the dialog ─────────────────────────────────────────────
         dlg = QDialog(self)
@@ -10616,6 +12056,39 @@ class EventEditorTab(QWidget):
             self._cond_var_picker.setEditText(cur_var)
         except Exception:
             pass
+
+    def _set_object_only_fields_enabled(self, on: bool) -> None:
+        """Grey out the fields only an object event has.
+
+        Triggers, signs and map scripts have no sprite to hide and no height
+        layer, so showing live controls for them would invite edits that go
+        nowhere. Cleared as well as disabled, so a stale value from the
+        previously-selected NPC is never left on screen.
+        """
+        for w in (self.obj_flag_combo, self._btn_obj_flag_find,
+                  self._btn_obj_flag_clear, self.elev_spin):
+            w.setEnabled(on)
+        if not on:
+            self.obj_flag_combo.blockSignals(True)
+            self.obj_flag_combo.setEditText('')
+            self.obj_flag_combo.blockSignals(False)
+            self.elev_spin.blockSignals(True)
+            self.elev_spin.setValue(0)
+            self.elev_spin.blockSignals(False)
+
+    def _on_pick_unused_object_flag(self):
+        """Fill the object's visibility flag with the next genuinely unused one."""
+        found = self._find_unused_flags(1)
+        if not found:
+            QMessageBox.information(
+                self, 'Find Unused Flag',
+                'No unused flag constants are left in the project.\n\n'
+                'Use Variables & Flags to add more, or free one up.')
+            return
+        self.obj_flag_combo.set_constant(found[0])
+        self._mark_dirty()
+        self._mw.log_message(
+            f'Event Editor: object visibility flag set to {found[0]}')
 
     def _on_find_unused_flag(self):
         """Scan the project for used flags and find the next available one."""
@@ -11206,6 +12679,31 @@ class EventEditorTab(QWidget):
         name = (name or '').strip()
         if not ok or not name:
             return
+
+        # A template that hard-codes the flag it was built with is only good
+        # once — every event made from it would share that flag and they would
+        # all disappear together. Offer to parameterise it instead.
+        flags_used = sorted({c[1] for c in cmds
+                             if c and c[0] == 'setflag' and len(c) > 1 and c[1]
+                             and c[1] != self.TEMPLATE_UNUSED_FLAG})
+        if flags_used:
+            shown = ', '.join(_resolve_name(f) for f in flags_used[:3])
+            ret = QMessageBox.question(
+                self, 'Save Page Template',
+                f'This page sets {shown}.\n\n'
+                f'Should each event made from this template get its OWN fresh '
+                f'flag instead of reusing that one?\n\n'
+                f'Say yes for a one-time thing — a chest, a pickup, an NPC who '
+                f'leaves. Say no if every event really should share the flag.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ret == QMessageBox.StandardButton.Yes:
+                cmds = [tuple(self.TEMPLATE_UNUSED_FLAG
+                              if (c[0] == 'setflag' and i == 1
+                                  and part in flags_used) else part
+                              for i, part in enumerate(c))
+                        for c in cmds]
+
         templates = self._load_page_templates()
         if name in templates:
             if QMessageBox.question(
@@ -11220,20 +12718,72 @@ class EventEditorTab(QWidget):
                 f'Event Editor: saved page template "{name}" '
                 f'({len(cmds)} command(s))')
 
+    #: Placeholder a saved template can use anywhere a flag constant goes.
+    #: Applying the template swaps it for a flag nothing else in the project
+    #: uses. Without this, a "one-time pickup" template is only reusable once —
+    #: every event made from it would share one flag and they would all vanish
+    #: together the first time any of them fired.
+    TEMPLATE_UNUSED_FLAG = '$UNUSED_FLAG$'
+
     def _apply_page_template(self, obj, script, name):
-        """Apply a saved template's commands to the current event's page."""
+        """Apply a saved template's commands to the current event's page.
+
+        Two things happen beyond copying the commands, and both exist because
+        a template for a one-time event is otherwise subtly broken:
+
+        * ``$UNUSED_FLAG$`` anywhere in the commands becomes a real unused
+          flag, so each event built from the template gets its own.
+        * If the template sets a flag, the object's OWN visibility flag is
+          offered the same one. That is the field that stops a looted chest or
+          a taken item reappearing when the player walks back in — setting
+          only the script flag leaves a bug that reads as an engine fault.
+        """
         templates = self._load_page_templates()
         cmds = templates.get(name)
         if not cmds:
             return
-        obj['_pages'] = [{'commands': [tuple(c) for c in cmds],
+
+        cmds = [tuple(c) for c in cmds]
+        needs_flag = any(self.TEMPLATE_UNUSED_FLAG in str(c) for c in cmds)
+        chosen = ''
+        if needs_flag:
+            found = self._find_unused_flags(1)
+            if not found:
+                QMessageBox.warning(
+                    self, 'Apply Template',
+                    f'"{name}" needs a spare flag and the project has none '
+                    f'left.\n\nFree one up in Variables & Flags, then apply '
+                    f'the template again.')
+                return
+            chosen = found[0]
+            cmds = [tuple(str(part).replace(self.TEMPLATE_UNUSED_FLAG, chosen)
+                          if isinstance(part, str) else part
+                          for part in c)
+                    for c in cmds]
+
+        obj['_pages'] = [{'commands': cmds,
                           '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
+
+        # Offer the script's flag to the object itself.
+        set_flags = [c[1] for c in cmds
+                     if c and c[0] == 'setflag' and len(c) > 1 and c[1]]
+        synced = ''
+        if set_flags and obj.get('_event_type', 'object') == 'object':
+            flag = chosen or set_flags[0]
+            current = str(obj.get('flag', '') or '')
+            if current in ('', '0', '0x0'):
+                obj['flag'] = flag
+                synced = flag
+
         self._refresh_current_object()
         self._mark_dirty()
+        note = f' (flag {chosen})' if chosen else ''
+        if synced:
+            note += ' — also set as this event\'s "Hide when flag"'
         self._mw.log_message(
-            f'Event Editor: applied page template "{name}" to {script}')
+            f'Event Editor: applied page template "{name}" to {script}{note}')
 
     def _manage_page_templates(self):
         """Small dialog to delete saved page templates."""
