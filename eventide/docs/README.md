@@ -57,9 +57,37 @@ Only specific categories get colored — plain text/choices/structure stays defa
 - **Open in Porymap**: Toolbar button launches Porymap focused on the current map
 
 ### Porymap bridge
+
+Porymap is NOT bundled — PorySuite downloads, updates and bridges to it. Never edit Porymap to make a
+feature work: build it on the PorySuite side or go through the bridge. Integration that required changing
+Porymap would break on the user's next Porymap update and would not exist on anyone else's install.
+
 - Event Editor exposes bridge API methods so Porymap can remotely navigate to maps, select events, and trigger reloads
 - Maps tab: right-click context menu with "Open in Porymap"
 - Layouts tab: "Open in Porymap" button opens the first map using the selected layout
+
+**The protocol, both directions:**
+
+| Direction | File | Carries |
+|---|---|---|
+| Porymap → PorySuite | `porysuite_bridge.json`, watched by `BridgeWatcher` | `map_opened`, `sync_request`, `event_selected`, `edit_request` |
+| PorySuite → Porymap | `porysuite_command.json`, polled by patched Porymap | `openMap` only |
+
+Both sides of the channel, plus the `onMapSaved` / `onEventSelected` callbacks and the CLI project argument,
+come from `porymap_patches/apply_patches.py`, which patches Porymap's C++ at install time by anchor string.
+
+**Porymap save → EVENTide: handled, and seamless.** The `SharedFileWatcher` sees `map.json` / `scripts.inc`
+change and calls `reload_current_map()`. With no unsaved edits that reloads silently, re-fingerprints, and
+restores the event and page the user was on. With unsaved edits the user gets exactly one Save/Discard/Cancel
+prompt.
+
+**EVENTide save → Porymap: deliberately left to Porymap (decided 2026-10-24).** Nothing is sent on save, so
+Porymap learns from its own file watcher and shows its "file has changed on disk, reload?" prompt
+(`porymap_src/src/mainwindow.cpp`, the `fileWatcherWarning`). That is a prompt, not data loss, and the user
+chose to leave it there rather than extend the patch set. **Do not add a `reloadMap` command action for this.**
+Every patch is another C++ anchor that can drift when Porymap updates upstream, and the gap it closes is one
+dialog. If this is ever revisited, test whether sending the existing `openMap` for the already-open map makes
+Porymap re-read it, before adding a new patch.
 
 ### Script creation
 - **New Script templates**: NPC Scripts, Signs, Map Scripts, Standard Wrappers, Field Objects, Item Balls
