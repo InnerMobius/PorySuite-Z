@@ -232,6 +232,77 @@ def test_an_untouched_save_is_not_blocked(tab, tmp_path):
     assert asked == []
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# The guard must not get in the way of the Porymap integration
+#
+# PorySuite and Porymap are meant to work as one app: save in Porymap and the
+# editor just goes with it. The watcher calls reload_current_map(), which with
+# no unsaved edits reloads silently. These pin that the guard stays out of it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_porymap_save_is_absorbed_silently(tab, tmp_path, monkeypatch):
+    """No unsaved edits: the editor takes the change with no dialog at all."""
+    seen = []
+    import eventide.ui.event_editor_tab as mod
+    for name in ('information', 'warning', 'critical', 'question'):
+        monkeypatch.setattr(mod.QMessageBox, name,
+                            staticmethod(lambda *a, _n=name, **k: seen.append(_n)))
+    (tmp_path / 'data' / 'maps' / 'Town' / 'scripts.inc').write_text(
+        EXTERNAL, encoding='utf-8')
+
+    tab._mw.modified = False
+    tab.reload_current_map()            # what the file watcher calls
+
+    assert seen == []                             # nothing interrupted the user
+    assert tab._changed_on_disk() == []           # fingerprint refreshed
+    assert _scripts(tmp_path) == EXTERNAL         # the outside change survived
+
+
+def test_saving_after_an_absorbed_change_does_not_prompt(tab, tmp_path):
+    """And the next Save must be clean — a refreshed snapshot means no warning."""
+    (tmp_path / 'data' / 'maps' / 'Town' / 'scripts.inc').write_text(
+        EXTERNAL, encoding='utf-8')
+    tab._mw.modified = False
+    tab.reload_current_map()
+
+    asked = []
+    tab._confirm_overwrite_external = lambda stale: asked.append(stale) or False
+    tab._on_save()
+    assert asked == []
+
+
+def test_external_prompt_does_not_ask_twice(tab, tmp_path, monkeypatch):
+    """With unsaved edits, answering 'Save' must not raise a SECOND dialog.
+
+    The watcher's own prompt already asked the question. Asking again in
+    _on_save would be the same decision twice, and its default is Cancel —
+    so an Enter press would drop the save the user just asked for.
+    """
+    import eventide.ui.event_editor_tab as mod
+    (tmp_path / 'data' / 'maps' / 'Town' / 'scripts.inc').write_text(
+        EXTERNAL, encoding='utf-8')
+    tab._mw.modified = True
+    monkeypatch.setattr(
+        mod.QMessageBox, 'question',
+        staticmethod(lambda *a, **k: mod.QMessageBox.StandardButton.Save))
+
+    second = []
+    tab._confirm_overwrite_external = lambda stale: second.append(stale) or False
+    tab.reload_current_map()
+
+    assert second == [], 'the user was asked the same question twice'
+    # and the save actually happened rather than being silently dropped
+    assert 'message Town_Text_Hi' not in _scripts(tmp_path)
+
+
+def test_external_ack_is_keyword_only(tab):
+    """`clicked` hands a bool to its slot; a positional ack would disable the
+    check every time the Save button is pressed."""
+    import inspect
+    sig = inspect.signature(tab._on_save)
+    assert sig.parameters['external_ack'].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 def test_snapshot_is_refreshed_by_a_reload(tab, tmp_path):
     """After taking the external version, Save must not keep warning."""
     d = tmp_path / 'data' / 'maps' / 'Town'

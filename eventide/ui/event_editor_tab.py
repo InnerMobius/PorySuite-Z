@@ -12026,7 +12026,17 @@ class EventEditorTab(QWidget):
         # Make sure the pseudo-event copies of these labels don't overwrite ours
         # later (save_pages preserves insertion order; these are authoritative).
 
-    def _on_save(self):
+    def _on_save(self, *, external_ack: bool = False):
+        """Write the current map to disk.
+
+        *external_ack*: the caller has ALREADY told the user about an external
+        change and been told to save anyway. Only reload_current_map() passes
+        it, and only from the Save branch of its own prompt — otherwise the
+        user answers two dialogs back to back for one decision, the second of
+        which defaults to Cancel and so would abandon the save they just asked
+        for. Keyword-only on purpose: `clicked` would otherwise hand us its
+        bool and silently disable the check.
+        """
         if not self._map_dir or not self._map_data:
             QMessageBox.information(self, 'Save', 'No map loaded.')
             return
@@ -12036,9 +12046,10 @@ class EventEditorTab(QWidget):
         # Cancel or a Reload leaves every file exactly as it is. See the
         # External-change detection block above for why this lives here and
         # not in the file watcher.
-        stale = self._changed_on_disk()
-        if stale and not self._confirm_overwrite_external(stale):
-            return
+        if not external_ack:
+            stale = self._changed_on_disk()
+            if stale and not self._confirm_overwrite_external(stale):
+                return
 
         self._collect_current()
         # Inline message text can't assemble (the msgbox macro needs a label);
@@ -12473,17 +12484,24 @@ class EventEditorTab(QWidget):
             from PyQt6.QtWidgets import QMessageBox
             ret = QMessageBox.question(
                 self, 'External Changes Detected',
-                'The current map was modified outside the Event Editor '
-                '(likely by Porymap), but you have unsaved changes here.\n\n'
-                'Save your edits first, discard them and reload from disk, '
-                'or keep working and ignore the external change?',
+                'The current map changed outside the Event Editor (most '
+                'likely Porymap), and you have unsaved changes here too.\n\n'
+                'Save — keep your edits and write them out, replacing the '
+                'outside change.\n'
+                'Discard — throw away your edits and take what is on disk.\n'
+                'Cancel — change nothing and keep working; the outside change '
+                'stays on disk and your edits stay here.',
                 QMessageBox.StandardButton.Save
                 | QMessageBox.StandardButton.Discard
                 | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
             if ret == QMessageBox.StandardButton.Save:
-                self._on_save()
+                # The user has just been told about the external change and
+                # chosen to overwrite it. Asking again in _on_save would be
+                # the same question twice — and its default is Cancel, so an
+                # Enter press would silently drop the save.
+                self._on_save(external_ack=True)
                 return
             if ret != QMessageBox.StandardButton.Discard:
                 return  # Cancel / closed dialog — keep user's work intact
