@@ -7310,6 +7310,14 @@ class EventEditorTab(QWidget):
         # Without this, _collect_current() (called from _on_object_changed)
         # can corrupt new map data by writing stale UI values from the
         # previous map into the new _objects list at the old index.
+        # Remember where the user was BEFORE the list is torn down, so an
+        # external save (Porymap, a git pull, the repair tool) puts them back
+        # on the same event and page instead of bouncing to the first NPC.
+        # Captured here because _current_obj_idx is about to be reset.
+        prev_key = (self._object_identity(self._objects[self._current_obj_idx])
+                    if 0 <= self._current_obj_idx < len(self._objects) else None)
+        prev_page = self._current_page_idx
+
         self._current_obj_idx = -1
         # Every external-script record is per-map — clear all four together or
         # a shared script resolved for the PREVIOUS map stays eligible for
@@ -7627,8 +7635,19 @@ class EventEditorTab(QWidget):
         self._verify_loaded_events(name)
 
         if self._objects:
-            self.obj_combo.setCurrentIndex(0)
-            self._on_object_changed(0)
+            # Put the user back where they were if that event still exists
+            # (same map reloaded); otherwise start at the first one.
+            idx = self._find_object_by_identity(prev_key)
+            restored = idx >= 0
+            if not restored:
+                idx = 0
+            self.obj_combo.blockSignals(True)
+            self.obj_combo.setCurrentIndex(idx)
+            self.obj_combo.blockSignals(False)
+            self._on_object_changed(idx)
+            # And the same page of it, when it still has that many.
+            if restored and 0 < prev_page < self.page_tabs.count():
+                self.page_tabs.setCurrentIndex(prev_page)
 
         # Phase 7: notify listeners (e.g. Porymap sync) that a map was loaded
         self.map_loaded.emit(name)
@@ -8421,6 +8440,39 @@ class EventEditorTab(QWidget):
     # ─────────────────────────────────────────────────────────────────────
     # Object selection
     # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _object_identity(obj) -> tuple | None:
+        """A key for an event that survives a re-parse of the map.
+
+        A reload rebuilds `_objects` from scratch, so the old list index means
+        nothing afterwards. This is what lets the editor put the user back on
+        the event they were looking at when Porymap (or anything else) saves —
+        without it, every external save bounced the view to the first NPC and
+        a graphic you had just changed in Porymap appeared not to have taken.
+
+        Returns None when nothing stable identifies the event, in which case
+        the caller falls back to the first one rather than guessing.
+        """
+        etype = obj.get('_event_type', 'object')
+        if etype == 'object':
+            key = str(obj.get('local_id') or '') or str(obj.get('script') or '')
+            return ('object', key) if key else None
+        if etype in ('coord', 'bg'):
+            # Triggers and signs often share a script, so position disambiguates.
+            return (etype, str(obj.get('script') or ''),
+                    int(obj.get('x', -1) or -1), int(obj.get('y', -1) or -1))
+        script = str(obj.get('script') or '')
+        return ('map_script', script) if script else None
+
+    def _find_object_by_identity(self, key) -> int:
+        """Index of the event matching *key*, or -1."""
+        if key is None:
+            return -1
+        for i, obj in enumerate(self._objects):
+            if self._object_identity(obj) == key:
+                return i
+        return -1
 
     def _on_object_changed(self, idx):
         # The user picked a different event in the dropdown — save the CURRENT

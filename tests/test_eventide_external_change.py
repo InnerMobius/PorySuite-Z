@@ -303,6 +303,98 @@ def test_external_ack_is_keyword_only(tab):
     assert sig.parameters['external_ack'].kind is inspect.Parameter.KEYWORD_ONLY
 
 
+def _two_npc_project(tmp_path):
+    """A map with two NPCs, so selection has somewhere to be lost."""
+    d = tmp_path / 'data' / 'maps' / 'Town'
+    data = dict(MAP_JSON)
+    base = MAP_JSON['object_events'][0]
+    data['object_events'] = [
+        dict(base, local_id='LOCALID_TOWN_A', script='Town_EventScript_A'),
+        dict(base, local_id='LOCALID_TOWN_B', script='Town_EventScript_B',
+             graphics_id='OBJ_EVENT_GFX_GIRL', x=9, y=9),
+    ]
+    (d / 'map.json').write_text(json.dumps(data), encoding='utf-8')
+    (d / 'scripts.inc').write_text(
+        'Town_EventScript_A::\n\tend\n\nTown_EventScript_B::\n\tend\n',
+        encoding='utf-8')
+    return d
+
+
+def _set_graphic(map_dir, index, graphic):
+    """What Porymap does when you change an NPC's sprite."""
+    p = map_dir / 'map.json'
+    data = json.loads(p.read_text(encoding='utf-8'))
+    data['object_events'][index]['graphics_id'] = graphic
+    p.write_text(json.dumps(data), encoding='utf-8')
+
+
+def test_a_graphic_changed_in_porymap_shows_up_on_the_right_npc(tab, tmp_path):
+    """The one that made this feel broken.
+
+    The data always arrived — but the reload reset the dropdown to the first
+    NPC, so the user was no longer looking at the one they had just changed
+    and it appeared not to have taken.
+    """
+    d = _two_npc_project(tmp_path)
+    tab._load_map(d)
+    tab.obj_combo.setCurrentIndex(1)
+    assert tab.gfx_combo.currentText() == 'OBJ_EVENT_GFX_GIRL'
+
+    _set_graphic(d, 1, 'OBJ_EVENT_GFX_BUG_CATCHER')
+    tab._mw.modified = False
+    tab.reload_current_map()
+
+    assert tab._current_obj_idx == 1, 'the view jumped off the edited NPC'
+    assert tab.gfx_combo.currentText() == 'OBJ_EVENT_GFX_BUG_CATCHER'
+
+
+def test_the_selected_page_survives_a_reload(tab, tmp_path):
+    d = tmp_path / 'data' / 'maps' / 'Town'
+    (d / 'scripts.inc').write_text(
+        'Town_EventScript_Boy::\n'
+        '\tgoto_if_set FLAG_TEMP_1, Town_EventScript_Boy_2\n'
+        '\tmsgbox Town_Text_Hi\n\tend\n\n'
+        'Town_EventScript_Boy_2::\n\tmsgbox Town_Text_Hi\n\tend\n',
+        encoding='utf-8')
+    tab._load_map(d)
+    if tab.page_tabs.count() < 2:
+        pytest.skip('this fixture did not produce a second page')
+    tab.page_tabs.setCurrentIndex(1)
+    tab._mw.modified = False
+    tab.reload_current_map()
+    assert tab.page_tabs.currentIndex() == 1
+
+
+def test_opening_a_different_map_starts_at_its_first_event(tab, tmp_path):
+    """Restoring position must not leak across maps."""
+    d2 = tmp_path / 'data' / 'maps' / 'Other'
+    d2.mkdir(parents=True)
+    data = dict(MAP_JSON, id='MAP_OTHER', name='Other')
+    data['object_events'] = [dict(MAP_JSON['object_events'][0],
+                                  local_id='LOCALID_OTHER_Z',
+                                  script='Other_EventScript_Z')]
+    (d2 / 'map.json').write_text(json.dumps(data), encoding='utf-8')
+    (d2 / 'scripts.inc').write_text('Other_EventScript_Z::\n\tend\n',
+                                    encoding='utf-8')
+    tab._load_map(d2)
+    assert tab._current_obj_idx == 0
+
+
+def test_a_deleted_event_falls_back_to_the_first(tab, tmp_path):
+    """If Porymap deletes the event you were on, don't end up on nothing."""
+    d = _two_npc_project(tmp_path)
+    tab._load_map(d)
+    tab.obj_combo.setCurrentIndex(1)
+    p = d / 'map.json'
+    data = json.loads(p.read_text(encoding='utf-8'))
+    del data['object_events'][1]
+    p.write_text(json.dumps(data), encoding='utf-8')
+    tab._mw.modified = False
+    tab.reload_current_map()
+    assert tab._current_obj_idx == 0
+    assert tab.obj_combo.count() == 1
+
+
 def test_snapshot_is_refreshed_by_a_reload(tab, tmp_path):
     """After taking the external version, Save must not keep warning."""
     d = tmp_path / 'data' / 'maps' / 'Town'
