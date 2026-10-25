@@ -21,6 +21,7 @@ hand-edited. Re-running produces no changes (byte-identical).
 """
 
 import os
+import re
 
 _FIELD_MARKER = "formSpeciesIdTable"
 _PROTO_MARKER = "GetFormSpeciesId"
@@ -171,13 +172,18 @@ _DEOXYS_TILES_OLD = (
     "        CpuCopy32(pointer + 0x800, pointer, 0x800);\n"
     "}"
 )
-_DEOXYS_TILES_NEW = (
+# The generated body, in two parts. The vanilla special case is kept SEPARATE
+# because it names SPECIES_DEOXYS: a project that has replaced the roster may
+# not define that constant at all, and emitting it unconditionally produces C
+# that will not compile. (CLAUDE.md: no hardcoded game-specific labels — parse
+# everything from the project's own source.)
+_DEOXYS_TILES_HEAD = (
     "static void DuplicateDeoxysTiles(void *pointer, s32 species)\n"
     "{\n"
     "    // PorySuite-Z form frame: a form that SHARES the base's stacked sheet\n"
     "    // renders frame N of it (copy that frame over frame 0). A form with its\n"
     "    // OWN sheet (different .data pointer) is left alone. GetSpeciesFormId is\n"
-    "    // 0 for a base species, preserving vanilla behaviour (including Deoxys).\n"
+    "    // 0 for a base species, so a base species keeps vanilla behaviour.\n"
     "    u8 formFrame = GetSpeciesFormId(species);\n"
     "    if (formFrame > 0)\n"
     "    {\n"
@@ -185,17 +191,37 @@ _DEOXYS_TILES_NEW = (
     "        if (t != NULL && gMonFrontPicTable[species].data == gMonFrontPicTable[t[0]].data)\n"
     "            CpuCopy32((u8 *)pointer + formFrame * 0x800, pointer, 0x800);\n"
     "    }\n"
+)
+# Only appended when include/constants/species.h actually defines SPECIES_DEOXYS.
+_DEOXYS_TILES_VANILLA_CASE = (
     "    else if (species == SPECIES_DEOXYS)\n"
     "        CpuCopy32((u8 *)pointer + 0x800, pointer, 0x800);\n"
-    "}"
 )
+_DEOXYS_TILES_TAIL = "}"
 
 
-def _patch_decompress(decompress_c):
+def deoxys_tiles_new(keep_vanilla_case: bool = True) -> str:
+    """The patched DuplicateDeoxysTiles body.
+
+    ``keep_vanilla_case`` adds back the stock ``SPECIES_DEOXYS`` branch. Pass
+    False for a project that does not define that species.
+    """
+    body = _DEOXYS_TILES_HEAD
+    if keep_vanilla_case:
+        body += _DEOXYS_TILES_VANILLA_CASE
+    return body + _DEOXYS_TILES_TAIL
+
+
+def _patch_decompress(decompress_c, species_h=None):
     """Generalize DuplicateDeoxysTiles so ANY form species renders frame N of
     its base's stacked sheet (vanilla only special-cased Deoxys). Idempotent;
     no-op if the file is missing or its structure differs (so a project that
-    already reworked this function isn't clobbered)."""
+    already reworked this function isn't clobbered).
+
+    The stock ``SPECIES_DEOXYS`` branch is only carried over when the project
+    still defines that species. A project that replaced the roster does not,
+    and emitting the branch regardless wrote C that could not compile.
+    """
     if not os.path.isfile(decompress_c):
         return False
     text = _read(decompress_c)
@@ -203,8 +229,24 @@ def _patch_decompress(decompress_c):
         return False
     if _DEOXYS_TILES_OLD not in text:
         return False
-    text = text.replace(_DEOXYS_TILES_OLD, _DEOXYS_TILES_NEW, 1)
+    keep = _defines_const(species_h, "SPECIES_DEOXYS")
+    text = text.replace(_DEOXYS_TILES_OLD, deoxys_tiles_new(keep), 1)
     return _write_if_changed(decompress_c, text)
+
+
+def _defines_const(header, const):
+    """True if ``header`` has a ``#define`` for ``const``.
+
+    An unknown or unreadable path answers True, which keeps stock behaviour for
+    a stock project rather than silently dropping a branch it needs.
+    """
+    if not header or not os.path.isfile(header):
+        return True
+    try:
+        pattern = r"^[ \t]*#define[ \t]+" + re.escape(const) + r"\b"
+        return re.search(pattern, _read(header), re.MULTILINE) is not None
+    except Exception:
+        return True
 
 
 def apply_form_system(project_root):
@@ -228,7 +270,7 @@ def apply_form_system(project_root):
         "species_h": _patch_species_h(species_h),
         "form_species_c": _create_form_species_c(form_c),
         "decompress_c": _patch_decompress(
-            os.path.join(project_root, "src", "decompress.c")),
+            os.path.join(project_root, "src", "decompress.c"), species_h),
     }
     _self_check(pokemon_h, species_h, form_c)
     return result

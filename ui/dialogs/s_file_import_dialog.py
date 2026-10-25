@@ -24,6 +24,9 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QWidget, QTextEdit, QScrollArea, QGridLayout,
 )
 
+from core.sound.voicegroup_parser import (
+    count_real_instruments, is_filler_instrument, nearest_real_slot,
+)
 from ui.custom_widgets.scroll_guard import install_scroll_guard
 
 
@@ -791,7 +794,6 @@ class SFileImportDialog(QDialog):
     def _populate_mapping_page(self):
         """Build one row per VOICE slot the song uses, each with a dropdown of
         the target voicegroup's instruments."""
-        from ui.dialogs.midi_import_dialog import _is_filler
 
         # Clear previous rows (keep the header row 0).
         for i in reversed(range(self._mapping_layout.count())):
@@ -811,8 +813,28 @@ class SFileImportDialog(QDialog):
         if not usage:
             usage = {0: []}  # no explicit VOICE — the engine defaults to slot 0
 
-        self._mapping_info.setText(
-            f"Voicegroup: {self._vg_combo.currentText()}")
+        # Say how much of the chosen voicegroup is actually usable. A stub
+        # voicegroup (a couple of real entries padded out with placeholder
+        # squares) is the single most common reason an imported song sounds
+        # wrong, and nothing used to tell the user before they pressed Import.
+        real = count_real_instruments(vg_instruments)
+        total = len(vg_instruments)
+        if total and real <= 8:
+            self._mapping_info.setText(
+                f"Voicegroup: {self._vg_combo.currentText()} — only {real} of "
+                f"{total} slots hold a real instrument. This voicegroup is "
+                f"mostly empty; consider picking a fuller one on the previous "
+                f"step.")
+            self._mapping_info.setStyleSheet("color: #e6a23c;")
+        elif total:
+            self._mapping_info.setText(
+                f"Voicegroup: {self._vg_combo.currentText()} — "
+                f"{real} of {total} slots hold a real instrument")
+            self._mapping_info.setStyleSheet("")
+        else:
+            self._mapping_info.setText(
+                f"Voicegroup: {self._vg_combo.currentText()}")
+            self._mapping_info.setStyleSheet("")
 
         row = 1
         for voice_num in sorted(usage):
@@ -839,7 +861,7 @@ class SFileImportDialog(QDialog):
             for idx in range(128):
                 if vg_instruments and idx < len(vg_instruments):
                     inst = vg_instruments[idx]
-                    if _is_filler(inst):
+                    if is_filler_instrument(inst):
                         label = f"{idx}: (empty)"
                     else:
                         tag = _type_tag(inst)
@@ -851,13 +873,30 @@ class SFileImportDialog(QDialog):
             for idx in range(slot_combo.count()):
                 if vg_instruments and idx < len(vg_instruments):
                     inst = vg_instruments[idx]
-                    color = QColor("#c44") if _is_filler(inst) else QColor("#6a6")
+                    color = QColor("#c44") if is_filler_instrument(inst) else QColor("#6a6")
                     slot_combo.setItemData(
                         idx, color, Qt.ItemDataRole.ForegroundRole)
-            slot_combo.setCurrentIndex(max(0, min(127, voice_num)))
-            slot_combo.setToolTip(
-                f"Which voicegroup slot this voice plays.\n"
-                f"Default {voice_num} keeps the .s file's original instrument.")
+            # Default to the slot the .s file asked for — but only if that slot
+            # actually holds an instrument in the TARGET voicegroup. The source
+            # was authored against a different bank, so its slot number often
+            # lands on filler here, and a voice aimed at filler plays a
+            # featureless beep. In that case start on the nearest real slot so
+            # the default is always something audible.
+            wanted = max(0, min(127, voice_num))
+            default_slot = nearest_real_slot(vg_instruments, wanted)
+            if default_slot is None:
+                default_slot = wanted
+            slot_combo.setCurrentIndex(default_slot)
+            if default_slot != wanted:
+                slot_combo.setToolTip(
+                    f"Which voicegroup slot this voice plays.\n"
+                    f"Slot {wanted} (the .s file's own choice) is EMPTY in this "
+                    f"voicegroup, so the nearest real instrument was picked "
+                    f"instead.")
+            else:
+                slot_combo.setToolTip(
+                    f"Which voicegroup slot this voice plays.\n"
+                    f"Default {voice_num} keeps the .s file's original instrument.")
             self._mapping_layout.addWidget(slot_combo, row, 3)
 
             self._voice_map_combos.append((voice_num, slot_combo))
@@ -941,9 +980,77 @@ class SFileImportDialog(QDialog):
             self._btn_next.setText("Import")
 
         elif current == _PAGE_MAPPING:
+            if not self._confirm_mapping():
+                return
             self._start_import()
 
         self._update_step_label()
+
+    def _confirm_mapping(self) -> bool:
+        """Stop an import that would point a voice at an empty slot.
+
+        The wizard has always coloured filler slots red, but colouring a
+        warning and then importing anyway is how a song ends up playing
+        identical beeps instead of its instruments. Offer to move every such
+        voice to the nearest real instrument; let the user override if they
+        genuinely want the placeholder square.
+        """
+        vg_instruments = self._get_target_vg_instruments()
+        if not vg_instruments:
+            return True
+
+        empties = []
+        for voice_num, combo in self._voice_map_combos:
+            data = combo.currentData()
+            slot = int(data) if data is not None else combo.currentIndex()
+            if 0 <= slot < len(vg_instruments) and \
+                    is_filler_instrument(vg_instruments[slot]):
+                empties.append((voice_num, combo, slot))
+        if not empties:
+            return True
+
+        rows = "\n".join(
+            f"    Voice {vn}  →  slot {slot} (empty)" for vn, _c, slot in empties)
+        can_fix = any(
+            nearest_real_slot(vg_instruments, slot) is not None
+            for _vn, _c, slot in empties)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Empty instrument slots")
+        box.setText(
+            f"{len(empties)} voice(s) point at an empty slot in "
+            f"{self._vg_combo.currentText()}:\n\n{rows}\n\n"
+            f"Those slots hold the placeholder square that voicegroups use to "
+            f"pad unused entries, not an instrument. The song will build, but "
+            f"each of these voices will play the same featureless beep.")
+        if can_fix:
+            fix_btn = box.addButton("Use nearest real instrument",
+                                    QMessageBox.ButtonRole.AcceptRole)
+        else:
+            fix_btn = None
+            box.setInformativeText(
+                "This voicegroup has no real instrument to move them to — "
+                "pick a different voicegroup on the previous step.")
+        back_btn = box.addButton("Go back", QMessageBox.ButtonRole.RejectRole)
+        anyway_btn = box.addButton("Import anyway",
+                                   QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(fix_btn or back_btn)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is anyway_btn:
+            return True
+        if fix_btn is not None and clicked is fix_btn:
+            moved = 0
+            for _vn, combo, slot in empties:
+                better = nearest_real_slot(vg_instruments, slot)
+                if better is not None and better != slot:
+                    combo.setCurrentIndex(better)
+                    moved += 1
+            _log.info("Mapping guard moved %d voice(s) off empty slots", moved)
+            return True
+        return False  # "Go back" — stay on the mapping page
 
     def _go_back(self):
         current = self._stack.currentIndex()

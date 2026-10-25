@@ -48,22 +48,9 @@ _DIRTY_SS = ("QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; }"
 # Filler slot detection
 # ---------------------------------------------------------------------------
 
-def _is_filler_instrument(inst) -> bool:
-    """Detect GBA 'empty slot' filler instruments.
-
-    Most voicegroups pad unused slots with a default voice_square_1 entry
-    (duty=2/50%, attack=0, decay=0, sustain=15, release=0, base=60, pan=0).
-    These are never referenced by any song and just clutter the browser.
-    """
-    return (inst.voice_type == 'voice_square_1'
-            and inst.duty_cycle == 2
-            and inst.attack == 0
-            and inst.decay == 0
-            and inst.sustain == 15
-            and inst.release == 0
-            and inst.base_midi_key == 60
-            and inst.pan == 0
-            and inst.sweep == 0)
+from core.sound.voicegroup_parser import (
+    is_filler_instrument as _is_filler_instrument,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -6,13 +6,19 @@ project (which has none of it natively):
   * a ``struct FormChange`` ({method, targetSpecies, param})
   * a ``const struct FormChange *formChangeTable`` pointer on ``struct SpeciesInfo``
   * non-battle trigger constants in ``include/constants/form_change_types.h``
-  * ``GetFormChangeTargetSpecies()`` in a new ``src/form_change.c``
-    (auto-compiled — the Makefile globs ``src/*.c``)
+  * ``TryUpdateOverworldFormChanges()`` and ``TryInBattleFormChange()`` in a
+    new ``src/form_change.c`` (auto-compiled — the Makefile globs ``src/*.c``)
+
+An earlier version generated a one-way ``GetFormChangeTargetSpecies()``
+resolver instead. That path is gone: everything routes through
+``TryUpdateOverworldFormChanges`` → ``ReevaluateOverworldForm``, and its stale
+declaration is pruned from a previously-patched ``pokemon.h`` (see
+``_OBSOLETE_PROTOS``).
 
 This is **Layer B infrastructure only**. It is additive + idempotent: with no
-``formChangeTable`` defined, every species' pointer is implicitly NULL and the
-resolver returns ``SPECIES_NONE``, so the engine behaves identically and a
-project still builds. The per-species form-change tables, the trigger hooks
+``formChangeTable`` defined, every species' pointer is implicitly NULL and
+nothing morphs, so the engine behaves identically and a project still builds.
+The per-species form-change tables, the trigger hooks
 (item-hold / item-use / time-of-day / weather), and the trigger-editor UI are
 layered on top and reference this infrastructure.
 

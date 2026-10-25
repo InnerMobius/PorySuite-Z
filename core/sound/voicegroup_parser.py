@@ -80,6 +80,11 @@ class Instrument:
         return 'keysplit' in self.voice_type
 
     @property
+    def is_filler(self) -> bool:
+        """True for the default placeholder that pads an unused slot."""
+        return is_filler_instrument(self)
+
+    @property
     def friendly_name(self) -> str:
         """Human-readable name for the instrument."""
         if self.is_directsound and self.sample_label:
@@ -104,6 +109,53 @@ class Instrument:
                 return f'Keysplit ->{target} ({self.keysplit_table})'
             return f'Keysplit All ->{target}'
         return self.voice_type
+
+
+# The exact entry voicegroups use to pad slots no song references:
+#   voice_square_1 60, 0, 0, 2, 0, 0, 15, 0
+# It is a bare 50%-duty square with no envelope. A song pointed at one of
+# these plays an identical featureless beep whatever instrument it asked for,
+# so every path that offers the user a slot has to be able to spot one.
+# Defined here once — the UI tabs, the import wizards, the GM generator and
+# the song validator all import this rather than re-deriving it.
+def is_filler_instrument(inst) -> bool:
+    """True if ``inst`` is the default placeholder that pads an unused slot."""
+    return (inst.voice_type == 'voice_square_1'
+            and inst.duty_cycle == 2
+            and inst.attack == 0
+            and inst.decay == 0
+            and inst.sustain == 15
+            and inst.release == 0
+            and inst.base_midi_key == 60
+            and inst.pan == 0
+            and inst.sweep == 0)
+
+
+def nearest_real_slot(instruments, wanted: int) -> Optional[int]:
+    """The usable slot closest to ``wanted`` in ``instruments``.
+
+    Returns ``wanted`` when that slot already holds a real instrument, else
+    the nearest non-filler slot (preferring the lower index on a tie), or
+    ``None`` when the voicegroup has nothing usable at all.
+    """
+    if not instruments:
+        return None
+    if 0 <= wanted < len(instruments) and not is_filler_instrument(instruments[wanted]):
+        return wanted
+    best = None
+    best_dist = None
+    for idx, inst in enumerate(instruments):
+        if is_filler_instrument(inst):
+            continue
+        dist = abs(idx - wanted)
+        if best_dist is None or dist < best_dist:
+            best, best_dist = idx, dist
+    return best
+
+
+def count_real_instruments(instruments) -> int:
+    """How many slots in ``instruments`` hold something other than filler."""
+    return sum(1 for inst in (instruments or []) if not is_filler_instrument(inst))
 
 
 @dataclass

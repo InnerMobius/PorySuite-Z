@@ -29,9 +29,44 @@ from core.sound.sample_loader import SampleData, DirectSoundSample, Programmable
 # Constants
 # ---------------------------------------------------------------------------
 
-OUTPUT_SAMPLE_RATE = 32768  # GBA native mixing rate (close to actual hardware)
+OUTPUT_SAMPLE_RATE = 32768  # internal render rate (downsampled to the engine's)
 TICKS_PER_FRAME = 1         # M4A runs at ~60 fps, 1 tick per frame at tempo scale
 GBA_FRAME_RATE = 59.7275    # GBA refresh rate in Hz
+
+# ---------------------------------------------------------------------------
+# What the engine actually runs at — src/m4a.c:80-83
+#
+#   m4aSoundMode(SOUND_MODE_DA_BIT_8
+#              | SOUND_MODE_FREQ_13379
+#              | (12 << SOUND_MODE_MASVOL_SHIFT)
+#              | (5 << SOUND_MODE_MAXCHN_SHIFT));
+#
+# so: 13379 Hz, 8-bit DAC, master volume 12 of 15, at most 5 PCM channels.
+# Rendering at a higher rate in floating point sounds cleaner than the console
+# can physically be, which is most of why previews never matched the ROM.
+# ---------------------------------------------------------------------------
+
+ENGINE_MIXER_RATE = 13379       # SOUND_MODE_FREQ_13379
+ENGINE_MASTER_VOLUME = 12       # SOUND_MODE_MASVOL value
+ENGINE_MAX_PCM_CHANNELS = 5     # SOUND_MODE_MAXCHN value
+ENGINE_DAC_BITS = 8             # SOUND_MODE_DA_BIT_8
+
+# The engine steps a CGB envelope once per frame, plus a second time on every
+# 15th frame "to keep up with the hardware envelope rate (1/64 s)" — see the
+# envelope_step_complete block in src/m4a.c. That works out at 63.7 Hz.
+_CGB_EXTRA_TICK_EVERY = 15
+
+# gCgb3Vol (src/m4a_tables.c) maps a CGB wave channel's 0-15 envelope level
+# onto NR32, which has only five settings. Expressed here as output gain, so
+# the programmable-wave preview steps between the same five levels the
+# hardware does instead of fading smoothly.
+_CGB3_VOL_GAIN = (
+    0.0, 0.0,                    # 0x00 — muted
+    0.25, 0.25, 0.25, 0.25,      # 0x60 — 25%
+    0.50, 0.50, 0.50, 0.50,      # 0x40 — 50%
+    0.75, 0.75, 0.75, 0.75,      # 0x80 — 75%
+    1.00, 1.00,                  # 0x20 — 100%
+)
 
 # ---------------------------------------------------------------------------
 # GBA M4A pitch tables (from m4a_tables.c)
@@ -117,38 +152,183 @@ def _fit_curve(curve: np.ndarray, n: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# GBA ADSR envelope
+# PCM (DirectSound) envelope — port of src/m4a_1.s, SoundMainRAM_ChanLoop
 # ---------------------------------------------------------------------------
-# GBA ADSR values are 0-255. The envelope runs per-VBlank frame (~59.7 Hz).
-# Attack: volume ramps 0->255 over (256 - attack) frames
-# Decay: volume ramps from peak to sustain over (decay) frames
-# Sustain: held at (sustain) level (0-255)
-# Release: volume ramps from sustain to 0 over (256 - release) frames
+# The engine runs this once per audio frame (59.7275 Hz). The three bytes are
+# NOT durations, and only one of the three behaves the way a synthesiser
+# normally would:
+#
+#   attack  (_081DCFF8)  envelopeVolume += attack, clamped at 0xFF
+#                        -> ADDITIVE. Time to full = 256 / attack frames,
+#                           so a BIG attack byte means FAST.
+#   decay   (_081DCFD6)  envelopeVolume = (envelopeVolume * decay) >> 8
+#                        until it falls to sustain
+#                        -> MULTIPLICATIVE. A BIG decay byte means SLOW.
+#   sustain              held at the sustain byte (0-255).
+#   release (_081DCFB6)  envelopeVolume = (envelopeVolume * release) >> 8
+#                        until it falls to pseudoEchoVolume
+#                        -> MULTIPLICATIVE. A BIG release byte means SLOW.
+#
+# Treating any of them as a linear ramp over "256 - byte" frames — which is
+# what this module used to do — makes attack far too slow and gets decay and
+# release backwards, so instruments previewed nothing like the ROM. Keep this
+# a per-frame integer state machine; do not "simplify" it into a curve.
+# ---------------------------------------------------------------------------
+
+_ENV_ATTACK = 3     # SOUND_CHANNEL_SF_ENV_ATTACK
+_ENV_DECAY = 2      # SOUND_CHANNEL_SF_ENV_DECAY
+_ENV_SUSTAIN = 1    # SOUND_CHANNEL_SF_ENV_SUSTAIN
+_ENV_RELEASE = 0    # SOUND_CHANNEL_SF_ENV_RELEASE
 
 
-# ---------------------------------------------------------------------------
-# CGB ADSR conversion
-# ---------------------------------------------------------------------------
-# CGB channels (square, wave, noise) use a different ADSR scale:
-#   Attack: 0 = instant, 1-7 = slower
-#   Decay:  0-7
-#   Sustain: 0-15 (15 = full volume)
-#   Release: 0 = instant, 1-7 = slower
+def engine_pcm_envelope_frames(
+    attack: int,
+    decay: int,
+    sustain: int,
+    release: int,
+    note_on_frames: int,
+    total_frames: int,
+    pseudo_echo_volume: int = 0,
+    pseudo_echo_length: int = 0,
+) -> list[int]:
+    """Per-frame envelope volumes (0-255) exactly as the mixer computes them.
 
-def _cgb_to_ds_adsr(
-    attack: int, decay: int, sustain: int, release: int,
-) -> tuple[int, int, int, int]:
-    """Convert CGB (0-7/0-15) ADSR to DirectSound (0-255) ADSR scale."""
-    ds_attack = 255 if attack == 0 else max(0, 255 - attack * 32)
-    ds_decay = min(255, decay * 32)
-    ds_sustain = min(255, sustain * 17)   # 0-15 -> 0-255
-    ds_release = min(255, release * 32)
-    return ds_attack, ds_decay, ds_sustain, ds_release
+    ``note_on_frames`` is how many frames the key is held; after that the
+    channel's STOP flag is set and the release multiply takes over. Pseudo-echo
+    (the engine's SOUND_CHANNEL_SF_IEC path) re-triggers the note at
+    ``pseudo_echo_volume`` for ``pseudo_echo_length`` frames once release falls
+    to that floor; both default to off, which is what every song in a stock
+    project uses, since they are set by the xiecv / xiecl track commands.
+    """
+    attack = max(0, min(255, int(attack)))
+    decay = max(0, min(255, int(decay)))
+    sustain = max(0, min(255, int(sustain)))
+    release = max(0, min(255, int(release)))
+    echo_vol = max(0, min(255, int(pseudo_echo_volume)))
+    echo_len = max(0, int(pseudo_echo_length))
+
+    out: list[int] = []
+    vol = 0
+    state = _ENV_ATTACK
+    in_echo = False
+    echo_left = echo_len
+    stopped = False
+
+    for frame in range(max(0, total_frames)):
+        if stopped:
+            out.append(0)
+            continue
+
+        if in_echo:
+            # _081DCFA0: count the echo down; the volume is held meanwhile.
+            echo_left -= 1
+            if echo_left <= 0:
+                vol = 0
+                stopped = True
+            out.append(vol)
+            continue
+
+        if frame >= note_on_frames:
+            # _081DCFB6: the key is up, so release multiplies regardless of
+            # which envelope phase the note had reached.
+            vol = (vol * release) >> 8
+            if vol <= echo_vol:
+                # _081DCFC8
+                vol = echo_vol
+                if vol == 0:
+                    stopped = True
+                else:
+                    in_echo = True
+                    echo_left = echo_len if echo_len else 1
+        elif state == _ENV_DECAY:
+            vol = (vol * decay) >> 8
+            if vol <= sustain:
+                vol = sustain
+                if vol == 0:
+                    vol = echo_vol
+                    if vol == 0:
+                        stopped = True
+                    else:
+                        in_echo = True
+                        echo_left = echo_len if echo_len else 1
+                else:
+                    state = _ENV_SUSTAIN
+        elif state == _ENV_ATTACK:
+            vol += attack
+            if vol >= 0xFF:
+                vol = 0xFF
+                state = _ENV_DECAY
+        # _ENV_SUSTAIN: held, nothing to do.
+
+        out.append(vol)
+
+    return out
 
 
-# ---------------------------------------------------------------------------
-# ADSR Envelope Generator
-# ---------------------------------------------------------------------------
+def _frames_to_samples(frames, n_samples: int, scale: float,
+                       sample_rate: int) -> np.ndarray:
+    """Expand a per-frame envelope to per-sample, held flat within each frame.
+
+    The hardware envelope only changes on a frame boundary, so a zero-order
+    hold is what actually happens — interpolating would smooth over steps the
+    ear can hear on a fast decay.
+    """
+    if n_samples <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if not frames:
+        return np.zeros(n_samples, dtype=np.float32)
+    arr = np.asarray(frames, dtype=np.float32) * scale
+    idx = (np.arange(n_samples, dtype=np.float64)
+           * (GBA_FRAME_RATE / float(sample_rate))).astype(np.int64)
+    np.clip(idx, 0, len(arr) - 1, out=idx)
+    return arr[idx]
+
+
+def release_tail_frames(release: int, start_level: int,
+                        pseudo_echo_volume: int = 0,
+                        pseudo_echo_length: int = 0) -> int:
+    """How many frames the engine's release actually takes from ``start_level``.
+
+    Used to size a preview buffer. The old code hard-capped every release at
+    2048 samples (62.5 ms), which chopped the tail off anything that rings.
+    """
+    release = max(0, min(255, int(release)))
+    vol = max(0, min(255, int(start_level)))
+    echo_vol = max(0, min(255, int(pseudo_echo_volume)))
+    frames = 0
+    while vol > echo_vol and frames < 1024:
+        nxt = (vol * release) >> 8
+        frames += 1
+        if nxt == vol:          # release 256/256 would never fall — cannot
+            break               # happen with a byte, but do not spin
+        vol = nxt
+    return frames + max(0, int(pseudo_echo_length))
+
+
+def pcm_release_samples(attack: int, decay: int, sustain: int, release: int,
+                        note_on_samples: int,
+                        sample_rate: int = OUTPUT_SAMPLE_RATE,
+                        pseudo_echo_volume: int = 0,
+                        pseudo_echo_length: int = 0) -> int:
+    """Buffer length a PCM note's release needs, in samples.
+
+    Measured, not guessed: the envelope is run for the note-on period to find
+    the level the release actually starts from, then the release multiply is
+    counted down from there. A note cut short during its attack releases from
+    a low level and needs almost no tail; a sustained one with release 0xF0
+    rings for most of a second. The old code used a flat 2048 samples
+    (62.5 ms) for both, which chopped every real tail off mid-fade.
+    """
+    spf = sample_rate / GBA_FRAME_RATE
+    note_on_frames = max(1, int(math.ceil(max(0, note_on_samples) / spf)))
+    held = engine_pcm_envelope_frames(
+        attack, decay, sustain, release, note_on_frames, note_on_frames,
+        pseudo_echo_volume, pseudo_echo_length)
+    start_level = held[-1] if held else 0
+    frames = release_tail_frames(release, start_level,
+                                 pseudo_echo_volume, pseudo_echo_length)
+    return int(frames * spf) + 1
+
 
 def generate_adsr_envelope(
     attack: int,
@@ -158,70 +338,195 @@ def generate_adsr_envelope(
     note_on_samples: int,
     release_samples: int = 0,
     sample_rate: int = OUTPUT_SAMPLE_RATE,
+    pseudo_echo_volume: int = 0,
+    pseudo_echo_length: int = 0,
 ) -> np.ndarray:
-    """Generate an ADSR envelope matching GBA M4A behavior.
+    """Per-sample PCM envelope, 0.0-1.0, matching the engine frame for frame."""
+    total_samples = max(0, note_on_samples) + max(0, release_samples)
+    if total_samples <= 0:
+        return np.zeros(0, dtype=np.float32)
 
-    GBA ADSR values are 0-255. The envelope updates per-VBlank (~59.7 Hz).
-    - Attack 255 = instant, 0 = ~4.3 seconds (256 frames)
-    - Decay: higher = slower decay to sustain
-    - Sustain 255 = full volume, 0 = silent
-    - Release 0 = instant, 255 = ~4.3 seconds
-    """
-    attack = max(0, min(255, attack))
-    decay = max(0, min(255, decay))
-    sustain = max(0, min(255, sustain))
-    release = max(0, min(255, release))
+    spf = sample_rate / GBA_FRAME_RATE
+    note_on_frames = int(math.ceil(max(0, note_on_samples) / spf))
+    total_frames = int(math.ceil(total_samples / spf)) + 1
 
-    sustain_level = sustain / 255.0
-    total_samples = note_on_samples + release_samples
-    samples_per_frame = sample_rate / GBA_FRAME_RATE
+    frames = engine_pcm_envelope_frames(
+        attack, decay, sustain, release, note_on_frames, total_frames,
+        pseudo_echo_volume, pseudo_echo_length)
+    return _frames_to_samples(frames, total_samples, 1.0 / 255.0, sample_rate)
 
-    envelope = np.ones(total_samples, dtype=np.float32)
 
-    # Attack: ramp from 0 to 1.0 over (256 - attack) frames
-    if attack < 255:
-        attack_frames = 256 - attack
-        attack_len = int(attack_frames * samples_per_frame)
-        if attack_len > 0:
-            actual_attack = min(attack_len, note_on_samples)
-            ramp = np.linspace(0.0, 1.0, actual_attack, dtype=np.float32)
-            envelope[:actual_attack] = ramp
-    # attack == 255: instant, already 1.0
+# ---------------------------------------------------------------------------
+# CGB envelope — port of the envelope_* block in src/m4a.c (CgbSound)
+# ---------------------------------------------------------------------------
+# Square, programmable-wave and noise voices do NOT use the PCM envelope. The
+# CGB envelope is a different machine: envelopeCounter counts the attack /
+# decay / release bytes down as STEP TIMES in 1/64-second ticks, and each time
+# it reaches zero a 4-bit volume (0-15) moves by one step. Converting the CGB
+# bytes onto the PCM scale and reusing the PCM envelope — which is what this
+# module used to do — is both mis-scaled and backwards.
+# ---------------------------------------------------------------------------
 
-    # Decay: ramp from 1.0 to sustain level
-    attack_len = int((256 - attack) * samples_per_frame) if attack < 255 else 0
-    decay_start = min(attack_len, note_on_samples)
-    if decay > 0 and sustain_level < 1.0:
-        decay_frames = 256 - decay
-        decay_len = int(decay_frames * samples_per_frame)
-        if decay_len > 0 and decay_start < note_on_samples:
-            actual_decay = min(decay_len, note_on_samples - decay_start)
-            ramp = np.linspace(1.0, sustain_level, actual_decay, dtype=np.float32)
-            envelope[decay_start:decay_start + actual_decay] = ramp
+def engine_cgb_envelope_frames(
+    attack: int,
+    decay: int,
+    sustain: int,
+    release: int,
+    note_on_frames: int,
+    total_frames: int,
+    envelope_goal: int = 15,
+    pseudo_echo_volume: int = 0,
+    pseudo_echo_length: int = 0,
+) -> list[int]:
+    """Per-frame CGB envelope levels (0-15) as CgbSound computes them."""
+    attack = max(0, int(attack))
+    decay = max(0, int(decay))
+    sustain = max(0, min(15, int(sustain)))
+    release = max(0, int(release))
+    goal = max(0, min(15, int(envelope_goal)))
+    # CgbModVol: sustainGoal = (envelopeGoal * sustain + 15) >> 4
+    sustain_goal = (goal * sustain + 15) >> 4
+    echo_vol = max(0, min(255, int(pseudo_echo_volume)))
+    echo_len = max(0, int(pseudo_echo_length))
 
-    # Sustain: hold at sustain level
-    sustain_start = decay_start + (int((256 - decay) * samples_per_frame) if decay > 0 else 0)
-    if sustain_start < note_on_samples:
-        envelope[sustain_start:note_on_samples] = sustain_level
+    out: list[int] = []
+    vol = 0
+    state = _ENV_ATTACK
+    counter = attack
+    in_echo = False
+    echo_left = echo_len
+    stopped = False
+    released = False
 
-    # Release: ramp from sustain level to 0
-    if release_samples > 0:
-        if release < 255:
-            release_frames = 256 - release
-            release_len = int(release_frames * samples_per_frame)
-            if release_len > 0:
-                actual_release = min(release_len, release_samples)
-                ramp = np.linspace(sustain_level, 0.0, actual_release, dtype=np.float32)
-                envelope[note_on_samples:note_on_samples + actual_release] = ramp
-                envelope[note_on_samples + actual_release:] = 0.0
+    def _step() -> None:
+        """One envelope tick — the body of envelope_step_repeat."""
+        nonlocal vol, state, counter, in_echo, echo_left, stopped
+        if stopped or in_echo:
+            return
+        if counter > 0:
+            counter -= 1
+            return
+        if state == _ENV_RELEASE:
+            vol -= 1
+            if vol <= 0:
+                # envelope_pseudoecho_start
+                vol = ((goal * echo_vol) + 0xFF) >> 8
+                if vol:
+                    in_echo = True
+                    echo_left = echo_len if echo_len else 1
+                else:
+                    vol = 0
+                    stopped = True
             else:
-                envelope[note_on_samples:] = 0.0
-        else:
-            # Very slow release
-            ramp = np.linspace(sustain_level, 0.0, release_samples, dtype=np.float32)
-            envelope[note_on_samples:] = ramp
+                counter = release
+        elif state == _ENV_SUSTAIN:
+            vol = sustain_goal
+            counter = 7
+        elif state == _ENV_DECAY:
+            vol -= 1
+            if vol <= sustain_goal:
+                if sustain == 0:
+                    vol = ((goal * echo_vol) + 0xFF) >> 8
+                    if vol:
+                        in_echo = True
+                        echo_left = echo_len if echo_len else 1
+                    else:
+                        vol = 0
+                        stopped = True
+                else:
+                    state = _ENV_SUSTAIN
+                    vol = sustain_goal
+                    counter = 7
+            else:
+                counter = decay
+        else:  # _ENV_ATTACK
+            vol += 1
+            if vol >= goal:
+                vol = goal
+                state = _ENV_DECAY
+                counter = decay
+            else:
+                counter = attack
 
-    return envelope
+    for frame in range(max(0, total_frames)):
+        if not released and frame >= note_on_frames:
+            # The STOP branch: switch to release and load its step time.
+            released = True
+            if not stopped and not in_echo:
+                state = _ENV_RELEASE
+                counter = release
+
+        if in_echo:
+            echo_left -= 1
+            if echo_left <= 0:
+                vol = 0
+                stopped = True
+        elif not stopped:
+            _step()
+            # "every 15 frames, envelope calculation has to be done twice to
+            # keep up with the hardware envelope rate (1/64 s)"
+            if frame % _CGB_EXTRA_TICK_EVERY == _CGB_EXTRA_TICK_EVERY - 1:
+                _step()
+
+        out.append(0 if stopped else max(0, min(15, vol)))
+
+    return out
+
+
+def _cgb_envelope_samples(attack, decay, sustain, release, note_on_samples,
+                          release_samples, sample_rate, *, wave_levels=False,
+                          envelope_goal=15):
+    total_samples = max(0, note_on_samples) + max(0, release_samples)
+    if total_samples <= 0:
+        return np.zeros(0, dtype=np.float32)
+    spf = sample_rate / GBA_FRAME_RATE
+    note_on_frames = int(math.ceil(max(0, note_on_samples) / spf))
+    total_frames = int(math.ceil(total_samples / spf)) + 1
+    frames = engine_cgb_envelope_frames(
+        attack, decay, sustain, release, note_on_frames, total_frames,
+        envelope_goal=envelope_goal)
+    if wave_levels:
+        # The wave channel's level goes through gCgb3Vol, which has only five
+        # settings — so map straight onto those gains. Rounding them back into
+        # the 0-15 integer scale first would smear them off the real levels.
+        gains = [_CGB3_VOL_GAIN[max(0, min(15, v))] for v in frames]
+        return _frames_to_samples(gains, total_samples, 1.0, sample_rate)
+    return _frames_to_samples(frames, total_samples, 1.0 / 15.0, sample_rate)
+
+
+def generate_cgb_envelope(attack: int, decay: int, sustain: int, release: int,
+                          note_on_samples: int, release_samples: int = 0,
+                          sample_rate: int = OUTPUT_SAMPLE_RATE) -> np.ndarray:
+    """Per-sample CGB envelope, 0.0-1.0, for square and noise voices."""
+    return _cgb_envelope_samples(attack, decay, sustain, release,
+                                 note_on_samples, release_samples, sample_rate)
+
+
+def generate_cgb_wave_envelope(attack: int, decay: int, sustain: int,
+                               release: int, note_on_samples: int,
+                               release_samples: int = 0,
+                               sample_rate: int = OUTPUT_SAMPLE_RATE
+                               ) -> np.ndarray:
+    """Per-sample envelope for a programmable-wave voice (five levels only)."""
+    return _cgb_envelope_samples(attack, decay, sustain, release,
+                                 note_on_samples, release_samples, sample_rate,
+                                 wave_levels=True)
+
+
+def cgb_release_samples(release: int, sustain: int,
+                        sample_rate: int = OUTPUT_SAMPLE_RATE) -> int:
+    """Buffer length a CGB note's release needs, in samples.
+
+    The release byte is a step time in 1/64-second ticks and the level walks
+    down one step at a time from the sustain level, so the tail is
+    ``release * levels`` ticks long.
+    """
+    release = max(0, int(release))
+    sustain = max(0, min(15, int(sustain)))
+    levels = max(1, (15 * sustain + 15) >> 4) if sustain else 15
+    ticks = max(1, release) * levels
+    seconds = ticks / (GBA_FRAME_RATE * (1.0 + 1.0 / _CGB_EXTRA_TICK_EVERY))
+    return int(seconds * sample_rate) + 1
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +540,9 @@ def render_directsound(
     velocity: int,
     duration_samples: int,
     release_samples: int = 2048,
-    attack: int = 0,
+    attack: int = 255,
     decay: int = 0,
-    sustain: int = 15,
+    sustain: int = 255,
     release: int = 0,
     no_resample: bool = False,
     bend_curve: Optional[np.ndarray] = None,
@@ -248,8 +553,15 @@ def render_directsound(
     real hardware behavior. The sample's raw freq field encodes both sample
     rate and base key in a single fixed-point value.
 
+    The ADSR defaults are deliberately the neutral envelope — instant on, full
+    volume, instant off. They used to be ``attack=0, sustain=15``, which only
+    sounded like anything because the envelope generator was wrong: on real
+    hardware ``attack=0`` adds nothing per frame, so the note never rises and
+    plays SILENT, and ``sustain=15`` is 6% of full, not full. Any caller that
+    cares about the envelope passes the instrument's real bytes.
+
     If no_resample is True (voice_directsound_no_resample / 0x08), the sample
-    plays at its native rate without any pitch shifting.
+    plays at the engine's mixer rate without pitch shifting.
 
     ``bend_curve`` (per-sample added semitones) glides the read rate within the
     note so a mid-note BEND (held-note sweep) is heard. Ignored for no_resample
@@ -263,9 +575,15 @@ def render_directsound(
 
     # Calculate playback rate using GBA's actual pitch calculation
     if no_resample:
-        # voice_directsound_no_resample: play at native sample rate, no pitch shift
-        src_rate = sample.sample_rate if sample.sample_rate > 0 else 8000
-        total_ratio = src_rate / OUTPUT_SAMPLE_RATE
+        # voice_directsound_no_resample (TONEDATA_TYPE_FIX). The mixer's fixed
+        # path (_081DD07C in src/m4a_1.s) reads one source byte per output
+        # sample, so the sample plays at the MIXER's rate — 13379 Hz — no
+        # matter what rate it was authored at. Using the sample's own rate
+        # here was right only by coincidence, because most fixed-pitch drums
+        # in a stock project happen to be 13379 Hz; the ones that are not
+        # previewed at the wrong pitch (an 11025 Hz hit sounds a third too
+        # low, a 26758 Hz one a whole octave).
+        total_ratio = ENGINE_MIXER_RATE / OUTPUT_SAMPLE_RATE
     elif sample.header.freq_raw > 0:
         # Use GBA's MidiKeyToFreq with the sample's raw freq field
         total_ratio = _midi_key_to_freq(sample.header.freq_raw, midi_note)
@@ -406,10 +724,10 @@ def render_square_wave(
     # Generate square wave using duty cycle
     wave = np.where((phase % 1.0) < duty, 0.5, -0.5).astype(np.float32)
 
-    # CGB channels use 0-7/0-15 ADSR scale, convert to 0-255
-    ds_a, ds_d, ds_s, ds_r = _cgb_to_ds_adsr(attack, decay, sustain, release)
-    env = generate_adsr_envelope(ds_a, ds_d, ds_s, ds_r,
-                                  duration_samples, release_samples)
+    # Square voices run the CGB envelope, not the PCM one: a 4-bit level
+    # stepped on a 1/64 s clock by the attack/decay/release step times.
+    env = generate_cgb_envelope(attack, decay, sustain, release,
+                                duration_samples, release_samples)
     wave *= env
 
     # Apply velocity (GBA uses same volume pipeline for all channel types)
@@ -461,10 +779,10 @@ def render_programmable_wave(
 
     wave = wavetable[indices]
 
-    # CGB channels use 0-7/0-15 ADSR scale, convert to 0-255
-    ds_a, ds_d, ds_s, ds_r = _cgb_to_ds_adsr(attack, decay, sustain, release)
-    env = generate_adsr_envelope(ds_a, ds_d, ds_s, ds_r,
-                                  duration_samples, release_samples)
+    # The wave channel's level goes through gCgb3Vol, which has only five
+    # settings, so its envelope steps between those instead of fading.
+    env = generate_cgb_wave_envelope(attack, decay, sustain, release,
+                                     duration_samples, release_samples)
     wave *= env
 
     # Apply velocity
@@ -521,10 +839,9 @@ def render_noise(
             held = np.pad(held, (0, total_len - len(held)))
         noise = held
 
-    # CGB channels use 0-7/0-15 ADSR scale, convert to 0-255
-    ds_a, ds_d, ds_s, ds_r = _cgb_to_ds_adsr(attack, decay, sustain, release)
-    env = generate_adsr_envelope(ds_a, ds_d, ds_s, ds_r,
-                                  duration_samples, release_samples)
+    # Noise is a CGB channel too — same 4-bit stepped envelope as the squares.
+    env = generate_cgb_envelope(attack, decay, sustain, release,
+                                duration_samples, release_samples)
     noise *= env
 
     # Apply velocity
@@ -670,24 +987,119 @@ def render_instrument(
 # Simple Reverb
 # ---------------------------------------------------------------------------
 
-def apply_reverb(audio: np.ndarray, reverb_level: int, sample_rate: int = OUTPUT_SAMPLE_RATE) -> np.ndarray:
-    """Apply simple delay-based reverb matching GBA behavior.
+def apply_reverb_stereo(stereo: np.ndarray, reverb_level: int,
+                        sample_rate: int = OUTPUT_SAMPLE_RATE) -> np.ndarray:
+    """Apply the engine's reverb — src/m4a_1.s, SoundMainRAM_Reverb.
 
-    reverb_level: 0-127 (from the song's reverb setting)
+    Per sample position the engine sums four bytes: left and right from the
+    half of the double buffer it is about to overwrite (two frames old) and
+    left and right from the other half (one frame old), multiplies by the
+    reverb level and shifts right 9. It writes that single value into BOTH
+    channels as the frame's starting point, and the voices are then mixed in
+    on top — so it is a two-tap feedback comb at roughly one and two frames
+    (~17 ms and ~33 ms) that also pulls the stereo image toward the middle.
+
+    That is nothing like a single dry echo tap, which is what this used to be.
+    Every song in a stock project sets ``reverb_set+50``, so getting the shape
+    wrong coloured all of them.
+
+    ``stereo`` is (n, 2) float; the return is a new array of the same shape.
     """
-    if reverb_level <= 0:
-        return audio
+    if reverb_level <= 0 or stereo.size == 0:
+        return stereo
+    return ReverbState(reverb_level, sample_rate).process(stereo)
 
-    # GBA reverb is a single feedback delay
-    delay_ms = 40  # ~40ms delay (approximate)
-    delay_samples = int(sample_rate * delay_ms / 1000)
-    feedback = reverb_level / 255.0  # scale to 0-0.5 range
 
-    output = audio.copy()
-    if delay_samples < len(output):
-        output[delay_samples:] += audio[:-delay_samples] * feedback
+class ReverbState:
+    """Stateful form of :func:`apply_reverb_stereo`.
 
-    return np.clip(output, -1.0, 1.0)
+    The engine's reverb feeds its own output back, so it cannot be applied to
+    one isolated block and forgotten. Live playback hands the mixer a new
+    buffer every callback, so it keeps one of these across callbacks instead of
+    restarting the comb (and audibly re-seeding it) every time.
+    """
+
+    def __init__(self, reverb_level: int,
+                 sample_rate: int = OUTPUT_SAMPLE_RATE):
+        self.reverb = int(max(0, min(127, reverb_level)))
+        self.block = max(1, int(round(sample_rate / GBA_FRAME_RATE)))
+        self._prev1 = np.zeros((self.block, 2), dtype=np.float32)
+        self._prev2 = np.zeros((self.block, 2), dtype=np.float32)
+
+    def reset(self) -> None:
+        self._prev1[:] = 0.0
+        self._prev2[:] = 0.0
+
+    def process(self, stereo: np.ndarray) -> np.ndarray:
+        if self.reverb <= 0 or stereo.size == 0:
+            return stereo
+        block = self.block
+        out = np.array(stereo, dtype=np.float32, copy=True)
+        for start in range(0, out.shape[0], block):
+            end = min(start + block, out.shape[0])
+            length = end - start
+            # prev1 is one block back, prev2 two blocks back — both already
+            # reverbed, which is what makes this feed back rather than decay
+            # in a single hop.
+            seed = ((self._prev2[:length, 0] + self._prev2[:length, 1]
+                     + self._prev1[:length, 0] + self._prev1[:length, 1])
+                    * self.reverb) / 512.0
+            out[start:end, 0] += seed
+            out[start:end, 1] += seed
+            # The engine stores the result as a signed byte, so the buffer
+            # itself clips — the feedback loop cannot run away.
+            np.clip(out[start:end], -1.0, 1.0, out=out[start:end])
+            self._prev2 = self._prev1
+            nxt = np.zeros((block, 2), dtype=np.float32)
+            nxt[:length] = out[start:end]
+            self._prev1 = nxt
+        return out
+
+
+def apply_engine_output_stage(stereo: np.ndarray,
+                              sample_rate: int = OUTPUT_SAMPLE_RATE,
+                              master_volume: int = ENGINE_MASTER_VOLUME
+                              ) -> np.ndarray:
+    """Put a finished mix through the console's output stage.
+
+    src/m4a.c sets SOUND_MODE_FREQ_13379 and SOUND_MODE_DA_BIT_8 with master
+    volume 12 of 15, so the hardware never produces anything brighter than a
+    6.7 kHz Nyquist or finer than 256 levels. Rendering in floating point at
+    32768 Hz and stopping there is why previews sounded cleaner and fuller
+    than the ROM ever can.
+
+    Three steps, in the order the console does them:
+
+    1. Scale by ``(master_volume + 1) / 16`` — the ``>> 4`` the mixer applies
+       right after the envelope (_081DD006 in src/m4a_1.s).
+    2. Resample to 13379 Hz by picking nearest samples, with no anti-alias
+       filter. The engine does not filter either; it simply computes samples
+       at that rate, aliasing and all, and the aliasing is part of the sound.
+    3. Quantise to 8-bit signed and hold each sample for one DAC period on
+       the way back up to the playback rate, which is what the DMA does.
+    """
+    if stereo.size == 0:
+        return stereo
+
+    scaled = np.asarray(stereo, dtype=np.float32) * ((master_volume + 1) / 16.0)
+
+    n = scaled.shape[0]
+    n_engine = max(1, int(round(n * ENGINE_MIXER_RATE / float(sample_rate))))
+    pick = np.minimum(
+        (np.arange(n_engine, dtype=np.float64)
+         * (float(sample_rate) / ENGINE_MIXER_RATE)).astype(np.int64),
+        n - 1)
+    at_engine_rate = scaled[pick]
+
+    levels = 1 << (ENGINE_DAC_BITS - 1)          # 128
+    quantised = np.clip(np.rint(at_engine_rate * levels),
+                        -levels, levels - 1) / levels
+
+    hold = np.minimum(
+        (np.arange(n, dtype=np.float64)
+         * (ENGINE_MIXER_RATE / float(sample_rate))).astype(np.int64),
+        n_engine - 1)
+    return quantised[hold].astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

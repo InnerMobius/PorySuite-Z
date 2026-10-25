@@ -20,7 +20,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from core.sound.voicegroup_parser import Instrument, Voicegroup, VoicegroupData
+from core.sound.voicegroup_parser import (
+    Instrument, Voicegroup, VoicegroupData, is_filler_instrument,
+)
 from core.sound.sound_constants import VOICE_MACRO_TYPES
 
 
@@ -213,21 +215,6 @@ _SAMPLE_TO_GM: dict[str, list[int]] = {
 # Filler detection
 # ---------------------------------------------------------------------------
 
-def _is_filler(inst: Instrument) -> bool:
-    """Check if an instrument is a default filler (unused placeholder)."""
-    return (
-        inst.voice_type == 'voice_square_1'
-        and inst.duty_cycle == 2
-        and inst.attack == 0
-        and inst.decay == 0
-        and inst.sustain == 15
-        and inst.release == 0
-        and inst.base_midi_key == 60
-        and inst.pan == 0
-        and inst.sweep == 0
-    )
-
-
 def _make_filler(slot: int) -> Instrument:
     """Create a default filler instrument for an empty slot."""
     return Instrument(
@@ -317,7 +304,7 @@ def _catalog_all_instruments(
     for vg_name in sorted(voicegroup_data.voicegroups):
         vg = voicegroup_data.voicegroups[vg_name]
         for inst in vg.instruments:
-            if _is_filler(inst):
+            if is_filler_instrument(inst):
                 continue
 
             # Build a signature to detect duplicates

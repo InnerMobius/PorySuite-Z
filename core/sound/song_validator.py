@@ -180,13 +180,24 @@ def validate_song_warnings(song, project_root: Optional[str] = None,
                            vg_data=None) -> list[str]:
     """Non-blocking semantic warnings — logged + surfaced, never block a save.
 
-    Currently: a VOICE pointing at a voicegroup entry with a NON-ZERO frequency
-    sweep. A sweep ramps the channel's pitch over time; on a short, high one-shot
-    SFX it sweeps the tone out of audible range so the sound plays silent
-    (se_small_item: VOICE 109 = voice_square_1_alt, sweep 21 → inaudible). It's
-    legal M4A (music sometimes wants a sweep), so this WARNS rather than rejects
-    — but for a one-shot SFX it's almost always a mistake. The caller decides
-    whether to surface it (the .s import does, since imports are SFX)."""
+    Two checks, both legal M4A that is almost always a mistake:
+
+    * A VOICE pointing at a voicegroup entry with a NON-ZERO frequency sweep.
+      A sweep ramps the channel's pitch over time; on a short, high one-shot
+      SFX it sweeps the tone out of audible range so the sound plays silent
+      (se_small_item: VOICE 109 = voice_square_1_alt, sweep 21 → inaudible).
+
+    * A VOICE pointing at a FILLER slot — the bare ``voice_square_1 60, 0, 0,
+      2, 0, 0, 15, 0`` that voicegroups use to pad slots no song references.
+      The song assembles and plays, but every voice aimed at filler makes the
+      same featureless beep, so the song sounds nothing like it should. This is
+      how an imported song lands on a near-empty voicegroup — one holding a
+      couple of real entries padded out with that placeholder — and reads as
+      "my import didn't build".
+
+    Both WARN rather than reject — music sometimes wants a sweep, and a filler
+    slot is valid assembly. The caller decides whether to surface them (the .s
+    import does, since imports are SFX)."""
     warnings: list[str] = []
     vg_name = getattr(song, 'voicegroup', None)
     if not vg_name:
@@ -221,6 +232,18 @@ def validate_song_warnings(song, project_root: Optional[str] = None,
                     f"VOICE {v} ({vg_name}) uses a square with frequency sweep "
                     f"{sweep} — a short/high one-shot SFX may sweep out of "
                     f"audible range and play SILENT. Use a sweep-0 voice for SFX.")
+            try:
+                from core.sound.voicegroup_parser import is_filler_instrument
+                filler = is_filler_instrument(inst)
+            except Exception:
+                filler = False
+            if filler:
+                warnings.append(
+                    f"VOICE {v} ({vg_name}) points at an EMPTY slot — that slot "
+                    f"holds the placeholder square voicegroups use to pad unused "
+                    f"entries, not an instrument. The song will build and play, "
+                    f"but this voice makes a featureless beep. Pick a slot that "
+                    f"holds a real instrument.")
     for w in warnings:
         _log.warning("%s: %s", getattr(song, 'label', '?'), w)
     return warnings

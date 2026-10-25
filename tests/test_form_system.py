@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(_ROOT, "core"))
 
 import pytest  # noqa: E402
 
+from core import form_system_patch  # noqa: E402
 from core.form_system_patch import apply_form_system  # noqa: E402
 
 _ENGINE = os.path.join(_ROOT, "pokefirered")
@@ -37,6 +38,29 @@ def _strip(path, tokens):
     open(path, "w", encoding="utf-8", newline="").writelines(kept)
 
 
+def _unpatch_decompress(path):
+    """Put ``DuplicateDeoxysTiles`` back to its stock body.
+
+    This used to line-strip the ``PorySuite-Z form frame`` marker comment and
+    call it unpatched, which never worked: the patch REPLACES the whole
+    function, so deleting its comment left a body that matched neither the
+    patched marker nor the stock text the patcher looks for. ``_patch_decompress``
+    then correctly no-opped and the test failed on ``decompress_c: False``.
+
+    Rewriting the function outright is also right for the live project, whose
+    copy has drifted from what the patcher emits (its ``SPECIES_DEOXYS`` branch
+    was removed, because this project does not define that species).
+    """
+    text = open(path, encoding="utf-8").read()
+    body = re.search(
+        r"static void DuplicateDeoxysTiles\(void \*pointer, s32 species\)\n"
+        r"\{.*?\n\}", text, flags=re.DOTALL)
+    assert body, "DuplicateDeoxysTiles not found in decompress.c"
+    open(path, "w", encoding="utf-8", newline="").write(
+        text[:body.start()] + form_system_patch._DEOXYS_TILES_OLD
+        + text[body.end():])
+
+
 def _mk_project(tmp):
     os.makedirs(os.path.join(tmp, "include", "constants"))
     os.makedirs(os.path.join(tmp, "src"))
@@ -47,7 +71,7 @@ def _mk_project(tmp):
     if os.path.isfile(_DECOMPRESS_C):
         dc = os.path.join(tmp, "src", "decompress.c")
         shutil.copy2(_DECOMPRESS_C, dc)
-        _strip(dc, ("PorySuite-Z form frame",))
+        _unpatch_decompress(dc)
     _strip(ph, ("formSpeciesIdTable", "formChangeTable", "GetFormSpeciesId",
                 "GetSpeciesFormId", "GetFormChangeTargetSpecies"))
     _strip(sp, ("FORM_SPECIES_END",))
@@ -107,3 +131,53 @@ def test_single_field_and_define_on_double_apply():
         assert ph.count("const u16 *formSpeciesIdTable;") == 1
         assert ph.count("u16 GetFormSpeciesId(u16 species, u8 formId);") == 1
         assert sp.count("#define FORM_SPECIES_END 0xFFFF") == 1
+
+
+# ---------------------------------------------------------------------------
+# The emitted C must not name a species the project does not have.
+#
+# The patcher used to append `else if (species == SPECIES_DEOXYS)` to the
+# generated body unconditionally. A project that has replaced the roster —
+# which is the whole point of this tool — does not define that constant, so the
+# patcher wrote C that would not compile. CLAUDE.md: no hardcoded game-specific
+# labels; parse everything from the project's own source.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(_skip, reason="engine copy not present")
+def test_vanilla_species_branch_is_dropped_when_undefined():
+    with tempfile.TemporaryDirectory() as d:
+        _mk_project(d)
+        sp = os.path.join(d, "include", "constants", "species.h")
+        text = open(sp, encoding="utf-8").read()
+        kept = [l for l in text.splitlines(keepends=True)
+                if "SPECIES_DEOXYS" not in l]
+        open(sp, "w", encoding="utf-8", newline="").writelines(kept)
+
+        r = apply_form_system(d)
+        assert r["decompress_c"] is True
+
+        dc = open(os.path.join(d, "src", "decompress.c"), encoding="utf-8").read()
+        assert "PorySuite-Z form frame" in dc, "the form-frame patch did not land"
+        body = dc[dc.index("static void DuplicateDeoxysTiles(void *pointer, s32 species)\n{"):]
+        body = body[:body.index("\n}") + 2]
+        assert "SPECIES_DEOXYS" not in body, (
+            "patcher emitted a species this project does not define:\n" + body)
+
+
+@pytest.mark.skipif(_skip, reason="engine copy not present")
+def test_vanilla_species_branch_is_kept_when_defined():
+    with tempfile.TemporaryDirectory() as d:
+        _mk_project(d)
+        sp = os.path.join(d, "include", "constants", "species.h")
+        text = open(sp, encoding="utf-8").read()
+        if "#define SPECIES_DEOXYS" not in text:
+            open(sp, "w", encoding="utf-8", newline="").write(
+                text.rstrip("\n") + "\n#define SPECIES_DEOXYS 410\n")
+
+        assert apply_form_system(d)["decompress_c"] is True
+
+        dc = open(os.path.join(d, "src", "decompress.c"), encoding="utf-8").read()
+        body = dc[dc.index("static void DuplicateDeoxysTiles(void *pointer, s32 species)\n{"):]
+        body = body[:body.index("\n}") + 2]
+        assert "else if (species == SPECIES_DEOXYS)" in body, (
+            "stock branch dropped from a project that still has that species")

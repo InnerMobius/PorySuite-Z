@@ -183,8 +183,12 @@ def clamp_psg_envelope(attack, decay, sustain, release):
     be the SLOWEST attack, so we instead recognise an out-of-CGB-range value as a
     leaked DirectSound value and convert it to its CGB equivalent — instant
     DirectSound attack 255 -> CGB 0 (the fix). Already-valid CGB values pass
-    through untouched. Mirrors the forward map in audio_engine `_cgb_to_ds_adsr`
-    (attack: ds=255-cgb*32; decay/release: ds=cgb*32; sustain: ds=cgb*17)."""
+    through untouched. The conversion it reverses (attack: ds=255-cgb*32;
+    decay/release: ds=cgb*32; sustain: ds=cgb*17) is an approximate mapping
+    used only to recognise a leaked DirectSound value here — playback no
+    longer converts between the two scales at all, because the engine runs a
+    separate envelope for CGB voices (see audio_engine
+    `engine_cgb_envelope_frames`)."""
     def _i(v):
         try:
             return int(v)

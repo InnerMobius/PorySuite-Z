@@ -100,17 +100,9 @@ def _type_color(voice_type: str) -> QColor:
     return _TYPE_COLORS.get(prefix, QColor(120, 120, 120))
 
 
-def _is_filler_instrument(inst) -> bool:
-    """Detect default filler (unused) instrument slots."""
-    return (inst.voice_type == 'voice_square_1'
-            and inst.duty_cycle == 2
-            and inst.attack == 0
-            and inst.decay == 0
-            and inst.sustain == 15
-            and inst.release == 0
-            and inst.base_midi_key == 60
-            and inst.pan == 0
-            and inst.sweep == 0)
+from core.sound.voicegroup_parser import (
+    is_filler_instrument as _is_filler_instrument,
+)
 
 
 # ---------------------------------------------------------------------------

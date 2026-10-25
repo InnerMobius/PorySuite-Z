@@ -382,6 +382,11 @@ class PianoRollWindow(QMainWindow):
         )
         self._sequencer.volume = self._vol_slider.value() / 100.0
 
+        # Give live playback the song's own reverb. Without this the piano
+        # roll was dry while the same song in the ROM runs reverb 50, which is
+        # a large part of why previews never sounded like the game.
+        self._sequencer.set_reverb(getattr(self._song, 'reverb', 0) or 0)
+
         # Set loop region from the piano roll's flattened loop points
         loop_s = self._piano_roll.canvas._loop_start
         loop_e = self._piano_roll.canvas._loop_end

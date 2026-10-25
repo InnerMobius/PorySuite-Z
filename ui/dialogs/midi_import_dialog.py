@@ -26,6 +26,9 @@ from PyQt6.QtWidgets import (
     QAbstractItemView,
 )
 
+from core.sound.voicegroup_parser import (
+    count_real_instruments, is_filler_instrument, nearest_real_slot,
+)
 from ui.custom_widgets.scroll_guard import install_scroll_guard
 
 
@@ -405,21 +408,6 @@ def _backdate_mid(s_path: str) -> None:
                 os.utime(cfg_path, (far_past, far_past))
         except OSError:
             pass
-
-
-# ── Filler detection (same logic as voicegroups_tab) ───────────────────────
-
-def _is_filler(inst) -> bool:
-    """Detect default filler (unused) instrument slots."""
-    return (inst.voice_type == 'voice_square_1'
-            and inst.duty_cycle == 2
-            and inst.attack == 0
-            and inst.decay == 0
-            and inst.sustain == 15
-            and inst.release == 0
-            and inst.base_midi_key == 60
-            and inst.pan == 0
-            and inst.sweep == 0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -818,7 +806,7 @@ class MidiImportDialog(QDialog):
             for idx in range(128):
                 if vg_instruments and idx < len(vg_instruments):
                     inst = vg_instruments[idx]
-                    if _is_filler(inst):
+                    if is_filler_instrument(inst):
                         label = f"{idx}: (empty)"
                     else:
                         label = f"{idx}: {inst.friendly_name}"
@@ -830,7 +818,7 @@ class MidiImportDialog(QDialog):
             for idx in range(slot_combo.count()):
                 if vg_instruments and idx < len(vg_instruments):
                     inst = vg_instruments[idx]
-                    if _is_filler(inst):
+                    if is_filler_instrument(inst):
                         slot_combo.setItemData(
                             idx, QColor("#c44"), Qt.ItemDataRole.ForegroundRole)
                     else:
@@ -841,10 +829,27 @@ class MidiImportDialog(QDialog):
                 slot_combo.setCurrentIndex(0)
                 slot_combo.setToolTip("Drums — mid2agb maps drum hits by note number")
             else:
-                slot_combo.setCurrentIndex(max(0, min(127, t.instrument_num)))
-                slot_combo.setToolTip(
-                    f"Which slot in the voicegroup to use for this track.\n"
-                    f"Default: {t.instrument_num} (same as the MIDI program number).")
+                # Default to the MIDI program number, but only when that slot
+                # holds a real instrument here. A GM program number is not a
+                # voicegroup slot index, so it frequently lands on the
+                # placeholder square that pads unused slots — and a voice
+                # aimed at a placeholder plays a featureless beep instead of
+                # the instrument. Fall back to the nearest real slot.
+                wanted = max(0, min(127, t.instrument_num))
+                default_slot = nearest_real_slot(vg_instruments, wanted)
+                if default_slot is None:
+                    default_slot = wanted
+                slot_combo.setCurrentIndex(default_slot)
+                if default_slot != wanted:
+                    slot_combo.setToolTip(
+                        f"Which slot in the voicegroup to use for this track.\n"
+                        f"Slot {wanted} (the MIDI program number) is EMPTY in "
+                        f"this voicegroup, so the nearest real instrument was "
+                        f"picked instead.")
+                else:
+                    slot_combo.setToolTip(
+                        f"Which slot in the voicegroup to use for this track.\n"
+                        f"Default: {t.instrument_num} (same as the MIDI program number).")
 
             self._mapping_layout.addWidget(slot_combo, row, 3)
 
@@ -852,8 +857,27 @@ class MidiImportDialog(QDialog):
             row += 1
 
         if self._midi_info.tracks:
-            self._mapping_info.setText(
-                f"Voicegroup: {self._vg_combo.currentText()}")
+            # Say how much of the chosen voicegroup is actually usable. A stub
+            # voicegroup (a couple of real entries padded out with placeholder
+            # squares) is the commonest reason an imported song sounds wrong.
+            real = count_real_instruments(vg_instruments)
+            total = len(vg_instruments)
+            if total and real <= 8:
+                self._mapping_info.setText(
+                    f"Voicegroup: {self._vg_combo.currentText()} — only {real} "
+                    f"of {total} slots hold a real instrument. This voicegroup "
+                    f"is mostly empty; pick a fuller one, or use Generate GM "
+                    f"Voicegroup.")
+                self._mapping_info.setStyleSheet("color: #e6a23c;")
+            elif total:
+                self._mapping_info.setText(
+                    f"Voicegroup: {self._vg_combo.currentText()} — "
+                    f"{real} of {total} slots hold a real instrument")
+                self._mapping_info.setStyleSheet("")
+            else:
+                self._mapping_info.setText(
+                    f"Voicegroup: {self._vg_combo.currentText()}")
+                self._mapping_info.setStyleSheet("")
 
     def _auto_select_gm_voicegroup(self):
         """If a GM voicegroup already exists, pre-select it."""
@@ -964,7 +988,7 @@ class MidiImportDialog(QDialog):
         # Build a lowercase name lookup for VG instruments
         vg_names = []
         for inst in insts:
-            vg_names.append(inst.friendly_name.lower() if not _is_filler(inst) else "")
+            vg_names.append(inst.friendly_name.lower() if not is_filler_instrument(inst) else "")
 
         for gm_num, spin in self._mapping_combos:
             if gm_num < 0:  # drums
@@ -1435,6 +1459,8 @@ class MidiImportDialog(QDialog):
             self._btn_next.setText("Next")
 
         elif current == _PAGE_MAPPING:
+            if not self._confirm_mapping():
+                return
             self._populate_structure_page()
             self._stack.setCurrentIndex(_PAGE_STRUCTURE)
             self._btn_next.setText("Import")
@@ -1443,6 +1469,69 @@ class MidiImportDialog(QDialog):
             self._start_import()
 
         self._update_step_label()
+
+    def _confirm_mapping(self) -> bool:
+        """Stop an import that would point a track at an empty slot.
+
+        Filler slots have always been coloured red here, but colouring a
+        warning and importing anyway is how a song ends up playing identical
+        beeps instead of its instruments. Offer to move every such track to the
+        nearest real instrument; let the user override if they mean it.
+        """
+        vg_instruments = self._get_selected_vg_instruments()
+        if not vg_instruments:
+            return True
+
+        empties = []
+        for gm_num, combo in self._mapping_combos:
+            data = combo.currentData()
+            slot = int(data) if data is not None else combo.currentIndex()
+            if (0 <= slot < len(vg_instruments)
+                    and is_filler_instrument(vg_instruments[slot])):
+                empties.append((gm_num, combo, slot))
+        if not empties:
+            return True
+
+        rows = "\n".join(
+            f"    Program {gm}  →  slot {slot} (empty)"
+            for gm, _c, slot in empties)
+        can_fix = any(
+            nearest_real_slot(vg_instruments, slot) is not None
+            for _gm, _c, slot in empties)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Empty instrument slots")
+        box.setText(
+            f"{len(empties)} track(s) point at an empty slot in "
+            f"{self._vg_combo.currentText()}:\n\n{rows}\n\n"
+            f"Those slots hold the placeholder square that voicegroups use to "
+            f"pad unused entries, not an instrument. The song will build, but "
+            f"each of these tracks will play the same featureless beep.")
+        if can_fix:
+            fix_btn = box.addButton("Use nearest real instrument",
+                                    QMessageBox.ButtonRole.AcceptRole)
+        else:
+            fix_btn = None
+            box.setInformativeText(
+                "This voicegroup has no real instrument to move them to — "
+                "pick a different voicegroup, or use Generate GM Voicegroup.")
+        back_btn = box.addButton("Go back", QMessageBox.ButtonRole.RejectRole)
+        anyway_btn = box.addButton("Import anyway",
+                                   QMessageBox.ButtonRole.DestructiveRole)
+        box.setDefaultButton(fix_btn or back_btn)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is anyway_btn:
+            return True
+        if fix_btn is not None and clicked is fix_btn:
+            for _gm, combo, slot in empties:
+                better = nearest_real_slot(vg_instruments, slot)
+                if better is not None and better != slot:
+                    combo.setCurrentIndex(better)
+            return True
+        return False
 
     def _go_back(self):
         current = self._stack.currentIndex()

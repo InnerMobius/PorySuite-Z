@@ -55,10 +55,40 @@ class TestRealProject:
         mons = mod.list_mon_sprites(_PROJECT)
         assert len(mons) >= 100, f"only {len(mons)} species folders"
 
-    def test_known_species_resolves(self):
-        mons = dict(mod.list_mon_sprites(_PROJECT))
-        assert "charizard" in mons
-        d = mons["charizard"]
-        assert os.path.isfile(mod.mon_sprite_path(d, "front"))
-        pal = mod.mon_palette(_PROJECT, "charizard", d)
-        assert len(pal) == 16
+    def test_every_listed_species_resolves(self):
+        """Every species the PROJECT defines must resolve to a front sprite.
+
+        This used to name one species (``charizard``) and assert it was in the
+        list. That only holds for a stock FireRed — the project this runs
+        against is free to replace the whole roster, and does. Naming a vanilla
+        species here breaks the standing rule in CLAUDE.md: parse everything
+        from the project's own source, never assume vanilla defaults.
+
+        Checking all of them is also a stronger test than checking one.
+        """
+        mons = mod.list_mon_sprites(_PROJECT)
+        assert mons, "no species sprite folders found"
+        missing = [slug for slug, d in mons
+                   if not os.path.isfile(mod.mon_sprite_path(d, "front"))]
+        assert not missing, f"front sprite unresolvable for: {missing[:10]}"
+
+    def test_palettes_resolve_where_a_palette_file_exists(self):
+        """A species with a ``normal.gbapal`` must resolve to 16 colours.
+
+        Species without that file are skipped on purpose: ``mon_palette``
+        documents ``[]`` as the total-miss result, so demanding 16 everywhere
+        would fail on a legitimately palette-less folder.
+        """
+        mons = mod.list_mon_sprites(_PROJECT)
+        assert mons, "no species sprite folders found"
+        checked = 0
+        wrong = []
+        for slug, d in mons:
+            if not os.path.isfile(os.path.join(d, "normal.gbapal")):
+                continue
+            checked += 1
+            pal = mod.mon_palette(_PROJECT, slug, d)
+            if len(pal) != 16:
+                wrong.append((slug, len(pal)))
+        assert checked, "no species had a normal.gbapal to check"
+        assert not wrong, f"palette not 16 colours for: {wrong[:10]}"

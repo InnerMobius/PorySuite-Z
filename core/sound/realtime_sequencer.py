@@ -39,9 +39,12 @@ import numpy as np
 
 from core.sound.audio_engine import (
     OUTPUT_SAMPLE_RATE,
+    ReverbState,
     render_instrument,
+    apply_engine_output_stage,
     apply_pan,
 )
+from core.sound.track_renderer import instrument_release_samples
 from core.sound.voicegroup_parser import Voicegroup, VoicegroupData
 from core.sound.sample_loader import SampleData
 
@@ -159,6 +162,13 @@ class RealtimeSequencer:
         self._loop_wrap_count: int = 0  # debug
         self._dbg_next_tick_log: float = 100.0  # debug: log tick every 100 ticks
 
+        # Output stage. Live playback used to go straight out as a float mix
+        # with no reverb at all, while every song in a project runs reverb 50
+        # and the console outputs 8-bit at 13379 Hz -- so the piano roll was
+        # both drier and cleaner than the same song in the ROM.
+        self._reverb_level = 0
+        self._reverb: Optional[ReverbState] = None
+
         # Background render thread
         self._render_queue: deque[_RenderRequest] = deque()
         self._render_thread: Optional[threading.Thread] = None
@@ -202,6 +212,19 @@ class RealtimeSequencer:
             ticks_per_frame = bpm * self._tbs / 150.0
             ticks_per_second = ticks_per_frame * 59.7275
             self._samples_per_tick = OUTPUT_SAMPLE_RATE / ticks_per_second
+
+    def set_reverb(self, level: int):
+        """Set the song's reverb level (0-127, 0 = off).
+
+        Pass the value from the song header so live playback matches the ROM.
+        A stock project writes ``reverb_set+50`` into every song, so leaving
+        this at 0 is what made the piano roll sound dry next to the game.
+        """
+        level = max(0, min(127, int(level or 0)))
+        with self._lock:
+            self._reverb_level = level
+            self._reverb = (ReverbState(level, OUTPUT_SAMPLE_RATE)
+                            if level > 0 else None)
 
     def set_loop(self, start: Optional[int], end: Optional[int]):
         """Set loop region. None = no loop."""
@@ -282,6 +305,9 @@ class RealtimeSequencer:
             self._render_queue.clear()
             self._playing = True
             self._loop_wrap_count = 0
+            # A fresh run must not inherit the last one's reverb tail.
+            if self._reverb is not None:
+                self._reverb.reset()
             _dbg(f"play: start_tick={start_tick} loop_start={self._loop_start} "
                  f"loop_end={self._loop_end} notes={len(self._notes)}")
 
@@ -569,6 +595,13 @@ class RealtimeSequencer:
                      f"voices={len(self._active_voices)} "
                      f"loop={self._loop_start}-{self._loop_end}")
                 self._dbg_next_tick_log = self._tick_accumulator + 200
+
+            # Mix bus, in the order the console applies it: reverb first
+            # (it seeds the buffer the voices were summed into), then the
+            # 13379 Hz / 8-bit output stage. Both are no-ops when off.
+            if self._reverb is not None:
+                outdata[:] = self._reverb.process(outdata)
+            outdata[:] = apply_engine_output_stage(outdata)
         except Exception as e:
             _dbg(f"CALLBACK ERROR: {e}")
 
@@ -590,7 +623,18 @@ class RealtimeSequencer:
         # very long periods (e.g. a sustained bass at 50 BPM).
         duration_samples = max(1, int(duration_ticks * self._samples_per_tick))
         duration_samples = min(duration_samples, OUTPUT_SAMPLE_RATE * 60)
-        release_samples = min(2048, duration_samples)
+
+        # Give the note as much release as the engine's envelope actually
+        # takes, instead of a flat 2048 samples (62.5 ms) that cut every real
+        # tail off mid-fade — and clicked, because the fade never reached zero.
+        inst = None
+        try:
+            if self._vg is not None:
+                inst = self._vg.get_instrument(voice_slot)
+        except Exception:
+            inst = None
+        release_samples = instrument_release_samples(inst, duration_samples) \
+            if inst is not None else min(2048, duration_samples)
 
         pan = ts.pan if ts else 64
 

@@ -23,8 +23,11 @@ import numpy as np
 from core.sound.audio_engine import (
     OUTPUT_SAMPLE_RATE,
     render_instrument,
-    apply_reverb,
+    apply_engine_output_stage,
+    apply_reverb_stereo,
     apply_pan,
+    cgb_release_samples,
+    pcm_release_samples,
 )
 from core.sound.song_parser import SongData, Track, TrackCommand, get_song_tempo
 from core.sound.voicegroup_parser import Voicegroup, VoicegroupData
@@ -704,12 +707,15 @@ def render_song(
     if stereo_mix is None:
         return np.zeros((OUTPUT_SAMPLE_RATE, 2), dtype=np.float32)
 
-    # Apply reverb
+    # Apply reverb. Both channels go through together: the engine's reverb
+    # sums left and right into one value and writes it to both, so running the
+    # channels separately loses the stereo collapse that gives it its sound.
     if song.reverb > 0:
-        left = apply_reverb(stereo_mix[:, 0], song.reverb)
-        right = apply_reverb(stereo_mix[:, 1], song.reverb)
-        stereo_mix[:, 0] = left
-        stereo_mix[:, 1] = right
+        stereo_mix = apply_reverb_stereo(stereo_mix, song.reverb)
+
+    # Then the console's output stage — 13379 Hz, 8-bit, master volume 12/15.
+    # Without this a render is cleaner and brighter than the ROM can be.
+    stereo_mix = apply_engine_output_stage(stereo_mix)
 
     # Normalize
     peak = np.max(np.abs(stereo_mix))
@@ -744,7 +750,7 @@ def render_instrument_preview(
     Returns stereo float32 array.
     """
     duration_samples = int(OUTPUT_SAMPLE_RATE * duration_ms / 1000)
-    release_samples = min(2048, duration_samples // 2)
+    release_samples = instrument_release_samples(instrument, duration_samples)
 
     mono = render_instrument(
         instrument, midi_note, velocity,
@@ -752,5 +758,47 @@ def render_instrument_preview(
         release_samples=release_samples,
     )
 
+    # Centre is correct here, and not for want of trying to use the voice's own
+    # pan field. ply_note (src/m4a_1.s, _081DDB80) only copies a voice's pan
+    # byte into the channel when the voice carries TONEDATA_TYPE_RHY — i.e. for
+    # a drum reached through voice_keysplit_all. For any ordinary voice played
+    # directly, rhythmPan stays 0 and the TRACK's pan is what moves the sound,
+    # so a single-slot audition pans dead centre on hardware too. (When pan
+    # does apply, the byte is centred on 64 and doubled:
+    # rhythmPan = (pan_byte - 0xC0) << 1.)
     stereo = apply_pan(mono, 64)
-    return stereo
+    return apply_engine_output_stage(stereo)
+
+
+def instrument_release_samples(instrument, note_on_samples: int,
+                               sample_rate: int = OUTPUT_SAMPLE_RATE) -> int:
+    """How long ``instrument``'s release tail runs, in samples.
+
+    Picks the right envelope for the channel type — PCM voices use the
+    multiplicative release from src/m4a_1.s, CGB voices walk a 4-bit level
+    down on a 1/64 s clock — and caps the result so a pathological value
+    cannot allocate an unbounded buffer.
+    """
+    if instrument is None:
+        return 0
+    if getattr(instrument, 'is_keysplit', False):
+        # A keysplit slot has no envelope of its own — the note routes into
+        # another voicegroup and the instrument that actually sounds is only
+        # known once the key is resolved. Give it a second of room; the
+        # envelope zeroes the rest, so the extra is silence, not a wrong tail.
+        return int(sample_rate)
+    attack = getattr(instrument, 'attack', 0) or 0
+    decay = getattr(instrument, 'decay', 0) or 0
+    sustain = getattr(instrument, 'sustain', 0) or 0
+    release = getattr(instrument, 'release', 0) or 0
+    try:
+        if getattr(instrument, 'is_directsound', False):
+            tail = pcm_release_samples(attack, decay, sustain, release,
+                                       note_on_samples, sample_rate)
+        else:
+            tail = cgb_release_samples(release, sustain, sample_rate)
+    except Exception:
+        tail = int(sample_rate * 0.25)
+    # Five seconds is longer than any real GBA tail; keep a bound so a bad
+    # voicegroup value cannot make a preview allocate forever.
+    return max(1, min(tail, int(sample_rate * 5)))
