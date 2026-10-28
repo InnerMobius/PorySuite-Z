@@ -74,6 +74,47 @@ class ConstantPicker(QComboBox):
         completer.setMaxVisibleItems(20)
         self.setCompleter(completer)
 
+        # Live feedback as the user types — see invalid_reason() below.
+        self.currentTextChanged.connect(lambda _t: self._refresh_validity())
+
+    # ── Typed-in text that does not match anything ────────────────────────
+    #
+    # These boxes stay typeable on purpose: typing is faster than hunting a
+    # dropdown, and a project may legitimately name a constant this editor has
+    # not parsed. But a typo, or a name from the wrong family, used to pass
+    # through in silence and surface much later as a build error or as a
+    # command that simply did nothing.
+    #
+    # So an unrecognised entry turns the box red and says why, and does NOT
+    # block saving. Blocking would mean being certain, and this cannot be: an
+    # empty constant list means parsing failed, not that everything is wrong.
+    _INVALID_SS = ('QComboBox { border: 1px solid #e74c3c; '
+                   'border-radius: 3px; }')
+
+    def invalid_reason(self) -> str | None:
+        """Why the typed text looks wrong, or None if it is fine."""
+        text = self.currentText().strip()
+        if not text or not self._raw_constants:
+            return None
+        if text in self._display_to_raw or text in self._raw_constants:
+            return None
+        if self._prefix and not text.upper().startswith(self._prefix.upper()):
+            return (f'"{text}" is not a {self._prefix}… name. '
+                    f'Names for this field start with {self._prefix}')
+        return (f'"{text}" is not one of this project’s {self._prefix}'
+                f'… names. Check the spelling, or pick from the list.')
+
+    def _refresh_validity(self) -> None:
+        """Outline the box when the text matches nothing.
+
+        Only the outline is touched here; the explanation is shown by whatever
+        hosts the picker, because a reason the user has to hover to find is
+        barely better than no reason at all. The tooltip is left alone so a
+        field's own help text survives.
+        """
+        self.setStyleSheet(
+            self._INVALID_SS if self.invalid_reason() else '')
+
     def selected_constant(self) -> str:
         """Return the raw constant name (e.g. ``ITEM_POKE_BALL``)."""
         text = self.currentText()

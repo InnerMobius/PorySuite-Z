@@ -27,7 +27,7 @@ from pathlib import Path
 from collections import OrderedDict
 
 from PyQt6.QtCore import QEvent, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QIcon, QPixmap, QColor
+from PyQt6.QtGui import QIcon, QPixmap, QColor, QKeySequence, QAction
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QScrollArea,
     QTreeWidget, QTreeWidgetItem, QComboBox, QPushButton,
@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
 )
 
 from eventide.backend.constants_manager import ConstantsManager
+from eventide.backend import var_flag_manager
 from eventide.ui.widgets import (ConstantPicker, MapPicker, SpritePreview,
                                  ValuePicker)
 from ui.custom_widgets.scroll_guard import install_scroll_guard_recursive
@@ -176,6 +177,9 @@ _OBJECT_LOCAL_IDS: list[str] = []  # Local IDs from current map's object_events
 # Same objects, paired with a label saying who each one is, so the command
 # dialogs can offer "Joe — Man" instead of a bare "LOCALID_PEWTER_JOE".
 _OBJECT_CHOICES: list[tuple[str, str]] = []
+_PROJECT_ROOT: str = ''            # Game tree root — read for the project's own
+                                   # macro definitions, so a command cannot be
+                                   # saved with a required parameter empty.
 _MOVEMENT_LABELS: list[str] = []   # Movement labels from the current script file
 _ALL_SCRIPTS: dict[str, list] = {} # label → [cmd_tuples] for movement step lookup
 _CURRENT_PAGES: list[dict] = []    # Current object's pages — for setflag→page linking
@@ -708,7 +712,7 @@ _FRIENDLY_NAMES: dict[str, str] = {
     'healplayerteam': 'Heal Player Team',
     'getplayerxy': 'Get Player Position', 'random': 'Random Number',
     'setobjectxyperm': 'Set NPC Position (Permanent)',
-    'savebgm': 'Save Current Music', 'fadedefaultbgm': 'Restore Saved Music',
+    'savebgm': 'Override Map Music', 'fadedefaultbgm': 'Back to Map Music',
     'buffernumberstring': 'Buffer Number', 'bufferstring': 'Buffer String',
     'wildbattle': 'Wild Battle',
     'givemon': 'Give Pokémon', 'giveegg': 'Give Egg',
@@ -864,7 +868,7 @@ _COMMAND_HELP: dict[str, str] = {
     'playbgm': 'Changes the background music.',
     'fadeoutbgm': 'Fades the background music out to silence.',
     'fadeinbgm': 'Fades the background music back in.',
-    'savebgm': 'Remembers the music that is playing so it can be brought back later.',
+    'savebgm': 'Makes this song play instead of the map’s own music, here and on every map after, until it is cleared. Needs a song; save MUS_DUMMY to clear it.',
     'fadedefaultbgm': 'Fades back to the music the map normally plays.',
     'playmoncry': 'Plays a creature’s cry.',
 
@@ -1517,6 +1521,19 @@ class _CommandEditDialog(QDialog):
             install_scroll_guard_recursive(self._widget)
             layout.addWidget(self._widget)
 
+        # Live explanation for any box whose typed text matches nothing. The
+        # box outlines itself red (ConstantPicker._refresh_validity); the reason
+        # belongs here, where it can be read without hovering.
+        self._typo_lbl = QLabel('')
+        self._typo_lbl.setStyleSheet('color:#e74c3c;font-size:11px;')
+        self._typo_lbl.setWordWrap(True)
+        self._typo_lbl.hide()
+        layout.addWidget(self._typo_lbl)
+        for picker in self._widget.findChildren(ConstantPicker):
+            picker.currentTextChanged.connect(
+                lambda _t: self._refresh_typo_note())
+        self._refresh_typo_note()
+
         # Button row
         btn_layout = QHBoxLayout()
 
@@ -1539,6 +1556,54 @@ class _CommandEditDialog(QDialog):
         btn_layout.addWidget(buttons)
 
         layout.addLayout(btn_layout)
+
+    def _refresh_typo_note(self):
+        """Say what the red box means, for every box that has gone red.
+
+        Deliberately a note and not a block: a project can name constants this
+        editor has not parsed, so "I don't recognise this" is not the same as
+        "this is wrong". Only a genuinely missing required value stops OK.
+        """
+        if not hasattr(self, '_typo_lbl'):
+            return
+        reasons = []
+        for picker in self._widget.findChildren(ConstantPicker):
+            reason = picker.invalid_reason()
+            if reason and reason not in reasons:
+                reasons.append(reason)
+        self._typo_lbl.setText('⚠ ' + '\n⚠ '.join(reasons))
+        self._typo_lbl.setVisible(bool(reasons))
+
+    def accept(self):
+        """Refuse to close while the command could not be assembled.
+
+        The editor must not be able to write a script the build will reject;
+        a required parameter left empty is caught here, at the dialog the user
+        is looking at, rather than surfacing as an assembler error long after.
+        """
+        problem = None
+        try:
+            problem = self._widget.validation_error()
+        except Exception:
+            problem = None
+        if not problem:
+            # Nothing bespoke to say, so check the command against the macro the
+            # project actually declares for it. This catches the whole class at
+            # once: an audit found 84 of the 127 commands the editor offers
+            # could be saved with a required parameter left empty.
+            try:
+                from eventide.backend.macro_params import (
+                    missing_required, describe_missing)
+                tup = self._widget.to_tuple()
+                missing = missing_required(_PROJECT_ROOT, tup[0], tup[1:])
+                if missing:
+                    problem = describe_missing(tup[0], missing)
+            except Exception:
+                problem = None
+        if problem:
+            QMessageBox.warning(self, 'Not finished yet', problem)
+            return
+        super().accept()
 
     def _on_goto(self):
         """Handle Go To button — save the target label and close."""
@@ -1571,6 +1636,23 @@ class _CommandWidget(QWidget):
 
     def friendly_name(self) -> str:
         return 'Command'
+
+    def validation_error(self) -> str | None:
+        """A plain-English reason this command cannot be written yet, or None.
+
+        Some script macros declare a parameter as required (`song:req`,
+        for instance), and a command missing one does not fail in the editor
+        or in game — it fails the BUILD, hours later, as an assembler error
+        naming a macro and a line number:
+
+            scripts.inc:69: Missing value for required parameter `song`
+                            of macro `savebgm'
+
+        Nothing connects that back to the dialog it came from. A widget whose
+        fields can be left empty should say so here instead, and the dialog
+        refuses to close until it is filled in. Returning None means fine.
+        """
+        return None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3468,13 +3550,31 @@ class _MoveRouteDialog(QDialog):
     Right side: categorized button grid to add steps.
     """
 
-    def __init__(self, steps: list[tuple], parent=None):
+    def __init__(self, steps: list[tuple], parent=None, shared_with=None):
         super().__init__(parent)
         self.setWindowTitle('Edit Move Route')
         self.setMinimumSize(750, 500)
         self.resize(850, 550)
 
         root = QVBoxLayout(self)
+
+        # Say it HERE, where the steps are actually edited. A note on the
+        # command behind this dialog, and a question asked before it opened,
+        # are both out of sight by the time somebody is changing steps — and
+        # this is the window where the damage happens.
+        if shared_with and len(shared_with) > 1:
+            banner = QLabel(
+                f'⚠  These steps are shared with '
+                f'{len(shared_with) - 1} other scene'
+                f'{"s" if len(shared_with) > 2 else ""} '
+                f'({", ".join(shared_with[:3])}'
+                f'{"…" if len(shared_with) > 3 else ""}). '
+                f'Anything you change here changes them too.')
+            banner.setWordWrap(True)
+            banner.setStyleSheet(
+                'color:#1b1b1b; background:#ffb74d; border-radius:4px;'
+                ' padding:6px 8px; font-weight:bold;')
+            root.addWidget(banner)
 
         # Main area: step list (left) + button grid (right)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -3488,7 +3588,37 @@ class _MoveRouteDialog(QDialog):
 
         self._step_list = QListWidget()
         self._step_list.setAlternatingRowColors(True)
+        # Pick several steps the way every other list works — click, shift to
+        # extend, ctrl to add one. A move route is mostly repeated steps, so
+        # selecting one at a time is the slowest possible way to edit one.
+        self._step_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._step_list.setDragDropMode(
+            QAbstractItemView.DragDropMode.InternalMove)
+        self._step_list.setToolTip(_tt(
+            'Click to select, Shift+click for a run, Ctrl+click to add one.\n'
+            'Ctrl+C / Ctrl+X / Ctrl+V to copy, cut and paste steps, '
+            'Ctrl+Z / Ctrl+Y to undo and redo, Delete to remove.\n'
+            'Steps can also be dragged into a new order.'))
         left_layout.addWidget(self._step_list, 1)
+
+        self._clipboard: list[tuple[str, str]] = []
+        self._undo: list[list[tuple[str, str]]] = []
+        self._redo: list[list[tuple[str, str]]] = []
+        for seq, slot in (
+            (QKeySequence.StandardKey.Copy, self._on_copy),
+            (QKeySequence.StandardKey.Cut, self._on_cut),
+            (QKeySequence.StandardKey.Paste, self._on_paste_steps),
+            (QKeySequence.StandardKey.Undo, self._on_undo),
+            (QKeySequence.StandardKey.Redo, self._on_redo),
+            (QKeySequence.StandardKey.Delete, self._on_delete),
+            (QKeySequence.StandardKey.SelectAll, self._step_list.selectAll),
+        ):
+            act = QAction(self)
+            act.setShortcut(seq)
+            act.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            act.triggered.connect(slot)
+            self.addAction(act)
 
         # Control buttons
         ctrl_row = QHBoxLayout()
@@ -3569,26 +3699,120 @@ class _MoveRouteDialog(QDialog):
         self._step_list.addItem(item)
         self._step_list.setCurrentItem(item)
 
-    def _on_delete(self):
+    # ── Selection, clipboard and undo ────────────────────────────────────
+    #
+    # The list is the only place a move route is actually written, and it had
+    # none of the things every other list has: one selection at a time, no
+    # copy, no paste, no undo. A route is mostly runs of repeated steps, so
+    # that made the common edit — "six more of those" — the slowest one.
+
+    def _rows(self) -> list[int]:
+        """Selected rows, top to bottom; the current row if none selected."""
+        rows = sorted(self._step_list.row(i)
+                      for i in self._step_list.selectedItems())
+        if rows:
+            return rows
         row = self._step_list.currentRow()
-        if row >= 0:
+        return [row] if row >= 0 else []
+
+    def _state(self) -> list[tuple[str, str]]:
+        return [(self._step_list.item(i).text(),
+                 self._step_list.item(i).data(Qt.ItemDataRole.UserRole))
+                for i in range(self._step_list.count())]
+
+    def _set_state(self, state) -> None:
+        self._step_list.clear()
+        for text, macro in state:
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, macro)
+            self._step_list.addItem(item)
+
+    def _push_undo(self) -> None:
+        self._undo.append(self._state())
+        del self._undo[:-100]
+        self._redo.clear()
+
+    def _on_undo(self):
+        if not self._undo:
+            return
+        self._redo.append(self._state())
+        self._set_state(self._undo.pop())
+
+    def _on_redo(self):
+        if not self._redo:
+            return
+        self._undo.append(self._state())
+        self._set_state(self._redo.pop())
+
+    def _on_copy(self):
+        rows = self._rows()
+        if rows:
+            self._clipboard = [
+                (self._step_list.item(r).text(),
+                 self._step_list.item(r).data(Qt.ItemDataRole.UserRole))
+                for r in rows]
+
+    def _on_cut(self):
+        self._on_copy()
+        self._on_delete()
+
+    def _on_paste_steps(self):
+        if not self._clipboard:
+            return
+        self._push_undo()
+        rows = self._rows()
+        at = (rows[-1] + 1) if rows else self._step_list.count()
+        for offset, (text, macro) in enumerate(self._clipboard):
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, macro)
+            self._step_list.insertItem(at + offset, item)
+        # setCurrentRow clears the selection in extended mode, so it goes
+        # first and the rows are re-selected after it.
+        self._step_list.setCurrentRow(at + len(self._clipboard) - 1)
+        self._step_list.clearSelection()
+        for offset in range(len(self._clipboard)):
+            self._step_list.item(at + offset).setSelected(True)
+
+    def _on_delete(self):
+        rows = self._rows()
+        if not rows:
+            return
+        self._push_undo()
+        for row in reversed(rows):           # bottom-up, so indices hold
             self._step_list.takeItem(row)
+        if self._step_list.count():
+            self._step_list.setCurrentRow(min(rows[0],
+                                              self._step_list.count() - 1))
 
     def _on_move_up(self):
-        row = self._step_list.currentRow()
-        if row > 0:
+        rows = self._rows()
+        if not rows or rows[0] == 0:
+            return
+        self._push_undo()
+        for row in rows:                      # top-down keeps the order
             item = self._step_list.takeItem(row)
             self._step_list.insertItem(row - 1, item)
-            self._step_list.setCurrentRow(row - 1)
+        self._step_list.setCurrentRow(rows[0] - 1)
+        self._step_list.clearSelection()
+        for row in rows:
+            self._step_list.item(row - 1).setSelected(True)
 
     def _on_move_down(self):
-        row = self._step_list.currentRow()
-        if row < self._step_list.count() - 1:
+        rows = self._rows()
+        if not rows or rows[-1] >= self._step_list.count() - 1:
+            return
+        self._push_undo()
+        for row in reversed(rows):            # bottom-up keeps the order
             item = self._step_list.takeItem(row)
             self._step_list.insertItem(row + 1, item)
-            self._step_list.setCurrentRow(row + 1)
+        self._step_list.setCurrentRow(rows[-1] + 1)
+        self._step_list.clearSelection()
+        for row in rows:
+            self._step_list.item(row + 1).setSelected(True)
 
     def _on_clear(self):
+        if self._step_list.count():
+            self._push_undo()
         self._step_list.clear()
 
     def get_steps(self) -> list[tuple]:
@@ -3603,12 +3827,106 @@ class _MoveRouteDialog(QDialog):
         return result
 
     @staticmethod
-    def edit_steps(steps: list[tuple], parent=None) -> list[tuple] | None:
+    def edit_steps(steps: list[tuple], parent=None,
+                   shared_with=None) -> list[tuple] | None:
         """Show the dialog and return the new steps, or None if cancelled."""
-        dlg = _MoveRouteDialog(steps, parent)
+        dlg = _MoveRouteDialog(steps, parent, shared_with=shared_with)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             return dlg.get_steps()
         return None
+
+
+def _setvar_value_in(commands, var: str):
+    """What these commands set `var` to, or None. First one wins."""
+    if not var:
+        return None
+    want = var.strip().upper()
+    for cmd in commands or []:
+        if not cmd or str(cmd[0]) != 'setvar' or len(cmd) < 2:
+            continue
+        parts = [p.strip() for p in str(cmd[1]).split(',')]
+        if parts and parts[0].upper() == want:
+            return parts[1] if len(parts) > 1 else ''
+    return None
+
+
+def trigger_condition_problem(var: str, value: str, commands):
+    """What is wrong with a trigger's firing condition, as (severity, text).
+
+    Returns None when it is arranged correctly. The ONE place this is decided,
+    so the warning under a trigger's condition and the map-wide Problems list
+    can never tell the user different things about the same trigger.
+
+    Severity is 'error' when the trigger cannot fire at all, and 'warning'
+    when it fires but never stops.
+    """
+    var = (var or '').strip()
+    value = str(value or '').strip()
+    if not var:
+        return None
+    sets_to = _setvar_value_in(commands, var)
+
+    if var.upper().startswith('VAR_TEMP'):
+        return ('warning',
+                f'Fires on every visit: {var} is a temp variable, and those '
+                f'reset every time the map loads. Pick a lasting variable and '
+                f'set it at the end of the scene.')
+    if sets_to is not None and sets_to == value:
+        extra = ('' if value in ('0', '') else
+                 ' Variables start at 0, so as written this can never fire at '
+                 'all.')
+        severity = 'warning' if value in ('0', '') else 'error'
+        return (severity,
+                f'This script sets {var} to {value}, which is the value the '
+                f'trigger fires on — so it never switches itself off.'
+                f'{extra} Fire on the STARTING value (0) and let the script '
+                f'set it to something else.')
+    if sets_to is None and value not in ('0', ''):
+        return ('error',
+                f'Never fires: nothing here sets {var}, and variables start '
+                f'at 0, so it will not fire until something else sets it to '
+                f'{value}.')
+    if sets_to is None:
+        return ('warning',
+                f'Fires every time: nothing here sets {var}, so the scene '
+                f'replays whenever the player steps on the tile. Set it at '
+                f'the end of the scene to stop that.')
+    return None
+
+
+def _movement_users(label: str) -> list[str]:
+    """Which scripts contain an Apply Movement naming this movement.
+
+    A movement is a NAMED, SHARED list of steps in the script file, but the
+    editor presents it as "the steps this command does", which is how two
+    commands end up quietly editing one list.
+    """
+    if not label:
+        return []
+    want = label.strip()
+    users: list[str] = []
+    for script_label, cmds in (_ALL_SCRIPTS or {}).items():
+        for cmd in cmds or []:
+            if (cmd and str(cmd[0]) == 'applymovement'
+                    and any(str(a).strip() == want for a in cmd[1:])):
+                users.append(script_label)
+                break
+    return users
+
+
+def _fresh_movement_label(like: str) -> str:
+    """A movement name not yet taken, numbered alongside `like`.
+
+    `Faron_Movement_4` -> `Faron_Movement_6` (the next free number), so a copy
+    sits with its siblings instead of being called something unrelated.
+    """
+    m = re.match(r'^(?P<base>.*_Movement_)(?P<n>\d+)$', (like or '').strip())
+    base = m.group('base') if m else ((like or 'Movement') + '_Copy')
+    taken = set(_ALL_SCRIPTS or {}) | set(_MOVEMENT_LABELS or [])
+    n = 1
+    while f'{base}{n}' in taken:
+        n += 1
+    return f'{base}{n}'
 
 
 class _ApplyMovementWidget(_CommandWidget):
@@ -3646,6 +3964,15 @@ class _ApplyMovementWidget(_CommandWidget):
                 self.move_combo.setEditText(movement)
         layout.addWidget(self.move_combo, 1)
 
+        # Visible warning that these steps are not this command's alone.
+        self._shared_lbl = QLabel('')
+        self._shared_lbl.setStyleSheet('color:#ffb74d;font-size:10px;')
+        # The tooltip is set in _update_shared_note, ONLY when the label has
+        # something to say. Setting it here looked harmless and was not: an
+        # empty label still has a hover area, so hovering a command whose
+        # movement is NOT shared produced a tooltip claiming it was.
+        layout.addWidget(self._shared_lbl)
+
         # Edit Steps button — opens the Move Route dialog
         self._edit_btn = QPushButton('Edit Steps...')
         self._edit_btn.setToolTip(_tt('Open the Move Route editor'))
@@ -3655,15 +3982,77 @@ class _ApplyMovementWidget(_CommandWidget):
         # Track modified steps (None = not modified, use original)
         self._modified_steps: list[tuple] | None = None
         self._movement_label = movement
+        self.move_combo.currentTextChanged.connect(
+            lambda _t: self._update_shared_note())
+        self._update_shared_note()
 
     def _on_edit_steps(self):
-        """Open the Move Route dialog with the current movement steps."""
+        """Open the Move Route dialog, after settling who owns these steps.
+
+        A movement is a named list shared by every command that points at it.
+        Copying an event copies the NAME, so the copy and the original walk the
+        same steps, and editing either rewrites both — with nothing on screen to
+        say so. That is what happened duplicating Faron's intro trigger: the new
+        one looked independent and silently shared Faron_Movement_3/4/5.
+
+        So when more than one command uses this movement, ask first, and offer
+        to split off a private copy rather than leaving "edit them all" as the
+        only possibility.
+        """
         label = self.move_combo.currentText().strip()
+        users = _movement_users(label)
+        if len(users) > 1:
+            others = ', '.join(users[:4]) + ('…' if len(users) > 4 else '')
+            box = QMessageBox(self)
+            box.setWindowTitle('Shared movement')
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setText(f'"{label}" is used by {len(users)} commands.')
+            box.setInformativeText(
+                f'Changing the steps changes it everywhere it is used:\n\n'
+                f'{others}\n\n'
+                f'Give this one its own copy instead?')
+            own = box.addButton('Make a copy for this one',
+                                QMessageBox.ButtonRole.AcceptRole)
+            box.addButton('Change all of them',
+                          QMessageBox.ButtonRole.DestructiveRole)
+            cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(own)
+            box.exec()
+            if box.clickedButton() is cancel:
+                return
+            if box.clickedButton() is own:
+                new_label = _fresh_movement_label(label)
+                # The steps start as a copy of what was being shared, so the
+                # scene looks unchanged until the user edits it.
+                _ALL_SCRIPTS[new_label] = list(_ALL_SCRIPTS.get(label, []))
+                if new_label not in _MOVEMENT_LABELS:
+                    _MOVEMENT_LABELS.append(new_label)
+                self.move_combo.addItem(new_label)
+                self.move_combo.setCurrentText(new_label)
+                label = new_label
+
         steps = list(_ALL_SCRIPTS.get(label, []))
-        result = _MoveRouteDialog.edit_steps(steps, self)
+        # Carry the sharing INTO the dialog as well. The question above is
+        # asked before it opens and the note is on the command behind it, so
+        # by the time someone is actually changing steps neither is in view.
+        result = _MoveRouteDialog.edit_steps(
+            steps, self, shared_with=_movement_users(label))
         if result is not None:
             self._modified_steps = result
             self._movement_label = label
+        self._update_shared_note()
+
+    def _update_shared_note(self):
+        """Say on the face of the command when its steps are shared."""
+        if not hasattr(self, '_shared_lbl'):
+            return
+        users = _movement_users(self.move_combo.currentText().strip())
+        shared = len(users) > 1
+        self._shared_lbl.setText(f'shared by {len(users)}' if shared else '')
+        self._shared_lbl.setToolTip(_tt(
+            'Other commands use this same movement. Editing the steps changes '
+            'it for all of them — "Edit Steps..." offers to make a copy '
+            'just for this one.') if shared else '')
 
     def get_modified_steps(self) -> tuple[str, list[tuple]] | None:
         """Return (movement_label, new_steps) if steps were modified."""
@@ -4074,8 +4463,25 @@ class _WaitFanfareWidget(_CommandWidget):
 
 
 class _PlayBGMWidget(_CommandWidget):
-    """Play Background Music — music picker + loop checkbox."""
-    def __init__(self, music='', loop=True, parent=None):
+    """Play Background Music — music picker + the macro's save_song flag.
+
+    That second parameter was presented as a "Loop" tick box, which it is not.
+    `ScrCmd_playbgm` reads it as `save`:
+
+        if (save == TRUE)
+            Overworld_SetSavedMusic(songId);
+        PlayNewMapMusic(songId);
+
+    and the saved song then overrides EVERY map's own music on each map load
+    (`overworld.c:1104`) until something clears it. Ticking a box labelled
+    "Loop" — a reasonable thing to want during a cutscene — therefore made the
+    cutscene's music follow the player around for the rest of the game, and
+    "Back to Map Music" does not undo it.
+
+    It also defaulted to ticked. The game's own scripts pass 0 forty-nine times
+    and 1 three times, so the default was backwards as well as mislabelled.
+    """
+    def __init__(self, music='', persist=False, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
@@ -4085,9 +4491,15 @@ class _PlayBGMWidget(_CommandWidget):
         if music:
             self.picker.set_constant(music)
         layout.addWidget(self.picker, 1)
-        self.loop_check = QCheckBox('Loop')
-        self.loop_check.setChecked(loop)
-        layout.addWidget(self.loop_check)
+        self.persist_check = QCheckBox('Keep playing on other maps')
+        self.persist_check.setToolTip(_tt(
+            'Normally OFF. Music loops by itself — this does not control that.\n'
+            'Ticked, this song replaces the music of every map the player goes '
+            'to from here, until something clears it, which is rarely what a '
+            'cutscene wants.\nTo go back to normal afterwards, leave this off '
+            'and finish with "Back to Map Music".'))
+        self.persist_check.setChecked(persist)
+        layout.addWidget(self.persist_check)
 
         btn_preview = QPushButton("▶")
         btn_preview.setFixedSize(28, 24)
@@ -4108,8 +4520,8 @@ class _PlayBGMWidget(_CommandWidget):
         layout.addWidget(btn_open)
 
     def to_tuple(self):
-        loop_val = 1 if self.loop_check.isChecked() else 0
-        return ('playbgm', self.picker.selected_constant(), loop_val)
+        save_song = 1 if self.persist_check.isChecked() else 0
+        return ('playbgm', self.picker.selected_constant(), save_song)
 
     def friendly_name(self):
         return 'Play Music'
@@ -5497,16 +5909,20 @@ class _HealPlayerTeamWidget(_CommandWidget):
 
 
 class _SaveBgmWidget(_CommandWidget):
-    """Save BGM — requires a song parameter."""
+    """savebgm — a persistent override of every map's music. Requires a song."""
     def __init__(self, song='', parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.addWidget(QLabel('Save Music:'))
+        layout.addWidget(QLabel('Override map music with:'))
         self.picker = ConstantPicker(ConstantsManager.MUSIC, prefix='MUS_')
         self.picker.setToolTip(_tt(
-            'Song to save — restores later with fadedefaultbgm.\n'
-            'The macro requires a song parameter.'))
+            'This song plays INSTEAD of the map’s own music, on this map '
+            'and every map after it, until something clears it (choose '
+            'MUS_DUMMY to clear).\n'
+            'It is not what "Back to Map Music" fades to — that reads the '
+            'map’s own setting and ignores this.\n'
+            'A song is required.'))
         if song:
             self.picker.set_constant(song)
         layout.addWidget(self.picker, 1)
@@ -5514,25 +5930,39 @@ class _SaveBgmWidget(_CommandWidget):
     def to_tuple(self):
         return ('savebgm', self.picker.selected_constant())
 
+    def validation_error(self):
+        # `savebgm song:req` — the assembler rejects the command outright with
+        # no song, so an empty picker has to be caught here.
+        if not self.picker.selected_constant().strip():
+            return ('Override Map Music needs a song.\n\n'
+                    'This command does not stash whatever is playing. It names '
+                    'a song that then plays instead of the map’s own music, '
+                    'on this map and every map after it, until something '
+                    'clears it — choosing MUS_DUMMY clears it.\n\n'
+                    'To go back to normal after a cutscene, you want '
+                    '"Back to Map Music" instead.')
+        return None
+
     def friendly_name(self):
-        return 'Save Current Music'
+        return 'Override Map Music'
 
 
 class _FadeDefaultBgmWidget(_CommandWidget):
-    """Restore saved BGM — no parameters."""
+    """Back to the map's own music — no parameters."""
     _header_only = True
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.addWidget(QLabel('Restore Saved Music (fade back to BGM saved by savebgm)'))
+        layout.addWidget(QLabel(
+            'Back to Map Music (fades to the music this map normally plays)'))
         layout.addStretch()
 
     def to_tuple(self):
         return ('fadedefaultbgm',)
 
     def friendly_name(self):
-        return 'Restore Saved Music'
+        return 'Back to Map Music'
 
 
 class _BufferNumberWidget(_CommandWidget):
@@ -6005,11 +6435,15 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
     if cmd == 'waitfanfare':
         return _WaitFanfareWidget()
     if cmd == 'playbgm':
+        # Default OFF when the flag is absent or unreadable — see _PlayBGMWidget
+        # for why "on" is both the rarer case and the damaging one to guess.
         if len(cmd_tuple) >= 3:
             return _PlayBGMWidget(str(cmd_tuple[1]),
-                                  bool(_safe_int(cmd_tuple[2], 1)))
+                                  bool(_safe_int(cmd_tuple[2], 0)))
         parts = _split_args(args)
-        return _PlayBGMWidget(parts[0], bool(_safe_int(parts[1], 1)) if len(parts) > 1 else True)
+        return _PlayBGMWidget(parts[0],
+                              bool(_safe_int(parts[1], 0)) if len(parts) > 1
+                              else False)
     if cmd == 'fadeoutbgm':
         return _FadeOutBGMWidget(_safe_int(args, 4))
     if cmd == 'fadeinbgm':
@@ -6351,8 +6785,8 @@ _PAGE_2_COMMANDS = [
         ('Play Music', 'playbgm'),
         ('Fade Out Music', 'fadeoutbgm'),
         ('Fade In Music', 'fadeinbgm'),
-        ('Save Current Music', 'savebgm'),
-        ('Restore Saved Music', 'fadedefaultbgm'),
+        ('Override Map Music', 'savebgm'),
+        ('Back to Map Music', 'fadedefaultbgm'),
     ]),
     ('Weather', [
         ('Set Weather', 'setweather'),
@@ -6626,8 +7060,8 @@ _CMD_TOOLTIPS: dict[str, str] = {
                          'Needs Tools > Install Sprite Swap Command once per project.',
     'getplayerxy': 'Store the player\'s X and Y position into two variables',
     'random': 'Generate a random number from 0 to (max-1)\nResult stored in VAR_RESULT',
-    'savebgm': 'Save the currently playing music so it can be restored later',
-    'fadedefaultbgm': 'Fade back to the previously saved background music',
+    'savebgm': 'Override every map’s music with a chosen song until cleared',
+    'fadedefaultbgm': 'Fade back to the music this map normally plays',
     'healplayerteam': 'Fully heal the player\'s entire party\n(HP, PP, status — like visiting a healing center)',
     'buffernumberstring': 'Store a number as text in a buffer\nUse {STR_VAR_1}, {STR_VAR_2}, or {STR_VAR_3} in messages',
     'bufferstring': 'Store a raw text string in a buffer\nUse {STR_VAR_1}, {STR_VAR_2}, or {STR_VAR_3} in messages',
@@ -7482,6 +7916,15 @@ class EventEditorTab(QWidget):
         btn_find_script = QPushButton('Find Script')
         btn_find_script.setToolTip(_tt('Search for script labels across all maps (Ctrl+Shift+F)'))
         btn_find_script.clicked.connect(self._on_find_script)
+        # None of the things this finds say anything in game — a trigger that
+        # never fires, a scene that replays, a command missing a value. Without
+        # one list, the only way to find them is to open every event and look.
+        self._btn_problems = QPushButton('Problems')
+        self._btn_problems.setToolTip(_tt(
+            'Check every event on this map for things that will not work:\n'
+            'a trigger that can never fire or never stops, a command missing\n'
+            'a value the build needs, steps shared with another scene.'))
+        self._btn_problems.clicked.connect(self._on_show_problems)
         self._btn_edit_raw = QPushButton('Edit Raw Code')
         self._btn_edit_raw.setToolTip(_tt(
             'Open this whole script as raw code in a pop-up.\n'
@@ -7498,6 +7941,7 @@ class EventEditorTab(QWidget):
         page_ctrl.addWidget(btn_find_flag)
         page_ctrl.addWidget(self._btn_vars)
         page_ctrl.addWidget(btn_find_script)
+        page_ctrl.addWidget(self._btn_problems)
         page_ctrl.addWidget(self._btn_edit_raw)
         page_ctrl.addWidget(self._divider_line())
         self._btn_open_porymap = QPushButton('Open in Porymap')
@@ -7790,6 +8234,69 @@ class EventEditorTab(QWidget):
         self.obj_id_resolved_lbl.setStyleSheet('color:#8a8a8a;font-size:10px;')
         self.obj_id_resolved_lbl.setWordWrap(True)
         pf.addRow('', self.obj_id_resolved_lbl)
+
+        # ── Trigger condition (coord_events only) ─────────────────────────
+        # A trigger fires when the player steps on its tile AND its variable
+        # equals its value. That pair decides whether the trigger ever runs
+        # again, so it is the most important thing about a trigger — and it had
+        # no editor at all. The variable was shown read-only in the "ID" box
+        # above, wearing that box's tooltip, which describes a NAME for an NPC
+        # and explicitly says "NOT a number"; the value was not shown anywhere.
+        #
+        # The common mistake this leaves you with is a trigger on VAR_TEMP_0.
+        # Temp variables reset on every map load, so the condition is always
+        # true and the trigger fires on every single step onto the tile —
+        # forever, re-running its script, and because a running script hides
+        # the HUD (script.c LockPlayerFieldControls) the HUD flashes each time.
+        self.trigger_row = QWidget()
+        trig_lay = QHBoxLayout(self.trigger_row)
+        trig_lay.setContentsMargins(0, 0, 0, 0)
+        self.trigger_var_picker = ConstantPicker(ConstantsManager.VARS,
+                                                 prefix='VAR_')
+        self.trigger_var_picker.setToolTip(_tt(
+            'The trigger only fires while this variable equals the value on '
+            'the right.\n\n'
+            'Avoid VAR_TEMP_*: temp variables reset every time the map loads, '
+            'so the trigger fires again on every visit — set a lasting '
+            'variable here and set it at the end of the scene so it stops.'))
+        trig_lay.addWidget(self.trigger_var_picker, 1)
+        trig_lay.addWidget(QLabel('equals'))
+        self.trigger_val_combo = _make_value_combo('0')
+        self.trigger_val_combo.setToolTip(_tt(
+            'The trigger fires only while the variable holds this value.'))
+        trig_lay.addWidget(self.trigger_val_combo)
+        pf.addRow('Fires while:', self.trigger_row)
+        self.trigger_row_label = pf.labelForField(self.trigger_row)
+
+        # ── Run once ──────────────────────────────────────────────────────
+        # Playing a scene once is the single most common thing anyone wants
+        # from a trigger, and doing it by hand needs four pieces of engine
+        # knowledge that are nowhere on screen: the variable has to be a
+        # lasting one (not VAR_TEMP_*), variables start at 0, the condition
+        # must therefore be 0 and NOT the value you end up setting, and the
+        # script has to set it to something else at the end. Three of those
+        # four went wrong in one afternoon of real use.
+        #
+        # So it is one tick box, and the editor writes all four.
+        self.run_once_check = QCheckBox('Run once, then never again')
+        self.run_once_check.setToolTip(_tt(
+            'Plays this scene the first time only.\n\n'
+            'Ticking it claims a lasting variable, sets the condition to its '
+            'starting value, and adds a "Set Variable" at the end of the '
+            'scene so the trigger switches itself off.\n'
+            'Unticking removes that last step, and the scene plays every '
+            'time the player steps on the tile.'))
+        self.run_once_check.toggled.connect(self._on_run_once_toggled)
+        pf.addRow('', self.run_once_check)
+        self.trigger_warn_lbl = QLabel('')
+        self.trigger_warn_lbl.setStyleSheet('color:#ffb74d;font-size:10px;')
+        self.trigger_warn_lbl.setWordWrap(True)
+        pf.addRow('', self.trigger_warn_lbl)
+        self.trigger_var_picker.currentTextChanged.connect(
+            self._update_trigger_warning)
+        self.trigger_val_combo.currentTextChanged.connect(
+            self._update_trigger_warning)
+        self._set_trigger_row_visible(False)
         pos_row = QHBoxLayout()
         self.x_spin = QSpinBox(); self.x_spin.setRange(0, 999)
         self.x_spin.setToolTip(_tt('X position on the map (tiles from left edge)'))
@@ -8083,6 +8590,9 @@ class EventEditorTab(QWidget):
     def load_project(self, project_info: dict):
         self.project_info = project_info
         self._root_dir = Path(project_info.get('dir', ''))
+        # The free-flag scan is memoised per project; opening or reloading one
+        # must not reuse the previous tree's answer.
+        var_flag_manager.invalidate_cache()
 
         # Load all constants via ConstantsManager
         try:
@@ -8469,6 +8979,17 @@ class EventEditorTab(QWidget):
         global _SCRIPT_LABELS, _OBJECT_LOCAL_IDS, _MOVEMENT_LABELS, _ALL_SCRIPTS
         _SCRIPT_LABELS = sorted(set(list(scripts.keys()) + list(self._pages.keys())))
 
+        # Where to find this project's macro definitions, and a fresh read of
+        # them: a project can add commands or change which parameters are
+        # required, and the check has to follow the project, not an assumption.
+        global _PROJECT_ROOT
+        _PROJECT_ROOT = str(self._root_dir or '')
+        try:
+            from eventide.backend.macro_params import clear_cache
+            clear_cache()
+        except Exception:
+            pass
+
         # Collect this map's object events, each with a readable label, so
         # the command dialogs can ask "which character?" in plain words.
         # The two fixed entries come first because they are what scripts use
@@ -8479,11 +9000,25 @@ class EventEditorTab(QWidget):
             ('LOCALID_PLAYER', 'The player'),
         ]
         seen = {raw for raw, _ in choices}
-        for obj in sorted(self._map_data.get('object_events', []),
-                          key=lambda o: str(o.get('local_id') or '')):
+        # An object's local id is its 1-BASED POSITION in this list. map.json
+        # does not store it as a field — the build writes it out positionally,
+        # so Faron's map.json objects become `object_event 1 ... object_event 8`
+        # in events.inc, in exactly this order.
+        #
+        # Reading a `local_id` key instead meant `obj.get('local_id')` was None
+        # for every object, every one was skipped, and the dropdown offered
+        # nothing but the two fixed entries however many characters a map had.
+        # With no list to pick from, the only way to aim a move route at a
+        # character was to type something in — and the obvious-looking
+        # `OBJ_EVENT_GFX_MAN` is a GRAPHICS constant (25), not an object id, so
+        # the move route addressed object 25 of a map that has 8 and the
+        # character never moved.
+        #
+        # A fork that does write `local_id` is still honoured.
+        for idx, obj in enumerate(self._map_data.get('object_events', []), 1):
             lid = obj.get('local_id')
-            raw = str(lid) if lid else ''
-            if not raw or raw in seen:
+            raw = str(lid).strip() if lid not in (None, '') else str(idx)
+            if raw in seen:
                 continue
             seen.add(raw)
             choices.append((raw, _object_choice_label(raw, obj)))
@@ -9618,6 +10153,7 @@ class EventEditorTab(QWidget):
         # Properties panel — adapt to event type
         if etype == 'object':
             self.obj_id_edit.setText(str(obj.get('local_id', '')))
+            self._set_trigger_row_visible(False)
             self._update_resolved_local_id()
             self.obj_id_edit.setEnabled(True)
             self.x_spin.setValue(int(obj.get('x', 0)))
@@ -9673,6 +10209,7 @@ class EventEditorTab(QWidget):
             self._right_stack.setCurrentIndex(1)
             self._hidden_item_panel.load(obj)
             self.obj_id_edit.setText('Hidden Item')
+            self._set_trigger_row_visible(False)
             self.obj_id_edit.setEnabled(False)
             self.x_spin.setValue(int(obj.get('x', 0)))
             self.y_spin.setValue(int(obj.get('y', 0)))
@@ -9692,9 +10229,16 @@ class EventEditorTab(QWidget):
             self._loading = False
             return
         elif etype in ('coord', 'bg'):
-            self.obj_id_edit.setText(obj.get('var', '') if etype == 'coord'
+            # A trigger's variable belongs in its own editable row, not in the
+            # NPC-name box wearing that box's tooltip.
+            self.obj_id_edit.setText('' if etype == 'coord'
                                      else obj.get('type', 'sign'))
             self.obj_id_edit.setEnabled(False)
+            if etype == 'coord':
+                self.trigger_var_picker.set_constant(obj.get('var', '') or '')
+                self.trigger_val_combo.set_value(str(obj.get('var_value', '0')))
+                self._update_trigger_warning()
+            self._set_trigger_row_visible(etype == 'coord')
             self.x_spin.setValue(int(obj.get('x', 0)))
             self.y_spin.setValue(int(obj.get('y', 0)))
             self.x_spin.setEnabled(False)
@@ -9708,6 +10252,7 @@ class EventEditorTab(QWidget):
             self.sprite_preview.set_sprite(None)
         else:  # map_script
             self.obj_id_edit.setText('(map script)')
+            self._set_trigger_row_visible(False)
             self.obj_id_edit.setEnabled(False)
             self.x_spin.setValue(0)
             self.y_spin.setValue(0)
@@ -9751,6 +10296,12 @@ class EventEditorTab(QWidget):
 
         # Scan for cross-references (other scripts that modify this object)
         self._update_xref(obj)
+        # Trigger warnings and the Run-once box read the COMMAND LIST, which is
+        # only filled in above — asking earlier (from the properties branch)
+        # read the previous event's commands, so a correctly arranged trigger
+        # showed as not-run-once and a repeating one showed no warning.
+        if obj.get('_event_type') == 'coord':
+            self._update_trigger_warning()
         self._loading = False
 
     def _refresh_current_object(self):
@@ -10584,6 +11135,306 @@ class EventEditorTab(QWidget):
             return ''
         return f'LOCALID_{map_up}_{name_up}' if map_up else f'LOCALID_{name_up}'
 
+    def _set_trigger_row_visible(self, visible: bool):
+        """Show the trigger condition only for coord_events."""
+        for w in (getattr(self, 'trigger_row', None),
+                  getattr(self, 'trigger_row_label', None),
+                  getattr(self, 'run_once_check', None),
+                  getattr(self, 'trigger_warn_lbl', None)):
+            if w is not None:
+                w.setVisible(visible)
+
+    def _commands_of(self, idx: int, obj: dict) -> list:
+        """This event's commands, taking unsaved edits into account.
+
+        The selected event's live list is what the user is looking at and what
+        Save will write, so the scan must read it rather than the copy loaded
+        from disk — otherwise fixing something leaves it listed as a problem,
+        and breaking something shows nothing.
+        """
+        if idx == self._current_obj_idx and self._cmd_tuples is not None:
+            return list(self._cmd_tuples)
+        out: list = []
+        for page in obj.get('_pages', []) or []:
+            out.extend(page.get('commands', []) or [])
+        return out
+
+    def scan_problems(self) -> list[dict]:
+        """Everything wrong with this map's events, worst first.
+
+        Every check here already exists somewhere in the editor and already
+        reports in the one dialog it belongs to. The point of gathering them is
+        that none of these failures says anything IN GAME — a trigger that
+        never fires, a scene that replays, a command missing a value — so
+        without a list the only way to find them is to open every event and
+        look. They are also exactly the problems this map had.
+
+        Returns dicts of {severity, event, event_idx, cmd_idx, text}.
+        """
+        problems: list[dict] = []
+        for idx, obj in enumerate(getattr(self, '_objects', None) or []):
+            etype = obj.get('_event_type', 'object')
+            name = self.obj_combo.itemText(idx) if idx < self.obj_combo.count() \
+                else (obj.get('script') or f'event {idx}')
+            commands = self._commands_of(idx, obj)
+
+            if etype == 'coord':
+                found = trigger_condition_problem(
+                    obj.get('var', ''), obj.get('var_value', '0'), commands)
+                if found:
+                    problems.append({'severity': found[0], 'event': name,
+                                     'event_idx': idx, 'cmd_idx': None,
+                                     'text': found[1]})
+
+            for cmd_idx, cmd in enumerate(commands):
+                if not cmd:
+                    continue
+                # A required parameter left empty fails the BUILD, so it is the
+                # most severe thing on this list.
+                try:
+                    from eventide.backend.macro_params import (
+                        missing_required, describe_missing)
+                    missing = missing_required(_PROJECT_ROOT, str(cmd[0]),
+                                               cmd[1:])
+                except Exception:
+                    missing = []
+                if missing:
+                    problems.append({
+                        'severity': 'error', 'event': name, 'event_idx': idx,
+                        'cmd_idx': cmd_idx,
+                        'text': describe_missing(str(cmd[0]), missing
+                                                 ).split('\n')[0]})
+                # Steps shared with another scene: editing here changes there.
+                if str(cmd[0]) == 'applymovement' and len(cmd) > 2:
+                    users = _movement_users(str(cmd[2]).strip())
+                    if len(users) > 1:
+                        problems.append({
+                            'severity': 'note', 'event': name,
+                            'event_idx': idx, 'cmd_idx': cmd_idx,
+                            'text': f'Movement {cmd[2]} is shared by '
+                                    f'{len(users)} scenes — editing its '
+                                    f'steps changes all of them.'})
+
+        order = {'error': 0, 'warning': 1, 'note': 2}
+        problems.sort(key=lambda p: (order.get(p['severity'], 3), p['event']))
+        return problems
+
+    _SEVERITY_FACE = {
+        'error':   ('✕', '#e74c3c', 'Will not work'),
+        'warning': ('⚠', '#ffb74d', 'Works, but not as intended'),
+        'note':    ('ℹ', '#64b5f6', 'Worth knowing'),
+    }
+
+    def _on_show_problems(self):
+        """List everything wrong with this map, and jump to any of it."""
+        problems = self.scan_problems()
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Problems on this map')
+        dlg.resize(760, 420)
+        lay = QVBoxLayout(dlg)
+
+        if not problems:
+            lay.addWidget(QLabel(
+                'Nothing to report — every trigger fires and stops when '
+                'it should, every command has the values the build needs, and '
+                'no scene is sharing another’s steps.'))
+        else:
+            counts = {}
+            for p in problems:
+                counts[p['severity']] = counts.get(p['severity'], 0) + 1
+            summary = ', '.join(
+                f'{counts[s]} {self._SEVERITY_FACE[s][2].lower()}'
+                for s in ('error', 'warning', 'note') if s in counts)
+            lay.addWidget(QLabel(f'{len(problems)} found — {summary}. '
+                                 f'Double-click one to go to it.'))
+
+        lst = QListWidget()
+        lst.setAlternatingRowColors(True)
+        for p in problems:
+            face, colour, _title = self._SEVERITY_FACE.get(
+                p['severity'], ('•', '#cccccc', ''))
+            where = p['event']
+            if p['cmd_idx'] is not None:
+                where = f'{where}, step {p["cmd_idx"] + 1}'
+            item = QListWidgetItem(f'{face}  {where}\n      {p["text"]}')
+            item.setForeground(QColor(colour))
+            item.setData(Qt.ItemDataRole.UserRole, p)
+            lst.addItem(item)
+        lay.addWidget(lst, 1)
+
+        def _go(item):
+            p = item.data(Qt.ItemDataRole.UserRole)
+            if not p:
+                return
+            dlg.accept()
+            self._jump_to_problem(p)
+
+        lst.itemDoubleClicked.connect(_go)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        btn_go = QPushButton('Go to')
+        btn_go.clicked.connect(
+            lambda: _go(lst.currentItem()) if lst.currentItem() else None)
+        btn_go.setEnabled(bool(problems))
+        row.addWidget(btn_go)
+        btn_close = QPushButton('Close')
+        btn_close.clicked.connect(dlg.reject)
+        row.addWidget(btn_close)
+        lay.addLayout(row)
+        dlg.exec()
+
+    def _jump_to_problem(self, problem: dict):
+        """Select the event — and the step — a problem is about."""
+        idx = problem.get('event_idx', -1)
+        if not (0 <= idx < self.obj_combo.count()):
+            return
+        self.obj_combo.setCurrentIndex(idx)
+        cmd_idx = problem.get('cmd_idx')
+        if cmd_idx is not None and 0 <= cmd_idx < self._cmd_list.count():
+            self._cmd_list.setCurrentRow(cmd_idx)
+            self._cmd_list.setFocus()
+
+    def _claim_free_variable(self) -> str:
+        """A lasting variable nothing else uses, for a Run-once trigger.
+
+        Prefers a plain numbered slot over a NAMED one: a free-but-named
+        variable like VAR_QUEST_LOG_MON_COUNTS is unreferenced today and
+        obviously reserved for something, so it must not be handed out without
+        being asked for.
+        """
+        candidates: list[str] = []
+        if self._root_dir:
+            try:
+                candidates = var_flag_manager.auto_claim_names(
+                    var_flag_manager.cached_scan(self._root_dir, 'var'))
+            except Exception:
+                candidates = []
+        generic = [v for v in candidates if re.fullmatch(r'VAR_0x[0-9A-Fa-f]+', v)]
+        pool = generic or candidates
+        # Anything this session has already handed out but not yet saved.
+        taken = set()
+        for obj in getattr(self, '_objects', None) or []:
+            val = str(obj.get('var', '') or '')
+            if val.startswith('VAR_'):
+                taken.add(val)
+            for page in obj.get('_pages', []) or []:
+                for cmd in page.get('commands', []) or []:
+                    for part in cmd or ():
+                        if isinstance(part, str):
+                            taken.update(re.findall(r'\bVAR_\w+\b', part))
+        for name in pool:
+            if name not in taken:
+                return name
+        return ''
+
+    def _run_once_setvar_index(self, var: str):
+        """Where the command list switches this trigger off, if it does.
+
+        A `setvar <var>, <anything but 0>` is the off switch, because the
+        condition fires on 0. Returns its index or None.
+        """
+        if not var:
+            return None
+        want = var.strip().upper()
+        for i, cmd in enumerate(self._cmd_tuples or []):
+            if not cmd or str(cmd[0]) != 'setvar' or len(cmd) < 2:
+                continue
+            parts = [p.strip() for p in str(cmd[1]).split(',')]
+            if (parts and parts[0].upper() == want
+                    and len(parts) > 1 and parts[1] not in ('0', '')):
+                return i
+        return None
+
+    def _is_run_once(self) -> bool:
+        """Whether this trigger is already arranged to play once.
+
+        Read from the actual setup rather than stored anywhere, so a scene
+        built by hand ticks the box, and the box never claims something the
+        script does not do.
+        """
+        var = self.trigger_var_picker.selected_constant().strip()
+        if not var or var.upper().startswith('VAR_TEMP'):
+            return False
+        if str(self.trigger_val_combo.selected_value()).strip() not in ('0', ''):
+            return False
+        return self._run_once_setvar_index(var) is not None
+
+    def _sync_run_once_check(self):
+        """Point the tick box at reality without re-triggering its handler."""
+        if not hasattr(self, 'run_once_check'):
+            return
+        self.run_once_check.blockSignals(True)
+        self.run_once_check.setChecked(self._is_run_once())
+        self.run_once_check.blockSignals(False)
+
+    def _on_run_once_toggled(self, checked: bool):
+        """Write — or unwrite — the whole run-once arrangement."""
+        if self._loading:
+            return
+        var = self.trigger_var_picker.selected_constant().strip()
+
+        if not checked:
+            idx = self._run_once_setvar_index(var)
+            if idx is not None:
+                self._push_undo()
+                self._cmd_tuples.pop(idx)
+                item = self._cmd_list.takeItem(idx)
+                del item
+                self._reindent_list()
+                self._mark_dirty()
+            self._update_trigger_warning()
+            return
+
+        # A temp variable resets on every map load, so it can never hold the
+        # scene "done"; claim a lasting one instead.
+        if not var or var.upper().startswith('VAR_TEMP'):
+            claimed = self._claim_free_variable()
+            if not claimed:
+                QMessageBox.warning(
+                    self, 'Run once',
+                    'No free variable could be found to remember that this '
+                    'scene has played. Pick one by hand in "Fires while:".')
+                self._sync_run_once_check()
+                return
+            self.trigger_var_picker.set_constant(claimed)
+            var = claimed
+
+        # Fire on the value a variable starts at, so the scene runs before
+        # anything has set it.
+        self.trigger_val_combo.set_value('0')
+
+        if self._run_once_setvar_index(var) is None:
+            self._push_undo()
+            # Before a trailing releaseall/release, which has to stay last.
+            at = -1
+            for i in range(len(self._cmd_tuples) - 1, -1, -1):
+                head = str((self._cmd_tuples[i] or ('',))[0])
+                if head in ('releaseall', 'release'):
+                    at = i
+                else:
+                    break
+            self._add_list_item(('setvar', f'{var}, 1'), at)
+            self._mark_dirty()
+        self._update_trigger_warning()
+
+    def _update_trigger_warning(self):
+        """Explain the three ways a trigger's condition goes wrong.
+
+        All three are invisible in game — the trigger simply does nothing, or
+        does it every time — and none of them is reported anywhere else.
+        """
+        if not hasattr(self, 'trigger_warn_lbl'):
+            return
+        problem = trigger_condition_problem(
+            self.trigger_var_picker.selected_constant(),
+            self.trigger_val_combo.selected_value(),
+            self._cmd_tuples)
+        self.trigger_warn_lbl.setText(
+            f'⚠ {problem[1]}' if problem else '')
+        # The tick box is derived from the setup, so it follows every change.
+        self._sync_run_once_check()
+
     def _update_resolved_local_id(self):
         """Show the LOCALID_* constant the typed name will become."""
         if not hasattr(self, 'obj_id_resolved_lbl'):
@@ -10604,6 +11455,15 @@ class EventEditorTab(QWidget):
             return
         obj = self._objects[self._current_obj_idx]
         etype = obj.get('_event_type', 'object')
+        if etype == 'coord':
+            # A trigger's condition is the only thing editable about it here.
+            # Blank variable is left alone rather than written as an empty
+            # string, which the build rejects.
+            var = self.trigger_var_picker.selected_constant().strip()
+            if var:
+                obj['var'] = var
+                obj['var_value'] = str(
+                    self.trigger_val_combo.selected_value()).strip() or '0'
         # Only write back editable properties for NPC object events
         if etype == 'object':
             # Only write local_id if non-empty.  An empty string causes
@@ -11547,6 +12407,8 @@ class EventEditorTab(QWidget):
             # Tolerate the old single-tuple clipboard shape.
             pasted = list(clip) if isinstance(clip, list) else [clip]
 
+        pasted, copied_moves = self._privatise_pasted_movements(pasted)
+
         self._push_undo()
         idx = self._selected_cmd_idx()
         insert_at = idx + 1 if idx >= 0 else len(self._cmd_tuples)
@@ -11558,6 +12420,64 @@ class EventEditorTab(QWidget):
         self._mw.log_message(
             f'Event Editor: pasted {len(pasted)} command(s)'
             if len(pasted) > 1 else 'Event Editor: pasted command')
+        if copied_moves:
+            pairs = ', '.join(f'{old} → {new}'
+                              for old, new in copied_moves.items())
+            self._mw.log_message(
+                f'Event Editor: gave the pasted copy its own movement'
+                f'{"s" if len(copied_moves) > 1 else ""} ({pairs}) so editing '
+                f'them will not change the original.')
+
+    def _privatise_pasted_movements(self, pasted: list[tuple]):
+        """Give pasted commands their own copy of any movement already in use.
+
+        A movement is a NAMED list of steps shared by everything that points at
+        its name, so duplicating a scene by copying its script and pasting it
+        produces a second event walking the ORIGINAL's steps — edit either and
+        both change. Duplicating a scene almost never means "and share the
+        movements", so the copy gets its own, seeded identically.
+
+        Two things are deliberately left shared:
+
+        * the `Common_Movement_*` library (face player, delays, emotes). Those
+          ARE meant to be shared, and copying them would litter every map with
+          near-duplicates.
+        * a label this map has never heard of, which there are no steps to
+          copy and no original to protect.
+
+        Returns the rewritten commands and a {old: new} map for the log.
+        """
+        from eventide.backend.eventide_utils import COMMON_MOVEMENT_LABELS
+        renamed: dict[str, str] = {}
+        out: list[tuple] = []
+        for cmd in pasted:
+            if not cmd or str(cmd[0]) != 'applymovement' or len(cmd) < 3:
+                out.append(cmd)
+                continue
+            label = str(cmd[2]).strip()
+            if label in renamed:
+                # Two pasted commands sharing one movement keep sharing the
+                # SAME new one — they are one scene.
+                out.append((cmd[0], cmd[1], renamed[label]))
+                continue
+            if (not label
+                    or label in COMMON_MOVEMENT_LABELS
+                    or label not in _ALL_SCRIPTS
+                    or not _movement_users(label)):
+                out.append(cmd)
+                continue
+            new_label = _fresh_movement_label(label)
+            steps = list(_ALL_SCRIPTS.get(label, []))
+            _ALL_SCRIPTS[new_label] = steps
+            self._all_scripts[new_label] = list(steps)
+            if not hasattr(self, '_modified_movements'):
+                self._modified_movements = {}
+            self._modified_movements[new_label] = list(steps)
+            if new_label not in _MOVEMENT_LABELS:
+                _MOVEMENT_LABELS.append(new_label)
+            renamed[label] = new_label
+            out.append((cmd[0], cmd[1], new_label))
+        return out, renamed
 
     def _renumber_page_tabs(self):
         """Keep page tabs labeled 1, 2, 3, … by position (they were a mix of
@@ -12091,58 +13011,27 @@ class EventEditorTab(QWidget):
             f'Event Editor: object visibility flag set to {found[0]}')
 
     def _on_find_unused_flag(self):
-        """Scan the project for used flags and find the next available one."""
+        """Report how many flags are genuinely free, and name the next one."""
         if not self._root_dir:
             QMessageBox.information(self, 'Find Flag', 'No project loaded.')
             return
 
-        # Collect all FLAG_ constants defined in the project
-        all_flags = set(ConstantsManager.FLAGS)
-
-        # Scan scripts for actually used flags (setflag/clearflag/checkflag/goto_if_set etc.)
-        used_flags = set()
-        maps_dir = self._root_dir / 'data' / 'maps'
-        if maps_dir.is_dir():
-            for scripts_file in maps_dir.rglob('scripts.inc'):
-                try:
-                    text = scripts_file.read_text(encoding='utf-8')
-                    for m in re.finditer(r'\b(FLAG_\w+)\b', text):
-                        used_flags.add(m.group(1))
-                except Exception:
-                    pass
-
-        # Also scan src/ for C code references
-        src_dir = self._root_dir / 'src'
-        if src_dir.is_dir():
-            for c_file in src_dir.rglob('*.c'):
-                try:
-                    text = c_file.read_text(encoding='utf-8')
-                    for m in re.finditer(r'\b(FLAG_\w+)\b', text):
-                        used_flags.add(m.group(1))
-                except Exception:
-                    pass
-
-        # Find FLAG_UNUSED_* that aren't referenced anywhere
-        unused = sorted(
-            f for f in all_flags
-            if f.startswith('FLAG_UNUSED_') and f not in used_flags
-        )
-
-        if unused:
-            # Show the first few and copy the first one
-            first = unused[0]
-            msg = (f'Found {len(unused)} unused flags.\n\n'
-                   f'Next available: {first}\n\n'
-                   f'First 10:\n' + '\n'.join(unused[:10]))
-            QMessageBox.information(self, 'Unused Flags', msg)
-            self._mw.log_message(
-                f'Event Editor: {len(unused)} unused flags found, '
-                f'next available: {first}')
-        else:
-            QMessageBox.warning(self, 'Unused Flags',
-                                'No FLAG_UNUSED_* constants found. '
-                                'You may need to define new flags in '
-                                'include/constants/flags.h')
+        unused = self._find_unused_flags(10000)
+        if not unused:
+            QMessageBox.warning(
+                self, 'Unused Flags',
+                'Every flag in this project is already in use.\n\n'
+                'Open Variables & Flags to review which ones could be '
+                'reclaimed.')
+            return
+        first = unused[0]
+        msg = (f'Found {len(unused)} free flags.\n\n'
+               f'Next available: {first}\n\n'
+               f'First 10:\n' + '\n'.join(unused[:10]))
+        QMessageBox.information(self, 'Unused Flags', msg)
+        self._mw.log_message(
+            f'Event Editor: {len(unused)} free flags found, '
+            f'next available: {first}')
 
     # ─────────────────────────────────────────────────────────────────────
     # Script Lookup (project-wide search)
@@ -12522,22 +13411,67 @@ class EventEditorTab(QWidget):
             self._btn_new_script.rect().bottomLeft()))
 
     def _find_unused_flags(self, count=1) -> list[str]:
-        """Find the next N unused FLAG_UNUSED_* constants in the project."""
-        all_flags = set(ConstantsManager.FLAGS)
+        """Find the next N flags that are genuinely free to claim.
+
+        The candidate list comes from the project-wide scan in
+        ``var_flag_manager``: a slot is offered only when it is referenced
+        nowhere in src, data, include or asm AND it sits outside the regions
+        the engine addresses by slot number. Matching on the ``FLAG_UNUSED_*``
+        NAME instead, as this used to, found only the nine slots vanilla
+        happens to label that way — and those nine sit in the spare tail of
+        the hidden-item block, exactly the ground the engine grows into, while
+        hundreds of ordinary free slots named ``FLAG_0x###`` went unoffered.
+
+        That scan is a snapshot, so two cheaper live checks are layered on top.
+        ``map.json`` is re-read because a flag can be an event PROPERTY — the
+        "Hide when flag" field, which appears in no script. In-memory objects
+        are checked as well, so applying a template twice before saving still
+        yields two different flags.
+        """
+        # Header order, which is slot order, so flags are handed out from the
+        # bottom of the free range upwards rather than alphabetically.
+        all_flags: list[str] = []
+        if self._root_dir:
+            try:
+                all_flags = var_flag_manager.auto_claim_names(
+                    var_flag_manager.cached_scan(self._root_dir, 'flag'))
+            except Exception:
+                all_flags = []
+        if not all_flags:
+            # Only when there is no project tree to scan (tests, or a
+            # half-open project). Without the headers there is no way to work
+            # out which region a slot is in, so this falls back to the old
+            # name match — which is why it must stay a last resort.
+            all_flags = sorted(f for f in ConstantsManager.FLAGS
+                               if f.startswith('FLAG_UNUSED_'))
+
         used_flags: set[str] = set()
-        maps_dir = self._root_dir / 'data' / 'maps'
-        if maps_dir.is_dir():
-            for sf in maps_dir.rglob('scripts.inc'):
-                try:
-                    text = sf.read_text(encoding='utf-8')
+        maps_dir = self._root_dir / 'data' / 'maps' if self._root_dir else None
+        if maps_dir and maps_dir.is_dir():
+            # scripts.inc: flags referenced by script commands.
+            # map.json: flags assigned as an event's visibility property.
+            for pattern in ('scripts.inc', 'map.json'):
+                for sf in maps_dir.rglob(pattern):
+                    try:
+                        text = sf.read_text(encoding='utf-8')
+                    except Exception:
+                        continue
                     for m in re.finditer(r'\b(FLAG_\w+)\b', text):
                         used_flags.add(m.group(1))
-                except Exception:
-                    pass
-        unused = sorted(
-            f for f in all_flags
-            if f.startswith('FLAG_UNUSED_') and f not in used_flags)
-        return unused[:count]
+
+        # Anything assigned in this session but not yet written to disk.
+        for obj in getattr(self, '_objects', None) or []:
+            val = str(obj.get('flag', '') or '')
+            if val.startswith('FLAG_'):
+                used_flags.add(val)
+            for page in obj.get('_pages', []):
+                for cmd in page.get('commands', []):
+                    for part in cmd or ():
+                        if isinstance(part, str):
+                            for m in re.finditer(r'\b(FLAG_\w+)\b', part):
+                                used_flags.add(m.group(1))
+
+        return [f for f in all_flags if f not in used_flags][:count]
 
     def _register_text(self, label: str, content: str):
         """Add a text entry to the in-memory texts dict and update __texts__."""
@@ -12626,8 +13560,51 @@ class EventEditorTab(QWidget):
             return None
         return Path(self._root_dir) / 'eventide_page_templates.json'
 
+    #: Event properties a template is allowed to carry, beyond its commands.
+    #:
+    #: Deliberately a whitelist. These values are written straight into the
+    #: map's ``map.json``, so an unrestricted one would let a malformed
+    #: template put arbitrary keys into the map file. Position is NOT here on
+    #: purpose: where an event sits is a property of that placement, never of
+    #: the template.
+    TEMPLATE_PROPERTIES = (
+        'flag', 'graphics_id', 'movement_type', 'trainer_type',
+        'elevation', 'movement_range_x', 'movement_range_y',
+    )
+
+    @classmethod
+    def _template_parts(cls, entry):
+        """Split one store entry into ``(commands, properties)``.
+
+        Accepts either on-disk shape. `_load_page_templates` normalises, but
+        this stays tolerant on purpose: the store is a USER file, so a
+        hand-written entry — or anything else handing us a bare list — must not
+        raise.
+        """
+        if isinstance(entry, dict):
+            raw_cmds = entry.get('commands') or []
+            raw_props = entry.get('properties') or {}
+        else:
+            raw_cmds, raw_props = entry or [], {}
+        cmds = [tuple(c) for c in raw_cmds]
+        props = {k: v for k, v in raw_props.items()
+                 if k in cls.TEMPLATE_PROPERTIES and v not in (None, '')}
+        return cmds, props
+
     def _load_page_templates(self) -> dict:
-        """Return ``{name: [command_tuples]}`` from the project store."""
+        """Return ``{name: {'commands': [...], 'properties': {...}}}``.
+
+        Two on-disk shapes are accepted, because templates are a USER file and
+        every one saved before event properties existed is a bare list:
+
+        * ``"name": [[cmd], [cmd]]``                      — commands only
+        * ``"name": {"commands": [...], "properties": {}}`` — with properties
+
+        Both normalise to the dict form here so callers only handle one shape.
+        The writer keeps the bare-list shape for templates that have no
+        properties, so an existing store is not rewritten into a new format
+        just by being read and saved.
+        """
         p = self._page_templates_path()
         if not p or not p.is_file():
             return {}
@@ -12636,18 +13613,41 @@ class EventEditorTab(QWidget):
         except Exception:
             return {}
         out = {}
-        for name, cmds in (data or {}).items():
+        for name, entry in (data or {}).items():
+            if isinstance(entry, dict):
+                rows = [c for c in (entry.get('commands') or [])
+                        if isinstance(c, list)]
+                entry = {'commands': rows,
+                         'properties': entry.get('properties') or {}}
+            else:
+                entry = [c for c in (entry or []) if isinstance(c, list)]
             # JSON lists → command tuples (the editor works in tuples).
-            out[name] = [tuple(c) for c in cmds if isinstance(c, list)]
+            cmds, props = self._template_parts(entry)
+            out[name] = {'commands': cmds, 'properties': props}
         return out
 
     def _save_page_templates(self, templates: dict) -> bool:
+        """Write the store back, keeping the bare-list shape where possible.
+
+        A template with no properties is written exactly as it always was, so
+        saving one template never reformats the others.
+        """
         p = self._page_templates_path()
         if not p:
             return False
         try:
-            serializable = {n: [list(c) for c in cmds]
-                            for n, cmds in templates.items()}
+            serializable = {}
+            for n, entry in templates.items():
+                if isinstance(entry, dict):
+                    cmds = entry.get('commands') or []
+                    props = entry.get('properties') or {}
+                else:
+                    cmds, props = entry, {}
+                rows = [list(c) for c in cmds]
+                if props:
+                    serializable[n] = {'commands': rows, 'properties': props}
+                else:
+                    serializable[n] = rows
             p.write_text(json.dumps(serializable, indent=2, ensure_ascii=False),
                          encoding='utf-8', newline='\n')
             return True
@@ -12704,6 +13704,29 @@ class EventEditorTab(QWidget):
                               for i, part in enumerate(c))
                         for c in cmds]
 
+        # A page is only half of an event. The graphic it uses, and the flag
+        # that stops it coming back once it has fired, are properties of the
+        # EVENT -- so a template that carries only commands reproduces a chest
+        # that works once and then reappears on every map load. Offer to
+        # remember them too.
+        props: dict = {}
+        if obj.get('_event_type', 'object') == 'object':
+            gfx = obj.get('graphics_id', '')
+            ret = QMessageBox.question(
+                self, 'Save Page Template',
+                'Also remember this event\'s own settings?\n\n'
+                f'• Graphic: {gfx or "(none)"}\n'
+                '• Hide when flag: each event made from this template gets '
+                'its OWN fresh flag\n\n'
+                'Say yes for something that should stay gone once used — a '
+                'chest, a one-time pickup. Say no to save just the commands.',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if ret == QMessageBox.StandardButton.Yes:
+                if gfx:
+                    props['graphics_id'] = gfx
+                props['flag'] = self.TEMPLATE_UNUSED_FLAG
+
         templates = self._load_page_templates()
         if name in templates:
             if QMessageBox.question(
@@ -12712,11 +13735,12 @@ class EventEditorTab(QWidget):
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
                 return
-        templates[name] = cmds
+        templates[name] = {'commands': cmds, 'properties': props}
         if self._save_page_templates(templates):
+            extra = f' + {len(props)} event propert(y/ies)' if props else ''
             self._mw.log_message(
                 f'Event Editor: saved page template "{name}" '
-                f'({len(cmds)} command(s))')
+                f'({len(cmds)} command(s){extra})')
 
     #: Placeholder a saved template can use anywhere a flag constant goes.
     #: Applying the template swaps it for a flag nothing else in the project
@@ -12739,12 +13763,21 @@ class EventEditorTab(QWidget):
           only the script flag leaves a bug that reads as an engine fault.
         """
         templates = self._load_page_templates()
-        cmds = templates.get(name)
-        if not cmds:
+        entry = templates.get(name)
+        if not entry:
+            return
+        cmds, props = self._template_parts(entry)
+        if not cmds and not props:
             return
 
-        cmds = [tuple(c) for c in cmds]
-        needs_flag = any(self.TEMPLATE_UNUSED_FLAG in str(c) for c in cmds)
+        # One flag per APPLY, shared by the commands and the properties, so a
+        # template that both sets a flag and hides the event behind it uses the
+        # same one. Properties are checked too: a chest needs a flag for its
+        # "Hide when flag" even though its script never calls setflag -- the
+        # engine sets that flag itself in removeobject.
+        needs_flag = (any(self.TEMPLATE_UNUSED_FLAG in str(c) for c in cmds)
+                      or any(self.TEMPLATE_UNUSED_FLAG in str(v)
+                             for v in props.values()))
         chosen = ''
         if needs_flag:
             found = self._find_unused_flags(1)
@@ -12760,28 +13793,58 @@ class EventEditorTab(QWidget):
                           if isinstance(part, str) else part
                           for part in c)
                     for c in cmds]
+            props = {k: (v.replace(self.TEMPLATE_UNUSED_FLAG, chosen)
+                         if isinstance(v, str) else v)
+                     for k, v in props.items()}
 
         obj['_pages'] = [{'commands': cmds,
                           '_label': script,
                           '_short_label': script.split('_')[-1]}]
         self._register_labels([script])
 
-        # Offer the script's flag to the object itself.
-        set_flags = [c[1] for c in cmds
-                     if c and c[0] == 'setflag' and len(c) > 1 and c[1]]
+        is_object = obj.get('_event_type', 'object') == 'object'
+        applied: list[str] = []
+
+        # ── Event properties the template carries ────────────────────
+        for key, value in props.items():
+            if key not in self.TEMPLATE_PROPERTIES:
+                continue          # _load_page_templates filters too; belt and braces
+            if key == 'flag':
+                # Only ever fill an EMPTY visibility flag. Overwriting a real
+                # one would orphan it: the old flag stays set in save files
+                # that already tripped it, and the event would reappear.
+                if not is_object:
+                    continue
+                current = str(obj.get('flag', '') or '')
+                if current not in ('', '0', '0x0'):
+                    continue
+            obj[key] = value
+            applied.append(key)
+
+        # ── Fall back to the script's own flag ───────────────────────
+        # A template with no flag PROPERTY but a setflag command still wants
+        # the event hidden behind that flag; this is the pre-properties
+        # behaviour and stays for every template saved before them.
         synced = ''
-        if set_flags and obj.get('_event_type', 'object') == 'object':
-            flag = chosen or set_flags[0]
-            current = str(obj.get('flag', '') or '')
-            if current in ('', '0', '0x0'):
-                obj['flag'] = flag
-                synced = flag
+        if 'flag' not in applied and is_object:
+            set_flags = [c[1] for c in cmds
+                         if c and c[0] == 'setflag' and len(c) > 1 and c[1]]
+            if set_flags:
+                current = str(obj.get('flag', '') or '')
+                if current in ('', '0', '0x0'):
+                    obj['flag'] = chosen or set_flags[0]
+                    synced = obj['flag']
 
         self._refresh_current_object()
         self._mark_dirty()
         note = f' (flag {chosen})' if chosen else ''
-        if synced:
+        if 'flag' in applied:
+            note += f' — "Hide when flag" set to {obj.get("flag")}'
+        elif synced:
             note += ' — also set as this event\'s "Hide when flag"'
+        other = [k for k in applied if k != 'flag']
+        if other:
+            note += f' — also set {", ".join(other)}'
         self._mw.log_message(
             f'Event Editor: applied page template "{name}" to {script}{note}')
 
@@ -12799,7 +13862,12 @@ class EventEditorTab(QWidget):
         lst = QListWidget()
         lst.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         for n in sorted(templates):
-            lst.addItem(f'{n}  ({len(templates[n])} cmd)')
+            t_cmds, t_props = self._template_parts(templates[n])
+            n_cmds, n_props = len(t_cmds), len(t_props)
+            label = f'{n}  ({n_cmds} cmd'
+            label += f', {n_props} propert{"y" if n_props == 1 else "ies"})' \
+                if n_props else ')'
+            lst.addItem(label)
         v.addWidget(lst, 1)
         row = QHBoxLayout()
         row.addStretch()
@@ -13885,16 +14953,35 @@ class EventEditorTab(QWidget):
             lines_from_commands, merge_hidden_lines,
         )
 
-        # Collect current external script commands from loaded objects
+        # Collect current external script commands from loaded objects.
+        #
+        # A resolved shared script is NOT a page of its own — it is appended
+        # into the calling page's command list behind a `_label_marker`, which
+        # is how the user sees `Std_ChestOpen` listed under the event that
+        # calls it. So the page's own `_label` is the CALLER's label, and
+        # testing only that found no external script to write: edits to a
+        # shared script were shown in the list, silently dropped on save, and
+        # the game kept running the old version. Split on the markers exactly
+        # the way the map-file save path above does, and collect each segment
+        # under the label that actually owns it.
         ext_pages: dict[str, list] = {}
         for obj in self._objects:
             script = obj.get('script', '')
             if not script:
                 continue
             for page in obj.get('_pages', []):
-                label = page.get('_label', script)
-                if label in self._external_script_labels:
-                    ext_pages[label] = page.get('commands', [])
+                current = page.get('_label', script)
+                current_cmds: list = []
+                for cmd in page.get('commands', []):
+                    if cmd and cmd[0] == '_label_marker':
+                        if current in self._external_script_labels:
+                            ext_pages[current] = current_cmds
+                        current = cmd[1] if len(cmd) > 1 else current
+                        current_cmds = []
+                    else:
+                        current_cmds.append(cmd)
+                if current in self._external_script_labels:
+                    ext_pages[current] = current_cmds
 
         # Drop every label that still matches what was read from disk.
         unchanged = [
