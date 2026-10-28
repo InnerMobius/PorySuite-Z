@@ -63,28 +63,63 @@ class Tilemap:
     entries: List[TileEntry] = field(default_factory=list)
     source_path: str = ""
 
+    width_source: str = "guess"   # "explicit" | "engine" | "guess"
+    cell_bytes: int = 2           # 1 for a byte-per-cell (affine / packed) map
+
     @staticmethod
     def from_file(path: str, width: int = 0) -> "Tilemap":
         """Load a tilemap .bin file.
 
-        If width is 0, auto-detect: try 32 first (standard GBA),
-        then infer from file size.
+        A `.bin` is headerless, so neither the cell size nor the width is in it.
+        Both are asked of the engine source first (see
+        `core/tilemap_engine_index`), because both used to be guessed wrong:
+
+          * `item_menu/list.bin` was shown 27 cells wide — the largest exact
+            divisor of 216 that is <= 32 — where `item_menu.c` declares
+            `LIST_TILES_WIDTH 18` by `LIST_TILES_HEIGHT 12`, so the map appeared
+            sheared.
+          * the five party-menu slot layouts, the two trade stripe maps and the
+            two affine trade maps are `INCBIN_U8` — ONE byte per cell. Read as
+            16-bit, `slot_main.bin` reports a highest tile index of 815 with
+            palette bits 1-3 where the truth is index 61 and no palette bits, so
+            nothing resolved and the map rendered solid black.
+
+        An explicit `width` (the user's own choice, or a saved preference) always
+        wins over both.
         """
         with open(path, "rb") as f:
             data = f.read()
 
-        count = len(data) // 2
+        facts = None
+        try:
+            from core.tilemap_engine_index import facts_for_path
+            facts = facts_for_path(path)
+        except Exception:        # never let the index stop a file from opening
+            facts = None
+
+        cell_bytes = facts.cell_bytes if facts is not None else 2
+
+        if cell_bytes == 1:
+            count = len(data)
+            entries = [TileEntry(tile_index=b) for b in data]
+        else:
+            count = len(data) // 2
+            entries = [TileEntry.from_u16(v)
+                       for v in struct.unpack(f"<{count}H", data[:count * 2])]
         if count == 0:
-            return Tilemap(source_path=path)
+            return Tilemap(source_path=path, cell_bytes=cell_bytes)
 
-        entries = []
-        for val in struct.unpack(f"<{count}H", data):
-            entries.append(TileEntry.from_u16(val))
-
-        # Auto-detect dimensions
-        if width <= 0:
+        height = 0
+        if width > 0:
+            source = "explicit"
+        elif facts is not None and facts.declared_dims:
+            width, height = facts.declared_dims
+            source = "engine"
+        else:
             width = _guess_width(count)
-        height = max(1, (count + width - 1) // width)
+            source = "guess"
+        if height <= 0:
+            height = max(1, (count + width - 1) // width)
 
         # Do NOT pad entries to width*height. The entry list IS the file's true
         # data; padding it inflates the saved size whenever the guessed width
@@ -94,6 +129,7 @@ class Tilemap:
         return Tilemap(
             width=width, height=height,
             entries=entries, source_path=path,
+            width_source=source, cell_bytes=cell_bytes,
         )
 
     def save(self, path: str = "") -> None:
@@ -119,7 +155,15 @@ class Tilemap:
         if not target:
             raise ValueError("No path specified")
         n = len(self.entries)
-        data = struct.pack(f"<{n}H", *(e.to_u16() for e in self.entries))
+        if self.cell_bytes == 1:
+            # A byte-per-cell map (the party-menu slots, the trade stripe and
+            # affine maps) carries ONLY a tile index — no flip bits, no palette
+            # bits. Writing `to_u16()` here would double the file and corrupt
+            # every one of them, so the cell size `from_file` detected has to be
+            # honoured on the way back out.
+            data = bytes(e.tile_index & 0xFF for e in self.entries)
+        else:
+            data = struct.pack(f"<{n}H", *(e.to_u16() for e in self.entries))
         with open(target, "wb") as f:
             f.write(data)
         if not path:
@@ -263,6 +307,47 @@ def set_tilemap_dim_pref(project_dir: str, bin_path: str,
 # ─── Tile sheet (PNG indexed image) ──────────────────────────────────────────
 
 
+def _uses_8bit_indices(img: QImage) -> bool:
+    """Does this sheet's artwork actually use pixel index values above 15?
+
+    This is the question that matters, and it is NOT the same as either of the
+    two things that were tried instead:
+
+      * **the colour table's length** (the original test, `len(ct) > 16`) is
+        storage padding, not content. `item_menu/bg.png` carries a 256-entry
+        table and uses only indices 0-15, so the editor treated 4bpp artwork as
+        256-colour mode and threw the cells' palette bits away.
+      * **the compiled asset's name** (`foo.4bpp` vs `foo.8bpp`) describes what
+        the engine loads, not how the PNG stores it. `party_menu/bg.png` and
+        `region_map.png` both compile to `.4bpp` yet hold indices up to 63 and
+        54, because several sub-palettes' worth of colours are baked in so the
+        art can be edited. Reading those as 4bpp installs a 16-entry colour
+        table under pixels that index past it.
+
+    An index above 15 means the pixel values span sub-palettes, which is exactly
+    when the attr path in `apply_palette_to_image` is the correct renderer.
+    """
+    if img.format() != QImage.Format.Format_Indexed8:
+        return False
+    try:
+        bits = img.constBits()
+        if bits is None:
+            return False
+        bits.setsize(img.sizeInBytes())
+        buf = memoryview(bits).cast("B")
+        stride = img.bytesPerLine()
+        width = img.width()
+        for row in range(img.height()):
+            start = row * stride
+            if max(buf[start:start + width], default=0) > 15:
+                return True
+        return False
+    except Exception:
+        # Fall back to the old storage test rather than refusing to load.
+        ct = img.colorTable()
+        return len(ct) > 16 if ct else False
+
+
 @dataclass
 class TileSheet:
     """A tile sheet loaded from an indexed PNG."""
@@ -280,9 +365,10 @@ class TileSheet:
             raise FileNotFoundError(f"Cannot load image: {path}")
         tw = max(1, img.width() // TILE_PX)
         th = max(1, img.height() // TILE_PX)
-        # Detect 8bpp: indexed image with >16 colors in the color table
-        ct = img.colorTable()
-        is_8bpp = len(ct) > 16 if ct else False
+        # Whether the artwork really spans an 8-bit index space — see
+        # _uses_8bit_indices for why neither the colour table's length nor the
+        # compiled asset's name answers this.
+        is_8bpp = _uses_8bit_indices(img)
         return TileSheet(
             image=img,
             tiles_wide=tw,
@@ -429,10 +515,6 @@ class PaletteSet:
                 return pal[color_idx]
         return (0, 0, 0)
 
-    def get_qcolor(self, pal_idx: int, color_idx: int) -> QColor:
-        r, g, b = self.get_color(pal_idx, color_idx)
-        return QColor(r, g, b)
-
     def palette_count(self) -> int:
         return len(self.palettes)
 
@@ -444,12 +526,6 @@ class PaletteSet:
         while len(self.palettes[slot]) < 16:
             self.palettes[slot].append((0, 0, 0))
         self._loaded_slots.add(slot)
-
-    def ensure_slots(self, count: int = 16) -> None:
-        """Ensure at least `count` palette slots exist (fills empty with black).
-        Does NOT mark new slots as loaded — they're placeholders."""
-        while len(self.palettes) < count:
-            self.palettes.append([(0, 0, 0)] * 16)
 
     def is_slot_loaded(self, slot: int) -> bool:
         """Check if a palette slot has real data (not just a placeholder)."""
@@ -545,6 +621,98 @@ class PaletteSet:
 # ─── Rendering ────────────────────────────────────────────────────────────────
 
 
+def build_palette_set(assets: "TilemapAssets",
+                      sheet: Optional[TileSheet]) -> Optional[PaletteSet]:
+    """Turn discovered assets into the PaletteSet the editor should render with.
+
+    One place decides this, because the choice was being made separately in the
+    tab's load path, its sheet-changed handler and its palette-source handler,
+    and they could disagree about what a tilemap's colours are.
+
+    Order:
+      1. `best_pals` in order, into slots 0, 1, 2… — correct for a split palette
+         source, where file N IS slot N.
+      2. any slot the engine names explicitly (`slot_pals`) placed at that slot,
+         filling gaps `best_pals` left rather than overwriting it.
+      3. failing both, the sheet PNG's own colour table.
+    """
+    pset: Optional[PaletteSet] = None
+    if assets.best_pals:
+        try:
+            pset = PaletteSet.from_pal_files(assets.best_pals)
+        except Exception:
+            pset = None
+
+    if assets.slot_pals:
+        if pset is None:
+            pset = PaletteSet()
+        for slot, path in sorted(assets.slot_pals.items()):
+            if pset.is_slot_loaded(slot):
+                continue
+            try:
+                if path.lower().endswith(".gbapal"):
+                    colors = _read_gbapal_file(path)
+                else:
+                    from ui.palette_utils import read_jasc_pal
+                    colors = read_jasc_pal(path)
+            except Exception:
+                continue
+            if not colors:
+                continue
+            # A >16-colour file at slot N covers N, N+1, … in sequence.
+            for i in range(0, min(len(colors), (16 - slot) * 16), 16):
+                chunk = list(colors[i:i + 16])
+                while len(chunk) < 16:
+                    chunk.append((0, 0, 0))
+                target = slot + i // 16
+                if target < 16 and not pset.is_slot_loaded(target):
+                    pset.set_palette_at(target, chunk)
+
+    if (pset is None or pset.palette_count() == 0) and sheet is not None:
+        pset = PaletteSet.from_indexed_image(sheet.image)
+    return pset
+
+
+def unresolved_slots(tilemap: Tilemap,
+                     palette_set: Optional[PaletteSet]) -> List[int]:
+    """Palette slots this tilemap's cells name that have no palette loaded.
+
+    `_recolor_tile` silently substitutes palette 0 for these, which is how a
+    screen ends up drawn in the wrong colours with nothing to explain it — the
+    move relearner's slot-4 cells come out black because palette 0 is black
+    there. The editor surfaces this list so the answer is visible instead of
+    being a mystery, since for many tilemaps the slot genuinely is not filled by
+    the screen that uses them and no amount of further parsing will say what
+    belongs there.
+    """
+    if palette_set is None:
+        return []
+    used = {e.palette for e in tilemap.entries}
+    return sorted(s for s in used if not palette_set.is_slot_loaded(s))
+
+
+def backdrop_color(palette_set: Optional["PaletteSet"]) -> Color:
+    """The colour a background pixel of palette-index 0 actually shows.
+
+    On the GBA, a BG pixel whose palette index is 0 is neither black nor
+    transparent — it shows the BACKDROP, which is BG palette 0, colour 0.
+
+    Both render paths MUST take their fill from here, or they disagree about what
+    a blank cell looks like. Before this existed, the canvas was filled with
+    opaque black while colour 0 was drawn transparent, so every blank cell came
+    out pure black: `pokemon_storage/menu.bin` is entirely colour-0 cells and
+    rendered as a solid black rectangle even though nothing about the file is
+    wrong, `fame_checker/tilemap1.bin` showed 77% black where the game shows
+    bright yellow, and `party_menu/bg.bin` 39% black over a sage backdrop.
+    """
+    if palette_set is not None and palette_set.palette_count() > 0:
+        return palette_set.get_color(0, 0)
+    # Nothing loaded, so there is no backdrop to show. Opaque black is the least
+    # misleading choice — transparent would let the widget background through and
+    # read as part of the artwork.
+    return (0, 0, 0)
+
+
 def render_tilemap(
     tilemap: Tilemap,
     sheet: TileSheet,
@@ -568,17 +736,16 @@ def render_tilemap(
     """
     pw, ph = tilemap.pixel_size()
     result = QImage(pw, ph, QImage.Format.Format_ARGB32)
-    result.fill(qRgba(0, 0, 0, 255))
+    # The GBA backdrop, not black — see backdrop_color(). Cells drawn from colour
+    # index 0 are transparent, so whatever is under them is what the user sees.
+    result.fill(qRgb(*backdrop_color(palette_set)))
 
-    use_palettes = (
-        palette_set is not None
-        and palette_set.palette_count() > 0
-        and sheet.image.format() == QImage.Format.Format_Indexed8
-    )
-
-    # Pre-build the 8bpp flat color table once for the whole render
+    # Pre-build the flat 256-colour table once for the whole render. Only the
+    # genuine-256-colour path consumes it — see recolor_tile_for_entry, which
+    # owns the decision about which path a sheet is on.
     flat_ct_8bpp = None
-    if use_palettes and sheet.is_8bpp:
+    if (palette_set is not None and palette_set.palette_count() > 0
+            and sheet.is_8bpp and palette_set.loaded_slot_count() <= 1):
         flat_ct_8bpp = build_flat_color_table(palette_set)
 
     painter = QPainter(result)
@@ -590,7 +757,7 @@ def render_tilemap(
             # Subtract offset to get the local index within this sheet.
             local_idx = entry.tile_index - tile_offset
             if tile_offset > 0 and (local_idx < 0 or local_idx >= sheet.tile_count):
-                # Tile belongs to a different sheet — render as dark grey
+                # Tile lives in a different sheet — leave the backdrop showing.
                 continue
 
             tile_img = sheet.get_tile_image(
@@ -598,17 +765,69 @@ def render_tilemap(
                 entry.hflip, entry.vflip,
             )
 
-            # Recolor with palette if applicable
-            if use_palettes and tile_img.format() == QImage.Format.Format_Indexed8:
-                if sheet.is_8bpp and flat_ct_8bpp:
-                    tile_img = _recolor_tile_8bpp(tile_img, flat_ct_8bpp)
-                else:
-                    tile_img = _recolor_tile(tile_img, entry.palette, palette_set)
+            tile_img = apply_palette_to_image(
+                tile_img, entry.palette, sheet, palette_set, flat_ct_8bpp)
 
             painter.drawImage(col * TILE_PX, row * TILE_PX, tile_img)
 
     painter.end()
     return result
+
+
+def apply_palette_to_image(
+    img: QImage,
+    pal_idx: int,
+    sheet: TileSheet,
+    palette_set: Optional[PaletteSet],
+    flat_ct_8bpp: Optional[List[int]] = None,
+) -> QImage:
+    """Colour one indexed image — a single tile, or a whole sheet — through the
+    palette that the GBA would actually use for it.
+
+    This is the ONLY place that decision is made. It used to be made in FOUR
+    places that did not agree:
+
+      * `render_tilemap` (full redraw, on load / resize / palette change),
+      * the canvas's per-cell repaint after a paint stroke,
+      * the tile picker's `paintEvent`, which draws the whole sheet,
+      * the selected-tile preview swatch.
+
+    Only the per-cell repaint handled the case where an 8bpp-stored sheet is
+    really a 4bpp asset whose cell palette bits pick a sub-palette. The other
+    three flattened it to one 256-colour table. So on `party_menu/bg.bin` 40% of
+    pixels differed between a full redraw and a paint stroke — a map loaded one
+    way, the cell you painted flipped to other colours, and the next redraw
+    flipped it back — while the picker and the preview showed a tile in colours
+    it would not have once placed. Every caller now comes through here.
+
+    `pal_idx` is the palette the cell (or the picker's selection) names.
+    `flat_ct_8bpp` is an optional pre-built table so a full render need not
+    rebuild it per cell; it is computed on demand when omitted.
+    """
+    if (palette_set is None
+            or palette_set.palette_count() == 0
+            or sheet.image.format() != QImage.Format.Format_Indexed8
+            or img.format() != QImage.Format.Format_Indexed8):
+        return img
+
+    if not sheet.is_8bpp:
+        return _recolor_tile(img, pal_idx, palette_set)
+
+    # An 8bpp-stored sheet is one of two different things, and they look alike
+    # on disk:
+    #   * a genuine 256-colour background — the pixel value indexes the whole
+    #     256-entry palette and hardware ignores the cell's palette bits;
+    #   * a 4bpp asset stored as 8bpp so several sub-palettes' worth of baked
+    #     colours are available while editing (the region map, party_menu/bg,
+    #     whose real engine asset is bg.4bpp) — here hardware DOES use the
+    #     cell's palette bits, together with the pixel's low four bits.
+    # More than one loaded sub-palette means the second case: those extra
+    # sub-palettes only exist so the palette bits have something to select.
+    if palette_set.loaded_slot_count() > 1:
+        return _recolor_tile_8bpp_attr(img, pal_idx, palette_set)
+    if flat_ct_8bpp is None:
+        flat_ct_8bpp = build_flat_color_table(palette_set)
+    return _recolor_tile_8bpp(img, flat_ct_8bpp)
 
 
 def _recolor_tile(
@@ -772,56 +991,61 @@ def detect_tile_palette(tile: QImage) -> int:
 
 
 def _pick_best_sheet(bin_path: str, sheets: List[str]) -> str:
-    """Pick the best tile sheet for a tilemap by checking tile coverage.
+    """Pick a tile sheet for a tilemap that has no same-named one, by coverage.
 
-    Reads the tilemap to find the max tile index, then picks the smallest
-    sheet that has enough tiles. This avoids choosing a large unrelated
-    sprite sheet (like rival.png with 72 tiles) over the correct smaller
-    sheet (like menu.png with 48 tiles) when the tilemap only uses 16 tiles.
+    Reads the tilemap's highest tile index, then returns the SMALLEST sheet that
+    has enough tiles to cover it. That keeps a large unrelated sprite sheet (say
+    `rival.png`, 72 tiles) from winning over the correct small one (`menu.png`,
+    48 tiles) when the tilemap only reaches index 16.
+
+    The previous implementation claimed to do that and did the opposite: it
+    sorted by `(image_width, -abs(tile_count - max_idx * 2))` descending, so it
+    took the WIDEST image — the large unrelated sheet the docstring warns about —
+    and, among equals, one with roughly twice as many tiles as needed (the factor
+    of two was never explained). Worse, no candidate qualifies at all whenever
+    the tilemap's indices are inflated, which happens for every byte-per-cell
+    `.bin` read as u16; it then fell through to `max(sheets, key=getsize)`, the
+    largest file IN BYTES, which says nothing about tile count. That is how
+    `party_menu/slot_main.bin` was paired with `pokeball.png` (32 tiles) while
+    the `bg.png` it belongs to (64 tiles) sat in the same candidate list.
+
+    When nothing covers the highest index, the most tiles is the most useful
+    guess, not the most bytes — and the tilemap probably needs a tile offset or
+    is not a u16 tilemap at all. Either way the editor's sheet dropdown is the
+    user's escape hatch, so this only has to be a good default.
     """
-    # Read max tile index from the bin file
     max_idx = 0
     try:
         with open(bin_path, "rb") as f:
             data = f.read()
-        for i in range(0, len(data), 2):
-            if i + 1 < len(data):
-                val = data[i] | (data[i + 1] << 8)
-                idx = val & 0x3FF
-                if idx > max_idx:
-                    max_idx = idx
+        for i in range(0, len(data) - 1, 2):
+            idx = (data[i] | (data[i + 1] << 8)) & 0x3FF
+            if idx > max_idx:
+                max_idx = idx
     except OSError:
         pass
 
-    # Find sheets that have enough tiles, prefer the smallest sufficient one
-    candidates = []
+    # One decode per candidate — `score()` used to re-decode the whole PNG on
+    # every sort comparison.
+    measured: List[Tuple[int, str]] = []
     for s in sheets:
         try:
             img = QImage(s)
             if img.isNull():
                 continue
-            tile_count = (img.width() // TILE_PX) * (img.height() // TILE_PX)
-            if tile_count > max_idx:
-                candidates.append((tile_count, s))
+            measured.append(
+                ((img.width() // TILE_PX) * (img.height() // TILE_PX), s))
         except Exception:
             continue
 
-    if candidates:
-        # Score candidates: prefer sheets that look like tile sheets
-        # (wider images = typical tile sheet layout) over small sprites.
-        # Among wide sheets, prefer closer tile count to what's needed.
-        def score(item):
-            tile_count, path = item
-            img = QImage(path)
-            width = img.width() if not img.isNull() else 0
-            # Primary: prefer wider images (tile sheets are typically 128px+)
-            # Secondary: among similar widths, prefer moderate tile count
-            return (width, -abs(tile_count - max_idx * 2))
-        candidates.sort(key=score, reverse=True)
-        return candidates[0][1]
+    if not measured:
+        return sheets[0] if sheets else ""
 
-    # Fallback: largest file
-    return max(sheets, key=lambda p: os.path.getsize(p))
+    # Sort by path as well so the choice is stable run to run.
+    covering = sorted(((n, p) for n, p in measured if n > max_idx))
+    if covering:
+        return covering[0][1]
+    return max(measured, key=lambda item: (item[0], item[1]))[1]
 
 
 @dataclass
@@ -832,6 +1056,16 @@ class TilemapAssets:
     pal_files: List[str]      # candidate .pal files
     best_sheet: str = ""      # best-guess tile sheet
     best_pals: List[str] = field(default_factory=list)
+    slot_pals: dict = field(default_factory=dict)
+    """VRAM palette slot -> palette file, where the engine states it.
+
+    `best_pals` is an ordered list that lands in slots 0, 1, 2… in order, which
+    is the right model for a split palette source. It is the WRONG model when a
+    tilemap's cells name specific slots: the move relearner's cells use slots 0
+    and 4, and dropping its one palette into slot 0 leaves slot 4 empty. This
+    carries the slot numbers the engine actually names so they can be loaded
+    where they belong. See `build_palette_set`.
+    """
 
 
 def discover_assets(bin_path: str) -> TilemapAssets:
@@ -882,11 +1116,51 @@ def discover_assets(bin_path: str) -> TilemapAssets:
         except OSError:
             pass
 
-    if not best_sheet and sheets:
-        # No exact name match — pick the best-fitting tile sheet.
-        # Read the tilemap to find the max tile index used, then pick the
-        # smallest sheet that has enough tiles to cover it (avoids picking
-        # a huge unrelated sprite sheet over a small but correct tile sheet).
+    # What the engine says beats both the name match and the heuristic: the
+    # `_Gfx` declared in the same block as this tilemap's `_Tilemap` IS the sheet
+    # it indexes into. Guessing from filenames and sizes got this wrong in both
+    # directions — `fame_checker/tilemap3.bin` has no name-mate at all and was
+    # paired by size with a character portrait instead of the `bg.png` the engine
+    # names, and `unused/blue_frame.bin` with an 8-tile `shadow.png` instead of
+    # `color_frames.png`.
+    engine_sheet = ""
+    engine_pals: List[str] = []
+    engine_slot_pals: dict = {}
+    try:
+        from core.tilemap_engine_index import facts_for_path, infer_game_dir
+        _facts = facts_for_path(bin_path)
+        if _facts is not None:
+            _game = infer_game_dir(bin_path)
+            for _slot, _pr in _facts.slot_palettes.items():
+                _cand = os.path.join(_game, *_pr.split("/"))
+                _stem = os.path.splitext(_cand)[0]
+                for _alt in (_stem + ".pal", _cand):
+                    if os.path.isfile(_alt):
+                        engine_slot_pals[_slot] = _alt
+                        break
+            if _facts.sheet_rel:
+                cand = os.path.join(_game, *_facts.sheet_rel.split("/"))
+                if os.path.isfile(cand):
+                    engine_sheet = cand
+            for pr in _facts.palette_rels:
+                cand = os.path.join(_game, *pr.split("/"))
+                # The authored `.pal` beside a `.gbapal` is the source of truth
+                # (the `.gbapal` is a build artifact), so prefer it when present.
+                stem = os.path.splitext(cand)[0]
+                for alt in (stem + ".pal", cand):
+                    if os.path.isfile(alt) and alt not in engine_pals:
+                        engine_pals.append(alt)
+                        break
+    except Exception:            # the index must never stop a tilemap opening
+        engine_sheet, engine_pals, engine_slot_pals = "", [], {}
+
+    if engine_sheet:
+        best_sheet = engine_sheet
+        if engine_sheet not in sheets:
+            sheets.insert(0, engine_sheet)
+    elif not best_sheet and sheets:
+        # The engine does not name a sheet for this one (64 of 285 covered
+        # tilemaps sit in a block with no `_Gfx`), so fall back to coverage.
         best_sheet = _pick_best_sheet(bin_path, sheets)
 
     # -- Palettes --
@@ -990,11 +1264,45 @@ def discover_assets(bin_path: str) -> TilemapAssets:
 
     split_pals = _numbered_jasc_pals()
 
+    def _split_sources_of(pal_path: str) -> list:
+        """The authored ``<stem><n>.pal`` sources behind a combined palette.
+
+        Same convention as ``_numbered_jasc_pals`` but keyed on the PALETTE's
+        own stem rather than the tilemap's, because the engine often names a
+        palette whose stem differs from the ``.bin`` (``summary_screen`` pages
+        all share one palette). Fewer than two is not a split pattern.
+        """
+        pdir = os.path.dirname(pal_path)
+        pstem = os.path.splitext(os.path.basename(pal_path))[0]
+        pat = _re.compile(r"^" + _re.escape(pstem) + r"(\d+)$")
+        found: list[tuple[int, str]] = []
+        try:
+            for f in os.listdir(pdir):
+                if not f.lower().endswith(".pal"):
+                    continue
+                m = pat.match(os.path.splitext(f)[0])
+                if m:
+                    found.append((int(m.group(1)), os.path.join(pdir, f)))
+        except OSError:
+            return []
+        if len(found) < 2:
+            return []
+        found.sort(key=lambda pair: pair[0])
+        return [p for _, p in found]
+
     if split_pals:
         # Multi-file split palette source — write back to each .pal in
         # order on save. The matching ``<stem>.gbapal`` (if present) is
         # a build artifact and stays out of ``best_pals``.
         best_pals = split_pals
+    elif engine_pals:
+        # The engine names this tilemap's palette in the same block as the
+        # tilemap itself, which beats matching on filename — the editor used to
+        # find nothing at all for 128 of 297 tilemaps and silently fall back to
+        # whatever colours the PNG happened to bake in.
+        best_pals = []
+        for p in engine_pals:
+            best_pals.extend(_split_sources_of(p) or [p])
     elif matching_pals:
         first_colors = _read_colors(matching_pals[0])
         if len(first_colors) > 16:
@@ -1023,4 +1331,5 @@ def discover_assets(bin_path: str) -> TilemapAssets:
         pal_files=pals,
         best_sheet=best_sheet,
         best_pals=best_pals,
+        slot_pals=engine_slot_pals,
     )

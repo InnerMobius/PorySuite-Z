@@ -455,10 +455,7 @@ class TilemapCanvas(QWidget):
         """Re-render a single tile and update display."""
         if not self._tilemap or not self._sheet or not self._rendered:
             return
-        from core.tilemap_data import (
-            _recolor_tile, _recolor_tile_8bpp, _recolor_tile_8bpp_attr,
-            build_flat_color_table,
-        )
+        from core.tilemap_data import apply_palette_to_image, backdrop_color
         entry = self._tilemap.get(col, row)
 
         # Apply tile offset
@@ -469,32 +466,22 @@ class TilemapCanvas(QWidget):
 
         tile_img = self._sheet.get_tile_image(idx, entry.hflip, entry.vflip)
 
-        use_palettes = (
-            self._palettes is not None
-            and self._palettes.palette_count() > 0
-            and self._sheet.image.format() == QImage.Format.Format_Indexed8
-        )
-        if use_palettes and tile_img.format() == QImage.Format.Format_Indexed8:
-            if self._sheet.is_8bpp:
-                # Region-map style: 8bpp PNG holds multiple sub-palettes
-                # baked side-by-side, but the GBA actually renders this
-                # as 4bpp with the .bin entry's attr-palette selecting
-                # which sub-palette to use. Render to MATCH the GBA so
-                # the editor canvas is WYSIWYG. If only one palette is
-                # loaded, fall through to flat 8bpp (true 256-color BG mode).
-                if self._palettes.palette_count() > 1:
-                    tile_img = _recolor_tile_8bpp_attr(
-                        tile_img, entry.palette, self._palettes)
-                else:
-                    flat_ct = build_flat_color_table(self._palettes)
-                    tile_img = _recolor_tile_8bpp(tile_img, flat_ct)
-            else:
-                tile_img = _recolor_tile(tile_img, entry.palette, self._palettes)
+        # Same single decision the full redraw uses, so a painted cell can never
+        # disagree with the redraw that follows it.
+        tile_img = apply_palette_to_image(
+            tile_img, entry.palette, self._sheet, self._palettes)
 
         painter = QPainter(self._rendered)
-        # Use Source mode so transparent pixels overwrite (erase) old content
-        # instead of alpha-blending on top of the previous tile
+        # Lay the backdrop down over the old cell first, then draw the tile on
+        # top of it — the same two steps render_tilemap does with its fill plus
+        # the default SourceOver. Drawing the tile alone in Source mode used to
+        # punch colour-0 pixels through to transparent, so a blank cell looked
+        # one way after a paint and another way after the next full redraw.
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        painter.fillRect(col * TILE_PX, row * TILE_PX, TILE_PX, TILE_PX,
+                         QColor(*backdrop_color(self._palettes)))
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceOver)
         painter.drawImage(col * TILE_PX, row * TILE_PX, tile_img)
         painter.end()
         self.update()
@@ -743,29 +730,14 @@ class TilePickerWidget(QWidget):
         z = self._zoom
         img = self._sheet.image
 
-        # Draw the tile sheet
-        if (self._palettes and self._palettes.palette_count() > 0
-                and img.format() == QImage.Format.Format_Indexed8):
-            if self._sheet.is_8bpp:
-                # 8bpp: apply full 256-color table
-                from core.tilemap_data import (
-                    _recolor_tile_8bpp, build_flat_color_table,
-                )
-                flat_ct = build_flat_color_table(self._palettes)
-                recolored = _recolor_tile_8bpp(img, flat_ct)
-            else:
-                # 4bpp: recolor with selected sub-palette
-                from core.tilemap_data import _recolor_tile
-                recolored = _recolor_tile(img, self._pal_idx, self._palettes)
-            p.drawImage(
-                QRect(0, 0, img.width() * z, img.height() * z),
-                recolored,
-            )
-        else:
-            p.drawImage(
-                QRect(0, 0, img.width() * z, img.height() * z),
-                img,
-            )
+        # Draw the tile sheet through the one shared palette decision, so a tile
+        # looks in the picker exactly as it will look once placed on the canvas.
+        from core.tilemap_data import apply_palette_to_image
+        p.drawImage(
+            QRect(0, 0, img.width() * z, img.height() * z),
+            apply_palette_to_image(img, self._pal_idx, self._sheet,
+                                   self._palettes),
+        )
 
         # Highlight selected tile
         tw = self._sheet.tiles_wide
@@ -915,6 +887,15 @@ class TilemapEditorTab(QWidget):
 
     def set_project(self, project_dir: str):
         self._project_dir = project_dir
+        # Re-read the engine facts for tilemaps (cell size, declared width, which
+        # sheet and palettes each .bin belongs to). This runs on project open AND
+        # on F5, which is what makes a tilemap the project added since the last
+        # parse — plus the C that references it — visible without a restart.
+        try:
+            from core.tilemap_engine_index import clear_engine_index
+            clear_engine_index()
+        except Exception:
+            pass
         if hasattr(self, '_anim_viewer'):
             self._anim_viewer.set_project(project_dir)
         # Palette Baker is project-aware too — pass the root through so
@@ -1366,7 +1347,13 @@ class TilemapEditorTab(QWidget):
         # if the file shrank under our cache.
         if pref is not None:
             pref_h = pref[1]
-            if pref_h > 0 and pref_w * pref_h == len(tilemap.entries):
+            # Accept the saved height whenever it can SHOW every cell. Requiring
+            # `pref_w * pref_h` to equal the count exactly threw the height away
+            # for any map with a legitimate partial last row — 216 cells at 32
+            # wide is 6.75 rows, so a saved 7 was refused and the user's layout
+            # silently reverted every time they reopened it. Too small would
+            # hide cells, so that is still refused.
+            if pref_h > 0 and pref_w > 0 and pref_w * pref_h >= len(tilemap.entries):
                 tilemap.height = pref_h
 
         self._tilemap = tilemap
@@ -1411,19 +1398,12 @@ class TilemapEditorTab(QWidget):
             except Exception:
                 pass
 
-        # Load palettes — prefer name-matching .pal files, otherwise
-        # use PNG's own color table (almost always the correct palette
-        # when there's no dedicated .pal file for this tilemap)
-        self._palettes = None
-        if assets.best_pals:
-            try:
-                self._palettes = PaletteSet.from_pal_files(assets.best_pals)
-            except Exception:
-                pass
-        # Fallback: extract palette from tile sheet image
-        if (not self._palettes or self._palettes.palette_count() == 0) and self._sheet:
-            self._palettes = PaletteSet.from_indexed_image(self._sheet.image)
-            # Set palette source combo to "PNG colors" when using fallback
+        # Load palettes through the one shared builder, which also places any
+        # slot the engine names at that slot rather than in file order.
+        from core.tilemap_data import build_palette_set
+        self._palettes = build_palette_set(assets, self._sheet)
+        if not assets.best_pals and not assets.slot_pals and self._palettes:
+            # Nothing but the PNG's own colour table — say so in the combo.
             self._pal_source_combo.blockSignals(True)
             idx = self._pal_source_combo.findText("PNG colors")
             if idx >= 0:
@@ -1520,17 +1500,35 @@ class TilemapEditorTab(QWidget):
 
         # Palette info: show loaded slot count and .pal file count
         loaded_slots = self._palettes.loaded_slot_count() if self._palettes else 0
-        pal_file_count = len(assets.best_pals)
+        pal_file_count = len(assets.best_pals) + len(assets.slot_pals)
         if is_8bpp:
             pal_info = f"256-color palette ({loaded_slots} sub-palettes from {pal_file_count} .pal)"
         else:
             pal_info = f"{loaded_slots} palette(s) from {pal_file_count} .pal"
 
+        # Say where the size came from, so "18x12" being right is not a
+        # coincidence the user has to take on trust.
+        size_note = {"engine": " (from the game source)",
+                     "explicit": " (saved)"}.get(tilemap.width_source, "")
+        cell_note = "  1 byte/cell" if tilemap.cell_bytes == 1 else ""
+
+        # Cells naming a palette slot nothing fills get drawn in palette 0, and
+        # that substitution used to be silent — the single most confusing way
+        # for a screen to come out the wrong colour. Name the slots instead.
+        from core.tilemap_data import unresolved_slots
+        missing = unresolved_slots(tilemap, self._palettes)
+        miss_note = ""
+        if missing:
+            which = ", ".join(str(s) for s in missing)
+            miss_note = (f"  —  ⚠ no palette loaded for slot{'s' if len(missing) > 1 else ''}"
+                         f" {which} (drawn in palette 0)")
+
         self._status.setText(
-            f"{parent}/{fname} — {tilemap.width}x{tilemap.height} tiles"
+            f"{parent}/{fname} — {tilemap.width}x{tilemap.height} tiles{size_note}"
             f" — Sheet: {sheet_name} ({bpp_mode})"
             f" — {pal_info}"
             f" — Max tile: {max_idx}"
+            f"{cell_note}{miss_note}"
         )
 
         self._update_pal_editor()
@@ -2661,12 +2659,11 @@ class TilemapEditorTab(QWidget):
         """Reload palettes from .pal files associated with the current tilemap."""
         if not self._tilemap or not self._tilemap.source_path:
             return
-        from core.tilemap_data import PaletteSet, discover_assets
+        from core.tilemap_data import build_palette_set, discover_assets
         assets = discover_assets(self._tilemap.source_path)
-        if assets.best_pals:
-            self._palettes = PaletteSet.from_pal_files(assets.best_pals)
-        else:
-            self._palettes = PaletteSet()
+        # Same builder as the load path, so a reload cannot land on a different
+        # set of palettes than the open did.
+        self._palettes = build_palette_set(assets, self._sheet)
 
     def _refresh_canvas(self):
         """Re-render the canvas with current tile offset and palettes."""
@@ -2913,19 +2910,12 @@ class TilemapEditorTab(QWidget):
     def _update_tile_preview(self):
         if not self._sheet:
             return
+        from core.tilemap_data import apply_palette_to_image
         tile = self._sheet.get_tile_image(
             self._current_tile, self._hflip, self._vflip)
-        if (self._palettes and self._palettes.palette_count() > 0
-                and tile.format() == QImage.Format.Format_Indexed8):
-            if self._sheet.is_8bpp:
-                from core.tilemap_data import (
-                    _recolor_tile_8bpp, build_flat_color_table,
-                )
-                flat_ct = build_flat_color_table(self._palettes)
-                tile = _recolor_tile_8bpp(tile, flat_ct)
-            else:
-                from core.tilemap_data import _recolor_tile
-                tile = _recolor_tile(tile, self._current_pal, self._palettes)
+        # One shared palette decision — see apply_palette_to_image.
+        tile = apply_palette_to_image(
+            tile, self._current_pal, self._sheet, self._palettes)
         # Scale up for preview (matches the 32x32 inline preview widget)
         scaled = tile.scaled(
             32, 32,

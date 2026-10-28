@@ -1290,6 +1290,15 @@ QTabBar::tab:hover:!selected {
             _spbus().clear()
         except Exception:
             pass
+        # The parsed engine facts for tilemaps (cell size, declared width, which
+        # sheet and palettes each .bin belongs to) are read from the game's C
+        # source once per project. A new or refreshed project has different
+        # source, so the previous parse must not shadow it.
+        try:
+            from core.tilemap_engine_index import clear_engine_index
+            clear_engine_index()
+        except Exception:
+            pass
         # Same class of cross-tab cache, so it is cleared in the same place:
         # the overworld sprite/palette model that read-only viewers share.
         # Without this a viewer keeps drawing icons from the PRE-EDIT parse
