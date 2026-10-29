@@ -1697,9 +1697,19 @@ class TilemapEditorTab(QWidget):
                 disk_img = QImage(sheet_path)
                 if not disk_img.isNull():
                     if disk_img.format() != QImage.Format.Format_Indexed8:
-                        disk_img = disk_img.convertToFormat(
-                            QImage.Format.Format_Indexed8)
-                    if disk_img.format() == QImage.Format.Format_Indexed8:
+                        # Do NOT convertToFormat here. Qt QUANTISES a
+                        # non-indexed image into a table of up to 256 colours,
+                        # and baking a 16-colour palette over that leaves most
+                        # pixels pointing at colours that do not exist — the
+                        # corruption fixed on 2026-10-29. Report and leave the
+                        # sheet alone.
+                        errors.append(
+                            f"{_os.path.basename(sheet_path)}: not an indexed "
+                            f"(paletted) PNG, so the palette cannot be baked "
+                            f"into it. Re-index it first; the file was not "
+                            f"changed."
+                        )
+                    else:
                         # For multi-palette sheets, bake the flat 256-color
                         # table. For single-palette sheets, just the 16.
                         ct_colors = (out_colors
@@ -1709,9 +1719,12 @@ class TilemapEditorTab(QWidget):
                                               transparent_index=-1):
                             wrote.append(_os.path.basename(sheet_path))
                         else:
+                            # Say the REAL reason — there are two now, and
+                            # "not indexed" is no longer the only one.
+                            from core.gba_image_utils import last_export_error
                             errors.append(
                                 f"{_os.path.basename(sheet_path)}: "
-                                f"refused (not indexed)"
+                                f"{last_export_error()}"
                             )
             except Exception as exc:
                 errors.append(f"{_os.path.basename(sheet_path)}: {exc}")

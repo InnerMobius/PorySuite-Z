@@ -145,23 +145,63 @@ class ItemsEditorEnumTest(unittest.TestCase):
         self.assertEqual(out["battleUsage"], "SOME_USAGE")
 
     def test_name_field_default_cap_is_thirteen(self):
-        # ITEM_NAME_LENGTH(14) - 1 = 13 max displayable chars.
+        # ITEM_NAME_LENGTH(14) - 1 = 13 usable BYTES.
+        #
+        # UPDATED 2026-10-29. This used to assert maxLength() == 13, but that
+        # character cap WAS the corruption: QLineEdit.setMaxLength truncates
+        # inside setText(), so loading '{POKEBLOCK} CASE' (16 characters, 10
+        # charmap bytes, comfortably inside the 14-byte buffer) shortened the
+        # stored name to '{POKEBLOCK} C' before the user touched anything, and
+        # editing any other field then saved the shortened name.
+        #
+        # The limit is now measured in encoded bytes and enforced on commit
+        # (see ItemDetailPanel.collect), never by the widget. maxLength must
+        # therefore be LARGE enough never to truncate a stored name.
         panel = self._panel()
-        self.assertEqual(panel.f_name.maxLength(), 13)
+        self.assertEqual(panel._usable_name_bytes(), 13)
+        self.assertGreater(panel.f_name.maxLength(), 13)
+        self.assertEqual(panel.f_name.maxLength(), panel._TYPING_CEILING)
 
-    def test_set_name_limit_blocks_overlong_input(self):
+    def test_set_name_limit_rejects_overlong_input(self):
+        # RENAMED AND REWRITTEN 2026-10-29: it used to assert that the widget
+        # TRUNCATED at the cap. Truncating is the corruption — it silently
+        # destroyed '{POKEBLOCK} CASE'. An over-limit name must instead be
+        # REFUSED on commit, leaving the previous value intact.
         panel = self._panel()
         panel.set_name_limit(13)
-        self.assertEqual(panel.f_name.maxLength(), 13)
-        panel.f_name.setText("ABCDEFGHIJKLMNOPQRST")   # 20 chars
-        self.assertEqual(len(panel.f_name.text()), 13)   # blocked at the cap
+        self.assertEqual(panel._usable_name_bytes(), 13)
+
+        base = {"english": "Potion"}
+        panel.f_name.setText("ABCDEFGHIJKLMNOPQRST")      # 20 characters
+        self.assertEqual(len(panel.f_name.text()), 20,
+                         "typing must not be truncated")
+
+        # This panel has no project, so there is no charmap and NOTHING can be
+        # measured. Deliberately, unmeasurable text is never refused: guessing
+        # a byte count could reject a name the engine would have accepted, and
+        # a custom {CODE} is exactly that case. So the text passes through
+        # unchanged rather than being trimmed.
+        self.assertEqual(panel.collect(base)["english"],
+                         "ABCDEFGHIJKLMNOPQRST",
+                         "without a charmap the text must pass through intact")
+        self.assertIn("?", panel._name_counter.text(),
+                      "the counter must say it cannot measure")
+
+        # Actual rejection, measured against the real project's charmap, is
+        # covered by tests/test_item_name_bytes.py.
+        panel.f_name.setText("Elixir")
+        self.assertEqual(panel.collect(base)["english"], "Elixir")
 
     def test_set_name_limit_follows_project(self):
-        # A project that widened ITEM_NAME_LENGTH to 20 -> cap 19.
+        # A project that widened ITEM_NAME_LENGTH to 20 -> 19 usable bytes.
+        # The limit must follow the project, not a hardcoded number; it is now
+        # carried as a byte budget rather than a widget character cap.
         panel = self._panel()
         panel.set_name_limit(19)
-        self.assertEqual(panel.f_name.maxLength(), 19)
+        self.assertEqual(panel._usable_name_bytes(), 19)
         self.assertIn("/19", panel._name_counter.text())
+        self.assertGreater(panel.f_name.maxLength(), 19,
+                           "the widget must never be the limit")
 
     def test_unknown_extra_fields_survive(self):
         # collect() starts from the base dict, so project-added fields the

@@ -219,14 +219,13 @@ class DataManagerGenerationTest(unittest.TestCase):
         self.create_project()
 
     def test_json_generated(self):
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -249,7 +248,10 @@ class DataManagerGenerationTest(unittest.TestCase):
         self.assertEqual(starters[0]["species"], "SPECIES_TEST")
         self.assertEqual(starters[0]["level"], 5)
         self.assertEqual(starters[0]["item"], "ITEM_TEST")
-        self.assertEqual(starters[0]["ability_num"], 1)
+        # No ability assertion: the starters ability section was removed
+        # deliberately in v0.0.6b ("was broken + non-editable"), so starters.json
+        # no longer carries ability_num.
+        self.assertNotIn("ability_num", starters[0])
 
         # Ensure species names were stored
         with open(
@@ -267,14 +269,13 @@ class DataManagerGenerationTest(unittest.TestCase):
         ))
 
     def test_pokedex_info_merged(self):
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -296,14 +297,13 @@ class DataManagerGenerationTest(unittest.TestCase):
         self.tempdir.cleanup()
         self.create_project(SPECIES_INFO_MISMATCH)
 
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -340,14 +340,13 @@ class DataManagerGenerationTest(unittest.TestCase):
                 "#define NUM_SPECIES SPECIES_EGG\n"
             )
 
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -371,14 +370,13 @@ class MissingItemsJsonRegressionTest(unittest.TestCase):
         self.tempdir.cleanup()
 
     def load_manager(self):
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module

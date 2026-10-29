@@ -2533,6 +2533,14 @@ class GraphicsTabWidget(QWidget):
         self._shiny_pal_dirty.add(sp)      # writes shiny.pal
         self._sprite_png_dirty.add(sp)
 
+        # Push BOTH palettes on the shared bus so every other view of this
+        # species recolours now, not after a save + reload (Sprite Rendering
+        # Pipeline rule: an import must push like a swatch edit does).
+        _get_palette_bus().set_pokemon_palette(
+            sp, "normal", self._palettes[sp]["normal"])
+        _get_palette_bus().set_pokemon_palette(
+            sp, "shiny", self._palettes[sp]["shiny"])
+
         # Menu icon (separate shared-palette path) if provided.
         icon_img = _load("icon")
         if icon_img is not None:
@@ -2898,6 +2906,13 @@ class GraphicsTabWidget(QWidget):
         else:
             self._normal_pal_dirty.add(self._current_species)
 
+        # Push on the shared bus so every other view of this species recolours
+        # now rather than after a save + reload (Sprite Rendering Pipeline rule:
+        # an import must push like a swatch edit does).
+        _get_palette_bus().set_pokemon_palette(
+            self._current_species, key, colors,
+        )
+
         # Update the swatch row display
         self._loading = True
         try:
@@ -3037,6 +3052,15 @@ class GraphicsTabWidget(QWidget):
         finally:
             self._loading = False
 
+        # Broadcast on the SAME bus a swatch edit uses, so the Pokedex panel,
+        # the species tree icons, the starter previews and the Info-tab front
+        # sprite recolour immediately instead of showing the old palette until
+        # the next save + reload. CLAUDE.md's Sprite Rendering Pipeline rule
+        # names "import" explicitly as a path that must push.
+        _get_palette_bus().set_pokemon_palette(
+            self._current_species, key, colors,
+        )
+
         # Refresh the battle scene preview if this side is currently shown
         show_shiny = self._preview_shiny
         if (is_shiny and show_shiny) or (not is_shiny and not show_shiny):
@@ -3092,38 +3116,75 @@ class GraphicsTabWidget(QWidget):
             # SHINY-only changes: write shiny.pal and NOTHING else. The normal
             # front/back PNGs are never touched — that's the whole point of
             # importing a shiny palette without disturbing the normal graphics.
+            # A species whose .pal write FAILED keeps its dirty flag. Clearing
+            # it unconditionally (as this did before 2026-10-29) meant a failed
+            # write silently forgot the user's palette edit with no way to
+            # retry it.
+            _shiny_failed: set[str] = set()
             for sp in list(self._shiny_pal_dirty):
                 if sp in self._normal_pal_dirty:
                     continue  # handled below (writes both pals)
                 _, spath = self._pal_paths_for(sp)
                 shiny_colors = (self._palettes.get(sp) or {}).get("shiny")
-                if shiny_colors and write_jasc_pal(spath, shiny_colors):
+                if not shiny_colors:
+                    # No shiny palette for this species at all. Nothing to
+                    # write and nothing wrong — reporting this as an error
+                    # produced a spurious warning.
+                    continue
+                if write_jasc_pal(spath, shiny_colors):
                     total_ok += 1
                 else:
-                    all_errors.append(f"pal-shiny:{sp}")
-            self._shiny_pal_dirty.clear()
+                    _shiny_failed.add(sp)
+                    all_errors.append(
+                        f"{sp} shiny palette could not be written to "
+                        f"{os.path.basename(spath)} — check the file is not "
+                        f"read-only. Your edit is still unsaved.")
+            self._shiny_pal_dirty.intersection_update(_shiny_failed)
 
             # NORMAL palette changes: write normal.pal (+ shiny.pal if it also
             # changed) AND re-bake the front/back PNGs so their baked colour
             # table matches the new normal.pal.
+            #
+            # Species whose PNG bake was refused are collected here so their
+            # pending pixel-remap flag survives instead of being dropped.
+            _png_bake_failed: set[str] = set()
+            _pal_failed: set[str] = set()
             for sp in list(self._normal_pal_dirty):
                 npath, spath = self._pal_paths_for(sp)
                 pal = self._palettes.get(sp, {})
                 normal_colors = pal.get("normal")
-                if normal_colors and write_jasc_pal(npath, normal_colors):
+                if not normal_colors:
+                    # Nothing staged for this species; not an error.
+                    continue
+                if write_jasc_pal(npath, normal_colors):
                     total_ok += 1
                 else:
-                    all_errors.append(f"pal-normal:{sp}")
-                if pal.get("shiny") and write_jasc_pal(spath, pal["shiny"]):
-                    total_ok += 1
-                else:
-                    all_errors.append(f"pal-shiny:{sp}")
+                    _pal_failed.add(sp)
+                    all_errors.append(
+                        f"{sp} normal palette could not be written to "
+                        f"{os.path.basename(npath)} — check the file is not "
+                        f"read-only. Your edit is still unsaved.")
+                if pal.get("shiny"):
+                    if write_jasc_pal(spath, pal["shiny"]):
+                        total_ok += 1
+                    else:
+                        _pal_failed.add(sp)
+                        all_errors.append(
+                            f"{sp} shiny palette could not be written to "
+                            f"{os.path.basename(spath)} — check the file is "
+                            f"not read-only. Your edit is still unsaved.")
 
-                # Bake normal palette into front/back PNGs.
-                # export_indexed_png refuses non-Indexed8 input (would
-                # otherwise produce an RGB PNG that breaks gbagfx during
-                # the build), so guarantee Indexed8 by loading from disk
-                # and converting if the in-memory copy isn't indexed.
+                # Bake normal palette into front/back PNGs so opening the .png
+                # in an art tool shows the current colours.
+                #
+                # Do NOT "guarantee Indexed8" by calling convertToFormat on a
+                # non-indexed sprite. That is what caused the corruption fixed
+                # on 2026-10-29: convertToFormat QUANTISES, inventing a table
+                # of up to 256 colours, and the result's pixel indices then
+                # point far past a 16-colour palette. Writing it produced a PNG
+                # that gbagfx accepted and reduced with `index % 16`, so the
+                # build SUCCEEDED and shipped a garbled sprite. A sprite that
+                # is not already indexed is REPORTED and left alone instead.
                 if not normal_colors:
                     continue
                 paths = self._sprite_paths.get(sp, {})
@@ -3140,8 +3201,17 @@ class GraphicsTabWidget(QWidget):
                         if disk_img.isNull():
                             continue
                         if disk_img.format() != QImage.Format.Format_Indexed8:
-                            disk_img = disk_img.convertToFormat(
-                                QImage.Format.Format_Indexed8)
+                            # Not an indexed sprite — say so and leave the file
+                            # alone. Converting it here is the corruption bug.
+                            _png_bake_failed.add(sp)
+                            all_errors.append(
+                                f"{sp} {key} sprite not written — it is not an "
+                                f"indexed (paletted) PNG, so the palette cannot "
+                                f"be baked into it. Re-index it to "
+                                f"{len(normal_colors)} colours first (Import "
+                                f"PNG Manually, or the Image Indexer). The "
+                                f"file on disk was not changed.")
+                            continue
                         img = disk_img
                     try:
                         if export_indexed_png(img, normal_colors, path,
@@ -3150,18 +3220,36 @@ class GraphicsTabWidget(QWidget):
                             # remap-only flag for this species.
                             pass
                         else:
+                            # Say WHY. There are two refusal reasons now (not
+                            # indexed, or pixels outside the palette) and the
+                            # second is the one that used to corrupt silently.
+                            from core.gba_image_utils import last_export_error
+                            _png_bake_failed.add(sp)
                             all_errors.append(
-                                f"sprite-png-bake-{key}:{sp} "
-                                f"(refused — not indexed)")
+                                f"{sp}: the new palette WAS saved and the game "
+                                f"will use it, but it could not also be stamped "
+                                f"into {key}.png for art tools to see — "
+                                f"{last_export_error()}")
                     except Exception as exc:
+                        _png_bake_failed.add(sp)
                         all_errors.append(
-                            f"sprite-png-bake-{key}:{sp} ({exc})")
+                            f"{sp}: the new palette WAS saved, but stamping it "
+                            f"into {key}.png failed ({exc}). The sprite file is "
+                            f"unchanged.")
                 # Pixel-remap flag (Index-as-Background) is handled by
                 # Pass 2 below — but if we just baked the new color
                 # table, the disk PNG matches our in-memory state, so
-                # we can drop the flag preemptively.
-                self._sprite_png_dirty.discard(sp)
-            self._normal_pal_dirty.clear()
+                # we can drop the flag preemptively. A species whose bake
+                # was REFUSED keeps its flag so the pending pixel remap is
+                # not silently discarded.
+                if sp not in _png_bake_failed:
+                    self._sprite_png_dirty.discard(sp)
+            # Keep the flag only for species whose .pal write actually FAILED.
+            # A refused PNG bake does NOT keep it: the .pal (which is what the
+            # game reads) was written successfully, so the palette edit IS
+            # saved — only the PNG's embedded table, which art tools read, is
+            # stale. That is reported separately above.
+            self._normal_pal_dirty.intersection_update(_pal_failed)
             # Icon palettes
             for idx in list(self._icon_pal_dirty):
                 path = icon_palette_pal_path(self._project_root, idx)
@@ -3176,6 +3264,10 @@ class GraphicsTabWidget(QWidget):
             # with the NORMAL palette baked into the colour table (that
             # matches pokefirered's build convention — front.png is an
             # indexed PNG whose palette ordering lines up with normal.pal).
+            # A species whose write was REFUSED keeps its dirty flag, so the
+            # pending edit survives for another attempt instead of being
+            # silently dropped by an unconditional clear.
+            _png_failed: set[str] = set()
             for sp in list(self._sprite_png_dirty):
                 imgs = self._sprite_imgs.get(sp, {})
                 paths = self._sprite_paths.get(sp, {})
@@ -3189,13 +3281,18 @@ class GraphicsTabWidget(QWidget):
                     if export_indexed_png(img, pal, path, transparent_index=0):
                         total_ok += 1
                     else:
-                        all_errors.append(f"sprite-png-{key}:{sp}")
-            self._sprite_png_dirty.clear()
+                        from core.gba_image_utils import last_export_error
+                        _png_failed.add(sp)
+                        all_errors.append(
+                            f"{sp} {key} sprite not written — "
+                            f"{last_export_error()}")
+            self._sprite_png_dirty.intersection_update(_png_failed)
 
             # Imported menu icons — fit the raw artwork onto the shared icon
             # palette this species uses (respecting any slot change), bake that
             # shared palette into icon.png (index 0 transparent) so the on-disk
             # PNG matches what the game will render.
+            _icon_failed: set[str] = set()
             for sp in list(self._icon_png_dirty):
                 path = (self._sprite_paths.get(sp, {}) or {}).get("icon", "")
                 if not path:
@@ -3211,12 +3308,16 @@ class GraphicsTabWidget(QWidget):
                     total_ok += 1
                     self._icon_import_src.pop(sp, None)
                 else:
-                    all_errors.append(f"icon-png:{sp}")
-            self._icon_png_dirty.clear()
+                    from core.gba_image_utils import last_export_error
+                    _icon_failed.add(sp)
+                    all_errors.append(
+                        f"{sp} menu icon not written — {last_export_error()}")
+            self._icon_png_dirty.intersection_update(_icon_failed)
 
             # Imported footprints — 2-colour indexed PNG (white bg = index 0,
             # black mark = index 1). No transparent slot (footprints are opaque
             # black/white and build to 1bpp).
+            _foot_failed: set[str] = set()
             for sp in list(self._footprint_png_dirty):
                 img = (self._sprite_imgs.get(sp, {}) or {}).get("footprint")
                 path = (self._sprite_paths.get(sp, {}) or {}).get(
@@ -3229,6 +3330,9 @@ class GraphicsTabWidget(QWidget):
                                       transparent_index=-1):
                     total_ok += 1
                 else:
-                    all_errors.append(f"footprint-png:{sp}")
-            self._footprint_png_dirty.clear()
+                    from core.gba_image_utils import last_export_error
+                    _foot_failed.add(sp)
+                    all_errors.append(
+                        f"{sp} footprint not written — {last_export_error()}")
+            self._footprint_png_dirty.intersection_update(_foot_failed)
         return total_ok, all_errors

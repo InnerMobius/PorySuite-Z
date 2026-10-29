@@ -22,14 +22,13 @@ sys.modules.setdefault("PyQt6.QtCore", qt_core)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
 
 # Load the extractor module without running the plugin package __init__
-pkg_name = "plugins.pokefirered"
-sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+pkg_name = "core"
 pkg_module = types.ModuleType(pkg_name)
-pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
 sys.modules[pkg_name] = pkg_module
 spec = importlib.util.spec_from_file_location(
     f"{pkg_name}.pokemon_data_extractor",
-    os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data_extractor.py"),
+    os.path.join(ROOT_DIR, "core", "pokemon_data_extractor.py"),
 )
 pdextractor = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = pdextractor

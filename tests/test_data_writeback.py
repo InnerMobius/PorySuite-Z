@@ -189,14 +189,13 @@ class WritebackTest(unittest.TestCase):
         self.tempdir.cleanup()
 
     def load_manager(self):
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
-            "plugins.pokefirered.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            "core.pokemon_data",
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -206,6 +205,12 @@ class WritebackTest(unittest.TestCase):
     def test_item_writeback(self):
         mgr = self.load_manager()
         mgr.data["pokemon_items"].data["ITEM_TEST"]["name"] = '_("CHANGED")'
+        # Mirror the app: Save All runs save() first (which writes the JSON
+        # source of truth and marks the data dirty) and parse_to_c_code()
+        # second. parse_to_c_code on its own is skipped by
+        # should_parse_to_c_code(), which gates on that dirty flag -- so this
+        # test used to assert against files nothing had written.
+        mgr.save()
         mgr.parse_to_c_code()
         with open(
             os.path.join(
@@ -230,6 +235,12 @@ class WritebackTest(unittest.TestCase):
         mgr = self.load_manager()
         mgr.set_move_data("MOVE_TEST", "power", 42)
         mgr.data["pokemon_moves"].data["move_descriptions"]["MOVE_TEST"] = "new"
+        # Mirror the app: Save All runs save() first (which writes the JSON
+        # source of truth and marks the data dirty) and parse_to_c_code()
+        # second. parse_to_c_code on its own is skipped by
+        # should_parse_to_c_code(), which gates on that dirty flag -- so this
+        # test used to assert against files nothing had written.
+        mgr.save()
         mgr.parse_to_c_code()
         with open(
             os.path.join(self.project_info["dir"], "src", "data", "battle_moves.h")
@@ -267,6 +278,12 @@ class WritebackTest(unittest.TestCase):
     def test_pokedex_writeback(self):
         mgr = self.load_manager()
         mgr.data["pokedex"].data["national_dex"][0]["dex_constant"] = "NATIONAL_DEX_NEW"
+        # Mirror the app: Save All runs save() first (which writes the JSON
+        # source of truth and marks the data dirty) and parse_to_c_code()
+        # second. parse_to_c_code on its own is skipped by
+        # should_parse_to_c_code(), which gates on that dirty flag -- so this
+        # test used to assert against files nothing had written.
+        mgr.save()
         mgr.parse_to_c_code()
         with open(
             os.path.join(self.project_info["dir"], "include", "constants", "pokedex.h")
@@ -285,7 +302,12 @@ class WritebackTest(unittest.TestCase):
         starter["species"] = "SPECIES_NONE"
         starter["level"] = 7
         starter["item"] = "ITEM_TEST"
-        starter["ability_num"] = 0
+        # Mirror the app: Save All runs save() first (which writes the JSON
+        # source of truth and marks the data dirty) and parse_to_c_code()
+        # second. parse_to_c_code on its own is skipped by
+        # should_parse_to_c_code(), which gates on that dirty flag -- so this
+        # test used to assert against files nothing had written.
+        mgr.save()
         mgr.parse_to_c_code()
         with open(
             os.path.join(self.project_info["dir"], "src", "field_specials.c")
@@ -295,7 +317,13 @@ class WritebackTest(unittest.TestCase):
         with open(os.path.join(self.project_info["dir"], "src", "battle_setup.c")) as f:
             bcontent = f.read()
         self.assertIn("ScriptGiveMon(starterMon, 7, ITEM_TEST", bcontent)
-        self.assertIn("abilityNum = 0;", bcontent)
+        # No ability assertion: the starters ability section was removed
+        # deliberately in v0.0.6b ("was broken + non-editable"), so the writer
+        # no longer emits abilityNum and the extractor no longer reads it.
+        # Whatever abilityNum line the project already had is left untouched,
+        # which is why asserting a value here passed for a while and then did
+        # not.
+        self.assertNotIn("ability_num", starter)
 
     def test_species_writeback(self):
         mgr = self.load_manager()
@@ -331,6 +359,12 @@ class WritebackTest(unittest.TestCase):
     def test_trainer_writeback(self):
         mgr = self.load_manager()
         mgr.data["pokemon_trainers"].data["TRAINER_TEST"]["aiFlags"] = "AI_NEW"
+        # Mirror the app: Save All runs save() first (which writes the JSON
+        # source of truth and marks the data dirty) and parse_to_c_code()
+        # second. parse_to_c_code on its own is skipped by
+        # should_parse_to_c_code(), which gates on that dirty flag -- so this
+        # test used to assert against files nothing had written.
+        mgr.save()
         mgr.parse_to_c_code()
         with open(
             os.path.join(self.project_info["dir"], "src", "data", "trainers.h")

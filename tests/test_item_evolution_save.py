@@ -86,14 +86,13 @@ class ItemEvolutionSaveTest(unittest.TestCase):
         self.tempdir.cleanup()
 
     def load_manager(self):
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module

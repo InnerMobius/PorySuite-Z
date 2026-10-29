@@ -23,13 +23,14 @@ from PyQt6.QtWidgets import (
     QCheckBox, QProgressBar, QMessageBox, QFrame, QSizePolicy,
     QStackedWidget, QWidget, QTextEdit, QRadioButton, QButtonGroup,
     QScrollArea, QGridLayout, QListWidget, QListWidgetItem,
-    QAbstractItemView,
 )
 
 from core.sound.voicegroup_parser import (
     count_real_instruments, is_filler_instrument, nearest_real_slot,
 )
 from ui.custom_widgets.scroll_guard import install_scroll_guard
+from ui.custom_widgets.reorderable_list import (
+    ReorderableListWidget, reorder_rows)
 
 
 # Page indices
@@ -1126,12 +1127,12 @@ class MidiImportDialog(QDialog):
         order_layout.itemAt(0).widget().setStyleSheet(
             "color: #888; font-size: 10px;")
 
-        self._order_list = QListWidget()
+        self._order_list = ReorderableListWidget()
         self._order_list.setAlternatingRowColors(True)
-        self._order_list.setDragDropMode(
-            QAbstractItemView.DragDropMode.InternalMove)
         self._order_list.currentRowChanged.connect(
             self._on_order_selected)
+        self._order_list.rows_move_requested.connect(
+            self._on_order_move_requested)
         order_layout.addWidget(self._order_list, 1)
 
         order_btns = QHBoxLayout()
@@ -1300,6 +1301,28 @@ class MidiImportDialog(QDialog):
                 self._play_order[row + 1], self._play_order[row]
             self._rebuild_order_list()
             self._order_list.setCurrentRow(row + 1)
+
+    def _on_order_move_requested(self, rows, dest: int):
+        """Reorder the play order by dragging, the same as the arrows do.
+
+        The play order is held in `self._play_order` and this list is painted
+        from it, which is the right way round -- but the drag was never wired
+        to anything, so dropping a row only scrambled the display until the
+        next repaint put it back. It looked exactly like the dialog throwing
+        an edit away.
+
+        So the drop is read for where it landed and the ORDER is reordered,
+        not the list. Same two steps as the Up and Down buttons: move the
+        entry, repaint from it. The loop point stays where it is, because it
+        is a position in the play order rather than a property of an entry.
+        """
+        moved, landed = reorder_rows(self._play_order, rows, dest)
+        if moved == self._play_order:
+            return                      # dropped where it already was
+        self._play_order = moved
+        self._rebuild_order_list()
+        if landed:
+            self._order_list.setCurrentRow(landed[0])
 
     def _on_order_selected(self, row: int):
         self._btn_remove_from_order.setEnabled(

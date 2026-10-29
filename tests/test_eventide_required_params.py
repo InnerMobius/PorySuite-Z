@@ -127,6 +127,28 @@ def test_a_vararg_macro_is_never_blocked(project):
     assert missing_required(project, 'gatherthings', ('',)) == []
 
 
+def test_an_editor_shaped_command_is_not_judged_positionally(project):
+    """More arguments than the macro declares means they are not its arguments.
+
+    The Text command proved this: the editor holds it as (label, text, type)
+    while the `message` macro declares ONE parameter, `text:req`. Compared
+    position by position, the blank LABEL was read as the missing text, and a
+    command with text plainly typed into it was refused — on a label the
+    editor fills in itself when saving.
+    """
+    assert missing_required(project, 'savebgm',
+                            ('', 'a song', 'EXTRA')) == []
+
+
+def test_fewer_arguments_than_declared_is_still_judged(project):
+    """Too few is the case worth catching — the value is simply absent."""
+    assert missing_required(project, 'playbgm', ('MUS_OAK',)) == ['save_song']
+
+
+def test_exactly_as_many_arguments_is_judged(project):
+    assert missing_required(project, 'playbgm', ('', 'MUS_OAK')) == ['song']
+
+
 def test_a_project_with_no_macro_file_is_never_blocked(tmp_path):
     clear_cache()
     assert missing_required(tmp_path, 'savebgm', ('',)) == []

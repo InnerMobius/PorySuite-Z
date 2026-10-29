@@ -71,6 +71,16 @@ docs/AGENTS.md
 docs/BUGS.md
 docs/CHANGELOG.md
 docs/CLAUDECONTEXT.md
+# PRIVATE development records and their archives. The two lines above cover the
+# working files by name; these cover every archive / split variant as well
+# (docs/BUGS_ARCHIVE.md, docs/CHANGELOG_ARCHIVE_2026-04.md, …). Without them an
+# archive file would be TRACKED and would publish six months of private notes
+# on the next commit — verified in a throwaway repo on 2026-10-29.
+# NOTE: this is PorySuite's OWN docs/ only. The FireRed game project keeps its
+# own, separately tracked docs/BUGS.md and CHANGELOG.md in pokefirered/ — those
+# are its business and must not be touched.
+docs/BUGS*.md
+docs/CHANGELOG*.md
 docs/DATAFLOW.md
 docs/renameplan.md
 docs/SOUND_ENGINE_DEBUG_LOG.md

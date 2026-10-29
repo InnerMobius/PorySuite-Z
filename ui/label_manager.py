@@ -7,14 +7,20 @@ style. Two layers, one screen:
 * **Friendly labels + notes** (non-destructive): give a constant a readable
   display name without touching game code. Saved per project in
   ``porysuite_labels.json``. The Event Editor shows these labels in script lines.
-* **Create / repurpose** (structural, via ``var_flag_manager``): claim a free
-  slot as a brand-new named variable/flag (safe — free slots have no references),
-  or repurpose a vanilla one you don't need with a whole-project rename and a
-  clear warning first.
+* **Create / reclaim** (structural, via ``var_flag_manager``): claim a free
+  slot as a brand-new named variable/flag (safe — free slots have no
+  references), or take over one the project no longer needs with a
+  whole-project rename, the full reference list in front of you, and a
+  snapshot of every file before it is touched.
 
-Every slot is colour-coded by real usage (free / your scripts / vanilla engine /
-reserved), computed from an actual project scan — so you can see at a glance what
-is safe to reclaim.
+Every slot carries a *category* — what it is for — and a *protection* level —
+how safe it is to take over. Both are worked out from the project itself: the
+slot's real number (resolved through the header's own arithmetic, so it lands
+in the right engine region) and every place it is actually referenced. Nothing
+is judged on its name alone.
+
+Reclaiming is always the user's explicit act. This screen never frees, renames
+or re-points a slot on its own.
 """
 
 import json
@@ -40,13 +46,35 @@ _LABELS_FILENAME = "porysuite_labels.json"
 _TYPE_FLAG = "flag"
 _TYPE_VAR = "var"
 
-# Friendly label + colour for each backend usage status.
-_STATUS_META = {
-    'free':     ('Free',                  '#3fae5a'),
-    'unused':   ('Free (vanilla name)',   '#3fae5a'),
-    'yours':    ('Your scripts',          '#5a9bd4'),
-    'vanilla':  ('Vanilla engine',        '#d9a441'),
-    'reserved': ('Reserved (locked)',     '#8a8a8a'),
+# Colour per category — what the slot is FOR.
+_CATEGORY_COLOR = {
+    'free':      '#3fae5a',
+    'item':      '#5a9bd4',
+    'event':     '#5a9bd4',
+    'trainer':   '#c2704a',
+    'shared':    '#d9a441',
+    'engine':    '#8a8a8a',
+    'system':    '#8a8a8a',
+    'temporary': '#8a8a8a',
+    'unknown':   '#d9a441',
+}
+
+# What each protection level means, in the user's words, and whether the
+# Reclaim button is allowed to go ahead at all.
+_PROTECTION_META = {
+    'free':        ("Free to use", True,
+                    "Nothing in the project refers to this slot. Claiming it "
+                    "changes nothing else."),
+    'review':      ("Reclaim candidate", True,
+                    "Used in one place only, so it is quick to check before "
+                    "you take it over."),
+    'preserve':    ("Preserved by default", False,
+                    "Trainer slots are kept as they are, because trainer "
+                    "numbering shifts as battles move onto new maps."),
+    'investigate': ("Protected until investigated", False,
+                    "Go through the references below before deciding."),
+    'protected':   ("Protected", False,
+                    "PorySuite will not rename this one."),
 }
 
 # Set by the unified window so "Use in Event Editor" can jump there.
@@ -93,7 +121,9 @@ class LabelManagerWidget(QWidget):
             "Name and reuse the game's variable and flag slots — like RPG "
             "Maker's Variables and Switches. Make a new one, give a friendly "
             "label to an existing one (safe — never changes game code), or "
-            "repurpose a vanilla one you don't need.")
+            "reclaim one the project no longer needs. Every slot shows what "
+            "it is for and exactly where it is used, so you can check before "
+            "you take it over.")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color: #888; margin-bottom: 6px;")
         root.addWidget(subtitle)
@@ -132,7 +162,12 @@ class LabelManagerWidget(QWidget):
         filter_row = QHBoxLayout()
         self._filter_combo = QComboBox()
         self._filter_combo.addItems(
-            ["All", "Flags", "Vars", "Free only", "Vanilla (reclaimable)"])
+            ["All", "Flags", "Vars", "Free only", "Reclaim candidates",
+             "Needs investigating", "Protected"])
+        self._filter_combo.setToolTip(
+            "Reclaim candidates are used in one place only. Needs "
+            "investigating means shared between places, or in a block the "
+            "engine addresses by number.")
         self._filter_combo.currentIndexChanged.connect(self._apply_filter)
         self._filter_combo.wheelEvent = lambda e: e.ignore()
         filter_row.addWidget(QLabel("Show:"))
@@ -156,10 +191,12 @@ class LabelManagerWidget(QWidget):
 
         legend = QLabel(
             '<span style="color:#3fae5a">■ Free</span>  '
-            '<span style="color:#5a9bd4">■ Your scripts</span>  '
-            '<span style="color:#d9a441">■ Vanilla engine</span>  '
-            '<span style="color:#8a8a8a">■ Reserved</span>')
+            '<span style="color:#5a9bd4">■ Item / event</span>  '
+            '<span style="color:#c2704a">■ Trainer</span>  '
+            '<span style="color:#d9a441">■ Shared / unclear</span>  '
+            '<span style="color:#8a8a8a">■ Engine, badges, temporary</span>')
         legend.setTextFormat(Qt.TextFormat.RichText)
+        legend.setWordWrap(True)
         left_layout.addWidget(legend)
 
         splitter.addWidget(left)
@@ -185,6 +222,16 @@ class LabelManagerWidget(QWidget):
         self._detail_usage.setWordWrap(True)
         right_layout.addWidget(self._detail_usage)
 
+        right_layout.addWidget(QLabel("Where it is used:"))
+        self._detail_refs = QPlainTextEdit()
+        self._detail_refs.setReadOnly(True)
+        self._detail_refs.setFont(QFont("Consolas", 9))
+        self._detail_refs.setMaximumHeight(150)
+        self._detail_refs.setPlaceholderText(
+            "Select a constant to see every map, script and engine file that "
+            "refers to it.")
+        right_layout.addWidget(self._detail_refs)
+
         right_layout.addSpacing(10)
 
         form = QFormLayout()
@@ -208,10 +255,11 @@ class LabelManagerWidget(QWidget):
 
         # Advanced / nav buttons
         adv_row = QHBoxLayout()
-        self._btn_rename_code = QPushButton("Rename in code…")
+        self._btn_rename_code = QPushButton("Reclaim / rename in code…")
         self._btn_rename_code.setToolTip(
-            "Advanced: change the real symbol name across the whole project "
-            "(not just the display label). Use to reclaim a vanilla slot.")
+            "Change the real symbol name across the whole project (not just "
+            "the display label). Use this to take over a slot the project no "
+            "longer needs. Every file is backed up first.")
         self._btn_rename_code.clicked.connect(self._on_rename_in_code)
         self._btn_rename_code.setEnabled(False)
         adv_row.addWidget(self._btn_rename_code)
@@ -267,12 +315,14 @@ class LabelManagerWidget(QWidget):
         if not self._project_dir:
             return
         pdir = Path(self._project_dir)
+        blank = {'category': None, 'protection': None, 'reason': '',
+                 'refs_total': 0, 'maps': [], 'engine': [], 'scripts': [],
+                 'samples': [], 'slot': None, 'region': '',
+                 'placeholder': False}
         for name, _val, _ln in vf._parse_defs(pdir, 'VAR_', vf.VARS_HEADER):
-            self._entries_var.append({'name': name, 'status': None,
-                                      'refs_total': 0, 'samples': []})
+            self._entries_var.append(dict(blank, name=name))
         for name, _val, _ln in vf._parse_defs(pdir, 'FLAG_', vf.FLAGS_HEADER):
-            self._entries_flag.append({'name': name, 'status': None,
-                                       'refs_total': 0, 'samples': []})
+            self._entries_flag.append(dict(blank, name=name))
 
     def _run_scan(self, force=False):
         if not self._project_dir:
@@ -283,8 +333,9 @@ class LabelManagerWidget(QWidget):
         self._status_label.setText("Scanning usage…")
         QApplication.processEvents()
         try:
-            self._entries_var = vf.scan(self._project_dir, 'var')
-            self._entries_flag = vf.scan(self._project_dir, 'flag')
+            vf.invalidate_cache(self._project_dir)
+            self._entries_var = vf.cached_scan(self._project_dir, 'var')
+            self._entries_flag = vf.cached_scan(self._project_dir, 'flag')
         finally:
             QApplication.restoreOverrideCursor()
         self._status_by_name = {}
@@ -360,14 +411,19 @@ class LabelManagerWidget(QWidget):
         rows = sorted(self._iter_entries(), key=lambda t: t[0]['name'])
         for e, ctype in rows:
             name = e['name']
-            status = e.get('status')
+            category = e.get('category')
+            protection = e.get('protection')
             if fidx == 1 and ctype != _TYPE_FLAG:
                 continue
             if fidx == 2 and ctype != _TYPE_VAR:
                 continue
-            if fidx == 3 and status not in ('free', 'unused'):
+            if fidx == 3 and protection != 'free':
                 continue
-            if fidx == 4 and status not in ('unused', 'vanilla'):
+            if fidx == 4 and protection != 'review':
+                continue
+            if fidx == 5 and protection not in ('investigate', 'preserve'):
+                continue
+            if fidx == 6 and protection != 'protected':
                 continue
 
             label_text = self._labels.get(name, {}).get("label", "")
@@ -378,14 +434,17 @@ class LabelManagerWidget(QWidget):
                 display = f"{name}  —  {label_text}"
             else:
                 display = f"{name}  —  ({self._auto_name(name)})"
-            if status and status in _STATUS_META:
-                display += f"   ·  {_STATUS_META[status][0]}"
+            if category in vf.CATEGORIES:
+                display += f"   ·  {vf.CATEGORIES[category]}"
 
             item = QListWidgetItem(display)
             item.setData(Qt.ItemDataRole.UserRole, name)
             item.setData(Qt.ItemDataRole.UserRole + 1, ctype)
-            if status and status in _STATUS_META:
-                item.setForeground(QColor(_STATUS_META[status][1]))
+            if category in _CATEGORY_COLOR:
+                item.setForeground(QColor(_CATEGORY_COLOR[category]))
+            if e.get('reason'):
+                item.setToolTip(f"{vf.PROTECTION.get(protection, '')} — "
+                                f"{e['reason']}")
             self._const_list.addItem(item)
 
         self._const_list.blockSignals(False)
@@ -404,10 +463,15 @@ class LabelManagerWidget(QWidget):
         labeled = sum(1 for v in self._labels.values()
                       if v.get("label", "").strip())
         free = sum(1 for e, _ in self._iter_entries()
-                   if e.get('status') in ('free', 'unused'))
-        extra = f" · {free} free" if self._scanned else ""
+                   if e.get('protection') == 'free')
+        review = sum(1 for e, _ in self._iter_entries()
+                     if e.get('protection') == 'review')
+        extra = (f" · {free} free · {review} reclaimable"
+                 if self._scanned else "")
         self._counts_label.setText(
             f"{visible} shown / {total} total · {labeled} labeled{extra}")
+        if self._scanned:
+            self._counts_label.setToolTip(self._capacity_tooltip())
 
     # ─── Detail panel ───────────────────────────────────────────────────────
 
@@ -416,6 +480,7 @@ class LabelManagerWidget(QWidget):
             self._detail_name.setText("Select a constant from the list")
             self._detail_status.setText("")
             self._detail_usage.setText("")
+            self._detail_refs.clear()
             for w in (self._label_edit, self._notes_edit,
                       self._btn_rename_code, self._btn_use_in_editor):
                 w.setEnabled(False)
@@ -427,20 +492,29 @@ class LabelManagerWidget(QWidget):
         self._detail_name.setText(name)
 
         e = self._status_by_name.get(name, {})
-        status = e.get('status')
-        if status and status in _STATUS_META:
-            lbl, color = _STATUS_META[status]
-            self._detail_status.setText(lbl)
-            self._detail_status.setStyleSheet(f"font-weight: bold; color: {color};")
+        category = e.get('category')
+        protection = e.get('protection')
+        if category in vf.CATEGORIES:
+            prot_label = vf.PROTECTION.get(protection, '')
+            color = _CATEGORY_COLOR.get(category, '#888')
+            slot = e.get('slot')
+            where = f"slot {slot} · {e.get('region', '')}" if slot is not None else ""
+            self._detail_status.setText(
+                f"{vf.CATEGORIES[category]} — {prot_label}"
+                + (f"    ({where})" if where else ""))
+            self._detail_status.setStyleSheet(
+                f"font-weight: bold; color: {color};")
         else:
             self._detail_status.setText("")
-        if e.get('refs_total'):
-            samples = '  ·  '.join(e.get('samples', [])[:3])
+            self._detail_status.setStyleSheet("font-weight: bold;")
+
+        if e.get('reason'):
+            meaning = _PROTECTION_META.get(protection, ('', False, ''))[2]
             self._detail_usage.setText(
-                f"Used in {e['refs_total']} place(s): {samples}")
+                f"This is {e['reason']}. {meaning}")
         else:
-            self._detail_usage.setText(
-                "Not referenced anywhere." if self._scanned else "")
+            self._detail_usage.setText("")
+        self._detail_refs.setPlainText(self._format_references(e))
 
         entry = self._labels.get(name, {})
         self._label_edit.blockSignals(True)
@@ -454,8 +528,58 @@ class LabelManagerWidget(QWidget):
         self._notes_edit.setEnabled(True)
         self._notes_edit.blockSignals(False)
 
-        self._btn_rename_code.setEnabled(status != 'reserved')
+        self._btn_rename_code.setEnabled(True)
         self._btn_use_in_editor.setEnabled(True)
+
+    # ─── Reference reporting ────────────────────────────────────────────────
+
+    def _format_references(self, e: dict) -> str:
+        """The plain-English "where is this used" block for the detail panel."""
+        if not self._scanned:
+            return "Checking the project…"
+        if not e.get('refs_total'):
+            return "Nothing in this project refers to this slot."
+        out = [f"Referenced {e['refs_total']} time(s)."]
+        for title, key in (("Maps", 'maps'),
+                           ("Shared scripts and data", 'scripts'),
+                           ("Engine source", 'engine')):
+            items = e.get(key) or []
+            if not items:
+                continue
+            out.append("")
+            out.append(f"{title} ({len(items)}):")
+            for s in items[:40]:
+                out.append(f"  - {s}")
+            if len(items) > 40:
+                out.append(f"  ... and {len(items) - 40} more")
+        samples = e.get('samples') or []
+        if samples:
+            out.append("")
+            out.append("First lines:")
+            for s in samples[:8]:
+                out.append(f"  {s}")
+        return "\n".join(out)
+
+    def _capacity_tooltip(self) -> str:
+        lines = ["Flags by region (named slots / still free):"]
+        for region, d in sorted(vf.capacity(self._entries_flag).items()):
+            lines.append(f"  {region}: {d['named']} named, {d['free']} free")
+        lines.append("Variables by region:")
+        for region, d in sorted(vf.capacity(self._entries_var).items()):
+            lines.append(f"  {region}: {d['named']} named, {d['free']} free")
+        for noun, entries in (("Flags", self._entries_flag),
+                              ("Variables", self._entries_var)):
+            free = len(vf.free_names(entries))
+            auto = len(vf.auto_claim_names(entries))
+            lines.append(
+                f"{noun}: {free} free, {auto} of them handed out "
+                f"automatically.")
+            if free != auto:
+                lines.append(
+                    f"  The other {free - auto} sit in blocks the engine "
+                    f"addresses by slot number, so a template never takes "
+                    f"one — reclaim those by hand if you need them.")
+        return "\n".join(lines)
 
     def _current_const_name(self) -> str:
         item = self._const_list.currentItem()
@@ -469,11 +593,11 @@ class LabelManagerWidget(QWidget):
         self._mark_dirty()
         item = self._const_list.currentItem()
         if item:
-            status = self._status_by_name.get(name, {}).get('status')
+            category = self._status_by_name.get(name, {}).get('category')
             base = (f"{name}  —  {text}" if text.strip()
                     else f"{name}  —  ({self._auto_name(name)})")
-            if status and status in _STATUS_META:
-                base += f"   ·  {_STATUS_META[status][0]}"
+            if category in vf.CATEGORIES:
+                base += f"   ·  {vf.CATEGORIES[category]}"
             item.setText(base)
 
     def _on_notes_edited(self):
@@ -504,8 +628,9 @@ class LabelManagerWidget(QWidget):
         if not free:
             QMessageBox.warning(
                 self, "New",
-                "No free slots left. Repurpose a vanilla one instead: select "
-                "it and click \"Rename in code\".")
+                "No free slots left. Reclaim one instead: set Show to "
+                "\"Reclaim candidates\", pick a slot, check what uses it on "
+                "the right, then click \"Reclaim / rename in code\".")
             return
         noun = 'variable' if kind == 'var' else 'flag'
         text, ok = QInputDialog.getText(
@@ -522,32 +647,86 @@ class LabelManagerWidget(QWidget):
         self._do_code_rename(free['name'], new, kind,
                              friendly=text.strip(), is_new=True)
 
+    def _reference_summary(self, e: dict) -> str:
+        bits = []
+        for title, key in (("map", 'maps'), ("shared script", 'scripts'),
+                           ("engine file", 'engine')):
+            items = e.get(key) or []
+            if items:
+                plural = "" if len(items) == 1 else "s"
+                bits.append(f"{len(items)} {title}{plural}")
+        return ", ".join(bits) if bits else "nowhere"
+
+    def _confirm_reclaim(self, name: str, e: dict) -> bool:
+        """Ask before taking over a slot. Returns True to go ahead.
+
+        Three gates, by how much is known about the slot: none for a free one,
+        a plain yes/no for a single-use one, and typing the slot's own name for
+        anything shared, trainer-numbered or otherwise unclear. A protected
+        slot is simply refused.
+        """
+        protection = e.get('protection')
+        if not self._scanned:
+            self._run_scan()
+            e = self._status_by_name.get(name, e)
+            protection = e.get('protection')
+        label, allowed, meaning = _PROTECTION_META.get(
+            protection, ("Unclassified", False,
+                         "This slot has not been checked yet."))
+
+        if protection == 'free':
+            return True
+
+        detail = (f"{name} is {e.get('reason', 'in use')}.\n\n"
+                  f"{meaning}\n\n"
+                  f"Used in: {self._reference_summary(e)}.\n\n"
+                  "Everything listed in the panel on the right will be "
+                  "rewritten to the new name. The slot number does not "
+                  "change, so an existing save file keeps whatever this bit "
+                  "was already set to. Every file is copied to a backup "
+                  "folder first.")
+
+        if allowed:
+            return QMessageBox.question(
+                self, f"Reclaim {name}?",
+                f"{label}\n\n{detail}\n\nGo ahead?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            ) == QMessageBox.StandardButton.Yes
+
+        if protection == 'protected':
+            QMessageBox.information(
+                self, "Protected",
+                f"{name} is {e.get('reason', 'protected')}.\n\n{meaning}\n\n"
+                "PorySuite will not rename this one. If you are certain it "
+                "is dead in your project, change it in the header by hand.")
+            return False
+
+        # preserve / investigate — make the user type the name out.
+        typed, ok = QInputDialog.getText(
+            self, f"Reclaim {name}?",
+            f"{label}\n\n{detail}\n\n"
+            f"Type {name} exactly to confirm you have checked the "
+            f"references:")
+        if not ok:
+            return False
+        if typed.strip() != name:
+            QMessageBox.information(
+                self, "Not reclaimed",
+                "That did not match, so nothing was changed.")
+            return False
+        return True
+
     def _on_rename_in_code(self):
         name = self._current_const_name()
         if not name:
             return
         e = self._status_by_name.get(name, {})
-        status = e.get('status')
         kind = 'flag' if name.startswith('FLAG_') else 'var'
-        if status == 'reserved':
-            QMessageBox.information(
-                self, "Reserved",
-                f"{name} is reserved by the engine and can't be renamed.")
+        if not self._confirm_reclaim(name, e):
             return
-        if status in ('vanilla', 'yours'):
-            where = '\n'.join('  • ' + s for s in e.get('samples', [])[:5])
-            note = ("\n\nRepurposing is safe ONLY if your hack doesn't use "
-                    "that vanilla feature." if status == 'vanilla' else
-                    "\n\nEvery place below updates to the new name.")
-            if QMessageBox.question(
-                    self, "Repurpose?",
-                    f"{name} is used in {e.get('refs_total', 0)} place(s):\n"
-                    f"{where}{note}\n\nRepurpose it anyway?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
-                return
         text, ok = QInputDialog.getText(
-            self, "Rename in code", "New name:",
+            self, "Reclaim / rename in code", "New name:",
             text=self._auto_name(name))
         if not ok:
             return
@@ -558,11 +737,27 @@ class LabelManagerWidget(QWidget):
             return
         self._do_code_rename(name, new, kind, friendly='', is_new=False)
 
+    def _backup_root(self) -> str:
+        """Where snapshots of renamed files go — inside PorySuite's own cache,
+        never inside the game tree."""
+        # Imported here, not at module scope: app_info lives in core/, which
+        # only joins sys.path once app.py has started.
+        try:
+            try:
+                from app_info import get_cache_dir
+            except ImportError:
+                from core.app_info import get_cache_dir
+            return os.path.join(get_cache_dir(self._project_dir),
+                                "flag_backups")
+        except Exception:
+            return ""
+
     def _do_code_rename(self, old: str, new: str, kind: str,
                         friendly: str, is_new: bool):
         QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
         try:
-            n, _files = vf.rename_symbol(self._project_dir, old, new)
+            n, _files, backup = vf.rename_symbol(
+                self._project_dir, old, new, backup_root=self._backup_root())
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -584,9 +779,12 @@ class LabelManagerWidget(QWidget):
         self._run_scan(force=True)
         self.constants_changed.emit()
         self.select_constant(new)
-        verb = "Created" if is_new else "Renamed"
-        QMessageBox.information(
-            self, verb, f"{verb} {new}.\nUpdated {n} file(s).")
+        verb = "Created" if is_new else "Reclaimed"
+        msg = f"{verb} {new}.\nUpdated {n} file(s)."
+        if backup:
+            msg += (f"\n\nThe previous version of every file that changed is "
+                    f"in:\n{backup}")
+        QMessageBox.information(self, verb, msg)
 
     def _on_use_in_editor(self):
         name = self._current_const_name()

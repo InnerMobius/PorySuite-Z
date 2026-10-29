@@ -115,6 +115,11 @@ class QTreeWidget:
         return len(self._items)
     def topLevelItem(self, index):
         return self._items[index]
+    def setCurrentItem(self, item):
+        # _select_species_in_tree syncs the tree to the pokedex selection.
+        self._selected = [item]
+    def currentItem(self):
+        return self._selected[0] if self._selected else None
 
 qt_widgets.QTreeWidget = QTreeWidget
 qt_widgets.QTreeWidgetItem = QTreeWidgetItem
@@ -122,7 +127,20 @@ qt_widgets.QTreeWidgetItem = QTreeWidgetItem
 qt_module.QtCore = qt_core
 qt_module.QtGui = qt_gui
 qt_module.QtWidgets = qt_widgets
+# Shared PyQt6 stub helpers -- see tests/_qt_stub.py for why none of this is a
+# hand-written list of Qt class names any more.
+from tests._qt_stub import (  # noqa: E402
+    StubQtFinder as _StubQtFinder,
+    UiStub as _UiStub,
+    auto_qt_class as _auto_qt_class,
+    autofill_qt_stub as _autofill_qt_stub,
+    is_qt_method_name as _is_qt_method_name,
+)
 
+if not any(isinstance(f, _StubQtFinder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _StubQtFinder())
+qt_module.__path__ = []  # marks the stub as a package
+_autofill_qt_stub(qt_module, qt_core, qt_gui, qt_widgets)
 sys.modules["PyQt6"] = qt_module
 sys.modules["PyQt6.QtCore"] = qt_core
 sys.modules["PyQt6.QtGui"] = qt_gui
@@ -134,7 +152,13 @@ sys.modules.setdefault("newproject", types.ModuleType("newproject")).NewProject 
 sys.modules.setdefault("exportingwindow", types.ModuleType("exportingwindow")).Exporting = type("Exporting", (), {})
 sys.modules.setdefault("plugininfodialog", types.ModuleType("plugininfodialog")).PluginInfoDialog = type("PluginInfoDialog", (), {})
 
-sys.modules.setdefault("ui", types.ModuleType("ui"))
+# The window imports its own submodules (`from ui.items_tab_widget import ...`),
+# so this placeholder package needs a real __path__ or those imports fail with
+# "'ui' is not a package". Submodules stubbed below still win -- they are
+# already in sys.modules by the time anything asks for them.
+_ui_pkg = sys.modules.setdefault("ui", types.ModuleType("ui"))
+if not hasattr(_ui_pkg, "__path__"):
+    _ui_pkg.__path__ = [os.path.join(ROOT_DIR, "ui")]
 ui_main = types.ModuleType("ui.ui_mainwindow")
 class Ui_MainWindow:
     def setupUi(self, _):
@@ -179,18 +203,40 @@ class DummySource:
     def get_species_info(self, species, field, form=None):
         return self.species_info.get(species, {}).get(field)
 
+    def get_evolutions(self, species):
+        # update_pokedex_entry compares the current evolution chain; these
+        # fixtures define none.
+        return []
 
+    def set_species_info(self, species, field, value, form=None):
+        # The category name is edited through the pokedex panel, which
+        # writes it back here. Record it so the test can read it back.
+        self.species_info.setdefault(species, {})[field] = value
 class PokedexEntryUpdateTest(unittest.TestCase):
     def setUp(self):
         self.mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        self.mw._loading_depth = 0
+        # update_pokedex_entry reads these to avoid saving the wrong
+        # species when the selection moves; __init__ would have set them.
+        self.mw.previous_selected_species = None
+        self.mw.previous_selected_form = None
+        self.mw.project_info = {"dir": "", "project_name": "proj"}
         self.mw.source_data = DummySource()
         self.Qt = qt_core.Qt
-        self.mw.ui = types.SimpleNamespace(
+        self.mw.ui = _UiStub(
             species_name=types.SimpleNamespace(setText=lambda *_: None),
             dex_num=types.SimpleNamespace(setText=lambda *_: None),
             species_category=types.SimpleNamespace(setText=lambda *_: None),
             species_description=QPlainTextEdit(),
             list_pokedex_national=QListWidget(),
+            # update_pokedex_entry syncs the species tree to the
+            # pokedex selection, so it needs a real tree even when
+            # this case does not look at it.
+            tree_pokemon=QTreeWidget(),
             list_pokedex_regional=QListWidget(),
         )
         self.mw.update_data = lambda *a, **k: None
@@ -208,6 +254,16 @@ class PokedexEntryUpdateTest(unittest.TestCase):
 class StatsRefreshTest(unittest.TestCase):
     def setUp(self):
         self.mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        self.mw._loading_depth = 0
+        # update_pokedex_entry reads these to avoid saving the wrong
+        # species when the selection moves; __init__ would have set them.
+        self.mw.previous_selected_species = None
+        self.mw.previous_selected_form = None
+        self.mw.project_info = {"dir": "", "project_name": "proj"}
         self.mw.source_data = DummySource()
         self.Qt = qt_core.Qt
         class DummySpin:
@@ -225,12 +281,16 @@ class StatsRefreshTest(unittest.TestCase):
             self.base_hp.setValue(hp)
         self.mw.update_data = update_data
         self.mw.sender = lambda: self.mw.ui.list_pokedex_national
-        self.mw.ui = types.SimpleNamespace(
+        self.mw.ui = _UiStub(
             species_name=types.SimpleNamespace(setText=lambda *_: None),
             dex_num=types.SimpleNamespace(setText=lambda *_: None),
             species_category=types.SimpleNamespace(setText=lambda *_: None),
             species_description=QPlainTextEdit(),
             list_pokedex_national=QListWidget(),
+            # update_pokedex_entry syncs the species tree to the
+            # pokedex selection, so it needs a real tree even when
+            # this case does not look at it.
+            tree_pokemon=QTreeWidget(),
             list_pokedex_regional=QListWidget(),
             base_hp=self.base_hp,
         )
@@ -254,6 +314,16 @@ class StatsRefreshTest(unittest.TestCase):
 class TreeSelectionUpdateTest(unittest.TestCase):
     def setUp(self):
         self.mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        self.mw._loading_depth = 0
+        # update_pokedex_entry reads these to avoid saving the wrong
+        # species when the selection moves; __init__ would have set them.
+        self.mw.previous_selected_species = None
+        self.mw.previous_selected_form = None
+        self.mw.project_info = {"dir": "", "project_name": "proj"}
         self.mw.source_data = DummySource()
         self.Qt = qt_core.Qt
         self.mw.save_species_data = lambda *a, **k: False
@@ -262,10 +332,11 @@ class TreeSelectionUpdateTest(unittest.TestCase):
         self.mw.sender = lambda: None
         self.mw.previous_selected_species = None
         self.mw.previous_selected_form = None
+        self.mw.project_info = {"dir": "", "project_name": "proj"}
         self.item_a = QTreeWidgetItem(["Test", "SPECIES_TEST", ""])
         self.item_b = QTreeWidgetItem(["Other", "SPECIES_OTHER", ""])
         tree = QTreeWidget([self.item_a, self.item_b])
-        self.mw.ui = types.SimpleNamespace(
+        self.mw.ui = _UiStub(
             tree_pokemon=tree,
             species_description=QPlainTextEdit(),
             list_pokedex_national=QListWidget(),
@@ -301,6 +372,16 @@ class TreeSelectionUpdateTest(unittest.TestCase):
 class PokedexListSyncTest(unittest.TestCase):
     def setUp(self):
         self.mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        self.mw._loading_depth = 0
+        # update_pokedex_entry reads these to avoid saving the wrong
+        # species when the selection moves; __init__ would have set them.
+        self.mw.previous_selected_species = None
+        self.mw.previous_selected_form = None
+        self.mw.project_info = {"dir": "", "project_name": "proj"}
         self.mw.source_data = DummySource()
         self.Qt = qt_core.Qt
         self.mw.save_species_data = lambda *a, **k: False
@@ -309,6 +390,7 @@ class PokedexListSyncTest(unittest.TestCase):
         self.mw.sender = lambda: None
         self.mw.previous_selected_species = None
         self.mw.previous_selected_form = None
+        self.mw.project_info = {"dir": "", "project_name": "proj"}
         self.item_a = QTreeWidgetItem(["Test", "SPECIES_TEST", ""])
         self.item_b = QTreeWidgetItem(["Other", "SPECIES_OTHER", ""])
         tree = QTreeWidget([self.item_a, self.item_b])
@@ -325,7 +407,7 @@ class PokedexListSyncTest(unittest.TestCase):
         reg_b.setData(self.Qt.ItemDataRole.UserRole, "HOENN_DEX_OTHER")
         list_reg = QListWidget([reg_a, reg_b])
 
-        self.mw.ui = types.SimpleNamespace(
+        self.mw.ui = _UiStub(
             tree_pokemon=tree,
             species_description=QPlainTextEdit(),
             list_pokedex_national=list_nat,

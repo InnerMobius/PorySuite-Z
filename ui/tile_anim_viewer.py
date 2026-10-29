@@ -68,12 +68,19 @@ class _NoScrollCombo(QComboBox):
 
 
 class _NoScrollSpin(QSpinBox):
-    """QSpinBox that ignores wheel events when not focused."""
+    """QSpinBox that NEVER changes value on the mouse wheel.
+
+    Was "ignores wheel events unless it has focus" until 2026-10-29. That rule
+    is wrong for a value-bearing widget and was measured failing: a spin box
+    that has been CLICKED has focus, so scrolling the page afterwards changed
+    the value (50 -> 49 on one notch). These boxes hold real game data —
+    trainer party levels, IVs, prize money, tile counts — so a silent change is
+    a data change. Same rule as ui/custom_widgets/scroll_guard.py: the wheel
+    never commits a value. `event.ignore()` leaves the event unaccepted so Qt
+    carries it to the parent and the PAGE still scrolls.
+    """
     def wheelEvent(self, event):
-        if self.hasFocus():
-            super().wheelEvent(event)
-        else:
-            event.ignore()
+        event.ignore()
 
 
 class _HexSpinBox(QSpinBox):

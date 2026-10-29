@@ -177,6 +177,35 @@ class ProjectData(QObject):
     def notify_texts_changed(self):
         self.texts_changed.emit()
 
+    # ── The three wrappers that were missing until 2026-10-29 ────────────
+    # `scripts_changed`, `maps_changed` and `constants_changed` were declared
+    # as signals in commit ca3f3cf (2026-04-03) and every other signal got a
+    # `notify_*` wrapper in the same commit — these three did not, while
+    # `ui/unified_mainwindow.py::_on_save_all` already called
+    # `notify_scripts_changed()`. So pressing Save All with EVENTide map edits
+    # pending raised AttributeError and killed the application part-way through
+    # the save, AFTER PorySuite and EVENTide data were written but BEFORE
+    # credits, labels, sound, tilemap, tile animations and shops.
+    #
+    # The signals were deliberate (see their comments above), so the repair is
+    # to supply the missing wrappers — NOT to delete the call, which would have
+    # silently dropped the cross-editor notification the author intended.
+    # `maps_changed` and `constants_changed` have no caller today; they are
+    # completed here because an incomplete wrapper set is exactly what caused
+    # the crash, and the next caller would hit the same wall.
+
+    def notify_scripts_changed(self):
+        """Call after scripts.inc content changes — notifies all listeners."""
+        self.scripts_changed.emit()
+
+    def notify_maps_changed(self):
+        """Call after map data changes — notifies all listeners."""
+        self.maps_changed.emit()
+
+    def notify_constants_changed(self):
+        """Call after constants are reloaded — notifies all listeners."""
+        self.constants_changed.emit()
+
     # ═════════════════════════════════════════════════════════════════════
     # Text.inc search — find trainer dialogue labels
     # ═════════════════════════════════════════════════════════════════════

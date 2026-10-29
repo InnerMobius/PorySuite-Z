@@ -73,8 +73,41 @@ def install_scroll_guard(widget: QWidget) -> None:
         widget.installEventFilter(_guard)
 
 
+def _handles_its_own_wheel(widget: QWidget) -> bool:
+    """True when *widget*'s class overrides ``wheelEvent`` itself.
+
+    Several editors predate this module and subclass the widget instead — e.g.
+    ``_NoScrollCombo`` in the tilemap, tile-animation, trainers and
+    trainer-class editors, which ignores the wheel while the popup is CLOSED
+    but deliberately passes it through while the popup is OPEN so the list can
+    be scrolled. Those are correct and were measured protected.
+
+    Installing the shared filter on one of them would eat the wheel before its
+    own ``wheelEvent`` ever ran, silently removing that popup behaviour. So a
+    recursive sweep leaves any widget that has made its own decision alone.
+    A widget needing the shared guard INSTEAD of its own handler should be
+    changed at its definition, not double-guarded here.
+    """
+    try:
+        for cls in type(widget).__mro__:
+            if cls in _GUARDED_TYPES:
+                return False          # reached the Qt base first: no override
+            if "wheelEvent" in getattr(cls, "__dict__", {}):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def install_scroll_guard_recursive(root: QWidget) -> None:
-    """Walk *root*'s widget tree and guard every combo / spin box."""
+    """Walk *root*'s widget tree and guard every combo / spin box.
+
+    This is a SNAPSHOT: it can only reach widgets that exist when it runs.
+    Anything built later — a table's per-row cell widgets, a lazily created
+    page — must call `install_scroll_guard` at the point of creation. Re-running
+    the sweep is harmless (one shared filter instance, re-installing is a no-op
+    in effect), so it is safe to call again after a page is built.
+    """
     for child in root.findChildren(QWidget):
-        if isinstance(child, _GUARDED_TYPES):
+        if isinstance(child, _GUARDED_TYPES) and not _handles_its_own_wheel(child):
             install_scroll_guard(child)

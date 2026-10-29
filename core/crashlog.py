@@ -6,6 +6,24 @@ import threading
 import traceback
 from datetime import datetime
 
+def _stream_is_usable(stream) -> bool:
+    """True when *stream* can actually be written to.
+
+    Under `pythonw.exe` (how PorySuite is launched) `sys.stdout` and
+    `sys.stderr` are None, and a `logging.StreamHandler` bound to None raises
+    on every single record. A stream can also be present but already closed,
+    which fails the same way. Checked once, at handler-install time.
+    """
+    if stream is None:
+        return False
+    try:
+        if getattr(stream, "closed", False):
+            return False
+        return callable(getattr(stream, "write", None))
+    except Exception:
+        return False
+
+
 def _app_root() -> str:
     # Root directory of the running application (repo root)
     # This file lives in core/, so go up one level
@@ -145,18 +163,39 @@ def init_logging() -> str:
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    # File handler
+    # File handler — always installed. This is the one that matters; see the
+    # console-handler note below for why that one is conditional.
     fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     fh.setFormatter(fmt)
     root.addHandler(fh)
 
-    # Console handler (info+)
-    ch = logging.StreamHandler(stream=sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
+    # Console handler (info+) — ONLY when there is a console to write to.
+    #
+    # PorySuite is launched with pythonw.exe (no console window), where
+    # sys.stdout and sys.stderr are None. A StreamHandler bound to None then
+    # raises inside logging on EVERY record:
+    #     AttributeError: 'NoneType' object has no attribute 'write'
+    # Measured in a real session on 2026-10-29: 13 such errors, and because
+    # they fire while the logger is handling the genuine exception, they bury
+    # the real traceback in a cascade of logging-error noise — which is exactly
+    # how the Save All crash went unnoticed.
+    #
+    # The file handler and the JSON handler above are unaffected, so nothing is
+    # lost by skipping the console one: crash logs and diagnostics are still
+    # written in full. This suppresses only the broken OUTPUT PATH, never an
+    # exception.
+    if _stream_is_usable(sys.stdout):
+        ch = logging.StreamHandler(stream=sys.stdout)
+        ch.setLevel(logging.INFO)
+        ch.setFormatter(fmt)
+        root.addHandler(ch)
+    else:
+        # Recorded in the file log so it is obvious why console output is absent.
+        logging.getLogger(__name__).debug(
+            "No usable console stream (running under pythonw?) — console log "
+            "handler not installed. File and JSON logs are unaffected.")
 
     # JSON line handler (captures everything including redirected stdout/stderr)
     jh = _JsonLineHandler(_JSON_PATH)

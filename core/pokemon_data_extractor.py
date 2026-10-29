@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import json
@@ -447,10 +448,22 @@ class SpeciesDataExtractor(PokemonDataExtractor):
         def parse_evolutions(val):
             if isinstance(val, str):
                 evos = re.sub(r'\(const struct Evolution\[\]\)\s*\{\s*\{(.*)\},\s*\}', r'\1', val).strip()
-                evos = evos.split("}, {")
+                # Split on the row separator and the field separator allowing
+                # ANY whitespace (including none). These used to be the literal
+                # strings "}, {" and ", ", so a perfectly valid C row written
+                # without a space after the comma — `{EVO_LEVEL,16,SPECIES_X}` —
+                # did not split into three fields. It fell into the else branch
+                # below and was stored as
+                #   {"method": "EVO_LEVEL,16,SPECIES_X",
+                #    "param": None, "targetSpecies": None}
+                # which destroyed that species' evolution in the cache AND wrote
+                # back as `{EVO_LEVEL,16,SPECIES_X, None, None}` — C that does
+                # not compile. This project happens to use comma-space
+                # throughout, but another user's does not have to.
+                evos = re.split(r'\}\s*,\s*\{', evos)
                 result = []
                 for evo in evos:
-                    evo = evo.strip().split(", ")
+                    evo = [part.strip() for part in re.split(r',\s*', evo.strip())]
                     method = evo[0].strip()
                     if len(evo) == 3:
                         try:
@@ -464,8 +477,16 @@ class SpeciesDataExtractor(PokemonDataExtractor):
                             "targetSpecies": target_species,
                         }
                     else:
-                        if method == "EVOLUTIONS_END":
+                        if method == "EVOLUTIONS_END" or not method:
                             continue
+                        # Still unparseable after the tolerant split. Keep the
+                        # old shape so nothing downstream changes, but say so —
+                        # silently caching a row with no target used to surface
+                        # much later as a build failure.
+                        logging.warning(
+                            "Unparseable gEvolutionTable row %r — stored "
+                            "without a target; it will not build until fixed.",
+                            evo)
                         evo_dict = {
                             "method": evo[0].strip(),
                             "param": None,

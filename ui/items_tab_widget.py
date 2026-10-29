@@ -568,25 +568,39 @@ class ItemDetailPanel(QWidget):
         id_card, id_form = _card("Identity")
 
         self.f_name = QLineEdit()
-        # Cap at the max DISPLAYABLE length (ITEM_NAME_LENGTH - 1); the buffer's
-        # last byte is the terminator, so a full-length name overflows the menu.
-        # Hardcoding ITEM_NAME_LENGTH itself (14) was the bug — it let a 14-char
-        # name through. set_name_limit() refines this from the project source.
-        self.f_name.setMaxLength(self._name_limit)
+        # DO NOT put the name limit on the widget. setMaxLength truncates
+        # inside setText(), so loading an item whose stored name measured
+        # "too long" silently shortened the user's data before they touched
+        # anything — that is what destroyed '{POKEBLOCK} CASE' on 2026-10-29.
+        # The real limit is ENCODED BYTES (see core/gba_text_bytes) and is
+        # enforced in collect(), which refuses an over-limit name and keeps the
+        # previous value. This ceiling exists only so the box cannot grow
+        # without bound; it is far above any nameable length.
+        self.f_name.setMaxLength(self._TYPING_CEILING)
         self.f_name.setPlaceholderText("In-game display name")
         self._name_counter = QLabel(f"0/{self._name_limit}")
         self._name_counter.setStyleSheet("color: #888888; font-size: 10px; font-family: 'Courier New';")
         self._name_counter.setToolTip("Characters used / max name length (ITEM_NAME_LENGTH - 1)")
         def _update_name_counter(text):
-            used = len(text)
-            cap = self._name_limit
-            self._name_counter.setText(f"{used}/{cap}")
-            # At the limit, the field blocks further input — flag it amber so the
-            # user knows why, not as an error (a name of exactly cap is valid).
-            at_limit = used >= cap
+            # Counts ENCODED BYTES, not characters: '{POKEBLOCK}' is 11
+            # characters but 5 bytes. '?' means this project's charmap cannot
+            # resolve part of the text (a custom code) — never guessed at, and
+            # never treated as overflow.
+            used = self._encoded_name_len(text)
+            cap = self._usable_name_bytes()
+            self._name_counter.setText(
+                f"{'?' if used is None else used}/{cap}")
+            over = used is not None and used > cap
+            at_limit = used is not None and used == cap
+            colour = "#e57373" if over else ("#ffb74d" if at_limit else "#888888")
             self._name_counter.setStyleSheet(
-                "color: #ffb74d; font-size: 10px; font-family: 'Courier New';" if at_limit
-                else "color: #888888; font-size: 10px; font-family: 'Courier New';"
+                f"color: {colour}; font-size: 10px; font-family: 'Courier New';"
+            )
+            self._name_counter.setToolTip(
+                f"Encoded bytes used / available ({cap}; the engine buffer is "
+                f"{self._name_limit_bytes} including the terminator). "
+                f"Control codes such as {{POKEBLOCK}} cost their real byte "
+                f"count, not their letters."
             )
         self._update_name_counter = _update_name_counter
         self.f_name.textChanged.connect(_update_name_counter)
@@ -906,6 +920,65 @@ class ItemDetailPanel(QWidget):
         finally:
             self._loading = False
 
+    # A ceiling only, so the box cannot grow without bound. It is NOT the
+    # name limit — see collect() for the real, byte-based enforcement.
+    _TYPING_CEILING = 120
+
+    # CLASS-LEVEL DEFAULTS, and they must stay class-level. The panel is
+    # constructed before any project is loaded (and directly, by tests), but
+    # _update_name_counter runs on every textChanged. PyQt6 routes a slot
+    # exception out of band and ABORTS THE PROCESS — an AttributeError here
+    # crashed the whole test run with STATUS_STACK_BUFFER_OVERRUN rather than
+    # failing a test. Do not move these into set_name_limit_for_project().
+    _name_limit_bytes = 14        # vanilla ITEM_NAME_LENGTH; refined per project
+    _text_bytes = None            # no charmap yet -> everything unmeasurable
+
+    def set_name_limit_for_project(self, project_path: str) -> None:
+        """Point the name field at this project's charmap and buffer size.
+
+        Replaces the old character cap. Nothing is truncated here or later;
+        the limit is applied when the edit is committed.
+        """
+        self._project_root_for_text = project_path or ""
+        try:
+            from core.gba_text_bytes import load_text_bytes
+            self._text_bytes = load_text_bytes(project_path)
+            self._name_limit_bytes = self._text_bytes.name_limit()
+        except Exception:
+            # No charmap / unreadable project: measure nothing and block
+            # nothing. Degrading to "unmeasurable" is the safe direction.
+            self._text_bytes = None
+        self.f_name.setMaxLength(self._TYPING_CEILING)
+        self._update_name_counter(self.f_name.text())
+
+    def _encoded_name_len(self, text: str):
+        """Encoded byte length, or None when it cannot be measured."""
+        tb = getattr(self, "_text_bytes", None)
+        if tb is None:
+            return None
+        try:
+            return tb.encoded_len(text)
+        except Exception:
+            return None
+
+    def _usable_name_bytes(self) -> int:
+        """Bytes available for the name once the terminator is reserved.
+
+        Never raises: this runs inside a Qt slot, where an exception aborts
+        the process instead of failing cleanly.
+        """
+        try:
+            return max(0, int(self._name_limit_bytes) - 1)
+        except Exception:
+            return 13          # vanilla ITEM_NAME_LENGTH - 1
+
+    def _name_is_acceptable(self, text: str) -> bool:
+        """False only when the name is MEASURABLY over the engine's buffer."""
+        used = self._encoded_name_len(text)
+        if used is None:
+            return True          # unmeasurable is never rejected
+        return used <= self._usable_name_bytes()
+
     def set_name_limit(self, max_chars: int) -> None:
         """Cap the item-name field at *max_chars* (the project's
         ITEM_NAME_LENGTH - 1, i.e. the max DISPLAYABLE name length). Blocks
@@ -918,7 +991,11 @@ class ItemDetailPanel(QWidget):
         if cap < 1:
             return
         self._name_limit = cap
-        self.f_name.setMaxLength(cap)
+        # Kept working for existing callers, but it no longer caps the WIDGET:
+        # setMaxLength truncates inside setText(), which is what shortened
+        # stored names on load. `cap` is the max displayable length, so the
+        # buffer it implies is cap + 1 (the extra byte is the terminator).
+        self._name_limit_bytes = cap + 1
         self._update_name_counter(self.f_name.text())
 
     def load_item(self, const: str, data: dict, icon_path: str | None = None,
@@ -1029,7 +1106,18 @@ class ItemDetailPanel(QWidget):
         # checkbox can't hold (e.g. a rod's secondaryId) is never coerced to 0.
         keep = self._keep_if_unrepresentable
         d = dict(base)
-        d["english"] = self.f_name.text()
+        # The name limit is applied HERE, not by the widget. An over-limit name
+        # is refused and the previous value kept intact — never trimmed, and
+        # never when the text could not be measured.
+        _name = self.f_name.text()
+        if self._name_is_acceptable(_name):
+            d["english"] = _name
+        else:
+            self._last_name_rejection = (
+                f"That name needs {self._encoded_name_len(_name)} bytes but "
+                f"only {self._usable_name_bytes()} are available, so it was "
+                f"not applied. The previous name was kept.")
+            d["english"] = base.get("english", base.get("name", ""))
         d["price"] = keep(base, "price", self.f_price.value())
         d["pocket"] = self.f_pocket.currentData()
         # convert real newlines back to the GBA literal \n separator
@@ -1294,11 +1382,13 @@ class ItemsTabWidget(QWidget):
         type_choices = [(n, n) for n, _i in src_types]
         self._detail.set_enum_choices(pocket_choices, type_choices)
 
-        # Cap item names at the project's max DISPLAYABLE length
-        # (ITEM_NAME_LENGTH - 1) — a full-length name has no room for the string
-        # terminator and overflows the in-game menu.
+        # Point the name field at this project's charmap. The limit is the
+        # engine's name BUFFER in encoded bytes (ITEM_NAME_LENGTH, terminator
+        # included) — NOT a character count, and NOT applied to the widget.
+        # Counting characters is what silently shortened '{POKEBLOCK} CASE'
+        # (16 characters, 10 bytes) to '{POKEBLOCK} C' on load.
         if project_path:
-            self._detail.set_name_limit(parse_item_name_length(project_path) - 1)
+            self._detail.set_name_limit_for_project(project_path)
 
         # Pocket safety net: surface any pocket the DATA uses that the source
         # headers didn't define (stale or hand-authored), preserved verbatim so

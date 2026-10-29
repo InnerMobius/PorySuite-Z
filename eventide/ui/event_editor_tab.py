@@ -44,6 +44,8 @@ from eventide.backend import var_flag_manager
 from eventide.ui.widgets import (ConstantPicker, MapPicker, SpritePreview,
                                  ValuePicker)
 from ui.custom_widgets.scroll_guard import install_scroll_guard_recursive
+from ui.custom_widgets.reorderable_list import (
+    ReorderableListWidget, move_list_rows, reorder_rows)
 
 
 # ── "No script" sentinels ───────────────────────────────────────────────────
@@ -3586,15 +3588,17 @@ class _MoveRouteDialog(QDialog):
         left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.addWidget(QLabel('Movement Steps:'))
 
-        self._step_list = QListWidget()
+        # The route is read straight off this list, so the list must not
+        # let a drop reorder it -- see ReorderableListWidget.
+        self._step_list = ReorderableListWidget()
         self._step_list.setAlternatingRowColors(True)
         # Pick several steps the way every other list works — click, shift to
         # extend, ctrl to add one. A move route is mostly repeated steps, so
         # selecting one at a time is the slowest possible way to edit one.
         self._step_list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
-        self._step_list.setDragDropMode(
-            QAbstractItemView.DragDropMode.InternalMove)
+        self._step_list.rows_move_requested.connect(
+            self._on_steps_move_requested)
         self._step_list.setToolTip(_tt(
             'Click to select, Shift+click for a run, Ctrl+click to add one.\n'
             'Ctrl+C / Ctrl+X / Ctrl+V to copy, cut and paste steps, '
@@ -3731,6 +3735,32 @@ class _MoveRouteDialog(QDialog):
         self._undo.append(self._state())
         del self._undo[:-100]
         self._redo.clear()
+
+    def _on_steps_move_requested(self, rows, dest: int) -> None:
+        """Move the dragged steps, and let the move be undone.
+
+        `get_steps` reads the route straight off this list, so the list is
+        the only copy of it -- a drop allowed to reorder the rows itself
+        would write one step over another and the wrong route would be
+        saved. The move is made here instead, with the same item objects.
+
+        Dragging also pushes an undo step now. Every other edit in this
+        dialog could be taken back with Ctrl+Z and a drag could not, which
+        was the one edit where it mattered most.
+        """
+        before = self._state()
+        landed = move_list_rows(self._step_list, rows, dest)
+        if not landed:
+            return                      # dropped where it already was
+        self._undo.append(before)
+        del self._undo[:-100]
+        self._redo.clear()
+        # setCurrentRow clears an extended selection, so it goes first.
+        self._step_list.setCurrentRow(landed[0])
+        for r in landed:
+            item = self._step_list.item(r)
+            if item is not None:
+                item.setSelected(True)
 
     def _on_undo(self):
         if not self._undo:
@@ -7581,27 +7611,21 @@ class _HiddenItemPanel(QWidget):
 # Drag-reorderable command list
 # ═════════════════════════════════════════════════════════════════════════════
 
-class _DraggableCommandList(QListWidget):
-    """QListWidget with internal drag-and-drop reorder support.
+def _make_insertion_line() -> QListWidgetItem:
+    """The trailing "@>" line: a place to insert at, not a command.
 
-    Emits ``rows_reordered`` after a drop so the parent can rebuild
-    ``_cmd_tuples`` from the new visual order.
+    The rest of the editor assumes this line is LAST, and that it is the only
+    row with no command behind it, so it must not be possible to pick it up
+    and drop it somewhere in the middle. Dropping another row ONTO it stays
+    allowed, because that is how someone says "move this to the end".
+
+    Its data being None is how every loop that walks the widget tells it
+    apart from a real command.
     """
-    rows_reordered = pyqtSignal()
-    #: Emitted BEFORE a drop changes anything, so the parent can snapshot the
-    #: order for undo. After the drop the old order is already gone.
-    rows_about_to_move = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
-
-    def dropEvent(self, event):
-        self.rows_about_to_move.emit()
-        super().dropEvent(event)
-        # After the drop completes, emit so the data layer can sync
-        self.rows_reordered.emit()
+    item = QListWidgetItem('@>')
+    item.setData(Qt.ItemDataRole.UserRole, None)
+    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDragEnabled)
+    return item
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -8475,7 +8499,7 @@ class EventEditorTab(QWidget):
         find_script_shortcut = QShortcut(QKeySequence('Ctrl+Shift+F'), self)
         find_script_shortcut.activated.connect(self._on_find_script)
 
-        self._cmd_list = _DraggableCommandList()
+        self._cmd_list = ReorderableListWidget()
         self._cmd_list.setToolTip(_tt(
             'Script commands for this event page\n'
             'Double-click to edit • Right-click for context menu • Drag to reorder'))
@@ -8487,9 +8511,8 @@ class EventEditorTab(QWidget):
         self._cmd_list.itemDoubleClicked.connect(self._on_edit_command)
         self._cmd_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._cmd_list.customContextMenuRequested.connect(self._on_cmd_context_menu)
-        self._cmd_list.rows_about_to_move.connect(
-            self._on_rows_about_to_move)
-        self._cmd_list.rows_reordered.connect(self._on_rows_moved)
+        self._cmd_list.rows_move_requested.connect(
+            self._on_rows_move_requested)
         self._cmd_list.setObjectName('cmdList')
         self._cmd_list.setStyleSheet(
             '#cmdList { font-size: 12px; }'
@@ -11043,9 +11066,7 @@ class EventEditorTab(QWidget):
             self._cmd_tuples.append(cmd_tuple)
 
         # Add the empty @> insertion line at the bottom (like RMXP)
-        empty_item = QListWidgetItem('@>')
-        empty_item.setData(Qt.ItemDataRole.UserRole, None)
-        self._cmd_list.addItem(empty_item)
+        self._cmd_list.addItem(_make_insertion_line())
         self._reindent_list()
 
     def _add_list_item(self, cmd_tuple: tuple, at_idx: int = -1):
@@ -11291,7 +11312,7 @@ class EventEditorTab(QWidget):
             return
         self.obj_combo.setCurrentIndex(idx)
         cmd_idx = problem.get('cmd_idx')
-        if cmd_idx is not None and 0 <= cmd_idx < self._cmd_list.count():
+        if cmd_idx is not None and 0 <= cmd_idx < len(self._cmd_tuples):
             self._cmd_list.setCurrentRow(cmd_idx)
             self._cmd_list.setFocus()
 
@@ -11513,10 +11534,15 @@ class EventEditorTab(QWidget):
     # ─────────────────────────────────────────────────────────────────────
 
     def _selected_cmd_idx(self) -> int:
-        """Return the index of the currently selected command, or -1."""
+        """Return the index of the currently selected command, or -1.
+
+        The trailing "@>" line is recognised by having no command behind it
+        rather than by being past the end of the list. Asking its POSITION
+        meant that any time the list and the commands fell out of step, a real
+        command was mistaken for the insertion line.
+        """
         row = self._cmd_list.currentRow()
-        # Don't count the empty @> line at the end as a command
-        if row >= len(self._cmd_tuples):
+        if row < 0 or self._command_item(row) is None:
             return -1
         return row
 
@@ -11690,9 +11716,15 @@ class EventEditorTab(QWidget):
     def _on_edit_command(self, item: QListWidgetItem):
         """Double-click handler — open edit dialog for the clicked command."""
         idx = self._cmd_list.row(item)
-        if idx >= len(self._cmd_tuples):
-            # Double-clicked the empty @> line — insert a new command
+        # The "@>" line is the one row with no command behind it, which is how
+        # it is told apart here. Going by POSITION instead meant that once the
+        # list and the commands fell out of step, double-clicking a real
+        # command ADDED another one rather than opening it for editing — which
+        # is what "clicking add text makes two boxes" was.
+        if item.data(Qt.ItemDataRole.UserRole) is None:
             self._on_add_command()
+            return
+        if idx < 0 or idx >= len(self._cmd_tuples):
             return
         cmd_tuple = self._cmd_tuples[idx]
         # Label markers are not editable — they're structural dividers
@@ -11901,6 +11933,11 @@ class EventEditorTab(QWidget):
             item = self._cmd_list.item(i)
             if item is None:
                 continue
+            if item.data(Qt.ItemDataRole.UserRole) is None:
+                # Not a command. Writing a command's text here would turn the
+                # trailing "@>" line into a convincing copy of one, and
+                # deleting that copy would take a real command with it.
+                continue
             pad = '      ' * ind
             base = _stringize(ct)
             item.setText('\n'.join(pad + ln for ln in base.split('\n')))
@@ -12009,9 +12046,7 @@ class EventEditorTab(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, cmd_tuple)
             _apply_cmd_color(item, cmd_tuple)
             self._cmd_list.addItem(item)
-        empty = QListWidgetItem('@>')
-        empty.setData(Qt.ItemDataRole.UserRole, None)
-        self._cmd_list.addItem(empty)
+        self._cmd_list.addItem(_make_insertion_line())
         self._reindent_list()
 
     def _on_undo(self):
@@ -12055,10 +12090,10 @@ class EventEditorTab(QWidget):
             self._mw.log_message(
                 f'Event Editor: deleted {removed} command(s)')
             return
-        self._push_undo()
         idx = self._selected_cmd_idx()
         if idx < 0 or idx >= len(self._cmd_tuples):
             return
+        self._push_undo()
         self._delete_one_row(idx)
 
     def _delete_one_row(self, idx: int) -> bool:
@@ -12079,6 +12114,12 @@ class EventEditorTab(QWidget):
         # (header + both branches + their bodies + Branch End).
         if head == 'choice_yesno':
             end = self._choice_block_end(idx)
+            if end < 0:
+                self._mw.log_message(
+                    'This "Show Choices" line has no "Branch End" to match it, '
+                    'so the editor cannot tell where the block stops. Use Undo, '
+                    'or delete the commands inside it one at a time.')
+                return False
             for j in range(end, idx - 1, -1):
                 self._cmd_tuples.pop(j)
                 self._cmd_list.takeItem(j)
@@ -12104,7 +12145,14 @@ class EventEditorTab(QWidget):
         return True
 
     def _choice_block_end(self, start: int) -> int:
-        """Index of the branch_end matching the choice_yesno at *start*."""
+        """Index of the branch_end matching the choice_yesno at *start*.
+
+        Returns -1 when there is no matching Branch End. This used to fall
+        back to the last command in the script, which meant deleting the
+        header of an unbalanced block silently deleted everything from it to
+        the end of the page. Saying "I could not find it" instead lets the
+        callers refuse rather than guess at how much to take.
+        """
         depth = 0
         for j in range(start + 1, len(self._cmd_tuples)):
             h = self._cmd_tuples[j][0] if self._cmd_tuples[j] else None
@@ -12114,21 +12162,66 @@ class EventEditorTab(QWidget):
                 if depth == 0:
                     return j
                 depth -= 1
-        return len(self._cmd_tuples) - 1
+        return -1
 
-    def _on_rows_about_to_move(self, *_args):
-        """Snapshot the order before a drag rewrites it."""
+    def _draggable_rows(self, rows) -> list:
+        """The rows a drag is allowed to move, and what travels with them.
+
+        Dragging follows the same structural rules as deleting, because the
+        two can break a page in the same way. A Show Choices header carries
+        its whole Yes/No block; the When and Branch End markers inside one
+        cannot travel on their own, since that would leave the block
+        unbalanced; and a label marker stays where it is. Without this, a drag
+        could reorder a page into a shape no other part of the editor allows.
+        """
+        out: set = set()
+        refused = False
+        for r in rows:
+            if not (0 <= r < len(self._cmd_tuples)):
+                continue            # the trailing "@>" line is not a command
+            head = self._cmd_tuples[r][0] if self._cmd_tuples[r] else None
+            if head == '_label_marker':
+                continue
+            if head in ('when_yes', 'when_no', 'branch_end'):
+                refused = True
+                continue
+            if head == 'choice_yesno':
+                end = self._choice_block_end(r)
+                if end < 0:
+                    refused = True
+                    continue
+                out.update(range(r, end + 1))
+                continue
+            out.add(r)
+        if refused and not out:
+            self._mw.log_message(
+                'Drag the "Show Choices" line to move the whole Yes/No block.')
+        return sorted(out)
+
+    def _on_rows_move_requested(self, rows, dest: int):
+        """Move the dragged commands, then repaint the list from the result.
+
+        The list widget is never asked to move its own rows — see
+        ReorderableListWidget and reorder_rows for what Qt does to them if it
+        is. Reordering here and repainting from the result also re-pins the
+        trailing "@>" line to the bottom, where the rest of the editor
+        assumes it is.
+        """
+        rows = self._draggable_rows(rows)
+        if not rows:
+            return
+        moved, landed = reorder_rows(self._cmd_tuples, rows, dest)
+        if moved == list(self._cmd_tuples):
+            return                  # dropped where it already was
         self._push_undo()
-
-    def _on_rows_moved(self, *_args):
-        """Rebuild _cmd_tuples from list widget items after drag-and-drop reorder."""
-        new_tuples = []
-        for i in range(self._cmd_list.count()):
-            data = self._cmd_list.item(i).data(Qt.ItemDataRole.UserRole)
-            if data is not None:  # Skip the empty @> insertion line
-                new_tuples.append(data)
-        self._cmd_tuples = new_tuples
-        self._reindent_list()
+        self._rebuild_cmd_list(moved)
+        if landed:
+            # setCurrentRow clears an extended selection, so it goes first.
+            self._cmd_list.setCurrentRow(landed[0])
+            for r in landed:
+                item = self._cmd_list.item(r)
+                if item is not None:
+                    item.setSelected(True)
         self._mark_dirty()
 
     def _on_move_up(self):
@@ -12158,15 +12251,36 @@ class EventEditorTab(QWidget):
         self._mark_dirty()
 
     def _on_duplicate(self):
-        self._push_undo()
         idx = self._selected_cmd_idx()
         if idx < 0 or idx >= len(self._cmd_tuples):
             return
-        insert_at = idx + 1
-        self._add_list_item(self._cmd_tuples[idx], insert_at)
+        head = self._cmd_tuples[idx][0] if self._cmd_tuples[idx] else None
+        # Copying one line out of a Yes/No block would leave the page with a
+        # block the editor can no longer make sense of, so the same structural
+        # rules apply here as to deleting and dragging: the whole block, or
+        # nothing.
+        if head in ('when_yes', 'when_no', 'branch_end'):
+            self._mw.log_message(
+                'Duplicate the "Show Choices" line to copy the whole Yes/No '
+                'block.')
+            return
+        block = [self._cmd_tuples[idx]]
+        if head == 'choice_yesno':
+            end = self._choice_block_end(idx)
+            if end < 0:
+                self._mw.log_message(
+                    'This "Show Choices" line has no "Branch End" to match it, '
+                    'so the editor cannot tell what to copy.')
+                return
+            block = [self._cmd_tuples[j] for j in range(idx, end + 1)]
+        self._push_undo()
+        insert_at = idx + len(block)
+        for i, ct in enumerate(block):
+            self._add_list_item(ct, insert_at + i)
         self._cmd_list.setCurrentRow(insert_at)
         self._mark_dirty()
-        self._mw.log_message('Event Editor: duplicated command')
+        self._mw.log_message(
+            f'Event Editor: duplicated {len(block)} command(s)')
 
     # ─────────────────────────────────────────────────────────────────────
     # Go To → navigation (follow goto/call/trainerbattle targets)
@@ -12355,12 +12469,46 @@ class EventEditorTab(QWidget):
     #: Commands copied inside the editor. A LIST, because a selection can be
     #: more than one row; paste already handled a list.
     _clipboard: list | None = None
+    #: The script text this editor last put on the SYSTEM clipboard. Paste
+    #: compares against it to tell "this is what I copied" from "something
+    #: else was copied since" — see _put_on_clipboard and _on_paste.
+    _clipboard_text: str | None = None
+
+    def _put_on_clipboard(self, cmds: list) -> None:
+        """Copy commands to the editor AND to the system clipboard.
+
+        Keeping them only in `EventEditorTab._clipboard` was the bug behind
+        "Ctrl+V pasted a URL": copying a command left the SYSTEM clipboard
+        holding whatever was there before, and paste reads that first. So
+        Ctrl+C then Ctrl+V pasted whatever had last been copied anywhere else
+        on the machine.
+
+        Writing the real script text out also means a command can be pasted
+        into a text editor or a wiki, the same way "Copy as Script" works for a
+        whole event.
+        """
+        EventEditorTab._clipboard = list(cmds)
+        text = ''
+        try:
+            from eventide.backend.eventide_utils import lines_from_commands
+            text = ''.join(lines_from_commands(cmds, dict(self._texts)))
+        except Exception:
+            text = ''
+        # Remembered so paste can tell "this is what I copied" from "somebody
+        # copied something else since".
+        EventEditorTab._clipboard_text = text
+        if text:
+            try:
+                from PyQt6.QtWidgets import QApplication
+                QApplication.clipboard().setText(text)
+            except Exception:
+                pass
 
     def _on_copy(self):
         rows = self._selected_cmd_rows()
         if not rows:
             return
-        EventEditorTab._clipboard = [self._cmd_tuples[r] for r in rows]
+        self._put_on_clipboard([self._cmd_tuples[r] for r in rows])
         self._mw.log_message(
             f'Event Editor: copied {len(rows)} command(s)' if len(rows) > 1
             else 'Event Editor: copied command')
@@ -12369,7 +12517,7 @@ class EventEditorTab(QWidget):
         rows = self._selected_cmd_rows()
         if not rows:
             return
-        EventEditorTab._clipboard = [self._cmd_tuples[r] for r in rows]
+        self._put_on_clipboard([self._cmd_tuples[r] for r in rows])
         self._on_del_command()
         self._mw.log_message(
             f'Event Editor: cut {len(rows)} command(s)' if len(rows) > 1
@@ -12391,11 +12539,27 @@ class EventEditorTab(QWidget):
             text = QApplication.clipboard().text()
         except Exception:
             text = ''
-        # Only treat the clipboard as script when the editor's own Copy was
-        # not the last thing to touch it — otherwise a plain command copy
-        # would be re-parsed from whatever text happened to be there.
+        # The comment that used to be here said the clipboard is only treated
+        # as script when the editor's own Copy was not the last thing to touch
+        # it — but nothing implemented that, and `parse_script_snippet` accepts
+        # ANY line as a command:
+        #
+        #     'https://example.com/a?b=1'  ->  [('https://example.com/a?b=1',)]
+        #
+        # so a URL copied from a browser pasted in as a command. Two checks
+        # now: use the editor's own commands when the clipboard still holds
+        # what it put there, and otherwise only accept text that parses into
+        # commands this project actually has.
         if text and text.strip():
-            pasted = parse_script_snippet(text, self._texts)
+            if text == getattr(EventEditorTab, '_clipboard_text', None) \
+                    and EventEditorTab._clipboard:
+                # Same tolerance as the fallback below: the clipboard used to
+                # hold ONE bare tuple, and `list(('waitstate',))` turns that
+                # into the string 'waitstate', whose first element is 'w'.
+                clip = EventEditorTab._clipboard
+                pasted = list(clip) if isinstance(clip, list) else [clip]
+            elif self._looks_like_script(text):
+                pasted = parse_script_snippet(text, self._texts)
 
         if not pasted:
             if not EventEditorTab._clipboard:
@@ -12407,6 +12571,7 @@ class EventEditorTab(QWidget):
             # Tolerate the old single-tuple clipboard shape.
             pasted = list(clip) if isinstance(clip, list) else [clip]
 
+        pasted = self._drop_pasted_text_definitions(pasted)
         pasted, copied_moves = self._privatise_pasted_movements(pasted)
 
         self._push_undo()
@@ -12427,6 +12592,68 @@ class EventEditorTab(QWidget):
                 f'Event Editor: gave the pasted copy its own movement'
                 f'{"s" if len(copied_moves) > 1 else ""} ({pairs}) so editing '
                 f'them will not change the original.')
+
+    def _looks_like_script(self, text: str) -> bool:
+        """Is this clipboard text actually script, or just text?
+
+        Pasting script copied from a file or a wiki is a real feature, so this
+        cannot simply refuse anything that did not come from the editor. But
+        the snippet parser treats every line as a command, so without a check
+        a copied URL, a file path or a sentence all paste in as commands.
+
+        The test is the project's OWN command list: every non-blank, non-label,
+        non-comment line has to start with a macro this project defines. One
+        line that does not is enough to say "this is not script" — it is text
+        that happens to be on the clipboard, and pasting it would make a mess
+        nobody asked for.
+        """
+        try:
+            from eventide.backend.macro_params import get_macros
+            macros = get_macros(_PROJECT_ROOT)
+        except Exception:
+            macros = {}
+        if not macros:
+            # Nothing to check against; keep the old permissive behaviour
+            # rather than refusing to paste at all.
+            return True
+        saw_command = False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith(('@', '#', '.')) or line.endswith(':'):
+                continue
+            head = line.split(None, 1)[0].rstrip(',')
+            if head not in macros:
+                return False
+            saw_command = True
+        return saw_command
+
+    def _drop_pasted_text_definitions(self, pasted: list[tuple]):
+        """Throw away text DEFINITIONS that arrive with a pasted script.
+
+        "Copy as Script" renders an event and its dialogue, on purpose, so the
+        copy is self-contained enough to paste into a file or a wiki. Pasting
+        it back into the editor is the one place that is wrong: the map already
+        defines those labels in text.inc, and defining them again fails the
+        build with "symbol already defined".
+
+        The snippet parser does not recognise a text block, so the label line
+        is lost and each `.string` arrives as a nonsense command of its own.
+        Those are what get dropped here — the `msgbox` commands keep pointing
+        at the labels the map already has, which is what was wanted.
+        """
+        kept: list[tuple] = []
+        dropped = 0
+        for cmd in pasted:
+            if cmd and str(cmd[0]) in ('.string', '.braille'):
+                dropped += 1
+                continue
+            kept.append(cmd)
+        if dropped:
+            self._mw.log_message(
+                f'Event Editor: ignored {dropped} line(s) of text that came '
+                f'with the pasted script — this map already defines them, '
+                f'and defining them twice would fail the build.')
+        return kept
 
     def _privatise_pasted_movements(self, pasted: list[tuple]):
         """Give pasted commands their own copy of any movement already in use.
@@ -14399,12 +14626,23 @@ class EventEditorTab(QWidget):
             if item:
                 item.setBackground(QColor(0, 0, 0, 0))
 
+    def _command_item(self, row: int):
+        """The item at *row*, or None when that row is not a command.
+
+        The trailing "@>" line is a place to insert at rather than a command,
+        so searching, highlighting and jumping all have to step over it.
+        """
+        item = self._cmd_list.item(row)
+        if item is None or item.data(Qt.ItemDataRole.UserRole) is None:
+            return None
+        return item
+
     def _on_search_commands(self, text):
         """Highlight matching commands as the user types."""
         text = text.lower().strip()
         match_count = 0
         for i in range(self._cmd_list.count()):
-            item = self._cmd_list.item(i)
+            item = self._command_item(i)
             if not item:
                 continue
             if text and text in item.text().lower():
@@ -14424,13 +14662,13 @@ class EventEditorTab(QWidget):
             return
         start = self._cmd_list.currentRow() + 1
         for i in range(start, self._cmd_list.count()):
-            item = self._cmd_list.item(i)
+            item = self._command_item(i)
             if item and text in item.text().lower():
                 self._cmd_list.setCurrentRow(i)
                 return
         # Wrap around to the top
         for i in range(0, start):
-            item = self._cmd_list.item(i)
+            item = self._command_item(i)
             if item and text in item.text().lower():
                 self._cmd_list.setCurrentRow(i)
                 return
@@ -14442,13 +14680,13 @@ class EventEditorTab(QWidget):
             return
         start = self._cmd_list.currentRow() - 1
         for i in range(start, -1, -1):
-            item = self._cmd_list.item(i)
+            item = self._command_item(i)
             if item and text in item.text().lower():
                 self._cmd_list.setCurrentRow(i)
                 return
         # Wrap around to the bottom
         for i in range(self._cmd_list.count() - 1, start, -1):
-            item = self._cmd_list.item(i)
+            item = self._command_item(i)
             if item and text in item.text().lower():
                 self._cmd_list.setCurrentRow(i)
                 return
@@ -14845,6 +15083,24 @@ class EventEditorTab(QWidget):
 
         try:
             write_scripts_inc(save_pages, self._hidden_lines, self._texts, scripts_path)
+            # text.inc owns this map's dialogue, so the same label defined in
+            # scripts.inc too is a duplicate symbol and the build stops. This
+            # both clears damage already on disk and keeps a later paste from
+            # leaving any.
+            try:
+                from eventide.backend.eventide_utils import (
+                    strip_duplicate_text_blocks)
+                dropped = strip_duplicate_text_blocks(
+                    scripts_path, self._local_text_labels)
+                if dropped:
+                    self._mw.log_message(
+                        'Event Editor: removed '
+                        f'{len(dropped)} duplicate text block(s) from '
+                        f'scripts.inc ({", ".join(dropped)}) — they are '
+                        f'defined in text.inc and would fail the build.')
+            except Exception as e:
+                self._mw.log_message(
+                    f'Event Editor: duplicate-text check failed: {e}')
             # Only write labels that came from this map's text.inc (or were
             # created during editing).  Global labels from data/text/*.inc
             # must NOT be dumped into the map's local text.inc.

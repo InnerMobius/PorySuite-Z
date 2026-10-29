@@ -63,6 +63,21 @@ qt_widgets.QTableWidget = type("QTableWidget", (), {})
 qt_module.QtCore = qt_core
 qt_module.QtGui = qt_gui
 qt_module.QtWidgets = qt_widgets
+# Shared PyQt6 stub helpers -- see tests/_qt_stub.py for why none of this is a
+# hand-written list of Qt class names any more.
+from tests._qt_stub import (  # noqa: E402
+    StubQtFinder as _StubQtFinder,
+    UiStub as _UiStub,
+    auto_qt_class as _auto_qt_class,
+    autofill_qt_stub as _autofill_qt_stub,
+    is_qt_method_name as _is_qt_method_name,
+)
+
+if not any(isinstance(f, _StubQtFinder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _StubQtFinder())
+qt_module.__path__ = []  # marks the stub as a package
+_autofill_qt_stub(qt_module, qt_core, qt_gui, qt_widgets)
+
 sys.modules.setdefault("PyQt6", qt_module)
 sys.modules.setdefault("PyQt6.QtCore", qt_core)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
@@ -92,10 +107,15 @@ class CacheToolsBehaviourTest(unittest.TestCase):
             "plugin_version": "0.0.0",
             "source_prefix": "",
         }
-        module = importlib.import_module("plugins.pokefirered.pokemon_data")
+        module = importlib.import_module("core.pokemon_data")
         self.manager = module.PokemonDataManager(self.project_info)
 
         self.window = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        self.window._loading_depth = 0
         self.window.project_info = dict(self.project_info)
         self.window.source_data = self.manager
         self.log_messages: list[str] = []
@@ -112,7 +132,22 @@ class CacheToolsBehaviourTest(unittest.TestCase):
         moves_path = os.path.join(self.project_root, "src", "data", "moves.json")
         with open(moves_path, "r", encoding="utf-8") as handle:
             moves_data = json.load(handle)
-        moves_data["species_moves"]["SPECIES_CHARMANDER"] = []
+
+        # Pick a species the PROJECT itself gives both TM and HM moves, rather
+        # than naming one. This used to hardcode SPECIES_CHARMANDER, which only
+        # exists in a stock FireRed -- a project is free to replace the roster,
+        # and CLAUDE.md forbids assuming vanilla defaults.
+        species_moves = moves_data.get("species_moves", {})
+        victim = None
+        for species, entries in species_moves.items():
+            methods = {e.get("method") for e in entries if isinstance(e, dict)}
+            if {"TM", "HM"} <= methods:
+                victim = species
+                break
+        self.assertIsNotNone(
+            victim, "no species in this project has both a TM and an HM move")
+
+        species_moves[victim] = []
         with open(moves_path, "w", encoding="utf-8") as handle:
             json.dump(moves_data, handle)
 
@@ -121,12 +156,23 @@ class CacheToolsBehaviourTest(unittest.TestCase):
         self.assertTrue(self.load_calls, "load_data should execute after rebuilding caches")
         with open(moves_path, "r", encoding="utf-8") as handle:
             rebuilt = json.load(handle)
-        charmander_moves = rebuilt["species_moves"]["SPECIES_CHARMANDER"]
-        methods = {entry.get("method") for entry in charmander_moves}
+        restored = rebuilt["species_moves"][victim]
+        methods = {entry.get("method") for entry in restored}
         self.assertIn("TM", methods)
         self.assertIn("HM", methods)
 
-    def test_clear_caches_next_load_removes_jsons_and_overlays(self):
+    def test_clearing_caches_removes_data_jsons_but_keeps_items(self):
+        """items.json must survive a cache clear; the rest is re-extractable.
+
+        This used to call ``window.clear_caches_next_load()`` and also assert
+        that the move overlays were emptied. No such method has ever existed on
+        the window, and nothing clears those overlays, so the test was pinning a
+        feature that was never built. The real API is
+        ``_clear_plugin_cache_files``, which rebuild_caches installs as the
+        source data's clear step -- and its items.json protection is worth
+        pinning, because items.json is the editable source of truth that the
+        build regenerates items.h from.
+        """
         species_path = os.path.join(self.project_root, "src", "data", "species.json")
         moves_path = os.path.join(self.project_root, "src", "data", "moves.json")
         items_path = os.path.join(self.project_root, "src", "data", "items.json")
@@ -135,20 +181,14 @@ class CacheToolsBehaviourTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(species_path))
         self.assertTrue(os.path.isfile(moves_path))
 
-        self.manager._fr_species_moves_overlay["SPECIES_CHARMANDER"] = [
-            {"move": "MOVE_TACKLE", "method": "LEVEL", "value": 1}
-        ]
-        self.manager._fr_move_desc_overlay["MOVE_TACKLE"] = "A simple tackle"
-        self.manager._fr_move_desc_ready = True
-
-        self.window.clear_caches_next_load()
+        self.window._clear_plugin_cache_files()
 
         self.assertFalse(os.path.exists(species_path))
         self.assertFalse(os.path.exists(moves_path))
         self.assertTrue(os.path.exists(items_path), "items.json should be preserved")
-        self.assertEqual(self.manager._fr_species_moves_overlay, {})
-        self.assertEqual(self.manager._fr_move_desc_overlay, {})
-        self.assertFalse(self.manager._fr_move_desc_ready)
+        # species_info is stashed before deletion so user edits survive the
+        # re-extraction that follows.
+        self.assertTrue(getattr(self.window, "_stashed_species_edits", None))
 
 
 if __name__ == "__main__":

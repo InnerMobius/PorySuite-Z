@@ -142,6 +142,15 @@ def missing_required(root_dir, command: str,
     if any(p.vararg for p in params):
         return []
     flat = flatten_args(args)
+    # More arguments than the macro declares means the editor's tuple is NOT
+    # the macro's argument list, so comparing them position by position is
+    # meaningless. The Text command is the case that proved it: the editor
+    # holds it as (label, text, type) while `message` declares one parameter,
+    # `text:req` — so position 0 compared the LABEL against it and announced
+    # that "text" was empty on a command with text plainly typed into it. The
+    # label is SUPPOSED to be blank; the editor generates it when saving.
+    if len(flat) > len(params):
+        return []
     missing: List[str] = []
     for p in params:
         if not p.required:

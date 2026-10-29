@@ -280,6 +280,17 @@ class MainWindow(QMainWindow):
         # Initialize UI
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        # Both dex lists are reordered by dragging, and the order of a dex
+        # lives ONLY in the list -- saving walks it row by row. So the lists
+        # have to own their own drops. This runs before anything is connected
+        # to them or lays them out, because it replaces the widgets.
+        for _dex_list in ("list_pokedex_national", "list_pokedex_regional"):
+            try:
+                self._promote_dex_list(_dex_list)
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "could not promote %s; drag-reorder stays unsafe",
+                    _dex_list)
         # Install diagnostics logging filter
         try:
             from diagnostics import install_global_filter
@@ -920,25 +931,20 @@ QTabBar::tab:hover:!selected {
                 lambda t: self._filter_list_widget(self.ui.list_pokedex_regional, t))
         except Exception:
             logging.getLogger(__name__).exception("search box wiring failed")
-        # Drag-to-reorder on either dex list must trip the dirty flag.
-        # QListWidget uses its internal model's rowsMoved signal — there is
-        # no widget-level equivalent. Connecting the model signal catches
-        # every InternalMove completion. Lambda captures the list reference
-        # so the slot knows which list to paint amber on.
-        try:
-            _nat = self.ui.list_pokedex_national
-            _nat.model().rowsMoved.connect(
-                lambda p, s, e, d, r, lst=_nat: self._on_dex_reordered(lst, s, e, r)
-            )
-        except Exception:
-            pass
-        try:
-            _reg = self.ui.list_pokedex_regional
-            _reg.model().rowsMoved.connect(
-                lambda p, s, e, d, r, lst=_reg: self._on_dex_reordered(lst, s, e, r)
-            )
-        except Exception:
-            pass
+        # Drag-to-reorder on either dex list. This used to hang off the
+        # internal model's rowsMoved signal, which a dropped row never emits
+        # — so neither the reorder nor the dirty marking was reliable. The
+        # promoted lists ask here instead, and the move is made below.
+        for _name in ("list_pokedex_national", "list_pokedex_regional"):
+            try:
+                _lst = getattr(self.ui, _name)
+                _lst.rows_move_requested.connect(
+                    lambda rows, dest, lst=_lst:
+                    self._on_dex_rows_move_requested(lst, rows, dest)
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "drag-reorder wiring failed for %s", _name)
         self.ui.tab_pokemon_data.currentChanged.connect(self.refresh_current_species)
         self.ui.evolutions.itemSelectionChanged.connect(self.update_evolutions)
         self.ui.pushButton_7.clicked.connect(self.add_evolution)
@@ -3016,8 +3022,12 @@ QTabBar::tab:hover:!selected {
         branch_row = QHBoxLayout()
         branch_row.addWidget(QLabel(f"<b>Push '{current_branch}' → branch:</b>"))
         branch_combo = QComboBox()
-        branch_combo.setFocusPolicy(_Qt.FocusPolicy.StrongFocus)
-        branch_combo.installEventFilter(self._combo_wheel_filter())
+        # Use the SHARED guard, not the old local filter. The local one only
+        # swallowed the wheel while the widget lacked focus — measured on
+        # 2026-10-29, a focused combo still jumped B -> C on one notch, which
+        # is exactly the "clicked then scrolled" case scroll_guard.py was
+        # written to stop. It also sets StrongFocus for us.
+        self._guard_wheel(branch_combo)
         for b in all_branches:
             branch_combo.addItem(b)
         # Default to the branch THIS repo last pushed to, so you don't have to
@@ -3493,19 +3503,11 @@ QTabBar::tab:hover:!selected {
             "return here and click Push again."
         )
 
-    def _combo_wheel_filter(self):
-        """Return a shared event filter that blocks wheel events on unfocused combo boxes."""
-        filt = getattr(self, "_wheel_filter_instance", None)
-        if filt is not None:
-            return filt
-        from PyQt6.QtCore import QObject, QEvent
-        class _WheelBlocker(QObject):
-            def eventFilter(self, obj, event):
-                if event.type() == QEvent.Type.Wheel and not obj.hasFocus():
-                    return True
-                return False
-        self._wheel_filter_instance = _WheelBlocker(self)
-        return self._wheel_filter_instance
+    # `_combo_wheel_filter` was removed on 2026-10-29. It blocked the wheel only
+    # while a widget lacked focus, which `ui/custom_widgets/scroll_guard.py`
+    # documents as the wrong rule for value-bearing widgets — measured, a
+    # FOCUSED combo under that filter still changed B -> C on one wheel notch.
+    # Use `self._guard_wheel(widget)` (the shared guard) instead.
 
     # ── Make ──────────────────────────────────────────────────────────────────
 
@@ -3903,6 +3905,36 @@ QTabBar::tab:hover:!selected {
         # explicit user action.
         self.load_data(project_info)
 
+    def _report_save_refusals(self, refusals: list[str]) -> None:
+        """Show the things a save REFUSED to write, once, in plain language.
+
+        Added 2026-10-29. The tab flushes already returned an error list and
+        `export_indexed_png` already explained itself, but the only consumer was
+        `logging.info`, so a refused sprite write was indistinguishable from a
+        successful one from the user's side. Everything else about the save
+        still succeeds; this says what did not.
+        """
+        if not refusals:
+            return
+        logging.warning("Save refused %d item(s): %s", len(refusals), refusals)
+        if getattr(self, "_loading_depth", 0) > 0 \
+                or getattr(self, "_refresh_discarding", False):
+            return
+        shown = refusals[:8]
+        body = "\n\n".join(f"• {r}" for r in shown)
+        if len(refusals) > len(shown):
+            body += f"\n\n…and {len(refusals) - len(shown)} more (see the log)."
+        try:
+            QMessageBox.warning(
+                self, "Some files were not written",
+                "Everything else saved, but these were left alone on purpose "
+                "rather than written incorrectly:\n\n"
+                f"{body}\n\n"
+                "The files named above are unchanged on disk. Fix the cause and "
+                "save again.")
+        except Exception:
+            pass
+
     def save_data(self, parse_headers: bool = True):
         """
         Save the source data and update project information.
@@ -3917,6 +3949,12 @@ QTabBar::tab:hover:!selected {
         Returns:
         - None
         """
+        # Anything a flush REFUSED to write is collected here and shown to the
+        # user once at the end of the save. Before 2026-10-29 these went to
+        # logging.info() only, so a refused sprite write looked exactly like a
+        # successful one — the reason existed but nothing displayed it.
+        save_refusals: list[str] = []
+
         # Flush Graphics tab edits (pic coords, elevation, icon palette index,
         # .pal files) before the main save pipeline runs.
         try:
@@ -3927,6 +3965,8 @@ QTabBar::tab:hover:!selected {
                         "Graphics tab: wrote %d file(s); errors: %s",
                         ok, errs or "none",
                     )
+                if errs:
+                    save_refusals.extend(f"Graphics: {e}" for e in errs)
         except Exception:
             logging.exception("graphics_tab_widget.flush_to_disk failed")
 
@@ -3939,8 +3979,14 @@ QTabBar::tab:hover:!selected {
                 if ok or errs:
                     logging.info("Encounters tab: wrote %d file(s); errors: %s",
                                  ok, errs or "none")
+                if errs:
+                    save_refusals.extend(f"Wild Encounters: {e}" for e in errs)
         except Exception:
             logging.exception("encounters_tab.flush_to_disk failed")
+        # Surface the refusals before the long header-writing phase, so the
+        # message is tied to the thing that failed rather than appearing after
+        # a minute of unrelated work.
+        self._report_save_refusals(save_refusals)
 
         # Save the source data
         self.source_data.save()
@@ -4346,7 +4392,24 @@ QTabBar::tab:hover:!selected {
             if evolution_method.startswith("EVO_MODE_"):
                 continue
             name = evo_info.get("name") if isinstance(evo_info, dict) else evo_info
+            # Three methods the engine declares but never acts on: the two
+            # time-of-day friendship ones have their switch bodies commented
+            # out ("FR/LG removed the time of day evolutions due to having no
+            # RTC") and EVO_LEVEL_SHEDINJA has no case in the switch at all.
+            # Label them instead of removing them — removing would change what
+            # existing species can keep, and a label changes no data.
+            if evolution_method in self._EVO_UNSUPPORTED_METHODS:
+                name = f"{name} — not supported by this engine"
             self.ui.evo_method.addItem(name, evolution_method)
+            if evolution_method in self._EVO_UNSUPPORTED_METHODS:
+                _i = self.ui.evo_method.count() - 1
+                self.ui.evo_method.setItemData(
+                    _i,
+                    "This game's code never acts on this method, so an "
+                    "evolution using it will never happen in play. It is left "
+                    "selectable so existing species keep what they have.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
         self.ui.evo_param.setEditable(True)
         # Add species flags to the flags list
         self.ui.species_flags.clear()
@@ -4382,6 +4445,13 @@ QTabBar::tab:hover:!selected {
         # cache for header-derived national ordering and cutoff
         self._nat_order_cache: list[str] | None = None
         self._kanto_cutoff_const: str | None = None
+        # Same treatment for the engine limits the evolution editor enforces.
+        # These are per-PROJECT (a different project can define a different
+        # EVOS_PER_MON / MAX_LEVEL), so they must be dropped here with the rest
+        # or opening a second project would validate against the first one's
+        # numbers.
+        self._evos_per_mon_cache: int | None = None
+        self._max_level_cache: int | None = None
 
         # ── Remove the ability row entirely from each starter form layout ───
         # The generated UI file put the ability combo + checkbox in row 4
@@ -4674,16 +4744,20 @@ QTabBar::tab:hover:!selected {
         return False
 
     def _log_save_diag(self, msg: str):
-        """Append a diagnostic line to porysuite/save_diag.log."""
-        try:
-            import time
-            log_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "save_diag.log")
-            with open(log_path, "a", encoding="utf-8", newline='\n') as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-        except Exception:
-            pass
+        """Append a diagnostic line to porysuite/save_diag.log.
+
+        OFF BY DEFAULT since 2026-10-29 — same reasoning as `_diag` above: it
+        appended on every save with no rotation or size cap and nothing read it.
+        Enable for a session with PORYSUITE_DIAG=1 (see core/diag_log.py).
+        """
+        from core import diag_log
+        if not diag_log.enabled():
+            return
+        import time
+        log_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "save_diag.log")
+        diag_log.append(log_path, f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     def _load_national_order_from_header(self) -> list[str]:
         if self._nat_order_cache is not None:
@@ -6714,6 +6788,12 @@ in the game.</p>
                     method_name = str(info)
                 else:
                     method_name = str(method_const)
+                # Flag a method this engine never acts on, the same way the
+                # dropdown does, so an evolution that can never fire is visible
+                # on the row ITSELF — not only while it is being picked. The
+                # stored data is not touched; this is display text.
+                if method_const in self._EVO_UNSUPPORTED_METHODS:
+                    method_name = f"{method_name} — not supported by this engine"
                 try:
                     item = QTreeWidgetItem(
                         [
@@ -6733,6 +6813,32 @@ in the game.</p>
                             item.setData(1, Qt.ItemDataRole.UserRole, method_const)
                         except Exception:
                             pass
+                        try:
+                            # Carry the target CONSTANT in column 0's user data
+                            # as well, so the save no longer has to read the
+                            # displayed TEXT. The form rows of the evo_species
+                            # dropdown are indented for readability ("    "
+                            # prefix), and reading the text stored that indent
+                            # into targetSpecies — which then stopped matching
+                            # on rename and left a dangling reference.
+                            item.setData(0, Qt.ItemDataRole.UserRole,
+                                         str(evo.get("targetSpecies", "")).strip())
+                        except Exception:
+                            pass
+                        if method_const in self._EVO_UNSUPPORTED_METHODS:
+                            try:
+                                _tip = (
+                                    "This game's code never acts on this "
+                                    "evolution method, so this evolution will "
+                                    "never happen in play. It is kept exactly "
+                                    "as it is — nothing has been changed for "
+                                    "you. Pick a different method if you want "
+                                    "it to work."
+                                )
+                                for _c in range(3):
+                                    item.setToolTip(_c, _tip)
+                            except Exception:
+                                pass
                     try:
                         self.ui.evolutions.addTopLevelItem(item)
                     except Exception:
@@ -6830,17 +6936,21 @@ in the game.</p>
         updated = False
 
         def _diag(tag, stored, ui):
-            # TEMP diagnostic (false-dirty hunt) — logs WHICH field the dirty-check
-            # flags so we stop guessing. Remove once confirmed clean.
-            try:
-                p = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    "diag_dirty.log")
-                with open(p, "a", encoding="utf-8") as _f:
-                    _f.write(f"{species} form={form} DIRTY[{tag}] "
-                             f"stored={stored!r} ui={ui!r}\n")
-            except Exception:
-                pass
+            # Diagnostic for the false-dirty hunt: records WHICH field the
+            # dirty-check flagged. OFF BY DEFAULT since 2026-10-29 — it used to
+            # append on every species save, with no rotation and no size cap,
+            # writing the project's own species constants and field values into
+            # the application folder for a diagnostic nobody was running.
+            # Turn it on for a session with PORYSUITE_DIAG=1 (see
+            # core/diag_log.py). Nothing reads the file; it is for eyeballing.
+            from core import diag_log
+            if not diag_log.enabled():
+                return
+            p = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "diag_dirty.log")
+            diag_log.append(p, f"{species} form={form} DIRTY[{tag}] "
+                               f"stored={stored!r} ui={ui!r}")
 
         def _normalize(v):
             # Normalize for comparison: strip, coerce numeric-looking strings to int,
@@ -7259,7 +7369,8 @@ in the game.</p>
             except Exception:
                 pass
         # Collect evolutions from the tree widget
-        evolutions: list[dict] = []
+        evolutions: list[dict] | None = []
+        evo_problems: list[str] = []
         evo_types = {}
         getter = getattr(self.source_data, "get_constant", None)
         if callable(getter):
@@ -7277,24 +7388,65 @@ in the game.</p>
                 method_const = None
             if not method_const:
                 method_name = item.text(1)
+                # Strip the "— not supported by this engine" suffix the display
+                # carries for the three methods this engine never acts on, so
+                # the name lookup still matches.
+                method_name = method_name.split(" — not supported")[0].strip()
                 for const, info in evo_types.items():
                     name = info.get("name") if isinstance(info, dict) else info
                     if name == method_name:
                         method_const = const
                         break
                 method_const = method_const or method_name
+            # Target: the CONSTANT from column 0's user data. Reading the
+            # displayed text stored the form rows' display indent into
+            # targetSpecies, which then failed to match on rename and left a
+            # dangling reference that would not build. `.strip()` on the
+            # fallback repairs a row that predates this.
+            target = None
+            try:
+                target = item.data(0, Qt.ItemDataRole.UserRole)
+            except Exception:
+                target = None
+            if not (isinstance(target, str) and target.strip()):
+                target = (item.text(0) or "").strip()
+            else:
+                target = target.strip()
+
             param_txt = item.text(2)
             try:
                 param_val = int(param_txt)
             except ValueError:
                 param_val = param_txt if param_txt else None
-            evolutions.append(
-                {
-                    "targetSpecies": item.text(0),
-                    "method": method_const,
-                    "param": param_val,
-                }
-            )
+            row = {
+                "targetSpecies": target,
+                "method": method_const,
+                "param": param_val,
+            }
+            problem = self._evo_row_problem(row)
+            if problem:
+                evo_problems.append(problem)
+                # Keep whatever is CURRENTLY stored for this row rather than
+                # writing something the engine cannot use. Nothing the user
+                # already had is changed by a refusal.
+                continue
+            evolutions.append(row)
+        if evo_problems:
+            # The row(s) that failed were dropped from `evolutions`, so the
+            # comparison below sees a shorter list and would WRITE that —
+            # silently deleting the user's evolution. Abandon the evolution
+            # write entirely and tell them instead.
+            self._report_evo_problems(species, evo_problems)
+            evolutions = None
+        elif len(evolutions) > self._evos_per_mon():
+            self._report_evo_problems(species, [
+                f"this species has {len(evolutions)} evolutions but the game "
+                f"has room for {self._evos_per_mon()}. Remove "
+                f"{len(evolutions) - self._evos_per_mon()} before saving — the "
+                f"extra one(s) would either fail the build or be dropped "
+                f"without warning."
+            ])
+            evolutions = None
         current = self.source_data.get_evolutions(species) or []
         # Compare CANONICALLY on the meaningful fields (targetSpecies, method,
         # param) so representation/order differences don't falsely flag an edit:
@@ -7313,7 +7465,10 @@ in the game.</p>
                 out.append((str(e.get("targetSpecies", "")),
                             str(e.get("method", "")), ps))
             return sorted(out)
-        if _canon_evos(evolutions) != _canon_evos(current):
+        # `evolutions is None` means validation refused the whole set. Skip the
+        # write so the stored evolutions stay exactly as they were — a refusal
+        # must never change the user's data.
+        if evolutions is not None and _canon_evos(evolutions) != _canon_evos(current):
             _diag("evolutions", current, evolutions)
             updated = True
             self.source_data.set_evolutions(species, evolutions)
@@ -7896,9 +8051,20 @@ in the game.</p>
                 self.ui.evo_species.setCurrentIndex(0)
                 self.ui.evo_method.setCurrentIndex(0)
             else:
-                self.ui.evo_species.setCurrentIndex(
-                    self.ui.evo_species.findText(item.text(0))
-                )
+                # Restore by the stored CONSTANT (findData), not by the
+                # displayed text. Form rows are indented for readability, so
+                # findText only ever matched because the indent happened to be
+                # in both places — which is the same coupling that let the
+                # indent reach targetSpecies. Fall back to findText for a row
+                # built before column 0 carried its constant.
+                _tgt = (item.data(0, Qt.ItemDataRole.UserRole)
+                        if hasattr(item, "data") else None)
+                _idx = -1
+                if isinstance(_tgt, str) and _tgt:
+                    _idx = self.ui.evo_species.findData(_tgt)
+                if _idx == -1:
+                    _idx = self.ui.evo_species.findText(item.text(0))
+                self.ui.evo_species.setCurrentIndex(_idx)
                 const_val = (
                     item.data(1, Qt.ItemDataRole.UserRole)
                     if hasattr(item, "data")
@@ -8094,6 +8260,167 @@ in the game.</p>
     _EVO_NO_PARAM_METHODS = frozenset({
         "EVO_FRIENDSHIP", "EVO_FRIENDSHIP_DAY", "EVO_FRIENDSHIP_NIGHT", "EVO_TRADE",
     })
+    #: Methods whose param the engine compares against the mon's LEVEL with
+    #: `param <= level` (pokefirered/src/pokemon.c:5470-5504). A param of 0 is
+    #: therefore ALWAYS TRUE — the mon would evolve on its very next level-up —
+    #: so a blank here must be REFUSED, never defaulted to zero.
+    _EVO_LEVEL_METHODS = frozenset({
+        "EVO_LEVEL", "EVO_LEVEL_ATK_GT_DEF", "EVO_LEVEL_ATK_EQ_DEF",
+        "EVO_LEVEL_ATK_LT_DEF", "EVO_LEVEL_SILCOON", "EVO_LEVEL_CASCOON",
+        "EVO_LEVEL_NINJASK", "EVO_LEVEL_SHEDINJA",
+    })
+    #: `param <= beauty`; beauty starts at 0, so 0 is always true here too.
+    _EVO_BEAUTY_METHODS = frozenset({"EVO_BEAUTY"})
+    #: Declared by the engine but unreachable in pokefirered. The two
+    #: friendship/time methods have their switch bodies commented out
+    #: ("FR/LG removed the time of day evolutions due to having no RTC",
+    #: src/pokemon.c:5455-5469) and EVO_LEVEL_SHEDINJA has no case in the
+    #: switch at all. Rows using them are left ALONE — existing data is never
+    #: rewritten — but the editor says so rather than implying they work.
+    _EVO_UNSUPPORTED_METHODS = frozenset({
+        "EVO_FRIENDSHIP_DAY", "EVO_FRIENDSHIP_NIGHT", "EVO_LEVEL_SHEDINJA",
+    })
+
+    def _evos_per_mon(self) -> int:
+        """`EVOS_PER_MON` from the project's own header, cached.
+
+        Read rather than hardcoded: `gEvolutionTable` is declared
+        `[NUM_SPECIES][EVOS_PER_MON]`, so one row too many is an "excess
+        elements in array initializer" error on the default build (-Werror,
+        pokefirered/Makefile:83) and a silently dropped evolution under
+        MODERN=1. Verified by compiling an 8-row case on 2026-10-29.
+        """
+        cached = getattr(self, "_evos_per_mon_cache", None)
+        if isinstance(cached, int) and cached > 0:
+            return cached
+        value = 7  # pokefirered's value; only used if the header is unreadable
+        try:
+            root = (self.project_info or {}).get("dir")
+            if root:
+                path = os.path.join(root, "include", "constants", "pokemon.h")
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    for raw in fh:
+                        line = raw.split("//")[0].strip()
+                        if line.startswith("#define EVOS_PER_MON"):
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                value = int(parts[2], 0)
+                            break
+        except Exception:
+            logging.exception("Could not read EVOS_PER_MON; using %s", value)
+        self._evos_per_mon_cache = value
+        return value
+
+    def _max_level(self) -> int:
+        """`MAX_LEVEL` from the project's own header, cached."""
+        cached = getattr(self, "_max_level_cache", None)
+        if isinstance(cached, int) and cached > 0:
+            return cached
+        value = 100
+        try:
+            root = (self.project_info or {}).get("dir")
+            if root:
+                path = os.path.join(root, "include", "constants", "pokemon.h")
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    for raw in fh:
+                        line = raw.split("//")[0].strip()
+                        if line.startswith("#define MAX_LEVEL"):
+                            parts = line.split()
+                            if len(parts) >= 3 and parts[1] == "MAX_LEVEL":
+                                value = int(parts[2], 0)
+                            break
+        except Exception:
+            logging.exception("Could not read MAX_LEVEL; using %s", value)
+        self._max_level_cache = value
+        return value
+
+    def _evo_row_problem(self, row: dict) -> str | None:
+        """Plain-English reason this evolution row cannot be saved, or None.
+
+        Per-method, against what the ENGINE actually reads. Deliberately does
+        NOT substitute a default for a missing value: for the nine level and
+        beauty methods the engine tests `param <= level`, so a 0 means "evolves
+        on the very next level-up", and for EVO_TRADE_ITEM `param == heldItem`
+        with ITEM_NONE (0) means "any trade holding nothing". Guessing would
+        silently change how the game plays.
+        """
+        target = str(row.get("targetSpecies") or "").strip()
+        method = str(row.get("method") or "").strip()
+        param = row.get("param")
+        ptxt = "" if param is None else str(param).strip()
+
+        if not target:
+            return ("an evolution row has no target species. Pick what it "
+                    "evolves into, or delete the row.")
+        if not method:
+            return (f"the evolution into {target} has no method. Pick how it "
+                    f"evolves, or delete the row.")
+
+        if method in self._EVO_NO_PARAM_METHODS:
+            return None          # the engine never reads param for these
+
+        if method in self._EVO_ITEM_METHODS:
+            if not ptxt or ptxt in ("None", "0", "ITEM_NONE"):
+                return (f"the evolution into {target} needs an item, but none "
+                        f"is chosen. Pick the item from the Param list.")
+            if not ptxt.startswith("ITEM_"):
+                return (f"the evolution into {target} has \"{ptxt}\" where an "
+                        f"item is needed. Pick the item from the Param list.")
+            return None
+
+        if method in self._EVO_LEVEL_METHODS or method in self._EVO_BEAUTY_METHODS:
+            is_level = method in self._EVO_LEVEL_METHODS
+            what = "level" if is_level else "beauty value"
+            lo, hi = (1, self._max_level()) if is_level else (0, 255)
+            if not ptxt or ptxt == "None":
+                return (f"the evolution into {target} has no {what}. Type one "
+                        f"between {lo} and {hi} — leaving it empty would make "
+                        f"it evolve immediately, which is not what an empty "
+                        f"box means.")
+            try:
+                n = int(ptxt)
+            except ValueError:
+                return (f"the evolution into {target} has \"{ptxt}\" where a "
+                        f"{what} is needed. Type a whole number between {lo} "
+                        f"and {hi}.")
+            if not (lo <= n <= hi):
+                return (f"the evolution into {target} has a {what} of {n}, "
+                        f"outside the usable range {lo}-{hi}.")
+            return None
+
+        # An unknown / project-added method: accept anything numeric or an
+        # engine constant, but refuse free text that would land in the C as-is.
+        if ptxt and not ptxt.isdigit() and not ptxt.replace("_", "").isalnum():
+            return (f"the evolution into {target} has \"{ptxt}\" as its "
+                    f"parameter, which is not a number or a constant name.")
+        return None
+
+    def _report_evo_problems(self, species: str, problems: list[str]) -> None:
+        """Tell the user why the evolutions were not saved, and log it."""
+        name = species
+        try:
+            name = self.source_data.get_species_data(species, "name") or species
+        except Exception:
+            pass
+        body = "\n\n".join(f"• {p}" for p in problems)
+        logging.warning("Evolutions not saved for %s: %s", species, problems)
+        # Never pop a dialog while the app is populating widgets itself or
+        # discarding edits for an F5 — the user did not do anything then, and
+        # the refusal has already been logged and has changed no data.
+        if getattr(self, "_loading_depth", 0) > 0 \
+                or getattr(self, "_refresh_discarding", False):
+            return
+        try:
+            QMessageBox.warning(
+                self, "Evolutions not saved",
+                f"{name}'s evolutions were left exactly as they were, because:"
+                f"\n\n{body}\n\n"
+                "Nothing else on this screen was affected. Fix the row(s) above "
+                "and save again — saving as-is would have produced game code "
+                "that does not build, or an evolution that behaves differently "
+                "from what the boxes show.")
+        except Exception:
+            pass
 
     def refresh_evo_param_choices(self, *_):
         """Update ``evo_param`` items/mode based on the selected method constant."""
@@ -8161,9 +8488,25 @@ in the game.</p>
         item.setText(1, self.ui.evo_method.currentText())
         if hasattr(item, "setData"):
             item.setData(1, Qt.ItemDataRole.UserRole, self.ui.evo_method.currentData())
+            item.setData(0, Qt.ItemDataRole.UserRole,
+                         self._selected_evo_target())
         param = self._read_evo_param()
         item.setText(2, str(param))
         self._on_species_field_edited()
+
+    def _selected_evo_target(self) -> str:
+        """The evolution-target CONSTANT currently picked in `evo_species`.
+
+        Base-species rows are added as `addItem(species, species)` so their text
+        and data are identical, but FORM rows are added as
+        `addItem("    " + form, form)` — the indent is display-only. Always take
+        `currentData()`, falling back to stripped text for a row that somehow
+        carries no data, so an indent can never reach `targetSpecies`.
+        """
+        data = self.ui.evo_species.currentData()
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+        return (self.ui.evo_species.currentText() or "").strip()
 
     def _read_evo_param(self):
         """Return the current evo_param value for saving to the tree/data."""
@@ -8190,6 +8533,11 @@ in the game.</p>
         if hasattr(new_item, "setData"):
             new_item.setData(
                 1, Qt.ItemDataRole.UserRole, self.ui.evo_method.currentData()
+            )
+            # The target CONSTANT, not the indented display text — see the note
+            # in update_data where rows are built from stored data.
+            new_item.setData(
+                0, Qt.ItemDataRole.UserRole, self._selected_evo_target()
             )
         count = self.ui.evolutions.topLevelItemCount()
         if count:
@@ -8252,8 +8600,10 @@ in the game.</p>
             elif getattr(self, "moves_main_tab_index", -1) == self.previous_main_tab:
                 self.save_moves_defs_table()
             elif self.previous_main_tab == 2:  # Items
-                self.save_items_table()
-                self.items_editor.save_icon_changes()
+                # Not inside the blanket `except AttributeError: pass` below:
+                # switching away from the Items tab must not silently discard
+                # pending edits. _flush_items_for_save records any failure.
+                self._flush_items_for_save()
             elif self.previous_main_tab == 3:  # Starters
                 self._flush_starter_widgets()
             elif self.previous_main_tab == 4:  # Trainers
@@ -9105,8 +9455,37 @@ QTabBar::tab:hover:!selected {
             # the tab, above the list (it was left orphaned behind the splitter).
             reg_vbox.addWidget(self.ui.pokedex_regional_search)
             reg_vbox.addWidget(self.ui.list_pokedex_regional)
-            reg_vbox.addWidget(self.ui.pushButton_4)    # "Add"
-            reg_vbox.addWidget(self.ui.pushButton_5)    # "Remove"
+            # ── Regional Dex is a DERIVED VIEW, not an editable list ─────────
+            # Proved from this project's engine on 2026-10-29: membership is
+            # `SpeciesToNationalPokedexNum(species) <= KANTO_DEX_COUNT` and
+            # nothing else (pokefirered/src/pokedex.c:75-120,
+            # src/pokedex_screen.c:1384 / :3186 / :3326). There is no regional
+            # list in the engine, so Add / Remove / drag-reorder here wrote to
+            # a field nothing reads and nothing emits — Save reported success
+            # and the game was unchanged.
+            #
+            # The list itself is kept: it is a useful view of exactly which
+            # species the player's regional dex will contain. Only the controls
+            # that implied independent editing are taken away.
+            reg_note = QLabel(
+                "This list is <b>worked out from the National Dex</b> and "
+                "cannot be edited directly.<br>"
+                "A species is in the Regional Dex when its National Dex number "
+                "is at or below <code>KANTO_DEX_COUNT</code> "
+                "(<code>include/constants/pokedex.h</code>).<br>"
+                "To change what is in it, reorder the <b>National Dex</b> tab, "
+                "or change that setting in the header."
+            )
+            reg_note.setWordWrap(True)
+            reg_note.setTextFormat(Qt.TextFormat.RichText)
+            reg_note.setStyleSheet(
+                "QLabel { color: #aaaaaa; font-size: 10px; padding: 4px; "
+                "border: 1px solid #3a3a3a; border-radius: 3px; "
+                "background: #242424; }"
+            )
+            reg_vbox.addWidget(reg_note)
+            self._regional_note = reg_note
+            self._make_regional_dex_read_only()
             reg_vbox.addWidget(self.reset_pokedex_button)
             list_tabs.addTab(reg_page, "Regional Dex")
 
@@ -9144,9 +9523,11 @@ QTabBar::tab:hover:!selected {
             dex_splitter.setStretchFactor(1, 1)
             self.ui.tab_pokedex_grid.addWidget(dex_splitter, 0, 0, 3, 3)
 
-            # ── Connect Add / Remove buttons for regional dex ────────────────────
-            self.ui.pushButton_4.clicked.connect(self._regional_dex_add)
-            self.ui.pushButton_5.clicked.connect(self._regional_dex_remove)
+            # The regional dex Add / Remove buttons are NOT connected: they were
+            # removed by _make_regional_dex_read_only above, because the engine
+            # derives regional membership from the National Dex order and
+            # KANTO_DEX_COUNT, so there was nothing for them to change. Wiring
+            # them here would raise on a deleted widget.
 
             # Track which dex constant is currently in the panel
             self._current_dex_const: str | None = None
@@ -9154,6 +9535,50 @@ QTabBar::tab:hover:!selected {
         except Exception as exc:
             import logging
             logging.warning("_setup_pokedex_tab failed: %s", exc)
+
+    def _make_regional_dex_read_only(self) -> None:
+        """Take away the controls that falsely implied regional editing.
+
+        Removes the Add and Remove buttons from the Regional Dex tab entirely
+        (they are regional-only, so nothing else needs them) and turns off
+        drag-and-drop on `list_pokedex_regional`. The list stays selectable and
+        scrollable so it can still be READ.
+
+        The National Dex half is deliberately untouched: its reorder is real,
+        it writes the enum, and its `_promote_dex_list` / `_dex_order_is_sane`
+        protections stay exactly as they are.
+        """
+        try:
+            for name in ("pushButton_4", "pushButton_5"):
+                btn = getattr(self.ui, name, None)
+                if btn is None:
+                    continue
+                try:
+                    btn.clicked.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+                btn.setParent(None)
+                btn.deleteLater()
+        except Exception:
+            logging.exception("Could not remove the regional dex Add/Remove buttons")
+
+        lst = getattr(self.ui, "list_pokedex_regional", None)
+        if lst is None:
+            return
+        try:
+            from PyQt6.QtWidgets import QAbstractItemView
+            lst.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
+            lst.setDragEnabled(False)
+            lst.setAcceptDrops(False)
+            lst.setDropIndicatorShown(False)
+            # Selection stays on so the entry can be inspected; editing is off.
+            lst.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            lst.setToolTip(
+                "Read-only view. Regional Dex membership comes from the "
+                "National Dex order and KANTO_DEX_COUNT."
+            )
+        except Exception:
+            logging.exception("Could not make the regional dex list read-only")
 
     def _regional_dex_add(self):
         """Add a species to the regional dex via a picker dialog."""
@@ -9265,14 +9690,93 @@ QTabBar::tab:hover:!selected {
                     match_role=Qt.ItemDataRole.UserRole, match_value=hoenn,
                 )
 
+    #: Carried from the generated list to its replacement. Everything else
+    #: is either a default or set again later by `_setup_pokedex_tab`.
+    _DEX_LIST_PROPS = (
+        "objectName", "font", "iconSize", "uniformItemSizes",
+        "selectionMode", "viewMode", "alternatingRowColors", "styleSheet",
+        "toolTip", "sizePolicy", "minimumWidth",
+    )
+
+    def _promote_dex_list(self, name: str):
+        """Swap a generated dex list for one that owns its own drops.
+
+        `ui/ui_mainwindow.py` is generated and must not be edited, so the
+        widget is replaced here instead: a `ReorderableListWidget` takes its
+        place in the layout, under the same name, carrying its properties
+        over. Everything wired up afterwards sees the replacement.
+
+        Done this way because a list cannot be made to own its drop from the
+        outside — an event filter never sees a drop at all, since Qt routes
+        drag-and-drop events past the receiver's filters. Overriding
+        `dropEvent` is the only way in, and that needs the class.
+        """
+        from ui.custom_widgets.reorderable_list import ReorderableListWidget
+        old = getattr(self.ui, name, None)
+        if old is None or isinstance(old, ReorderableListWidget):
+            return None
+        parent = old.parentWidget()
+        new = ReorderableListWidget(parent)
+        for prop in self._DEX_LIST_PROPS:
+            try:
+                getattr(new, "set" + prop[0].upper() + prop[1:])(
+                    getattr(old, prop)())
+            except Exception:
+                pass
+        # The delegate is a CHILD of the old list, so it would be destroyed
+        # along with it.
+        try:
+            delegate = old.itemDelegate()
+            if delegate is not None:
+                delegate.setParent(new)
+                new.setItemDelegate(delegate)
+        except Exception:
+            pass
+        # Carry any rows across. In practice this runs before the lists are
+        # filled, but a promotion that silently emptied a populated list
+        # would be a nasty trap to leave lying around.
+        for _ in range(old.count()):
+            new.addItem(old.takeItem(0))
+        layout = parent.layout() if parent is not None else None
+        if layout is not None:
+            # Searches nested layouts too, which is where these lists live.
+            layout.replaceWidget(old, new)
+        old.setParent(None)
+        old.deleteLater()
+        setattr(self.ui, name, new)
+        return new
+
+    def _on_dex_rows_move_requested(self, lst, rows, dest: int):
+        """Move the dragged dex rows, then mark what changed.
+
+        The order of a dex is held nowhere but this list — the save walks it
+        row by row and stamps each row's position on as its dex number — so
+        the rows are moved here, with the item objects themselves, rather
+        than by the drop. `move_list_rows` says what a drop does to them.
+        """
+        from ui.custom_widgets.reorderable_list import move_list_rows
+        landed = move_list_rows(lst, rows, dest)
+        if not landed:
+            return                      # dropped where it already was
+        # setCurrentRow clears an extended selection, so it goes first.
+        lst.setCurrentRow(landed[0])
+        for r in landed:
+            item = lst.item(r)
+            if item is not None:
+                item.setSelected(True)
+        lo = min(min(rows), min(landed))
+        hi = max(max(rows), max(landed))
+        self._on_dex_reordered(lst, lo, hi, hi)
+
     def _on_dex_reordered(self, lst, source_start: int,
                           source_end: int, destination_row: int):
-        """Wired (via lambda) to both dex lists' `model().rowsMoved`.
+        """Marks what a dex reorder changed. Called by
+        `_on_dex_rows_move_requested` once the rows have actually moved.
 
-        Drag-to-reorder on either dex list fires this slot. The national
-        save block (line ~8874) and regional save block (added alongside
-        this fix) rebuild their respective dex lists from the UI order —
-        so reorders DO persist on Save.
+        It used to be wired to the list model's `rowsMoved` signal, which a
+        dropped row never emits — so none of this ran on a drag. The save
+        blocks rebuild both dex lists from the list order, so a reorder does
+        persist on Save, which is exactly why it has to be marked here.
 
         Visual feedback:
           - title bar asterisk via `setWindowModified(True)`
@@ -9315,6 +9819,53 @@ QTabBar::tab:hover:!selected {
                 )
         except Exception:
             pass
+
+    def _dex_order_is_sane(self, which: str, dex_list, previous) -> bool:
+        """True if *dex_list* is safe to write over the saved dex.
+
+        The order of a dex is read straight off a list widget, which means a
+        list that has gone wrong is written out as the user's real dex with
+        nothing to contradict it: a species listed twice under two numbers,
+        another gone from the dex altogether, and the same wrong numbers
+        stamped onto the species table. Nothing downstream can tell, so the
+        check happens here, before anything is written.
+
+        It compares against what was loaded rather than against any rule
+        about what a dex should contain, so adding and removing entries stays
+        possible — only LOSING one silently, or ending up with the same entry
+        twice, is refused.
+        """
+        from collections import Counter
+        consts = [e.get("dex_constant") for e in dex_list]
+        counts = Counter(c for c in consts if c)
+        dupes = sorted(c for c, n in counts.items() if n > 1)
+        before = {e.get("dex_constant") for e in (previous or [])
+                  if e.get("dex_constant")}
+        missing = sorted(before - set(consts))
+        if not dupes and not missing:
+            return True
+        log = logging.getLogger(__name__)
+        log.error("%s dex order refused: duplicates=%s missing=%s",
+                  which, dupes, missing)
+        lines = [f"The {which} Pokédex list is not in a state that can be "
+                 "saved, so it has been left exactly as it was. "
+                 "Nothing else in this save was affected."]
+        if dupes:
+            lines.append("Listed more than once: "
+                         + ", ".join(dupes[:8])
+                         + (" …" if len(dupes) > 8 else ""))
+        if missing:
+            lines.append("Missing from the list: "
+                         + ", ".join(missing[:8])
+                         + (" …" if len(missing) > 8 else ""))
+        lines.append("Close the project without saving again and reopen it "
+                     "to get the dex back as it was on disk.")
+        try:
+            QMessageBox.warning(self, f"{which} Pokédex not saved",
+                                "\n\n".join(lines))
+        except Exception:
+            pass
+        return False
 
     def _on_species_field_edited(self):
         """Unified dirty handler for every editable field under the Pokemon
@@ -10405,6 +10956,26 @@ QTabBar::tab:hover:!selected {
         widget.setProperty("_table_row", row)
         table.setCellWidget(row, col, widget)
 
+    def _guard_wheel(self, *widgets) -> None:
+        """Install the SHARED scroll guard on widgets built at runtime.
+
+        `install_scroll_guard_recursive(self)` in __init__ is a one-time sweep:
+        it only reaches widgets that already exist at that moment. The learnset
+        tables build a spin box and a combo per ROW, per species, long after the
+        sweep has run — so those were unguarded, and one wheel notch over the
+        Level-Up list silently changed a move or a level. The save reads those
+        widgets back as the ONLY record of the learnset, so the wrong data went
+        straight into the game.
+
+        This is deliberately the same `install_scroll_guard` the rest of the app
+        uses (value never changes on the wheel, and the event still reaches the
+        scroll area so the page scrolls) — not a second mechanism.
+        """
+        from ui.custom_widgets.scroll_guard import install_scroll_guard
+        for w in widgets:
+            if w is not None:
+                install_scroll_guard(w)
+
     def _level_up_add_row(self) -> None:
         table = self._level_up_table
         row = table.rowCount()
@@ -10423,6 +10994,7 @@ QTabBar::tab:hover:!selected {
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
         self._learnset_set_cell_widget(table, row, 1, combo)
+        self._guard_wheel(spin, combo)
         table.scrollToBottom()
         self.setWindowModified(True)
 
@@ -10471,6 +11043,7 @@ QTabBar::tab:hover:!selected {
         combo.setCurrentIndex(idx if idx >= 0 else 0)
         combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
         self._learnset_set_cell_widget(table, row, 0, combo)
+        self._guard_wheel(combo)
         table.scrollToBottom()
         self.setWindowModified(True)
 
@@ -11017,6 +11590,7 @@ QTabBar::tab:hover:!selected {
                 combo.setCurrentIndex(idx if idx >= 0 else 0)
                 combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
                 self._learnset_set_cell_widget(table, row, 1, combo)
+                self._guard_wheel(spin, combo)
         table.resizeColumnToContents(0)
 
         # ── TM/HM tab ───────────────────────────────────────────────
@@ -11086,6 +11660,7 @@ QTabBar::tab:hover:!selected {
                 combo.setCurrentIndex(idx if idx >= 0 else 0)
                 combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
                 self._learnset_set_cell_widget(egg_table, row, 0, combo)
+                self._guard_wheel(combo)
 
     def load_moves_table(self):
         """Compat wrapper for legacy call sites/tests."""
@@ -11917,10 +12492,27 @@ QTabBar::tab:hover:!selected {
                     try:
                         svc = getattr(getattr(self, "source_data", None), "refactor_service", None)
                         if svc:
-                            previews = svc.rename_item(old_const, new_const, display_name="", preview_only=True)
+                            # `preview=` — NOT `preview_only=`. The wrong keyword
+                            # raised TypeError into the handler below, so the
+                            # preview pane was always empty. preview=True also
+                            # keeps this keystroke out of the pending queue.
+                            previews = svc.rename_item(
+                                old_const, new_const, display_name="",
+                                preview=True)
                             dlg.set_preview(previews or [])
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Visible, not discarded: show it where the preview
+                        # would have been, and log the traceback for the file
+                        # log. A dialog here would fire on every keystroke.
+                        import logging as _lg
+                        _lg.getLogger(__name__).exception(
+                            "item rename preview failed")
+                        try:
+                            dlg.set_preview([(
+                                "preview unavailable", 0,
+                                type(exc).__name__, str(exc))])
+                        except Exception:
+                            pass
             dlg.suffix_edit.textChanged.connect(_preview)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
@@ -12307,6 +12899,61 @@ QTabBar::tab:hover:!selected {
         dlg.finish   = _finish_ok
         return dlg
 
+    def _flush_items_for_save(self) -> bool:
+        """Flush the Items editor and REPORT what happened. Returns True on
+        a clean save.
+
+        WHY THIS EXISTS (2026-10-29). Both save paths used to do this inline
+        inside a blanket swallow::
+
+            update_main_tabs()  try: ... save_items_table() ... except AttributeError: pass
+            update_save()       try: save_items_table()
+                                     items_editor.save_icon_changes()
+                                except Exception: pass
+
+        so a failing item save silently discarded the user's pending edits,
+        and `save_icon_changes()`'s bool result — its only way of reporting a
+        failed `item_icon_table.h` write — was thrown away at both call sites.
+        `update_save()` is what Save All records as "PorySuite data", so the
+        loss was still reported as a successful save.
+
+        Failures are appended to ``self._item_save_errors``, which Save All
+        reads. Nothing here clears the editor's pending edits, so a failure
+        stays retryable. Both halves are attempted even if the first fails —
+        skipping the icons because the data write raised would hide a second,
+        independent problem.
+        """
+        self._item_save_errors = []
+        ie = getattr(self, "items_editor", None)
+        if ie is None:
+            return True                      # tab not built yet: nothing to do
+
+        # 1. item data
+        try:
+            self.save_items_table()
+        except Exception as e:
+            msg = f"item data could not be saved: {e}"
+            self._item_save_errors.append(msg)
+            self.log_message(f"Error saving items: {e}")
+            import logging as _lg
+            _lg.getLogger(__name__).exception("save_items_table failed")
+
+        # 2. icons — attempted regardless, and its RESULT is checked
+        try:
+            if ie.save_icon_changes() is False:
+                msg = ("item icons could not be written to "
+                       "item_icon_table.h")
+                self._item_save_errors.append(msg)
+                self.log_message(f"Error saving item icons: {msg}")
+        except Exception as e:
+            msg = f"item icons could not be saved: {e}"
+            self._item_save_errors.append(msg)
+            self.log_message(f"Error saving item icons: {e}")
+            import logging as _lg
+            _lg.getLogger(__name__).exception("save_icon_changes failed")
+
+        return not self._item_save_errors
+
     def update_save(self):
         """
         Updates the save data for the previously selected species, saves general data,
@@ -12355,11 +13002,9 @@ QTabBar::tab:hover:!selected {
                 self._flush_pokedex_panel()
             except Exception:
                 pass
-            try:
-                self.save_items_table()
-                self.items_editor.save_icon_changes()
-            except Exception:
-                pass
+            # Items report their own outcome rather than vanishing into a
+            # blanket swallow; Save All reads self._item_save_errors.
+            self._flush_items_for_save()
             try:
                 self.save_moves_defs_table()
             except Exception:
@@ -12419,9 +13064,10 @@ QTabBar::tab:hover:!selected {
 
                 if rename_pending == 0:
                     # Update Pokédex ordering from the UI
+                    previous_nat = self.source_data.get_national_dex() or []
                     dex_list = []
                     current_entries = {
-                        d["dex_constant"]: d for d in self.source_data.get_national_dex()
+                        d["dex_constant"]: d for d in previous_nat
                     }
                     for i in range(self.ui.list_pokedex_national.count()):
                         item = self.ui.list_pokedex_national.item(i)
@@ -12429,13 +13075,20 @@ QTabBar::tab:hover:!selected {
                         entry = current_entries.get(const, {"dex_constant": const})
                         entry["dex_num"] = i + 1
                         dex_list.append(entry)
-                        species = entry.get("species")
-                        if species:
+                    # The list IS the dex order, so nothing else can notice if
+                    # it has gone wrong. Check before writing, and before any
+                    # of it reaches the species table below.
+                    if self._dex_order_is_sane(
+                            "National", dex_list, previous_nat):
+                        for i, entry in enumerate(dex_list):
+                            species = entry.get("species")
+                            if not species:
+                                continue
                             sdata = self.source_data.get_pokemon_data().get(species)
                             if sdata is not None:
                                 sdata["dex_num"] = i + 1
-                                sdata["dex_constant"] = const
-                    self.source_data.data["pokedex"].data["national_dex"] = dex_list
+                                sdata["dex_constant"] = entry.get("dex_constant")
+                        self.source_data.data["pokedex"].data["national_dex"] = dex_list
 
                     # Same treatment for the regional dex list — it also
                     # supports drag-reorder. Without this rebuild, regional
@@ -12454,9 +13107,14 @@ QTabBar::tab:hover:!selected {
                             )
                             entry["dex_num"] = i + 1
                             reg_list.append(entry)
-                        self.source_data.data["pokedex"].data["regional_dex"] = reg_list
+                        if self._dex_order_is_sane(
+                                "Regional", reg_list,
+                                self.source_data.get_regional_dex() or []):
+                            self.source_data.data["pokedex"].data[
+                                "regional_dex"] = reg_list
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).exception(
+                            "regional dex rebuild failed")
 
                 # Consolidate global Moves table edits before save
                 dlg.step("Writing moves")

@@ -1070,8 +1070,11 @@ class RefactorService:
 
     def rename_item(self, old_const: str, new_const: str, display_name: str, preview: bool = False) -> List[PreviewEntry]:
         previews = self._search_and_replace(old_const, new_const, True)
-        # Queue for Save
-        self.pending.append({"op": "rename_item", "old": old_const, "new": new_const, "display": display_name})
+        # Queue for Save — but NOT while previewing. The rename dialog calls
+        # this on every keystroke, so an unguarded append queued one rename per
+        # character typed. Same guard as rename_ability / rename_trainer.
+        if not preview:
+            self.pending.append({"op": "rename_item", "old": old_const, "new": new_const, "display": display_name})
         return previews
 
     def rename_move(self, old_const: str, new_const: str, display_name: str, preview: bool = False) -> List[PreviewEntry]:

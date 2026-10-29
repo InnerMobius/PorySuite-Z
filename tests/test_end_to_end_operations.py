@@ -29,6 +29,21 @@ qt_gui.QImage = type("QImage", (), {})
 qt_gui.QPixmap = type("QPixmap", (), {})
 qt_module.QtCore = qt_core
 qt_module.QtGui = qt_gui
+# Shared PyQt6 stub helpers -- see tests/_qt_stub.py for why none of this is a
+# hand-written list of Qt class names any more.
+from tests._qt_stub import (  # noqa: E402
+    StubQtFinder as _StubQtFinder,
+    UiStub as _UiStub,
+    auto_qt_class as _auto_qt_class,
+    autofill_qt_stub as _autofill_qt_stub,
+    is_qt_method_name as _is_qt_method_name,
+)
+
+if not any(isinstance(f, _StubQtFinder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _StubQtFinder())
+qt_module.__path__ = []  # marks the stub as a package
+_autofill_qt_stub(qt_module, qt_core, qt_gui)
+
 sys.modules.setdefault("PyQt6", qt_module)
 sys.modules.setdefault("PyQt6.QtCore", qt_core)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
@@ -39,7 +54,13 @@ sys.modules.setdefault("newproject", types.ModuleType("newproject")).NewProject 
 sys.modules.setdefault("exportingwindow", types.ModuleType("exportingwindow")).Exporting = type("Exporting", (), {})
 sys.modules.setdefault("plugininfodialog", types.ModuleType("plugininfodialog")).PluginInfoDialog = type("PluginInfoDialog", (), {})
 
-sys.modules.setdefault("ui", types.ModuleType("ui"))
+# The window imports its own submodules (`from ui.items_tab_widget import ...`),
+# so this placeholder package needs a real __path__ or those imports fail with
+# "'ui' is not a package". Submodules stubbed below still win -- they are
+# already in sys.modules by the time anything asks for them.
+_ui_pkg = sys.modules.setdefault("ui", types.ModuleType("ui"))
+if not hasattr(_ui_pkg, "__path__"):
+    _ui_pkg.__path__ = [os.path.join(ROOT_DIR, "ui")]
 ui_main = types.ModuleType("ui.ui_mainwindow")
 
 class Ui_MainWindow:
@@ -220,14 +241,13 @@ class ProjectTest(unittest.TestCase):
         self.create_project()
 
     def load_manager(self):
-        pkg_name = "plugins.pokefirered"
-        sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+        pkg_name = "core"
         pkg_module = types.ModuleType(pkg_name)
-        pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+        pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
         sys.modules[pkg_name] = pkg_module
         spec = importlib.util.spec_from_file_location(
-            "plugins.pokefirered.pokemon_data",
-            os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data.py"),
+            "core.pokemon_data",
+            os.path.join(ROOT_DIR, "core", "pokemon_data.py"),
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
@@ -258,7 +278,11 @@ class ProjectTest(unittest.TestCase):
         starter["species"] = "SPECIES_NONE"
         starter["level"] = 7
         starter["item"] = "ITEM_TEST"
-        starter["ability_num"] = 0
+        # Mirror the app: Save All runs save() (writes the JSON source of
+        # truth and marks the data dirty) before parse_to_c_code(), which
+        # is gated on that dirty flag. No ability field: the starters
+        # ability section was removed in v0.0.6b.
+        mgr.save()
         mgr.parse_to_c_code()
         with open(os.path.join(self.project_info["dir"], "src", "field_specials.c")) as f:
             content = f.read()
@@ -266,7 +290,11 @@ class ProjectTest(unittest.TestCase):
         with open(os.path.join(self.project_info["dir"], "src", "battle_setup.c")) as f:
             bcontent = f.read()
         self.assertIn("ScriptGiveMon(starterMon, 7, ITEM_TEST", bcontent)
-        self.assertIn("abilityNum = 0;", bcontent)
+        # No ability assertion: the starters ability section was removed
+        # deliberately in v0.0.6b ("was broken + non-editable"), so the
+        # writer no longer emits abilityNum. Whatever line the project
+        # already had is left untouched.
+        self.assertNotIn("ability_num", starter)
 
     def test_reorder_pokedex_updates_header(self):
         mgr = self.load_manager()
@@ -281,6 +309,11 @@ class ProjectTest(unittest.TestCase):
 
     def test_update_data_sets_abilities(self):
         mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        mw._loading_depth = 0
         class DummyBox:
             def __init__(self):
                 self.index = None
@@ -298,6 +331,10 @@ class ProjectTest(unittest.TestCase):
             def setCurrentIndex(self, *_):
                 pass
             def setEnabled(self, *_):
+                pass
+            def setReadOnly(self, *_):
+                pass
+            def setToolTip(self, *_):
                 pass
         class DummyEvo:
             def clear(self):

@@ -396,12 +396,29 @@ class _SImportWorker(QThread):
         """Write the wizard's priority / reverb / volume into the .s's
         ``.equ <label>_pri/_rev/_mvl`` equates. The priority struct byte at the
         bottom is emitted as ``.byte <label>_pri``, so updating the equate
-        updates it too. Reverb keeps the engine's ``reverb_set+N`` form."""
+        updates it too.
+
+        Reverb has two distinct forms and they are NOT interchangeable:
+
+          ``reverb_set+N``  set the global reverb to N for this song
+          ``N`` (no flag)   leave the global reverb alone — inherit it
+
+        The engine only applies the value when the ``reverb_set`` bit (0x80) is
+        present (``src/m4a.c``: ``if (songHeader->reverb & SOUND_MODE_REVERB_SET)``),
+        and the setting is GLOBAL, so forcing 0 on a short jingle changes the
+        reverb for whatever plays next too. The parser reports both forms as
+        plain ``N``, so this used to emit ``reverb_set+N`` unconditionally and
+        silently converted any inherit-style song into a force-0 one just by
+        being replaced. A stock project here has 25 songs written that way.
+
+        So: keep the source's form when the value has not changed, and only
+        write the explicit form when the user actually set a value.
+        """
         with open(dest_path, encoding="utf-8") as f:
             lines = f.readlines()
 
         pri_re = re.compile(r'^(\s*\.equ\s+\w+_pri\s*,\s*).*$')
-        rev_re = re.compile(r'^(\s*\.equ\s+\w+_rev\s*,\s*).*$')
+        rev_re = re.compile(r'^(\s*\.equ\s+\w+_rev\s*,\s*)(.*)$')
         mvl_re = re.compile(r'^(\s*\.equ\s+\w+_mvl\s*,\s*).*$')
 
         for i, line in enumerate(lines):
@@ -409,12 +426,34 @@ class _SImportWorker(QThread):
             if pri_re.match(stripped):
                 lines[i] = pri_re.sub(rf'\g<1>{self._priority}', stripped) + '\n'
             elif rev_re.match(stripped):
-                lines[i] = rev_re.sub(rf'\g<1>reverb_set+{self._reverb}', stripped) + '\n'
+                head, existing = rev_re.match(stripped).groups()
+                lines[i] = head + self._reverb_value(existing) + '\n'
             elif mvl_re.match(stripped):
                 lines[i] = mvl_re.sub(rf'\g<1>{self._volume}', stripped) + '\n'
 
         with open(dest_path, "w", encoding="utf-8", newline="\n") as f:
             f.writelines(lines)
+
+    def _reverb_value(self, existing: str) -> str:
+        """The text to write after ``.equ <label>_rev,``.
+
+        ``existing`` is whatever the source file had there. See
+        :meth:`_rewrite_properties` for why the form matters.
+        """
+        existing = existing.strip()
+        had_set_flag = 'reverb_set' in existing
+        try:
+            source_value = (int(existing.split('+', 1)[1].strip())
+                            if had_set_flag else int(existing))
+        except (ValueError, IndexError):
+            source_value = None
+
+        # Value untouched: keep the source's form exactly, so an inherit-style
+        # song stays inherit and an explicit one stays explicit.
+        if source_value == self._reverb:
+            return existing
+
+        return f'reverb_set+{self._reverb}'
 
     @staticmethod
     def _make_placeholder_mid() -> bytes:

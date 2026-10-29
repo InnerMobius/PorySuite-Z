@@ -2375,7 +2375,19 @@ class FieldEffectSpritesTab(QWidget):
                 disk_img = disk_img.convertToFormat(QImage.Format.Format_Indexed8)
             img = disk_img
         try:
-            export_indexed_png(img, colors, entry.png_path)
+            # The return value MUST be checked: export_indexed_png refuses an
+            # image whose pixels the palette cannot describe, and a refusal
+            # writes nothing. Ignoring it reported success and cleared the
+            # dirty flags below, silently dropping the user's edit.
+            if not export_indexed_png(img, colors, entry.png_path):
+                from core.gba_image_utils import last_export_error
+                QMessageBox.warning(
+                    self, "Bake Palette",
+                    "The sprite PNG was NOT written.\n\n"
+                    f"{last_export_error()}\n\n"
+                    "Your palette edit is still unsaved — nothing on disk "
+                    "was changed.")
+                return
         except Exception as exc:
             QMessageBox.warning(self, "Bake Palette",
                                 f"Could not bake the PNG:\n{exc}")
@@ -2547,13 +2559,20 @@ class FieldEffectSpritesTab(QWidget):
                 errors.append(f"fe-png:{entry.name} (cannot load as indexed)")
                 continue
             try:
-                export_indexed_png(img, colors, entry.png_path)
-                self._palette_dirty.discard(key)
-                self._sprite_png_dirty.discard(entry.png_path)
-                if not wrote_pal:
-                    # Counted as a save only when there's no .pal sibling
-                    # (the .pal write already incremented ok above).
-                    ok += 1
+                # Check the return value. A refusal writes nothing, so the
+                # dirty flags must STAY set — clearing them regardless was
+                # silently discarding the edit.
+                if export_indexed_png(img, colors, entry.png_path):
+                    self._palette_dirty.discard(key)
+                    self._sprite_png_dirty.discard(entry.png_path)
+                    if not wrote_pal:
+                        # Counted as a save only when there's no .pal sibling
+                        # (the .pal write already incremented ok above).
+                        ok += 1
+                else:
+                    from core.gba_image_utils import last_export_error
+                    errors.append(f"fe-png:{entry.name} "
+                                  f"({last_export_error()})")
             except Exception as exc:
                 errors.append(f"fe-png:{entry.name} ({exc})")
 
@@ -2568,9 +2587,13 @@ class FieldEffectSpritesTab(QWidget):
             key = self._bus_key(entry)
             pal = self._palettes.get(key, [(0, 0, 0)] * 16)
             try:
-                export_indexed_png(img, pal, png_path)
-                self._sprite_png_dirty.discard(png_path)
-                ok += 1
+                if export_indexed_png(img, pal, png_path):
+                    self._sprite_png_dirty.discard(png_path)
+                    ok += 1
+                else:
+                    from core.gba_image_utils import last_export_error
+                    errors.append(f"fe-png:{entry.name} "
+                                  f"({last_export_error()})")
             except Exception as exc:
                 errors.append(f"fe-png:{entry.name} ({exc})")
 
@@ -6202,9 +6225,13 @@ class OverworldGraphicsTab(QWidget):
                 continue
             pal = self._palettes.get(entry.palette_tag, [(0, 0, 0)] * 16)
             try:
-                export_indexed_png(img, pal, entry.png_path)
-                self._sprite_png_dirty.discard(gfx_key)
-                ok += 1
+                if export_indexed_png(img, pal, entry.png_path):
+                    self._sprite_png_dirty.discard(gfx_key)
+                    ok += 1
+                else:
+                    from core.gba_image_utils import last_export_error
+                    errors.append(f"overworld-png:{gfx_key} "
+                                  f"({last_export_error()})")
             except Exception as exc:
                 errors.append(f"overworld-png:{gfx_key} ({exc})")
 

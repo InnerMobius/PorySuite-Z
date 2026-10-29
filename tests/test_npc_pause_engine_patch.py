@@ -314,11 +314,18 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
             "pause-step block was stacked across re-runs",
         )
 
-    def test_pause_is_gated_on_preventstep_for_cutscenes(self):
-        # FREEZE FIX: the LADX pause must NOT fire during a locked/scripted
+    def test_pause_is_gated_on_the_script_window_for_cutscenes(self):
+        # FREEZE FIX: the mid-step pause must NOT fire during a locked/scripted
         # sequence. NpcTakeStep is the same step path a scripted applymovement
         # uses, so an un-gated pause stalls a cutscene NPC's walk forever and
-        # hangs waitmovement (Bill's Sea Cottage teleporter freeze).
+        # hangs waitmovement (the teleporter freeze).
+        #
+        # The gate is ArePlayerFieldControlsLocked(). This test used to assert
+        # gPlayerAvatar.preventStep, which was the FIRST attempt and did not
+        # work: preventStep is set by field effects (mount/surf/...) but NOT by
+        # lockall/lock, so cutscenes still froze. The patcher says as much in
+        # the comment it emits. Asserting the superseded gate meant this test
+        # was pinning the broken version of its own fix.
         _write_synthetic_field_player(self.tmp)
         patch.ensure_npc_pause_engine_support(self.tmp)
         with open(
@@ -326,7 +333,9 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
             encoding="utf-8",
         ) as f:
             text = f.read()
-        self.assertIn("if (!gPlayerAvatar.preventStep)", text)
+        self.assertIn("if (!ArePlayerFieldControlsLocked())", text)
+        # And must NOT fall back to the gate that did not work.
+        self.assertNotIn("if (!gPlayerAvatar.preventStep)", text)
 
     def test_outdated_pause_block_is_upgraded_in_place(self):
         # A project that already had the OLD un-gated block must be upgraded
@@ -337,7 +346,9 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             text = f.read()
         # Simulate an older install: remove the gate guard but keep the fences.
-        old = text.replace("if (!gPlayerAvatar.preventStep)", "if (1) /*old*/")
+        # (Was written against the superseded preventStep gate, so it replaced
+        # nothing and the file went back unchanged.)
+        old = text.replace("if (!ArePlayerFieldControlsLocked())", "if (1) /*old*/")
         self.assertNotEqual(old, text)
         with open(path, "w", encoding="utf-8") as f:
             f.write(old)
@@ -345,7 +356,7 @@ class NpcPauseEnginePatchTests(unittest.TestCase):
         self.assertTrue(ok)
         with open(path, encoding="utf-8") as f:
             text2 = f.read()
-        self.assertIn("if (!gPlayerAvatar.preventStep)", text2)
+        self.assertIn("if (!ArePlayerFieldControlsLocked())", text2)
         self.assertEqual(text2.count("PORYSUITE-NPCPAUSE pause-step begin"), 1)
         self.assertTrue(any("upgraded" in m for m in msgs))
 

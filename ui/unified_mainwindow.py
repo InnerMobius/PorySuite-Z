@@ -187,9 +187,8 @@ class UnifiedMainWindow(QMainWindow):
         # icon_name -> human label, for the Settings → Tabs checkbox list.
         self._page_labels: dict = {}
         # Tabs the user has hidden (persisted). Loaded lazily in
-        # _load_hidden_tabs(); these three are hidden on first run.
+        # _load_hidden_tabs(); the defaults live on the class, below.
         self._hidden_tabs = None
-        self._default_hidden_tabs = ("encounters", "fame_checker", "labels")
         # Per-page dirty section count.  Multiple logical sections share a
         # single toolbar button (e.g. "species" + "pokedex" → "pokemon").
         self._page_dirty_counts: dict[str, int] = {}
@@ -388,6 +387,18 @@ class UnifiedMainWindow(QMainWindow):
 
     # ── tab show/hide (Settings → Tabs) ─────────────────────────────────────
 
+    # Hidden on first run, because both are gated on project support.
+    # "labels" (Variables & Flags) used to be in this list too — swept in with
+    # the two new editors when tab show/hide shipped in v0.1.47b — which
+    # quietly took the Flag Manager's toolbar icon away for everyone.
+    _default_hidden_tabs = ("encounters", "fame_checker")
+
+    # Tabs that were hidden by an old default rather than by the user's own
+    # choice, and the settings key recording that we have already put each one
+    # back. The correction runs once per tab: hide it again afterwards and it
+    # stays hidden.
+    _UNHIDE_ONCE = {"labels": "tabs/unhidden_labels_once"}
+
     def _load_hidden_tabs(self) -> set:
         if self._hidden_tabs is None:
             s = QSettings(get_settings_path(), QSettings.Format.IniFormat)
@@ -398,7 +409,22 @@ class UnifiedMainWindow(QMainWindow):
                 self._hidden_tabs = {val} if val else set()
             else:
                 self._hidden_tabs = set(val)
+            self._apply_unhide_once(s)
         return self._hidden_tabs
+
+    def _apply_unhide_once(self, settings) -> None:
+        """Undo a tab that an old release hid by default, exactly once."""
+        changed = False
+        for name, key in self._UNHIDE_ONCE.items():
+            if settings.value(key, False, type=bool):
+                continue
+            settings.setValue(key, True)
+            if name in self._hidden_tabs:
+                self._hidden_tabs.discard(name)
+                changed = True
+        if changed:
+            settings.setValue("tabs/hidden", sorted(self._hidden_tabs))
+            settings.sync()
 
     def _tab_supported(self, name: str) -> bool:
         """A gated tab is only ever shown when the project actually has it."""
@@ -1269,6 +1295,30 @@ class UnifiedMainWindow(QMainWindow):
             porysuite_main.config_tab.modified.connect(
                 lambda: self.set_page_dirty("config", True))
 
+        # ── Scroll-wheel guard over every page in the stack ─────────────────
+        # Added 2026-10-29. This window builds pages of its own (the Tilemap
+        # Editor among them) and adopts others, and it never ran the guard at
+        # all — so a page created here had NO protection, and the Tilemap
+        # Editor's width, height, tile-offset and palette-slot boxes could be
+        # changed by scrolling the page. MainWindow's own sweep runs in its
+        # __init__, long before this.
+        #
+        # The sweep deliberately skips any widget whose class overrides
+        # wheelEvent itself (see scroll_guard._handles_its_own_wheel), so the
+        # editors that subclass their combos to allow popup scrolling keep that
+        # behaviour. Re-running it is harmless.
+        try:
+            from ui.custom_widgets.scroll_guard import (
+                install_scroll_guard_recursive,
+            )
+            for _i in range(self.stack.count()):
+                _page = self.stack.widget(_i)
+                if _page is not None:
+                    install_scroll_guard_recursive(_page)
+        except Exception:
+            import logging
+            logging.exception("scroll guard sweep over stack pages failed")
+
     # ═════════════════════════════════════════════════════════════════════════
     # Project loading
     # ═════════════════════════════════════════════════════════════════════════
@@ -1369,6 +1419,71 @@ class UnifiedMainWindow(QMainWindow):
     # Action handlers
     # ═════════════════════════════════════════════════════════════════════════
 
+    def _confirm_saved(self, label, probe, outcome, saved_detail=""):
+        """After a save call returns, confirm it actually reached the disk.
+
+        Returns True when the editor now reports itself clean.
+
+        WHY THIS EXISTS (2026-10-29). A returning save call is NOT proof of a
+        save. `credits_editor._on_save`, `label_manager._save_labels` and
+        EVENTide's `event_editor_tab._on_save` all catch their own exception,
+        show their own dialog and return normally; two of them also have early
+        `return`s that write nothing (no project directory, no map loaded, the
+        user cancelling the overwrite prompt). Save All's per-editor
+        try/except cannot see any of that, so it recorded `saved` and the
+        status bar said "All changes saved." while the work sat unsaved and the
+        dirty markers were cleared. Reproduced before this was written.
+
+        Each of those editors clears its dirty flag ONLY after a successful
+        write, so asking it again is the proof. Deliberately implemented here
+        rather than by changing the editors: their own Save buttons rely on
+        that self-contained error handling, and this needs no editor to change
+        behaviour.
+        """
+        still_dirty = self._editor_dirty(label, probe, outcome)
+        if still_dirty is None:
+            return False            # unanswerable; _editor_dirty recorded it
+        if still_dirty:
+            outcome.failed(
+                label,
+                "the editor reported a problem of its own and the changes are "
+                "still unsaved")
+            self.log_message(
+                f"{label}: the save did not take — it still has unsaved "
+                f"changes. Look for that editor's own error message.")
+            return False
+        outcome.saved(label, saved_detail)
+        return True
+
+    def _editor_dirty(self, label, probe, outcome):
+        """Ask an editor whether it has unsaved work, tolerating a broken answer.
+
+        Returns True (has changes), False (none) or None (could not tell).
+
+        WHY THIS EXISTS (2026-10-29). Each editor's SAVE in _on_save_all is
+        wrapped in try/except, but the question that PRECEDES it was not, at
+        nine call sites. A raising has_unsaved_changes() therefore aborted Save
+        All mid-sequence and skipped every later editor — the same data loss as
+        the AttributeError crash fixed the same day, by a different route.
+        Reproduced before this was written.
+
+        None is NOT the same as False. SaveOutcome.nothing_to_save()
+        overwrites, so collapsing "cannot tell" into "clean" would let the
+        `elif` after each check relabel the failure as "nothing to save" and
+        clear the user's dirty marker with the work still unsaved. An
+        unanswerable check is recorded FAILED: the marker stays, the summary
+        names it, and the save carries on with the remaining editors.
+        """
+        try:
+            return bool(probe())
+        except Exception as e:
+            outcome.failed(label, f"could not check for unsaved changes: {e}")
+            self.log_message(f"Error checking {label} for unsaved changes: {e}")
+            import logging as _lg
+            _lg.getLogger(__name__).exception(
+                "unsaved-changes check failed for %s", label)
+            return None
+
     def _on_save_all(self):
         """Save all dirty editors and emit change signals."""
         ans = QMessageBox.question(
@@ -1382,6 +1497,15 @@ class UnifiedMainWindow(QMainWindow):
         if ans != QMessageBox.StandardButton.Yes:
             return
 
+        # Per-editor outcome bookkeeping. Before 2026-10-29 each editor set its
+        # own ad-hoc flag, every failure went only to the side log panel, and
+        # the EVENTide dirty dot was cleared whether or not its save had thrown
+        # — so a failed save was indistinguishable from a successful one. See
+        # ui/save_outcome.py for why "nothing to save", "saved", "partly saved"
+        # and "failed" must stay four separate states.
+        from ui.save_outcome import SaveOutcome
+        outcome = SaveOutcome()
+
         saved_porysuite = False
         saved_eventide = False
 
@@ -1392,27 +1516,62 @@ class UnifiedMainWindow(QMainWindow):
         if self._porysuite_window:
             try:
                 self._porysuite_window.update_save()
-                self._porysuite_window.setWindowModified(False)
-                saved_porysuite = True
-                self.set_page_dirty("ui", False)
-                self.set_page_dirty("config", False)
+                # update_save() swallows per-editor problems so one bad editor
+                # cannot abort the rest. The Items flush records its failures
+                # instead of discarding them, so a failed item or icon write
+                # is no longer reported as a successful save.
+                _item_errs = list(getattr(
+                    self._porysuite_window, "_item_save_errors", []) or [])
+                if _item_errs:
+                    outcome.partial("PorySuite data", "; ".join(_item_errs))
+                    self.log_message(
+                        "Some item data did not save: " + "; ".join(_item_errs))
+                else:
+                    self._porysuite_window.setWindowModified(False)
+                    saved_porysuite = True
+                    outcome.saved("PorySuite data")
+                    self.set_page_dirty("ui", False)
+                    self.set_page_dirty("config", False)
             except Exception as e:
+                outcome.failed("PorySuite data", str(e))
                 self.log_message(f"Error saving PorySuite data: {e}")
+        else:
+            outcome.nothing_to_save("PorySuite data")
 
         # Save EVENTide data (skip if no map is loaded — nothing to save)
-        if self._eventide_window and self._eventide_window.isWindowModified():
+        _ev_dirty = (self._editor_dirty(
+            "EVENTide maps and scripts",
+            self._eventide_window.isWindowModified, outcome)
+            if self._eventide_window else False)
+        if _ev_dirty:
             eet = self._eventide_window.event_editor_tab
             if getattr(eet, '_map_dir', None) and getattr(eet, '_map_data', None):
                 try:
                     eet._on_save()
-                    saved_eventide = True
+                    # Its own handler swallows write errors and it has a
+                    # cancel path, so a returning call proves nothing —
+                    # the window-modified flag it clears on success does.
+                    saved_eventide = self._confirm_saved(
+                        "EVENTide maps and scripts",
+                        self._eventide_window.isWindowModified, outcome)
                 except Exception as e:
+                    outcome.failed("EVENTide maps and scripts", str(e))
                     self.log_message(f"Error saving EVENTide data: {e}")
-            # Always clear EVENTide dirty flag after save — even if no map
-            # is loaded.  The gfx_combo refresh during save fires
-            # currentIndexChanged → _mark_dirty, leaving EVENTide dirty
-            # with nothing actually needing saving.
-            self._eventide_window.setWindowModified(False)
+            else:
+                # Marked dirty but no map loaded — the gfx_combo refresh fires
+                # currentIndexChanged -> _mark_dirty, leaving EVENTide dirty
+                # with nothing actually needing saving. That is genuinely
+                # "nothing to save", which is NOT a failure.
+                outcome.nothing_to_save("EVENTide maps and scripts")
+            # Clearing the window-modified flag is correct for both of the
+            # branches above (saved, or nothing outstanding) but NOT after an
+            # exception — that would present a failed save as a successful one
+            # and lose the retry. The dirty dot itself is handled further down
+            # via outcome.may_clear_dirty("EVENTide maps and scripts").
+            if outcome.may_clear_dirty("EVENTide maps and scripts"):
+                self._eventide_window.setWindowModified(False)
+        elif _ev_dirty is False and self._eventide_window:
+            outcome.nothing_to_save("EVENTide maps and scripts")
 
         # Maps tab: flush staged section/in-game-name edits to disk first.
         # Region Map tab: flush staged cell paints. Both have save() that
@@ -1426,17 +1585,33 @@ class UnifiedMainWindow(QMainWindow):
             if maps_tab:
                 try:
                     maps_save_ok = maps_tab.save()
+                    if maps_save_ok:
+                        outcome.saved("Maps")
+                    else:
+                        outcome.failed("Maps", "the Maps tab reported a failure")
                 except Exception as e:
                     maps_save_ok = False
+                    outcome.failed("Maps", str(e))
                     self.log_message(f"Error saving Maps tab: {e}")
             if region_tab and hasattr(region_tab, 'save'):
                 try:
                     region_save_ok = region_tab.save()
+                    if region_save_ok:
+                        outcome.saved("Region Map")
+                    else:
+                        outcome.failed("Region Map",
+                                       "the Region Map tab reported a failure")
                 except Exception as e:
                     region_save_ok = False
+                    outcome.failed("Region Map", str(e))
                     self.log_message(f"Error saving Region Map tab: {e}")
 
-            self.set_page_dirty("events", False)
+            # The events dot used to be cleared unconditionally here, so a
+            # failed EVENTide save still looked saved. It now follows the
+            # recorded outcome: cleared when the save succeeded OR there was
+            # nothing outstanding, kept when the save threw.
+            if outcome.may_clear_dirty("EVENTide maps and scripts"):
+                self.set_page_dirty("events", False)
             if region_save_ok:
                 self.set_page_dirty("regionmap", False)
             if maps_save_ok:
@@ -1444,34 +1619,66 @@ class UnifiedMainWindow(QMainWindow):
                 if maps_tab:
                     maps_tab.clear_dirty_markers()
 
-        # Emit change signals so the other side picks up changes
-        if saved_porysuite and hasattr(self, 'project_data'):
-            self.project_data.notify_trainers_changed()
-            self.project_data.notify_items_changed()
-            self.project_data.notify_species_changed()
-            self.project_data.notify_moves_changed()
-
-        if saved_eventide and hasattr(self, 'project_data'):
-            self.project_data.notify_texts_changed()
-            self.project_data.notify_scripts_changed()
+        # Emit change signals so the other side picks up changes.
+        #
+        # Guarded as a block: these are NOTIFICATIONS, not saves. A listener
+        # raising here must not abort the editors that still have to save below
+        # (credits, labels, sound, tilemap, tile animations, shops). That is
+        # exactly what happened before 2026-10-29, when
+        # `notify_scripts_changed` did not exist: the AttributeError killed the
+        # application with six editors still unsaved.
+        if hasattr(self, 'project_data'):
+            try:
+                if saved_porysuite:
+                    self.project_data.notify_trainers_changed()
+                    self.project_data.notify_items_changed()
+                    self.project_data.notify_species_changed()
+                    self.project_data.notify_moves_changed()
+                if saved_eventide:
+                    self.project_data.notify_texts_changed()
+                    self.project_data.notify_scripts_changed()
+            except Exception as e:
+                # Not an editor failure — nothing was lost, the other side just
+                # may not have refreshed. Log it and carry on saving.
+                self.log_message(
+                    f"Warning: could not notify the other editor of changes: {e}")
+                import logging as _lg
+                _lg.getLogger(__name__).exception(
+                    "cross-editor change notification failed")
 
         # Save credits editor
         saved_credits = False
-        if hasattr(self, "_credits_editor") and self._credits_editor.has_unsaved_changes():
+        _cred_dirty = (self._editor_dirty(
+            "Credits", self._credits_editor.has_unsaved_changes, outcome)
+            if hasattr(self, "_credits_editor") else False)
+        if _cred_dirty:
             try:
                 self._credits_editor._on_save()
-                saved_credits = True
+                saved_credits = self._confirm_saved(
+                    "Credits", self._credits_editor.has_unsaved_changes,
+                    outcome)
             except Exception as e:
+                outcome.failed("Credits", str(e))
                 self.log_message(f"Error saving credits: {e}")
+        elif _cred_dirty is False and hasattr(self, "_credits_editor"):
+            outcome.nothing_to_save("Credits")
 
         # Save label manager
         saved_labels = False
-        if hasattr(self, "_label_manager") and self._label_manager.has_unsaved_changes():
+        _lab_dirty = (self._editor_dirty(
+            "Label Manager", self._label_manager.has_unsaved_changes, outcome)
+            if hasattr(self, "_label_manager") else False)
+        if _lab_dirty:
             try:
                 self._label_manager._save_labels()
-                saved_labels = True
+                saved_labels = self._confirm_saved(
+                    "Label Manager", self._label_manager.has_unsaved_changes,
+                    outcome)
             except Exception as e:
+                outcome.failed("Label Manager", str(e))
                 self.log_message(f"Error saving labels: {e}")
+        elif _lab_dirty is False and hasattr(self, "_label_manager"):
+            outcome.nothing_to_save("Label Manager")
 
         # Save Sound Editor data (voicegroups + song table when modified)
         saved_sound = False
@@ -1484,23 +1691,42 @@ class UnifiedMainWindow(QMainWindow):
             # of whether the voicegroup list itself was touched.
             vg_tab = getattr(se, '_voicegroups_tab', None)
             inst_tab = getattr(se, '_instruments_tab', None)
-            inst_dirty = bool(inst_tab and inst_tab._dirty_inst_keys)
-            if vg_tab and (vg_tab.has_unsaved_changes() or inst_dirty):
+            inst_dirty = self._editor_dirty(
+                "Sound Editor (instruments)",
+                lambda: bool(inst_tab and inst_tab._dirty_inst_keys), outcome)
+            _vg_dirty = (self._editor_dirty(
+                "Sound Editor (voicegroups)",
+                vg_tab.has_unsaved_changes, outcome) if vg_tab else False)
+            if vg_tab and (_vg_dirty or inst_dirty):
                 try:
                     vg_tab.save_to_disk()
-                    saved_sound = True
-                    if inst_tab:
+                    saved_sound = self._confirm_saved(
+                        "Sound Editor (voicegroups)",
+                        vg_tab.has_unsaved_changes, outcome)
+                    # Only once the write is CONFIRMED: save_to_disk has an
+                    # early return that writes nothing, and clearing the
+                    # instruments flag then would discard pending edits.
+                    if saved_sound and inst_tab:
                         inst_tab.clear_dirty()
                 except Exception as e:
+                    # The instruments dirty flag is deliberately NOT cleared
+                    # here: the write failed, so those edits are still pending.
+                    outcome.failed("Sound Editor (voicegroups)", str(e))
                     self.log_message(f"Error saving voicegroups: {e}")
             # Piano roll edits (song .s files)
             pr = getattr(se, '_piano_roll_window', None)
-            if pr and getattr(pr, 'has_unsaved_changes', lambda: False)():
+            _pr_dirty = (self._editor_dirty(
+                "Sound Editor (piano roll)",
+                getattr(pr, 'has_unsaved_changes', lambda: False), outcome)
+                if pr else False)
+            if _pr_dirty:
                 try:
                     path = pr.save_to_disk()
                     saved_sound = True
+                    outcome.saved("Sound Editor (piano roll)")
                     self.log_message(f"Saved piano roll edits to {path}")
                 except Exception as e:
+                    outcome.failed("Sound Editor (piano roll)", str(e))
                     self.log_message(f"Error saving piano roll: {e}")
 
             # Song table (song_table.inc, songs.h, midi.cfg) — when modified
@@ -1514,8 +1740,11 @@ class UnifiedMainWindow(QMainWindow):
                     write_midi_cfg(se._project_root, st)
                     st._dirty = False
                     saved_sound = True
+                    outcome.saved("Sound Editor (song table)")
                     self.log_message("Saved song table, songs.h, and midi.cfg")
                 except Exception as e:
+                    # _dirty is left True so the edits can be retried.
+                    outcome.failed("Sound Editor (song table)", str(e))
                     self.log_message(f"Error saving song table: {e}")
 
             if saved_sound:
@@ -1526,7 +1755,12 @@ class UnifiedMainWindow(QMainWindow):
         saved_tile_anim = False
         if hasattr(self, '_tilemap_editor'):
             # Tilemap .bin
-            if hasattr(self._tilemap_editor, 'has_unsaved_changes') and self._tilemap_editor.has_unsaved_changes():
+            _tm_dirty = (self._editor_dirty(
+                "Tilemap Editor",
+                self._tilemap_editor.has_unsaved_changes, outcome)
+                if hasattr(self._tilemap_editor, 'has_unsaved_changes')
+                else False)
+            if _tm_dirty:
                 try:
                     ok, errs = self._tilemap_editor.flush_to_disk()
                     if ok > 0:
@@ -1534,11 +1768,23 @@ class UnifiedMainWindow(QMainWindow):
                         self.log_message("Saved tilemap .bin")
                     if errs:
                         self.log_message(f"Tilemap save errors: {', '.join(errs)}")
+                    # Some written AND some refused is PARTIAL, not success.
+                    if errs and ok > 0:
+                        outcome.partial("Tilemap Editor", "; ".join(errs))
+                    elif errs:
+                        outcome.failed("Tilemap Editor", "; ".join(errs))
+                    else:
+                        outcome.saved("Tilemap Editor")
                 except Exception as e:
+                    outcome.failed("Tilemap Editor", str(e))
                     self.log_message(f"Error saving tilemap: {e}")
             # Tile animation properties
             anim_ed = getattr(self._tilemap_editor, '_anim_viewer', None)
-            if anim_ed and hasattr(anim_ed, 'has_unsaved_changes') and anim_ed.has_unsaved_changes():
+            _anim_dirty = (self._editor_dirty(
+                "Tile Animations", anim_ed.has_unsaved_changes, outcome)
+                if (anim_ed and hasattr(anim_ed, 'has_unsaved_changes'))
+                else False)
+            if _anim_dirty:
                 try:
                     ok, errs = anim_ed.flush_to_disk()
                     if ok > 0:
@@ -1546,22 +1792,48 @@ class UnifiedMainWindow(QMainWindow):
                         self.log_message(f"Saved {ok} tile animation property change(s)")
                     if errs:
                         self.log_message(f"Tile animation save errors: {', '.join(errs)}")
+                    if errs and ok > 0:
+                        outcome.partial("Tile Animations", "; ".join(errs))
+                    elif errs:
+                        outcome.failed("Tile Animations", "; ".join(errs))
+                    else:
+                        outcome.saved("Tile Animations")
                 except Exception as e:
+                    outcome.failed("Tile Animations", str(e))
                     self.log_message(f"Error saving tile animation properties: {e}")
 
         # Clear the tilesets dirty dot if the tab is now clean — whether THIS
         # Save-All did the writing OR a prior per-tab Save already saved it (in
         # which case flush_to_disk is a no-op but the dot must still come off).
-        if saved_tilemap or saved_tile_anim or (
+        # `saved_tilemap` / `saved_tile_anim` are True whenever ANY item was
+        # written, so on a PARTIAL save (some written, some refused) they were
+        # clearing the dot while work was still outstanding. Require that
+        # neither recorded a failure or a partial.
+        _tiles_clean = (
+            outcome.state("Tilemap Editor") not in ("failed", "partial")
+            and outcome.state("Tile Animations") not in ("failed", "partial"))
+        try:
+            _tm_now_clean = (
                 hasattr(self, '_tilemap_editor')
                 and hasattr(self._tilemap_editor, 'has_unsaved_changes')
-                and not self._tilemap_editor.has_unsaved_changes()):
+                and not self._tilemap_editor.has_unsaved_changes())
+        except Exception as e:
+            # Deliberately records no outcome: the editor may already be down
+            # as `saved`, and this is only the question "may the dot come off".
+            # Unanswerable means the dot stays on, which is the safe direction.
+            self.log_message(
+                f"Could not re-check the tilemap editor; leaving the tilesets "
+                f"marker as it is: {e}")
+            _tm_now_clean = False
+        if _tiles_clean and (saved_tilemap or saved_tile_anim or _tm_now_clean):
             self.set_page_dirty("tilesets", False)
 
         # Save Shop Editor (rewrites .2byte item lists in map scripts.inc)
         saved_shops = False
-        if hasattr(self, '_shop_editor') and \
-                self._shop_editor.has_unsaved_changes():
+        _shop_dirty = (self._editor_dirty(
+            "Shop Editor", self._shop_editor.has_unsaved_changes, outcome)
+            if hasattr(self, '_shop_editor') else False)
+        if _shop_dirty:
             try:
                 ok, errs = self._shop_editor.flush_to_disk()
                 if ok > 0:
@@ -1569,27 +1841,76 @@ class UnifiedMainWindow(QMainWindow):
                     self.log_message(f"Saved {ok} shop(s)")
                 if errs:
                     self.log_message(f"Shop save errors: {', '.join(errs)}")
+                if errs and ok > 0:
+                    outcome.partial("Shop Editor", "; ".join(errs))
+                elif errs:
+                    outcome.failed("Shop Editor", "; ".join(errs))
+                else:
+                    outcome.saved("Shop Editor")
             except Exception as e:
+                outcome.failed("Shop Editor", str(e))
                 self.log_message(f"Error saving shops: {e}")
-        if saved_shops:
+        elif _shop_dirty is False and hasattr(self, '_shop_editor'):
+            outcome.nothing_to_save("Shop Editor")
+        # Same partial-save trap as the tilesets dot above: `saved_shops` is
+        # True when ANY shop was written, so a partial save would have cleared
+        # the dot with shops still unsaved.
+        if saved_shops and outcome.may_clear_dirty("Shop Editor"):
             self.set_page_dirty("shops", False)
 
-        if saved_labels:
+        if outcome.may_clear_dirty("Label Manager"):
             self.set_page_dirty("labels", False)
 
-        # Always clear the dirty flag after save — even if no sub-component
-        # reported changes.  The Sound Editor (and others) can emit modified()
-        # for actions that are immediately persisted (e.g. .s file import
-        # writes to disk, piano roll Save button), leaving the unified window
-        # dirty with nothing left to actually save.
-        self.setWindowModified(False)
+        # Clear the window-modified flag only when nothing FAILED. It used to
+        # be cleared unconditionally, with the comment below as the reason —
+        # which is right for "emitted modified() but already persisted", and
+        # wrong after a genuine failure, because it removed the last sign that
+        # work was still outstanding.
+        #
+        # (Original note, still true for the no-op case: the Sound Editor and
+        # others can emit modified() for actions that are immediately persisted
+        # — a .s file import, the piano roll Save button — leaving the unified
+        # window dirty with nothing left to actually save.)
+        if outcome.all_ok():
+            self.setWindowModified(False)
 
-        if (saved_porysuite or saved_eventide or saved_credits
-                or saved_labels or saved_sound or saved_tile_anim
-                or saved_tilemap or saved_shops):
+        # ── One outcome report, never a barrage, never a false success ──────
+        # Every per-editor log_message above is kept for troubleshooting; this
+        # is the part the user actually sees. Before 2026-10-29 the status bar
+        # said "All changes saved." whenever ANY editor saved, so a partial or
+        # failed save was announced as a complete one.
+        for line in outcome.log_lines():
+            self.log_message(line)
+
+        if outcome.should_warn():
+            failed = outcome.failed_names()
+            self.statusBar().showMessage(
+                f"Save incomplete — {len(failed)} editor(s) did not save.",
+                8000)
+            self._report_save_outcome(outcome)
+        elif outcome.saved_names():
             self.statusBar().showMessage("All changes saved.", 4000)
         else:
             self.statusBar().showMessage("Nothing to save.", 2000)
+
+    def _report_save_outcome(self, outcome) -> None:
+        """Show ONE dialog naming what saved and what did not.
+
+        Only called when something actually failed — having nothing to save is
+        not a failure and must not produce a warning.
+        """
+        if not outcome.should_warn():
+            return
+        try:
+            QMessageBox.warning(
+                self, "Some changes were NOT saved",
+                outcome.summary_text() + "\n\n"
+                "The log panel has the full details.")
+        except Exception:
+            import logging as _lg
+            _lg.getLogger(__name__).exception(
+                "could not show the save outcome dialog; outcome was: %s",
+                outcome.summary_text())
 
     def _on_make(self, extra_args: list):
         """Delegate make to PorySuite's existing _run_make method.

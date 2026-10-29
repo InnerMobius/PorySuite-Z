@@ -422,6 +422,71 @@ def _strip_braille_prefix(text: str) -> str:
     return text
 
 
+def strip_duplicate_text_blocks(scripts_inc_path: Path,
+                                local_text_labels) -> list[str]:
+    """Remove text blocks from scripts.inc for labels that text.inc defines.
+
+    A label can only be defined once in the assembled source. `text.inc` owns
+    this map's dialogue, so a `Foo_Text_3::` block in `scripts.inc` as well is
+    a duplicate symbol and the build stops dead:
+
+        data/maps/Faron/text.inc:8: Error: symbol `Faron_Text_3' is already
+            defined
+
+    They get there by pasting a copied event. "Copy as Script" renders the
+    event AND its text, deliberately, so the copy is self-contained — but the
+    paste then re-defines text the map already has. `write_scripts_inc`
+    preserves anything in the file it was not asked to rewrite, so once a
+    duplicate lands it survives every later save; a plain reload-and-save does
+    NOT clear it.
+
+    So the save path asks for them to be removed. Returns the labels dropped.
+    """
+    if not scripts_inc_path.exists():
+        return []
+    owned = {str(x) for x in (local_text_labels or ())}
+    if not owned:
+        return []
+    try:
+        lines = scripts_inc_path.read_text(encoding='utf-8').splitlines(True)
+    except OSError:
+        return []
+
+    label_re = re.compile(r'^([A-Za-z0-9_]+)::')
+    body_re = re.compile(r'^\s*\.(string|braille)\b')
+
+    out: list[str] = []
+    removed: list[str] = []
+    i = 0
+    while i < len(lines):
+        m = label_re.match(lines[i])
+        if not m or m.group(1) not in owned:
+            out.append(lines[i])
+            i += 1
+            continue
+        # Gather this block: its body up to the next label.
+        j = i + 1
+        while j < len(lines) and not label_re.match(lines[j]):
+            j += 1
+        body = [ln for ln in lines[i + 1:j] if ln.strip()]
+        # Only a block that is PURELY text is a duplicate definition. A label
+        # that happens to share the name but holds commands is left alone.
+        if body and all(body_re.match(ln) for ln in body):
+            removed.append(m.group(1))
+            i = j
+            while out and not out[-1].strip():     # tidy the gap it leaves
+                out.pop()
+            out.append('\n')
+            continue
+        out.extend(lines[i:j])
+        i = j
+
+    if removed:
+        scripts_inc_path.write_text(''.join(out), encoding='utf-8',
+                                    newline='')
+    return removed
+
+
 def write_text_inc(texts: dict, path: Path):
     """Write the label->text mapping back to text.inc.
 

@@ -1100,7 +1100,6 @@ class EventideMainWindow(QMainWindow):
             QPlainTextEdit, QPushButton,
         )
         from PyQt6.QtGui import QFont
-        from PyQt6.QtCore import Qt as _Qt
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Push to Remote")
@@ -1111,8 +1110,12 @@ class EventideMainWindow(QMainWindow):
         branch_row = QHBoxLayout()
         branch_row.addWidget(QLabel("<b>Branch to push:</b>"))
         branch_combo = QComboBox()
-        branch_combo.setFocusPolicy(_Qt.FocusPolicy.StrongFocus)
-        branch_combo.installEventFilter(self._combo_wheel_filter())
+        # Shared guard, not the old local filter: that one only swallowed the
+        # wheel while the widget lacked focus, and a FOCUSED combo still jumped
+        # a value on one notch (measured 2026-10-29). install_scroll_guard also
+        # sets StrongFocus.
+        from ui.custom_widgets.scroll_guard import install_scroll_guard
+        install_scroll_guard(branch_combo)
         for b in all_branches:
             branch_combo.addItem(b)
         idx = branch_combo.findText(current_branch)
@@ -1308,19 +1311,10 @@ class EventideMainWindow(QMainWindow):
         worker.done.connect(_on_done)
         worker.start()
 
-    def _combo_wheel_filter(self):
-        """Return a shared event filter that blocks wheel events on unfocused combo boxes."""
-        filt = getattr(self, "_wheel_filter_instance", None)
-        if filt is not None:
-            return filt
-        from PyQt6.QtCore import QObject, QEvent
-        class _WheelBlocker(QObject):
-            def eventFilter(self, obj, event):
-                if event.type() == QEvent.Type.Wheel and not obj.hasFocus():
-                    return True
-                return False
-        self._wheel_filter_instance = _WheelBlocker(self)
-        return self._wheel_filter_instance
+    # `_combo_wheel_filter` was removed on 2026-10-29 — it blocked the wheel
+    # only while a widget lacked focus, which is the rule
+    # `ui/custom_widgets/scroll_guard.py` documents as wrong for value-bearing
+    # widgets. Use `install_scroll_guard(widget)` from that module instead.
 
     def _git_configure_remote(self) -> None:
         """Placeholder — handled by the git panel's remotes section."""

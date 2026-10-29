@@ -17,18 +17,36 @@ from PyQt6.QtGui import QFont, QColor, QIcon
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QPushButton, QLineEdit, QTextEdit, QPlainTextEdit,
-    QListWidget, QListWidgetItem, QGroupBox, QFrame,
+    QListWidgetItem, QGroupBox, QFrame,
     QSpinBox, QComboBox, QSplitter, QMessageBox, QScrollArea,
-    QSizePolicy, QAbstractItemView,
+    QSizePolicy,
 )
 
 from dex_description_edit import DexDescriptionEdit
+from ui.custom_widgets.reorderable_list import (
+    ReorderableListWidget, reorder_rows)
 
 # Credits window is 30 tiles wide (240 px, full GBA screen width).
 # Variable-width font means ~30 characters per line in practice.
 # Each credits screen shows 6 lines at a time.
 _CREDITS_MAX_CHARS_PER_LINE = 30
 _CREDITS_MAX_LINES = 6
+
+# What a credits entry stays on screen for when the script does not say.
+_DEFAULT_DURATION = 210
+
+
+def _enum_name(title_symbol: str) -> str:
+    """The name the credits script uses to refer to an entry.
+
+    ``gCreditsString_Game_Designers`` is printed by
+    ``CREDITS_PRINT(GAME_DESIGNERS, 211)``, so this is what ties an entry to
+    its command in the script. Deriving it in one place matters: the saved
+    enum, the script's commands and the matching done here all have to agree
+    on an entry's name, and three separate copies of this line would not have
+    to.
+    """
+    return title_symbol.replace("gCreditsString_", "").upper()
 
 
 # ── Parsing helpers ──────────────────────────────────────────────────────────
@@ -165,12 +183,12 @@ class CreditsEditorWidget(QWidget):
         list_label.setStyleSheet("font-weight: bold;")
         left_lay.addWidget(list_label)
 
-        self._entry_list = QListWidget()
+        self._entry_list = ReorderableListWidget()
         self._entry_list.setAlternatingRowColors(True)
         self._entry_list.setFont(QFont("Source Code Pro", 10))
         self._entry_list.currentRowChanged.connect(self._on_entry_selected)
-        self._entry_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self._entry_list.model().rowsMoved.connect(self._on_rows_moved)
+        self._entry_list.rows_move_requested.connect(
+            self._on_rows_move_requested)
         left_lay.addWidget(self._entry_list, 1)
 
         # ── List buttons ─────────────────────────────────────────────────────
@@ -246,7 +264,7 @@ class CreditsEditorWidget(QWidget):
         ))
         self._duration_spin = QSpinBox()
         self._duration_spin.setRange(1, 9999)
-        self._duration_spin.setValue(210)
+        self._duration_spin.setValue(_DEFAULT_DURATION)
         self._duration_spin.setSuffix(" frames")
         self._duration_spin.valueChanged.connect(self._on_duration_changed)
         script_lay.addRow("Display duration:", self._duration_spin)
@@ -398,9 +416,15 @@ class CreditsEditorWidget(QWidget):
         self._dirty = False
         self._save_btn.setEnabled(False)
 
-    def _populate_list(self):
+    def _populate_list(self, select: int | None = 0):
+        """Repaint the list from the entries.
+
+        *select* is the row to leave selected, or None to choose nothing --
+        used after a drag, where the row to keep selected is the one the
+        dragged entry landed on rather than the first.
+        """
         self._entry_list.clear()
-        for i, entry in enumerate(self._entries):
+        for entry in self._entries:
             # Show a clean display: "Role: Names" on one line
             title_clean = entry.title_text.strip().replace("\n", " ").strip()
             names_clean = entry.names_text.strip().replace("\n", ", ").strip()
@@ -410,14 +434,14 @@ class CreditsEditorWidget(QWidget):
             if names_clean:
                 display += f"  —  {names_clean}"
             item = QListWidgetItem(display)
-            item.setData(Qt.ItemDataRole.UserRole, i)
             # Re-apply amber tint if this entry had unsaved edits before the rebuild.
             if entry.title_symbol in self._dirty_symbols:
                 item.setBackground(QColor("#3d2e00"))
             self._entry_list.addItem(item)
 
-        if self._entries:
-            self._entry_list.setCurrentRow(0)
+        if self._entries and select is not None:
+            self._entry_list.setCurrentRow(
+                max(0, min(select, len(self._entries) - 1)))
 
     # ═════════════════════════════════════════════════════════════════════════
     # Entry Selection & Editing
@@ -445,27 +469,35 @@ class CreditsEditorWidget(QWidget):
 
         # Find duration from script
         self._duration_spin.blockSignals(True)
-        duration = self._find_duration_for_entry(row)
-        self._duration_spin.setValue(duration if duration > 0 else 210)
+        self._duration_spin.setValue(self._duration_for_entry(entry))
         self._duration_spin.blockSignals(False)
 
         self._update_preview()
 
-    def _find_duration_for_entry(self, entry_index: int) -> int:
-        """Find the script PRINT command duration for the given entry index."""
-        # The sCreditsTexts array is indexed by CREDITS_STRING_* enum values.
-        # PRINT commands reference enum names which map 1:1 to sCreditsTexts indices.
-        # We match by counting PRINT commands in the script.
-        print_idx = 0
+    def _print_cmd_for_entry(self, entry) -> "ScriptCommand | None":
+        """The script command that puts *entry* on screen, found by name.
+
+        Matched by the entry's own name rather than by counting PRINT
+        commands. Counting was wrong in both directions: the script contains
+        blank DUMMY prints used as pauses, which are not entries at all, so
+        every entry after the first pause was lined up with another entry's
+        command -- reading one entry's duration off another, and writing an
+        edited duration onto the wrong line of the script. A project whose
+        script prints entries in an order of its own was mismatched from the
+        first entry on.
+        """
+        want = _enum_name(entry.title_symbol)
         for cmd in self._script:
-            if cmd.cmd_type == "PRINT":
-                if cmd.param == "DUMMY":
-                    print_idx += 1  # DUMMY entries don't map to sCreditsTexts
-                    continue
-                if print_idx == entry_index:
-                    return cmd.duration
-                print_idx += 1
-        return 210  # default
+            if cmd.cmd_type == "PRINT" and cmd.param == want:
+                return cmd
+        return None
+
+    def _duration_for_entry(self, entry) -> int:
+        """How long *entry* stays on screen, per the script."""
+        cmd = self._print_cmd_for_entry(entry)
+        if cmd is None or cmd.duration <= 0:
+            return _DEFAULT_DURATION
+        return cmd.duration
 
     def _on_text_changed(self):
         row = self._entry_list.currentRow()
@@ -493,18 +525,11 @@ class CreditsEditorWidget(QWidget):
         row = self._entry_list.currentRow()
         if row < 0 or row >= len(self._entries):
             return
-        # Update the script command's duration
-        print_idx = 0
-        for cmd in self._script:
-            if cmd.cmd_type == "PRINT":
-                if cmd.param == "DUMMY":
-                    print_idx += 1
-                    continue
-                if print_idx == row:
-                    cmd.duration = value
-                    self._mark_dirty()
-                    return
-                print_idx += 1
+        cmd = self._print_cmd_for_entry(self._entries[row])
+        if cmd is None:
+            return          # nothing in the script shows this entry
+        cmd.duration = value
+        self._mark_dirty()
 
     def _update_preview(self):
         title = self._title_edit.toPlainText()
@@ -588,17 +613,49 @@ class CreditsEditorWidget(QWidget):
 
         self.modified.emit()
 
-    def _on_rows_moved(self):
-        """Rebuild entries list to match new visual order after drag-drop."""
-        new_entries = []
-        for i in range(self._entry_list.count()):
-            item = self._entry_list.item(i)
-            old_idx = item.data(Qt.ItemDataRole.UserRole)
-            new_entries.append(self._entries[old_idx])
-            item.setData(Qt.ItemDataRole.UserRole, i)
-        self._entries = new_entries
+    def _on_rows_move_requested(self, rows, dest: int):
+        """Move the dragged entries, then repaint the list from the result.
+
+        The list widget is never asked to move its own rows -- see
+        ReorderableListWidget for what Qt does to them if it is. The old
+        handler here was wired to the list model's "rows moved" signal, which
+        a dropped row never emits, so it could not keep the entries in step
+        with what the list was showing however Qt behaved.
+        """
+        moved, landed = reorder_rows(self._entries, rows, dest)
+        if moved == self._entries:
+            return                  # dropped where it already was
+        self._entries = moved
+        self._reorder_script_prints()
+        self._populate_list(select=landed[0] if landed else None)
         # Reorder affects every entry — tint all rows amber.
         self._mark_dirty(tint_all=True)
+
+    def _reorder_script_prints(self):
+        """Put the entries' script commands into the order the list now shows.
+
+        The order the credits actually play in is the SCRIPT's order, not the
+        order of the text table -- the table is addressed by name, and saving
+        rewrites the names to match the table, so the two cancel out.
+        Reordering the list alone therefore changed nothing in the game at
+        all. Each entry's command has to move with it.
+
+        Only the commands that show an entry are moved. Map changes, cameos
+        and the blank DUMMY pauses stay exactly where they are, because they
+        are the pacing of the sequence rather than part of the list. Whole
+        commands are moved rather than just their names, so each entry keeps
+        its own display duration.
+        """
+        order = {_enum_name(e.title_symbol): i
+                 for i, e in enumerate(self._entries)}
+        slots = [i for i, cmd in enumerate(self._script)
+                 if cmd.cmd_type == "PRINT" and cmd.param in order]
+        cmds = [self._script[i] for i in slots]
+        # Stable, so a name the script happens to print more than once keeps
+        # its own commands in the order they were already in.
+        cmds.sort(key=lambda cmd: order[cmd.param])
+        for slot, cmd in zip(slots, cmds):
+            self._script[slot] = cmd
 
     # ═════════════════════════════════════════════════════════════════════════
     # Add / Remove Entries
@@ -631,8 +688,8 @@ class CreditsEditorWidget(QWidget):
             if cmd.cmd_type in ("THEENDGFX", "WAITBUTTON"):
                 insert_pos = i
                 break
-        enum_name = title_sym.replace("gCreditsString_", "").upper()
-        self._script.insert(insert_pos, ScriptCommand("PRINT", enum_name, 210))
+        self._script.insert(insert_pos, ScriptCommand(
+            "PRINT", _enum_name(title_sym), _DEFAULT_DURATION))
 
         self._populate_list()
         self._entry_list.setCurrentRow(len(self._entries) - 1)
@@ -654,17 +711,12 @@ class CreditsEditorWidget(QWidget):
         removed_symbol = entry.title_symbol
         self._entries.pop(row)
 
-        # Remove corresponding PRINT from script
-        print_idx = 0
-        for i, cmd in enumerate(self._script):
-            if cmd.cmd_type == "PRINT":
-                if cmd.param == "DUMMY":
-                    print_idx += 1
-                    continue
-                if print_idx == row:
-                    self._script.pop(i)
-                    break
-                print_idx += 1
+        # Remove the command that showed it, found by name -- counting PRINT
+        # commands popped a different entry's line whenever the script had a
+        # blank DUMMY pause before this one.
+        cmd = self._print_cmd_for_entry(entry)
+        if cmd is not None:
+            self._script.remove(cmd)
 
         # The entry is gone — remove from dirty tracking.
         self._dirty_symbols.discard(removed_symbol)
@@ -833,7 +885,7 @@ class CreditsEditorWidget(QWidget):
         # ── Update enum CreditsString to match entries ───────────────────────
         enum_entries = []
         for i, entry in enumerate(self._entries):
-            name = entry.title_symbol.replace("gCreditsString_", "").upper()
+            name = _enum_name(entry.title_symbol)
             if i == 0:
                 enum_entries.append(f"    CREDITS_STRING_{name} = 0")
             else:

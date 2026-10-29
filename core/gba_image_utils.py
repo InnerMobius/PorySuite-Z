@@ -619,6 +619,51 @@ def swap_palette_entries(
 
 # ── Export ───────────────────────────────────────────────────────────────────
 
+#: Why the most recent ``export_indexed_png`` call refused, or "" if it
+#: succeeded. Module-level rather than a changed return type because 22 call
+#: sites across 8 files treat the result as a plain bool; see
+#: ``last_export_error``.
+_LAST_EXPORT_ERROR: str = ""
+
+
+def last_export_error() -> str:
+    """Plain-English reason the last ``export_indexed_png`` call refused.
+
+    Empty string when the last call succeeded. Callers that show messages to
+    the user (the Graphics tab's save report, the trainer and overworld tabs)
+    should include this so a refusal explains itself instead of looking like a
+    silent no-op.
+    """
+    return _LAST_EXPORT_ERROR
+
+
+def _max_pixel_index(img: QImage) -> int:
+    """Highest palette index any pixel in an Indexed8 image uses.
+
+    Reads the raw buffer a row at a time (``bytesPerLine`` can exceed
+    ``width`` because Qt pads rows), falling back to a per-pixel walk if the
+    buffer cannot be taken.
+    """
+    w, h = img.width(), img.height()
+    if w <= 0 or h <= 0:
+        return 0
+    try:
+        ptr = img.constBits()
+        ptr.setsize(img.sizeInBytes())
+        buf = bytes(ptr)
+        bpl = img.bytesPerLine()
+        hi = 0
+        for y in range(h):
+            row = buf[y * bpl: y * bpl + w]
+            if row:
+                m = max(row)
+                if m > hi:
+                    hi = m
+        return hi
+    except Exception:
+        return max(img.pixelIndex(x, y) for y in range(h) for x in range(w))
+
+
 def export_indexed_png(
     indexed_img: QImage,
     palette: list[Color],
@@ -627,19 +672,65 @@ def export_indexed_png(
 ) -> bool:
     """Save an indexed QImage as PNG. Returns True on success.
 
-    HARD REQUIREMENT: input MUST be Format_Indexed8. If it isn't, this
-    function refuses to save (returns False) rather than producing an
-    RGB PNG that would break gbagfx with "unsupported color type"
-    during the project build. Callers that load images from disk for
-    palette-baking MUST `convertToFormat(Format_Indexed8)` first.
+    Two HARD REQUIREMENTS, both of which refuse the save (return False) and
+    leave any existing file on disk BYTE-UNTOUCHED:
+
+    1. The input must be ``Format_Indexed8``. An RGB image would otherwise be
+       written as an RGB PNG, which breaks gbagfx with "unsupported color
+       type" during the project build.
+
+    2. Every pixel index must fall inside ``palette``. This is the check the
+       function lacked until 2026-10-29, and the format check alone is NOT a
+       substitute for it. ``QImage.convertToFormat(Format_Indexed8)``
+       QUANTISES a non-indexed image, inventing a colour table of up to 256
+       entries — the result passes requirement 1 while its pixels point far
+       past a 16-colour sprite palette. Writing that produced a PNG which
+       gbagfx happily reduced with ``index % 16``
+       (``pokefirered/tools/gbagfx/convert_png.c:48-76``), so the build
+       SUCCEEDED and shipped a garbled sprite. A loud build failure had been
+       turned into silent corruption.
+
+    So do NOT "fix" a rejected image by calling ``convertToFormat`` on it —
+    that is the bug. Re-index it onto a real palette first (the manual palette
+    picker / Image Indexer do this correctly), or leave it alone.
+
+    Validation is against ``len(palette)``, never a hardcoded 16: the GBA
+    Image Indexer legitimately writes 256-colour images.
+
+    On refusal, ``last_export_error()`` holds a reason suitable for showing to
+    the user.
     """
+    global _LAST_EXPORT_ERROR
+    _LAST_EXPORT_ERROR = ""
     try:
         if indexed_img is None or indexed_img.isNull():
+            _LAST_EXPORT_ERROR = "no image to write (empty or missing)."
             return False
         if indexed_img.format() != QImage.Format.Format_Indexed8:
             # Caller passed a non-indexed image. Refuse — silently writing
             # an RGB PNG here is what causes gbagfx to fail with
             # "red_normal.png: unsupported color type" during the build.
+            _LAST_EXPORT_ERROR = (
+                "the image is not an indexed (paletted) PNG, so it cannot be "
+                "saved as one. Re-index it to a 16-colour palette first."
+            )
+            return False
+        # Requirement 2: the palette must be able to describe every pixel.
+        # Checked BEFORE anything is created or written, so a refusal cannot
+        # touch the artwork on disk.
+        n_colors = len(palette)
+        if n_colors <= 0:
+            _LAST_EXPORT_ERROR = "no palette was supplied."
+            return False
+        hi = _max_pixel_index(indexed_img)
+        if hi >= n_colors:
+            _LAST_EXPORT_ERROR = (
+                f"this image uses colour slot {hi}, but the palette only has "
+                f"{n_colors} colours (slots 0-{n_colors - 1}). Saving it would "
+                f"leave those pixels with no colour, and the game would render "
+                f"them wrongly. Re-index the image to {n_colors} colours first "
+                f"— nothing was written, so the file on disk is unchanged."
+            )
             return False
         # Rebuild the colour table to make sure it matches our palette.
         img = _rebuild_color_table(indexed_img, palette, transparent_index)
@@ -647,6 +738,10 @@ def export_indexed_png(
         # Final safety net: if _rebuild_color_table somehow returned a
         # non-indexed image, refuse the save.
         if img.format() != QImage.Format.Format_Indexed8:
+            _LAST_EXPORT_ERROR = (
+                "the palette could not be applied without losing the image's "
+                "indexed format, so nothing was written."
+            )
             return False
         # Byte-equality guard: render the PNG to a buffer first, then
         # only write to disk if the bytes differ. Prevents phantom git
@@ -657,6 +752,7 @@ def export_indexed_png(
         buf = QBuffer()
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         if not img.save(buf, "PNG"):
+            _LAST_EXPORT_ERROR = "Qt could not encode the image as a PNG."
             return False
         new_bytes = bytes(buf.data())
         if os.path.isfile(output_path):
@@ -669,7 +765,8 @@ def export_indexed_png(
         with open(output_path, "wb") as f:
             f.write(new_bytes)
         return True
-    except Exception:
+    except Exception as exc:
+        _LAST_EXPORT_ERROR = f"could not write the image: {exc}"
         return False
 
 

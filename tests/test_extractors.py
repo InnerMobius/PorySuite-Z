@@ -38,14 +38,13 @@ sys.modules.setdefault("PyQt6.QtCore", qt_core)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
 
 # Load the extractor module without running the plugin package __init__
-pkg_name = "plugins.pokefirered"
-sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+pkg_name = "core"
 pkg_module = types.ModuleType(pkg_name)
-pkg_module.__path__ = [os.path.join(os.path.dirname(__file__), "..", "plugins", "pokefirered")]
+pkg_module.__path__ = [os.path.join(os.path.dirname(__file__), "..", "core")]
 sys.modules[pkg_name] = pkg_module
 spec = importlib.util.spec_from_file_location(
     f"{pkg_name}.pokemon_data_extractor",
-    os.path.join(os.path.dirname(__file__), "..", "plugins", "pokefirered", "pokemon_data_extractor.py"),
+    os.path.join(os.path.dirname(__file__), "..", "core", "pokemon_data_extractor.py"),
 )
 pdextractor = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = pdextractor
@@ -61,7 +60,7 @@ PokemonConstantsExtractor = pdextractor.PokemonConstantsExtractor
 spec_data = importlib.util.spec_from_file_location(
     f"{pkg_name}.pokemon_data",
     os.path.join(
-        os.path.dirname(__file__), "..", "plugins", "pokefirered", "pokemon_data.py"
+        os.path.dirname(__file__), "..", "core", "pokemon_data.py"
     ),
 )
 pokemon_data_mod = importlib.util.module_from_spec(spec_data)
@@ -104,8 +103,12 @@ class ExtractorReturnTypeTest(unittest.TestCase):
         self.assertEqual(result[0]["species"], "SPECIES_TEST")
         self.assertEqual(result[0]["level"], 5)
         self.assertEqual(result[0]["item"], "ITEM_TEST")
-        self.assertEqual(result[0]["ability_num"], 1)
         self.assertEqual(result[0]["custom_move"], "MOVE_NONE")
+        # No ability assertion: the starters ability section was removed
+        # deliberately in v0.0.6b ("was broken + non-editable"), so the
+        # extractor no longer emits ability_num at all. These tests kept
+        # asserting it for releases afterwards.
+        self.assertNotIn("ability_num", result[0])
 
     def test_starters_extractor_missing_ability_and_move(self):
         path = os.path.join(self.tempdir.name, "src", "battle_setup.c")
@@ -115,8 +118,12 @@ class ExtractorReturnTypeTest(unittest.TestCase):
             )
         ext = StartersDataExtractor(self.project_info, "starters.json")
         result = ext.extract_data()
-        self.assertEqual(result[0]["ability_num"], -1)
         self.assertEqual(result[0]["custom_move"], "MOVE_NONE")
+        # No ability assertion: the starters ability section was removed
+        # deliberately in v0.0.6b ("was broken + non-editable"), so the
+        # extractor no longer emits ability_num at all. These tests kept
+        # asserting it for releases afterwards.
+        self.assertNotIn("ability_num", result[0])
 
     def test_starters_extractor_parses_custom_move(self):
         path = os.path.join(self.tempdir.name, "src", "battle_setup.c")
@@ -128,8 +135,12 @@ class ExtractorReturnTypeTest(unittest.TestCase):
         result = ext.extract_data()
         self.assertEqual(result[0]["level"], 10)
         self.assertEqual(result[0]["item"], "ITEM_TEST")
-        self.assertEqual(result[0]["ability_num"], 2)
         self.assertEqual(result[0]["custom_move"], "MOVE_TEST")
+        # No ability assertion: the starters ability section was removed
+        # deliberately in v0.0.6b ("was broken + non-editable"), so the
+        # extractor no longer emits ability_num at all. These tests kept
+        # asserting it for releases afterwards.
+        self.assertNotIn("ability_num", result[0])
 
     def test_pokedex_extractor_returns_dict(self):
         ext = PokedexDataExtractor(self.project_info, "pokedex.json")

@@ -92,6 +92,21 @@ qt_widgets.QPushButton = type("QPushButton", (), {})
 qt_module.QtCore = qt_core
 qt_module.QtGui = qt_gui
 qt_module.QtWidgets = qt_widgets
+# Shared PyQt6 stub helpers -- see tests/_qt_stub.py for why none of this is a
+# hand-written list of Qt class names any more.
+from tests._qt_stub import (  # noqa: E402
+    StubQtFinder as _StubQtFinder,
+    UiStub as _UiStub,
+    auto_qt_class as _auto_qt_class,
+    autofill_qt_stub as _autofill_qt_stub,
+    is_qt_method_name as _is_qt_method_name,
+)
+
+if not any(isinstance(f, _StubQtFinder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _StubQtFinder())
+qt_module.__path__ = []  # marks the stub as a package
+_autofill_qt_stub(qt_module, qt_core, qt_gui, qt_widgets)
+
 sys.modules["PyQt6"] = qt_module
 sys.modules["PyQt6.QtCore"] = qt_core
 sys.modules["PyQt6.QtGui"] = qt_gui
@@ -103,7 +118,13 @@ sys.modules.setdefault("newproject", types.ModuleType("newproject")).NewProject 
 sys.modules.setdefault("exportingwindow", types.ModuleType("exportingwindow")).Exporting = type("Exporting", (), {})
 sys.modules.setdefault("plugininfodialog", types.ModuleType("plugininfodialog")).PluginInfoDialog = type("PluginInfoDialog", (), {})
 
-sys.modules.setdefault("ui", types.ModuleType("ui"))
+# The window imports its own submodules (`from ui.items_tab_widget import ...`),
+# so this placeholder package needs a real __path__ or those imports fail with
+# "'ui' is not a package". Submodules stubbed below still win -- they are
+# already in sys.modules by the time anything asks for them.
+_ui_pkg = sys.modules.setdefault("ui", types.ModuleType("ui"))
+if not hasattr(_ui_pkg, "__path__"):
+    _ui_pkg.__path__ = [os.path.join(ROOT_DIR, "ui")]
 ui_main = types.ModuleType("ui.ui_mainwindow")
 class Ui_MainWindow:
     def setupUi(self, _):
@@ -118,14 +139,13 @@ import importlib.util
 importlib.reload(mainwindow)
 mainwindow.QTreeWidgetItem = QTreeWidgetItem
 
-pkg_name = "plugins.pokefirered"
-sys.modules.setdefault("plugins", types.ModuleType("plugins"))
+pkg_name = "core"
 pkg_module = types.ModuleType(pkg_name)
-pkg_module.__path__ = [os.path.join(ROOT_DIR, "plugins", "pokefirered")]
+pkg_module.__path__ = [os.path.join(ROOT_DIR, "core")]
 sys.modules[pkg_name] = pkg_module
 spec = importlib.util.spec_from_file_location(
     f"{pkg_name}.pokemon_data_extractor",
-    os.path.join(ROOT_DIR, "plugins", "pokefirered", "pokemon_data_extractor.py"),
+    os.path.join(ROOT_DIR, "core", "pokemon_data_extractor.py"),
 )
 pdextractor = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = pdextractor
@@ -161,7 +181,10 @@ class DummyBox:
         pass
     def setEditText(self, text):
         self._text = text
-
+    def blockSignals(self, block):
+        # update_evolutions blocks signals while it repopulates the box.
+        self._blocked = bool(block)
+        return False
 class DummyWidget:
     def __init__(self, val=0):
         self._val = val
@@ -182,10 +205,27 @@ class DummyWidget:
         pass
     def currentData(self):
         return 0
+    def __getattr__(self, item):
+        # Absorb any other Qt-style call (setReadOnly, setEnabled, ...). The
+        # setters this test actually inspects are defined explicitly above and
+        # take precedence; anything snake_case still raises, so a missing app
+        # attribute stays visible.
+        if _is_qt_method_name(item):
+            return lambda *a, **k: None
+        raise AttributeError(item)
 
 class EvolutionsTreeTest(unittest.TestCase):
     def setUp(self):
         self.mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        self.mw._loading_depth = 0
+        # save_species_data reads project_info; use the class's own if it
+        # has one, else a placeholder (these cases never touch disk).
+        self.mw.project_info = getattr(
+            self, "project_info", {"dir": "", "project_name": "proj"})
         self.mw.update_gender_ratio = lambda *_: None
         self.mw.setWindowModified = lambda *_: None
         self.tree = QTreeWidget()
@@ -382,6 +422,15 @@ class EvolutionsTreeFileLoadTest(unittest.TestCase):
                 self.data = ext.extract_data()
 
         self.mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        self.mw._loading_depth = 0
+        # save_species_data reads project_info; use the class's own if it
+        # has one, else a placeholder (these cases never touch disk).
+        self.mw.project_info = getattr(
+            self, "project_info", {"dir": "", "project_name": "proj"})
         self.mw.update_gender_ratio = lambda *_: None
         self.mw.setWindowModified = lambda *_: None
         self.tree = QTreeWidget()

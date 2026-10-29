@@ -83,12 +83,19 @@ class _NoScrollCombo(QComboBox):
 
 
 class _NoScrollSpin(QSpinBox):
-    """QSpinBox that ignores wheel events unless it has focus."""
+    """QSpinBox that NEVER changes value on the mouse wheel.
+
+    Was "ignores wheel events unless it has focus" until 2026-10-29. That rule
+    is wrong for a value-bearing widget and was measured failing: a spin box
+    that has been CLICKED has focus, so scrolling the page afterwards changed
+    the value (50 -> 49 on one notch). These boxes hold real game data —
+    trainer party levels, IVs, prize money, tile counts — so a silent change is
+    a data change. Same rule as ui/custom_widgets/scroll_guard.py: the wheel
+    never commits a value. `event.ignore()` leaves the event unaccepted so Qt
+    carries it to the parent and the PAGE still scrolls.
+    """
     def wheelEvent(self, event):
-        if self.hasFocus():
-            super().wheelEvent(event)
-        else:
-            event.ignore()
+        event.ignore()
 
 
 # ── Searchable, non-free-text combo box ──────────────────────────────────────
@@ -1652,12 +1659,15 @@ class _TrainerDetailPanel(QWidget):
         slots_scroll.setWidget(self._slots_container)
         layout.addWidget(slots_scroll, 1)
 
-        add_btn = QPushButton("+ Add Pokémon")
-        add_btn.setStyleSheet(
+        # Kept on the panel (it used to be a local) so _update_party_count
+        # can disable it when the party is full — it silently did nothing at
+        # six before, with no indication why.
+        self._add_mon_btn = QPushButton("+ Add Pokémon")
+        self._add_mon_btn.setStyleSheet(
             "background: #1a3a1a; color: #aaffaa; border: none; padding: 5px; border-radius: 3px;"
         )
-        add_btn.clicked.connect(self._add_party_slot)
-        layout.addWidget(add_btn)
+        self._add_mon_btn.clicked.connect(self._add_party_slot)
+        layout.addWidget(self._add_mon_btn)
 
         self._party_count_lbl = QLabel("0 / 6")
         self._party_count_lbl.setStyleSheet("color: #777; font-size: 10px;")
@@ -2545,6 +2555,18 @@ class _TrainerDetailPanel(QWidget):
         self._party_count_lbl.setStyleSheet(
             f"color: {'#ff8a80' if n > 6 else '#aaa'}; font-size: 10px;"
         )
+        # Show the six-Pokemon limit instead of ignoring the click. This runs
+        # on every path that changes the party — load, add, remove, clear and
+        # rematch-tier switch all call this method — so the button re-enables
+        # by itself as soon as a slot is removed.
+        btn = getattr(self, "_add_mon_btn", None)
+        if btn is not None:
+            full = n >= 6
+            btn.setEnabled(not full)
+            btn.setToolTip(
+                "A trainer can carry six Pokémon at most. "
+                "Remove one to add a different Pokémon."
+                if full else "")
 
     # ── public API ────────────────────────────────────────────────────────────
     def load(self, const: str, trainer: dict, party: Optional[dict]):
@@ -2770,7 +2792,12 @@ class _AddTrainerDialog(QDialog):
         # Trainer name field
         self._name_edit = QLineEdit()
         self._name_edit.setPlaceholderText("e.g. BOB, LISA, MARCOS")
-        self._name_edit.setMaxLength(10)  # GBA trainer names max ~10 chars
+        # 11, matching _TrainerDetailPanel and the engine: include/battle.h
+        # declares `u8 trainerName[12]`, i.e. 11 characters plus the EOS
+        # terminator. Every engine read scans to EOS, so the eleventh
+        # character is safe. This used to be 10, which meant a name you could
+        # set when EDITING a trainer could not be set when CREATING one.
+        self._name_edit.setMaxLength(11)
         form.addRow("Name:", self._name_edit)
 
         # Preview of the constant that will be created

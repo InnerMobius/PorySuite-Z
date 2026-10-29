@@ -42,6 +42,21 @@ qt_widgets.QPushButton = type("QPushButton", (), {})
 qt_module.QtCore = qt_core
 qt_module.QtGui = qt_gui
 qt_module.QtWidgets = qt_widgets
+# Shared PyQt6 stub helpers -- see tests/_qt_stub.py for why none of this is a
+# hand-written list of Qt class names any more.
+from tests._qt_stub import (  # noqa: E402
+    StubQtFinder as _StubQtFinder,
+    UiStub as _UiStub,
+    auto_qt_class as _auto_qt_class,
+    autofill_qt_stub as _autofill_qt_stub,
+    is_qt_method_name as _is_qt_method_name,
+)
+
+if not any(isinstance(f, _StubQtFinder) for f in sys.meta_path):
+    sys.meta_path.insert(0, _StubQtFinder())
+qt_module.__path__ = []  # marks the stub as a package
+_autofill_qt_stub(qt_module, qt_core, qt_gui, qt_widgets)
+
 sys.modules.setdefault("PyQt6", qt_module)
 sys.modules.setdefault("PyQt6.QtCore", qt_core)
 sys.modules.setdefault("PyQt6.QtGui", qt_gui)
@@ -53,7 +68,13 @@ sys.modules.setdefault("newproject", types.ModuleType("newproject")).NewProject 
 sys.modules.setdefault("exportingwindow", types.ModuleType("exportingwindow")).Exporting = type("Exporting", (), {})
 sys.modules.setdefault("plugininfodialog", types.ModuleType("plugininfodialog")).PluginInfoDialog = type("PluginInfoDialog", (), {})
 
-sys.modules.setdefault("ui", types.ModuleType("ui"))
+# The window imports its own submodules (`from ui.items_tab_widget import ...`),
+# so this placeholder package needs a real __path__ or those imports fail with
+# "'ui' is not a package". Submodules stubbed below still win -- they are
+# already in sys.modules by the time anything asks for them.
+_ui_pkg = sys.modules.setdefault("ui", types.ModuleType("ui"))
+if not hasattr(_ui_pkg, "__path__"):
+    _ui_pkg.__path__ = [os.path.join(ROOT_DIR, "ui")]
 ui_main = types.ModuleType("ui.ui_mainwindow")
 class Ui_MainWindow:
     def setupUi(self, _):
@@ -69,13 +90,20 @@ class DummyLabel:
         self.text = None
     def setText(self, val):
         self.text = val
+    def __getattr__(self, item):
+        # Absorb any other Qt-style call (setReadOnly, setEnabled, ...). The
+        # setters this test actually inspects are defined explicitly above and
+        # take precedence; anything snake_case still raises, so a missing app
+        # attribute stays visible.
+        if _is_qt_method_name(item):
+            return lambda *a, **k: None
+        raise AttributeError(item)
 
 class DummyTab:
     def __init__(self):
         self.enabled = True
     def setEnabled(self, val):
         self.enabled = val
-
 class DummyWidget:
     def setText(self, *_):
         pass
@@ -87,6 +115,14 @@ class DummyWidget:
         pass
     def setCurrentIndex(self, *_):
         pass
+    def __getattr__(self, item):
+        # Absorb any other Qt-style call (setReadOnly, setEnabled, ...). The
+        # setters this test actually inspects are defined explicitly above and
+        # take precedence; anything snake_case still raises, so a missing app
+        # attribute stays visible.
+        if _is_qt_method_name(item):
+            return lambda *a, **k: None
+        raise AttributeError(item)
 
 class DummyEvo:
     def clear(self):
@@ -97,10 +133,14 @@ class DummyEvo:
         return 0
     def resizeColumnToContents(self, *_):
         pass
-
 class TabAvailabilityTest(unittest.TestCase):
     def test_update_data_keeps_tab_enabled(self):
         mw = mainwindow.MainWindow.__new__(mainwindow.MainWindow)
+        # MainWindow.__init__ is skipped on purpose (it would need a real Qt
+        # app), so any plain attribute the methods under test read has to be
+        # seeded here. _loading_depth is the re-entrancy counter that
+        # update_data and the loading guard increment.
+        mw._loading_depth = 0
         mw.ui = types.SimpleNamespace(
             species_name=DummyLabel(),
             dex_num=DummyWidget(),
