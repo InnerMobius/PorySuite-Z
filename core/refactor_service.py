@@ -10,6 +10,47 @@ from local_env import LocalUtil
 PreviewEntry = Tuple[str, int, str, str]
 
 
+class UnsafeRenameError(RuntimeError):
+    """A rename was refused because its own replacement rule would corrupt
+    other, unrelated identifiers.
+
+    C1 containment, added 2026-10-31. `_rename_in_file` applies a PLAIN
+    SUBSTRING replace (`ln.replace(old, new)`), so renaming an identifier that
+    occurs INSIDE another live identifier rewrites that one too. Measured in
+    this project: renaming MOVE_THUNDER rewrote MOVE_THUNDERBOLT,
+    MOVE_THUNDER_PUNCH, MOVE_THUNDER_WAVE and MOVE_THUNDER_SHOCK — 0 of 4
+    neighbours survived. The same root cause corrupts tileset and map renames.
+
+    This is CONTAINMENT, not the repair. The replacement engine still needs
+    identifier-, path- and ownership-aware matching (tracked as C2). Until
+    then an unsafe rename is refused BEFORE any file is touched, and named as
+    blocked by collision containment rather than fixed.
+    """
+
+    def __init__(self, old: str, new: str, collisions: List[str],
+                 kind: str = "rename"):
+        self.old = old
+        self.new = new
+        self.collisions = sorted(collisions)
+        self.kind = kind
+        super().__init__(self.plain_english())
+
+    def plain_english(self) -> str:
+        names = self.collisions
+        shown = ", ".join(names[:6])
+        if len(names) > 6:
+            shown += f", and {len(names) - 6} more"
+        return (
+            f"Renaming {self.old} would also damage {len(names)} other "
+            f"{self.kind}{'s' if len(names) != 1 else ''} whose name contains "
+            f"it: {shown}.\n\n"
+            f"Nothing has been changed. This rename is blocked until the "
+            f"name no longer overlaps — for example rename those entries "
+            f"first, or pick a name for this one that is not contained in "
+            f"theirs."
+        )
+
+
 # ── Map / region-map protection for SPECIES renames ────────────────────────────
 # A MON rename must never rewrite MAP, MAPSEC, or region-map identifiers, nor
 # in-game PLACE names — those are not species data, and touching them breaks the
@@ -282,6 +323,72 @@ class RefactorService:
     def _record(self, category: str, old: str, new: str) -> None:
         self.history.setdefault(category, []).append({"old": old, "new": new})
         self._write_history()
+
+    # ── C1: collision containment ────────────────────────────────────────
+    # These two evaluate the operation's OWN replacement plan before it runs.
+    # The criterion is deliberately NOT "two names share a prefix" — that
+    # would refuse plenty of safe renames. It is "the substring replace this
+    # operation is about to perform would also rewrite another LIVE
+    # identifier of the same family".
+    #
+    # Derived symbols (an ability's sXxxDescription, a trainer's sParty_*) are
+    # renamed on purpose through their own explicit calls and are NOT in a
+    # family sibling set, so this guard cannot block them. That matters: a
+    # blanket whole-word match WOULD have broken them, which is why this is
+    # operation-level.
+
+    def _family_siblings(self, rel_json: str, prefix: str) -> List[str]:
+        """Live identifiers of one family, read from the project's own data."""
+        try:
+            path = os.path.join(self.util.repo_root(), *rel_json.split("/"))
+            if not os.path.isfile(path):
+                return []
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+        except Exception:
+            logging.exception("Could not read %s for a collision check", rel_json)
+            return []
+        # Collect BOTH dict keys and string values that carry the prefix.
+        # The project's data files are not uniform: moves.json and
+        # abilities.json key entries by their constant, while items.json is a
+        # LIST of records whose constant sits in an `itemId` field. A
+        # keys-only scan found 0 item siblings and left that guard inert.
+        #
+        # Over-collecting here is the SAFE direction: an extra sibling can
+        # only make the guard refuse a rename it might have allowed, whereas
+        # a missed sibling lets the rename corrupt a real identifier.
+        out: List[str] = []
+        stack = [data]
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    if isinstance(k, str) and k.startswith(prefix):
+                        out.append(k)
+                    if isinstance(v, str) and v.startswith(prefix):
+                        out.append(v)
+                    elif isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                for x in cur:
+                    if isinstance(x, str) and x.startswith(prefix):
+                        out.append(x)
+                    elif isinstance(x, (dict, list)):
+                        stack.append(x)
+        return sorted(set(out))
+
+    def collision_preflight(self, old: str, new: str, siblings, *,
+                            kind: str = "entry") -> None:
+        """Refuse a rename whose replacement would rewrite other identifiers.
+
+        Raises :class:`UnsafeRenameError` before anything is written. Silent
+        on a safe rename, so a legitimate operation is unaffected.
+        """
+        if not old or not new or old == new:
+            return
+        hits = [s for s in (siblings or []) if s and s != old and old in s]
+        if hits:
+            raise UnsafeRenameError(old, new, hits, kind)
 
     def _rename_in_file(self, path: str, old: str, new: str, preview: List[PreviewEntry]) -> None:
         try:
@@ -1069,6 +1176,10 @@ class RefactorService:
         })
 
     def rename_item(self, old_const: str, new_const: str, display_name: str, preview: bool = False) -> List[PreviewEntry]:
+        self.collision_preflight(
+            old_const, new_const,
+            self._family_siblings("src/data/items.json", "ITEM_"),
+            kind="item")
         previews = self._search_and_replace(old_const, new_const, True)
         # Queue for Save — but NOT while previewing. The rename dialog calls
         # this on every keystroke, so an unguarded append queued one rename per
@@ -1078,9 +1189,20 @@ class RefactorService:
         return previews
 
     def rename_move(self, old_const: str, new_const: str, display_name: str, preview: bool = False) -> List[PreviewEntry]:
+        # C1: refuse before anything is read or queued. Measured hazard —
+        # renaming MOVE_THUNDER rewrote four other moves.
+        self.collision_preflight(
+            old_const, new_const,
+            self._family_siblings("src/data/moves.json", "MOVE_"),
+            kind="move")
         previews = self._search_and_replace(old_const, new_const, True)
-        # Queue for Save
-        self.pending.append({"op": "rename_move", "old": old_const, "new": new_const, "display": display_name})
+        # Queue for Save — but NOT while previewing. The rename dialog calls
+        # this on EVERY KEYSTROKE, and this method was missing the guard its
+        # three siblings have (rename_item / rename_ability / rename_trainer),
+        # so typing a ten-character name queued ten pending renames. Found
+        # 2026-10-31 while wiring the collision preflight.
+        if not preview:
+            self.pending.append({"op": "rename_move", "old": old_const, "new": new_const, "display": display_name})
         return previews
 
     def _trainer_to_party_symbol(self, trainer_const: str) -> str:
@@ -1100,6 +1222,10 @@ class RefactorService:
         - The description variable name (sXxxDescription → sNewDescription)
         - The src/data/abilities.json key
         """
+        self.collision_preflight(
+            old_const, new_const,
+            self._family_siblings("src/data/abilities.json", "ABILITY_"),
+            kind="ability")
         old_base = old_const[len("ABILITY_"):] if old_const.startswith("ABILITY_") else old_const
         new_base = new_const[len("ABILITY_"):] if new_const.startswith("ABILITY_") else new_const
         old_desc_var = "s" + self._camel(old_base) + "Description"
@@ -1130,6 +1256,12 @@ class RefactorService:
         - The derived sParty_* party symbol in trainer_parties.h and trainers.h
         - The src/data/trainers.json key
         """
+        # C1: the worst-exposed family in this project — 192 of 743 trainer
+        # constants contain another one as a substring.
+        self.collision_preflight(
+            old_const, new_const,
+            self._family_siblings("src/data/trainers.json", "TRAINER_"),
+            kind="trainer")
         old_party = self._trainer_to_party_symbol(old_const)
         new_party = self._trainer_to_party_symbol(new_const)
 

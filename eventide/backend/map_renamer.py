@@ -13,6 +13,44 @@ from typing import List, Tuple, Callable, Optional
 from eventide.backend.file_utils import replace_in_file, replace_repo_wide
 
 
+class UnsafeMapOperationError(RuntimeError):
+    """A map rename or delete was refused because it would alter content
+    belonging to OTHER maps.
+
+    C1 containment, added 2026-10-31 (finding item 0). Both operations end in
+    `replace_repo_wide` with PLAIN SUBSTRING pairs, so a map whose name occurs
+    inside another map's name rewrites that one too.
+
+    Delete was the worse of the two: it passed ``(map_folder, '')`` — an EMPTY
+    replacement — which `replace_repo_wide`'s own docstring forbids in as many
+    words ("never pass an empty `new` here at all"). Measured: deleting a map
+    called ``Route1`` turned ``data/maps/Route10/map.bin`` into
+    ``data/maps/0/map.bin``, ``Route11_Text`` into ``1_Text`` and
+    ``EventScript_Route1_Sign`` into ``EventScript__Sign`` — every one of them
+    in a file belonging to a different map.
+
+    This is CONTAINMENT, not the repair. Some legitimate operations are now
+    refused rather than performed unsafely; the safe implementation is C2.
+    """
+
+    def __init__(self, operation: str, subject: str, reasons):
+        self.operation = operation
+        self.subject = subject
+        self.reasons = list(reasons)
+        super().__init__(self.plain_english())
+
+    def plain_english(self) -> str:
+        body = "\n".join(f"  • {r}" for r in self.reasons[:10])
+        more = ("\n  • …and %d more" % (len(self.reasons) - 10)
+                if len(self.reasons) > 10 else "")
+        return ("The %s of '%s' was stopped before anything was changed:\n"
+                "%s%s\n\n"
+                "Nothing has been changed. Resolve the items above — rename "
+                "the conflicting map, or update the files that still refer to "
+                "this one — and try again."
+                % (self.operation, self.subject, body, more))
+
+
 def _folder_to_map_id(folder: str) -> str:
     """Convert a map FOLDER name to its MAP_ constant the way mapjson does:
     insert an underscore at every CamelCase boundary, then upper-case.
@@ -37,6 +75,11 @@ class MapRenamer:
         # Warnings from the most recent rename_map() about heal locations that
         # still point at a now-missing map (empty when all is well).
         self.last_stale_heal_locations: List[str] = []
+        # Files that still mention the most recently deleted map's folder
+        # name. These used to be "handled" by deleting that text from every
+        # file in the project, which corrupted neighbouring maps; they are now
+        # reported so the user can resolve them deliberately.
+        self.last_delete_leftovers: List[str] = []
 
     def load_map_groups(self) -> dict:
         if not os.path.exists(self.map_groups_json):
@@ -119,6 +162,14 @@ class MapRenamer:
         # map.json 'name' is always kept in sync with the folder name.
         # External tools (Porymap, mapjson) rely on this convention.
 
+        # C1: check BEFORE the first write. Everything below this point
+        # renames folders and rewrites files; refusing afterwards would leave
+        # the project half-renamed.
+        if map_folder != new_folder or old_id != new_id:
+            conflicts = self.map_operation_conflicts(map_folder, old_id)
+            if conflicts:
+                raise UnsafeMapOperationError("rename", map_folder, conflicts)
+
         if map_folder != new_folder:
             old_path = os.path.join(self.maps_dir, map_folder)
             new_path = os.path.join(self.maps_dir, new_folder)
@@ -161,6 +212,49 @@ class MapRenamer:
         # that STILL points at a map the project no longer defines so the caller
         # can warn the user instead of letting the build fail later.
         self.last_stale_heal_locations = self._stale_heal_locations()
+
+    # ── C1: map-operation containment ────────────────────────────────────
+
+    def live_map_folders(self) -> List[str]:
+        """Every map folder the project currently defines."""
+        out = []
+        for group, maps in (self.groups or {}).items():
+            if group == 'group_order' or not isinstance(maps, list):
+                continue
+            out.extend(m for m in maps if isinstance(m, str))
+        try:
+            if os.path.isdir(self.maps_dir):
+                out.extend(n for n in os.listdir(self.maps_dir)
+                           if os.path.isdir(os.path.join(self.maps_dir, n)))
+        except OSError:
+            pass
+        return sorted(set(out))
+
+    def map_operation_conflicts(self, map_folder: str,
+                                old_id: Optional[str] = None) -> List[str]:
+        """Reasons an operation on *map_folder* would hit other maps.
+
+        The criterion is the operation's OWN rule — a plain substring replace
+        repo-wide — so a conflict is another LIVE map whose folder name or
+        MAP_ constant contains ours. Sharing a prefix is not in itself a
+        conflict; being contained is.
+        """
+        reasons: List[str] = []
+        others = [m for m in self.live_map_folders() if m != map_folder]
+        if map_folder:
+            for other in others:
+                if map_folder in other:
+                    reasons.append(
+                        "the map '%s' contains '%s' in its name, so the "
+                        "replacement would rewrite it too" % (other, map_folder))
+        if old_id:
+            for other in others:
+                other_id = self._read_map_id(other) or _folder_to_map_id(other)
+                if other_id and other_id != old_id and old_id in other_id:
+                    reasons.append(
+                        "the constant %s belongs to the map '%s' and contains "
+                        "%s" % (other_id, other, old_id))
+        return reasons
 
     def _read_map_id(self, map_folder: str) -> Optional[str]:
         """Return the MAP_ constant recorded in a map's map.json, or None."""
@@ -220,6 +314,31 @@ class MapRenamer:
             with open(map_json) as f:
                 data = json.load(f)
                 map_id = data.get('id')
+
+        # ── C1 containment ───────────────────────────────────────────────
+        # Check BEFORE anything is removed. This used to delete the map
+        # folder first and only then run the replacements, so a problem
+        # discovered later could not undo the deletion.
+        conflicts = self.map_operation_conflicts(map_folder, map_id)
+        if conflicts:
+            raise UnsafeMapOperationError("deletion", map_folder, conflicts)
+
+        # FAIL CLOSED on references this deletion cannot resolve.
+        #
+        # An earlier version of this repair deleted the map and then REPORTED
+        # the references it had left behind. That is the same shape as finding
+        # 0j: a surviving reference to something that no longer exists stops
+        # the project linking, and by then the map is already gone. A map may
+        # only be deleted when every surviving reference can be safely updated
+        # or is provably harmless, so anything left over refuses the operation
+        # BEFORE the folder is touched.
+        unresolved = self._unresolved_references(map_folder, map_id)
+        if unresolved:
+            raise UnsafeMapOperationError(
+                "deletion", map_folder,
+                ["%s still refers to '%s', and this deletion cannot safely "
+                 "update it" % (p, map_folder) for p in unresolved[:10]])
+
         self._delete_map_folder(map_folder)
         if map_folder in self.groups.get(group, []):
             self.groups[group].remove(map_folder)
@@ -228,12 +347,76 @@ class MapRenamer:
                 self.groups['group_order'].remove(group)
         self.save_map_groups()
 
+        # The MAP_ constant is repointed as a WHOLE IDENTIFIER. Without that,
+        # deleting MAP_ROUTE1 also rewrote the middle of MAP_ROUTE10.
         repls: List[Tuple[str, str]] = []
         if map_id:
             repls.append((map_id, 'MAP_UNDEFINED'))
-        repls.append((map_folder, ''))
-        replace_repo_wide(self.root_dir, repls, callback)
+            replace_repo_wide(self.root_dir, repls, callback, whole_word=True)
+
+        # The blanket `(map_folder, '')` replacement that used to run here has
+        # been REMOVED, not made safe. `replace_repo_wide`'s own docstring
+        # forbids it outright — "never pass an empty `new` here at all" —
+        # because it deletes that text from every file in the project.
+        # Measured on a throwaway copy, deleting a map called `Route1` turned
+        # `data/maps/Route10/map.bin` into `data/maps/0/map.bin`,
+        # `Route11_Text` into `1_Text` and `EventScript_Route1_Sign` into
+        # `EventScript__Sign` — all in OTHER maps' files.
+        #
+        # Nothing safe can be substituted here without knowing which textual
+        # occurrences belong to this map, which is the C2 work. So the
+        # deletion does what it can prove is correct, and REPORTS the
+        # references it has deliberately left alone rather than guessing.
+        # Always empty on a successful delete: anything unresolved refused the
+        # operation above. Kept so a caller can state that plainly.
+        self.last_delete_leftovers = []
         self._generate_headers()
+
+    def _unresolved_references(self, map_folder: str,
+                               map_id: Optional[str]) -> List[str]:
+        """Files referring to this map that the deletion cannot fix.
+
+        Excluded, because the operation genuinely handles them:
+          * anything inside the map's own folder — it is being removed;
+          * `map_groups.json` — the entry is removed from it;
+          * occurrences of the MAP_ constant — repointed to MAP_UNDEFINED.
+
+        What remains is a reference to a map that is about to stop existing,
+        which is why it refuses rather than reports.
+        """
+        hits: List[str] = []
+        if not map_folder:
+            return hits
+        own_dir = os.path.normcase(os.path.join(self.maps_dir, map_folder))
+        groups_json = os.path.normcase(self.map_groups_json)
+        for root, dirs, files in os.walk(self.root_dir):
+            if '.git' in dirs:
+                dirs.remove('.git')
+            if os.path.normcase(root).startswith(own_dir):
+                dirs[:] = []
+                continue
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.normcase(path) == groups_json:
+                    continue
+                try:
+                    with open(path, 'r', encoding='utf-8',
+                              errors='surrogateescape') as f:
+                        text = f.read()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if map_folder not in text:
+                    continue
+                # Occurrences that are only part of the MAP_ constant are
+                # handled by the MAP_UNDEFINED repointing above.
+                if map_id:
+                    text = text.replace(map_id, '')
+                    if map_folder not in text:
+                        continue
+                hits.append(os.path.relpath(path, self.root_dir))
+                if len(hits) >= 200:
+                    return hits
+        return hits
 
     def clean_orphaned_map_data(
         self,

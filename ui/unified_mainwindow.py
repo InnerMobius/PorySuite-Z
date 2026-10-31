@@ -966,6 +966,19 @@ class UnifiedMainWindow(QMainWindow):
         eventide_main.maps_tab.data_changed.connect(
             lambda: (self.set_page_dirty("maps", True),
                      self.setWindowModified(True)))
+        # Finding 0c: staged Maps edits (a section reassignment, a new region
+        # map entry) are held in memory until Save. They used to emit nothing,
+        # so this window never knew they existed — the close prompt did not
+        # ask, and the work was lost without warning. `staged_changed` is a
+        # separate signal precisely because `data_changed` also triggers
+        # reloads of the Region Map and Layouts tabs, which would discard
+        # THEIR pending edits as a side effect of reporting ours.
+        if hasattr(eventide_main.maps_tab, "staged_changed"):
+            eventide_main.maps_tab.staged_changed.connect(
+                lambda: (self.set_page_dirty(
+                             "maps", eventide_main.maps_tab._has_pending()),
+                         self.setWindowModified(True)
+                         if eventide_main.maps_tab._has_pending() else None))
         # Region Map subscribes to app-wide file_saved so it refreshes its
         # background when (e.g.) the Tilemap Editor writes a new .bin.
         rm_tab = eventide_main.region_map_tab

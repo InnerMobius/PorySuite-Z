@@ -208,6 +208,10 @@ from local_env import LocalUtil
 from app_info import APP_NAME, AUTHOR, get_data_dir
 import core as _core
 from core.file_io import write_text_if_changed
+# C1 containment: raised when a rename's own replacement rule would rewrite
+# other, unrelated identifiers. Every rename handler below catches it and
+# shows the refusal instead of corrupting files.
+from core.refactor_service import UnsafeRenameError
 from suppress_dialog import maybe_exec
 try:
     from newproject import NewProject
@@ -3904,6 +3908,203 @@ QTabBar::tab:hover:!selected {
         # any in-memory adjustments made during load; saving must be an
         # explicit user action.
         self.load_data(project_info)
+
+    # ── save-outcome accounting ──────────────────────────────────────────
+    # A header writer's return is one of FIVE outcomes, and the save
+    # coordinator has to treat them differently:
+    #
+    #   > 0   WRITTEN     data persisted
+    #   == 0  UNCHANGED   destination already matched what we intended
+    #   < 0   FAILED      the data was NOT persisted
+    #   -2    SKIPPED     the writer does not apply to this project
+    #         NOT RUN     a dependency failed, so it never executed
+    #
+    # Until 2026-10-31 every call site collapsed those into one branch —
+    # `if n > 0: log(...)` with no else — so a FAILED write was
+    # indistinguishable from "nothing needed doing", and the save went on to
+    # clear the dirty markers and re-baseline the snapshot as though it had
+    # succeeded. That also killed the retry: the next Save compared against a
+    # baseline that already contained the unwritten edit and skipped the work.
+    #
+    # CAUTION, deliberately not papered over: a return of 0 does NOT prove the
+    # destination matches. `_write_pokedex_text_header` returns 0 after
+    # silently discarding a description whose symbol is shared or missing
+    # (finding NEW3). Treat 0 as "nothing written", not as proof of success.
+    # NEW3's own repair is tracked separately as NEW3a.
+
+    def _note_write(self, label: str, rv, dlg=None, *,
+                    ok_msg: str = "{label} updated ({n})",
+                    noop_msg: str | None = None,
+                    skipped: tuple = (),
+                    skipped_msg: str = "{label}: not applicable to this project"
+                    ) -> bool:
+        """Classify one writer's return, log it, and record any failure.
+
+        Returns True when the write is known not to have failed. Failures are
+        collected on ``self._write_failures`` so the save can report them and
+        refuse to claim a clean state.
+        """
+        failures = getattr(self, "_write_failures", None)
+        if failures is None:
+            failures = self._write_failures = []
+        # A bool is an int in Python, so `int(True) == 1` would be read as
+        # "wrote one thing" and `int(False) == 0` as "nothing to do". No
+        # writer returns a bool today, but the contract is a count, and a
+        # silent misread here is exactly the class of bug this repair exists
+        # to remove — so refuse it rather than guess which it meant.
+        if isinstance(rv, bool) or rv is None:
+            failures.append(f"{label}: writer returned an unusable result "
+                            f"({rv!r}); treating it as a failure rather than "
+                            f"guessing. Nothing was confirmed written.")
+            return False
+        try:
+            n = int(rv)
+        except (TypeError, ValueError):
+            failures.append(f"{label}: writer returned an unusable result "
+                            f"({rv!r}); nothing was written.")
+            return False
+        if n != n:          # NaN survives int() on some paths
+            failures.append(f"{label}: writer returned an unusable result "
+                            f"({rv!r}); nothing was written.")
+            return False
+
+        if n in skipped:
+            if dlg is not None:
+                dlg.log_line(skipped_msg.format(label=label, n=n))
+            return True
+        if n < 0:
+            failures.append(
+                f"{label}: the file could not be written. Your change is "
+                f"still pending — it was NOT saved.")
+            if dlg is not None:
+                dlg.log_line(f"{label}: FAILED — not written")
+            return False
+        if n == 0:
+            if dlg is not None and noop_msg:
+                dlg.log_line(noop_msg.format(label=label, n=n))
+            return True
+        if dlg is not None:
+            dlg.log_line(ok_msg.format(label=label, n=n))
+        return True
+
+    # Files a new move must appear in. If any one of them misses the write,
+    # the engine source refers to a constant the others never defined — a
+    # reproduced build break (`MOVE_X undeclared here`).
+    _NEW_MOVE_TARGETS = (
+        ("moves.h", ("include", "constants", "moves.h")),
+        ("move_names.h", ("src", "data", "text", "move_names.h")),
+        ("move_descriptions.c", ("src", "move_descriptions.c")),
+        ("battle_anim_scripts.s", ("data", "battle_anim_scripts.s")),
+    )
+
+    def _write_new_moves_guarded(self, new_moves_data: dict,
+                                 all_descs: dict, dlg=None) -> bool:
+        """Write all four new-move files, or leave all four as they were.
+
+        NOT atomic, and deliberately not described as such: this takes a
+        snapshot of the four targets, runs the existing writers, and restores
+        every snapshot if any of them fails. A crash mid-restore can still
+        leave a mixed state, which is why a failed restore is reported rather
+        than swallowed.
+
+        Before this, the four writers ran straight through: a failure in the
+        first still let the other three write, leaving `move_names.h` naming a
+        constant `moves.h` had never defined. Verified against a real build —
+        `error: 'MOVE_...' undeclared here (not in a function)`.
+        """
+        root = self.project_info.get("dir", "")
+        snapshot: dict[str, bytes | None] = {}
+        for label, parts in self._NEW_MOVE_TARGETS:
+            path = os.path.join(root, *parts)
+            try:
+                with open(path, "rb") as fh:
+                    snapshot[path] = fh.read()
+            except OSError:
+                snapshot[path] = None       # absent; a writer will refuse it
+
+        writers = (
+            ("moves.h", lambda: self._write_new_move_constants(new_moves_data),
+             "moves.h: {n} new constants added"),
+            ("move_names.h", lambda: self._write_new_move_names(new_moves_data),
+             "move_names.h: {n} new names added"),
+            ("move_descriptions.c",
+             lambda: self._write_new_move_descriptions(new_moves_data, all_descs),
+             "move_descriptions.c: {n} new descriptions added"),
+            ("battle_anim_scripts.s",
+             lambda: self._write_new_move_animations(new_moves_data),
+             "battle_anim_scripts.s: {n} new animation entries added"),
+        )
+
+        ok = True
+        for label, call, msg in writers:
+            try:
+                rv = call()
+            except Exception:
+                logging.exception("%s writer raised", label)
+                rv = -1
+            if not self._note_write(label, rv, dlg, ok_msg=msg):
+                ok = False
+                break                       # do not write files that depend
+                                            # on the one that just failed
+        if ok:
+            return True
+
+        # Put every target back the way it was.
+        unrecovered = []
+        for path, original in snapshot.items():
+            try:
+                if original is None:
+                    if os.path.exists(path):
+                        os.remove(path)
+                else:
+                    with open(path, "wb") as fh:
+                        fh.write(original)
+            except OSError:
+                unrecovered.append(path)
+        if unrecovered:
+            logging.error("New-move rollback incomplete: %s", unrecovered)
+            self._write_failures.append(
+                "Adding the new move failed AND undoing the partial write did "
+                "not fully succeed. These files may be inconsistent and should "
+                "be checked or restored from version control: "
+                + ", ".join(os.path.relpath(p, root) for p in unrecovered))
+        else:
+            self._write_failures.append(
+                "The new move was not added. Every file involved has been put "
+                "back as it was, and the move is still pending, so you can "
+                "fix the problem and save again.")
+        return False
+
+    def _report_write_failures(self, failures: list[str]) -> None:
+        """Tell the user that writes were ATTEMPTED AND FAILED.
+
+        Deliberately NOT routed through `_report_save_refusals`: that dialog
+        says the files were "left alone on purpose", which is true of a
+        validation refusal and false of an I/O failure. Conflating them tells
+        the user their data was deliberately skipped when in fact it is lost
+        unless they save again.
+        """
+        if not failures:
+            return
+        logging.error("Save: %d write(s) FAILED: %s", len(failures), failures)
+        if getattr(self, "_loading_depth", 0) > 0 \
+                or getattr(self, "_refresh_discarding", False):
+            return
+        shown = failures[:8]
+        body = "\n\n".join(f"• {f}" for f in shown)
+        if len(failures) > len(shown):
+            body += f"\n\n…and {len(failures) - len(shown)} more (see the log)."
+        try:
+            QMessageBox.critical(
+                self, "Some changes were NOT saved",
+                "These files could not be written, so the changes they carry "
+                "are still unsaved:\n\n" + body +
+                "\n\nYour edits are still in the editor and the unsaved "
+                "markers have been left on. Fix the problem above (a missing "
+                "file, a read-only file, or one open in another program) and "
+                "save again.")
+        except Exception:
+            logging.exception("Could not show the write-failure dialog")
 
     def _report_save_refusals(self, refusals: list[str]) -> None:
         """Show the things a save REFUSED to write, once, in plain language.
@@ -10595,7 +10796,12 @@ QTabBar::tab:hover:!selected {
                 if svc is None:
                     QMessageBox.warning(self, "Rename", "Refactor service unavailable.")
                     return
-                previews = svc.rename_ability(old_const, new_const, display_name=display_name or "")
+                try:
+                    previews = svc.rename_ability(old_const, new_const,
+                                                  display_name=display_name or "")
+                except UnsafeRenameError as exc:
+                    QMessageBox.warning(self, "Rename blocked", str(exc))
+                    return
 
             # Update widget in-memory data
             if hasattr(self, "abilities_tab") and self.abilities_tab:
@@ -10990,8 +11196,7 @@ QTabBar::tab:hover:!selected {
         combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         for m in self.learnset_move_options:
             combo.addItem(self._move_display_name(m), m)
-        idx = combo.findData("MOVE_NONE")
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._select_learnset_move(combo, "MOVE_NONE")
         combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
         self._learnset_set_cell_widget(table, row, 1, combo)
         self._guard_wheel(spin, combo)
@@ -11039,8 +11244,7 @@ QTabBar::tab:hover:!selected {
         combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         for m in self.learnset_move_options:
             combo.addItem(self._move_display_name(m), m)
-        idx = combo.findData("MOVE_NONE")
-        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._select_learnset_move(combo, "MOVE_NONE")
         combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
         self._learnset_set_cell_widget(table, row, 0, combo)
         self._guard_wheel(combo)
@@ -11295,6 +11499,68 @@ QTabBar::tab:hover:!selected {
                 seen.add(mv)
                 moves.append(mv)
         return moves
+
+    # Marker shown on a learnset row whose move constant this project does
+    # not define. The row stays selectable and the ORIGINAL constant is kept
+    # as the item's data, so saving writes back what was there.
+    _UNRESOLVED_MOVE_PREFIX = "⚠ "
+
+    def _select_learnset_move(self, combo, move_const: str):
+        """Point *combo* at *move_const*, preserving it if unknown.
+
+        Finding F4. This used to be::
+
+            idx = combo.findData(move_const)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+        Index 0 is not a neutral fallback. The option list is
+        `sorted(moves_map.keys())` with MOVE_NONE inserted only if missing —
+        and it is never missing — so index 0 is MOVE_ABSORB and MOVE_NONE sits
+        at 195. A learnset entry naming a move the project no longer has
+        therefore loaded as Absorb, and the next save wrote Absorb into that
+        species' learnset. The real move was gone with nothing said.
+
+        Substituting MOVE_NONE instead would be no better: the save SKIPS rows
+        whose move is MOVE_NONE, so that turns "wrong move written" into "row
+        silently deleted".
+
+        So an unknown constant is PRESERVED. A marked entry carrying it as its
+        data is added to this combo, which keeps the value intact through the
+        round trip and shows the user that something needs attention.
+
+        Returns the unresolved constant, or None when it resolved normally.
+        """
+        if not move_const:
+            move_const = "MOVE_NONE"
+        idx = combo.findData(move_const)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+            return None
+        # Not in this project — keep it rather than choosing for the user.
+        combo.addItem(f"{self._UNRESOLVED_MOVE_PREFIX}{move_const} "
+                      f"(not in this project)", move_const)
+        combo.setCurrentIndex(combo.count() - 1)
+        return move_const
+
+    def _note_unresolved_move(self, species: str, move_const) -> None:
+        """Record an unresolved learnset move so the user can be told once."""
+        if not move_const:
+            return
+        store = getattr(self, "_unresolved_learnset_moves", None)
+        if store is None:
+            store = self._unresolved_learnset_moves = {}
+        key = species or "(unknown species)"
+        known = store.setdefault(move_const, set())
+        if key not in known:
+            known.add(key)
+            # Not silent: the row itself carries the ⚠ marker, and this
+            # records it for the log file. Deliberately not a modal — this
+            # fires while browsing species, and a dialog per selection would
+            # train the user to dismiss it without reading.
+            logging.warning(
+                "Learnset: %s refers to %s, which this project does not "
+                "define. The value has been preserved, not replaced.",
+                key, move_const)
 
     def _move_display_name(self, const: str) -> str:
         """Return a human-readable name for a move constant (e.g. 'Tackle' for 'MOVE_TACKLE')."""
@@ -11586,8 +11852,11 @@ QTabBar::tab:hover:!selected {
                 for m in self.learnset_move_options:
                     combo.addItem(self._move_display_name(m), m)
                 move_const = str(entry.get("move", "MOVE_NONE"))
-                idx = combo.findData(move_const)
-                combo.setCurrentIndex(idx if idx >= 0 else 0)
+                # F4: preserve a constant this project does not define rather
+                # than silently selecting index 0 (MOVE_ABSORB).
+                unresolved = self._select_learnset_move(combo, move_const)
+                if unresolved:
+                    self._note_unresolved_move(species, unresolved)
                 combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
                 self._learnset_set_cell_widget(table, row, 1, combo)
                 self._guard_wheel(spin, combo)
@@ -11656,8 +11925,11 @@ QTabBar::tab:hover:!selected {
                 for m in self.learnset_move_options:
                     combo.addItem(self._move_display_name(m), m)
                 move_const = str(entry.get("move", "MOVE_NONE"))
-                idx = combo.findData(move_const)
-                combo.setCurrentIndex(idx if idx >= 0 else 0)
+                # F4: preserve a constant this project does not define rather
+                # than silently selecting index 0 (MOVE_ABSORB).
+                unresolved = self._select_learnset_move(combo, move_const)
+                if unresolved:
+                    self._note_unresolved_move(species, unresolved)
                 combo.currentTextChanged.connect(lambda *_: self.setWindowModified(True))
                 self._learnset_set_cell_widget(egg_table, row, 0, combo)
                 self._guard_wheel(combo)
@@ -11896,7 +12168,12 @@ QTabBar::tab:hover:!selected {
                 QMessageBox.warning(self, "Rename", "Refactor service unavailable.")
                 return
 
-            previews = svc.rename_trainer(old_const, new_const, preview=True)
+            try:
+                previews = svc.rename_trainer(old_const, new_const, preview=True)
+            except UnsafeRenameError as exc:
+                from PyQt6.QtWidgets import QMessageBox as _QMB
+                _QMB.warning(self, "Rename blocked", str(exc))
+                return
             svc.pending.append({
                 "op": "rename_trainer",
                 "old": old_const,
@@ -12317,7 +12594,12 @@ QTabBar::tab:hover:!selected {
                 QMessageBox.warning(self, "Rename", "Refactor service unavailable.")
                 return
 
-            previews = svc.rename_trainer(old_const, new_const, preview=True)
+            try:
+                previews = svc.rename_trainer(old_const, new_const, preview=True)
+            except UnsafeRenameError as exc:
+                from PyQt6.QtWidgets import QMessageBox as _QMB
+                _QMB.warning(self, "Rename blocked", str(exc))
+                return
             svc.pending.append({
                 "op": "rename_trainer",
                 "old": old_const,
@@ -12416,8 +12698,17 @@ QTabBar::tab:hover:!selected {
                 if svc is None:
                     QMessageBox.warning(self, "Rename", "Refactor service unavailable.")
                     return
-                # Queue the rename (also returns preview list of source-file hits)
-                previews = svc.rename_move(old_const, new_const, display_name=display_name or "")
+                # Queue the rename (also returns preview list of source-file hits).
+                # C1: the service refuses a rename whose substring replace
+                # would rewrite other moves. Refusing is the whole point, so
+                # show it and stop — do NOT fall through to the in-memory
+                # updates below, or the editor would diverge from the files.
+                try:
+                    previews = svc.rename_move(old_const, new_const,
+                                               display_name=display_name or "")
+                except UnsafeRenameError as exc:
+                    QMessageBox.warning(self, "Rename blocked", str(exc))
+                    return
 
             # Update the moves widget in-memory data
             if hasattr(self.ui, "moves_widget"):
@@ -12526,7 +12817,11 @@ QTabBar::tab:hover:!selected {
                 return
 
             # Queue the rename (also returns preview list of source-file hits)
-            previews = svc.rename_item(old_const, new_const, display_name="")
+            try:
+                previews = svc.rename_item(old_const, new_const, display_name="")
+            except UnsafeRenameError as exc:
+                QMessageBox.warning(self, "Rename blocked", str(exc))
+                return
 
             # Update the items editor in-memory data
             self.items_editor.rename_item_key(old_const, new_const)
@@ -12964,6 +13259,11 @@ QTabBar::tab:hover:!selected {
             return
         self._save_in_progress = True
 
+        # Group A repair: failures recorded by `_note_write` land here. Reset
+        # per save so one run's failures cannot suppress the next run's clean
+        # finish. See the contract above `_note_write`.
+        self._write_failures: list[str] = []
+
         # Capture the current species edits IMMEDIATELY, before any dialog or
         # processEvents call.  processEvents pumps queued QTimer callbacks
         # (e.g. _reapply_slider from update_data) that overwrite the inline
@@ -13203,44 +13503,48 @@ QTabBar::tab:hover:!selected {
                 # bypasses the broken plugin parse_to_c_code pipeline and
                 # mirrors the approach used by the evolution editor.
                 n_patched = self._write_species_info_header()
-                if n_patched >= 0:
-                    dlg.log_line(f"species_info.h updated ({n_patched} species patched)")
-                else:
-                    dlg.log_line("species_info.h: skipped (file not found or error)")
+                self._note_write(
+                    "species_info.h", n_patched, dlg,
+                    ok_msg="species_info.h updated ({n} species patched)",
+                    noop_msg="species_info.h: already up to date")
 
                 # Innate abilities table — only on projects with the innate system
                 # (the engine's GetBattlerInnate reads it); vanilla projects skip it.
                 n_innate = self._write_innate_abilities_header()
-                if n_innate == -2:
-                    pass  # no innate system in this project — nothing to write
-                elif n_innate >= 0:
-                    dlg.log_line(f"innate_abilities.h updated ({n_innate} species with innates)")
-                else:
-                    dlg.log_line("innate_abilities.h: skipped (error)")
+                # -2 means "this project has no innate system", which is a
+                # legitimate skip, not a failure.
+                self._note_write(
+                    "innate_abilities.h", n_innate, dlg, skipped=(-2,),
+                    ok_msg="innate_abilities.h updated ({n} species with innates)",
+                    skipped_msg="innate_abilities.h: no innate system in this project")
 
-                # Write pokedex entries (category) and description text
+                # Write pokedex entries (category) and description text.
+                # These two had NO failure branch at all before this repair —
+                # `if n and n > 0` is False for -1, so a failed write produced
+                # no message of any kind (finding NEW2).
                 n_dex = self._write_pokedex_entries_header()
-                if n_dex and n_dex > 0:
-                    dlg.log_line(f"pokedex_entries.h updated ({n_dex} categories)")
+                self._note_write(
+                    "pokedex_entries.h", n_dex, dlg,
+                    ok_msg="pokedex_entries.h updated ({n} categories)")
                 n_desc = self._write_pokedex_text_header()
-                if n_desc and n_desc > 0:
-                    dlg.log_line(f"pokedex_text_fr.h updated ({n_desc} descriptions)")
+                self._note_write(
+                    "pokedex_text_fr.h", n_desc, dlg,
+                    ok_msg="pokedex_text_fr.h updated ({n} descriptions)")
 
                 # Write moves/learnsets directly to C headers
                 n_moves = self._write_moves_headers()
-                if n_moves >= 0:
-                    dlg.log_line(f"Learnset headers updated ({n_moves} species patched)")
-                else:
-                    dlg.log_line("Learnset headers: skipped (error)")
+                self._note_write(
+                    "Learnset headers", n_moves, dlg,
+                    ok_msg="Learnset headers updated ({n} species patched)",
+                    noop_msg="Learnset headers: already up to date")
 
                 # items.h is regenerated from items.json by the build (jsonproc).
                 n_items = self._write_items_header()
-                if n_items == -2:
-                    dlg.log_line("items.h: build-generated from items.json — left for the build to regenerate")
-                elif n_items >= 0:
-                    dlg.log_line(f"items.h regenerated ({n_items} items)")
-                else:
-                    dlg.log_line("items.h: skipped (file not found or error)")
+                self._note_write(
+                    "items.h", n_items, dlg, skipped=(-2,),
+                    ok_msg="items.h regenerated ({n} items)",
+                    skipped_msg="items.h: build-generated from items.json — "
+                                "left for the build to regenerate")
 
                 # Write new move entries to header files if any were added
                 try:
@@ -13256,21 +13560,28 @@ QTabBar::tab:hover:!selected {
                             pass
                         new_moves_data = {k: all_moves[k] for k in new_moves_set if k in all_moves}
                         dlg.step("Writing new move headers")
-                        nc = self._write_new_move_constants(new_moves_data)
-                        if nc > 0:
-                            dlg.log_line(f"moves.h: {nc} new constants added")
-                        nn = self._write_new_move_names(new_moves_data)
-                        if nn > 0:
-                            dlg.log_line(f"move_names.h: {nn} new names added")
-                        nd = self._write_new_move_descriptions(new_moves_data, all_descs)
-                        if nd > 0:
-                            dlg.log_line(f"move_descriptions.c: {nd} new descriptions added")
-                        na = self._write_new_move_animations(new_moves_data)
-                        if na > 0:
-                            dlg.log_line(f"battle_anim_scripts.s: {na} new animation entries added")
-                        self.ui.moves_widget.clear_new_moves()
+                        # NEW4, reporting half. Each of these four writes a
+                        # DIFFERENT engine file, and each used to be
+                        # `if n > 0: log(...)` with no else — so a failure was
+                        # silent while the remaining writers carried on,
+                        # leaving the engine source referring to a constant
+                        # that was never defined (a reproduced build break).
+                        # Reporting is fixed here; the partial-commit and
+                        # retry behaviour is Group B, and NEW4 is NOT repaired
+                        # until that lands.
+                        ok = self._write_new_moves_guarded(
+                            new_moves_data, all_descs, dlg)
+                        # Only forget that these moves are new once every file
+                        # that describes them actually took the write. The set
+                        # is the ONLY record that they still need writing, so
+                        # clearing it after a failure made the loss permanent.
+                        if ok:
+                            self.ui.moves_widget.clear_new_moves()
                 except Exception:
-                    pass
+                    logging.exception("New-move header writing failed")
+                    self._write_failures.append(
+                        "New move headers: an unexpected error stopped the "
+                        "write. The new move(s) are still pending.")
 
                 # Regenerate the plugin-pipeline headers (trainers.h,
                 # battle_anim_scripts.s, evolutions / constants / starters /
@@ -13386,18 +13697,43 @@ QTabBar::tab:hover:!selected {
             self._save_in_progress = False
             self._species_already_captured = False
 
-        # Clear amber dirty markers from every tracked list/tree.
-        self._clear_all_dirty_markers()
+        # Group A repair. Neither of the two steps below may run after a
+        # FAILED write, because together they tell the application that the
+        # in-memory data is now safely on disk:
+        #
+        #   * `_clear_all_dirty_markers()` removes the amber row markers and
+        #     the toolbar dots, so the user is told everything saved;
+        #   * `_capture_plugin_signatures()` snapshots the in-memory data as
+        #     the new "already persisted" baseline — INCLUDING the edit that
+        #     was never written. `_plugin_data_unchanged` then returns True
+        #     and the writers skip it, so pressing Save again does nothing.
+        #     That is what made the loss permanent rather than recoverable.
+        #
+        # The dirty markers here are whole-tree, with no per-writer ownership
+        # to split them by. Faced with that, keep the BROADER dirty state
+        # rather than invent a false-clean one: an extra amber marker is a
+        # nuisance, a missing one is a silent loss. Re-running the writers on
+        # the next save is safe — they all go through `write_text_if_changed`,
+        # which is a no-op when the file already matches.
+        self._finish_save_bookkeeping()
 
-        # Re-baseline the snapshot guards — the just-written disk state is
-        # the new "clean" reference for any future Save All. Without this,
-        # the snapshot would keep comparing against the load-time data and
-        # treat every legitimate save as "still clean", or worse, mis-detect
-        # later edits relative to a stale baseline.
+    def _finish_save_bookkeeping(self) -> bool:
+        """Close out a save: either declare it clean, or report the failures.
+
+        Split out of `update_save` so the decision can be exercised directly
+        rather than inferred from reading the source. Returns True when the
+        save finished clean.
+        """
+        write_failures = getattr(self, "_write_failures", None) or []
+        if write_failures:
+            self._report_write_failures(write_failures)
+            return False
+        self._clear_all_dirty_markers()
         try:
             self._capture_plugin_signatures()
         except Exception:
             pass
+        return True
         # Clear per-tab dirty trackers so the next Save All correctly
         # detects "no edits" and skips their writebacks.
         try:
@@ -13878,6 +14214,109 @@ QTabBar::tab:hover:!selected {
 
         return total
 
+    @staticmethod
+    def _current_description_in_header(text: str, symbol: str):
+        """The description currently stored under *symbol*, or None."""
+        import re
+        m = re.search(
+            r"const\s+u8\s+" + re.escape(symbol) + r"\[\]\s*=\s*_\(\n(.*?)\)\s*;",
+            text, re.S)
+        if not m:
+            return None
+        lines = []
+        for raw in m.group(1).splitlines():
+            raw = raw.strip()
+            if not (raw.startswith('"') and raw.rfind('"') > 0):
+                continue
+            body = raw[1:raw.rfind('"')]
+            lines.append(body[:-2] if body.endswith(r"\n") else body)
+        return "\n".join(lines)
+
+    def _plan_pokedex_descriptions(self, natdex, header_text):
+        """Decide which descriptions may be written, and why not for the rest.
+
+        Returns ``(desc_map, conflicts)``. `conflicts` holds ONE entry per
+        underlying cause, not one per affected creature — editing a single
+        creature whose symbol is shared by 25 others must not produce 24
+        redundant errors.
+        """
+        by_symbol: dict = {}
+        no_symbol: list = []
+        for entry in natdex:
+            sym = entry.get("description")
+            desc = entry.get("descriptionText")
+            name = entry.get("dex_constant") or entry.get("species") or "?"
+            if not desc:
+                continue
+            if not sym:
+                # Nothing in the engine for this text to be written to.
+                no_symbol.append(name)
+                continue
+            by_symbol.setdefault(sym, []).append((name, desc))
+
+        desc_map: dict = {}
+        conflicts: list = []
+
+        for sym, rows in by_symbol.items():
+            on_disk = self._current_description_in_header(header_text, sym)
+            changed = [(n, d) for n, d in rows if d != on_disk]
+            if not changed:
+                # Untouched — including placeholders that merely share a
+                # symbol. Not a conflict, and not worth a word to the user.
+                continue
+            distinct = {d for _n, d in changed}
+            if len(rows) > 1:
+                # Writing it would change every creature sharing the symbol.
+                conflicts.append(
+                    "%s cannot be given a separate description: %d Pokédex "
+                    "entries share the text symbol %s (%s). Writing it would "
+                    "change all of them, so nothing was written for any."
+                    % (", ".join(n for n, _d in changed[:3])
+                       + ("…" if len(changed) > 3 else ""),
+                       len(rows), sym,
+                       ", ".join(n for n, _d in rows[:4])
+                       + ("…" if len(rows) > 4 else "")))
+                continue
+            if len(distinct) > 1:
+                conflicts.append(
+                    "%s has %d different descriptions competing for the same "
+                    "symbol %s; none was written."
+                    % (rows[0][0], len(distinct), sym))
+                continue
+            desc_map[sym] = changed[0][1]
+
+        if no_symbol:
+            conflicts.append(
+                "%d Pokédex %s no text symbol in the engine, so %s "
+                "description could not be written: %s."
+                % (len(no_symbol),
+                   "entries have" if len(no_symbol) != 1 else "entry has",
+                   "their" if len(no_symbol) != 1 else "its",
+                   ", ".join(no_symbol[:6])
+                   + ("…" if len(no_symbol) > 6 else "")))
+        return desc_map, conflicts
+
+    def _report_description_conflicts(self, conflicts: list) -> None:
+        """Tell the user which descriptions could not be saved, and why."""
+        if not conflicts:
+            return
+        logging.warning("Pokedex descriptions not written: %s", conflicts)
+        if getattr(self, "_loading_depth", 0) > 0 \
+                or getattr(self, "_refresh_discarding", False):
+            return
+        body = "\n\n".join(f"• {c}" for c in conflicts[:6])
+        if len(conflicts) > 6:
+            body += f"\n\n…and {len(conflicts) - 6} more (see the log)."
+        try:
+            QMessageBox.warning(
+                self, "Some Pokédex descriptions were not saved",
+                "Everything else saved normally.\n\n" + body +
+                "\n\nYour text is still in the editor. These entries share "
+                "one block of description text in the game's source, so they "
+                "cannot yet be given separate descriptions.")
+        except Exception:
+            logging.exception("Could not show the description-conflict dialog")
+
     def _write_pokedex_text_header(self) -> int:
         """Patch description text in pokedex_text_fr.h from in-memory pokedex data.
 
@@ -13900,22 +14339,32 @@ QTabBar::tab:hover:!selected {
         except Exception:
             return -1
 
-        # Build lookup: description symbol -> descriptionText
-        desc_map = {}
-        for entry in natdex:
-            sym = entry.get("description")  # e.g. "gBlobbasaurPokedexText"
-            desc = entry.get("descriptionText")
-            if sym and desc:
-                desc_map[sym] = desc
-
-        if not desc_map:
-            return 0
-
         try:
             with open(path, "r", encoding="utf-8") as f:
                 text = f.read()
         except Exception:
             return -1
+
+        # ── NEW3a containment ────────────────────────────────────────────
+        # This used to be a plain `desc_map[sym] = desc` walked in list order.
+        # Descriptions are keyed by C SYMBOL, and in this project 25 dex
+        # entries share `gDummyPokedexText` while 77 more carry no symbol at
+        # all — 102 of 488. So the last entry in the list silently won the
+        # shared block, every earlier edit was discarded before anything was
+        # written, and whichever text survived was shown by all 103 engine
+        # rows pointing at that symbol. Meanwhile the editor kept displaying
+        # each creature its own text, because the UI reads pokedex.json.
+        #
+        # So: refuse what cannot be represented independently, and say why.
+        # Deliberately NOT a blanket refusal — an unchanged placeholder that
+        # merely happens to share a symbol is fine, and a save that touched
+        # nothing must produce no diagnostics at all.
+        desc_map, conflicts = self._plan_pokedex_descriptions(natdex, text)
+        if conflicts:
+            self._report_description_conflicts(conflicts)
+
+        if not desc_map:
+            return 0
 
         total = 0
         for sym, desc in desc_map.items():

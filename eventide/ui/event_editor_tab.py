@@ -22,6 +22,7 @@ Architecture:
 
 import os
 import json
+import logging
 import re
 from pathlib import Path
 from collections import OrderedDict
@@ -140,6 +141,54 @@ def _strip_label_blocks(path, labels) -> int:
         except OSError:
             return 0
     return removed
+
+
+def _labels_referenced_in_project(root, labels) -> set:
+    """Which of *labels* is still referred to by something on disk.
+
+    Finding 0j. A label is "still used" when it appears anywhere in the
+    project OTHER than as its own definition line — a `map.json` script field,
+    a `goto`/`call` in another script, a trainer battle, anything.
+
+    Deliberately broad. Over-reporting a reference only leaves a harmless
+    orphan block behind; under-reporting one deletes a definition something
+    still points at, and the project stops linking. Those two errors are not
+    equally bad, so this leans to keeping.
+    """
+    wanted = {l for l in (labels or ()) if l}
+    if not wanted or root is None:
+        return set()
+    found: set = set()
+    definition = re.compile(r'^\s*(\w+)::')
+    root = Path(root)
+    for sub in ('data', 'src', 'include'):
+        base = root / sub
+        if not base.is_dir():
+            continue
+        for path in base.rglob('*'):
+            if not path.is_file() or path.suffix.lower() not in (
+                    '.inc', '.s', '.json', '.c', '.h', '.pory'):
+                continue
+            try:
+                text = path.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            for label in wanted - found:
+                if label not in text:
+                    continue
+                # Ignore the label's OWN definition lines; anything else is a
+                # reference that would dangle if the block were removed.
+                for line in text.splitlines():
+                    if label not in line:
+                        continue
+                    m = definition.match(line)
+                    if m and m.group(1) == label:
+                        continue
+                    found.add(label)
+                    break
+            if found == wanted:
+                return found
+    return found
 
 
 # ── Sound Editor integration callbacks (set by unified_mainwindow) ──────────
@@ -9307,6 +9356,22 @@ class EventEditorTab(QWidget):
         self._remember_disk_state(map_json, map_dir / 'scripts.inc',
                                   map_dir / 'text.inc')
 
+        # Finding 0j. The map's state has now been fully and successfully
+        # replaced from disk, so deletions staged against the PREVIOUS state
+        # no longer describe anything real. This is the verified transition
+        # boundary — deliberately here, at the END of a load that worked, and
+        # NOT on entering one: a load that fails partway must leave pending
+        # deletions alone rather than silently discarding recoverable work.
+        #
+        # This is what makes Delete → F5 → Save safe. Without it the set
+        # survived the revert and the next save stripped a label that map.json
+        # had just been reloaded still pointing at, and the project stopped
+        # linking with `undefined reference`.
+        self.reset_deleted_script_labels()
+        # Finding 0f, same boundary and same reasoning: movement edits staged
+        # against the map we just replaced do not describe this one.
+        self.reset_modified_movements()
+
         # ── Self-verification: warn about problems the user should know ──
         self._verify_loaded_events(name)
 
@@ -14695,6 +14760,128 @@ class EventEditorTab(QWidget):
     # Save
     # ─────────────────────────────────────────────────────────────────────
 
+    def _labels_still_referenced(self, labels) -> set:
+        """Labels something on disk still points at (finding 0j)."""
+        try:
+            root = getattr(self._mw, 'project_dir', None) or \
+                getattr(self._mw, 'root_dir', None)
+            if root is None:
+                proj = getattr(self._mw, 'project_info', None) or {}
+                root = proj.get('dir')
+            if not root:
+                # Cannot establish what references what. Keep everything:
+                # an orphan is harmless, a dangling reference is not.
+                return set(labels or ())
+            return _labels_referenced_in_project(root, labels)
+        except Exception:
+            logging.exception('0j reference check failed; keeping all labels')
+            return set(labels or ())
+
+    def reset_deleted_script_labels(self) -> None:
+        """Forget the deletions staged this session.
+
+        Finding 0j. Called at VERIFIED state transitions — after a project or
+        map load has actually completed, and after a successful save — never
+        on merely *entering* a load. A load that fails partway must not
+        silently discard recoverable pending edits.
+        """
+        self._deleted_script_labels = set()
+
+    def reset_modified_movements(self) -> None:
+        """Forget movement-route edits staged against the previous map.
+
+        Finding 0f. `_modified_movements` is keyed by movement LABEL, and
+        those labels are not unique across maps. Every entry was written into
+        whichever map happened to be open at save time:
+
+            for mov_label, mov_steps in self._modified_movements.items():
+                save_pages[mov_label] = mov_steps
+
+        So an edit made with one map open could be written into another, and
+        the dict survived F5 — the action that is supposed to discard pending
+        edits.
+
+        Called at the same verified transition as the deleted-label reset,
+        and for the same reason: at the END of a load that succeeded, never
+        on entering one.
+        """
+        self._modified_movements = {}
+        self._modified_movements_owner = getattr(self, '_map_dir', None)
+
+    def _serialise_events_for_map_json(self):
+        """Build map.json's three event arrays WITHOUT touching live objects.
+
+        Finding 0h. The save used to `obj.pop('_pages')` and
+        `obj.pop('_event_type')` straight off the live objects before writing.
+        Those two keys are the editor's own bookkeeping — `_pages` holds the
+        parsed script pages the UI renders, and `_event_type` decides which
+        map.json array an event belongs to. When the write then failed, the
+        live objects were left stripped: the editor unusable until reloaded,
+        and a retry would have misfiled every event as an object because its
+        type had already been removed.
+
+        So this serialises DETACHED COPIES. A failed save must cost the user
+        the write, not the editor state as well.
+
+        Returns ``(object_events, coord_events, bg_events, normalised_ids)``.
+        `normalised_ids` pairs each live object with its repaired local_id so
+        the caller can apply them AFTER a successful write — applying them
+        before would leave the editor carrying changes that never reached
+        disk, which is this same defect in miniature.
+
+        Split into its own method so the no-mutation guarantee can be
+        exercised directly rather than inferred from reading the save path.
+        """
+        obj_events: list = []
+        coord_events: list = []
+        bg_events: list = []
+        normalised_ids: list = []
+        for obj in self._objects:
+            etype = obj.get('_event_type', 'object')
+            record = {k: v for k, v in obj.items()
+                      if k not in ('_pages', '_event_type')}
+            if etype == 'object':
+                # Guarantee a valid local_id: the build emits
+                # `#define <local_id> <index>`, so a stray number/word
+                # (e.g. a hand-typed "001") would compile-break. Normalize
+                # every object, not just the edited one, so an existing bad
+                # id is repaired on the next save.
+                lid = record.get('local_id')
+                if lid:
+                    norm = self._normalize_local_id(str(lid))
+                    if norm:
+                        record['local_id'] = norm
+                    else:
+                        record.pop('local_id', None)
+                    normalised_ids.append((obj, norm))
+                obj_events.append(record)
+            elif etype == 'coord':
+                coord_events.append(record)
+            elif etype == 'bg':
+                bg_events.append(record)
+            # map_script entries are synthetic — don't write to map.json
+        return obj_events, coord_events, bg_events, normalised_ids
+
+    def _movements_for_current_map(self) -> dict:
+        """Staged movement edits that belong to the map now open.
+
+        Split out of the save path so the ownership decision can be exercised
+        directly rather than inferred from reading it.
+        """
+        staged = getattr(self, '_modified_movements', None) or {}
+        if not staged:
+            return {}
+        owner = getattr(self, '_modified_movements_owner', None)
+        if owner is not None and owner != getattr(self, '_map_dir', None):
+            try:
+                self._mw.log_message(
+                    'Event Editor: ignored %d movement edit(s) staged on a '
+                    'different map.' % len(staged))
+            except Exception:
+                pass
+            return {}
+        return dict(staged)
+
     def _ensure_map_inc_registered(self, kind: str):
         """Ensure `.include "data/maps/<Map>/<kind>"` exists in event_scripts.s.
 
@@ -15069,10 +15256,16 @@ class EventEditorTab(QWidget):
                 if current_label not in self._external_script_labels:
                     save_pages[current_label] = current_cmds
 
-        # Include any modified movement routes in save_pages
-        if hasattr(self, '_modified_movements'):
-            for mov_label, mov_steps in self._modified_movements.items():
-                save_pages[mov_label] = mov_steps
+        # Include any modified movement routes in save_pages.
+        #
+        # Finding 0f: these are keyed by movement LABEL, and labels are not
+        # unique across maps, so this used to write every staged edit into
+        # whichever map was open. The reset at the end of a successful map
+        # load is the primary guard; this owner check is the backstop, so a
+        # future path that reaches a save without going through _load_map
+        # still cannot write one map's movements into another.
+        for mov_label, mov_steps in self._movements_for_current_map().items():
+            save_pages[mov_label] = mov_steps
 
         # Turn per-page State Appearance into the map's On Transition script.
         # No-op unless an NPC actually has a per-page appearance set.
@@ -15124,13 +15317,34 @@ class EventEditorTab(QWidget):
             # otherwise stay orphaned in scripts.inc). Also drop their `_Text`.
             deleted = getattr(self, '_deleted_script_labels', None)
             if deleted:
-                n = _strip_label_blocks(scripts_path, deleted)
-                _strip_label_blocks(text_path,
-                                    {f'{l}_Text' for l in deleted} | set(deleted))
-                if n:
+                # Finding 0j. This set is per-session and survives F5, so a
+                # delete the user UNDID by reverting still had its label
+                # stripped on the next save — while map.json, reloaded from
+                # disk, still pointed at it. The link then failed with
+                # `undefined reference to '<label>'` from map_events.o, and
+                # nothing in that message points back at the deleted event.
+                #
+                # So a label is only stripped when nothing surviving still
+                # refers to it. Where ownership is uncertain the definition is
+                # KEPT: a harmless orphan beats an undefined reference that
+                # stops the project linking. Legitimate orphan cleanup still
+                # happens for labels nothing references.
+                still_used = self._labels_still_referenced(deleted)
+                strippable = set(deleted) - still_used
+                if still_used:
                     self._mw.log_message(
-                        f'Event Editor: removed {n} deleted script block(s) '
-                        f'from scripts.inc.')
+                        'Event Editor: kept %d script block(s) that are still '
+                        'referenced: %s'
+                        % (len(still_used), ', '.join(sorted(still_used)[:6])))
+                if strippable:
+                    n = _strip_label_blocks(scripts_path, strippable)
+                    _strip_label_blocks(
+                        text_path,
+                        {f'{l}_Text' for l in strippable} | set(strippable))
+                    if n:
+                        self._mw.log_message(
+                            f'Event Editor: removed {n} deleted script block(s) '
+                            f'from scripts.inc.')
                 self._deleted_script_labels = set()
 
             # Self-heal: remove any leftover NULL:: / NULL_Text:: (or 0/0x0)
@@ -15144,31 +15358,8 @@ class EventEditorTab(QWidget):
             _strip_sentinel_blocks(text_path)
 
             # Split objects back into their original map.json arrays
-            obj_events = []
-            coord_events = []
-            bg_events = []
-            for obj in self._objects:
-                obj.pop('_pages', None)
-                etype = obj.pop('_event_type', 'object')
-                if etype == 'object':
-                    # Guarantee a valid local_id: the build emits
-                    # `#define <local_id> <index>`, so a stray number/word
-                    # (e.g. a hand-typed "001") would compile-break. Normalize
-                    # every object, not just the edited one, so an existing bad
-                    # id is repaired on the next save.
-                    lid = obj.get('local_id')
-                    if lid:
-                        norm = self._normalize_local_id(str(lid))
-                        if norm:
-                            obj['local_id'] = norm
-                        else:
-                            obj.pop('local_id', None)
-                    obj_events.append(obj)
-                elif etype == 'coord':
-                    coord_events.append(obj)
-                elif etype == 'bg':
-                    bg_events.append(obj)
-                # map_script entries are synthetic — don't write to map.json
+            (obj_events, coord_events, bg_events,
+             normalised_ids) = self._serialise_events_for_map_json()
             self._map_data['object_events'] = obj_events
             self._map_data['coord_events'] = coord_events
             self._map_data['bg_events'] = bg_events
@@ -15176,6 +15367,16 @@ class EventEditorTab(QWidget):
             with map_json.open('w', encoding='utf-8', newline='\n') as fh:
                 json.dump(self._map_data, fh, indent=2)
                 fh.write('\n')
+
+            # The write succeeded, so the local_id repairs that went into the
+            # file can now safely be reflected in the live objects. Doing this
+            # BEFORE the write would have left the editor carrying changes
+            # that never reached disk (finding 0h's shape, in miniature).
+            for live_obj, norm in normalised_ids:
+                if norm:
+                    live_obj['local_id'] = norm
+                else:
+                    live_obj.pop('local_id', None)
 
             # Save any modified external scripts back to their source files
             self._save_external_scripts()

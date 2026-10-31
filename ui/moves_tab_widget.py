@@ -942,6 +942,45 @@ class MovesTabWidget(QWidget):
         """Pass animation labels through to the detail panel."""
         self._detail.populate_animations(anim_labels)
 
+    @staticmethod
+    def _merge_flags(original, edited) -> str:
+        """Combine the user's checkbox choices with the flags no checkbox shows.
+
+        The engine defines fourteen move flags (`FLAG_*` in
+        `include/constants/pokemon.h`); the editor shows six. The detail
+        panel's `collect()` can only rebuild the field from the six it has, so
+        before this merge, editing ANY property of a move — power, PP,
+        accuracy — silently dropped the other eight. Measured on this
+        project's own data: 58 of 355 moves carry at least one of them, and
+        MOVE_FIRE_PUNCH lost FLAG_PUNCHING_MOVE, which is what Iron Fist
+        checks.
+
+        The invariant: an unrelated edit preserves every previously loaded
+        flag unless the user explicitly changes it through a control that
+        represents it.
+
+        This belongs HERE, at the data-model boundary, rather than on the
+        detail widget — a widget-local copy dies when the selection changes,
+        the tab reloads, or the widget is rebuilt.
+        """
+        def _split(value):
+            if not value:
+                return []
+            if isinstance(value, str):
+                return [p.strip() for p in value.split("|")
+                        if p.strip() and p.strip() != "0"]
+            return [str(p).strip() for p in value if str(p).strip()]
+
+        representable = {f for f, _tip in ALL_FLAGS}
+        original_flags = _split(original)
+        edited_flags = _split(edited)
+        # Everything the UI cannot show is carried through untouched, in its
+        # original order; the user's choices decide the rest.
+        preserved = [f for f in original_flags if f not in representable]
+        chosen = [f for f in edited_flags if f in representable]
+        merged = chosen + [f for f in preserved if f not in chosen]
+        return " | ".join(merged) if merged else "0"
+
     def save_current(self) -> None:
         """Flush the current detail panel edits back to internal dicts."""
         if not self._dirty or self._current_move is None:
@@ -949,6 +988,10 @@ class MovesTabWidget(QWidget):
         move, data, desc = self._detail.collect()
         if move and move in self._moves_data:
             existing = dict(self._moves_data[move])
+            data = dict(data)
+            if "flags" in data:
+                data["flags"] = self._merge_flags(
+                    existing.get("flags"), data.get("flags"))
             existing.update(data)
             self._moves_data[move] = existing
             self._move_descriptions[move] = desc

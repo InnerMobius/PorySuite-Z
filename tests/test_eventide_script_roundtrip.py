@@ -73,7 +73,29 @@ def _parse(*lines):
 
 
 def _write(cmds, texts=None):
-    """Render command tuples back to script lines, stripped of newlines."""
+    """Render command tuples back to script lines, normalised for CONTENT.
+
+    Strips the trailing newline and the leading indentation, because every
+    assertion in this file is about what the writer EMITS — command names,
+    argument counts, `message` versus `msgbox`, nothing injected — not about
+    how it is indented.
+
+    The indentation used to be absent entirely: the writer emitted every
+    command flush-left, which is finding 0g (a no-op save flattened whole
+    files, inflating a 98-line edit into a 239-line diff). Since that was
+    repaired the writer emits the project's tab, and these expectations were
+    written against the old flush-left output. Normalising here keeps all
+    twenty content assertions exactly as strong as they were; the
+    indentation itself is covered by `test_eventide_script_indent.py`, which
+    asserts commands are indented AND that labels, blank lines, directives
+    and comments are not.
+    """
+    return [ln.rstrip('\n').lstrip('\t')
+            for ln in lines_from_commands(cmds, texts or {})]
+
+
+def _write_verbatim(cmds, texts=None):
+    """Render without normalising — for asserting a TRUE round trip."""
     return [ln.rstrip('\n') for ln in lines_from_commands(cmds, texts or {})]
 
 
@@ -178,6 +200,14 @@ def test_call_does_not_get_a_lock_injected():
 def test_writer_adds_nothing_at_all_to_a_plain_script():
     lines = ['\tlock', '\tfaceplayer', '\tmsgbox Text_Hi', '\trelease', '\tend']
     assert _roundtrip(*lines) == [ln.strip() for ln in lines]
+
+
+def test_a_plain_script_round_trips_byte_for_byte():
+    """Stronger than the test above, and only possible since 0g was fixed:
+    what goes in comes back out unchanged, INCLUDING the indentation. Before
+    the repair the tabs were stripped, so this could not have passed."""
+    lines = ['\tlock', '\tfaceplayer', '\tmsgbox Text_Hi', '\trelease', '\tend']
+    assert _write_verbatim(_parse(*lines)) == lines
 
 
 def _write_block(tmp_path, body):

@@ -796,6 +796,10 @@ class TileAnimEditorWidget(QWidget):
         # State flags
         self._loading: bool = False
         self._dirty: bool = False
+        # Finding 0d: property edits staged per animation, {id(anim):
+        # (anim, values)}. Keyed by identity rather than name so two
+        # animations sharing a name cannot overwrite each other's edits.
+        self._pending_props: dict = {}
 
         self._build_ui()
 
@@ -1511,6 +1515,14 @@ class TileAnimEditorWidget(QWidget):
         if idx < 0 or idx >= len(self._current_tileset_anims):
             return
 
+        # Finding 0d. Switching used to replace `_current_anim` outright, and
+        # both `has_unsaved_changes()` and `flush_to_disk()` work off whatever
+        # that points at. So editing animation A's properties and clicking B
+        # discarded A's edits AND made the app report nothing unsaved — it was
+        # now comparing B's spinners against B. Stage A's values before the
+        # switch so neither the edit nor the knowledge of it is lost.
+        self._capture_pending_props()
+
         self._preview.stop()
         self._btn_play.setText("\u25b6 Play")
 
@@ -1545,14 +1557,24 @@ class TileAnimEditorWidget(QWidget):
         # Re-render frames with selected palette
         self._rerender_frames_with_palette()
 
-        # Set property spinners
+        # Set property spinners. Finding 0d: a pending edit staged against
+        # THIS animation earlier in the session wins over what is on disk, so
+        # coming back to it shows the user's own unsaved values rather than
+        # silently reverting them.
+        staged = self._pending_props.get(id(anim), (None, None))[1]
         self._loading = True
-        self._divisor_spin.setValue(anim.divisor)
-        self._start_tile_spin.setValue(anim.dest_tile)
-        self._tile_amount_spin.setValue(anim.tile_count)
-        self._phase_spin.setValue(anim.phase)
-        self._counter_max_spin.setValue(anim.counter_max if anim.counter_max else 0)
-        self._update_fps_label(anim.divisor)
+        self._divisor_spin.setValue(
+            staged["divisor"] if staged else anim.divisor)
+        self._start_tile_spin.setValue(
+            staged["dest_tile"] if staged else anim.dest_tile)
+        self._tile_amount_spin.setValue(
+            staged["tile_count"] if staged else anim.tile_count)
+        self._phase_spin.setValue(staged["phase"] if staged else anim.phase)
+        self._counter_max_spin.setValue(
+            staged["counter_max"] if staged
+            else (anim.counter_max if anim.counter_max else 0))
+        self._update_fps_label(
+            staged["divisor"] if staged else anim.divisor)
         self._loading = False
 
         # Set up preview
@@ -1954,16 +1976,55 @@ class TileAnimEditorWidget(QWidget):
         self._dirty = True
         self.modified.emit()
 
+    # ── Finding 0d: staged property edits, per animation ─────────────────
+    # `_current_anim` is a single pointer and the save worked off it alone,
+    # so an edit to one animation vanished the moment another was selected.
+    # These keep each animation's unsaved values until they are written or
+    # explicitly discarded.
+
+    def _current_prop_values(self) -> dict:
+        return {
+            "divisor": self._divisor_spin.value(),
+            "dest_tile": self._start_tile_spin.value(),
+            "tile_count": self._tile_amount_spin.value(),
+            "phase": self._phase_spin.value(),
+            "counter_max": self._counter_max_spin.value(),
+        }
+
+    @staticmethod
+    def _props_differ(anim, values: dict) -> bool:
+        return (values["divisor"] != anim.divisor
+                or values["dest_tile"] != anim.dest_tile
+                or values["tile_count"] != anim.tile_count
+                or values["phase"] != anim.phase
+                or values["counter_max"] != (anim.counter_max or 0))
+
+    def _capture_pending_props(self) -> None:
+        """Stage the visible values against the animation they belong to."""
+        anim = getattr(self, "_current_anim", None)
+        if anim is None or self._loading:
+            return
+        values = self._current_prop_values()
+        if self._props_differ(anim, values):
+            self._pending_props[id(anim)] = (anim, values)
+        else:
+            # Edited back to what is on disk — no longer pending.
+            self._pending_props.pop(id(anim), None)
+
+    def discard_pending_props(self) -> None:
+        """Drop every staged property edit (F5 / revert-to-disk)."""
+        self._pending_props = {}
+        self._dirty = False
+
     def has_unsaved_changes(self) -> bool:
-        """Check if there are pending property changes not yet written."""
-        if not self._dirty or not self._current_anim:
-            return False
-        anim = self._current_anim
-        return (self._divisor_spin.value() != anim.divisor
-                or self._start_tile_spin.value() != anim.dest_tile
-                or self._tile_amount_spin.value() != anim.tile_count
-                or self._phase_spin.value() != anim.phase
-                or self._counter_max_spin.value() != (anim.counter_max or 0))
+        """True when any animation has property changes not yet written.
+
+        Checks EVERY staged animation, not merely the selected one — the
+        defect was that it reported False the instant you clicked away from
+        the one you had edited.
+        """
+        self._capture_pending_props()
+        return bool(self._pending_props)
 
     def flush_to_disk(self) -> tuple:
         """Write pending property changes to C source.
@@ -1971,15 +2032,39 @@ class TileAnimEditorWidget(QWidget):
         Returns ``(ok_count, error_list)`` matching the flush_to_disk
         convention used by other PorySuite editors.
         """
-        if not self._current_anim or not self._project_dir:
+        if not self._project_dir:
             return (0, [])
 
-        anim = self._current_anim
-        new_div = self._divisor_spin.value()
-        new_start = self._start_tile_spin.value()
-        new_amount = self._tile_amount_spin.value()
-        new_phase = self._phase_spin.value()
-        new_cmax = self._counter_max_spin.value()
+        # Finding 0d: write EVERY animation with staged edits, not just the
+        # selected one. This used to read the spinners and write
+        # `self._current_anim`, so an edit made before clicking to another
+        # animation was never written — and was already gone from the
+        # spinners by then anyway.
+        self._capture_pending_props()
+        ok = 0
+        errors: list[str] = []
+        for staged_anim, staged_values in list(self._pending_props.values()):
+            n, errs = self._flush_one_anim(staged_anim, staged_values)
+            ok += n
+            errors.extend(errs)
+            if not errs:
+                self._pending_props.pop(id(staged_anim), None)
+
+        if ok > 0 or not errors:
+            self._dirty = False
+
+        anim = getattr(self, "_current_anim", None)
+        if anim is None:
+            return (ok, errors)
+        return self._finish_flush(anim, ok, errors)
+
+    def _flush_one_anim(self, anim, values: dict) -> tuple:
+        """Write one animation's staged property values to the C source."""
+        new_div = values["divisor"]
+        new_start = values["dest_tile"]
+        new_amount = values["tile_count"]
+        new_phase = values["phase"]
+        new_cmax = values["counter_max"]
 
         ok = 0
         errors: list[str] = []
@@ -2019,9 +2104,10 @@ class TileAnimEditorWidget(QWidget):
             else:
                 errors.append("counter max")
 
-        if ok > 0 or not errors:
-            self._dirty = False
+        return ok, errors
 
+    def _finish_flush(self, anim, ok: int, errors: list) -> tuple:
+        """Collision warning + return, for the animation now on screen."""
         # Last-chance collision warning: if this animation's tile range now
         # overlaps another in the same tileset, both will fight over those
         # tiles in-game. Warn loudly on the explicit save.

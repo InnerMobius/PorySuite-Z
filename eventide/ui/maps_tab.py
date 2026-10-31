@@ -92,6 +92,19 @@ class MapsTab(QWidget):
     data_changed = pyqtSignal()
     # Emitted when user double-clicks a map — carries the map folder name
     map_selected = pyqtSignal(str)
+    # Finding 0c. Emitted when the STAGED (not yet written) edit set changes,
+    # purely so the window can show this tab as dirty.
+    #
+    # It has to be its own signal: `data_changed` is also wired to
+    # EventideMainWindow._on_maps_changed, which reloads the Region Map and
+    # Layouts tabs from the project — so reusing it to report "there is a
+    # staged change here" would discard those editors' pending work as a side
+    # effect. Staging a change must not reload anything.
+    #
+    # Before this existed, staging emitted nothing at all: the unified window
+    # never marked Maps dirty, the close prompt did not know to ask, and the
+    # staged edits were lost without warning.
+    staged_changed = pyqtSignal()
 
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
@@ -428,7 +441,10 @@ class MapsTab(QWidget):
         self._dirty_items.clear()
         self._pending_sections.clear()
         self._pending_rms.clear()
-        self.btn_save.setEnabled(False)
+        # Finding 0c: route through _refresh_save_state so the window's dirty
+        # marker clears too, not just the button. Setting the button directly
+        # left the dot lit after an F5 that had discarded the staged edits.
+        self._refresh_save_state()
         self._populate_tree()
         self._mw.log_message(f"Maps tab: loaded {project_dir}")
 
@@ -470,7 +486,9 @@ class MapsTab(QWidget):
         self._pending_sections.clear()
         self._pending_rms.clear()
         if hasattr(self, "btn_save"):
-            self.btn_save.setEnabled(False)
+            # Finding 0c: same reason as load_project — clear the window's
+            # marker, not only the button.
+            self._refresh_save_state()
         for i in range(self.map_tree.topLevelItemCount()):
             group_item = self.map_tree.topLevelItem(i)
             group_item.setBackground(0, _TRANSPARENT)
@@ -847,6 +865,13 @@ class MapsTab(QWidget):
     def _refresh_save_state(self):
         """Reflect pending state in the Save button + log a hint."""
         self.btn_save.setEnabled(self._has_pending())
+        # Finding 0c: tell the window there is unsaved work here, without
+        # reloading any sibling editor. See `staged_changed` above for why
+        # this cannot reuse `data_changed`.
+        try:
+            self.staged_changed.emit()
+        except Exception:
+            pass
 
     def _effective_section(self, folder: str, disk_section: str) -> str:
         """Return the section the tree should display for this map.
@@ -974,6 +999,8 @@ class MapsTab(QWidget):
         n_rms = len(self._pending_rms)
         self._pending_sections.clear()
         self._pending_rms.clear()
+        # Finding 0c: a successful save must clear the dirty marker it set.
+        self._refresh_save_state()
         self._mw.log_message(
             f"Maps tab: saved {n_sec} section reassignment(s), "
             f"{n_rms} region-map edit(s)")

@@ -143,6 +143,30 @@ def _lbl(text: str) -> QLabel:
     return l
 
 
+def _render_sprite(path: str | None, palette=None) -> QPixmap | None:
+    """Render a sprite through the sanctioned pipeline when we have a palette.
+
+    Finding F8. `_load_gba_sprite` below reads the PNG's own baked-in colour
+    table, which is stale the moment the user edits that sprite's palette —
+    the authoritative palette lives in the `.pal` file, and unsaved edits live
+    only in `core/sprite_palette_bus`. `core/sprite_render.load_sprite_pixmap`
+    is the one sanctioned way to combine the two.
+
+    Falls back to the old loader only when no palette could be resolved, so a
+    sprite still appears rather than vanishing.
+    """
+    if not path:
+        return None
+    if palette:
+        try:
+            pm = load_sprite_pixmap(path, palette)
+            if pm is not None and not pm.isNull():
+                return pm
+        except Exception:
+            pass
+    return _load_gba_sprite(path)
+
+
 def _load_gba_sprite(path: str) -> QPixmap | None:
     """
     Load a 4-bit indexed GBA PNG and make its background transparent.
@@ -264,12 +288,21 @@ class _SizePreview(QWidget):
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def set_trainer(self, path: str | None) -> None:
-        self._trainer_pm = _load_gba_sprite(path)
+    # Finding F8. Both of these used to take a PATH ONLY and render it through
+    # `_load_gba_sprite`, a flat `QImage(path)` that reads whatever colour
+    # table the PNG happens to carry. That bypasses the sprite pipeline
+    # CLAUDE.md requires, so a palette edited in the Graphics tab recoloured
+    # the header sprite right beside this preview and left the preview itself
+    # on the old colours — two renderings of the same creature disagreeing on
+    # one screen. The palette is now passed in and the sanctioned renderer
+    # used when one is available.
+
+    def set_trainer(self, path: str | None, palette=None) -> None:
+        self._trainer_pm = _render_sprite(path, palette)
         self.update()
 
-    def set_pokemon(self, path: str | None) -> None:
-        self._pokemon_pm = _load_gba_sprite(path)
+    def set_pokemon(self, path: str | None, palette=None) -> None:
+        self._pokemon_pm = _render_sprite(path, palette)
         self.update()
 
     def set_values(self, poke_scale: int, poke_offset: int,
@@ -731,12 +764,20 @@ class PokedexDetailPanel(QWidget):
             )
         pm = load_sprite_pixmap(png_path, pal)
         self._sprite_lbl.setPixmap(pm or QPixmap())
-        self._size_preview.set_pokemon(png_path)
+        # F8: the preview gets the SAME palette the header sprite just used,
+        # instead of re-reading the PNG's baked-in colours.
+        self._size_preview.set_pokemon(png_path, pal)
 
     # ── bus subscription ─────────────────────────────────────────────────────
 
     def _on_palette_changed(self, category: str, key: str) -> None:
-        """Re-render the header sprite when OUR species' palette changes."""
+        """Re-render on a palette edit — header sprite AND size preview.
+
+        Finding F8: this used to refresh only `_sprite_lbl`, so editing a
+        palette recoloured the header sprite and left the size-comparison
+        preview right beside it on the old colours. Two renderings of the
+        same creature, disagreeing, with nothing to explain it.
+        """
         if category != CAT_POKEMON:
             return
         if not self._species_const or not self._sprite_path:
@@ -752,6 +793,7 @@ class PokedexDetailPanel(QWidget):
                 pm = load_sprite_pixmap(self._sprite_path, pal)
                 if pm is not None:
                     self._sprite_lbl.setPixmap(pm)
+                self._size_preview.set_pokemon(self._sprite_path, pal)
         except Exception:
             pass
 

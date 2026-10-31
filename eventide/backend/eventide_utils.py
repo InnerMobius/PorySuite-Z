@@ -2105,7 +2105,49 @@ def lines_from_commands(
     if not commands and 'nop' not in cmd_names and 'nop1' not in cmd_names:
         visible.append('nop\n')
 
-    return visible
+    return _indent_script_lines(visible)
+
+
+# Finding 0g. Every command literal above is emitted flush-left, so writing a
+# script back stripped the leading tab from each command line. Measured: a
+# NO-OP parse-and-write-back flattened 100% of the indentation — PewterCity
+# 656 tabbed lines to 0, PalletTown 373 to 0, ViridianCity 155 to 0.
+#
+# That is not cosmetic. It inflated a real 98-line edit into a 239-line diff
+# (2.4x), which defeats `git diff` as the way to tell tool churn from the
+# user's own edits — exactly when that matters most, during recovery from a
+# bad map operation. It also re-flattened two maps the user had already
+# repaired by hand.
+#
+# The project's own convention, counted across 12 real scripts.inc files:
+# 323 tab-indented command lines against 1 flush-left. LABELS are flush-left
+# by convention, which is why `Kakariko_MapScripts::` was untouched in the
+# diff while every command under it moved. So this indents commands and must
+# NEVER indent a label.
+#
+# Measured before relying on a per-line prefix: across 453 of 453 maps and
+# 17,642 emitted elements, ZERO contained an embedded newline and ZERO failed
+# to end in one — so one tab per element is sufficient.
+_LABEL_RE = re.compile(r'^\w+::')
+
+
+def _indent_script_lines(lines: list[str]) -> list[str]:
+    """Apply the project's command indentation without touching labels.
+
+    Left alone: blank lines, anything already indented, labels (`Foo::`),
+    assembler directives (`.macro`, `.endm`) and comments.
+    """
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if (not stripped
+                or line.startswith(('\t', ' '))
+                or _LABEL_RE.match(stripped)
+                or stripped.startswith(('@', '.', '#'))):
+            out.append(line)
+        else:
+            out.append('\t' + line)
+    return out
 
 
 def merge_hidden_lines(visible: list[str], hidden: list[tuple[int, str]]) -> list[str]:
