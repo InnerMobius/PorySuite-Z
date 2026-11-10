@@ -233,7 +233,31 @@ class EventideMainWindow(QMainWindow):
             if ret == QMessageBox.StandardButton.Cancel:
                 return
             if ret == QMessageBox.StandardButton.Save:
-                self.event_editor_tab._on_save()
+                # Refreshing reloads everything from disk. A returning
+                # `_on_save` is not proof of a save (see
+                # _try_save_before_closing), so going ahead would discard
+                # exactly the edits the user asked to protect (2026-11-08).
+                try:
+                    self.event_editor_tab._on_save()
+                except Exception as e:
+                    self.log_message(
+                        f"Refresh cancelled, the save failed: {e}")
+                    QMessageBox.warning(
+                        self, "Your changes were NOT saved",
+                        f"EVENTide could not save your changes, so it has "
+                        f"not refreshed.\n\n{e}\n\nYour unsaved work is "
+                        f"still here.")
+                    return
+                if self.isWindowModified():
+                    self.log_message(
+                        "Refresh cancelled: the save did not take, so "
+                        "reloading would have discarded the changes.")
+                    QMessageBox.warning(
+                        self, "Your changes were NOT saved",
+                        "The save did not go through, so EVENTide has not "
+                        "refreshed.\n\nLook for the editor's own error "
+                        "message. Your unsaved work is still here.")
+                    return
         self.load_data(self.project_info)
         self.statusBar().showMessage("Project refreshed from disk.", 4000)
 
@@ -268,7 +292,31 @@ class EventideMainWindow(QMainWindow):
             self,
             "You have unsaved changes. Would you like to save before closing?")
         if ret == QMessageBox.StandardButton.Save:
-            self.event_editor_tab._on_save()
+            # `_on_save` catches its own write errors, shows its own dialog
+            # and returns normally, and it has early returns that write
+            # nothing (no map loaded, overwrite declined) — so a returning
+            # call is NOT proof of a save. The window-modified flag it clears
+            # on success is. Same reasoning as
+            # UnifiedMainWindow._confirm_saved (2026-11-08).
+            try:
+                self.event_editor_tab._on_save()
+            except Exception as e:
+                self.log_message(
+                    f"Save failed, so EVENTide did not close: {e}")
+                QMessageBox.warning(
+                    self, "Your changes were NOT saved",
+                    f"EVENTide could not save your changes, so it did not "
+                    f"close.\n\n{e}\n\nYour unsaved work is still here.")
+                return False
+            if self.isWindowModified():
+                self.log_message(
+                    "Save did not take, so EVENTide did not close.")
+                QMessageBox.warning(
+                    self, "Your changes were NOT saved",
+                    "The save did not go through, so EVENTide did not "
+                    "close.\n\nLook for the editor's own error message. "
+                    "Your unsaved work is still here.")
+                return False
             return True
         return ret != QMessageBox.StandardButton.Cancel
 

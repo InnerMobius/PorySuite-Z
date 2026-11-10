@@ -7678,6 +7678,121 @@ def _make_insertion_line() -> QListWidgetItem:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Add Map Script
+# ═════════════════════════════════════════════════════════════════════════════
+
+class _AddMapScriptDialog(QDialog):
+    """Pick the moment a new map script should run at.
+
+    The moments come from the project's own ``map_scripts.h`` rather than a
+    list in here, and whether each one's target is a plain script or a table
+    of ``map_script_2`` rows is read from the engine — see
+    :mod:`eventide.backend.map_script_types`. Two of them (On Frame, On Warp
+    In) only run while a variable holds a particular value, so those grow a
+    variable row; the rest hide it, because offering a condition the engine
+    will never consult is how a user ends up with a scene that silently never
+    fires.
+    """
+
+    def __init__(self, types: list, map_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Add Map Script')
+        self._types = list(types)
+        self.resize(560, 0)
+
+        root = QVBoxLayout(self)
+        blurb = QLabel(
+            f'A map script runs on its own, without the player talking to '
+            f'anyone or stepping on anything. Pick when it should run on '
+            f'<b>{map_name}</b>.')
+        blurb.setWordWrap(True)
+        root.addWidget(blurb)
+
+        form = QFormLayout()
+        self.moment = QComboBox()
+        for t in self._types:
+            label = t.label
+            if t.unused:
+                label += '  — not used by this engine'
+            self.moment.addItem(label, t.const)
+        self.moment.wheelEvent = lambda e: e.ignore()
+        self.moment.currentIndexChanged.connect(self._sync)
+        form.addRow('Runs:', self.moment)
+
+        self._when = QLabel('')
+        self._when.setWordWrap(True)
+        self._when.setStyleSheet('color: #9e9e9e;')
+        form.addRow('', self._when)
+
+        # Only shown for the table moments. A ConstantPicker so the user picks
+        # a named variable rather than typing a slot number.
+        self._var = ConstantPicker(ConstantsManager.VARS, prefix='VAR_')
+        self._var.setToolTip(_tt(
+            'The variable the engine checks. The script runs only while this\n'
+            'variable holds the value below — that is how a scene plays once\n'
+            'and then stops: the scene itself sets the variable to something\n'
+            'else on its way out.'))
+        self._var_row = form.rowCount()
+        form.addRow('Only when:', self._var)
+
+        self._value = QSpinBox()
+        self._value.setRange(0, 65535)
+        self._value.setToolTip(_tt(
+            'The value that variable must hold for the script to run.\n'
+            'A brand-new variable starts at 0, so 0 means "right from the\n'
+            'start of the game".'))
+        self._value.wheelEvent = lambda e: e.ignore()
+        self._value_row = form.rowCount()
+        form.addRow('…is exactly:', self._value)
+
+        root.addLayout(form)
+
+        self._warn = QLabel('')
+        self._warn.setWordWrap(True)
+        self._warn.setStyleSheet('color: #ffb74d;')
+        root.addWidget(self._warn)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self._form = form
+        self._sync()
+
+    def _sync(self):
+        t = self.chosen()
+        if t is None:
+            return
+        self._when.setText(t.when)
+        needs_var = t.is_table
+        for row in (self._var_row, self._value_row):
+            lbl = self._form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            fld = self._form.itemAt(row, QFormLayout.ItemRole.FieldRole)
+            for item in (lbl, fld):
+                if item is not None and item.widget() is not None:
+                    item.widget().setVisible(needs_var)
+        self._warn.setText(
+            'This engine does not run this moment, so the script would never '
+            'fire. Added anyway if you want it.' if t.unused else '')
+        self.adjustSize()
+
+    def chosen(self):
+        """The selected :class:`MapScriptType`, or None."""
+        const = self.moment.currentData()
+        return next((t for t in self._types if t.const == const), None)
+
+    def condition(self) -> tuple[str, int]:
+        """The variable and value for a table moment. ('' , 0) for the rest."""
+        t = self.chosen()
+        if t is None or not t.is_table:
+            return '', 0
+        return self._var.selected_constant().strip(), int(self._value.value())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Main Event Editor Tab
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -7878,7 +7993,37 @@ class EventEditorTab(QWidget):
                   'Would you like to save before switching?')
         from PyQt6.QtWidgets import QMessageBox
         if ret == QMessageBox.StandardButton.Save:
-            self._on_save()
+            # A returning `_on_save` is NOT proof of a save. It catches its
+            # own write errors, shows its own dialog and returns normally,
+            # and it has early returns that write nothing (no map directory,
+            # overwrite declined). The window-modified flag it clears on
+            # success is the proof.
+            #
+            # Before 2026-11-08 this returned True regardless, so a save that
+            # never happened was followed by loading a different map — which
+            # discards exactly the edits the user had just asked to keep.
+            # Same defect as the close and refresh paths; this one fires in
+            # ordinary use, every time a different map is clicked.
+            try:
+                self._on_save()
+            except Exception as e:
+                self._mw.log_message(
+                    f"Save failed, so EVENTide did not switch map: {e}")
+                QMessageBox.warning(
+                    self, "Your changes were NOT saved",
+                    f"EVENTide could not save this map, so it has not "
+                    f"switched away from it.\n\n{e}\n\nYour unsaved work "
+                    f"is still here.")
+                return False
+            if self._mw.isWindowModified():
+                self._mw.log_message(
+                    "Save did not take, so EVENTide did not switch map.")
+                QMessageBox.warning(
+                    self, "Your changes were NOT saved",
+                    "The save did not go through, so EVENTide has not "
+                    "switched map.\n\nLook for the editor's own error "
+                    "message. Your unsaved work is still here.")
+                return False
             return True
         elif ret == QMessageBox.StandardButton.Discard:
             return True
@@ -7977,6 +8122,15 @@ class EventEditorTab(QWidget):
         self._btn_new_script.setToolTip(_tt(
             'Create a new script from a template'))
         self._btn_new_script.clicked.connect(self._on_new_npc_script)
+        self._btn_add_map_script = QPushButton('Add Map Script')
+        self._btn_add_map_script.setToolTip(_tt(
+            'Give this map a script that runs on its own — no NPC to talk to\n'
+            'and no tile to step on. Use it to set the map up before the\n'
+            'player sees it: move people where the story needs them, hide\n'
+            'someone who should not be there yet, change tiles.\n'
+            'You choose when it runs (as the map loads, on arrival, once a\n'
+            'variable reaches a value, and so on).'))
+        self._btn_add_map_script.clicked.connect(self._on_add_map_script)
         btn_find_flag = QPushButton('Find Unused Flag')
         btn_find_flag.setToolTip(_tt('Scan project for the next available unused flag'))
         btn_find_flag.clicked.connect(self._on_find_unused_flag)
@@ -8011,6 +8165,7 @@ class EventEditorTab(QWidget):
         page_ctrl.addWidget(btn_del_event)
         page_ctrl.addWidget(self._divider_line())
         page_ctrl.addWidget(self._btn_new_script)
+        page_ctrl.addWidget(self._btn_add_map_script)
         page_ctrl.addWidget(btn_find_flag)
         page_ctrl.addWidget(self._btn_vars)
         page_ctrl.addWidget(btn_find_script)
@@ -13104,6 +13259,22 @@ class EventEditorTab(QWidget):
         disp = self.obj_combo.currentText() or 'this event'
         script = obj.get('script', '') or ''
 
+        # The map's script TABLE is not an event and cannot be deleted. The
+        # generated map header points at `<Map>_MapScripts`, so removing the
+        # label does not simplify anything — it stops the project linking.
+        # Emptying it is the supported way to turn every map script off, and
+        # deleting the individual entries below does exactly that.
+        table_event = self._find_map_scripts_table_event()
+        if table_event is not None and obj is table_event:
+            QMessageBox.information(
+                self, 'Delete Event',
+                'This is the map\'s script table, not an event. The map '
+                'header points at it, so deleting it would stop the project '
+                'building.\n\nDelete the individual map scripts instead — an '
+                'empty table is fine and means "this map has no map '
+                'scripts".')
+            return
+
         # Collect the event's script labels (entry + every page label).
         labels = set()
         if not _is_no_script(script):
@@ -13152,6 +13323,13 @@ class EventEditorTab(QWidget):
         self.obj_combo.blockSignals(True)
         self.obj_combo.removeItem(idx)
         self.obj_combo.blockSignals(False)
+
+        # A map script is reached by a row in a table, so deleting the script
+        # without deleting the row leaves the table pointing at a label that
+        # no longer exists — the project stops linking. Strip the rows here,
+        # in the same action, rather than leaving the user to find them.
+        orphaned = self._strip_map_script_rows_pointing_at(script)
+
         self._mark_dirty()
 
         # Show a neighbouring event (or clear the panel if none are left).
@@ -13169,17 +13347,26 @@ class EventEditorTab(QWidget):
             msg += f' + {len(to_delete)} script label(s) (removed on Save)'
         if shared:
             msg += f'; kept {len(shared)} label(s) still used elsewhere'
+        if orphaned:
+            msg += (f'; removed {orphaned} map script table row(s) that '
+                    f'pointed at it')
         self._mw.log_message(msg)
 
         self._mark_dirty()
 
-        # Update module-level labels for dropdown use
+        # Keep the module-level label list in step, so a script that no longer
+        # exists stops being offered in every goto / call dropdown.
+        #
+        # This block used to read `old_label` and `new_label` — names from the
+        # RENAME path, which do not exist here. So every single Delete Event
+        # removed the event and then raised NameError on its way out: the
+        # deletion stood, the exception surfaced as a crash, and the label
+        # stayed in the dropdowns. Nothing in the function ever set those two
+        # names; it could not have worked.
         global _SCRIPT_LABELS
-        if old_label in _SCRIPT_LABELS:
-            _SCRIPT_LABELS.remove(old_label)
-        if new_label not in _SCRIPT_LABELS:
-            _SCRIPT_LABELS.append(new_label)
-            _SCRIPT_LABELS.sort()
+        for gone in to_delete:
+            if gone in _SCRIPT_LABELS:
+                _SCRIPT_LABELS.remove(gone)
 
     def _replace_label_in_cmd(self, cmd_tuple: tuple, old: str, new: str) -> tuple:
         """If cmd_tuple references old label, return a new tuple with it replaced."""
@@ -13288,8 +13475,375 @@ class EventEditorTab(QWidget):
             self.elev_spin.setValue(0)
             self.elev_spin.blockSignals(False)
 
+    # ── Map scripts ─────────────────────────────────────────────────────
+    #
+    # A map script runs without the player doing anything to set it off: the
+    # engine calls it as the map loads, on arrival, or once a variable reaches
+    # a value. EVENTide could always READ one and edit its commands — what it
+    # could not do was create one. Any map whose `<Map>_MapScripts::` table
+    # held only its terminator (every map that had never needed a scene) was a
+    # dead end: a row you could look at with no way to add to it.
+    #
+    # Hiding someone until a scene starts is the ordinary reason to want one.
+    # Vanilla does that with a flag set in a global new-game script, but a map
+    # script that sets the same flag on arrival does the job inside one map and
+    # needs no engine-wide edit — and the engine runs On Transition well before
+    # it spawns any object, so the hidden one is never drawn.
+
+    def _map_label_prefix(self) -> str:
+        """The name this map's labels are built from.
+
+        Mirrors `_load_map`, which reads the name inside map.json and falls
+        back to the folder. The two agree for every stock map, but the loader
+        is the one that finds the table, so building a label off the folder
+        name instead risks writing an entry into a table nothing reads.
+        """
+        name = ''
+        if self._map_data:
+            name = str(self._map_data.get('name') or '')
+        if not name and self._map_dir:
+            name = self._map_dir.name
+        return name
+
+    def _map_script_moments(self) -> list:
+        """The map script moments this project has, read from its own source.
+
+        Cached per project, not per map — the engine's list of moments is a
+        property of the project, and re-walking src/ for every dialog would
+        be wasteful. Keyed by root so switching projects re-reads.
+        """
+        root = self._root_dir
+        cached = getattr(self, '_msm_cache', None)
+        if cached is not None and cached[0] == root:
+            return cached[1]
+        moments: list = []
+        if root:
+            try:
+                from eventide.backend.map_script_types import discover
+                moments = discover(root)
+            except Exception as e:
+                self._mw.log_message(
+                    'Event Editor: could not read the map script moments from '
+                    f'this project — {e}')
+        self._msm_cache = (root, moments)
+        return moments
+
+    def _find_map_scripts_table_event(self) -> dict | None:
+        """This map's script table pseudo-event if it already has one.
+
+        Pure lookup. Kept separate from :meth:`_map_scripts_table_event`,
+        which CREATES one, so that a caller only asking "is this the table?"
+        cannot conjure a table row into a map that has none as a side effect
+        of the question.
+        """
+        prefix = self._map_label_prefix()
+        if not prefix:
+            return None
+        label = f'{prefix}_MapScripts'
+        for obj in self._objects:
+            if (obj.get('_event_type') == 'map_script'
+                    and obj.get('script') == label):
+                return obj
+        return None
+
+    def _map_scripts_table_event(self) -> dict | None:
+        """This map's script table as a pseudo-event, created if it has none.
+
+        The table is `<Map>_MapScripts::` — `map_script` rows ending in
+        `.byte 0`. Every stock map has the label, because the map header points
+        at it and a missing one would not link, but an unused table holds the
+        terminator alone. Returns None only when the map has no name to build
+        a label from.
+        """
+        prefix = self._map_label_prefix()
+        if not prefix:
+            return None
+        existing = self._find_map_scripts_table_event()
+        if existing is not None:
+            return existing
+        label = f'{prefix}_MapScripts'
+        entry = {
+            'script': label,
+            '_event_type': 'map_script',
+            '_pages': [{'commands': [('.byte', '0')], '_label': label,
+                        '_short_label': 'Script Table', '_conditions': [],
+                        '_sub_labels': [label]}],
+        }
+        self._objects.append(entry)
+        self.obj_combo.blockSignals(True)
+        self.obj_combo.addItem('[MapScript] Script Table (Scripts)')
+        self.obj_combo.blockSignals(False)
+        self._register_labels([label])
+        return entry
+
+    @staticmethod
+    def _table_row_insert(cmds: list, row: tuple, terminator: str) -> list:
+        """Put *row* into a script table, keeping the terminator last.
+
+        `.byte 0` ends a `map_script` table and `.2byte 0` ends a
+        `map_script_2` one, and the engine walks the table until it reads that
+        zero. A row placed after it assembles, links, and is never reached —
+        the kind of wrong that only shows up as "my scene doesn't happen".
+        """
+        out = [c for c in cmds if not (c and c[0] == terminator)]
+        out.append(row)
+        out.append((terminator, '0'))
+        return out
+
+    def _taken_labels(self) -> set:
+        """Every script label already spoken for, so a new one can dodge them."""
+        taken = set(self._all_scripts or {})
+        taken |= set(_SCRIPT_LABELS or [])
+        for obj in self._objects:
+            s = obj.get('script')
+            if s:
+                taken.add(s)
+            for page in obj.get('_pages', []) or []:
+                lbl = page.get('_label')
+                if lbl:
+                    taken.add(lbl)
+        return taken
+
+    def _add_map_script_pseudo_event(self, label: str, commands: list,
+                                     caption: str) -> int:
+        """Register a new map-script label as an editable pseudo-event.
+
+        Returns its index in `self._objects` / the event dropdown.
+        """
+        entry = {
+            'script': label,
+            '_event_type': 'map_script',
+            '_pages': [{'commands': list(commands), '_label': label,
+                        '_short_label': self._shorten_label(label),
+                        '_conditions': [], '_sub_labels': [label]}],
+        }
+        self._objects.append(entry)
+        self.obj_combo.blockSignals(True)
+        self.obj_combo.addItem(caption)
+        self.obj_combo.blockSignals(False)
+        self._register_labels([label])
+        return len(self._objects) - 1
+
+    def _on_add_map_script(self):
+        """Give this map a script that runs on its own."""
+        if not self._map_dir or not self._map_data:
+            QMessageBox.information(
+                self, 'Add Map Script',
+                'Open a map first — a map script belongs to one map.')
+            return
+
+        moments = self._map_script_moments()
+        if not moments:
+            QMessageBox.warning(
+                self, 'Add Map Script',
+                "This project's list of map script moments "
+                "(include/constants/map_scripts.h) could not be read, so "
+                "there is no way to tell when its engine runs them.\n\n"
+                "Nothing has been changed.")
+            return
+
+        table = self._map_scripts_table_event()
+        if table is None:
+            QMessageBox.warning(
+                self, 'Add Map Script',
+                'This map has no name, so a script label cannot be built '
+                'for it.\n\nNothing has been changed.')
+            return
+
+        prefix = self._map_label_prefix()
+        dlg = _AddMapScriptDialog(moments, prefix, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        mst = dlg.chosen()
+        if mst is None:
+            return
+        var, value = dlg.condition()
+        if mst.is_table and not var:
+            QMessageBox.warning(
+                self, 'Add Map Script',
+                f'{mst.label} only runs while a variable holds a particular '
+                f'value, so it needs one chosen.\n\nNothing has been added.')
+            return
+
+        from eventide.backend.map_script_types import label_for
+
+        taken = self._taken_labels()
+        table_page = table['_pages'][0]
+        select_idx = -1
+
+        if mst.is_table:
+            # Two labels: the inner table of `map_script_2` rows that the map
+            # table points at, and the scene one of those rows runs. The user
+            # wants to write the scene, so that is the one we open.
+            inner = label_for(self._root_dir, prefix, mst, taken)
+            taken.add(inner)
+            scene = f'{prefix}_EventScript_{mst.suffix}'
+            n = 2
+            while scene in taken:
+                scene = f'{prefix}_EventScript_{mst.suffix}_{n}'
+                n += 1
+            taken.add(scene)
+
+            table_page['commands'] = self._table_row_insert(
+                table_page.get('commands', []),
+                ('map_script', f'{mst.const}, {inner}'), '.byte')
+            self._add_map_script_pseudo_event(
+                inner,
+                [('map_script_2', f'{var}, {value}, {scene}'),
+                 ('.2byte', '0')],
+                f'[MapScript] {mst.label}: {self._shorten_label(inner)}')
+            select_idx = self._add_map_script_pseudo_event(
+                scene, [('end',)],
+                f'[MapScript] {mst.label} scene: '
+                f'{self._shorten_label(scene)}')
+            made = f'{inner} + {scene}'
+        else:
+            target = label_for(self._root_dir, prefix, mst, taken)
+            table_page['commands'] = self._table_row_insert(
+                table_page.get('commands', []),
+                ('map_script', f'{mst.const}, {target}'), '.byte')
+            select_idx = self._add_map_script_pseudo_event(
+                target, [('end',)],
+                f'[MapScript] {mst.label}: {self._shorten_label(target)}')
+            made = target
+
+        # Keep the table row's own caption honest — it summarises the moments
+        # the table holds, and it just gained one.
+        self._refresh_map_script_table_caption(table)
+
+        self._mark_dirty()
+        self._mw.log_message(
+            f'Event Editor: added a {mst.label} map script to {prefix} '
+            f'({made}) — nothing on disk until Save')
+
+        if select_idx >= 0:
+            self.obj_combo.blockSignals(True)
+            self.obj_combo.setCurrentIndex(select_idx)
+            self.obj_combo.blockSignals(False)
+            self._display_object(select_idx)
+
+    def _strip_map_script_rows_pointing_at(self, label: str) -> int:
+        """Remove every table row that runs *label*. Returns how many went.
+
+        Both row shapes name their target LAST — `map_script TYPE, LABEL` and
+        `map_script_2 VAR, VALUE, LABEL` — so one rule covers the map's own
+        table and the inner `map_script_2` tables alike, and deleting either
+        an entry or the scene an entry runs cleans up after itself.
+
+        Rows are matched on the target, never on position: a table the user
+        reordered by hand still has the right row removed.
+        """
+        if not label or _is_no_script(label):
+            return 0
+        removed = 0
+        for obj in self._objects:
+            if obj.get('_event_type') != 'map_script':
+                continue
+            for page in obj.get('_pages', []) or []:
+                cmds = page.get('commands') or []
+                kept = []
+                dropped = 0
+                for ct in cmds:
+                    if (ct and ct[0] in ('map_script', 'map_script_2')
+                            and len(ct) > 1):
+                        target = str(ct[1]).split(',')[-1].strip()
+                        if target == label:
+                            dropped += 1
+                            continue
+                    kept.append(ct)
+                if dropped:
+                    page['commands'] = kept
+                    removed += dropped
+        if removed:
+            table = self._find_map_scripts_table_event()
+            if table is not None:
+                self._refresh_map_script_table_caption(table)
+        return removed
+
+    def _refresh_map_script_table_caption(self, table: dict):
+        """Re-summarise the moments the map's script table holds.
+
+        The dropdown row for the table reads "Script Table (On Transition, On
+        Frame)". Adding or removing an entry changes that list, and a stale
+        caption is how a user concludes the entry did not take.
+        """
+        try:
+            idx = self._objects.index(table)
+        except ValueError:
+            return
+        kinds: list[str] = []
+        for ct in table.get('_pages', [{}])[0].get('commands', []) or []:
+            if not ct:
+                continue
+            if ct[0] == 'map_script' and len(ct) > 1:
+                type_arg = str(ct[1]).split(',')[0].strip()
+                kinds.append(_MAP_SCRIPT_TYPES.get(type_arg, type_arg))
+            elif ct[0] == 'map_script_2':
+                kinds.append('Conditional')
+        summary = ', '.join(kinds) if kinds else 'Scripts'
+        self.obj_combo.blockSignals(True)
+        self.obj_combo.setItemText(
+            idx, f'[MapScript] Script Table ({summary})')
+        self.obj_combo.blockSignals(False)
+
+    def _flag_users_on_this_map(self, flag: str) -> list[str]:
+        """Scripts on this map that mention *flag*, most useful ones first.
+
+        Used to warn before a flag already doing a job is swapped out. The map
+        now open is the right scope: a flag an event HIDES on is nearly always
+        set or cleared by a script on the same map, and that pairing is the
+        thing a replacement breaks.
+        """
+        if not flag or not flag.startswith('FLAG_'):
+            return []
+        users: list[str] = []
+        for label, cmds in (self._all_scripts or {}).items():
+            if not isinstance(cmds, list) or label.startswith('__'):
+                continue
+            for ct in cmds:
+                if not ct:
+                    continue
+                if any(isinstance(part, str) and flag in part
+                       for part in ct[1:]):
+                    users.append(label)
+                    break
+        return users
+
     def _on_pick_unused_object_flag(self):
-        """Fill the object's visibility flag with the next genuinely unused one."""
+        """Fill the object's visibility flag with the next genuinely unused one.
+
+        Find unused hands out a BRAND-NEW flag. That is right for an event
+        that has none and wrong for one that already has a flag its own
+        scripts name — which is the normal case for an item ball or a one-off
+        NPC. Replacing it leaves the object hiding on the new flag while every
+        `setflag` / `clearflag` still names the old one, so the event comes
+        back every time the player re-enters the map. The build is fine; only
+        playing it shows the fault.
+        """
+        current = self.obj_flag_combo.selected_constant().strip()
+        if current and current.startswith('FLAG_'):
+            users = self._flag_users_on_this_map(current)
+            body = (f'This event already hides on {_resolve_name(current)} '
+                    f'({current}).\n\n')
+            if users:
+                shown = ', '.join(sorted(set(users))[:4])
+                body += (f'{len(set(users))} script(s) on this map still name '
+                         f'that flag:\n  {shown}\n\n'
+                         f'Replacing it leaves this event hiding on a new '
+                         f'flag while those scripts keep setting the old one '
+                         f'— so it would stop staying hidden.\n\n')
+            else:
+                body += ('Nothing on this map names that flag yet, so '
+                         'replacing it is probably harmless.\n\n')
+            body += 'Find a different flag anyway?'
+            if QMessageBox.question(
+                    self, 'Find Unused Flag', body,
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
         found = self._find_unused_flags(1)
         if not found:
             QMessageBox.information(
@@ -13299,8 +13853,13 @@ class EventEditorTab(QWidget):
             return
         self.obj_flag_combo.set_constant(found[0])
         self._mark_dirty()
-        self._mw.log_message(
-            f'Event Editor: object visibility flag set to {found[0]}')
+        if current:
+            self._mw.log_message(
+                f'Event Editor: object visibility flag changed from '
+                f'{current} to {found[0]}')
+        else:
+            self._mw.log_message(
+                f'Event Editor: object visibility flag set to {found[0]}')
 
     def _on_find_unused_flag(self):
         """Report how many flags are genuinely free, and name the next one."""
@@ -15106,7 +15665,18 @@ class EventEditorTab(QWidget):
         # Ensure the map script table runs our On Transition, preserving any
         # other map_script entries (on-load, on-frame, etc.).
         table_label = f'{map_name}_MapScripts'
-        existing_table = self._all_scripts.get(table_label, []) or []
+        # Build on what the save is ABOUT to write, not on what is still on
+        # disk. The object loop above has already put the table into
+        # save_pages from the editor's own pseudo-event, so a row the user
+        # added with Add Map Script this session lives there and nowhere else.
+        # Reading `_all_scripts` alone — as this did — rebuilt the table from
+        # the pre-edit state and silently dropped every entry added since the
+        # map was loaded, which is the one way these two features could
+        # collide: a map with both State Appearance data and a hand-added
+        # On Load would lose the On Load on the first save.
+        existing_table = (save_pages.get(table_label)
+                          if table_label in save_pages
+                          else self._all_scripts.get(table_label, [])) or []
         new_table: list = []
         for ct in existing_table:
             if not ct or ct[0] not in ('map_script', 'map_script_2'):

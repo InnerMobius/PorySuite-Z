@@ -8,6 +8,7 @@ from collections import OrderedDict
 # Paths now reference files directly under include/ and src/.
 
 from core.pokemon_data_extractor_base import PokemonDataExtractor
+from . import hoenn_dex
 from .utils import preprocess_c_file
 
 
@@ -276,13 +277,23 @@ def parse_pokedex_entries(util) -> dict[str, dict]:
     if not lines:
         print("Missing file or empty read for pokedex entries")
     # collect valid species constants from species.h
+    #
+    # The value is never used here -- this set only answers "is this a real
+    # species?" -- so it must not be part of the match. It used to require
+    # `\s+(\d+)`, decimal digits, which silently excluded every species
+    # PorySuite itself appends: those are written as
+    # `#define SPECIES_FOO (NUM_SPECIES + 30)`, an expression. In the owner's
+    # project that was 77 of 490 creatures, and every one of their Pokedex
+    # entries was dropped whole -- no description symbol, no category, no
+    # height, weight, scale or offset. The editor showed them blank while the
+    # engine had real values.
     species_path = os.path.join(root, "include", "constants", "species.h")
     species_consts = set()
     if os.path.isfile(species_path):
         print(f"Reading {os.path.abspath(species_path)}")
         with open(species_path, encoding="utf-8") as f:
             for ln in f:
-                m = re.match(r"#define\s+(SPECIES_[A-Z0-9_]+)\s+(\d+)", ln)
+                m = re.match(r"#define\s+(SPECIES_[A-Z0-9_]+)\s+\S", ln)
                 if m:
                     species_consts.add(m.group(1))
 
@@ -1988,17 +1999,216 @@ class PokedexDataExtractor(PokemonDataExtractor):
         return key, value
 
     HEADER_FILE = os.path.join("include", "constants", "pokedex.h")
+    POKEMON_C = os.path.join("src", "pokemon.c")
+
+    # Bumped whenever a parser change means an EXISTING cache no longer says
+    # what the engine says. A cache without this stamp was written by a parser
+    # we no longer trust, so it is rebuilt once and then left alone. Timestamps
+    # cannot answer this: the cache is NEWER than the source it misread.
+    CACHE_FORMAT = 2
+
+    # pokedex.json is derived from all of these, but only pokedex.h is
+    # registered as a backed-up file and the inherited freshness check compares
+    # only registered files. So an edit to the entry blocks or to either
+    # description file -- by hand, by a merge, by another tool -- left the
+    # cache looking perfectly current.
+    WATCHED_FILES = (
+        os.path.join("src", "data", "pokemon", "pokedex_entries.h"),
+        os.path.join("src", "data", "pokemon", "pokedex_text_fr.h"),
+        os.path.join("src", "data", "pokemon", "pokedex_text_lg.h"),
+        os.path.join("include", "constants", "species.h"),
+    )
+
+    def should_extract(self) -> bool:
+        """Return ``True`` when ``pokedex.json`` needs rebuilding.
+
+        Three things can make the cache wrong and the inherited check sees none
+        of them:
+
+        * It compares only the files registered for backup -- just pokedex.h --
+          so a change to the entry blocks or the description text goes
+          unnoticed. ``WATCHED_FILES`` closes that.
+        * A cache written before the regional Pokedex existed as a model
+          carries no ``hoenn_order``; without it the save path has no
+          authoritative regional dex and quietly declines to write one.
+        * A cache can be NEWER than the source it misread. No timestamp can
+          detect that, which is why ``CACHE_FORMAT`` is stamped on write.
+        """
+        if super().should_extract():
+            return True
+
+        root = self.local_util.repo_root()
+        path = os.path.join(root, "src", "data", self.DATA_FILE)
+        try:
+            cache_mtime = os.path.getmtime(path)
+        except OSError:
+            return True
+        for rel in self.WATCHED_FILES:
+            try:
+                if os.path.getmtime(os.path.join(root, rel)) > cache_mtime:
+                    return True
+            except OSError:
+                continue  # a file that is not there cannot be newer
+
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f) or {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return True
+        if not isinstance(data, dict):
+            return True
+        if data.get("cache_format") != self.CACHE_FORMAT:
+            return True
+        return not data.get("hoenn_order")
+
+    def _extract_hoenn_dex(self) -> dict:
+        """Read the engine's real regional (Hoenn) Pokedex.
+
+        Returns the cache fragment: ``hoenn_order`` plus ``regional_count``,
+        which together are the authoritative model, and a derived
+        ``regional_dex`` for the views that read one.
+
+        On any parse failure this returns an ``hoenn_dex_error`` and NO
+        ordering, so regional serialization stays disabled. It deliberately
+        does NOT fall back to the old national-order slice: that fallback could
+        then be written into engine source and destroy a hand-curated dex.
+        """
+        root = self.local_util.repo_root()
+        header_path = os.path.join(root, self.HEADER_FILE)
+        c_path = os.path.join(root, self.POKEMON_C)
+
+        # RAW text, not `_read_header`'s preprocessed lines. The Hoenn section
+        # is identified by a COMMENT, which preprocessing can strip, and the
+        # writer has to see byte-for-byte what this parser saw or a no-op save
+        # will not round-trip.
+        try:
+            with open(header_path, encoding="utf-8", newline="") as f:
+                header_text = f.read()
+        except OSError as exc:
+            msg = (
+                f"Could not read {self.HEADER_FILE} ({exc}), so the regional "
+                "Pokedex is unavailable. No engine file was modified."
+            )
+            print(f"Regional Pokedex: {msg}")
+            self.messages.append(msg)
+            return {"hoenn_dex_error": msg}
+
+        c_text = ""
+        try:
+            with open(c_path, encoding="utf-8", newline="") as f:
+                c_text = f.read()
+        except OSError:
+            # parse() then falls back to the macro's own name correspondence.
+            print(f"Missing {self.POKEMON_C}; Hoenn identities unverified")
+
+        try:
+            dex = hoenn_dex.parse(header_text, c_text)
+        except hoenn_dex.HoennDexError as exc:
+            print(f"Regional Pokedex: {exc}")
+            self.messages.append(str(exc))
+            return {"hoenn_dex_error": str(exc)}
+
+        frag = dex.to_cache()
+        frag["hoenn_dex_error"] = None
+        # Derived view for the lists that read a flat regional membership.
+        # Regenerated from the model on every extraction; the writer never
+        # reads it, so it cannot become a competing source of truth.
+        frag["regional_dex"] = [
+            {
+                "dex_constant": dex.national.get(h),
+                "hoenn_constant": h,
+            }
+            for h in dex.included
+        ]
+        print(
+            f"Regional Pokedex: {dex.regional_count} of {len(dex.order)} "
+            "Hoenn entries are in the dex [OK]"
+        )
+        return frag
+
+    def _reconcile_hoenn_dex(self, data: dict) -> None:
+        """Bring a cached ``pokedex.json`` onto the authoritative Hoenn model.
+
+        Older caches carry only ``regional_dex``, which was
+        ``national_dex[:KANTO_DEX_COUNT]`` and never described the engine. That
+        stale interpretation is replaced rather than kept as an alternate
+        dataset -- but only after engine extraction actually succeeds.
+
+        A cached ``regional_dex`` that still equals the national slice is
+        purely derived, so there is nothing to lose. One that DIFFERS was edited
+        by the user through the Info-tab tick and never reached the engine, so
+        it is reported rather than silently discarded.
+        """
+        if not isinstance(data, dict):
+            return
+        if data.get("hoenn_order"):
+            return  # already on the authoritative model
+
+        frag = self._extract_hoenn_dex()
+        if not frag.get("hoenn_order"):
+            # Extraction failed. Leave the cache alone and keep serialization
+            # disabled; do not promote the stale slice to authoritative.
+            data["hoenn_dex_error"] = frag.get("hoenn_dex_error")
+            return
+
+        stale = data.get("regional_dex") or []
+        natdex = data.get("national_dex") or []
+        if stale and not self._is_national_slice(stale, natdex):
+            msg = (
+                f"The previous regional Pokedex list held {len(stale)} entries "
+                "that did not come from the National Dex order, so it may "
+                "contain edits made before this version. Those edits were "
+                "never written to the game. The list has been replaced with "
+                "the game's own regional Pokedex; the old entries are still in "
+                "the National Dex and nothing was deleted."
+            )
+            print(f"Regional Pokedex: {msg}")
+            self.messages.append(msg)
+
+        data.update(frag)
+
+    @staticmethod
+    def _is_national_slice(regional: list, natdex: list) -> bool:
+        """Is this cached list simply the first N of the national order?
+
+        That is what the old extractor produced, so a match means the list is
+        derived and carries no user intent.
+        """
+        def _const(entry):
+            if isinstance(entry, dict):
+                return entry.get("dex_constant")
+            return entry
+
+        reg = [_const(e) for e in regional]
+        nat = [_const(e) for e in natdex]
+        return bool(reg) and nat[: len(reg)] == reg
 
     def extract_data(self) -> dict | None:
         self.messages = []
         json_path = os.path.join(self.local_util.repo_root(), "src", "data", self.DATA_FILE)
         if not os.path.isfile(json_path):
             print(f"Missing file: {os.path.abspath(json_path)}")
-        header_abs = os.path.join(self.local_util.repo_root(), self.HEADER_FILE)
-        data = _load_json(json_path)
-        if data is not None:
-            print(f"Loaded {len(data['national_dex'])} pokedex entries [OK]")
-            return data
+        # The cache is a FALLBACK here, never the answer.
+        #
+        # This used to return pokedex.json outright whenever the file existed.
+        # But extract_data is only ever CALLED when the cache is missing or
+        # stale -- instantiate_extractor establishes that first -- so returning
+        # it handed straight back the data that had just been judged
+        # untrustworthy, and the engine read below never happened.
+        #
+        # What that cost: a cache written by an older parser that could not see
+        # species defined as expressions kept 77 creatures permanently blank in
+        # the editor -- no category, height, weight, scale or description --
+        # while the real values sat in pokedex_entries.h the whole time.
+        # Reopening never helped, because the only code that reads that file is
+        # below this point. The parser was fixed and nothing changed on screen.
+        #
+        # Re-reading loses nothing: every field here is derived from engine
+        # source, and the editor writes the engine before it writes this cache.
+        # Verified against a real project -- 488 cached entries, zero fields
+        # where cache and engine disagreed, zero keys a fresh read could not
+        # reproduce.
+        cached = _load_json(json_path)
 
         lines = _read_header(self.local_util, self.HEADER_FILE)
         if not lines:
@@ -2051,30 +2261,26 @@ class PokedexDataExtractor(PokemonDataExtractor):
                 if text is not None:
                     entry["descriptionText"] = text
 
-        # Build regional dex: use Kanto Dex count if defined, else default to 151
-        kanto_count = 151
-        try:
-            for ln in lines:
-                clean = _clean_line(ln)
-                m = re.match(r"#define\s+KANTO_DEX_COUNT\s+(NATIONAL_DEX_[A-Z0-9_]+)", clean)
-                if m:
-                    cutoff = m.group(1)
-                    # Find index of cutoff in valid list
-                    for i, entry in enumerate(valid, start=1):
-                        if entry.get("dex_constant") == cutoff:
-                            kanto_count = i
-                            break
-                    break
-        except Exception:
-            pass
-        regional = [{"dex_constant": entry.get("dex_constant")} for entry in valid[:kanto_count]]
-
-        data = {"national_dex": valid, "regional_dex": regional}
+        # Regional dex: read the engine's REAL Hoenn ordering and boundary.
+        #
+        # This used to be `valid[:KANTO_DEX_COUNT]` -- a slice of the NATIONAL
+        # order under a regional label. In a real project that matched the
+        # engine's regional dex in neither length (151 vs 202), order, nor
+        # membership: only 47 of the 151 names appeared in it at all. See
+        # core/hoenn_dex.py for the authoritative model.
+        data = {"national_dex": valid, "cache_format": self.CACHE_FORMAT}
+        data.update(self._extract_hoenn_dex())
 
         if len(valid) < 1:
             print(
                 f"Error: expected at least 1 pokedex entry but parsed {len(valid)}. Aborting pokedex load."
             )
+            # The engine read produced nothing. Hand back what was on disk
+            # rather than replacing a real Pokedex with an empty one -- that is
+            # the only reason the cache is still loaded above.
+            if cached is not None:
+                self._reconcile_hoenn_dex(cached)
+                return cached
             return data
         if not _write_json(json_path, data, 1):
             print("Aborting pokedex load.")

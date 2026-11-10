@@ -668,6 +668,23 @@ class TrainerGraphicsTab(QWidget):
         self._pic_keys = sorted(pic_map.keys())
         self._palettes.clear()
         self._palette_dirty.clear()
+        # Finding item 3. F5 means "throw away my in-memory edits and reload
+        # from disk", and these two were the only pieces of edit state this
+        # tab never dropped — in fact nothing in this file ever cleared them,
+        # so they outlived a project switch too.
+        #
+        # Together they are what bites: `_sprite_png_dirty` says "these still
+        # need writing" and `_sprite_imgs` supplies the discarded pixels, so
+        # pressing F5, clicking a sprite you had edited, and saving wrote the
+        # edit you had just discarded. Without re-clicking it you got a quiet
+        # save error instead, and the stale entry never cleared because
+        # entries are only removed on a SUCCESSFUL write.
+        #
+        # They belong here, in the reset block BEFORE the grid is rebuilt,
+        # so a load that fails partway cannot drop the record while leaving
+        # the stale images behind.
+        self._sprite_png_dirty.clear()
+        self._sprite_imgs.clear()
         self._current_pic = None
         self._current_png_path = ""
         self._dirty_dot.hide()

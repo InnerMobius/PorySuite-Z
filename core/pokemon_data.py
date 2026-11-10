@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from local_env import LocalUtil
 from . import pokemon_data_extractor as pee
+from . import hoenn_dex
 from .refactor_service import RefactorService
 
 
@@ -2899,11 +2900,90 @@ class Pokedex(pokemon_data.Pokedex):
         patched = pre + new_body + post
         new_content = "".join(patched)
 
+        # Regional (Hoenn) Pokedex: the enum body and HOENN_DEX_COUNT.
+        #
+        # Both live in this same file, so the national and regional edits are
+        # prepared together and written in ONE write. If the regional model is
+        # unsound, serialize() raises before anything is written and the
+        # national edit goes nowhere either -- so a half-updated pokedex.h is
+        # not a state this can produce. That is all-or-nothing at the file
+        # level; it is NOT crash-atomic, and the surrounding backup/rollback
+        # machinery is what covers a crash mid-write.
+        #
+        # The two macro tables in src/pokemon.c are deliberately NOT written.
+        # SPECIES_TO_HOENN and HOENN_TO_NATIONAL derive both index and value
+        # from the name, so the preprocessor re-indexes every row from this
+        # enum; the engine says so itself above the arrays. Regenerating them
+        # would buy nothing and risk an off-by-one that still compiles while
+        # misidentifying Pokemon. See core/hoenn_dex.py.
+        new_content = self._apply_hoenn_dex(new_content)
+
         # Only write back if content changed
         if new_content != content:
             with WriteSourceFile(self.project_info, rel_path) as wf:
                 wf.write(new_content)
-        # Done: Hoenn enum, defines, guards, and comments remain untouched.
+
+    def _apply_hoenn_dex(self, header_text: str) -> str:
+        """Return ``header_text`` with the regional Pokedex updated.
+
+        Returns it unchanged when there is no authoritative model to write --
+        an older cache, or an extraction that failed. Writing a guessed
+        regional dex would overwrite the user's real one, so not writing is the
+        only safe behaviour here.
+        """
+        order = self.data.get("hoenn_order") or []
+        if not order:
+            err = self.data.get("hoenn_dex_error")
+            if err:
+                logger.warning("Regional Pokedex not saved: %s", err)
+            return header_text
+
+        count = self.data.get("regional_count")
+        if not isinstance(count, int):
+            logger.warning(
+                "Regional Pokedex not saved: the membership boundary is "
+                "missing from the project data."
+            )
+            return header_text
+
+        consts: list[str] = []
+        national: dict[str, str] = {}
+        for entry in order:
+            if isinstance(entry, dict):
+                h = entry.get("hoenn_constant")
+                national[h] = entry.get("dex_constant")
+            else:
+                h = entry
+                national[h] = None
+            if h:
+                consts.append(h)
+
+        # Take the layout -- indentation and the boundary comments -- from the
+        # file being patched, not from the cache. The cache does not carry them,
+        # and defaulting them would quietly delete the engine's own comments on
+        # the first save. Reading them here means comment preservation does not
+        # depend on what some earlier extraction happened to store.
+        try:
+            _existing, boundary_comments, indent = hoenn_dex.parse_hoenn_order(
+                header_text
+            )
+        except hoenn_dex.HoennDexError as exc:
+            logger.warning(
+                "Regional Pokedex not saved: the Hoenn section of pokedex.h "
+                "could not be read back before writing (%s). The file was "
+                "left as it is.", exc,
+            )
+            return header_text
+
+        dex = hoenn_dex.HoennDex(
+            order=consts,
+            regional_count=count,
+            national=national,
+            boundary_comments=boundary_comments,
+            indent=indent,
+        )
+        # Raises HoennDexError on an unsound model, before any write.
+        return hoenn_dex.serialize(header_text, dex)
 
 class PokemonDataManager(pokemon_data.PokemonDataManager):
     """

@@ -1497,8 +1497,27 @@ class UnifiedMainWindow(QMainWindow):
                 "unsaved-changes check failed for %s", label)
             return None
 
-    def _on_save_all(self):
-        """Save all dirty editors and emit change signals."""
+    def _on_save_all(self) -> bool:
+        """Save all dirty editors and emit change signals.
+
+        Returns True when a caller may safely go on to do something that
+        destroys unsaved work — close the window, refresh from disk, switch
+        project. False means the work is still only in memory: either the
+        user cancelled the confirmation below, or at least one editor failed
+        or only partly saved.
+
+        WHY THIS RETURNS SOMETHING (2026-11-08). The 2026-10-29 repair made
+        failures VISIBLE to the user but never AVAILABLE to callers — this
+        method returned None on every path. So `_refresh_project` (F5) and
+        `closeEvent` called it, ignored the result, and destroyed exactly the
+        edits the user had just asked to protect. `SaveOutcome` already
+        computed the answer; it was dropped at the method boundary.
+
+        A cancelled confirmation returns False deliberately. The user reaches
+        it by choosing Save over Discard on a close or refresh prompt and then
+        declining to write, so nothing was saved and the destructive step must
+        not go ahead. Discard is still offered on a fresh attempt.
+        """
         ans = QMessageBox.question(
             self, "Save All",
             "Save all changes to disk?\n\n"
@@ -1508,7 +1527,7 @@ class UnifiedMainWindow(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         )
         if ans != QMessageBox.StandardButton.Yes:
-            return
+            return False
 
         # Per-editor outcome bookkeeping. Before 2026-10-29 each editor set its
         # own ad-hoc flag, every failure went only to the side log panel, and
@@ -1905,6 +1924,15 @@ class UnifiedMainWindow(QMainWindow):
             self.statusBar().showMessage("All changes saved.", 4000)
         else:
             self.statusBar().showMessage("Nothing to save.", 2000)
+
+        # The answer a destructive caller needs. `all_ok()` is True for an
+        # editor that had nothing to save, which is right here: there is
+        # nothing left in memory to lose. An EMPTY outcome also reports True,
+        # which happens only when no project is loaded — a loaded project
+        # always records "PorySuite data" — and allowing the close then is
+        # correct. Said out loud because "nothing was recorded" and
+        # "everything succeeded" must never be confused by accident.
+        return outcome.all_ok()
 
     def _report_save_outcome(self, outcome) -> None:
         """Show ONE dialog naming what saved and what did not.
@@ -3211,7 +3239,16 @@ class UnifiedMainWindow(QMainWindow):
             if ret == QMessageBox.StandardButton.Cancel:
                 return
             if ret == QMessageBox.StandardButton.Save:
-                self._on_save_all()
+                # Refreshing reloads every editor from disk. If the save did
+                # not happen, going ahead discards precisely the edits the
+                # user just asked to protect — the defect this guard fixes
+                # (2026-11-08). Save All has already told them what went
+                # wrong, so say nothing more; just leave the work alone.
+                if not self._on_save_all():
+                    self.log_message(
+                        "Refresh cancelled: your changes were not saved, so "
+                        "reloading from disk would have discarded them.")
+                    return
 
         # Refresh PorySuite (clears caches, re-parses headers, reloads all editors)
         if self._porysuite_window:
@@ -3509,7 +3546,35 @@ class UnifiedMainWindow(QMainWindow):
     # ═════════════════════════════════════════════════════════════════════════
 
     def _has_unsaved_changes(self) -> bool:
-        """Check if any editor has unsaved changes."""
+        """Check if any editor has unsaved changes.
+
+        WHY THE WINDOW'S OWN FLAG IS READ FIRST (2026-11-08). The named list
+        below answered a SHORTER question than Save All asks: Save All records
+        outcomes for twelve editors, this consulted six attributes. The
+        Tilemap Editor was absent entirely and the sound branch reached only
+        `_voicegroups_tab`, so a pending tilemap, tile-animation, instrument
+        or piano-roll edit made the window close with no prompt at all —
+        verified down to an unchanged `.bin` on disk while the editor itself
+        said it had unsaved work.
+
+        Adding four more names would have drifted again. Those editors are
+        already reporting correctly, through a channel this method ignored:
+        they call `setWindowModified(True)` on THIS window. Reading that flag
+        subsumes the list instead of extending it.
+
+        Safe to rely on because clearing it is disciplined: the unified flag
+        is cleared on project load, on F5 (both of which wipe in-memory edits
+        by design) and in Save All only when `outcome.all_ok()`. Setting it
+        is suppressed during loads and bulk population by `_suppress_dirty`,
+        `_ps_suppress_dirty` and `_loading_depth`.
+
+        Keep the named checks below. `_porysuite_window` and
+        `_eventide_window` track their own flags and are not covered by this
+        one, and the editors with a real `has_unsaved_changes()` are a more
+        precise answer when they are present.
+        """
+        if self.isWindowModified():
+            return True
         if self._porysuite_window and self._porysuite_window.isWindowModified():
             return True
         if self._eventide_window and self._eventide_window.isWindowModified():
@@ -3540,7 +3605,17 @@ class UnifiedMainWindow(QMainWindow):
             self,
             "You have unsaved changes. Would you like to save before closing?")
         if ret == QMessageBox.StandardButton.Save:
-            self._on_save_all()
+            # A save that did not happen must not be followed by a close
+            # (2026-11-08). No "Close Anyway" is offered at this moment on
+            # purpose: the user already chose Save over Discard, and a second
+            # destructive button here invites an accidental discard. Discard
+            # is still on the dialog if they try to close again.
+            if not self._on_save_all():
+                event.ignore()
+                # Quit to Launcher routes through close(), so a blocked quit
+                # must not leave the relaunch armed.
+                self._return_to_launcher = False
+                return
             event.accept()
             self._maybe_relaunch_to_launcher()
         elif ret == QMessageBox.StandardButton.Discard:

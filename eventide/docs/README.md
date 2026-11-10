@@ -146,7 +146,30 @@ applied.
 - **New Script templates**: NPC Scripts, Signs, Map Scripts, Standard Wrappers, Field Objects, Item Balls
 - **New Hidden Item**: Creates a data-only hidden item (no script) with auto-found unused flag
 - **Hidden Item Editor**: Dedicated property panel for hidden items (item, flag, quantity, position, elevation, underfoot)
-- **Find Unused Flag**: Scans the project for available `FLAG_UNUSED_*` constants
+- **Find Unused Flag**: Scans the project for a slot that is referenced nowhere in `src`, `data`,
+  `include` or `asm` AND sits outside the regions the engine addresses by slot number. If the event
+  already has a flag, it asks first and tells you how many scripts on this map still name that flag —
+  replacing one that a `setflag` elsewhere still points at breaks the pair silently.
+- **Add Map Script**: Gives the map a script that runs on its own, with no NPC to talk to and no tile
+  to step on. You pick the moment — as the map loads, on arrival, once a variable reaches a value,
+  and so on — and get an empty script to write. The list of moments is read from the project's own
+  `include/constants/map_scripts.h`, so a hack that adds one gets it offered.
+
+### Making someone appear partway through the game
+
+The engine does not draw an object while its hide flag is on, so the pattern is: the flag starts on,
+and the scene turns it off.
+
+1. Give the NPC a flag in **Hide when flag** (`Find unused` picks a free one).
+2. Make that flag start switched on. Two ways, both supported:
+   - **Add Map Script → On Transition**, then `Set Flag` on it. On Transition runs before the map's
+     objects are drawn, so the NPC is never shown. This keeps everything inside the one map.
+   - **Variables & Flags → "Switched ON when a new game starts"**. This is how vanilla does it, in
+     one script shared by the whole game.
+3. In the scene that reveals them, use **Add NPC/Object** on their local id. That command ignores the
+   hide flag, so they appear for the scene without the flag having to change.
+4. When they should be gone for good, `Remove Object` and `Set Flag` — and the flag keeps them away
+   on every later visit.
 
 ### Command list interaction
 - **Keyboard**: `Del` delete, `Ctrl+C` / `Ctrl+X` / `Ctrl+V` copy / cut / paste, `Ctrl+D` duplicate,

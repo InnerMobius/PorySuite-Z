@@ -147,22 +147,20 @@ def test_preview_entries_render_as_the_dialog_expects(svc):
         assert "ITEM_" in line
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN DEFECT, confirmed 2026-10-29, deliberately NOT fixed here. "
-    "_search_and_replace matches constants as SUBSTRINGS with no word "
-    "boundary, so renaming ITEM_OLD also rewrites ITEM_OLDER. This is not "
-    "cosmetic: the same function performs the real rename (apply_pending -> "
-    "_search_and_replace(preview_only=False)), and the user's project really "
-    "contains ITEM_TEA as a prefix of ITEM_TEACHY_TV — renaming ITEM_TEA to "
-    "ITEM_CHAI produces the undefined constant ITEM_CHAICHY_TV and breaks the "
-    "build. Proved in scratchpad/prove_prefix_bug.py. "
-    "_search_and_replace is shared by EVERY rename type (species, moves, "
-    "abilities, trainers, items) and already carries deliberate special-case "
-    "protection for species/MAPSEC collisions, so adding word boundaries is a "
-    "change to a shared system and needs its own authorisation. "
-    "When it is fixed, this test starts passing and strict=True will say so."))
 def test_preview_does_not_claim_unrelated_files(svc):
-    """ITEM_OLDER must not be reported — or rewritten — as an ITEM_OLD hit."""
+    """ITEM_OLDER must not be reported — or rewritten — as an ITEM_OLD hit.
+
+    Was a strict xfail from 2026-10-29 to 2026-11-08, recording that
+    `_search_and_replace` matched constants as bare SUBSTRINGS: renaming
+    ITEM_TEA to ITEM_CHAI produced the undefined ITEM_CHAICHY_TV out of
+    ITEM_TEACHY_TV and broke the build. `_search_and_replace` is shared by
+    every rename type, so the repair needed its own authorisation; it got it,
+    and the xfail XPASSED, which is what strict=True is for.
+
+    The matcher is now `core.refactor_service._bounded`. Read its docstring
+    before changing any of this: the boundary pair is asymmetric on purpose
+    and a symmetric \b breaks `old_octo.4bpp` and `gMonFrontPic_Paras`.
+    """
     previews = svc.rename_item("ITEM_OLD", "ITEM_NEW", display_name="",
                                preview=True)
     bad = [p for p in previews if os.path.basename(str(p[0])) == "unrelated.c"]
@@ -197,9 +195,10 @@ def test_unrelated_constants_survive_a_confirmed_rename(svc, project, tmp_path):
     asserted on the queueing call alone and passed without a single byte
     changing.
 
-    ITEM_OLDER is NOT asserted here: it is currently corrupted by the
-    substring match, which `test_preview_does_not_claim_unrelated_files`
-    records as a known defect.
+    ITEM_OLDER IS asserted here as of 2026-11-08. It used to be left out
+    because the substring match genuinely corrupted it; the bounded matcher
+    fixed that, so the assertion belongs in the test rather than in a comment
+    explaining its absence.
     """
     svc.history = {}
     svc.history_path = str(tmp_path / "history.json")
@@ -215,6 +214,14 @@ def test_unrelated_constants_survive_a_confirmed_rename(svc, project, tmp_path):
         encoding="utf-8")
     assert "giveitem ITEM_NEW" in inc, "map scripts were not updated"
     assert "giveitem ITEM_KEEP" in inc, "an unrelated giveitem was rewritten"
+
+    # The neighbour that shares ITEM_OLD as a PREFIX. This is the one the
+    # substring matcher turned into ITEM_NEWER and the build then rejected.
+    unrelated = (project / "src" / "unrelated.c").read_text(encoding="utf-8")
+    assert "ITEM_OLDER" in unrelated, (
+        "ITEM_OLDER was rewritten by a rename of ITEM_OLD — the prefix "
+        "collision is back")
+    assert "ITEM_NEWER" not in unrelated
 
     # NOTE: src/data/items.json is deliberately NOT RefactorService's job.
     # _search_and_replace excludes it (see its scan_spec comment) and

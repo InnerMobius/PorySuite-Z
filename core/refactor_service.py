@@ -1,4 +1,5 @@
 import os
+import functools
 import json
 import re
 import logging
@@ -8,6 +9,55 @@ from local_env import LocalUtil
 
 
 PreviewEntry = Tuple[str, int, str, str]
+
+
+@functools.lru_cache(maxsize=512)
+def _bounded(token: str) -> "re.Pattern":
+    """*token*, matched only where it is a whole identifier component.
+
+    THE BOUNDARY PAIR IS DELIBERATELY ASYMMETRIC and each half was added after
+    a measured corruption in this project. Do not "tidy" it into ``\b``.
+
+    **trailing** ``(?![A-Za-z0-9_])`` -- a token can never match the PREFIX of
+    a longer identifier:
+
+        PARAS -> SPARKLING      made SPECIES_PARASECT into SPECIES_SPARKLINGECT
+        MOVE_THUNDER -> ...     rewrote MOVE_THUNDERBOLT, MOVE_THUNDER_PUNCH,
+                                MOVE_THUNDER_WAVE and MOVE_THUNDER_SHOCK;
+                                0 of 4 neighbours survived
+        Octo -> ...             would rewrite Octorok
+
+    The underscore IS excluded here, which is what protects
+    ``MOVE_THUNDER_PUNCH`` as well as ``MOVE_THUNDERBOLT``.
+
+    **leading** ``(?<![A-Za-z0-9])`` -- a token can never match the END of a
+    longer word:
+
+        ABRA -> VOLTARIX        made KADABRA into KADVOLTARIX
+
+    The underscore is deliberately NOT excluded, so a token still matches
+    straight after one. ``gMonFrontPic_Paras``, ``old_octo.4bpp`` and a
+    trainer's ``_BULBASAUR`` all have to keep renaming, and a symmetric word
+    boundary stops them -- it half-renames maps and graphics rules. That
+    symmetric version was proposed twice and rejected twice; see BUGS.md,
+    "Rename proposal RESOLVED".
+
+    ``_multi_search_and_replace`` has used this pair for every species rename
+    since 2026-10-29. It lives here so the single-token path uses the SAME
+    one instead of a second copy that can drift.
+    """
+    return re.compile(r"(?<![A-Za-z0-9])" + re.escape(token)
+                      + r"(?![A-Za-z0-9_])")
+
+
+def _bounded_replace(token: str, new: str, line: str) -> str:
+    r"""*line* with every bounded occurrence of *token* replaced by *new*.
+
+    The replacement goes through a lambda on purpose: ``re.sub`` would read
+    backslashes and ``\g<...>`` in a replacement STRING, and a new name is
+    user input.
+    """
+    return _bounded(token).sub(lambda _m: new, line)
 
 
 class UnsafeRenameError(RuntimeError):
@@ -386,7 +436,20 @@ class RefactorService:
         """
         if not old or not new or old == new:
             return
-        hits = [s for s in (siblings or []) if s and s != old and old in s]
+        # Judged by the SAME matcher the rename will use (2026-11-08). While
+        # the replace was plain substring the criterion was `old in s`, which
+        # refused any rename whose name was a substring of a sibling --
+        # ITEM_TEA with ITEM_TEACHY_TV present, MOVE_THUNDER with
+        # MOVE_THUNDERBOLT. Now that the replace is bounded those are safe and
+        # must be ALLOWED; refusing them would be containment standing in for
+        # a repair that has landed.
+        #
+        # It still fires where the bounded replace really would reach a
+        # sibling -- a sibling of the form SOME_ITEM_TEA, where the leading
+        # boundary deliberately permits a preceding underscore. That case is
+        # the reason this guard is not simply deleted.
+        pat = _bounded(old)
+        hits = [s for s in (siblings or []) if s and s != old and pat.search(s)]
         if hits:
             raise UnsafeRenameError(old, new, hits, kind)
 
@@ -397,9 +460,15 @@ class RefactorService:
         except OSError:
             return
         changed = False
+        # Bounded, not substring. Before 2026-11-08 this was
+        # `if old in ln: ln.replace(old, new)`, so renaming MOVE_THUNDER
+        # rewrote MOVE_THUNDERBOLT and MOVE_THUNDER_PUNCH, and renaming Octo
+        # would rewrite Octorok. See _bounded for why the boundaries are
+        # asymmetric and why \b is wrong here.
+        pat = _bounded(old)
         for idx, ln in enumerate(lines):
-            if old in ln:
-                newline = ln.replace(old, new)
+            if pat.search(ln):
+                newline = _bounded_replace(old, new, ln)
                 if newline != ln:
                     preview.append((os.path.relpath(path, self.util.repo_root()), idx + 1, ln.rstrip(), newline.rstrip()))
                     lines[idx] = newline
@@ -441,14 +510,18 @@ class RefactorService:
         newly-written substring can never be re-matched by a later token in the
         SAME sweep.  That is the exact property needed to kill the cascade.
 
-        A TRAILING identifier boundary ``(?![A-Za-z0-9_])`` is applied so a
-        token can never match the PREFIX of a longer identifier: renaming
-        ``PARAS`` must NOT touch ``PARASECT`` (which is how ``SPECIES_PARASECT``
-        became the corrupt ``SPECIES_SPARKLINGECT`` when PARAS→SPARKLING ran).
-        No LEADING boundary is used, so names embedded at the END of a longer
-        identifier still match (``gMonFrontPic_Paras`` → the ``Paras`` suffix is
-        replaced) — that is the substring behaviour callers rely on. The
-        boundary only blocks the prefix-cascade, nothing else.
+        Both identifier boundaries are applied -- see :func:`_bounded`, which
+        documents the pair and is what the single-token path uses. In short:
+        trailing ``(?![A-Za-z0-9_])`` so a token cannot match the PREFIX of a
+        longer identifier (PARAS must not touch PARASECT), and leading
+        ``(?<![A-Za-z0-9])`` so it cannot match the END of a longer word (ABRA
+        must not touch KADABRA) while still matching after an underscore, so
+        ``gMonFrontPic_Paras`` keeps renaming.
+
+        (Until 2026-11-08 this paragraph said "No LEADING boundary is used",
+        which the code two lines below it contradicted -- the leading boundary
+        was added with the KADABRA fix and the prose was never updated. Read
+        the regex, not this docstring, if they ever disagree again.)
         """
         # Deduplicate identity and empty pairs; preserve first occurrence.
         seen: set = set()
@@ -554,8 +627,17 @@ class RefactorService:
         return preview
 
     def _search_and_replace(self, old: str, new: str, preview_only: bool) -> List[PreviewEntry]:
+        """Rewrite one token across the source tree, or report what it would do.
+
+        The preview and the write MUST use the same matcher. They did not
+        before 2026-11-08 -- both were plain substring, and when the preview
+        was later given a boundary without the write (or the reverse) the
+        dialog described changes the save did not make. Both now go through
+        :func:`_bounded`.
+        """
         root = self.util.repo_root()
         preview: List[PreviewEntry] = []
+        pat = _bounded(old)
         # Walk C/header files under src/ and include/, plus assembler/script
         # includes under data/ (maps, event scripts, etc.)
         scan_spec = [
@@ -598,8 +680,11 @@ class RefactorService:
                         try:
                             with open(file_path, "r", encoding="utf-8", errors="surrogateescape") as f:
                                 for i, ln in enumerate(f, 1):
-                                    if old in ln:
-                                        preview.append((os.path.relpath(file_path, root), i, ln.rstrip(), ln.rstrip().replace(old, new)))
+                                    if pat.search(ln):
+                                        preview.append((
+                                            os.path.relpath(file_path, root), i,
+                                            ln.rstrip(),
+                                            _bounded_replace(old, new, ln.rstrip())))
                         except OSError:
                             continue
                     else:
@@ -1111,9 +1196,16 @@ class RefactorService:
                 with open(sg_path, "r", encoding="utf-8") as f:
                     sg = json.load(f)
                 rel = os.path.relpath(sg_path, root).replace("\\", "/")
+                # Anchored exactly as _rename_in_species_graphics_json
+                # writes it: a key is rewritten only when it ENDS in
+                # ``_<old_camel>``. A substring test here reported keys the
+                # save would never touch -- renaming Pika listed
+                # gMonFrontPic_Pikachu (2026-11-08).
+                _suffix = "_" + old_camel
                 for k in sg:
-                    if old_camel in k:
-                        previews.append((rel, 0, k, k.replace(old_camel, new_camel)))
+                    if k.endswith(_suffix):
+                        previews.append((
+                            rel, 0, k, k[: -len(old_camel)] + new_camel))
             except Exception:
                 pass
 

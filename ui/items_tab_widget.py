@@ -40,6 +40,42 @@ from core.sprite_render import load_sprite_pixmap
 from core.sprite_palette_bus import get_bus as _get_palette_bus, CAT_ITEM_ICON
 
 
+def _parse_item_aliases(project_path: str) -> dict[str, str]:
+    """{ITEM_NAME: ITEM_TARGET} for every ``#define ITEM_NAME ITEM_OTHER`` in
+    include/constants/items.h, chains followed to the end.
+
+    A project RENAMES an item by aliasing a numbered slot
+    (``#define ITEM_ZORA_TUNIC ITEM_0EB``), while ``item_icon_table.h`` keeps
+    the row under the slot name (``[ITEM_0EB] = {...}``).  Every lookup or
+    write keyed by the item's real constant has to follow the alias, or the
+    item looks icon-less and its icon can't be saved.
+    """
+    path = os.path.join(project_path, "include", "constants", "items.h")
+    raw: dict[str, str] = {}
+    try:
+        text = open(path, encoding="utf-8", errors="surrogateescape").read()
+    except OSError:
+        return {}
+    for m in re.finditer(r'^\s*#define\s+(ITEM_\w+)\s+(ITEM_\w+)\s*(?://.*|/\*.*)?$',
+                         text, re.MULTILINE):
+        raw[m.group(1)] = m.group(2)
+    resolved: dict[str, str] = {}
+    for name in raw:
+        target, seen = name, set()
+        while target in raw and target not in seen:
+            seen.add(target)
+            target = raw[target]
+        resolved[name] = target
+    return resolved
+
+
+def _add_alias_keys(table: dict, aliases: dict[str, str]) -> None:
+    """Make every alias look up the same entry as the constant it names."""
+    for alias, target in aliases.items():
+        if alias not in table and target in table:
+            table[alias] = table[target]
+
+
 def _parse_item_icon_map(project_path: str) -> dict[str, str]:
     """
     Returns {ITEM_CONSTANT: abs_png_path} by chaining two C-header lookups:
@@ -81,6 +117,7 @@ def _parse_item_icon_map(project_path: str) -> dict[str, str]:
         if os.path.isfile(abs_png):
             result[const] = abs_png
 
+    _add_alias_keys(result, _parse_item_aliases(project_path))
     return result
 
 
@@ -106,6 +143,10 @@ def _parse_item_icon_full(project_path: str):
             item_syms[m.group(1)] = (m.group(2), m.group(3))
     except OSError:
         pass
+    # Renamed items (ITEM_ZORA_TUNIC -> ITEM_0EB) answer with their slot's row.
+    # Callers that count or rewrite rows must dedupe by the slot name -- see
+    # ItemsTabWidget._icon_key.
+    _add_alias_keys(item_syms, _parse_item_aliases(project_path))
 
     # Step 2: symbol → relative path (icons only)
     sym_to_rel: dict[str, str] = {}
@@ -158,6 +199,17 @@ def write_item_icon_entry(
     new_text, count = pattern.subn(
         r'\g<1>' + icon_sym + ', ' + palette_sym + r'\2', text
     )
+    if count == 0:
+        # A renamed item's row lives under its slot name ([ITEM_0EB] for
+        # ITEM_ZORA_TUNIC) -- follow the alias and try that row.
+        target = _parse_item_aliases(project_path).get(item_const)
+        if target and target != item_const:
+            pattern = re.compile(
+                r'(\[\s*' + re.escape(target) + r'\s*\]\s*=\s*\{)\w+,\s*\w+(\})'
+            )
+            new_text, count = pattern.subn(
+                r'\g<1>' + icon_sym + ', ' + palette_sym + r'\2', text
+            )
     if count == 0:
         return False
     try:
@@ -1008,15 +1060,19 @@ class ItemDetailPanel(QWidget):
             self.set_icon(icon_path)
             self._current_icon_path = icon_path or ""
 
-            # Select icon in combo
-            if icon_sym:
-                idx = self.f_icon_combo.findData(icon_sym, Qt.ItemDataRole.UserRole)
-                if idx >= 0:
-                    self.f_icon_combo.setCurrentIndex(idx)
-                else:
-                    self.f_icon_combo.setCurrentText(
-                        icon_sym.replace("gItemIcon_", "")
-                    )
+            # Select icon in combo. ALWAYS set it -- never leave the previous
+            # item's selection standing. A stale selection is not just a wrong
+            # label: get_selected_icon_sym() reads it on _flush, so editing any
+            # other field of an icon-less item queued the PREVIOUS item's icon
+            # as a change. No entry, or a symbol not in the picker, shows as
+            # no selection (index -1 -> get_selected_icon_sym() is None).
+            idx = (self.f_icon_combo.findData(icon_sym, Qt.ItemDataRole.UserRole)
+                   if icon_sym else -1)
+            self.f_icon_combo.setCurrentIndex(idx)
+            if idx < 0:
+                self.f_icon_combo.setEditText(
+                    icon_sym.replace("gItemIcon_", "") if icon_sym else "(no icon entry)"
+                )
 
             self.f_name.setText(name)
 
@@ -1187,7 +1243,8 @@ class ItemsTabWidget(QWidget):
         self._icons:    dict[str, str]  = {}   # const → abs png path
         self._current:  str | None      = None
         self._icon_cache: dict[str, QIcon] = {}
-        self._item_syms:  dict[str, tuple[str, str]] = {}  # const → (icon_sym, pal_sym)
+        self._item_syms:  dict[str, tuple[str, str]] = {}  # const → (icon_sym, pal_sym); aliases included
+        self._item_aliases: dict[str, str] = {}             # ITEM_ZORA_TUNIC → ITEM_0EB (items.h #defines)
         self._project_path: str = ""
         self._icon_dirty: dict[str, tuple[str, str]] = {}  # const → (new_icon, new_pal)
         self._build()
@@ -1403,6 +1460,7 @@ class ItemsTabWidget(QWidget):
 
         # Resolve icons (simple map for list thumbnails)
         self._icons = _parse_item_icon_map(project_path) if project_path else {}
+        self._item_aliases = _parse_item_aliases(project_path) if project_path else {}
 
         # Full icon data for the picker
         if project_path:
@@ -1610,7 +1668,15 @@ class ItemsTabWidget(QWidget):
 
         # Shared-icon warning — the icon symbol may be referenced by
         # several items; replacing the PNG changes the icon for ALL of them.
-        sharers = [c for c, (i, _p) in self._item_syms.items() if i == icon_sym]
+        # One entry per icon-table ROW: an alias and its slot name are the same
+        # item. Show the readable name (ITEM_ZORA_TUNIC, not ITEM_0EB).
+        by_row: dict[str, str] = {}
+        for c, (i, _p) in self._item_syms.items():
+            if i == icon_sym:
+                row = self._icon_key(c)
+                if row not in by_row or c != row:
+                    by_row[row] = c
+        sharers = list(by_row.values())
         if len(sharers) > 1:
             preview = ", ".join(sorted(sharers)[:8])
             if len(sharers) > 8:
@@ -1710,6 +1776,15 @@ class ItemsTabWidget(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, new_const)
                 break
 
+    def _icon_key(self, const: str) -> str:
+        """The item_icon_table.h row a constant uses: its slot name if it is
+        an items.h alias (ITEM_ZORA_TUNIC -> ITEM_0EB), else itself."""
+        return self._item_aliases.get(const, const)
+
+    def _names_for_row(self, row: str) -> set[str]:
+        """Every constant that resolves to icon-table row *row*."""
+        return {row} | {a for a, t in self._item_aliases.items() if t == row}
+
     def _flush(self):
         if self._current and self._current in self._items and self._detail._dirty:
             self._items[self._current] = self._detail.collect(
@@ -1722,13 +1797,15 @@ class ItemsTabWidget(QWidget):
                 if new_sym != orig[0]:
                     pal = self._detail.get_default_palette(new_sym)
                     self._icon_dirty[self._current] = (new_sym, pal)
-                    # Update internal tracking
-                    self._item_syms[self._current] = (new_sym, pal)
-                    # Refresh the icon in the list sidebar
+                    # Update internal tracking under EVERY name of this row
+                    # (an alias and its slot name), or they disagree.
                     png = getattr(self._detail, "_sym_to_png", {}).get(new_sym, "")
-                    if png:
-                        self._icons[self._current] = png
-                        self._icon_cache.pop(self._current, None)
+                    for name in self._names_for_row(self._icon_key(self._current)) | {self._current}:
+                        self._item_syms[name] = (new_sym, pal)
+                        # Refresh the icon in the list sidebar
+                        if png:
+                            self._icons[name] = png
+                            self._icon_cache.pop(name, None)
 
     def save_icon_changes(self) -> bool:
         """Write any pending icon changes to item_icon_table.h.

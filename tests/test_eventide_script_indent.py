@@ -82,3 +82,62 @@ def test_every_emitted_element_is_one_line():
         [("lock", ("lock", "")), ("end", ("end", ""))], texts={})
     for ln in lines:
         assert ln.count("\n") <= 1, "multi-line element: %r" % ln
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Table terminators (added when EVENTide learned to CREATE a map script table)
+#
+# The blanket "directives stay put" rule above is right for `.equ` / `.set` /
+# `.macro`, and was wrong for the DATA terminators that close a table. Counted
+# across the project's 453 scripts.inc files:
+#
+#   .byte   449 indented : 4 flush        .equ  0 indented : 34 flush
+#   .2byte  224 indented : 0 flush        .set  0 indented :  5 flush
+#
+# It was invisible until the editor could write a table of its own, because
+# `.byte 0` closes the outer table and `.2byte 0` the inner one — so every
+# table EVENTide wrote had its terminator shoved to column 0, which is the
+# diff noise this whole module exists to stop.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_table_terminator_is_indented():
+    assert _indent_script_lines([".byte 0\n"]) == ["\t.byte 0\n"]
+
+
+def test_an_inner_table_terminator_is_indented():
+    assert _indent_script_lines([".2byte 0\n"]) == ["\t.2byte 0\n"]
+
+
+def test_a_whole_map_script_table_comes_out_consistently():
+    out = _indent_script_lines([
+        "Woods_MapScripts::\n",
+        "map_script MAP_SCRIPT_ON_TRANSITION, Woods_OnTransition\n",
+        ".byte 0\n",
+    ])
+    assert out == [
+        "Woods_MapScripts::\n",
+        "\tmap_script MAP_SCRIPT_ON_TRANSITION, Woods_OnTransition\n",
+        "\t.byte 0\n",
+    ]
+
+
+def test_equ_stays_flush_left():
+    """0 indented : 34 flush in the real tree — it belongs at the top of the
+    file, like a label, not inside a block."""
+    assert _indent_script_lines([".equ FOO, VAR_TEMP_2\n"]) \
+        == [".equ FOO, VAR_TEMP_2\n"]
+
+
+def test_set_stays_flush_left():
+    assert _indent_script_lines([".set FOO, 1\n"]) == [".set FOO, 1\n"]
+
+
+def test_an_unmeasured_directive_is_left_exactly_where_it_was():
+    """Being wrong by leaving a line alone costs nothing; being wrong by
+    moving one costs a line of somebody's diff."""
+    assert _indent_script_lines([".incbin \"x.bin\"\n"]) \
+        == [".incbin \"x.bin\"\n"]
+
+
+def test_an_already_indented_terminator_is_not_doubled():
+    assert _indent_script_lines(["\t.byte 0\n"]) == ["\t.byte 0\n"]

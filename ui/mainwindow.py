@@ -3902,7 +3902,11 @@ QTabBar::tab:hover:!selected {
             if ret == QMessageBox.StandardButton.Cancel:
                 return
             if ret == QMessageBox.StandardButton.Save:
-                self.update_save()
+                # Loading another project replaces everything in memory. If
+                # the save did not happen, keep this project and its pending
+                # edits instead (2026-11-08).
+                if not self._save_for_destructive_action("switch projects"):
+                    return
 
         # Load data for the requested project. Do not automatically persist
         # any in-memory adjustments made during load; saving must be an
@@ -4627,15 +4631,18 @@ QTabBar::tab:hover:!selected {
             "GENDERLESS": "Species is genderless in-game (genderRatio = 255).",
             "NO_FLIP": "Rendering hint: do not flip sprites.",
             "IN_NATDEX": "Managed by NATIONAL_DEX enum in include/constants/pokedex.h.",
-            "IN_REGDEX": "Managed by KANTO_DEX_COUNT in include/constants/pokedex.h.",
+            "IN_REGDEX": "Tick to put this Pokemon in the Regional Pokedex. It is added at the end; use the Regional Dex tab to change where it sits.",
         }
         for key, label in virtual_flags:
             item = QListWidgetItem(label)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, key)
-            # Engine-managed dex flags: show state but grey out and explain where to change
-            if key in ("IN_NATDEX", "IN_REGDEX"):
+            # IN_NATDEX stays engine-managed: the National Dex list owns
+            # that ordering. IN_REGDEX is editable -- it drives the engine's
+            # real Hoenn ordering and boundary, the same model the Regional Dex
+            # tab edits. See core/hoenn_dex.py.
+            if key == "IN_NATDEX":
                 try:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
                 except Exception:
@@ -4752,23 +4759,9 @@ QTabBar::tab:hover:!selected {
         if self.ui.list_pokedex_national.count() > 0:
             self.ui.list_pokedex_national.setCurrentRow(0)
 
-        # Add species to regional dex list
-        self.ui.list_pokedex_regional.clear()
-        regdex = self.source_data.get_regional_dex()
-        for entry in regdex:
-            dex_const = entry.get("dex_constant", entry)
-            nat_const = dex_const.replace("HOENN_DEX_", "NATIONAL_DEX_")
-            species   = self.source_data.get_species_by_dex_constant(nat_const)
-            name = None
-            if species:
-                name = self.source_data.get_species_data(species, "name")
-            if not name:
-                name = species or dex_const
-            item = QListWidgetItem(name)
-            item.setData(Qt.ItemDataRole.UserRole, dex_const)
-            if species:
-                item.setIcon(self._species_list_icon(species))
-            self.ui.list_pokedex_regional.addItem(item)
+        # Regional dex list: the engine's full Hoenn ordering, split by the
+        # membership boundary.
+        self._populate_regional_dex_list()
 
         # Populate the items editor after the event loop has finished the current
         # layout pass, so the QListWidget is fully visible when items are added.
@@ -6810,17 +6803,21 @@ in the game.</p>
                         item.setData(1000, None)
                         item.setCheckState(Qt.CheckState.Checked if species in natdex_species else Qt.CheckState.Unchecked)
                     elif key == "IN_REGDEX":
-                        # Compute from engine header: national order up to cutoff
-                        nat_order = self._load_national_order_from_header()
-                        cutoff = self._load_kanto_cutoff_from_header()
+                        # Read from the engine's real Hoenn ordering: a Pokemon
+                        # is in the Regional Pokedex when its position is
+                        # within the membership boundary.
+                        #
+                        # This used to compare its NATIONAL dex position
+                        # against KANTO_DEX_COUNT, which is a different list
+                        # entirely -- it ticked the wrong Pokemon.
                         present = False
-                        if isinstance(nat_const, str) and nat_const in nat_order:
-                            try:
-                                idx = nat_order.index(nat_const)
-                                cutoff_idx = nat_order.index(cutoff)
-                                present = idx <= cutoff_idx
-                            except ValueError:
-                                present = False
+                        _model = self._hoenn_model()
+                        if _model is not None and isinstance(nat_const, str):
+                            _order, _count = _model
+                            for _i, _e in enumerate(_order):
+                                if _e.get("dex_constant") == nat_const:
+                                    present = _i < _count
+                                    break
                         item.setData(1000, None)
                         item.setCheckState(Qt.CheckState.Checked if present else Qt.CheckState.Unchecked)
                     else:
@@ -7519,50 +7516,45 @@ in the game.</p>
                                     _diag("national_dex", "(list changed)", checked)
                                     pdata['national_dex'] = lst
                                     updated = True
-                            # Regional Dex membership
+                            # Regional Dex membership. This tick and the
+                            # Regional Dex list drive the SAME ordering and
+                            # boundary, so neither can disagree with the other.
+                            # Ticking moves the Pokemon into the included
+                            # section; unticking moves it out. Neither deletes
+                            # it from the game's ordering, and neither reorders
+                            # anything else.
                             if key == "IN_REGDEX":
-                                lst = list(pdata.get('regional_dex', []))
-                                nat = self.source_data.get_species_data(species, 'dex_constant')
-                                reg = nat  # store national dex constants for regional list
-                                present = False
-                                changed_regdex = False
-                                for entry in lst:
-                                    const = entry.get('dex_constant') if isinstance(entry, dict) else entry
-                                    if const == reg:
-                                        present = True
-                                        if not checked:
-                                            lst = [e for e in lst if (e.get('dex_constant') if isinstance(e, dict) else e) != reg]
-                                            changed_regdex = True
-                                        break
-                                if checked and not present and reg:
-                                    lst.append({'dex_constant': reg})
-                                    changed_regdex = True
-                                    # Reflect in the UI regional list
-                                    try:
-                                        name = self.source_data.get_species_data(species, 'name') or species
-                                        cat = self.source_data.get_species_info(species, 'categoryName') or ''
-                                        text = name if not cat else f"{name} - {cat}"
-                                        it = QListWidgetItem(text)
-                                        it.setData(Qt.ItemDataRole.UserRole, reg)
-                                        self.ui.list_pokedex_regional.addItem(it)
-                                    except Exception:
-                                        pass
-                                if not checked and present and reg:
-                                    # Remove from the UI list
-                                    try:
-                                        for i in range(self.ui.list_pokedex_regional.count() - 1, -1, -1):
-                                            it = self.ui.list_pokedex_regional.item(i)
-                                            if it.data(Qt.ItemDataRole.UserRole) == reg:
-                                                self.ui.list_pokedex_regional.takeItem(i)
-                                                break
-                                    except Exception:
-                                        pass
-                                # Only mark as updated if the list actually changed
-                                # (see IN_NATDEX note above).
-                                if changed_regdex:
-                                    _diag("regional_dex", "(list changed)", checked)
-                                    pdata['regional_dex'] = lst
-                                    updated = True
+                                model = self._hoenn_model()
+                                if model is None:
+                                    _diag("regional_dex",
+                                          "(engine dex unreadable)", checked)
+                                else:
+                                    order, count = model
+                                    nat = self.source_data.get_species_data(
+                                        species, 'dex_constant')
+                                    index = next(
+                                        (i for i, e in enumerate(order)
+                                         if e.get('dex_constant') == nat), None)
+                                    if index is None:
+                                        _diag("regional_dex",
+                                              "(not in the Hoenn ordering)",
+                                              checked)
+                                    elif checked and index >= count:
+                                        order = list(order)
+                                        order.insert(count, order.pop(index))
+                                        self._set_hoenn_model(order, count + 1)
+                                        self._populate_regional_dex_list()
+                                        _diag("regional_dex", "(added)", checked)
+                                        updated = True
+                                    elif not checked and index < count:
+                                        order = list(order)
+                                        order.insert(count - 1,
+                                                     order.pop(index))
+                                        self._set_hoenn_model(order, count - 1)
+                                        self._populate_regional_dex_list()
+                                        _diag("regional_dex", "(removed)",
+                                              checked)
+                                        updated = True
                         else:
                             pass
                     except Exception:
@@ -9656,26 +9648,22 @@ QTabBar::tab:hover:!selected {
             # the tab, above the list (it was left orphaned behind the splitter).
             reg_vbox.addWidget(self.ui.pokedex_regional_search)
             reg_vbox.addWidget(self.ui.list_pokedex_regional)
-            # ── Regional Dex is a DERIVED VIEW, not an editable list ─────────
-            # Proved from this project's engine on 2026-10-29: membership is
-            # `SpeciesToNationalPokedexNum(species) <= KANTO_DEX_COUNT` and
-            # nothing else (pokefirered/src/pokedex.c:75-120,
-            # src/pokedex_screen.c:1384 / :3186 / :3326). There is no regional
-            # list in the engine, so Add / Remove / drag-reorder here wrote to
-            # a field nothing reads and nothing emits — Save reported success
-            # and the game was unchanged.
+            # ── Regional Dex: the engine's real Hoenn ordering ───────────────
+            # An earlier note here said membership was worked out from the
+            # National Dex and KANTO_DEX_COUNT. That was wrong, and the list it
+            # described was the first 151 entries of the NATIONAL dex wearing a
+            # regional label. The engine keeps a real HOENN_DEX_* ordering whose
+            # first HOENN_DEX_COUNT entries are the dex; see core/hoenn_dex.py.
             #
-            # The list itself is kept: it is a useful view of exactly which
-            # species the player's regional dex will contain. Only the controls
-            # that implied independent editing are taken away.
+            # The list now shows that whole ordering in two sections with the
+            # membership boundary drawn between them, and editing is real.
             reg_note = QLabel(
-                "This list is <b>worked out from the National Dex</b> and "
-                "cannot be edited directly.<br>"
-                "A species is in the Regional Dex when its National Dex number "
-                "is at or below <code>KANTO_DEX_COUNT</code> "
-                "(<code>include/constants/pokedex.h</code>).<br>"
-                "To change what is in it, reorder the <b>National Dex</b> tab, "
-                "or change that setting in the header."
+                "Drag a Pokemon <b>across the dividing line</b> to add it to or "
+                "remove it from the Regional Pokedex.<br>"
+                "Drag it <b>within a section</b> to change the order it appears "
+                "in.<br>"
+                "Pokemon below the line keep their place in the game's ordering "
+                "— removing one from the Pokedex never deletes it."
             )
             reg_note.setWordWrap(True)
             reg_note.setTextFormat(Qt.TextFormat.RichText)
@@ -9686,7 +9674,6 @@ QTabBar::tab:hover:!selected {
             )
             reg_vbox.addWidget(reg_note)
             self._regional_note = reg_note
-            self._make_regional_dex_read_only()
             reg_vbox.addWidget(self.reset_pokedex_button)
             list_tabs.addTab(reg_page, "Regional Dex")
 
@@ -9724,11 +9711,27 @@ QTabBar::tab:hover:!selected {
             dex_splitter.setStretchFactor(1, 1)
             self.ui.tab_pokedex_grid.addWidget(dex_splitter, 0, 0, 3, 3)
 
-            # The regional dex Add / Remove buttons are NOT connected: they were
-            # removed by _make_regional_dex_read_only above, because the engine
-            # derives regional membership from the National Dex order and
-            # KANTO_DEX_COUNT, so there was nothing for them to change. Wiring
-            # them here would raise on a deleted widget.
+            # Regional dex Add / Remove, and drag across the boundary. All
+            # three drive the same ordering-plus-boundary model.
+            for _name, _slot in (("pushButton_4", self._regional_dex_add),
+                                 ("pushButton_5", self._regional_dex_remove)):
+                _btn = getattr(self.ui, _name, None)
+                if _btn is not None:
+                    try:
+                        _btn.clicked.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    _btn.clicked.connect(_slot)
+            # NOT the model's `rowsMoved`: a dropped row never emits it, so a
+            # handler wired there never runs and the list silently drifts away
+            # from the data. The promoted list refuses the drop and reports
+            # where the rows were headed instead. See
+            # ui/custom_widgets/reorderable_list.py.
+            try:
+                self.ui.list_pokedex_regional.rows_move_requested.connect(
+                    self._on_regional_rows_moved)
+            except Exception:
+                logging.exception("Could not wire regional dex drag handling")
 
             # Track which dex constant is currently in the panel
             self._current_dex_const: str | None = None
@@ -9737,127 +9740,418 @@ QTabBar::tab:hover:!selected {
             import logging
             logging.warning("_setup_pokedex_tab failed: %s", exc)
 
-    def _make_regional_dex_read_only(self) -> None:
-        """Take away the controls that falsely implied regional editing.
+    # ── Regional (Hoenn) Pokedex ─────────────────────────────────────────────
+    #
+    # The list shows the engine's COMPLETE Hoenn ordering in two sections, with
+    # a boundary row between them:
+    #
+    #     Included — N Pokemon          order[:regional_count]
+    #     ---- boundary ----
+    #     Not included — M Pokemon      order[regional_count:]
+    #
+    # There is one model behind both sections -- the ordered list and the
+    # boundary -- never two lists that can disagree. Moving a row across the
+    # boundary changes membership; moving it within a section changes only
+    # order. Nothing is ever deleted from the ordering: removing a Pokemon from
+    # the dex moves it below the line, where its Hoenn identity survives.
+    #
+    # See core/hoenn_dex.py for why this is the engine's real shape and why
+    # src/pokemon.c is not rewritten for these edits.
 
-        Removes the Add and Remove buttons from the Regional Dex tab entirely
-        (they are regional-only, so nothing else needs them) and turns off
-        drag-and-drop on `list_pokedex_regional`. The list stays selectable and
-        scrollable so it can still be READ.
+    HOENN_CONST_ROLE = Qt.ItemDataRole.UserRole + 1
+    ROW_KIND_ROLE = Qt.ItemDataRole.UserRole + 2
+    ROW_ENTRY = "entry"
+    ROW_HEADER = "header"
+    ROW_BOUNDARY = "boundary"
 
-        The National Dex half is deliberately untouched: its reorder is real,
-        it writes the enum, and its `_promote_dex_list` / `_dex_order_is_sane`
-        protections stay exactly as they are.
+    def _hoenn_model(self) -> tuple[list, int] | None:
+        """The authoritative ordering and boundary, or ``None`` if unavailable.
+
+        ``None`` means the engine's Hoenn dex could not be read, so the
+        regional dex must stay read-only rather than fall back to anything.
         """
         try:
-            for name in ("pushButton_4", "pushButton_5"):
-                btn = getattr(self.ui, name, None)
-                if btn is None:
-                    continue
-                try:
-                    btn.clicked.disconnect()
-                except (TypeError, RuntimeError):
-                    pass
-                btn.setParent(None)
-                btn.deleteLater()
+            dex = self.source_data.data.get("pokedex")
+            data = getattr(dex, "data", None) or {}
         except Exception:
-            logging.exception("Could not remove the regional dex Add/Remove buttons")
+            return None
+        order = data.get("hoenn_order") or []
+        count = data.get("regional_count")
+        if not order or not isinstance(count, int):
+            return None
+        return order, count
 
+    def _hoenn_dex_error(self) -> str | None:
+        try:
+            dex = self.source_data.data.get("pokedex")
+            return (getattr(dex, "data", None) or {}).get("hoenn_dex_error")
+        except Exception:
+            return None
+
+    def _regional_row_label(self, entry: dict, number: int) -> tuple[str, str]:
+        """``(display text, species constant or "")`` for one ordering entry."""
+        nat_const = entry.get("dex_constant") or ""
+        species = ""
+        name = None
+        if nat_const:
+            try:
+                species = self.source_data.get_species_by_dex_constant(
+                    nat_const) or ""
+            except Exception:
+                species = ""
+        if species:
+            try:
+                name = self.source_data.get_species_data(species, "name")
+            except Exception:
+                name = None
+        if not name:
+            name = species or entry.get("hoenn_constant") or nat_const
+        return f"#{number:03d}  {name}", species
+
+    def _make_regional_header(self, text: str,
+                              kind: str | None = None) -> QListWidgetItem:
+        """A section divider: visible, but never a Pokemon.
+
+        The divider between the two sections is tagged ``ROW_BOUNDARY`` so
+        reading the list back can tell which side of the line a row landed on.
+        """
+        item = QListWidgetItem(text)
+        item.setData(self.ROW_KIND_ROLE, kind or self.ROW_HEADER)
+        # Not selectable, not draggable, not a drop target. Dragging onto the
+        # boundary is how membership changes, so the row itself must never
+        # behave like an entry.
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        item.setForeground(QColor("#9bbcff"))
+        item.setBackground(QColor("#20262f"))
+        return item
+
+    def _populate_regional_dex_list(self) -> None:
+        """Rebuild the regional list from the model, preserving the selection."""
         lst = getattr(self.ui, "list_pokedex_regional", None)
         if lst is None:
             return
+
+        previous = None
         try:
-            from PyQt6.QtWidgets import QAbstractItemView
-            lst.setDragDropMode(QAbstractItemView.DragDropMode.NoDragDrop)
-            lst.setDragEnabled(False)
-            lst.setAcceptDrops(False)
-            lst.setDropIndicatorShown(False)
-            # Selection stays on so the entry can be inspected; editing is off.
-            lst.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            lst.setToolTip(
-                "Read-only view. Regional Dex membership comes from the "
-                "National Dex order and KANTO_DEX_COUNT."
-            )
+            cur = lst.currentItem()
+            if cur is not None:
+                previous = cur.data(self.HOENN_CONST_ROLE)
         except Exception:
-            logging.exception("Could not make the regional dex list read-only")
+            previous = None
 
-    def _regional_dex_add(self):
-        """Add a species to the regional dex via a picker dialog."""
+        lst.blockSignals(True)
         try:
-            from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QVBoxLayout, QListWidget, QListWidgetItem, QLineEdit, QLabel
-            natdex = self.source_data.get_national_dex()
-            regdex = self.source_data.get_regional_dex()
-            in_reg = {e.get("dex_constant") for e in regdex}
-
-            dlg = QDialog(self)
-            dlg.setWindowTitle("Add to Regional Dex")
-            dlg.resize(300, 500)
-            layout = QVBoxLayout(dlg)
-            layout.addWidget(QLabel("Select a Pokémon to add:"))
-            search = QLineEdit()
-            search.setPlaceholderText("Search…")
-            layout.addWidget(search)
-            lst = QListWidget()
-            for entry in natdex:
-                dc = entry.get("dex_constant", "")
-                if dc in in_reg:
-                    continue
-                sp = entry.get("species")
-                name = self.source_data.get_species_data(sp, "name") if sp else None
-                label = name or sp or dc
-                it = QListWidgetItem(label)
-                it.setData(Qt.ItemDataRole.UserRole, entry)
-                if sp:
-                    it.setIcon(self._species_list_icon(sp))
-                lst.addItem(it)
-            layout.addWidget(lst)
-            search.textChanged.connect(lambda t: [
-                lst.item(i).setHidden(t.lower() not in lst.item(i).text().lower())
-                for i in range(lst.count())
-            ])
-            btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-            btns.accepted.connect(dlg.accept)
-            btns.rejected.connect(dlg.reject)
-            layout.addWidget(btns)
-            lst.itemDoubleClicked.connect(lambda _: dlg.accept())
-
-            if dlg.exec() != QDialog.DialogCode.Accepted or not lst.currentItem():
+            lst.clear()
+            model = self._hoenn_model()
+            if model is None:
+                self._apply_regional_dex_editable(False)
+                err = self._hoenn_dex_error()
+                lst.addItem(self._make_regional_header(
+                    "Regional Pokedex unavailable"))
+                msg = QListWidgetItem(
+                    err or "The game's regional Pokedex could not be read, so "
+                    "it cannot be edited here. No game file has been changed."
+                )
+                msg.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                msg.setForeground(QColor("#d08a6a"))
+                lst.addItem(msg)
                 return
 
-            nat_entry = lst.currentItem().data(Qt.ItemDataRole.UserRole)
-            dc = nat_entry.get("dex_constant", "")
-            sp = nat_entry.get("species")
-            new_entry = {"species": sp, "dex_constant": dc}
-            self.source_data.data["pokedex"].data.setdefault("regional_dex", []).append(new_entry)
+            order, count = model
+            self._apply_regional_dex_editable(True)
 
-            name = self.source_data.get_species_data(sp, "name") if sp else None
-            it = QListWidgetItem(name or sp or dc)
-            it.setData(Qt.ItemDataRole.UserRole, dc)
-            if sp:
-                it.setIcon(self._species_list_icon(sp))
-            self.ui.list_pokedex_regional.addItem(it)
-            self.setWindowModified(True)
+            lst.addItem(self._make_regional_header(
+                f"In the Regional Pokedex — {count}"))
+            restore = None
+            for i, entry in enumerate(order):
+                if i == count:
+                    lst.addItem(self._make_regional_header(
+                        "Not in the Regional Pokedex — "
+                        f"{len(order) - count}", self.ROW_BOUNDARY))
+                text, species = self._regional_row_label(entry, i + 1)
+                item = QListWidgetItem(text)
+                # UserRole keeps the NATIONAL constant: other readers already
+                # expect that there.
+                item.setData(Qt.ItemDataRole.UserRole,
+                             entry.get("dex_constant"))
+                item.setData(self.HOENN_CONST_ROLE,
+                             entry.get("hoenn_constant"))
+                item.setData(self.ROW_KIND_ROLE, self.ROW_ENTRY)
+                if i >= count:
+                    item.setForeground(QColor("#8d8d8d"))
+                if species:
+                    try:
+                        item.setIcon(self._species_list_icon(species))
+                    except Exception:
+                        pass
+                lst.addItem(item)
+                if previous and entry.get("hoenn_constant") == previous:
+                    restore = item
+
+            if count >= len(order):
+                lst.addItem(self._make_regional_header(
+                    "Not in the Regional Pokedex — 0",
+                    self.ROW_BOUNDARY))
+            if restore is not None:
+                lst.setCurrentItem(restore)
+        finally:
+            lst.blockSignals(False)
+
+    def _apply_regional_dex_editable(self, editable: bool) -> None:
+        """Turn regional editing on or off to match whether a model exists."""
+        lst = getattr(self.ui, "list_pokedex_regional", None)
+        if lst is not None:
+            try:
+                from PyQt6.QtWidgets import QAbstractItemView
+                if editable:
+                    lst.setDragDropMode(
+                        QAbstractItemView.DragDropMode.InternalMove)
+                    lst.setDragEnabled(True)
+                    lst.setAcceptDrops(True)
+                    lst.setDropIndicatorShown(True)
+                    lst.setToolTip(
+                        "Drag a Pokemon across the dividing line to add it to "
+                        "or remove it from the Regional Pokedex. Drag within a "
+                        "section to change the order."
+                    )
+                else:
+                    lst.setDragDropMode(
+                        QAbstractItemView.DragDropMode.NoDragDrop)
+                    lst.setDragEnabled(False)
+                    lst.setAcceptDrops(False)
+                    lst.setDropIndicatorShown(False)
+                lst.setEditTriggers(
+                    QAbstractItemView.EditTrigger.NoEditTriggers)
+            except Exception:
+                logging.exception("Could not set regional dex drag state")
+
+        for name in ("pushButton_4", "pushButton_5"):
+            btn = getattr(self.ui, name, None)
+            if btn is not None:
+                try:
+                    btn.setEnabled(editable)
+                except RuntimeError:
+                    pass
+
+    def _set_hoenn_model(self, order: list, count: int) -> None:
+        """Store a new ordering and boundary, and mark the project modified."""
+        try:
+            self.source_data.data["pokedex"].data["hoenn_order"] = order
+            self.source_data.data["pokedex"].data["regional_count"] = count
+            # The flat regional list is a DERIVED view, kept in step so the
+            # other readers of it do not go stale. It is never the thing that
+            # gets serialized.
+            self.source_data.data["pokedex"].data["regional_dex"] = [
+                {"dex_constant": e.get("dex_constant"),
+                 "hoenn_constant": e.get("hoenn_constant")}
+                for e in order[:count]
+            ]
         except Exception:
-            import logging
+            logging.exception("Could not store the regional dex model")
+            return
+        if self._loading_depth <= 0:
+            self.setWindowModified(True)
+            try:
+                self.sectionDirtyChanged.emit("pokedex", True)
+            except Exception:
+                pass
+
+    def _read_regional_list(self) -> tuple[list, int] | None:
+        """Read the widget back into an ordering and a boundary.
+
+        Rows above the boundary divider are in the dex, rows below are not --
+        so a drag across the line IS the membership change, with no separate
+        bookkeeping that could disagree with what the user sees.
+        """
+        lst = getattr(self.ui, "list_pokedex_regional", None)
+        model = self._hoenn_model()
+        if lst is None or model is None:
+            return None
+        order, _old_count = model
+        by_const = {e.get("hoenn_constant"): e for e in order}
+
+        new_order: list = []
+        count = None
+        for row in range(lst.count()):
+            item = lst.item(row)
+            kind = item.data(self.ROW_KIND_ROLE)
+            if kind == self.ROW_BOUNDARY:
+                count = len(new_order)
+                continue
+            if kind != self.ROW_ENTRY:
+                continue
+            const = item.data(self.HOENN_CONST_ROLE)
+            entry = by_const.get(const)
+            if entry is None:
+                # An unknown row would mean writing an entry the engine has no
+                # identity for. Refuse the whole read rather than drop it.
+                logging.warning(
+                    "Regional dex row %r is not in the Hoenn ordering; "
+                    "ignoring this reorder.", const)
+                return None
+            new_order.append(entry)
+
+        if count is None:
+            count = len(new_order)
+        if len(new_order) != len(order):
+            logging.warning(
+                "Regional dex read back %d of %d entries; ignoring this "
+                "reorder rather than dropping any.",
+                len(new_order), len(order))
+            return None
+        return new_order, count
+
+    def _on_regional_rows_moved(self, rows, dest: int) -> None:
+        """A drag landed: work out the new ordering and boundary, then redraw.
+
+        The move is done on the DATA and the list is repainted from it, so
+        there is only ever one order. The widget is never asked to move its own
+        rows -- `ui/custom_widgets/reorderable_list.py` measured what that does
+        (it overwrites the landing row, duplicates one entry and loses
+        another, and reports success).
+
+        Where the rows land relative to the dividing row IS the membership
+        change: drag above the line to add, below it to remove. No separate
+        bookkeeping, so the two cannot disagree.
+        """
+        if self._loading_depth > 0:
+            return
+        model = self._hoenn_model()
+        lst = getattr(self.ui, "list_pokedex_regional", None)
+        if model is None or lst is None:
+            return
+
+        from ui.custom_widgets.reorderable_list import reorder_rows
+
+        # Describe every widget row, headers included, so the simulated move
+        # tells us which side of the divider each entry ended up on.
+        descriptors = []
+        for r in range(lst.count()):
+            item = lst.item(r)
+            descriptors.append((item.data(self.ROW_KIND_ROLE),
+                                item.data(self.HOENN_CONST_ROLE)))
+
+        # A header is not a Pokemon. They are not draggable, but a dragged
+        # selection is not something to take on trust.
+        sources = [r for r in rows
+                   if 0 <= r < len(descriptors)
+                   and descriptors[r][0] == self.ROW_ENTRY]
+        if not sources:
+            return
+
+        moved, landed = reorder_rows(descriptors, sources, dest)
+        if not landed:
+            return                      # dropped where it already was
+
+        order, _old_count = model
+        by_const = {e.get("hoenn_constant"): e for e in order}
+        new_order = []
+        count = None
+        for kind, const in moved:
+            if kind == self.ROW_BOUNDARY:
+                count = len(new_order)
+                continue
+            if kind != self.ROW_ENTRY:
+                continue
+            entry = by_const.get(const)
+            if entry is None:
+                logging.warning(
+                    "Regional dex row %r is not in the Hoenn ordering; "
+                    "leaving the order as it was.", const)
+                self._populate_regional_dex_list()
+                return
+            new_order.append(entry)
+
+        if count is None:
+            count = len(new_order)
+        if len(new_order) != len(order):
+            # Refuse rather than write an ordering that lost an entry.
+            logging.warning(
+                "Regional dex reorder produced %d of %d entries; leaving the "
+                "order as it was.", len(new_order), len(order))
+            self._populate_regional_dex_list()
+            return
+
+        self._set_hoenn_model(new_order, count)
+        self._populate_regional_dex_list()
+
+    def _selected_regional_entry(self) -> tuple[list, int, int] | None:
+        """``(order, count, index)`` for the selected Pokemon, or ``None``."""
+        lst = getattr(self.ui, "list_pokedex_regional", None)
+        model = self._hoenn_model()
+        if lst is None or model is None:
+            return None
+        item = lst.currentItem()
+        if item is None or item.data(self.ROW_KIND_ROLE) != self.ROW_ENTRY:
+            return None
+        const = item.data(self.HOENN_CONST_ROLE)
+        order, count = model
+        for i, entry in enumerate(order):
+            if entry.get("hoenn_constant") == const:
+                return order, count, i
+        return None
+
+    def _regional_dex_add(self):
+        """Put the selected Pokemon into the Regional Pokedex.
+
+        It lands at the end of the included section. Nothing is created and
+        nothing moves out of the overall ordering.
+        """
+        try:
+            sel = self._selected_regional_entry()
+            if sel is None:
+                self._regional_dex_hint(
+                    "Select a Pokemon below the line first, then press Add to "
+                    "put it in the Regional Pokedex.")
+                return
+            order, count, index = sel
+            if index < count:
+                self._regional_dex_hint(
+                    "That Pokemon is already in the Regional Pokedex.")
+                return
+            order = list(order)
+            entry = order.pop(index)
+            order.insert(count, entry)
+            self._set_hoenn_model(order, count + 1)
+            self._populate_regional_dex_list()
+        except Exception:
             logging.exception("_regional_dex_add failed")
 
     def _regional_dex_remove(self):
-        """Remove the selected entry from the regional dex."""
+        """Take the selected Pokemon out of the Regional Pokedex.
+
+        It moves to the start of the section below the line and KEEPS its place
+        in the game's ordering. Removing from the Pokedex is not deleting.
+        """
         try:
-            row = self.ui.list_pokedex_regional.currentRow()
-            if row < 0:
+            sel = self._selected_regional_entry()
+            if sel is None:
+                self._regional_dex_hint(
+                    "Select a Pokemon above the line first, then press Remove "
+                    "to take it out of the Regional Pokedex.")
                 return
-            item = self.ui.list_pokedex_regional.item(row)
-            dc = item.data(Qt.ItemDataRole.UserRole) if item else None
-            regdex = self.source_data.data["pokedex"].data.get("regional_dex", [])
-            self.source_data.data["pokedex"].data["regional_dex"] = [
-                e for e in regdex if e.get("dex_constant") != dc
-            ]
-            self.ui.list_pokedex_regional.takeItem(row)
-            self.setWindowModified(True)
+            order, count, index = sel
+            if index >= count:
+                self._regional_dex_hint(
+                    "That Pokemon is already out of the Regional Pokedex.")
+                return
+            order = list(order)
+            entry = order.pop(index)
+            order.insert(count - 1, entry)
+            self._set_hoenn_model(order, count - 1)
+            self._populate_regional_dex_list()
         except Exception:
-            import logging
             logging.exception("_regional_dex_remove failed")
+
+    def _regional_dex_hint(self, text: str) -> None:
+        """Say why nothing happened, instead of appearing to ignore the click."""
+        try:
+            self.statusBar().showMessage(text, 6000)
+        except Exception:
+            logging.info("Regional dex: %s", text)
 
     def _on_pokedex_panel_edited(self):
         """Wired to `_pokedex_panel.changed`. Marks the project modified AND
@@ -11194,6 +11488,7 @@ QTabBar::tab:hover:!selected {
         combo = QComboBox()
         combo.setEditable(True)
         combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._attach_move_text_commit(combo)   # F3
         for m in self.learnset_move_options:
             combo.addItem(self._move_display_name(m), m)
         self._select_learnset_move(combo, "MOVE_NONE")
@@ -11242,6 +11537,7 @@ QTabBar::tab:hover:!selected {
         combo = QComboBox()
         combo.setEditable(True)
         combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._attach_move_text_commit(combo)   # F3
         for m in self.learnset_move_options:
             combo.addItem(self._move_display_name(m), m)
         self._select_learnset_move(combo, "MOVE_NONE")
@@ -11541,6 +11837,51 @@ QTabBar::tab:hover:!selected {
                       f"(not in this project)", move_const)
         combo.setCurrentIndex(combo.count() - 1)
         return move_const
+
+    def _attach_move_text_commit(self, combo) -> None:
+        """Make a typed move name commit, or visibly not stick.
+
+        Finding F3. These combos are editable with InsertPolicy.NoInsert, so
+        the UI invites typing — but typing does not move `currentIndex`, and
+        the save reads `(currentData() or currentText())`. Measured with real
+        key events: pressing RETURN committed correctly, while Tab and
+        clicking away left the OLD move selected and silently threw the typed
+        one away. A box that accepts a value on one exit path and discards it
+        on two others is worse than one that never accepted typing at all.
+
+        `editingFinished` covers Return AND focus-out, so Return keeps working
+        through the SAME resolution routine rather than a second, divergent
+        one. Choosing a completion with the mouse sets the line edit's text
+        first, so that path resolves here too.
+
+        Text matching nothing is REFUSED, not guessed at: the box snaps back
+        to what is actually selected, so the user can see the edit did not
+        take rather than believing a typo was saved.
+        """
+        line = combo.lineEdit()
+        if line is None:
+            return
+
+        def _commit():
+            typed = (combo.currentText() or "").strip()
+            if not typed:
+                combo.setCurrentIndex(combo.currentIndex())
+                return
+            idx = combo.findText(typed, Qt.MatchFlag.MatchFixedString)
+            if idx >= 0:
+                if idx != combo.currentIndex():
+                    combo.setCurrentIndex(idx)
+                    self.setWindowModified(True)
+                return
+            # No such move — restore what is actually selected.
+            current = combo.itemText(combo.currentIndex())
+            if typed != current:
+                combo.setCurrentText(current)
+                logging.info(
+                    "Learnset: %r does not match any move in this project; "
+                    "the row was left on %r.", typed, current)
+
+        line.editingFinished.connect(_commit)
 
     def _note_unresolved_move(self, species: str, move_const) -> None:
         """Record an unresolved learnset move so the user can be told once."""
@@ -11849,6 +12190,7 @@ QTabBar::tab:hover:!selected {
                 combo = QComboBox()
                 combo.setEditable(True)
                 combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+                self._attach_move_text_commit(combo)   # F3
                 for m in self.learnset_move_options:
                     combo.addItem(self._move_display_name(m), m)
                 move_const = str(entry.get("move", "MOVE_NONE"))
@@ -11922,6 +12264,7 @@ QTabBar::tab:hover:!selected {
                 combo = QComboBox()
                 combo.setEditable(True)
                 combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+                self._attach_move_text_commit(combo)   # F3
                 for m in self.learnset_move_options:
                     combo.addItem(self._move_display_name(m), m)
                 move_const = str(entry.get("move", "MOVE_NONE"))
@@ -12946,7 +13289,11 @@ QTabBar::tab:hover:!selected {
                 qm.StandardButton.Yes | qm.StandardButton.No,
             )
             if ret == qm.StandardButton.Yes:
-                self.update_save()
+                # Do not offer the New Project dialog if the save the user
+                # asked for did not happen (2026-11-08).
+                if not self._save_for_destructive_action(
+                        "create the new project"):
+                    return
             d = NewProject(parent=self)
             d.show()
         elif origin == self.ui.actionOpen_in_Terminal:
@@ -13390,31 +13737,24 @@ QTabBar::tab:hover:!selected {
                                 sdata["dex_constant"] = entry.get("dex_constant")
                         self.source_data.data["pokedex"].data["national_dex"] = dex_list
 
-                    # Same treatment for the regional dex list — it also
-                    # supports drag-reorder. Without this rebuild, regional
-                    # reorders were silently dropped at save time.
+                    # The regional list keeps its model up to date as the user
+                    # drags, so there is nothing to rebuild here. This is a
+                    # last check that what is on screen still matches what is
+                    # about to be written.
+                    #
+                    # The old code here rebuilt the regional list by reading
+                    # every row's UserRole. That cannot be done any more: the
+                    # list now carries section headers and a boundary divider,
+                    # which are not Pokemon, and it was also rebuilding the
+                    # DERIVED view rather than the ordering and boundary that
+                    # actually get serialized.
                     try:
-                        reg_list = []
-                        current_reg = {
-                            d.get("dex_constant"): d
-                            for d in (self.source_data.get_regional_dex() or [])
-                        }
-                        for i in range(self.ui.list_pokedex_regional.count()):
-                            item = self.ui.list_pokedex_regional.item(i)
-                            const = item.data(Qt.ItemDataRole.UserRole)
-                            entry = current_reg.get(
-                                const, {"dex_constant": const}
-                            )
-                            entry["dex_num"] = i + 1
-                            reg_list.append(entry)
-                        if self._dex_order_is_sane(
-                                "Regional", reg_list,
-                                self.source_data.get_regional_dex() or []):
-                            self.source_data.data["pokedex"].data[
-                                "regional_dex"] = reg_list
+                        read = self._read_regional_list()
+                        if read is not None:
+                            self._set_hoenn_model(*read)
                     except Exception:
                         logging.getLogger(__name__).exception(
-                            "regional dex rebuild failed")
+                            "regional dex readback failed")
 
                 # Consolidate global Moves table edits before save
                 dlg.step("Writing moves")
@@ -14214,88 +14554,6 @@ QTabBar::tab:hover:!selected {
 
         return total
 
-    @staticmethod
-    def _current_description_in_header(text: str, symbol: str):
-        """The description currently stored under *symbol*, or None."""
-        import re
-        m = re.search(
-            r"const\s+u8\s+" + re.escape(symbol) + r"\[\]\s*=\s*_\(\n(.*?)\)\s*;",
-            text, re.S)
-        if not m:
-            return None
-        lines = []
-        for raw in m.group(1).splitlines():
-            raw = raw.strip()
-            if not (raw.startswith('"') and raw.rfind('"') > 0):
-                continue
-            body = raw[1:raw.rfind('"')]
-            lines.append(body[:-2] if body.endswith(r"\n") else body)
-        return "\n".join(lines)
-
-    def _plan_pokedex_descriptions(self, natdex, header_text):
-        """Decide which descriptions may be written, and why not for the rest.
-
-        Returns ``(desc_map, conflicts)``. `conflicts` holds ONE entry per
-        underlying cause, not one per affected creature — editing a single
-        creature whose symbol is shared by 25 others must not produce 24
-        redundant errors.
-        """
-        by_symbol: dict = {}
-        no_symbol: list = []
-        for entry in natdex:
-            sym = entry.get("description")
-            desc = entry.get("descriptionText")
-            name = entry.get("dex_constant") or entry.get("species") or "?"
-            if not desc:
-                continue
-            if not sym:
-                # Nothing in the engine for this text to be written to.
-                no_symbol.append(name)
-                continue
-            by_symbol.setdefault(sym, []).append((name, desc))
-
-        desc_map: dict = {}
-        conflicts: list = []
-
-        for sym, rows in by_symbol.items():
-            on_disk = self._current_description_in_header(header_text, sym)
-            changed = [(n, d) for n, d in rows if d != on_disk]
-            if not changed:
-                # Untouched — including placeholders that merely share a
-                # symbol. Not a conflict, and not worth a word to the user.
-                continue
-            distinct = {d for _n, d in changed}
-            if len(rows) > 1:
-                # Writing it would change every creature sharing the symbol.
-                conflicts.append(
-                    "%s cannot be given a separate description: %d Pokédex "
-                    "entries share the text symbol %s (%s). Writing it would "
-                    "change all of them, so nothing was written for any."
-                    % (", ".join(n for n, _d in changed[:3])
-                       + ("…" if len(changed) > 3 else ""),
-                       len(rows), sym,
-                       ", ".join(n for n, _d in rows[:4])
-                       + ("…" if len(rows) > 4 else "")))
-                continue
-            if len(distinct) > 1:
-                conflicts.append(
-                    "%s has %d different descriptions competing for the same "
-                    "symbol %s; none was written."
-                    % (rows[0][0], len(distinct), sym))
-                continue
-            desc_map[sym] = changed[0][1]
-
-        if no_symbol:
-            conflicts.append(
-                "%d Pokédex %s no text symbol in the engine, so %s "
-                "description could not be written: %s."
-                % (len(no_symbol),
-                   "entries have" if len(no_symbol) != 1 else "entry has",
-                   "their" if len(no_symbol) != 1 else "its",
-                   ", ".join(no_symbol[:6])
-                   + ("…" if len(no_symbol) > 6 else "")))
-        return desc_map, conflicts
-
     def _report_description_conflicts(self, conflicts: list) -> None:
         """Tell the user which descriptions could not be saved, and why."""
         if not conflicts:
@@ -14318,9 +14576,20 @@ QTabBar::tab:hover:!selected {
             logging.exception("Could not show the description-conflict dialog")
 
     def _write_pokedex_text_header(self) -> int:
-        """Patch description text in pokedex_text_fr.h from in-memory pokedex data.
+        """Persist Pokedex descriptions, allocating symbols where needed.
 
-        Returns number of entries updated, or -1 on error.
+        A description is a POINTER into a separate text file, and many
+        creatures share the engine's one placeholder block. Writing a user's
+        words into that shared block changes every creature pointing at it, so
+        a creature given text of its own gets a symbol of its own here --
+        allocated lazily, only when there is actually something to store.
+
+        The planning, the all-or-nothing write and the rollback all live in
+        core/pokedex_descriptions.py, so the end-to-end harness exercises the
+        same code this does rather than a parallel copy of it.
+
+        Returns the number of creatures whose description changed, or -1 on
+        error.
         """
         # Description text lives on the species_data plugin (it's stored
         # under each species' species_info.description). Skip if neither
@@ -14328,10 +14597,15 @@ QTabBar::tab:hover:!selected {
         if (self._plugin_data_unchanged("species_data")
                 and self._plugin_data_unchanged("pokedex")):
             return 0
-        import re
+
+        from core import pokedex_descriptions as pdesc
+
         root = self.project_info.get("dir", "")
-        path = os.path.join(root, "src", "data", "pokemon", "pokedex_text_fr.h")
-        if not os.path.isfile(path):
+        base = os.path.join(root, "src", "data", "pokemon")
+        entries_path = os.path.join(base, "pokedex_entries.h")
+        fr_path = os.path.join(base, "pokedex_text_fr.h")
+        lg_path = os.path.join(base, "pokedex_text_lg.h")
+        if not os.path.isfile(entries_path) or not os.path.isfile(fr_path):
             return -1
 
         try:
@@ -14339,68 +14613,16 @@ QTabBar::tab:hover:!selected {
         except Exception:
             return -1
 
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except Exception:
+        result = pdesc.write_descriptions(
+            natdex, entries_path, fr_path, [lg_path])
+
+        if result.conflicts:
+            self._report_description_conflicts(result.conflicts)
+        if result.failure:
+            logging.error("Pokedex descriptions: %s", result.failure)
+            self._write_failures.append(result.failure)
             return -1
-
-        # ── NEW3a containment ────────────────────────────────────────────
-        # This used to be a plain `desc_map[sym] = desc` walked in list order.
-        # Descriptions are keyed by C SYMBOL, and in this project 25 dex
-        # entries share `gDummyPokedexText` while 77 more carry no symbol at
-        # all — 102 of 488. So the last entry in the list silently won the
-        # shared block, every earlier edit was discarded before anything was
-        # written, and whichever text survived was shown by all 103 engine
-        # rows pointing at that symbol. Meanwhile the editor kept displaying
-        # each creature its own text, because the UI reads pokedex.json.
-        #
-        # So: refuse what cannot be represented independently, and say why.
-        # Deliberately NOT a blanket refusal — an unchanged placeholder that
-        # merely happens to share a symbol is fine, and a save that touched
-        # nothing must produce no diagnostics at all.
-        desc_map, conflicts = self._plan_pokedex_descriptions(natdex, text)
-        if conflicts:
-            self._report_description_conflicts(conflicts)
-
-        if not desc_map:
-            return 0
-
-        total = 0
-        for sym, desc in desc_map.items():
-            # Format description as C string literal lines:
-            # const u8 gXxxPokedexText[] = _(
-            #     "line1\n"
-            #     "line2\n"
-            #     "line3");
-            lines = desc.split("\n")
-            c_lines = []
-            for i, line in enumerate(lines):
-                escaped = line.replace("\\", "\\\\").replace('"', '\\"')
-                if i < len(lines) - 1:
-                    c_lines.append(f'    "{escaped}\\n"')
-                else:
-                    c_lines.append(f'    "{escaped}"')
-            new_body = "\n".join(c_lines)
-
-            # Match existing block: const u8 gXxxPokedexText[] = _(\n    "...");
-            pat = re.compile(
-                rf"(const\s+u8\s+{re.escape(sym)}\[\]\s*=\s*_\(\n)(.*?)((?:\);|\)))",
-                re.S,
-            )
-            m = pat.search(text)
-            if m:
-                replacement = m.group(1) + new_body + m.group(3)
-                if replacement != m.group(0):
-                    text = text[:m.start()] + replacement + text[m.end():]
-                    total += 1
-
-        try:
-            write_text_if_changed(path, text)
-        except Exception:
-            return -1
-
-        return total
+        return result.touched
 
     # ── Animation extractor ──────────────────────────────────────────
 
@@ -15392,6 +15614,56 @@ QTabBar::tab:hover:!selected {
         """
         self.ui.logOutput.append(message)
 
+    def _save_for_destructive_action(self, what: str) -> bool:
+        """Save PorySuite data when the next step would destroy unsaved work.
+
+        `what` is a plain base-form description of that step ("switch
+        projects", "close"). Returns True only when it is safe to go ahead.
+        On failure it tells the user and returns False, and the CALLER must
+        abandon the step.
+
+        WHY THIS EXISTS (2026-11-08). Three "save before you lose your work"
+        prompts called `update_save()` bare — switching projects, New Project
+        and exiting. `update_save()` raises on a write it cannot do, and from
+        `closeEvent` that exception leaves the event handler altogether: the
+        user asked for a save, got no save, got no message, and the
+        destructive step went ahead regardless.
+
+        KNOWN LIMIT, not papered over. `update_save()` has no success return
+        value and swallows most per-editor problems in bare `except` blocks,
+        so this cannot see a write that failed QUIETLY. It reads the two
+        signals that do exist — an escaping exception, and the Items flush's
+        `_item_save_errors` — which is what the measured defect was. Giving
+        `update_save()` a real failure channel is a separate and much larger
+        change; see BUGS.md, "How update_save() reports success: it does not".
+        """
+        self._item_save_errors = []
+        try:
+            self.update_save()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).exception(
+                "save failed, so PorySuite did not %s", what)
+            self.log_message(f"Save failed, so PorySuite did not {what}: {e}")
+            QMessageBox.warning(
+                self, "Your changes were NOT saved",
+                f"PorySuite could not save your changes, so it did not "
+                f"{what}.\n\n{e}\n\nYour unsaved work is still here — fix "
+                f"the problem and try again.")
+            return False
+        errs = list(getattr(self, "_item_save_errors", []) or [])
+        if errs:
+            detail = "; ".join(errs)
+            self.log_message(
+                f"Save incomplete, so PorySuite did not {what}: {detail}")
+            QMessageBox.warning(
+                self, "Some changes were NOT saved",
+                f"Some of your changes could not be saved, so PorySuite did "
+                f"not {what}.\n\n{detail}\n\nYour unsaved work is still "
+                f"here — fix the problem and try again.")
+            return False
+        return True
+
     def try_save_before_closing(self):
         """
         Saves the project before closing the application.
@@ -15405,7 +15677,11 @@ QTabBar::tab:hover:!selected {
                 "You have unsaved changes. Would you like to save before exiting?",
             )
             if ret == QMessageBox.StandardButton.Save:
-                self.update_save()
+                # A failed save must not be followed by a close. Returning
+                # False here makes closeEvent call event.ignore(), so the
+                # window stays open with the work intact. No "Close Anyway"
+                # is offered at this moment on purpose (2026-11-08).
+                return self._save_for_destructive_action("close")
             return ret != QMessageBox.StandardButton.Cancel
         return True
 

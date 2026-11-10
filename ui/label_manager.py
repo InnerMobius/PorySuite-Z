@@ -34,9 +34,11 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QPlainTextEdit,
     QListWidget, QListWidgetItem, QSplitter, QMessageBox,
     QComboBox, QAbstractItemView, QInputDialog, QApplication,
+    QCheckBox,
 )
 
 from eventide.backend import var_flag_manager as vf
+from eventide.backend import new_game_state as ngs
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -251,6 +253,41 @@ class LabelManagerWidget(QWidget):
         self._notes_edit.textChanged.connect(self._on_notes_edited)
         self._notes_edit.setEnabled(False)
         form.addRow("Notes:", self._notes_edit)
+
+        # ── New game ────────────────────────────────────────────────────────
+        # Flags are off in a fresh save file. That is wrong for a hide flag:
+        # the engine skips an object whose hide flag is ON, so "this person is
+        # not here yet" has to START on and be cleared when they should
+        # appear. Vanilla switches those on in one script run once at the
+        # beginning of a new game, and nothing in PorySuite could read or
+        # write it — so a hide flag set in the editor worked perfectly and
+        # then never came on, and the NPC stood there from the first save.
+        #
+        # This is one property of one flag, so it lives here beside the
+        # flag's other properties rather than in a screen of its own: a
+        # second place to look up what a flag does is a second place for the
+        # answer to drift.
+        self._newgame_check = QCheckBox("Switched ON when a new game starts")
+        self._newgame_check.setEnabled(False)
+        self._newgame_check.toggled.connect(self._on_newgame_toggled)
+        self._newgame_row = form.rowCount()
+        form.addRow("New game:", self._newgame_check)
+
+        self._newgame_value = QLineEdit()
+        self._newgame_value.setPlaceholderText("not set — starts at 0")
+        self._newgame_value.setMaximumWidth(120)
+        self._newgame_value.setEnabled(False)
+        self._newgame_value.editingFinished.connect(self._on_newgame_value_set)
+        self._newgame_value_row = form.rowCount()
+        form.addRow("Starts at:", self._newgame_value)
+
+        self._newgame_note = QLabel("")
+        self._newgame_note.setWordWrap(True)
+        self._newgame_note.setStyleSheet("color: #888; font-size: 11px;")
+        self._newgame_note_row = form.rowCount()
+        form.addRow("", self._newgame_note)
+
+        self._form = form
         right_layout.addLayout(form)
 
         # Advanced / nav buttons
@@ -482,10 +519,21 @@ class LabelManagerWidget(QWidget):
             self._detail_usage.setText("")
             self._detail_refs.clear()
             for w in (self._label_edit, self._notes_edit,
-                      self._btn_rename_code, self._btn_use_in_editor):
+                      self._btn_rename_code, self._btn_use_in_editor,
+                      self._newgame_check, self._newgame_value):
                 w.setEnabled(False)
             self._label_edit.clear()
             self._notes_edit.clear()
+            # A tick left showing with nothing selected reads as a statement
+            # about the project, so clear it — without firing the handler,
+            # which would try to edit the game source.
+            self._newgame_check.blockSignals(True)
+            self._newgame_check.setChecked(False)
+            self._newgame_check.blockSignals(False)
+            self._newgame_value.blockSignals(True)
+            self._newgame_value.clear()
+            self._newgame_value.blockSignals(False)
+            self._show_newgame_rows(flag=False, var=False, note="")
             return
 
         name = current.data(Qt.ItemDataRole.UserRole)
@@ -530,6 +578,139 @@ class LabelManagerWidget(QWidget):
 
         self._btn_rename_code.setEnabled(True)
         self._btn_use_in_editor.setEnabled(True)
+        self._sync_newgame(name)
+
+    # ─── New game ───────────────────────────────────────────────────────────
+
+    def _newgame(self):
+        """The project's new-game script, re-read each time it is needed.
+
+        Not cached. It is a file the user can also edit by hand, and a stale
+        cache here would show a tick for a line that is no longer there — a
+        checkbox that lies about engine source is worse than one that is a
+        few milliseconds slow.
+        """
+        if not self._project_dir:
+            return ngs.NewGameState()
+        try:
+            return ngs.read(self._project_dir)
+        except Exception:
+            return ngs.NewGameState()
+
+    def _show_newgame_rows(self, *, flag: bool, var: bool, note: str):
+        for row, shown in ((self._newgame_row, flag),
+                           (self._newgame_value_row, var),
+                           (self._newgame_note_row, bool(note))):
+            for role in (QFormLayout.ItemRole.LabelRole,
+                         QFormLayout.ItemRole.FieldRole):
+                item = self._form.itemAt(row, role)
+                if item is not None and item.widget() is not None:
+                    item.widget().setVisible(shown)
+        self._newgame_note.setText(note)
+
+    def _sync_newgame(self, name: str):
+        """Show what the new-game script currently does with *name*."""
+        is_flag = name.startswith("FLAG_")
+        is_var = name.startswith("VAR_")
+        state = self._newgame()
+
+        if not state.found:
+            self._newgame_check.setEnabled(False)
+            self._newgame_value.setEnabled(False)
+            self._show_newgame_rows(
+                flag=is_flag, var=is_var,
+                note="This project has no new-game script — nothing in "
+                     "src/new_game.c hands one to RunScriptImmediately(), so "
+                     "there is nowhere to record a starting value.")
+            self._newgame_check.blockSignals(True)
+            self._newgame_check.setChecked(False)
+            self._newgame_check.blockSignals(False)
+            self._newgame_value.blockSignals(True)
+            self._newgame_value.clear()
+            self._newgame_value.blockSignals(False)
+            return
+
+        note = ""
+        if state.locked:
+            note = f"{state.label} cannot be edited safely: {state.locked}"
+        elif is_flag:
+            note = ("Use this for someone who should not be in the world "
+                    "yet. The engine skips an object while its hide flag is "
+                    "on, so switch it on here and have the scene clear it.")
+
+        self._newgame_check.blockSignals(True)
+        self._newgame_check.setChecked(is_flag and state.sets_flag(name))
+        self._newgame_check.setEnabled(is_flag and state.editable)
+        self._newgame_check.blockSignals(False)
+
+        self._newgame_value.blockSignals(True)
+        self._newgame_value.setText(state.vars.get(name, "") if is_var else "")
+        self._newgame_value.setEnabled(is_var and state.editable)
+        self._newgame_value.blockSignals(False)
+
+        self._show_newgame_rows(flag=is_flag, var=is_var, note=note)
+
+    def _on_newgame_toggled(self, on: bool):
+        """Add or remove this flag's line in the new-game script.
+
+        This writes to the game's own source there and then — it is not part
+        of the label file, and there is no Save button for it. So the status
+        line says exactly what changed and in which script, and a refused or
+        unnecessary write puts the tick back where it was rather than leaving
+        the box disagreeing with the file.
+        """
+        name = self._current_const_name()
+        if not name or not name.startswith("FLAG_"):
+            return
+        backup = ""
+        state = self._newgame()
+        if state.path is not None:
+            try:
+                backup = vf.backup_files(
+                    self._project_dir, [str(state.path)], self._backup_root())
+            except Exception:
+                backup = ""
+        try:
+            changed, msg = ngs.set_flag(self._project_dir, name, on)
+        except Exception as exc:
+            changed, msg = False, f"could not write the new-game script: {exc}"
+        if not changed:
+            self._newgame_check.blockSignals(True)
+            self._newgame_check.setChecked(self._newgame().sets_flag(name))
+            self._newgame_check.blockSignals(False)
+            self._status_label.setText(msg)
+            return
+        if backup:
+            msg += f"  (previous version saved in {backup})"
+        self._status_label.setText(msg)
+        self._sync_newgame(name)
+
+    def _on_newgame_value_set(self):
+        """Give this variable a starting value, change it, or clear it."""
+        name = self._current_const_name()
+        if not name or not name.startswith("VAR_"):
+            return
+        raw = self._newgame_value.text().strip()
+        state = self._newgame()
+        current = state.vars.get(name)
+        if raw == (current or ""):
+            return
+        backup = ""
+        if state.path is not None:
+            try:
+                backup = vf.backup_files(
+                    self._project_dir, [str(state.path)], self._backup_root())
+            except Exception:
+                backup = ""
+        try:
+            changed, msg = ngs.set_var(
+                self._project_dir, name, raw if raw else None)
+        except Exception as exc:
+            changed, msg = False, f"could not write the new-game script: {exc}"
+        if changed and backup:
+            msg += f"  (previous version saved in {backup})"
+        self._status_label.setText(msg)
+        self._sync_newgame(name)
 
     # ─── Reference reporting ────────────────────────────────────────────────
 

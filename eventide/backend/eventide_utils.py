@@ -2130,12 +2130,37 @@ def lines_from_commands(
 # to end in one — so one tab per element is sufficient.
 _LABEL_RE = re.compile(r'^\w+::')
 
+# Finding 0g left every assembler directive flush-left. That is right for the
+# ones it names, and wrong for the DATA terminators that close a table, which
+# the project indents like the commands around them. Counted across its 453
+# scripts.inc files:
+#
+#   .byte    449 indented :   4 flush      .equ     0 indented :  34 flush
+#   .2byte   224 indented :   0 flush      .set     0 indented :   5 flush
+#
+# It only started to matter once EVENTide could CREATE a map script table,
+# because `.byte 0` closes the outer one and `.2byte 0` the inner: every table
+# the editor wrote came out with its terminator shoved to column 0, which is
+# the diff noise Finding 0g exists to prevent.
+#
+# Deliberately ONLY these three, not "every directive the project indents".
+# `.align`, `.ifdef`, `.endif`, `.else`, `.macro` and `.endm` are also
+# indented in the real tree (23:0, 18:1, 18:1, 9:1, 6:0, 6:0), but Finding
+# 0g's DO-NOT-REGRESS list says directives stay put and names `.macro` and
+# `.endm` outright. Nothing EVENTide emits produces those, so widening this
+# would be overruling a recorded decision for no gain. Logged in BUGS.md
+# instead, with the counts, for a deliberate call.
+_INDENTED_DIRECTIVES = ('.byte', '.2byte', '.4byte')
+
 
 def _indent_script_lines(lines: list[str]) -> list[str]:
     """Apply the project's command indentation without touching labels.
 
     Left alone: blank lines, anything already indented, labels (`Foo::`),
-    assembler directives (`.macro`, `.endm`) and comments.
+    comments, and every assembler directive except the table terminators in
+    :data:`_INDENTED_DIRECTIVES`. So `.equ` and `.set` — which the project
+    writes flush-left, like labels — stay flush-left, and so does everything
+    Finding 0g's DO-NOT-REGRESS list covers.
     """
     out: list[str] = []
     for line in lines:
@@ -2143,10 +2168,14 @@ def _indent_script_lines(lines: list[str]) -> list[str]:
         if (not stripped
                 or line.startswith(('\t', ' '))
                 or _LABEL_RE.match(stripped)
-                or stripped.startswith(('@', '.', '#'))):
+                or stripped.startswith(('@', '#'))):
             out.append(line)
-        else:
-            out.append('\t' + line)
+            continue
+        if stripped.startswith('.'):
+            head = stripped.split(None, 1)[0]
+            out.append('\t' + line if head in _INDENTED_DIRECTIVES else line)
+            continue
+        out.append('\t' + line)
     return out
 
 
