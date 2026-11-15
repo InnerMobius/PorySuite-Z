@@ -57,6 +57,7 @@ class TrackRow(QFrame):
     selected = pyqtSignal(int)             # track_index — user clicked this row
     remove_requested = pyqtSignal(int)     # track_index — right-click → Delete
     duplicate_requested = pyqtSignal(int)  # track_index — right-click → Duplicate
+    move_requested = pyqtSignal(int, int)  # track_index, -1 = up / +1 = down
 
     def __init__(self, track_index: int, track_info: dict,
                  instrument_names: Optional[list] = None, parent=None):
@@ -307,6 +308,9 @@ class TrackRow(QFrame):
         # select this row first so any highlight / active-track state follows
         self.selected.emit(self._index)
         menu = QMenu(self)
+        act_up = menu.addAction("Move Track Up")
+        act_down = menu.addAction("Move Track Down")
+        menu.addSeparator()
         act_dup = menu.addAction("Duplicate Track")
         act_del = menu.addAction("Delete Track")
         chosen = menu.exec(event.globalPos())
@@ -314,6 +318,10 @@ class TrackRow(QFrame):
             self.remove_requested.emit(self._index)
         elif chosen is act_dup:
             self.duplicate_requested.emit(self._index)
+        elif chosen is act_up:
+            self.move_requested.emit(self._index, -1)
+        elif chosen is act_down:
+            self.move_requested.emit(self._index, 1)
 
     @property
     def is_muted(self) -> bool:
@@ -337,6 +345,7 @@ class TrackSidebar(QWidget):
     track_added = pyqtSignal()
     track_removed = pyqtSignal(int)          # track index
     track_duplicated = pyqtSignal(int)       # track index
+    track_moved = pyqtSignal(int, int)       # track index, -1 up / +1 down
     mute_solo_changed = pyqtSignal()         # batch mute/solo changed (mute all, etc.)
     voicegroup_changed = pyqtSignal(str)     # new voicegroup name
 
@@ -448,6 +457,17 @@ class TrackSidebar(QWidget):
         self._btn_dup.clicked.connect(self._on_duplicate)
         btn_row.addWidget(self._btn_dup)
 
+        self._btn_up = QPushButton("▲")
+        self._btn_up.setFixedSize(26, 24)
+        self._btn_up.setToolTip("Move the selected track up")
+        self._btn_up.clicked.connect(lambda: self._on_move(-1))
+        btn_row.addWidget(self._btn_up)
+        self._btn_down = QPushButton("▼")
+        self._btn_down.setFixedSize(26, 24)
+        self._btn_down.setToolTip("Move the selected track down")
+        self._btn_down.clicked.connect(lambda: self._on_move(1))
+        btn_row.addWidget(self._btn_down)
+
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
@@ -520,6 +540,7 @@ class TrackSidebar(QWidget):
             row.selected.connect(self._on_row_selected)
             row.remove_requested.connect(self.track_removed.emit)
             row.duplicate_requested.connect(self.track_duplicated.emit)
+            row.move_requested.connect(self.track_moved.emit)
             row.mute_toggled.connect(self.track_muted.emit)
             row.solo_toggled.connect(self.track_soloed.emit)
             row.volume_changed.connect(self.track_volume.emit)
@@ -567,6 +588,15 @@ class TrackSidebar(QWidget):
     def _on_duplicate(self):
         if self._selected_index >= 0:
             self.track_duplicated.emit(self._selected_index)
+
+    def _on_move(self, delta: int):
+        if self._selected_index >= 0:
+            self.track_moved.emit(self._selected_index, delta)
+
+    def select_row(self, index: int) -> None:
+        """Select (and highlight) row *index*, as a click on it would."""
+        if 0 <= index < len(self._rows):
+            self._on_row_selected(index)
 
     def _on_mute_all(self):
         for row in self._rows:
@@ -637,6 +667,13 @@ class TrackSidebar(QWidget):
             if row.is_soloed:
                 soloed.add(i)
         return {'muted': muted, 'soloed': soloed}
+
+    def set_mute_solo_state(self, muted: set, soloed: set) -> None:
+        """Re-apply mute / solo after the track list was rebuilt (a track
+        added, removed or duplicated must not unmute everything)."""
+        for i, row in enumerate(self._rows):
+            row._btn_mute.setChecked(i in muted)
+            row._btn_solo.setChecked(i in soloed)
 
 
 def extract_track_infos(song_data, vg_data=None) -> list[dict]:

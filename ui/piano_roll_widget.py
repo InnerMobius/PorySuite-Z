@@ -72,6 +72,11 @@ SNAP_VALUES = {
     '1/8': 12,
     '1/16': 6,
     '1/32': 3,
+    # Triplets fit the game's clock exactly (24 ticks a beat): three triplet
+    # quarters in two beats, three triplet eighths in one, six sixteenths.
+    '1/4 triplet': 16,
+    '1/8 triplet': 8,
+    '1/16 triplet': 4,
     'Free': 1,
 }
 
@@ -280,6 +285,9 @@ class PianoRollCanvas(QWidget):
         self._control_events: list[dict] = []  # BEND/BENDR/VOL/PAN for sequencer
         self._total_ticks: int = 960
         self._beats_per_measure: int = 4
+        # Bar-line positions (playback ticks) from the song's time signatures;
+        # empty = every 4/4 bar. See bars_in().
+        self._bar_starts: list[int] = []
         self._ticks_per_beat: int = _TICKS_PER_BEAT
         self._loop_start: Optional[int] = None
         self._loop_end: Optional[int] = None
@@ -306,9 +314,16 @@ class PianoRollCanvas(QWidget):
         self._clipboard_ctrl: list[dict] = []
         self._visible_tracks: Optional[set[int]] = None  # None = all visible
 
-        # Undo stack — stores snapshots of (notes, control_events)
-        self._undo_stack: list[tuple[list[dict], list[dict]]] = []
-        self._max_undo: int = 50
+        # Undo / redo. The Piano Roll window replaces this with its own
+        # history (set_history), whose snapshots also hold the tracks, their
+        # commands and the loop; on its own the canvas undoes its notes and
+        # drawn controls.
+        from ui.piano_roll_history import EditHistory
+        self._history = EditHistory(
+            capture=lambda: ([dict(n) for n in self._notes],
+                             [dict(e) for e in self._control_events]),
+            restore=self._restore_own_snapshot,
+            same=lambda a, b: a == b)
 
         # Drag state
         self._mode: int = _Mode.NONE
@@ -345,6 +360,32 @@ class PianoRollCanvas(QWidget):
     def get_sequencer_events(self) -> list[dict]:
         """Get notes + control events merged for the sequencer."""
         return list(self._notes) + list(self._control_events)
+
+    def set_bar_starts(self, bar_starts: list) -> None:
+        """Where the song's bars begin (playback ticks), from its time
+        signatures. The grid, the ruler and the lanes draw bar lines here."""
+        self._bar_starts = sorted(set(int(t) for t in bar_starts))
+        self.update()
+
+    def bars_in(self, t0: int, t1: int) -> list:
+        """[(tick, bar number)] of every bar line from *t0* to *t1*. After the
+        last known bar the last bar's length repeats."""
+        starts = self._bar_starts
+        if not starts:
+            step = self._ticks_per_beat * self._beats_per_measure
+            first = max(0, t0) // step
+            return [(b * step, b + 1) for b in range(first, t1 // step + 1)]
+        out = [(t, i + 1) for i, t in enumerate(starts) if t0 <= t <= t1]
+        step = (starts[-1] - starts[-2]) if len(starts) > 1 else 96
+        step = max(1, step)
+        t, n = starts[-1] + step, len(starts) + 1
+        if t < t0:
+            k = (t0 - t) // step
+            t, n = t + k * step, n + k
+        while t <= t1:
+            out.append((t, n))
+            t, n = t + step, n + 1
+        return out
 
     def set_loop_region(self, start: Optional[int], end: Optional[int]):
         self._loop_start = start
@@ -391,28 +432,73 @@ class PianoRollCanvas(QWidget):
             }
         self.update()
 
-    def push_undo(self):
-        """Save current state to the undo stack."""
-        snapshot = (
-            [dict(n) for n in self._notes],
-            [dict(e) for e in self._control_events],
-        )
-        self._undo_stack.append(snapshot)
-        if len(self._undo_stack) > self._max_undo:
-            self._undo_stack.pop(0)
+    def set_history(self, history) -> None:
+        """Use *history* (an ``EditHistory``) for undo / redo."""
+        self._history = history
+
+    @property
+    def history(self):
+        return self._history
+
+    def push_undo(self, merge_key=None):
+        """Record the state just before an edit (one undo step)."""
+        self._history.checkpoint(merge_key)
 
     def undo(self):
-        """Restore the most recent undo snapshot."""
-        if not self._undo_stack:
-            self.status_message.emit("Nothing to undo")
-            return
-        notes, controls = self._undo_stack.pop()
-        self._notes = notes
-        self._control_events = controls
+        self.status_message.emit("Undo" if self._history.undo() else "Nothing to undo")
+
+    def redo(self):
+        self.status_message.emit("Redo" if self._history.redo() else "Nothing to redo")
+
+    def _restore_own_snapshot(self, state) -> None:
+        notes, controls = state
+        self._notes = [dict(n) for n in notes]
+        self._control_events = [dict(e) for e in controls]
         self._selected.clear()
         self.notes_changed.emit()
         self.update()
-        self.status_message.emit("Undo")
+
+    def remap_tracks(self, mapping: dict) -> None:
+        """Renumber tracks on the canvas: *mapping* is {old index: new index},
+        or None to drop that track's notes and drawn controls.
+
+        Applied to the notes, the drawn controls and the clipboard alike, so
+        after a track is removed or moved the canvas and the song keep agreeing
+        about which track is which. (Track operations used to re-fill the
+        canvas from the song's commands instead, which threw away every unsaved
+        edit.) Undo snapshots need no renumbering: each one holds its own track
+        list, so its numbers are right for it."""
+        def fix(items):
+            out = []
+            for it in items:
+                old = it.get('track', 0)
+                new = mapping.get(old, old)
+                if new is None:
+                    continue
+                out.append(it if new == old else {**it, 'track': new})
+            return out
+        self._notes = fix(self._notes)
+        self._control_events = fix(self._control_events)
+        self._clipboard = fix(self._clipboard)
+        self._clipboard_ctrl = fix(self._clipboard_ctrl)
+        self._selected.clear()
+        if self._visible_tracks is not None:
+            self._visible_tracks = {mapping.get(t, t) for t in self._visible_tracks
+                                    if mapping.get(t, t) is not None}
+        active = mapping.get(self._active_track, self._active_track)
+        self._active_track = 0 if active is None else active
+        self.update()
+
+    def duplicate_track_content(self, src: int, dst: int) -> None:
+        """Copy track *src*'s notes and drawn controls — as they are now,
+        unsaved edits included — onto track *dst*."""
+        notes = [{**n, 'track': dst} for n in self._notes if n.get('track', 0) == src]
+        # Tempo is song-wide, not part of a track's own content.
+        ctrls = [{**e, 'track': dst} for e in self._control_events
+                 if e.get('track', 0) == src and e.get('type') != 'TEMPO']
+        self._notes.extend(notes)
+        self._control_events.extend(ctrls)
+        self.update()
 
     def delete_selected(self):
         if not self._selected:
@@ -622,14 +708,17 @@ class PianoRollCanvas(QWidget):
         t = (vis_start // tick_step) * tick_step
         while t <= vis_end:
             x = self._tick_to_x(t)
-            if t % ticks_per_measure == 0:
-                p.setPen(QPen(_GRID_MEASURE_COLOR, 1))
-            elif t % self._ticks_per_beat == 0:
+            if t % self._ticks_per_beat == 0:
                 p.setPen(QPen(_GRID_BEAT_COLOR, 1))
             else:
                 p.setPen(QPen(_GRID_LINE_COLOR, 1))
             p.drawLine(int(x), content_top, int(x), content_bottom)
             t += tick_step
+        # Bar lines where the song's time signatures put them.
+        p.setPen(QPen(_GRID_MEASURE_COLOR, 1))
+        for bt, _n in self.bars_in(vis_start, vis_end):
+            x = self._tick_to_x(bt)
+            p.drawLine(int(x), content_top, int(x), content_bottom)
 
         # ── Horizontal grid lines ──
         vis_top = self._y_to_note(rect.top())
@@ -1149,8 +1238,6 @@ class PianoRollCanvas(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Delete or event.key() == Qt.Key.Key_Backspace:
             self.delete_selected()
-        elif event.key() == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.undo()
         elif event.key() == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.select_all()
         elif event.key() == Qt.Key.Key_C and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -1222,34 +1309,30 @@ class RulerWidget(QWidget):
         grad.setColorAt(1.0, QColor(35, 35, 42))
         p.fillRect(0, 0, w, h, grad)
 
-        ticks_per_measure = self._canvas._ticks_per_beat * self._canvas._beats_per_measure
-        tw = self._canvas._tick_width * self._canvas._zoom_x
-
         # Visible tick range based on scroll offset
         vis_start = max(0, self._local_x_to_tick(0))
         vis_end = self._local_x_to_tick(w + 1)
+        bars = self._canvas.bars_in(max(0, vis_start - 96 * 4), vis_end)
+        bar_ticks = {t for t, _n in bars}
 
-        # Beat ticks (small marks between measures)
+        # Beat ticks (small marks between bars)
         p.setPen(QPen(QColor(70, 70, 80), 1))
         bt = (vis_start // _TICKS_PER_BEAT) * _TICKS_PER_BEAT
         while bt <= vis_end:
             bx = self._tick_to_local_x(bt)
-            if bt % ticks_per_measure != 0:
+            if bt not in bar_ticks:
                 p.drawLine(int(bx), h - 6, int(bx), h)
             bt += _TICKS_PER_BEAT
 
-        # Measure numbers and main ticks
+        # Bar numbers and main ticks, where the time signatures put the bars
         p.setPen(QPen(_RULER_TEXT))
         p.setFont(QFont("", 9))
-        m = (vis_start // ticks_per_measure) * ticks_per_measure
-        while m <= vis_end:
+        for m, num in bars:
             x = self._tick_to_local_x(m)
-            num = m // ticks_per_measure + 1
             p.drawText(int(x) + 4, h - 8, str(num))
             p.setPen(QPen(QColor(140, 140, 150), 1))
             p.drawLine(int(x), h - 10, int(x), h)
             p.setPen(QPen(_RULER_TEXT))
-            m += ticks_per_measure
 
         # Bottom border
         p.setPen(QPen(QColor(80, 80, 90), 1))
@@ -1303,6 +1386,7 @@ class PianoRollWidget(QWidget):
     notes_changed = pyqtSignal()
     status_message = pyqtSignal(str)
     ruler_clicked = pyqtSignal(int)
+    lane_start_value_changed = pyqtSignal(int, str)   # track, control kind
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1360,9 +1444,53 @@ class PianoRollWidget(QWidget):
         layout.addLayout(ruler_row)
         layout.addWidget(self._scroll_area, 1)
 
+        # ── Automation / velocity lane (active track only) ──
+        from ui.piano_roll_lanes import AutomationLane, LANES, LANE_HEIGHT
+        from ui.custom_widgets.scroll_guard import install_scroll_guard
+        self._lane = AutomationLane(self._canvas)
+        self._lane.edited.connect(self.notes_changed.emit)
+        self._lane.start_value_changed.connect(self.lane_start_value_changed.emit)
+        self._scroll_area.horizontalScrollBar().valueChanged.connect(
+            self._lane.set_scroll_offset)
+        self._canvas.notes_changed.connect(self._lane.update)
+        self._canvas.zoom_changed.connect(lambda *_: self._lane.update())
+        lane_head = QHBoxLayout()
+        lane_head.setContentsMargins(4, 2, 4, 2)
+        lane_head.addWidget(QLabel("Lane:"))
+        self._lane_combo = QComboBox()
+        install_scroll_guard(self._lane_combo)
+        for key, text, *_rest in LANES:
+            self._lane_combo.addItem(text, key)
+        self._lane_combo.setToolTip(
+            "What the strip below shows and edits — for the selected track only.\n"
+            "Velocity is per note; the others are the track's controls over time.")
+        self._lane_combo.currentIndexChanged.connect(
+            lambda _i: self._lane.set_kind(self._lane_combo.currentData()))
+        lane_head.addWidget(self._lane_combo)
+        lane_hint = QLabel("click: add point · drag: move · right-click: delete")
+        lane_hint.setStyleSheet("color: #888;")
+        lane_head.addWidget(lane_hint)
+        lane_head.addStretch()
+        layout.addLayout(lane_head)
+        lane_row = QHBoxLayout()
+        lane_row.setContentsMargins(0, 0, 0, 0)
+        lane_row.setSpacing(0)
+        spacer = QWidget()
+        spacer.setFixedSize(_PIANO_WIDTH, LANE_HEIGHT)
+        lane_row.addWidget(spacer)
+        lane_row.addWidget(self._lane, 1)
+        tail = QWidget()
+        tail.setFixedSize(self._scroll_area.verticalScrollBar().sizeHint().width(), LANE_HEIGHT)
+        lane_row.addWidget(tail)
+        layout.addLayout(lane_row)
+
     @property
     def canvas(self) -> PianoRollCanvas:
         return self._canvas
+
+    @property
+    def lane(self):
+        return self._lane
 
     def load_song_data(self, song_data, track_index: int = -1):
         """Load a parsed SongData into the piano roll.
@@ -1414,7 +1542,8 @@ class PianoRollWidget(QWidget):
             # subroutine has 10 PAN commands and is called 7 times, we get
             # 70 PAN events instead of 10.  Deduplicate by (tick, type, value)
             # so only unique events at each tick position survive.
-            _CONTROL_EVENT_CMDS = {'BEND', 'BENDR', 'VOL', 'PAN', 'TEMPO'}
+            _CONTROL_EVENT_CMDS = {'BEND', 'BENDR', 'VOL', 'PAN', 'TEMPO', 'VOICE',
+                                   'MOD', 'LFOS', 'MODT', 'LFODL', 'TUNE'}
             _seen_ctrl: set[tuple[int, str, int]] = set()
             for cmd in flat_cmds:
                 if cmd.cmd in _CONTROL_EVENT_CMDS and cmd.value is not None:

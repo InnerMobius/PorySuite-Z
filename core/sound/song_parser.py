@@ -35,6 +35,13 @@ class TrackCommand:
     target_label: Optional[str] = None  # for GOTO/PATT: the label reference
     raw_line: str = ''           # original source line for round-trip fidelity
     parsed_value: Optional[int] = None  # value captured at parse time (see __post_init__)
+    sub: Optional[str] = None    # XCMD sub-command ('xIECV' / 'xIECL') or MEMACC operation ('mem_set', ...)
+    arg1: Optional[int] = None   # MEMACC's first operand (the memory slot); value is the second
+    # Where the command came from: (line number, position on the line). Two
+    # reads of the same file give every command the same origin, and a command
+    # an editor creates has none — which is how a save tells exactly what an
+    # editor changed (safe_song_save.apply_command_edits).
+    origin: Optional[tuple] = None
 
     def __post_init__(self):
         # Snapshot the parse-time value. If the UI later edits `value`, this
@@ -54,6 +61,11 @@ class Track:
     commands: list[TrackCommand] = field(default_factory=list)
     loop_label: Optional[str] = None    # GOTO target label (loop start)
     loop_tick: Optional[int] = None     # tick position of the loop start
+    # Bar comments mid2agb writes ("@ 005   ----"), as (bar number, index of
+    # the next command). They record where the source MIDI's bars fell, which
+    # decides how mid2agb splits waits; the MIDI exporter uses them to write
+    # the time signature back.
+    bar_marks: list = field(default_factory=list)
 
 
 @dataclass
@@ -122,6 +134,14 @@ def _eval_expr(expr: str, equs: dict[str, int]) -> int:
 _RE_EQU = re.compile(r'\.equ\s+(\w+)\s*,\s*(.+)')
 _RE_LABEL = re.compile(r'^(\w+):')
 _RE_TRACK_COMMENT = re.compile(r'Track\s+(\d+)\s+\(Midi-Chn\.(\d+)\)')
+_RE_BAR_COMMENT = re.compile(r'^@\s*(\d{3,})\s+-{4,}')
+
+# Commands the M4A engine (and mid2agb's PrintOp) allow to be repeated by
+# "running status": a later line may give just the value(s). TEMPO, KEYSH,
+# PRIO and the flow commands are never repeated this way (mid2agb prints them
+# with PrintByte, which leaves the running command alone).
+_RUNNING_VALUE_CMDS = frozenset(
+    ('VOICE', 'VOL', 'PAN', 'BEND', 'BENDR', 'LFOS', 'LFODL', 'MOD', 'MODT', 'TUNE'))
 _RE_BYTE = re.compile(r'\.byte\s+(.*)')
 _RE_WORD = re.compile(r'\.word\s+(\w+)')
 _RE_GLOBAL = re.compile(r'\.global\s+(\w+)')
@@ -265,6 +285,10 @@ def parse_song_file(filepath: str) -> SongData:
     pending_pitch: Optional[int] = None     # last pitch seen (sticky)
     pending_velocity: Optional[int] = None  # last velocity seen (sticky)
     last_control_cmd: Optional[str] = None  # last VOL/MOD/PAN/etc. for running status
+    # The command a bare value / bare pitch line repeats ("running status"):
+    # 'NOTE', 'TIE', 'EOT' or one of _RUNNING_VALUE_CMDS. A bare pitch after
+    # an EOT is another EOT, after a TIE another TIE — not a new note.
+    run_op: Optional[str] = None
     in_footer = False
     awaiting_pointer_for: Optional[str] = None  # 'GOTO' or 'PATT' waiting for .word
 
@@ -280,6 +304,10 @@ def parse_song_file(filepath: str) -> SongData:
             if m:
                 # Starting a new track section
                 pass
+            mb = _RE_BAR_COMMENT.match(comment)
+            if mb and current_track is not None and not in_footer:
+                current_track.bar_marks.append(
+                    (int(mb.group(1)), len(current_track.commands)))
             continue
 
         # --- Footer detection: the song header at the bottom ---
@@ -329,6 +357,7 @@ def parse_song_file(filepath: str) -> SongData:
                     pending_pitch = None
                     pending_velocity = None
                     last_control_cmd = None
+                    run_op = None
                     awaiting_pointer_for = None
                     continue
 
@@ -384,6 +413,7 @@ def parse_song_file(filepath: str) -> SongData:
         byte_content = m.group(1)
         tokens = [t.strip() for t in byte_content.split(',')]
 
+        n_before = len(current_track.commands)
         i = 0
         while i < len(tokens):
             token = tokens[i]
@@ -432,6 +462,7 @@ def parse_song_file(filepath: str) -> SongData:
                     pitch=pitch, velocity=velocity, gate_time=gate,
                     raw_line=stripped,
                 ))
+                run_op = 'NOTE'
                 i += 1
                 continue
 
@@ -475,6 +506,9 @@ def parse_song_file(filepath: str) -> SongData:
                         cmd='EOT', tick=current_tick, pitch=pitch,
                         raw_line=stripped,
                     ))
+                    if pitch is not None:
+                        pending_pitch = pitch
+                    run_op = 'EOT'
                     i += 1
                     continue
 
@@ -497,7 +531,49 @@ def parse_song_file(filepath: str) -> SongData:
                         pitch=pitch, velocity=velocity,
                         raw_line=stripped,
                     ))
+                    run_op = 'TIE'
                     i += 1
+                    continue
+
+                # XCMD carries a sub-command and ITS value:
+                #   .byte  XCMD , xIECV , 8
+                # Record both. The old code evaluated the sub-command name as
+                # the value and threw the real value away, so the echo setting
+                # could never be written back out.
+                if cmd_name == 'XCMD':
+                    sub = tokens[i + 1] if i + 1 < len(tokens) else None
+                    xval = None
+                    if i + 2 < len(tokens):
+                        try:
+                            xval = _eval_expr(tokens[i + 2], equs)
+                        except Exception:
+                            xval = None
+                    current_track.commands.append(TrackCommand(
+                        cmd='XCMD', tick=current_tick, value=xval, sub=sub,
+                        raw_line=stripped,
+                    ))
+                    run_op = 'XCMD'
+                    i += 3
+                    continue
+
+                # MEMACC has an operation and two operands:
+                #   .byte  MEMACC, mem_set, 0x00, 117
+                # It used to be read as a one-value command, and the two
+                # operands then fell through as "running status" values of the
+                # previous command (two phantom PAN events, in mus_rs_vs_trainer).
+                if cmd_name == 'MEMACC':
+                    def _num(k):
+                        try:
+                            return _eval_expr(tokens[k], equs) if k < len(tokens) else None
+                        except Exception:
+                            return None
+                    current_track.commands.append(TrackCommand(
+                        cmd='MEMACC', tick=current_tick,
+                        sub=tokens[i + 1] if i + 1 < len(tokens) else None,
+                        arg1=_num(i + 2), value=_num(i + 3),
+                        raw_line=stripped,
+                    ))
+                    i += 4
                     continue
 
                 # Commands with a single value argument
@@ -507,14 +583,11 @@ def parse_song_file(filepath: str) -> SongData:
                     value = _eval_expr(val_token, equs)
                     i += 1
 
-                # XCMD takes two extra bytes (sub-command + value);
-                # consume the remaining token on this line if present
-                if cmd_name == 'XCMD' and i + 1 < len(tokens):
-                    i += 1  # skip the extra XCMD argument
-
                 # Track the last control command for running status
                 if cmd_name in ('VOL', 'MOD', 'PAN', 'BEND', 'BENDR', 'KEYSH', 'TEMPO'):
                     last_control_cmd = cmd_name
+                if cmd_name in _RUNNING_VALUE_CMDS:
+                    run_op = cmd_name
 
                 current_track.commands.append(TrackCommand(
                     cmd=cmd_name, tick=current_tick, value=value,
@@ -523,26 +596,49 @@ def parse_song_file(filepath: str) -> SongData:
                 i += 1
                 continue
 
-            # --- Pitch-only continuation (sticky note) ---
-            # When a bare pitch name appears, it reuses the last Nxx duration
+            # --- Pitch-only continuation (running status) ---
+            # A bare pitch repeats the last note-type command: after an EOT it
+            # is another EOT, after a TIE another TIE, otherwise a note with
+            # the last Nxx duration. (mid2agb's PrintOp/PrintEndOfTieOp.)
             if token in NOTE_NAMES:
                 pitch = NOTE_NAMES[token]
                 pending_pitch = pitch
-                velocity = pending_velocity
 
+                if run_op == 'EOT':
+                    current_track.commands.append(TrackCommand(
+                        cmd='EOT', tick=current_tick, pitch=pitch,
+                        raw_line=stripped,
+                    ))
+                    i += 1
+                    continue
+
+                velocity = pending_velocity
+                gate = None
                 if i + 1 < len(tokens):
                     next_t = tokens[i + 1]
                     if next_t.startswith('v') and next_t[1:].isdigit():
                         velocity = int(next_t[1:])
                         pending_velocity = velocity
                         i += 1
+                        if i + 1 < len(tokens) and tokens[i + 1] in ('gtp1', 'gtp2', 'gtp3'):
+                            gate = int(tokens[i + 1][-1])
+                            i += 1
+
+                if run_op == 'TIE':
+                    current_track.commands.append(TrackCommand(
+                        cmd='TIE', tick=current_tick, pitch=pitch, velocity=velocity,
+                        raw_line=stripped,
+                    ))
+                    i += 1
+                    continue
 
                 duration = NOTE_TICKS.get(pending_note_cmd, 0) if pending_note_cmd else 0
                 current_track.commands.append(TrackCommand(
                     cmd='NOTE', tick=current_tick, duration=duration,
-                    pitch=pitch, velocity=velocity,
+                    pitch=pitch, velocity=velocity, gate_time=gate,
                     raw_line=stripped,
                 ))
+                run_op = 'NOTE'
                 i += 1
                 continue
 
@@ -583,10 +679,20 @@ def parse_song_file(filepath: str) -> SongData:
             # along with their argument, NOT treated as running status.
             _XCMD_SUBCMDS = {'xIECV', 'xIECL', 'xiecv', 'xiecl'}
             if token in _XCMD_SUBCMDS or token.lower() in _XCMD_SUBCMDS:
-                # Skip the sub-command token and its value argument
-                i += 1
-                if i < len(tokens):
-                    i += 1  # skip the value too
+                # A continuation line is a second XCMD in its own right
+                # (xIECL after xIECV). It used to be skipped, which dropped it
+                # from the song entirely.
+                xval = None
+                if i + 1 < len(tokens):
+                    try:
+                        xval = _eval_expr(tokens[i + 1], equs)
+                    except Exception:
+                        xval = None
+                current_track.commands.append(TrackCommand(
+                    cmd='XCMD', tick=current_tick, value=xval, sub=token,
+                    raw_line=stripped,
+                ))
+                i += 2
                 continue
 
             # --- Bare integer (running status for VOL, MOD, etc.) ---
@@ -594,7 +700,13 @@ def parse_song_file(filepath: str) -> SongData:
             # e.g. ".byte  95*mus_gym_mvl/mxv" after a VOL command means VOL=95*mvl/mxv
             try:
                 val = _eval_expr(token, equs)
-                cmd_type = last_control_cmd if last_control_cmd else 'VOL'
+                # Repeat the running command (VOICE, LFOS, TUNE, ... too — the
+                # old list covered only VOL/MOD/PAN/BEND/BENDR, so a second
+                # "VOICE , 3" written as a bare "3" was read as a volume).
+                if run_op in _RUNNING_VALUE_CMDS:
+                    cmd_type = run_op
+                else:
+                    cmd_type = last_control_cmd if last_control_cmd else 'VOL'
                 current_track.commands.append(TrackCommand(
                     cmd=cmd_type, tick=current_tick, value=val,
                     raw_line=stripped,
@@ -602,6 +714,9 @@ def parse_song_file(filepath: str) -> SongData:
             except Exception:
                 pass
             i += 1
+
+        for k, made in enumerate(current_track.commands[n_before:]):
+            made.origin = (line_idx, k)
 
     # Don't forget the last track
     if current_track is not None and not in_footer:

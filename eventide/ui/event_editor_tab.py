@@ -12298,71 +12298,101 @@ class EventEditorTab(QWidget):
         return [r for r in rows if 0 <= r < len(self._cmd_tuples)]
 
     def _on_del_command(self):
+        """Delete every selected row. EVERY row can be deleted — there is no
+        row the editor refuses to remove (owner's rule, 2026-11-15).
+
+        The rows that go are computed up front (`_delete_span` per row, then
+        the union), and removed highest first, so a row that takes a whole
+        Yes/No block with it can never shift the index of another selected row
+        still waiting to be removed.
+        """
         rows = self._selected_cmd_rows()
-        if len(rows) > 1:
-            self._push_undo()
-            # Highest first so each removal cannot shift the ones still to go.
-            removed = 0
-            for r in reversed(rows):
-                if self._delete_one_row(r):
-                    removed += 1
-            self._mark_dirty()
-            self._mw.log_message(
-                f'Event Editor: deleted {removed} command(s)')
-            return
-        idx = self._selected_cmd_idx()
-        if idx < 0 or idx >= len(self._cmd_tuples):
+        if not rows:
+            idx = self._selected_cmd_idx()
+            if idx < 0 or idx >= len(self._cmd_tuples):
+                return
+            rows = [idx]
+        doomed: set = set()
+        for r in rows:
+            doomed.update(self._delete_span(r))
+        if not doomed:
             return
         self._push_undo()
-        self._delete_one_row(idx)
-
-    def _delete_one_row(self, idx: int) -> bool:
-        """Delete the command at *idx*, honouring the structural rules.
-
-        Returns True if something was removed. Shared by the single-row path
-        and the multi-selection path so both obey the same rules: a label
-        marker is structural, a Show Choices header takes its whole block with
-        it, and the inner When/Branch-End markers cannot go on their own.
-        """
-        if idx < 0 or idx >= len(self._cmd_tuples):
-            return False
-        head = self._cmd_tuples[idx][0] if self._cmd_tuples[idx] else None
-        # Label markers are structural — can't be deleted
-        if head == '_label_marker':
-            return False
-        # Deleting the Show Choices header removes the WHOLE branch block
-        # (header + both branches + their bodies + Branch End).
-        if head == 'choice_yesno':
-            end = self._choice_block_end(idx)
-            if end < 0:
-                self._mw.log_message(
-                    'This "Show Choices" line has no "Branch End" to match it, '
-                    'so the editor cannot tell where the block stops. Use Undo, '
-                    'or delete the commands inside it one at a time.')
-                return False
-            for j in range(end, idx - 1, -1):
-                self._cmd_tuples.pop(j)
-                self._cmd_list.takeItem(j)
-            new_idx = min(idx, len(self._cmd_tuples) - 1)
-            if new_idx >= 0:
-                self._cmd_list.setCurrentRow(new_idx)
-            self._reindent_list()
-            self._mark_dirty()
-            return True
-        # The inner When/Branch-End markers can't be deleted on their own —
-        # they'd unbalance the block. Delete the Show Choices header instead.
-        if head in ('when_yes', 'when_no', 'branch_end'):
-            self._mw.log_message(
-                'Delete the "Show Choices" line to remove the whole Yes/No block.')
-            return False
-        self._cmd_tuples.pop(idx)
-        self._cmd_list.takeItem(idx)
-        new_idx = min(idx, len(self._cmd_tuples) - 1)
+        labels_gone = [self._cmd_tuples[j][1] for j in doomed
+                       if self._cmd_tuples[j]
+                       and self._cmd_tuples[j][0] == '_label_marker'
+                       and len(self._cmd_tuples[j]) > 1]
+        for j in sorted(doomed, reverse=True):
+            self._cmd_tuples.pop(j)
+            self._cmd_list.takeItem(j)
+        new_idx = min(min(doomed), len(self._cmd_tuples) - 1)
         if new_idx >= 0:
             self._cmd_list.setCurrentRow(new_idx)
         self._reindent_list()
         self._mark_dirty()
-        return True
+        if len(rows) > 1:
+            self._mw.log_message(
+                f'Event Editor: deleted {len(doomed)} command(s)')
+        self._warn_if_label_still_used(labels_gone)
+
+    def _delete_span(self, idx: int) -> list:
+        """The rows that deleting the row at *idx* removes.
+
+        * A Label row goes on its own. The commands under it stay, and now
+          belong to the label above.
+        * A Show Choices line, or any of its When Yes / When No / Branch End
+          lines, removes the WHOLE Yes/No block — a block missing one of those
+          lines cannot be saved. These used to refuse; a row that cannot be
+          deleted is not allowed in this editor.
+        * A Yes/No line whose block is already broken (no matching partner)
+          goes on its own, so it can always be cleaned up.
+        * Anything else is just that row.
+        """
+        if idx < 0 or idx >= len(self._cmd_tuples):
+            return []
+        head = self._cmd_tuples[idx][0] if self._cmd_tuples[idx] else None
+        if head in ('choice_yesno', 'when_yes', 'when_no', 'branch_end'):
+            start = idx if head == 'choice_yesno' else self._choice_block_start(idx)
+            end = self._choice_block_end(start) if start >= 0 else -1
+            if start >= 0 and end >= idx:
+                return list(range(start, end + 1))
+        return [idx]
+
+    def _choice_block_start(self, idx: int) -> int:
+        """Index of the Show Choices line whose block holds the row at *idx*
+        (a When Yes / When No / Branch End line), or -1 if there is none."""
+        depth = 0
+        for j in range(idx - 1, -1, -1):
+            h = self._cmd_tuples[j][0] if self._cmd_tuples[j] else None
+            if h == 'branch_end':
+                depth += 1
+            elif h == 'choice_yesno':
+                if depth == 0:
+                    return j
+                depth -= 1
+        return -1
+
+    def _warn_if_label_still_used(self, labels) -> None:
+        """Say so when a deleted Label row is still jumped to on this page.
+
+        Deleting the row is always allowed. But a label this map defines that
+        something still does `goto`/`call` to would no longer exist once
+        saved, and the build would fail on it — worth one line in the log.
+        Shared scripts (Std_ChestOpen and friends) live in their own files, so
+        removing their row here never breaks anything.
+        """
+        external = getattr(self, '_external_script_labels', set()) or set()
+        for label in labels:
+            if label in external:
+                continue
+            still_used = any(
+                ct and self._extract_goto_target(ct) == label
+                for ct in self._cmd_tuples)
+            if still_used:
+                self._mw.log_message(
+                    f'Event Editor: removed the label "{label}", but a command '
+                    f'on this page still jumps to it. Point that command '
+                    f'somewhere else (or Undo), or the build will fail.')
 
     def _choice_block_end(self, start: int) -> int:
         """Index of the branch_end matching the choice_yesno at *start*.
@@ -12724,20 +12754,95 @@ class EventEditorTab(QWidget):
             except Exception:
                 pass
 
+    def _shared_script_labels(self) -> set:
+        """Every label that lives in a SHARED script file, not in a map.
+
+        That is data/scripts/*.inc and data/event_scripts.s — the same files
+        `_resolve_external_scripts` searches — plus whatever this map already
+        resolved from them. Read fresh each time (copy/paste are rare and the
+        files are small), because a map that had no chest when it was opened
+        has never resolved Std_ChestOpen, and paste must still recognise it.
+        """
+        labels = set(getattr(self, '_external_script_labels', set()) or set())
+        root = getattr(self, '_root_dir', None)
+        if not root:
+            return labels
+        files = []
+        shared_dir = Path(root) / 'data' / 'scripts'
+        if shared_dir.is_dir():
+            files.extend(f for f in shared_dir.iterdir()
+                         if f.suffix == '.inc' and f.is_file())
+        es = Path(root) / 'data' / 'event_scripts.s'
+        if es.is_file():
+            files.append(es)
+        label_re = re.compile(r'^([A-Za-z0-9_]+)::', re.MULTILINE)
+        for f in files:
+            try:
+                labels.update(label_re.findall(f.read_text(encoding='utf-8')))
+            except Exception:
+                continue
+        return labels
+
+    def _strip_shared_sections(self, cmds: list) -> "tuple[list, list]":
+        """Leave out the shared-script sections a page DISPLAYS.
+
+        A chest's page shows "Label: Std_ChestOpen" and the body of that shared
+        script under its own lines, so the user can see what it calls. Those
+        rows are a view of data/scripts/chest.inc, not part of the event, and
+        the event's own `call Std_ChestOpen` already runs them. Copying them
+        along made a second definition of the shared script: saved into a map
+        that had no chest when opened, that is `Std_ChestOpen::` in the map's
+        scripts.inc and a "symbol already defined" build failure; in a map that
+        had one, editing the copy edited every chest in the game.
+
+        A section runs from its Label row to the next Label row. Returns
+        (kept commands, labels of the sections left out).
+        """
+        shared = None
+        kept: list = []
+        dropped: list = []
+        skipping = False
+        for cmd in cmds:
+            if cmd and cmd[0] == '_label_marker':
+                label = str(cmd[1]) if len(cmd) > 1 else ''
+                if shared is None:
+                    shared = self._shared_script_labels()
+                skipping = label in shared
+                if skipping:
+                    dropped.append(label)
+                    continue
+            if not skipping:
+                kept.append(cmd)
+        return kept, dropped
+
+    def _say_shared_left_out(self, dropped: list, verb: str) -> None:
+        if dropped:
+            self._mw.log_message(
+                f'Event Editor: {verb} without the shared script'
+                f'{"s" if len(dropped) > 1 else ""} {", ".join(dropped)} — '
+                f'{"they live" if len(dropped) > 1 else "it lives"} in its own '
+                f'file, and the "call" line already runs it.')
+
     def _on_copy(self):
         rows = self._selected_cmd_rows()
         if not rows:
             return
-        self._put_on_clipboard([self._cmd_tuples[r] for r in rows])
+        cmds, dropped = self._strip_shared_sections(
+            [self._cmd_tuples[r] for r in rows])
+        self._put_on_clipboard(cmds)
         self._mw.log_message(
-            f'Event Editor: copied {len(rows)} command(s)' if len(rows) > 1
+            f'Event Editor: copied {len(cmds)} command(s)' if len(cmds) != 1
             else 'Event Editor: copied command')
+        self._say_shared_left_out(dropped, 'copied')
 
     def _on_cut(self):
         rows = self._selected_cmd_rows()
         if not rows:
             return
-        self._put_on_clipboard([self._cmd_tuples[r] for r in rows])
+        cmds, dropped = self._strip_shared_sections(
+            [self._cmd_tuples[r] for r in rows])
+        self._put_on_clipboard(cmds)
+        self._say_shared_left_out(dropped, 'cut')
         self._on_del_command()
         self._mw.log_message(
             f'Event Editor: cut {len(rows)} command(s)' if len(rows) > 1
@@ -12792,6 +12897,12 @@ class EventEditorTab(QWidget):
             pasted = list(clip) if isinstance(clip, list) else [clip]
 
         pasted = self._drop_pasted_text_definitions(pasted)
+        # Script copied elsewhere ("Copy as Script", an older clipboard, a
+        # file) can still carry shared-script sections; never paste them.
+        pasted, dropped_shared = self._strip_shared_sections(pasted)
+        self._say_shared_left_out(dropped_shared, 'pasted')
+        if not pasted:
+            return
         pasted, copied_moves = self._privatise_pasted_movements(pasted)
 
         self._push_undo()

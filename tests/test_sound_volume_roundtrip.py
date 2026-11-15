@@ -13,8 +13,9 @@ its volume was adjusted in the editor:
 2. **Chord mis-encoding.** PorySuite's own .s writer dropped the explicit
    note-length on a chord tone that mid2agb keeps (writing a bare ``Fs5`` where
    mid2agb writes ``N01 , Fs5``). It assembled fine but played broken. The fix
-   regenerates the .s with mid2agb itself (``recompile_song``), the reference
-   encoder the build uses — so editor saves match the build byte-for-byte.
+   regenerates the .s with mid2agb itself (``safe_song_save`` runs it in a temp
+   folder), the reference encoder the build uses — so editor saves match the
+   build byte-for-byte.
 """
 import os
 import shutil
@@ -30,7 +31,8 @@ for _p in (ROOT_DIR, os.path.join(ROOT_DIR, "core")):
 import mido  # noqa: E402
 from core.sound.song_parser import parse_song_file  # noqa: E402
 from core.sound.midi_exporter import write_midi_file  # noqa: E402
-from core.sound.song_compiler import find_mid2agb, recompile_song  # noqa: E402
+from core.sound.song_compiler import find_mid2agb  # noqa: E402
+from core.sound.safe_song_save import render_s_with_mid2agb  # noqa: E402
 
 # A decaying SFX: VOL 96 -> 48 (raw multipliers) under master mvl=80, plus a
 # two-note chord (Gn4 + Cn5 at the same tick, the second tone bare = running).
@@ -120,9 +122,14 @@ class VolumeUnscaleTest(unittest.TestCase):
 @unittest.skipUnless(find_mid2agb(os.path.join(ROOT_DIR, "pokefirered")),
                      "project mid2agb unavailable")
 class Mid2agbRecompileTest(unittest.TestCase):
-    """recompile_song must regenerate the .s via mid2agb with the correct
-    chord encoding (explicit length on the chord tone), in a throwaway project
-    tree so the live project is never touched."""
+    """mid2agb (run the way safe_song_save runs it: in a temp folder, with the
+    song's midi.cfg flags) must rebuild the .s with the correct chord encoding
+    (explicit length on the chord tone), in a throwaway project tree so the
+    live project is never touched."""
+
+    def _rebuild(self, d):
+        with open(os.path.join(d, "sound", "songs", "midi", "t.mid"), "rb") as f:
+            return render_s_with_mid2agb(d, "t", f.read())
 
     def _temp_project(self, d, mvl, voice=None):
         midi = os.path.join(d, "sound", "songs", "midi")
@@ -146,11 +153,7 @@ class Mid2agbRecompileTest(unittest.TestCase):
     def test_recompile_preserves_decay_and_chord(self):
         with tempfile.TemporaryDirectory() as d:
             self._temp_project(d, mvl=90)
-            ok, err = recompile_song(d, "t")
-            self.assertTrue(ok, f"recompile failed: {err}")
-            with open(os.path.join(d, "sound", "songs", "midi", "t.s"),
-                      encoding="utf-8") as _f:
-                s = _f.read()
+            s = self._rebuild(d)
             import re
             mult = [int(x) for x in re.findall(r"VOL\s+,\s+(\d+)\*", s)]
             # decay shape preserved (strictly decreasing), two steps
@@ -171,11 +174,7 @@ class Mid2agbRecompileTest(unittest.TestCase):
         # old voice number the regenerated .s kept inheriting.)
         with tempfile.TemporaryDirectory() as d:
             self._temp_project(d, mvl=100, voice=127)
-            ok, err = recompile_song(d, "t")
-            self.assertTrue(ok, f"recompile failed: {err}")
-            with open(os.path.join(d, "sound", "songs", "midi", "t.s"),
-                      encoding="utf-8") as _f:
-                s = _f.read()
+            s = self._rebuild(d)
             import re
             voices = re.findall(r"VOICE\s+,\s+(\d+)", s)
             self.assertIn("127", voices,

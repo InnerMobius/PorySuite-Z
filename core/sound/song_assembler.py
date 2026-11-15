@@ -127,26 +127,6 @@ def assemble_file(s_path: str, repo_root: Optional[str] = None) -> tuple[bool, O
     return _run_as(s_path, repo_root or "")
 
 
-def assemble_text(content: str, repo_root: str,
-                  near_dir: Optional[str] = None) -> tuple[bool, Optional[str]]:
-    """Assemble generated .s text without committing it: writes a temp .s (in
-    near_dir if given, so include resolution matches the real target) and runs
-    the assembler. Used by save_song_file BEFORE writing the real file."""
-    if not repo_root:
-        return True, None
-    tmp_dir = near_dir if (near_dir and os.path.isdir(near_dir)) else repo_root
-    fd, tmp_s = tempfile.mkstemp(suffix=".s", prefix="_gate_", dir=tmp_dir)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            f.write(content)
-        return _run_as(tmp_s, repo_root)
-    finally:
-        try:
-            os.remove(tmp_s)
-        except OSError:
-            pass
-
-
 def _repo_root_from_path(s_path: Optional[str]) -> Optional[str]:
     if not s_path:
         return None

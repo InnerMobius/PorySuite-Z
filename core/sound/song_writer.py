@@ -1003,146 +1003,6 @@ def write_song(song: SongData) -> str:
     return _uniquify_colliding_labels('\n'.join(lines), prefix)
 
 
-def save_song_file(song: SongData, path: Optional[str] = None,
-                   verify_build: bool = True) -> str:
-    """Write a SongData to its .s file. Returns the path written to.
-
-    If path is None, uses song.file_path (the original location).
-
-    ``verify_build`` (default True) runs GATE 1 — the real assembler on the
-    generated .s before writing it — so a song that wouldn't compile never
-    reaches disk. Callers that only tweak a header equate (priority/reverb/
-    volume — which can't change the .s's assemble-ability) pass False to skip
-    the ~1s toolchain round-trip; the static validator still runs always.
-
-    The .s file is the canonical, full-fidelity source of truth for any
-    song that's been edited in the Piano Roll or via the inline header
-    editor.  But we cannot afford to leave the .mid on disk stale,
-    because:
-
-      - The pokefirered Makefile rule `%.s: %.mid midi.cfg` will rerun
-        mid2agb if it sees the .mid as newer than the .s on disk.
-      - `git reset --hard FETCH_HEAD` / `git checkout` / `git pull`
-        restores any tracked .mid back to its committed content AND
-        bumps its mtime to "now" — which would defeat any mtime-only
-        protection and let a stale .mid silently overwrite the user's
-        hand-edited .s on the next build.
-
-    The defense in depth is:
-
-      1. Write the .s with the song's current in-memory content.
-      2. **Regenerate the .mid from that same in-memory song data** so
-         the .mid contents are byte-equivalent to the .s.  Even if a
-         future git operation restores the .mid (mtime bumped) and the
-         build pipeline runs mid2agb, the regenerated .s is audibly
-         equivalent — no silent data loss.  Also makes the .mid actually
-         playable in Windows Media Player / any DAW, which the previous
-         26-byte placeholder was not.
-      3. Backdate the .mid AND midi.cfg by 1 hour so pokefirered's
-         `%.s: %.mid midi.cfg` Make rule never decides to re-run
-         mid2agb during normal builds.  The .s is touched to "now" to
-         win against any filesystem-clock skew.
-
-    The .mid regeneration is byte-equality guarded inside
-    `write_midi_file` — re-saving an unchanged song doesn't dirty the
-    .mid's mtime or git status.
-    """
-    import os
-    import time as _time
-
-    output_path = path or song.file_path
-    if not output_path:
-        raise ValueError(f"No file path for song '{song.label}'")
-
-    content = write_song(song)
-
-    # Export-time validation gate — refuse to write a malformed or
-    # out-of-range .s so a bad code path can never put a non-building or
-    # wrong-voicegroup sound on disk. The existing (good) file is left
-    # untouched on failure. Fail-OPEN only if the validator itself errors
-    # (a validator bug must not block every legitimate save); fail-CLOSED on
-    # any validation error it returns.
-    try:
-        from core.sound.song_validator import validate_song_export
-        _verrs = validate_song_export(song, content)
-    except Exception as _vexc:
-        import logging as _logging
-        _logging.getLogger("SoundEditor.SongWriter").warning(
-            "Export validator could not run for %s: %s — writing anyway",
-            song.label, _vexc)
-        _verrs = []
-    if _verrs:
-        import logging as _logging
-        _logging.getLogger("SoundEditor.SongWriter").error(
-            "Refusing to write %s — export validation failed:\n  - %s",
-            song.label, "\n  - ".join(_verrs))
-        raise ValueError(
-            "Export blocked: the generated .s for '{}' is invalid and was "
-            "NOT written (your existing file is unchanged):\n  - {}".format(
-                song.label, "\n  - ".join(_verrs)))
-
-    # GATE 1 — assemble the generated .s with the REAL toolchain, exactly as the
-    # build does, so a song that won't compile never reaches disk. Catches
-    # anything the static validator doesn't know about. Fail-OPEN when the
-    # toolchain isn't reachable (the static validator stays the guarantee).
-    # Skipped when verify_build=False (header-only equate edits can't change
-    # assemble-ability and shouldn't pay the ~1s toolchain round-trip).
-    if verify_build:
-        try:
-            from core.sound.song_assembler import (
-                assemble_text, _repo_root_from_path)
-            _repo = _repo_root_from_path(output_path)
-            _aok, _aerr = assemble_text(
-                content, _repo or '', os.path.dirname(output_path))
-        except Exception as _aexc:
-            import logging as _logging
-            _logging.getLogger("SoundEditor.SongWriter").warning(
-                "Assemble gate could not run for %s: %s — writing anyway",
-                song.label, _aexc)
-            _aok, _aerr = True, None
-        if not _aok:
-            import logging as _logging
-            _logging.getLogger("SoundEditor.SongWriter").error(
-                "Refusing to write %s — it does not assemble:\n%s",
-                song.label, _aerr)
-            raise ValueError(
-                "Export blocked: the generated .s for '{}' does NOT assemble "
-                "and was not written (your existing file is unchanged):\n{}"
-                .format(song.label, _aerr))
-
-    with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write(content)
-
-    midi_dir = os.path.dirname(output_path)
-    base = os.path.basename(output_path).rsplit('.', 1)[0]
-    mid_path = os.path.join(midi_dir, base + '.mid')
-    cfg_path = os.path.join(midi_dir, 'midi.cfg')
-
-    # Step 2: regenerate the .mid from the in-memory song so the .mid
-    # on disk MATCHES the .s we just wrote.  Falls back gracefully if
-    # mido has an issue with the song data — the .s save already
-    # succeeded above, so a failed .mid render is non-fatal.
-    try:
-        from core.sound.midi_exporter import write_midi_file
-        write_midi_file(song, mid_path)
-    except Exception as _exc:
-        # Failures inside write_midi_file are already logged.  This
-        # outer guard catches the rarer case where the IMPORT fails
-        # (e.g. mido missing, midi_exporter syntax error during dev).
-        # Surface a single warning line so the user at least knows
-        # the .mid wasn't regenerated — don't propagate, because the
-        # .s save already succeeded and the .s is the canonical edit.
-        import logging as _logging
-        _logging.getLogger("SoundEditor.SongWriter").warning(
-            "Could not regenerate .mid for %s: %s — .s saved OK",
-            song.label, _exc)
-
-    # Step 3: timestamp lock.
-    lock_song_timestamps(output_path, mid_path, cfg_path)
-
-    return output_path
-
-
 def lock_song_timestamps(s_path: str, mid_path: str, cfg_path: str) -> None:
     """Keep ``.mid`` and ``midi.cfg`` from looking newer than the ``.s``.
 
@@ -1158,10 +1018,10 @@ def lock_song_timestamps(s_path: str, mid_path: str, cfg_path: str) -> None:
     what happened to a PoryDAW session: the arrangement was in the ``.mid``,
     the build read the ``.s``, and the two had nothing to do with each other.
 
-    Extracted from :func:`save_song_file` so this decision can be exercised
-    directly. It was inline, and a test could not reach it without building a
-    whole song — so the one mutation that mattered, re-locking a real ``.mid``,
-    went uncaught.
+    Kept as its own function so this decision can be exercised directly — the
+    one mutation that mattered, re-locking a real ``.mid``, once went uncaught
+    while it was buried inside a whole-song save. Used by
+    ``safe_song_save`` for songs whose ``.s`` is their only source.
     """
     import os
     import time as _time

@@ -81,6 +81,24 @@ As of 2026-06-28, volume edits go through the game's own sound converter (mid2ag
 ### A sound effect plays the wrong instrument or is silent in-game, even though it looks right in the editor
 The instrument a sound uses lives in its `.mid` (the source the build compiles), not just the `.s`. If a sound's `.mid` held a stale instrument number, every build regenerated the `.s` with that wrong instrument — so hand-editing the `.s` kept reverting. Fixed by writing the chosen instrument into the `.mid`. To repair such a sound: open it in the Sound Editor, set the instrument you want, and save — that writes the `.mid`, and the build then renders it correctly. (Example: the bomb-pickup chime was silent because its `.mid` pointed at a silent voice; it now points at the audible one.)
 
+### The Piano Roll says "'song' was NOT saved — nothing on disk was changed"
+The save builds the song with the game's own converter first and refuses if the result would not play what the editor shows, or would change something you did not edit. Nothing is written when that happens, so your files are safe. The message says why. The common cases:
+- **"PorySuite was updated while it was running"**: restart PorySuite, reopen the song and make the edit again.
+- **"….mid was changed after ….s was built"**: another program changed the song's MIDI. Use **Refresh from MIDI** in the Sound Editor (or build the project), reopen the song and make the edit again.
+- **A track move was refused**: the song's MIDI keeps two of those tracks inside one MIDI track, or the move would put the first MIDI track (which holds the tempo and loop markers) behind another. Move a different track, or rearrange the tracks in a MIDI editor.
+
+### I edited a song in another program (such as PoryDAW) and PorySuite still shows the old version
+Some editors write only the song's `.mid`; the `.s` PorySuite shows is rebuilt from it by the next game build. Select the song in the Sound Editor (or switch back to PorySuite): when its `.mid` no longer matches, a note appears with a **Refresh from MIDI** button. It rebuilds just that song, the way the build would, and never changes the `.mid` or `midi.cfg`. The old `.s` is kept as a backup in PorySuite's cache folder. If the note says the `.s` was changed instead, refreshing replaces those `.s` changes, so it asks first. Don't edit the same song in two programs at the same time.
+
+### "Song changed on disk" appears while the Piano Roll is open
+Another program changed the song's files. Choose **Yes** to reload (refreshing from the MIDI when that is what changed); any unsaved edits in the window are discarded, and the box says whether you have any. Choose **No** to keep working: saving is refused until the song is reloaded, so nothing on disk can be overwritten.
+
+### A save failed with "Access is denied"
+Another program (often a virus scanner or a file-sync tool) held the song's file open. PorySuite retries for a moment before giving up; if it still fails, every file is put back as it was, and your edits stay in the window. Close the other program, or wait a moment, and save again.
+
+### An empty track I added is gone after saving
+The game's converter writes no track that has no notes, so a new track is only saved once it has at least one note. For the same reason, deleting every note of an existing track makes the save refuse (the song would lose a track); remove the track with the track list's **-** button instead.
+
 ---
 
 ## Git — Pull / Push

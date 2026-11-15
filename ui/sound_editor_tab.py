@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QSlider, QGroupBox,
     QTreeWidget, QTreeWidgetItem, QHeaderView,
     QComboBox, QFrame, QProgressBar, QSizePolicy,
-    QSpinBox, QToolButton, QTabWidget, QMenu,
+    QSpinBox, QToolButton, QTabWidget, QMenu, QMessageBox,
 )
 
 from ui.custom_widgets.scroll_guard import install_scroll_guard
@@ -33,9 +33,15 @@ from ui.custom_widgets.scroll_guard import install_scroll_guard
 _log = logging.getLogger("SoundEditor")
 _log.setLevel(logging.DEBUG)
 _log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sound_editor.log")
-_fh = logging.FileHandler(_log_path, mode="w", encoding="utf-8")
+# Appended, not overwritten: opening it with mode "w" at import meant that
+# anything importing this module (the test suite, a second window) wiped the
+# running app's log. Capped at 2 MB, with the previous file kept as .log.1.
+from logging.handlers import RotatingFileHandler
+_fh = RotatingFileHandler(_log_path, mode="a", maxBytes=2_000_000, backupCount=1,
+                          encoding="utf-8")
 _fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
 _log.addHandler(_fh)
+_log.info("==== Sound Editor log opened (%s) ====", __import__("time").strftime("%Y-%m-%d"))
 
 
 # ---------------------------------------------------------------------------
@@ -103,13 +109,19 @@ class SoundEditorTab(QWidget):
         self._inline_save_timer.setInterval(400)
         self._inline_save_timer.timeout.connect(self._flush_inline_save)
         self._pending_inline_song = None
-        self._pending_inline_regen = False
+        self._pending_inline_regen = False     # a tempo edit is pending
+        self._pending_inline_flags = False     # a volume/priority/reverb edit is pending
+        self._pending_tempo_bpm = None         # the BPM the user typed
 
         # Connect thread-safe signals
         self._render_done.connect(self._start_playback)
         self._render_failed.connect(self._on_render_error)
 
         _log.info("SoundEditorTab created")
+        # Coming back to PorySuite from another program (such as a DAW that
+        # just saved this song's MIDI) re-checks the selected song.
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().applicationStateChanged.connect(self._on_app_state_changed)
 
     # ═════════════════════════════════════════════════════════════════════════
     # UI Construction
@@ -317,6 +329,13 @@ class SoundEditorTab(QWidget):
         props_layout.addLayout(props_right)
         info_layout.addWidget(props_frame)
 
+        # Shown only when the song's .mid and .s disagree (see midi_refresh).
+        self._midi_sync_label = QLabel("")
+        self._midi_sync_label.setWordWrap(True)
+        self._midi_sync_label.setStyleSheet("color: #ffb74d;")
+        self._midi_sync_label.setVisible(False)
+        info_layout.addWidget(self._midi_sync_label)
+
         right_layout.addWidget(info_group)
 
         # ── Transport controls ──────────────────────────────────────────────
@@ -346,6 +365,15 @@ class SoundEditorTab(QWidget):
         self._btn_piano_roll.clicked.connect(self._open_piano_roll)
         self._btn_piano_roll.setEnabled(False)
         btn_row.addWidget(self._btn_piano_roll)
+
+        self._btn_refresh_midi = QPushButton("Refresh from MIDI")
+        self._btn_refresh_midi.setToolTip(
+            "Rebuild just this song's .s from its .mid — what a game build would do.\n"
+            "Use it after editing the song's MIDI in another program (such as PoryDAW).\n"
+            "The .mid and midi.cfg are not changed; the old .s is kept as a backup.")
+        self._btn_refresh_midi.clicked.connect(self._on_refresh_from_midi)
+        self._btn_refresh_midi.setVisible(False)
+        btn_row.addWidget(self._btn_refresh_midi)
 
         btn_row.addStretch()
 
@@ -779,6 +807,76 @@ class SoundEditorTab(QWidget):
             self._detail_loop.setText("Loop: —")
             self._btn_play.setEnabled(False)
             self._btn_piano_roll.setEnabled(False)
+        self._update_midi_sync(song_label)
+
+    def _on_app_state_changed(self, state) -> None:
+        if state == Qt.ApplicationState.ApplicationActive and self._current_song_key:
+            self._update_midi_sync(self._current_song_key)
+
+    def _update_midi_sync(self, label: str) -> None:
+        """Show whether *label*'s .s still matches its .mid, and offer Refresh
+        from MIDI when it does not."""
+        self._midi_sync_label.setVisible(False)
+        self._btn_refresh_midi.setVisible(False)
+        if not self._project_root:
+            return
+        from core.sound.midi_refresh import midi_sync_status
+        try:
+            status = midi_sync_status(self._project_root, label)
+        except Exception as exc:
+            _log.warning("Could not compare %s with its MIDI: %s", label, exc)
+            return
+        if status.can_refresh:
+            self._midi_sync_label.setText(status.message())
+            self._midi_sync_label.setVisible(True)
+            self._btn_refresh_midi.setVisible(True)
+
+    def _on_refresh_from_midi(self):
+        label = self._current_song_key
+        if not label or not self._project_root:
+            return
+        from core.sound.midi_refresh import midi_sync_status, refresh_from_midi
+        from core.sound.safe_song_save import SongSaveRefused
+        prw = self._live_piano_roll()
+        same = prw is not None and prw._song.label == label
+        if same:
+            if prw.has_unsaved_changes():
+                QMessageBox.warning(
+                    self, "Refresh from MIDI",
+                    f"The Piano Roll has unsaved edits to {label}. Save or discard them "
+                    "first — refreshing would replace the song they were made on.")
+                return
+        status = midi_sync_status(self._project_root, label)
+        if not status.can_refresh:
+            self._update_midi_sync(label)
+            return
+        conflict = status.state == 'conflict'
+        detail = f"\n\nWhat differs: {status.detail}" if status.detail else ""
+        ask = QMessageBox.question(
+            self, "Refresh from MIDI",
+            status.message() + detail + "\n\n"
+            + ("Replace the .s with what the MIDI builds to? (The current .s is "
+               "kept as a backup in PorySuite's cache folder.)" if conflict else
+               "Rebuild this song's .s from its MIDI now? The .mid and midi.cfg are "
+               "not changed, and the old .s is kept as a backup."),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ask != QMessageBox.StandardButton.Yes:
+            return
+        if prw is not None and same:
+            prw.close()
+            self._piano_roll_window = None
+        try:
+            refresh_from_midi(self._project_root, label, allow_conflict=conflict)
+        except SongSaveRefused as exc:
+            QMessageBox.warning(self, "Refresh from MIDI", f"Not refreshed: {exc}")
+            return
+        self._all_songs.pop(label, None)
+        current = self._song_tree.currentItem()
+        if current is not None and current.data(0, _ROLE_SONG_KEY) == label:
+            self._on_song_selected(current, None)
+        QMessageBox.information(self, "Refresh from MIDI",
+                                f"{label} now matches its MIDI file.")
 
     # ═════════════════════════════════════════════════════════════════════════
     # Song context menu (rename / delete)
@@ -980,7 +1078,7 @@ class SoundEditorTab(QWidget):
         # Close any open piano roll first: it caches the SongData it was built
         # with, and a later Save could write that stale parse back over the
         # replacement.
-        prw = getattr(self, "_piano_roll_window", None)
+        prw = self._live_piano_roll()
         if prw is not None:
             try:
                 if hasattr(prw, "_is_dirty"):
@@ -1117,8 +1215,10 @@ class SoundEditorTab(QWidget):
             if cmd.cmd == 'TEMPO':
                 cmd.value = int(value * tbs / 2)
                 break
-        # Tempo lives in the .mid (mid2agb derives the TEMPO command from it),
-        # so the .mid must be regenerated for this edit.
+        # The save edits ONLY the tempo events inside the existing .mid
+        # (safe_song_save.save_song_tempo) — never a re-drawn .mid. Remember
+        # the exact BPM typed: cmd.value above cannot hold an odd BPM.
+        self._pending_tempo_bpm = int(value)
         self._schedule_inline_save(song, regen_mid=True)
 
     def _on_song_reverb_changed(self, value: int):
@@ -1151,12 +1251,18 @@ class SoundEditorTab(QWidget):
     def _schedule_inline_save(self, song, regen_mid: bool = False):
         """Debounce an inline header save. The caller has already updated the
         in-memory song value (so the spinbox + preview are instant); this only
-        defers the disk write + mid2agb recompile until the user stops adjusting,
-        so dragging a slider or typing digits doesn't fire one subprocess per
-        tick. regen_mid is OR-ed across a burst (a tempo edit forces a .mid
-        rewrite even if a later volume tick in the same burst wouldn't)."""
+        defers the disk write until the user stops adjusting, so dragging a
+        slider or typing digits doesn't fire one mid2agb run per tick.
+
+        A burst can hold both kinds of edit, and each is remembered on its own:
+        ``regen_mid=True`` marks a tempo edit, anything else a header edit
+        (volume / priority / reverb). The flush saves exactly the kinds that
+        happened, so a volume tweak never drags the tempo path along."""
         self._pending_inline_song = song
-        self._pending_inline_regen = self._pending_inline_regen or regen_mid
+        if regen_mid:
+            self._pending_inline_regen = True
+        else:
+            self._pending_inline_flags = True
         self._inline_save_timer.start()  # restarts the countdown each tick
 
     def _flush_inline_save(self):
@@ -1166,106 +1272,114 @@ class SoundEditorTab(QWidget):
         song = self._pending_inline_song
         if song is None:
             return
-        regen = self._pending_inline_regen
+        tempo = self._pending_inline_regen
+        flags = self._pending_inline_flags
+        bpm = self._pending_tempo_bpm
         self._pending_inline_song = None
         self._pending_inline_regen = False
-        self._save_song_inline(song, regen)
+        self._pending_inline_flags = False
+        self._pending_tempo_bpm = None
+        self._save_song_inline(song, tempo=tempo, flags=flags, tempo_bpm=bpm)
 
-    def _save_song_via_mid2agb(self, song, regen_mid: bool) -> bool:
-        """Persist a MIDI-sourced song by editing its SOURCE and regenerating
-        the .s with the project's own **mid2agb** — the same reference encoder
-        the build uses — instead of PorySuite's hand-rolled .s writer.
+    def _save_song_inline(self, song, *, tempo: bool = False, flags: bool = False,
+                          tempo_bpm=None):
+        """Persist inline header edits through core.sound.safe_song_save.
 
-        PorySuite's writer can mis-encode some note shapes (e.g. it drops the
-        explicit length on a chord tone that mid2agb keeps), which assembles
-        fine but plays back broken. Routing through mid2agb makes a save
-        produce exactly what a build would, so editing volume / priority /
-        reverb / tempo can never desync the .s from the engine's encoding.
+        * Tempo: only the tempo events inside the song's existing .mid change
+          (every tempo scaled by the same factor), then mid2agb rebuilds the .s.
+          A song whose .s is its only source gets just its TEMPO lines edited.
+        * Volume / priority / reverb / voicegroup: midi.cfg's flags change and
+          mid2agb rebuilds the .s from the UNCHANGED .mid. The voicegroup is
+          passed every time so a bank change can never be reverted by a stale
+          -G (the old "the -G thing didn't stick" bug).
 
-        * Volume / priority / reverb are mid2agb FLAGS in midi.cfg — the .mid
-          note data is left untouched (``regen_mid=False``). For a master
-          volume change this is essential: the .mid holds the raw per-note
-          multipliers and mid2agb re-applies the new master, so the envelope
-          scales correctly and the decay is preserved.
-        * Tempo lives in the .mid, so ``regen_mid=True`` rewrites it first.
-
-        Returns True if mid2agb regenerated the .s; False to tell the caller to
-        fall back to the legacy writer (song isn't MIDI-sourced, or no mid2agb).
+        Every save is checked before it writes: mid2agb runs in a temp folder
+        and the result may differ from the old .s only where this edit allows.
+        Otherwise nothing is written and the user is told why. There is no
+        fallback to PorySuite's own .s writer — that writer was the thing
+        destroying songs (BUGS.md 2026-11-15).
         """
-        import os as _os
-        from core.sound.song_compiler import recompile_song, find_mid2agb
-        root = self._project_root
-        label = song.label
-        mid_path = _os.path.join(root, 'sound', 'songs', 'midi', label + '.mid')
-        if not (_os.path.isfile(mid_path) and find_mid2agb(root)):
-            return False
-        if regen_mid:
-            # Note / tempo edit: rewrite the .mid from the song. The master is
-            # unchanged for these edits, so write_midi_file's VOL un-scale is
-            # consistent and the round-trip preserves levels.
+        from core.sound import safe_song_save as SSS
+        from core.sound.song_parser import get_song_tempo
+        from core.sound.song_table_manager import voicegroup_index_from_name
+        root, label = self._project_root, song.label
+        problems = []
+        saved = []
+        if tempo:
             try:
-                from core.sound.midi_exporter import write_midi_file
-                write_midi_file(song, mid_path)
+                bpm = tempo_bpm if tempo_bpm is not None else get_song_tempo(song)
+                r = SSS.save_song_tempo(root, label, int(bpm))
+                if r.changed:
+                    saved.append(r.message)
+            except SSS.SongSaveRefused as e:
+                problems.append(f"Tempo not saved: {e}")
             except Exception as e:
-                _log.warning("write_midi_file failed for %s: %s", label, e)
-                return False
-        # Sync midi.cfg's -P/-R/-V AND -G BEFORE recompiling — mid2agb reads
-        # these flags, and recompile regenerates the .s from the .mid using them.
-        # -G MUST be synced to the song's current voicegroup or a bank change
-        # silently reverts on recompile (the .s comes back on the old -G).
-        try:
-            from core.sound.song_table_manager import (
-                update_midi_cfg_flags, voicegroup_index_from_name)
-            update_midi_cfg_flags(
-                root, label,
-                priority=getattr(song, 'priority', None),
-                reverb=getattr(song, 'reverb', None),
-                volume=getattr(song, 'master_volume', None),
-                voicegroup=voicegroup_index_from_name(getattr(song, 'voicegroup', None)),
-            )
-        except Exception as e:
-            _log.warning("midi.cfg sync failed for %s: %s", label, e)
-        ok, err = recompile_song(root, label)
-        if not ok:
-            _log.warning("mid2agb recompile failed for %s: %s — using fallback",
-                         label, err)
-            return False
-        _log.info("Inline save via mid2agb: %s (regen_mid=%s)", label, regen_mid)
-        return True
-
-    def _save_song_inline(self, song, regen_mid: bool = False):
-        """Persist an inline header edit (tempo/reverb/volume/priority).
-
-        For a MIDI-sourced song the .s is a build artifact, so we edit the
-        source (.mid for tempo, midi.cfg flags for volume/priority/reverb) and
-        regenerate the .s with mid2agb — never PorySuite's .s writer. Falls back
-        to the legacy writer when the song isn't MIDI-sourced or mid2agb is
-        unavailable."""
-        try:
-            if not self._save_song_via_mid2agb(song, regen_mid):
-                # Legacy fallback: PorySuite's own .s writer + midi.cfg sync.
-                from core.sound.song_writer import save_song_file
-                save_song_file(song, verify_build=False)
-                try:
-                    from core.sound.song_table_manager import (
-                        update_midi_cfg_flags, voicegroup_index_from_name)
-                    update_midi_cfg_flags(
-                        self._project_root, song.label,
+                _log.exception("Tempo save crashed for %s", label)
+                problems.append(f"Tempo not saved (unexpected error): {e}")
+        if flags:
+            try:
+                if SSS.save_song_header(
+                        root, label,
                         priority=getattr(song, 'priority', None),
                         reverb=getattr(song, 'reverb', None),
                         volume=getattr(song, 'master_volume', None),
-                        voicegroup=voicegroup_index_from_name(getattr(song, 'voicegroup', None)),
-                    )
-                except Exception as e:
-                    _log.warning("midi.cfg sync failed for %s: %s", song.label, e)
-            # Data is on disk — clear any existing dirty tint for this song.
-            # Do NOT add to _dirty_songs; inline saves don't leave pending changes.
-            key = self._current_song_key
-            self._dirty_songs.discard(key)
-            self._tint_song_row(key, False)
-            _log.info("Inline save: %s", song.label)
+                        voicegroup=voicegroup_index_from_name(getattr(song, 'voicegroup', None))):
+                    saved.append("volume / priority / reverb")
+            except SSS.SongSaveRefused as e:
+                problems.append(f"Volume / priority / reverb not saved: {e}")
+            except Exception as e:
+                _log.exception("Header save crashed for %s", label)
+                problems.append(f"Volume / priority / reverb not saved (unexpected error): {e}")
+
+        # Whatever happened, the song in memory must now say what the disk says,
+        # so the spinboxes and the preview never show an edit that was refused.
+        self._resync_song_from_disk(song)
+
+        if problems:
+            for p in problems:
+                _log.error("Inline save refused for %s: %s", label, p)
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Song not saved",
+                f"<b>{label}</b> was left exactly as it was on disk.<br><br>"
+                + "<br><br>".join(problems))
+            return
+        # Data is on disk — clear any existing dirty tint for this song.
+        # Do NOT add to _dirty_songs; inline saves don't leave pending changes.
+        self._dirty_songs.discard(label)
+        self._tint_song_row(label, False)
+        _log.info("Inline save: %s (%s)", label, ", ".join(saved) or "nothing changed")
+
+    def _resync_song_from_disk(self, song) -> None:
+        """Copy the tempo and header values from the .s on disk back into the
+        in-memory *song*, in place (other windows may hold the same object)."""
+        from core.sound.song_parser import parse_song_file, get_song_tempo
+        s_path = os.path.join(self._project_root, "sound", "songs", "midi", song.label + ".s")
+        try:
+            fresh = parse_song_file(s_path)
         except Exception as e:
-            _log.error("Inline song save failed for %s: %s", song.label, e)
+            _log.warning("Could not re-read %s after saving: %s", song.label, e)
+            return
+        for attr in ("reverb", "master_volume", "priority", "voicegroup", "tempo_base"):
+            if hasattr(fresh, attr):
+                setattr(song, attr, getattr(fresh, attr))
+        mine = [c for t in song.tracks for c in t.commands if c.cmd == 'TEMPO']
+        theirs = [c for t in fresh.tracks for c in t.commands if c.cmd == 'TEMPO']
+        if len(mine) == len(theirs):
+            for a, b in zip(mine, theirs):
+                a.value = b.value
+                a.parsed_value = b.parsed_value
+        else:
+            self._all_songs[song.label] = fresh
+        if self._current_song_key == song.label:
+            self._loading_song = True
+            try:
+                self._spin_tempo.setValue(get_song_tempo(fresh))
+                self._spin_reverb.setValue(fresh.reverb)
+                self._spin_volume.setValue(fresh.master_volume)
+                self._spin_priority.setValue(getattr(fresh, 'priority', 0) or 0)
+            finally:
+                self._loading_song = False
 
     def _on_goto_voicegroup(self):
         """Click the 'Open' button next to the voicegroup label."""
@@ -1276,6 +1390,17 @@ class SoundEditorTab(QWidget):
             return
         self._tab_widget.setCurrentWidget(self._voicegroups_tab)
         self._voicegroups_tab.select_voicegroup(song.voicegroup)
+
+    def _live_piano_roll(self):
+        """The open Piano Roll window, or None. The window deletes itself when
+        closed, and calling into a deleted window ended the whole program, so
+        every use goes through this check."""
+        from PyQt6 import sip
+        win = getattr(self, "_piano_roll_window", None)
+        if win is None or sip.isdeleted(win):
+            self._piano_roll_window = None
+            return None
+        return win
 
     def _open_piano_roll(self):
         """Open the Piano Roll window for the currently selected song."""
@@ -1290,7 +1415,7 @@ class SoundEditorTab(QWidget):
 
         from ui.piano_roll_window import PianoRollWindow
         # Close any existing piano roll window
-        if hasattr(self, '_piano_roll_window') and self._piano_roll_window is not None:
+        if self._live_piano_roll() is not None:
             try:
                 self._piano_roll_window.close()
             except RuntimeError:

@@ -569,6 +569,66 @@ def voicegroup_index_from_name(name: Optional[str]) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def apply_header_flags(flags: list[str], *, priority: Optional[int] = None,
+                       reverb: Optional[int] = None, volume: Optional[int] = None,
+                       voicegroup: Optional[int] = None) -> list[str]:
+    """One song's mid2agb flags with -P/-R/-V (and -G when given) set.
+
+    mid2agb omits -P0/-R0 (matching register_song); -V is always written when a
+    volume is given; -G only when `voicegroup` is given (None keeps the bank).
+    Every other flag (-E, ...) is kept."""
+    out = list(flags)
+
+    def setf(prefix: str, text: Optional[str]):
+        nonlocal out
+        # mid2agb reads option letters case-insensitively (main.cpp toupper),
+        # so "-v100" IS a volume flag; leaving it would give the line two.
+        out = [g for g in out if not g.upper().startswith(prefix)]
+        if text is not None:
+            out.append(prefix + text)
+
+    setf('-P', str(priority) if (priority is not None and priority > 0) else None)
+    setf('-R', str(reverb) if (reverb is not None and reverb > 0) else None)
+    setf('-V', f"{volume:03d}" if volume is not None else None)
+    if voicegroup is not None:
+        setf('-G', f"{voicegroup:03d}")
+    return out
+
+
+def midi_cfg_with_flags(cfg_text: str, label: str, *, priority: Optional[int] = None,
+                        reverb: Optional[int] = None, volume: Optional[int] = None,
+                        voicegroup: Optional[int] = None):
+    """Pure version of update_midi_cfg_flags: nothing is written.
+
+    Returns (new_text, old_flags, new_flags). old_flags is None when the song
+    has no line. When the flags are the same set as before, new_text IS
+    cfg_text, so a no-op edit cannot reorder or rewrite the line. Only the
+    song's own line can change, and it keeps its original line ending."""
+    mid_name = label + '.mid'
+    lines = cfg_text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        body = line.rstrip('\r\n')
+        ending = line[len(body):]
+        stripped = body.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        head, sep, rest = body.partition(':')
+        if not sep or head.strip() != mid_name:
+            continue
+        old_flags = rest.split()
+        new_flags = apply_header_flags(old_flags, priority=priority, reverb=reverb,
+                                       volume=volume, voicegroup=voicegroup)
+        # mid2agb's master volume defaults to 127 when -V is absent, so adding
+        # "-V127" to a line that had no -V changes nothing that is built.
+        if not any(f.upper().startswith('-V') for f in old_flags):
+            new_flags = [f for f in new_flags if f != '-V127']
+        if sorted(f.upper() for f in old_flags) == sorted(f.upper() for f in new_flags):
+            return cfg_text, old_flags, old_flags
+        lines[i] = f"{(mid_name + ':').ljust(30)}{' '.join(new_flags)}{ending or chr(10)}"
+        return ''.join(lines), old_flags, new_flags
+    return cfg_text, None, []
+
+
 def update_midi_cfg_flags(project_root: str, label: str,
                           priority: Optional[int] = None,
                           reverb: Optional[int] = None,
@@ -594,21 +654,8 @@ def update_midi_cfg_flags(project_root: str, label: str,
         lines = f.readlines()
 
     def _apply(flags: list[str]) -> list[str]:
-        out = list(flags)
-
-        def setf(prefix: str, text: Optional[str]):
-            nonlocal out
-            out = [g for g in out if not g.startswith(prefix)]
-            if text is not None:
-                out.append(prefix + text)
-
-        setf('-P', str(priority) if (priority is not None and priority > 0) else None)
-        setf('-R', str(reverb) if (reverb is not None and reverb > 0) else None)
-        setf('-V', f"{volume:03d}" if volume is not None else None)
-        # -G only when explicitly given — None preserves the existing bank.
-        if voicegroup is not None:
-            setf('-G', f"{voicegroup:03d}")
-        return out
+        return apply_header_flags(flags, priority=priority, reverb=reverb,
+                                  volume=volume, voicegroup=voicegroup)
 
     changed = False
     for i, line in enumerate(lines):

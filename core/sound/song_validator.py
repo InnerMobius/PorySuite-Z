@@ -3,8 +3,9 @@
 The Sound Editor's writer is the canonical source of truth, but a bad import,
 a stale code path, or a future regression must NEVER be able to put a song on
 disk that won't build or that strands a sound on the wrong voicegroup. This
-module is the gate: ``save_song_file`` runs it on the generated text + the
-SongData BEFORE writing, and refuses to write if anything is wrong.
+module is the gate the .s import dialogs run (``validate_s_file``) before they
+accept a file. (Editor saves never write PorySuite's own .s text: they run
+mid2agb and check its result, in ``safe_song_save``.)
 
 It checks the two failure classes seen in the wild:
 
@@ -254,8 +255,8 @@ def validate_song_export(song, s_text: str,
                          vg_data=None) -> list[str]:
     """Full export validation: text shape + voicegroup/VOICE range.
 
-    Returns a combined list of error strings (empty == valid). ``save_song_file``
-    calls this BEFORE writing and refuses to write if it's non-empty.
+    Returns a combined list of error strings (empty == valid). ``validate_s_file``
+    runs it on a file the user is importing.
     """
     label = getattr(song, 'label', '') or ''
     if project_root is None:

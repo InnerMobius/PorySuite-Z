@@ -225,7 +225,7 @@ def _postprocess_structure(s_path: str, loop_config: dict):
         # Protect against mid2agb overwrite: backdate the .mid so it's
         # older than the .s we just wrote.  make's %.s:%.mid rule skips
         # mid2agb when .s is newer.  Use a 1-hour backdate (matching
-        # save_song_file's timestamp lock) — the previous 2-second value
+        # song_writer.lock_song_timestamps) — the previous 2-second value
         # was inside filesystem-clock-jitter range.  Backdate midi.cfg
         # too if it's currently at/after the .s, since midi.cfg is a
         # co-dependency in the Make rule.

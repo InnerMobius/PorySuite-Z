@@ -66,19 +66,39 @@ mus_f:
 """
 
 
+def _mid2agb():
+    if not _QT_OK:
+        return None
+    from core.sound.song_compiler import find_mid2agb
+    return find_mid2agb(os.path.join(ROOT_DIR, "pokefirered"))
+
+
 @unittest.skipUnless(_QT_OK, "real PyQt6 unavailable")
+@unittest.skipUnless(_mid2agb(), "project mid2agb unavailable")
 class VolumeFadeTest(unittest.TestCase):
     def _roundtrip(self, new_volume):
         """Open the song in a piano roll, set the track volume, save, and
-        return (before_envelope, after_envelope) as effective VOL values."""
+        return (before_envelope, after_envelope) as effective VOL values.
+
+        A throwaway project tree (song, midi.cfg, mid2agb): a Piano Roll save
+        builds the song with mid2agb and checks it before writing, so it needs
+        a project — it refuses rather than write an unchecked file."""
+        import shutil
         with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, "mus_f.s")
+            midi = os.path.join(d, "sound", "songs", "midi")
+            tools = os.path.join(d, "tools", "mid2agb")
+            os.makedirs(midi)
+            os.makedirs(tools)
+            shutil.copy2(_mid2agb(), tools)
+            with open(os.path.join(midi, "midi.cfg"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("mus_f.mid:                    -E -G013 -V080\n")
+            p = os.path.join(midi, "mus_f.s")
             with open(p, "w", encoding="utf-8", newline="\n") as f:
                 f.write(_SONG)
             song = parse_song_file(p)
             song.file_path = p
             before = [c.value for c in song.tracks[0].commands if c.cmd == 'VOL']
-            win = PianoRollWindow(song)
+            win = PianoRollWindow(song, project_root=d)
             win._on_track_volume(0, new_volume)
             win.save_to_disk()
             after = [c.value for c in parse_song_file(p).tracks[0].commands

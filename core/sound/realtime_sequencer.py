@@ -554,6 +554,15 @@ class RealtimeSequencer:
                         if ts:
                             ts.pan = max(0, min(127, note.get('value', 64)))
                         continue
+                    if evt_type == 'MOD':
+                        if ts:
+                            ts.modulation = max(0, min(127, note.get('value', 0)))
+                        continue
+                    if evt_type == 'VOICE':
+                        # A mid-song instrument change: the next note uses it.
+                        if ts:
+                            ts.voice = max(0, min(127, note.get('value', 0)))
+                        continue
                     if evt_type == 'TEMPO':
                         # M4A bytecode: TEMPO value = bpm * tbs / 2.
                         # Convert back to BPM and recompute samples-per-tick

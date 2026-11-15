@@ -1,13 +1,21 @@
-"""Song Structure Panel for the Piano Roll.
+"""Song Structure panel for the Piano Roll.
 
-Right-side panel showing the song's structural commands in plain English:
-- Sections (labels / markers)
-- Loop Back points (GOTO)
-- Pattern Calls (PATT/PEND subroutines)
-- End Song (FINE)
+Shows the song's structure — where the loop starts and loops back, every time
+a pattern (a written-once section the song repeats) plays, other section
+markers and where the song ends — at the time each one PLAYS, on the same
+clock the canvas draws notes on.
 
-Users can add, remove, reorder, and edit these to control how
-the song plays back — intro sections, loop bodies, reusable patterns.
+It used to list the commands at their position in the song's TEXT, where a
+pattern call takes no time. In a song with repeats the loop then appeared too
+early (Kakariko: shown at 2879, plays at 3935; 40 of the project's 81 looping
+songs were off), and a loop entered there landed too early in the song. Its
+Section / Pattern Call / End Song buttons rewrote the song's commands in
+memory, but no save ever wrote them: the build makes the song's patterns and
+labels from its notes and its loop.
+
+What the panel edits is what a save writes: the loop. Set, move or remove it
+here (or with the cursor buttons); the change goes through the window, into
+the undo history and into the next save, on the playback clock.
 """
 
 from __future__ import annotations
@@ -15,474 +23,274 @@ from __future__ import annotations
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QIcon
+from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QListWidgetItem, QComboBox, QSpinBox,
-    QGroupBox, QMessageBox, QInputDialog, QAbstractItemView,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget,
+    QListWidgetItem, QAbstractItemView, QDialog, QDialogButtonBox, QFormLayout,
+    QSpinBox, QMessageBox,
 )
 
 from ui.custom_widgets.scroll_guard import install_scroll_guard
 
 
-# Friendly names for the assembly commands
-_CMD_LABELS = {
-    'LABEL':  'Section',
-    'GOTO':   'Loop Back',
-    'PATT':   'Play Pattern',
-    'PEND':   'End Pattern',
-    'FINE':   'End Song',
+_KIND_TEXT = {
+    'loop_start': 'Loop starts',
+    'loop_end': 'Loops back to the loop start',
+    'pattern': 'Pattern',
+    'section': 'Marker',
+    'end': 'Song ends',
+}
+_KIND_COLOR = {
+    'loop_start': QColor(80, 140, 255),
+    'loop_end': QColor(80, 140, 255),
+    'pattern': QColor(220, 160, 80),
+    'section': QColor(80, 180, 80),
+    'end': QColor(255, 80, 80),
 }
 
-_CMD_COLORS = {
-    'LABEL':  QColor(80, 180, 80),      # green
-    'GOTO':   QColor(80, 140, 255),      # blue
-    'PATT':   QColor(220, 160, 80),      # orange
-    'PEND':   QColor(220, 160, 80, 140), # faded orange
-    'FINE':   QColor(255, 80, 80),       # red
-}
-
-_CMD_DESCRIPTIONS = {
-    'LABEL':  'Marks a named position in the song that can be jumped to.',
-    'GOTO':   'Jumps back to a Section marker — creates a loop.',
-    'PATT':   'Calls a reusable pattern section, then returns here.',
-    'PEND':   'Marks the end of a reusable pattern section.',
-    'FINE':   'Stops the song completely.',
-}
+TICKS_PER_BEAT = 24     # the M4A / mid2agb clock
 
 
-class StructureItem:
-    """One structural command in the song."""
+class _LoopDialog(QDialog):
+    def __init__(self, start: int, end: int, limit: int, where, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Set Loop")
+        self._where = where
+        form = QFormLayout(self)
+        self._start = QSpinBox()
+        self._end = QSpinBox()
+        for box, value in ((self._start, start), (self._end, end)):
+            install_scroll_guard(box)
+            box.setRange(0, limit)
+            box.setValue(value)
+            box.setSuffix(" ticks")
+        self._hint = QLabel()
+        self._hint.setStyleSheet("color: #999;")
+        form.addRow("Loop starts at:", self._start)
+        form.addRow("Loops back at:", self._end)
+        form.addRow(self._hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._start.valueChanged.connect(self._update_hint)
+        self._end.valueChanged.connect(self._update_hint)
+        self._update_hint()
 
-    def __init__(self, cmd: str, tick: int, label: str = '',
-                 target: str = '', track_index: int = 0):
-        self.cmd = cmd          # LABEL, GOTO, PATT, PEND, FINE
-        self.tick = tick        # flattened tick position
-        self.label = label      # this item's label name (for LABEL)
-        self.target = target    # target label name (for GOTO, PATT)
-        self.track_index = track_index
+    def _update_hint(self):
+        self._hint.setText(f"{self._where(self._start.value())}  →  "
+                           f"{self._where(self._end.value())}\n"
+                           f"({TICKS_PER_BEAT} ticks = one beat; times are when the music plays)")
+
+    def _accept(self):
+        if self._end.value() <= self._start.value():
+            QMessageBox.warning(self, "Set Loop",
+                                "The loop has to end after it starts.")
+            return
+        self.accept()
+
+    def values(self) -> tuple[int, int]:
+        return self._start.value(), self._end.value()
 
 
 class SongStructurePanel(QWidget):
-    """Right-side panel for viewing and editing song structure."""
+    """Right-side panel: the song's structure on the playback clock, and the
+    loop controls."""
 
-    structure_changed = pyqtSignal()  # emitted when user edits structure
-    seek_to_tick = pyqtSignal(int)    # user wants to jump to a tick
+    #: (start, end) the user asked for; (None, None) removes the loop.
+    loop_requested = pyqtSignal(object, object)
+    seek_to_tick = pyqtSignal(int)
+    time_signatures_requested = pyqtSignal()
+    #: (at tick, length): length > 0 inserts that much time, < 0 removes it.
+    shift_time_requested = pyqtSignal(int, int)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.setFixedWidth(220)
-        self._items: list[StructureItem] = []
-        self._labels: list[str] = []   # available section names
-        self._total_ticks: int = 0
-        self._cursor_tick: int = 0     # current playback/ruler position
-        self._track0_prefix: str = ''  # e.g. 'mus_myroute_1_' for stripping
+        self._entries: list[tuple[int, str, str]] = []   # (tick, kind, name)
+        self._structure: dict = {'sections': [], 'patterns': [], 'end': 0}
+        self._loop: tuple = (None, None)
+        self._cursor_tick = 0
+        self._total_ticks = 0
+        self._prefix = ''
+        self._bar_starts: list[int] = []
         self._build_ui()
 
-    def set_cursor_tick(self, tick: int):
-        """Update the cursor position so Add dialogs default to it."""
-        self._cursor_tick = tick
-
+    # ── UI ─────────────────────────────────────────────────────────────
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
-
         header = QLabel("Song Structure")
         header.setFont(QFont("", 10, QFont.Weight.Bold))
         header.setStyleSheet("color: #ccc;")
         layout.addWidget(header)
+        note = QLabel("Times are when each part plays.\nClick an entry to jump there.")
+        note.setStyleSheet("color: #888; font-size: 10px;")
+        layout.addWidget(note)
 
-        # ── Structure list ──
         self._list = QListWidget()
         self._list.setStyleSheet("""
-            QListWidget {
-                background: #1e1e22;
-                border: 1px solid #444;
-                font-size: 11px;
-            }
-            QListWidget::item {
-                padding: 4px 6px;
-                border-bottom: 1px solid #333;
-            }
-            QListWidget::item:selected {
-                background: #2a3a5a;
-            }
+            QListWidget { background: #1e1e22; border: 1px solid #444; font-size: 11px; }
+            QListWidget::item { padding: 4px 6px; border-bottom: 1px solid #333; }
+            QListWidget::item:selected { background: #2a3a5a; }
         """)
-        self._list.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection)
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._list.itemClicked.connect(self._on_item_clicked)
-        self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self._list, 1)
 
-        # ── Add buttons ──
-        add_group = QGroupBox("Add")
-        add_layout = QVBoxLayout(add_group)
-        add_layout.setContentsMargins(4, 8, 4, 4)
-        add_layout.setSpacing(3)
+        self._loop_label = QLabel()
+        self._loop_label.setWordWrap(True)
+        self._loop_label.setStyleSheet("color: #8ab4ff;")
+        layout.addWidget(self._loop_label)
 
-        btn_section = QPushButton("+ Section")
-        btn_section.setToolTip(
-            "Add a named marker at a tick position.\n"
-            "Other commands can jump to this section.")
-        btn_section.clicked.connect(self._add_section)
-        add_layout.addWidget(btn_section)
+        self._btn_set = QPushButton("Set Loop…")
+        self._btn_set.setToolTip("Type the loop's start and end (when the music plays).")
+        self._btn_set.clicked.connect(self._on_set_loop)
+        layout.addWidget(self._btn_set)
+        row = QHBoxLayout()
+        self._btn_start_here = QPushButton("Start Here")
+        self._btn_start_here.setToolTip("Move the loop start to the playback cursor.")
+        self._btn_start_here.clicked.connect(self._on_start_here)
+        row.addWidget(self._btn_start_here)
+        self._btn_end_here = QPushButton("End Here")
+        self._btn_end_here.setToolTip("Make the song loop back at the playback cursor.")
+        self._btn_end_here.clicked.connect(self._on_end_here)
+        row.addWidget(self._btn_end_here)
+        layout.addLayout(row)
+        self._btn_remove = QPushButton("Remove Loop")
+        self._btn_remove.setToolTip("The song plays once and stops instead of looping.")
+        self._btn_remove.clicked.connect(lambda: self.loop_requested.emit(None, None))
+        layout.addWidget(self._btn_remove)
 
-        btn_loop = QPushButton("+ Loop Back")
-        btn_loop.setToolTip(
-            "Add a jump-back point that loops to a Section.\n"
-            "Everything between the Section and this point repeats.")
-        btn_loop.clicked.connect(self._add_loop_back)
-        add_layout.addWidget(btn_loop)
+        self._btn_time_sigs = QPushButton("Time Signatures…")
+        self._btn_time_sigs.setToolTip("Where bars fall (3/4, 6/8, ...). Does not change what plays.")
+        self._btn_time_sigs.clicked.connect(self.time_signatures_requested.emit)
+        layout.addWidget(self._btn_time_sigs)
 
-        btn_pattern = QPushButton("+ Pattern Call")
-        btn_pattern.setToolTip(
-            "Insert a call to a reusable pattern.\n"
-            "Plays that pattern's notes, then comes back here.")
-        btn_pattern.clicked.connect(self._add_pattern_call)
-        add_layout.addWidget(btn_pattern)
+        row2 = QHBoxLayout()
+        self._btn_insert_time = QPushButton("Insert Time…")
+        self._btn_insert_time.setToolTip(
+            "Add silence at the cursor on every track; everything after it moves later.")
+        self._btn_insert_time.clicked.connect(lambda: self._ask_shift(+1))
+        row2.addWidget(self._btn_insert_time)
+        self._btn_remove_time = QPushButton("Remove Time…")
+        self._btn_remove_time.setToolTip(
+            "Cut a stretch out of every track at the cursor; everything after it moves earlier.")
+        self._btn_remove_time.clicked.connect(lambda: self._ask_shift(-1))
+        row2.addWidget(self._btn_remove_time)
+        layout.addLayout(row2)
 
-        btn_end = QPushButton("+ End Song")
-        btn_end.setToolTip("Add an end-of-song marker. Song stops here.")
-        btn_end.clicked.connect(self._add_end_song)
-        add_layout.addWidget(btn_end)
+    # ── public API ─────────────────────────────────────────────────────
+    def set_cursor_tick(self, tick: int):
+        self._cursor_tick = max(0, int(tick))
 
-        layout.addWidget(add_group)
+    def set_bar_starts(self, bar_starts: list[int]) -> None:
+        """Bar-line positions (playback ticks), for showing "bar 3, beat 2"."""
+        self._bar_starts = sorted(bar_starts)
+        self._refresh()
 
-        # ── Remove button ──
-        btn_row = QHBoxLayout()
-        self._btn_remove = QPushButton("Remove")
-        self._btn_remove.setToolTip("Remove the selected structure item.")
-        self._btn_remove.clicked.connect(self._remove_selected)
-        btn_row.addWidget(self._btn_remove)
-
-        self._btn_edit = QPushButton("Edit")
-        self._btn_edit.setToolTip(
-            "Edit the selected item (change target, tick, name).")
-        self._btn_edit.clicked.connect(self._on_item_double_clicked)
-        btn_row.addWidget(self._btn_edit)
-
-        self._btn_clear = QPushButton("Clear All")
-        self._btn_clear.setToolTip("Remove all structure items at once.")
-        self._btn_clear.clicked.connect(self._clear_all)
-        btn_row.addWidget(self._btn_clear)
-        layout.addLayout(btn_row)
-
-    # ── Public API ──
-
-    def _strip_track_prefix(self, asm_label: str) -> str:
-        """Strip the track label prefix from an assembly label.
-
-        e.g. 'mus_myroute_1_intro' → 'intro' when _track0_prefix
-        is 'mus_myroute_1_'.  Falls back to the full label if no
-        prefix matches.
-        """
-        if self._track0_prefix and asm_label.startswith(self._track0_prefix):
-            return asm_label[len(self._track0_prefix):]
-        return asm_label
-
-    def load_from_song(self, song_data, total_ticks: int):
-        """Extract structural commands from all tracks and display them."""
-        self._items.clear()
-        self._labels.clear()
+    def load_from_song(self, song, total_ticks: int):
+        """Read the song's structure (patterns, markers, end) on the playback
+        clock. The loop shown is the editor's own (``set_loop``)."""
+        from core.sound.midi_exporter import song_structure
         self._total_ticks = total_ticks
+        self._structure = song_structure(song)
+        self._prefix = (song.tracks[0].label + '_') if song.tracks else ''
+        self._refresh()
 
-        # Remember track 0's label prefix so we can strip it from
-        # assembly labels to show the user's friendly name.
-        # e.g. track 0 label = 'mus_myroute_1' → prefix 'mus_myroute_1_'
-        self._track0_prefix = ''
-        if song_data.tracks:
-            self._track0_prefix = song_data.tracks[0].label + '_'
+    def set_loop(self, start, end) -> None:
+        self._loop = (start, end)
+        self._refresh()
 
-        # Collect PATT targets so we can exclude them — these are internal
-        # subroutine labels (e.g. mus_evil_3_007), not user-visible sections.
-        patt_targets: set[str] = set()
-        for track in song_data.tracks:
-            for cmd in track.commands:
-                if cmd.cmd == 'PATT' and cmd.target_label:
-                    patt_targets.add(cmd.target_label)
+    def where(self, tick: int) -> str:
+        """"tick 3935 (bar 41, beat 4)" — bars from the song's time signatures."""
+        if self._bar_starts:
+            import bisect
+            i = bisect.bisect_right(self._bar_starts, tick) - 1
+            if i >= 0:
+                beat = (tick - self._bar_starts[i]) // TICKS_PER_BEAT + 1
+                return f"tick {tick} (bar {i + 1}, beat {beat})"
+        return f"tick {tick}"
 
-        # Collect section labels (user-created or loop markers), skipping
-        # any label that exists only as a PATT subroutine target.
-        # Strip track prefixes so the user sees friendly names.
-        for ti, track in enumerate(song_data.tracks):
-            for cmd in track.commands:
-                if cmd.cmd == 'LABEL' and cmd.target_label:
-                    friendly = self._strip_track_prefix(cmd.target_label)
-                    if (friendly not in self._labels
-                            and cmd.target_label not in patt_targets):
-                        self._labels.append(friendly)
+    # ── internals ──────────────────────────────────────────────────────
+    def _friendly(self, label: str) -> str:
+        return label[len(self._prefix):] if self._prefix and label.startswith(self._prefix) else label
 
-        # Only show structure from track 0 (all tracks should mirror)
-        if song_data.tracks:
-            track = song_data.tracks[0]
-            for cmd in track.commands:
-                if cmd.cmd in ('LABEL', 'GOTO', 'PATT', 'PEND', 'FINE'):
-                    friendly = self._strip_track_prefix(
-                        cmd.target_label or '')
-                    item = StructureItem(
-                        cmd=cmd.cmd,
-                        tick=cmd.tick,
-                        label=friendly,
-                        target=friendly,
-                        track_index=0,
-                    )
-                    self._items.append(item)
-
-        self._refresh_list()
-
-    def get_structure_items(self) -> list[StructureItem]:
-        """Return the current structure for saving."""
-        return list(self._items)
-
-    def get_loop_region(self) -> tuple[int | None, int | None]:
-        """Return (loop_start_tick, loop_end_tick) from the structure.
-
-        Finds the first GOTO and its target LABEL to determine the loop.
-        """
-        # Find first GOTO
-        goto_item = None
-        for item in self._items:
-            if item.cmd == 'GOTO':
-                goto_item = item
-                break
-        if goto_item is None:
-            return (None, None)
-
-        # Find the target label
-        for item in self._items:
-            if item.cmd == 'LABEL' and item.label == goto_item.target:
-                return (item.tick, goto_item.tick)
-
-        return (None, None)
-
-    def get_loop_label(self) -> str | None:
-        """Return the label name that the GOTO points to.
-
-        This is the user's chosen section name (e.g. 'intro'), NOT the
-        auto-generated '_B1' fallback. Returns None if no GOTO exists.
-        """
-        for item in self._items:
-            if item.cmd == 'GOTO':
-                return item.target
-        return None
-
-    # ── List display ──
-
-    def _refresh_list(self):
+    def _refresh(self):
+        st = self._structure
+        entries = [(t, 'pattern', self._friendly(n)) for t, n in st['patterns']]
+        entries += [(t, 'section', self._friendly(n)) for t, n in st['sections']]
+        start, end = self._loop
+        if start is not None and end is not None:
+            entries += [(start, 'loop_start', ''), (end, 'loop_end', '')]
+            self._loop_label.setText(f"Loop: {self.where(start)} → {self.where(end)}")
+            self._btn_remove.setEnabled(True)
+        else:
+            self._loop_label.setText("No loop: the song plays once.")
+            self._btn_remove.setEnabled(False)
+        if st['end']:
+            entries.append((st['end'], 'end', ''))
+        order = {'loop_start': 0, 'section': 1, 'pattern': 2, 'loop_end': 3, 'end': 4}
+        self._entries = sorted(entries, key=lambda e: (e[0], order[e[1]]))
         self._list.clear()
-        # Sort by tick position
-        sorted_items = sorted(self._items, key=lambda x: x.tick)
-        self._items = sorted_items
+        for tick, kind, name in self._entries:
+            text = _KIND_TEXT[kind] + (f" \"{name}\" plays" if kind == 'pattern'
+                                       else f" \"{name}\"" if name else "")
+            item = QListWidgetItem(f"  {text}\n  at {self.where(tick)}")
+            item.setForeground(_KIND_COLOR[kind])
+            self._list.addItem(item)
 
-        for item in self._items:
-            friendly = _CMD_LABELS.get(item.cmd, item.cmd)
-            color = _CMD_COLORS.get(item.cmd, QColor(180, 180, 180))
-
-            if item.cmd == 'LABEL':
-                text = f"  {friendly}: \"{item.label}\"\n  at tick {item.tick}"
-            elif item.cmd == 'GOTO':
-                text = (f"  {friendly} → \"{item.target}\"\n"
-                        f"  at tick {item.tick}")
-            elif item.cmd == 'PATT':
-                text = (f"  {friendly}: \"{item.target}\"\n"
-                        f"  at tick {item.tick}")
-            elif item.cmd == 'PEND':
-                text = f"  End Pattern\n  at tick {item.tick}"
-            elif item.cmd == 'FINE':
-                text = f"  End Song\n  at tick {item.tick}"
-            else:
-                text = f"  {item.cmd} at tick {item.tick}"
-
-            li = QListWidgetItem(text)
-            li.setForeground(color)
-            li.setData(Qt.ItemDataRole.UserRole, id(item))
-            self._list.addItem(li)
-
-    def _get_selected_item(self) -> StructureItem | None:
+    def _on_item_clicked(self, _item):
         row = self._list.currentRow()
-        if row < 0 or row >= len(self._items):
-            return None
-        return self._items[row]
+        if 0 <= row < len(self._entries):
+            self.seek_to_tick.emit(self._entries[row][0])
 
-    # ── Click handlers ──
+    def _limit(self) -> int:
+        return max(self._total_ticks, self._structure.get('end') or 0, self._cursor_tick) + 96 * 64
 
-    def _on_item_clicked(self, li: QListWidgetItem):
-        item = self._get_selected_item()
-        if item:
-            self.seek_to_tick.emit(item.tick)
+    def _on_set_loop(self):
+        start, end = self._loop
+        if start is None or end is None:
+            start = 0
+            end = max(self._structure.get('end') or 0, self._cursor_tick, TICKS_PER_BEAT * 4)
+        dlg = _LoopDialog(start, end, self._limit(), self.where, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.loop_requested.emit(*dlg.values())
 
-    def _on_item_double_clicked(self, *_args):
-        item = self._get_selected_item()
-        if not item:
+    def _ask_shift(self, sign: int):
+        from PyQt6.QtWidgets import QInputDialog
+        if self._cursor_tick < 1:
+            QMessageBox.warning(self, "Insert / Remove Time",
+                                "Put the cursor after the very start first (the start holds "
+                                "each track's starting values).")
             return
-        self._edit_item(item)
-
-    def _edit_item(self, item: StructureItem):
-        """Edit an existing structure item."""
-        if item.cmd == 'LABEL':
-            name, ok = QInputDialog.getText(
-                self, "Edit Section",
-                "Section name:",
-                text=item.label)
-            if ok and name.strip():
-                old_name = item.label
-                item.label = name.strip()
-                # Update any GOTOs/PATTs that reference the old name
-                for other in self._items:
-                    if other.target == old_name:
-                        other.target = item.label
-
-        elif item.cmd in ('GOTO', 'PATT'):
-            if not self._labels:
-                QMessageBox.information(
-                    self, "No Sections",
-                    "Add a Section first before setting a target.")
-                return
-            targets = list(self._labels)
-            current = targets.index(item.target) if item.target in targets else 0
-            target, ok = QInputDialog.getItem(
-                self, f"Edit {_CMD_LABELS[item.cmd]}",
-                "Jump to section:", targets, current, False)
-            if ok:
-                item.target = target
-
-        # All items: edit tick position.
-        # Max is 65535 (16-bit GBA tick ceiling), not _total_ticks — commands
-        # like GOTO legitimately sit at or beyond the last note in the song.
-        tick, ok = QInputDialog.getInt(
-            self, "Edit Position",
-            "Tick position:", item.tick, 0, 65535)
+        what = "insert" if sign > 0 else "remove"
+        length, ok = QInputDialog.getInt(
+            self, "Insert Time" if sign > 0 else "Remove Time",
+            f"Ticks to {what} at {self.where(self._cursor_tick)} "
+            f"({TICKS_PER_BEAT} = one beat, {TICKS_PER_BEAT * 4} = a 4/4 bar):",
+            TICKS_PER_BEAT * 4, 1, 96 * 256)
         if ok:
-            item.tick = tick
+            self.shift_time_requested.emit(self._cursor_tick, sign * length)
 
-        self._refresh_list()
-        self.structure_changed.emit()
-
-    # ── Add commands ──
-
-    def _add_section(self):
-        name, ok = QInputDialog.getText(
-            self, "New Section",
-            "Section name (e.g. 'Intro', 'Chorus', 'Loop'):")
-        if not ok or not name.strip():
+    def _on_start_here(self):
+        start, end = self._loop
+        if end is None:
+            end = self._structure.get('end') or 0
+        if self._cursor_tick >= end:
+            QMessageBox.warning(self, "Loop Start",
+                                "Put the cursor before the loop's end first.")
             return
+        self.loop_requested.emit(self._cursor_tick, end)
 
-        tick, ok = QInputDialog.getInt(
-            self, "Section Position",
-            "Place at tick:", self._cursor_tick, 0, 65535)
-        if not ok:
+    def _on_end_here(self):
+        start, _end = self._loop
+        if start is None:
+            start = 0
+        if self._cursor_tick <= start:
+            QMessageBox.warning(self, "Loop End",
+                                "Put the cursor after the loop's start first.")
             return
-
-        label_name = name.strip().replace(' ', '_')
-        self._items.append(StructureItem(
-            cmd='LABEL', tick=tick, label=label_name))
-        if label_name not in self._labels:
-            self._labels.append(label_name)
-        self._refresh_list()
-        self.structure_changed.emit()
-
-    def _add_loop_back(self):
-        if not self._labels:
-            QMessageBox.information(
-                self, "No Sections",
-                "You need to add a Section first.\n\n"
-                "A Loop Back jumps to a Section — so create the\n"
-                "Section where you want the loop to start, then\n"
-                "add the Loop Back where you want it to repeat from.")
-            return
-
-        target, ok = QInputDialog.getItem(
-            self, "Loop Back Target",
-            "Loop back to which section?",
-            self._labels, 0, False)
-        if not ok:
-            return
-
-        tick, ok = QInputDialog.getInt(
-            self, "Loop Back Position",
-            "Place Loop Back at tick:", self._cursor_tick,
-            0, 65535)
-        if not ok:
-            return
-
-        self._items.append(StructureItem(
-            cmd='GOTO', tick=tick, target=target))
-        self._refresh_list()
-        self.structure_changed.emit()
-
-    def _add_pattern_call(self):
-        if not self._labels:
-            QMessageBox.information(
-                self, "No Sections",
-                "You need to add a Section first.\n\n"
-                "A Pattern Call plays the notes from a Section,\n"
-                "then returns to continue from here.")
-            return
-
-        target, ok = QInputDialog.getItem(
-            self, "Pattern to Play",
-            "Play which section's pattern?",
-            self._labels, 0, False)
-        if not ok:
-            return
-
-        tick, ok = QInputDialog.getInt(
-            self, "Pattern Call Position",
-            "Insert Pattern Call at tick:", self._cursor_tick,
-            0, 65535)
-        if not ok:
-            return
-
-        self._items.append(StructureItem(
-            cmd='PATT', tick=tick, target=target))
-        self._refresh_list()
-        self.structure_changed.emit()
-
-    def _add_end_song(self):
-        tick, ok = QInputDialog.getInt(
-            self, "End Song Position",
-            "End the song at tick:", self._cursor_tick,
-            0, 65535)
-        if not ok:
-            return
-
-        self._items.append(StructureItem(
-            cmd='FINE', tick=tick))
-        self._refresh_list()
-        self.structure_changed.emit()
-
-    def _remove_selected(self):
-        item = self._get_selected_item()
-        if not item:
-            return
-
-        friendly = _CMD_LABELS.get(item.cmd, item.cmd)
-        reply = QMessageBox.question(
-            self, "Remove",
-            f"Remove this {friendly} at tick {item.tick}?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # If removing a label, also remove from the label list
-        if item.cmd == 'LABEL' and item.label in self._labels:
-            self._labels.remove(item.label)
-
-        self._items.remove(item)
-        self._refresh_list()
-        self.structure_changed.emit()
-
-    def _clear_all(self):
-        if not self._items:
-            return
-        reply = QMessageBox.question(
-            self, "Clear All",
-            f"Remove all {len(self._items)} structure items?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        self._items.clear()
-        self._labels.clear()
-        self._refresh_list()
-        self.structure_changed.emit()
+        self.loop_requested.emit(start, self._cursor_tick)

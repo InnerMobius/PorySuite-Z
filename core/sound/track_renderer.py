@@ -16,6 +16,7 @@ Mixes all tracks together for full song playback.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Optional
 
 import numpy as np
@@ -119,6 +120,11 @@ def collect_tempo_changes(song, tbs: int) -> list:
 # Command timeline flattener
 # ---------------------------------------------------------------------------
 
+# Deepest pattern-inside-pattern call followed (mid2agb never nests; this only
+# stops a malformed self-calling pattern from looping forever).
+_MAX_PATTERN_DEPTH = 4
+
+
 def _build_label_index(commands: list[TrackCommand]) -> dict[str, int]:
     """Build a map of label_name -> command list index."""
     index = {}
@@ -151,9 +157,16 @@ def flatten_track_commands(
     pc = 0                      # program counter (index into commands)
     call_stack: list[int] = []  # return addresses for PATT calls
     goto_count = 0              # how many times we've hit GOTO
-    max_commands = len(commands) * (loop_count + 1) * 4  # safety limit
+    # Safety limit on STEPS, not on output. The old limit capped the output at
+    # 4x the written commands, and a track that calls its patterns often plays
+    # out longer than that, so the end of 9 tracks in 8 of this project's songs
+    # was silently cut off — missing from the Piano Roll and its saves. GOTO is
+    # already bounded by loop_count and pattern calls by their nesting depth.
+    max_steps = 4_000_000
+    steps = 0
 
-    while pc < len(commands) and len(result) < max_commands:
+    while pc < len(commands) and steps < max_steps:
+        steps += 1
         cmd = commands[pc]
 
         if cmd.cmd == 'LABEL':
@@ -164,7 +177,7 @@ def flatten_track_commands(
         if cmd.cmd == 'PATT':
             # Subroutine call — push return address, jump to target
             target = cmd.target_label
-            if target and target in label_index:
+            if target and target in label_index and len(call_stack) < _MAX_PATTERN_DEPTH:
                 call_stack.append(pc + 1)  # return to next instruction
                 pc = label_index[target] + 1  # jump past the label
                 continue
@@ -195,18 +208,13 @@ def flatten_track_commands(
         if cmd.cmd == 'FINE':
             break
 
-        # For all other commands, emit with updated tick
-        new_cmd = TrackCommand(
-            cmd=cmd.cmd,
-            tick=current_tick,
-            duration=cmd.duration,
-            pitch=cmd.pitch,
-            velocity=cmd.velocity,
-            gate_time=cmd.gate_time,
-            value=cmd.value,
-            target_label=cmd.target_label,
-            raw_line=cmd.raw_line,
-        )
+        # For all other commands, emit a copy with the playback tick.
+        # dataclasses.replace copies every field the command's OWN class has,
+        # so this works for any version of TrackCommand. Naming the fields here
+        # broke the Piano Roll on 2026-11-15: a PorySuite started before the
+        # parser gained `sub`/`arg1` still held the old class, and reading
+        # cmd.sub raised AttributeError on every open.
+        new_cmd = dataclasses.replace(cmd, tick=current_tick)
         result.append(new_cmd)
 
         # Only WAITs advance the tick clock — notes are placed at the
@@ -262,7 +270,10 @@ def get_flattened_loop_info(
     call_stack: list[int] = []
     current_tick = 0
     loop_start_tick = None
-    max_iters = len(commands) * 8
+    # A step limit, not 8x the written commands: a track that calls its
+    # patterns often runs longer than that, and the old cap stopped the walk
+    # before the GOTO — reporting a loop end in the middle of the song.
+    max_iters = 4_000_000
 
     iters = 0
     while pc < len(commands) and iters < max_iters:
@@ -278,7 +289,7 @@ def get_flattened_loop_info(
 
         if cmd.cmd == 'PATT':
             target = cmd.target_label
-            if target and target in label_index:
+            if target and target in label_index and len(call_stack) < _MAX_PATTERN_DEPTH:
                 call_stack.append(pc + 1)
                 pc = label_index[target] + 1
                 continue

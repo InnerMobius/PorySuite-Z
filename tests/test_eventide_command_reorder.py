@@ -274,16 +274,21 @@ def test_an_unbalanced_block_is_not_deleted_to_the_end_of_the_page(tab):
     So deleting a Show Choices header with no Branch End deleted everything
     after it, in one keystroke, with nothing said about it.
     """
+    # It then REFUSED to delete at all. Since 2026-11-15 every row can be
+    # deleted, so the header goes on its own — and still only the header.
     _load(tab, [('lockall',), ('choice_yesno', 'q'), ('message', 'T', 'x', 'D'),
                 ('end',)])
-    assert tab._delete_one_row(1) is False
-    assert len(tab._cmd_tuples) == 4
-    assert any('Branch End' in m for m in tab._mw.messages)
+    assert tab._delete_span(1) == [1]
+    tab._cmd_list.setCurrentRow(1)
+    tab._on_del_command()
+    assert [c[0] for c in tab._cmd_tuples] == ['lockall', 'message', 'end']
 
 
 def test_a_balanced_block_is_still_deleted_whole(tab):
     _load(tab, CHOICE)
-    assert tab._delete_one_row(1) is True
+    assert tab._delete_span(1) == list(range(1, 7))
+    tab._cmd_list.setCurrentRow(1)
+    tab._on_del_command()
     assert [c[0] for c in tab._cmd_tuples] == ['lockall', 'end']
 
 

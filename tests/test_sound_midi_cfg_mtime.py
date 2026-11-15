@@ -119,16 +119,22 @@ class MidiCfgMtimeTest(unittest.TestCase):
 
     def test_save_paths_still_wire_the_voicegroup_G_sync(self):
         # GUARD against the exact regression the user hit ("the -G thing didn't
-        # stick"): a save path calls recompile_song, which regenerates the .s
-        # from midi.cfg's -G — so it MUST first update_midi_cfg_flags(...,
-        # voicegroup=...). If a refactor drops that arg, the bank silently
-        # reverts again. Assert the wiring is present in each save path body.
+        # stick"): a save path rebuilds the .s with mid2agb using midi.cfg's -G,
+        # so it MUST pass the song's current voicegroup. If a refactor drops
+        # that arg, the bank silently reverts again. Assert the wiring is
+        # present in each save path body.
         import re as _re
+        # Neither editor calls recompile_song any more (it is gone): the Sound
+        # Editor's header save goes through safe_song_save.save_song_header and
+        # the Piano Roll through safe_song_save.save_editor_song, both of which
+        # build the .s with the NEW flags (including -G) and check it before
+        # writing. The guarantee is the same — the current voicegroup must be
+        # passed every time.
         checks = [
-            ("ui/piano_roll_window.py", r"def save_to_disk"),
-            ("ui/sound_editor_tab.py", r"def _save_song_via_mid2agb"),
+            ("ui/piano_roll_window.py", r"def save_to_disk", "save_editor_song"),
+            ("ui/sound_editor_tab.py", r"def _save_song_inline", "save_song_header"),
         ]
-        for rel, fn_re in checks:
+        for rel, fn_re, rebuild_call in checks:
             src = open(os.path.join(ROOT_DIR, rel), encoding="utf-8").read()
             m = _re.search(fn_re, src)
             self.assertIsNotNone(m, f"{fn_re} not found in {rel}")
@@ -137,9 +143,9 @@ class MidiCfgMtimeTest(unittest.TestCase):
             nxt = _re.search(r"\n    def ", body[10:])
             body = body[:nxt.start() + 10] if nxt else body
             self.assertIn("voicegroup", body,
-                          f"{rel}:{fn_re} must pass voicegroup to update_midi_cfg_flags "
-                          f"before recompile_song, or a bank change reverts")
-            self.assertIn("recompile_song", body)
+                          f"{rel}:{fn_re} must pass the current voicegroup to the "
+                          f"rebuild, or a bank change reverts")
+            self.assertIn(rebuild_call, body)
 
     def test_backdate_helper_handles_no_s_files(self):
         # An empty dir (no .s) must not raise and must leave cfg alone.
