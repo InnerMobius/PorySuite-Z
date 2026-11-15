@@ -787,17 +787,35 @@ def register_song(
         with open(cfg_path, "a", encoding="utf-8", newline="\n") as f:
             f.write(cfg_line)
 
-        # CRITICAL: midi.cfg is a Makefile dependency for EVERY .s file.
-        # Appending to it makes midi.cfg newer than all existing .s files.
-        # Touch every .s so make doesn't re-run mid2agb on songs whose
-        # .mid is a placeholder (which would wipe them to 0-track garbage).
-        midi_dir = os.path.dirname(cfg_path)
-        for fn in os.listdir(midi_dir):
-            if fn.endswith('.s'):
-                try:
-                    os.utime(os.path.join(midi_dir, fn))
-                except OSError:
-                    pass
+        # midi.cfg is a Makefile dependency for EVERY .s, so appending to it
+        # makes it newer than all of them and the next build would re-run
+        # mid2agb on every song — including ones whose .mid is a placeholder,
+        # which wipes them to a 0-track header.
+        #
+        # This used to stamp every .s to "now" to stop that. It worked, and it
+        # also made every .s newer than every .mid, so a song edited in an
+        # external DAW could never rebuild: make saw the .s as current and
+        # skipped the conversion, and the edit never reached the ROM.
+        #
+        # Backdate midi.cfg below the oldest .s instead. Same protection —
+        # midi.cfg can no longer be the newer file — without touching a single
+        # song's timestamp, so a genuinely newer .mid still rebuilds its own
+        # .s. This is the approach song_table_manager already documents as the
+        # replacement for "os.utime every .s"; this was the last site still
+        # doing it the old way.
+        try:
+            from core.sound.song_table_manager import _backdate_midi_cfg
+            _backdate_midi_cfg(cfg_path)
+        except Exception:
+            # Fail closed to the old behaviour rather than leaving midi.cfg
+            # newer than everything, which regenerates every song.
+            midi_dir = os.path.dirname(cfg_path)
+            for fn in os.listdir(midi_dir):
+                if fn.endswith('.s'):
+                    try:
+                        os.utime(os.path.join(midi_dir, fn))
+                    except OSError:
+                        pass
 
     return True, ""
 

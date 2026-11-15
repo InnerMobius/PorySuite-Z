@@ -1551,42 +1551,11 @@ QTabBar::tab:hover:!selected {
             return False, str(exc)
 
     def _git_status_entries(self) -> "list[tuple[str, str]]":
-        """Return [(xy, path), ...] from ``git status --porcelain -z``.
-
-        Uses -z (NUL-delimited) so paths are VERBATIM — git's normal status
-        output WRAPS any path containing a space or special char in quotes
-        (e.g. `"concept/UI/trainer card concept.png"`), and passing that quoted
-        string to `git add` stages NOTHING (no file by that literal name), which
-        is exactly why files with spaces silently refused to commit. -z avoids
-        the quoting entirely, so every listed file stages correctly.
-        """
-        cwd = (self.project_info or {}).get("dir", "")
-        if not cwd:
-            return []
-        try:
-            r = subprocess.run(
-                [self._git_exe(), "-C", cwd, "status", "--porcelain", "-z"],
-                capture_output=True, text=True, timeout=15,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except Exception:
-            return []
-        # Do NOT strip: a record's first byte can be a meaningful space (" M").
-        records = (r.stdout or "").split("\x00")
-        entries: "list[tuple[str, str]]" = []
-        i = 0
-        while i < len(records):
-            rec = records[i]
-            if not rec:
-                i += 1
-                continue
-            xy = rec[:2]
-            path = rec[3:]               # XY (2 chars) + 1 space, then the path
-            if xy and xy[0] in ("R", "C"):
-                i += 1                    # rename/copy: the next field is the ORIGIN
-            entries.append((xy, path))
-            i += 1
-        return entries
+        """[(xy, path), ...] with every path verbatim — see core/git_status.py.
+        The unified window has the same method over the same helper; the Git
+        panel calls it on whichever window opened it."""
+        from core.git_status import status_entries
+        return status_entries(self._git_exe(), (self.project_info or {}).get("dir", ""))
 
     def _open_git_panel(self, page: str = "") -> None:
         """Open (or bring to front) the Git Panel window.
@@ -1972,13 +1941,17 @@ QTabBar::tab:hover:!selected {
         dlg.exec()
 
     def _git_pull(self, override_url: str = "", use_upstream: bool = False,
-                  on_refresh_done: "callable | None" = None) -> None:
+                  on_refresh_done: "callable | None" = None,
+                  branch: str = "") -> None:
         """
         Git → Pull submenu actions.
 
         override_url: if given (e.g. pret upstream URL), fetch directly from
         that URL and reset to FETCH_HEAD instead of using origin.
         use_upstream: if True, load the upstream URL from storage.
+        branch: the ORIGIN branch to pull from (the Git panel's branch picker,
+        the counterpart of Push's target-branch picker). '' = the current
+        branch's own upstream, as before.
         """
         if not self.project_info:
             return
@@ -2008,6 +1981,8 @@ QTabBar::tab:hover:!selected {
                 "rev-parse", "--abbrev-ref", "@{upstream}", timeout=10)
             _up = (_up or "").strip()
             _target = _up if (ok_up and _up and "fatal" not in _up.lower()) else ""
+            if branch:
+                _target = f"origin/{branch}"   # the branch the user chose to pull from
             if not _target:
                 ok_ls, _ls = self._git_run(
                     "ls-remote", "--heads", "origin", _cur, timeout=15)
@@ -2019,8 +1994,12 @@ QTabBar::tab:hover:!selected {
             fetch_label = "git fetch origin"
             reset_label = f"git reset --hard {_target}"
 
-        _, branch = self._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
-        branch_label = (branch or "").strip()
+        _, _head = self._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=10)
+        branch_label = (_head or "").strip()
+        # Pulling ANOTHER branch into this one: say both, so it is plain that
+        # e.g. origin/master's contents are about to become 'camera-work'.
+        _source_label = reset_args[-1] if not is_upstream_pull else ""
+        _cross_branch = bool(_source_label) and _source_label != f"origin/{branch_label}"
 
         # If this branch has committed work the remote target doesn't, a hard
         # reset pull would discard it — warn loudly (the stash only covers
@@ -2065,7 +2044,9 @@ QTabBar::tab:hover:!selected {
             "stash, so nothing is lost — you can restore it afterward from the "
             "Git panel → Stash section (or 'git stash pop').\n\n"
             f"  Remote: {remote_label}\n"
-            + (f"  Branch: {branch_label}\n" if branch_label else "") +
+            + (f"  From:   {_source_label}\n  Into your branch: {branch_label}\n"
+               if _cross_branch else
+               (f"  Branch: {branch_label}\n" if branch_label else "")) +
             _diverge_warn +
             "\nSaved to the stash first:\n"
             "  • Uncommitted changes to tracked files\n"
@@ -2100,7 +2081,10 @@ QTabBar::tab:hover:!selected {
         _vlayout.setSpacing(8)
 
         _from_lbl = QLabel(f"<b>Pulling from:</b> {remote_label}"
-                           + (f"&nbsp;&nbsp;<b>Branch:</b> {branch_label}" if branch_label else ""))
+                           + (f"&nbsp;&nbsp;<b>From:</b> {_source_label}"
+                              f"&nbsp;&nbsp;<b>Into:</b> {branch_label}"
+                              if _cross_branch else
+                              (f"&nbsp;&nbsp;<b>Branch:</b> {branch_label}" if branch_label else "")))
         _from_lbl.setWordWrap(True)
         _vlayout.addWidget(_from_lbl)
 
@@ -2396,38 +2380,17 @@ QTabBar::tab:hover:!selected {
 
     def _git_finish_switch(self, branch: str, project_dir: str) -> None:
         """After landing on *branch*: make it track origin/<branch> (so Push AND
-        Pull both follow it) and, if the local branch is behind the remote,
-        offer to fast-forward it to the latest. Then refresh the project."""
-        from PyQt6.QtWidgets import QMessageBox as _MB
+        Pull both follow it), then refresh the project.
+
+        Switching ONLY switches. It used to follow up with an "Update to
+        latest?" offer (fast-forward) or a "Branch has diverged" warning when
+        the branch was behind GitHub — removed 2026-11-15 at the owner's
+        request: people switch with their own plan in mind, and the branch
+        list already says "update available — N behind GitHub". Updating is
+        Pull's job, when the user chooses. tests/test_git_panel_contract.py
+        guards that this path never merges."""
         # Track origin/<branch> so push/pull default here. Harmless if already set.
         self._git_run("branch", f"--set-upstream-to=origin/{branch}", branch, timeout=10)
-        _, behind_out = self._git_run(
-            "rev-list", "--count", f"{branch}..origin/{branch}", timeout=10)
-        _, ahead_out = self._git_run(
-            "rev-list", "--count", f"origin/{branch}..{branch}", timeout=10)
-        try:
-            behind = int((behind_out or "0").strip() or 0)
-        except ValueError:
-            behind = 0
-        try:
-            ahead = int((ahead_out or "0").strip() or 0)
-        except ValueError:
-            ahead = 0
-        if behind > 0 and ahead == 0:
-            if _MB.question(
-                self, "Update to latest?",
-                f"'{branch}' is {behind} commit(s) behind the version on GitHub.\n\n"
-                f"Update it to the latest now?  (Fast-forward — nothing of yours "
-                f"is lost.)",
-                _MB.StandardButton.Yes | _MB.StandardButton.No,
-            ) == _MB.StandardButton.Yes:
-                self._git_run("merge", "--ff-only", f"origin/{branch}", timeout=60)
-        elif behind > 0 and ahead > 0:
-            _MB.warning(
-                self, "Branch has diverged",
-                f"'{branch}' has {ahead} commit(s) that GitHub doesn't, and is "
-                f"{behind} behind. They've split apart — use Pull when you're "
-                f"ready to reconcile them. I won't auto-merge and risk your work.")
         # Align the push default with the branch you're now working on.
         self._git_save_push_target(project_dir, branch)
         self.statusBar().showMessage(
@@ -2442,7 +2405,7 @@ QTabBar::tab:hover:!selected {
         origin/<branch>, so from then on Push and Pull both target it — no
         picking, and pull can't grab a stale different branch. If *branch* only
         exists on the remote (remote_only), a local copy that tracks it is
-        created. A stale local copy is offered a fast-forward to the latest.
+        created. The branch is NOT updated from GitHub — that is Pull's job.
         Conflicts with uncommitted changes use an in-app Stash/Discard prompt —
         no terminal.
         """
@@ -2455,14 +2418,19 @@ QTabBar::tab:hover:!selected {
         from PyQt6.QtWidgets import QMessageBox as _MB
         ans = _MB.question(
             self, "Switch Branch",
-            f"Switch to '{branch}' and use it for Push and Pull?\n\n"
-            f"If you have unsaved changes you'll get a Stash/Discard prompt.",
+            f"Switch to the '{branch}' branch?\n\n"
+            f"Your project's files will change to match '{branch}' as it is "
+            f"on this PC. After that, Push sends to '{branch}' on GitHub and "
+            f"Pull brings in '{branch}' from GitHub.\n\n"
+            f"If you have changes you haven't committed, you'll be asked "
+            f"first whether to set them aside (stash) or throw them away.",
             _MB.StandardButton.Yes | _MB.StandardButton.Cancel,
         )
         if ans != _MB.StandardButton.Yes:
             return
 
-        # Refresh remote state so tracking + 'behind' checks are accurate.
+        # Fetch so a GitHub-only branch (remote_only) exists to be checked out.
+        # Fetch only updates the remote-tracking copies; it never touches files.
         self._git_run("fetch", "origin", timeout=90)
         checkout_args = (
             ["checkout", "-b", branch, "--track", f"origin/{branch}"]
@@ -2973,6 +2941,89 @@ QTabBar::tab:hover:!selected {
         except Exception:
             pass
 
+    def _clone_safety_gate(self, project_dir: str) -> bool:
+        """Warn before pushing a tree that will not build once cloned.
+
+        A decomp .gitignore ignores compiled graphics and audio on purpose —
+        `make` rebuilds them from tracked sources. The trap is a file the
+        build *reads* that is ignored and has no tracked source behind it: it
+        works forever on the machine that happens to hold it, and the failure
+        lands on whoever clones next, as a bare missing-file error from a
+        makefile rule they have never heard of.
+
+        Returns True to carry on with the push.
+
+        Deliberately quiet: anything the checker is unsure about is treated as
+        fine. The whole value of this dialog is that it means something when
+        it appears, and a warning that fires on files which turn out to be OK
+        gets dismissed on reflex — at which point it is worth less than
+        nothing. See core/clone_safety.py for what that costs.
+        """
+        try:
+            from core import clone_safety
+        except ImportError:
+            return True
+
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+        from PyQt6.QtCore import Qt as _Qt
+
+        # The check needs the repository root, which is not always the project
+        # directory — a project with a `source/` prefix keeps its .git above
+        # it, and passing the wrong one makes the check skip in silence.
+        try:
+            root = self.util.repo_root()
+        except Exception:
+            root = project_dir
+        if not root or not os.path.isdir(os.path.join(root, ".git")):
+            root = project_dir
+
+        try:
+            QApplication.setOverrideCursor(_Qt.CursorShape.WaitCursor)
+            try:
+                report = clone_safety.check(root)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except Exception as exc:
+            # Never block a push over a bug in the check itself.
+            logging.exception("Clone-safety check failed: %s", exc)
+            return True
+
+        if not report.ran or not report.findings:
+            return True
+
+        findings = report.findings
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("This push would not build elsewhere")
+        box.setTextFormat(_Qt.TextFormat.RichText)
+        box.setText(clone_safety.warning_html(findings))
+        add_btn = box.addButton("Add them to git",
+                                QMessageBox.ButtonRole.AcceptRole)
+        push_btn = box.addButton("Push anyway",
+                                 QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(add_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is push_btn:
+            return True
+        if clicked is not add_btn:
+            return False
+
+        result = clone_safety.repair(root, findings)
+        QMessageBox.information(self, "Clone safety",
+                                clone_safety.repair_summary(result))
+        # Keep an already-open Git Panel honest about what is now staged.
+        panel = getattr(self, "_git_panel_instance", None)
+        if panel is not None:
+            try:
+                panel.refresh()
+            except Exception:
+                logging.exception("Git panel refresh after clone-safety fix")
+        return False
+
     def _git_push(self) -> None:
         """
         Git → Push to Remote
@@ -2993,6 +3044,11 @@ QTabBar::tab:hover:!selected {
                 self, "Push to Remote",
                 "No remote is configured.\n\nUse Git → Configure Remote… to set one first."
             )
+            return
+
+        # Clone-safety pre-flight. A push is the last moment the project is
+        # still whole on one machine: after it, somebody clones and finds out.
+        if not self._clone_safety_gate(project_dir):
             return
 
         _, current_branch = self._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=10)

@@ -70,6 +70,11 @@ class SongTableData:
     """Complete parsed song table + constants + config."""
     entries: list[SongEntry] = field(default_factory=list)
 
+    #: ``(label, token)`` for every song-table field holding a name this
+    #: project does not define. Such a row also will not assemble, so this is
+    #: a build breaker to surface, not a curiosity to swallow.
+    unresolved_fields: list[tuple[str, str]] = field(default_factory=list)
+
     # Lookup helpers
     _by_index: dict[int, SongEntry] = field(default_factory=dict, repr=False)
     _by_label: dict[str, SongEntry] = field(default_factory=dict, repr=False)
@@ -106,7 +111,20 @@ class SongTableData:
 # Parsers
 # ---------------------------------------------------------------------------
 
-_RE_SONG_MACRO = re.compile(r'song\s+(\w+)\s*,\s*(\d+)\s*,\s*(\d+)')
+# The middle and last fields accept a NAME as well as a number. Vanilla
+# FireRed writes bare numbers, but PoryDAW registers songs with pokeemerald's
+# symbolic constants (`MUSIC_PLAYER_BGM`, `MUSIC_PLAYER_SE1` — both strings are
+# in porydaw.exe), and FireRed defines neither.
+#
+# This pattern used to be `(\d+)`, digits only. A row it could not match was
+# skipped in SILENCE, and since an entry's index comes from its position in
+# this list, dropping one row shifted every song after it by one. Measured on
+# a real project: one PoryDAW-added song at index 332 made PorySuite label
+# `mus_sevii_route` as MUS_CASTLE_TOWN, and 52 songs after it were wrong too.
+# Clicking "Castle Town" played sevii route, which is exactly how it was
+# reported.
+_RE_SONG_MACRO = re.compile(
+    r'song\s+([A-Za-z_]\w*)\s*,\s*([A-Za-z0-9_]+)\s*,\s*([A-Za-z0-9_]+)')
 _RE_DEFINE = re.compile(
     r'#define\s+((?:MUS|SE)_\w+)\s+(\d+)\s'
 )
@@ -115,14 +133,67 @@ _RE_CFG_LINE = re.compile(
 )
 
 
-def _parse_song_table(filepath: str) -> list[tuple[str, int, int]]:
-    """Parse song_table.inc -> [(label, music_player, unknown), ...]"""
+_RE_MUSIC_PLAYER_ROW = re.compile(r'music_player\s+gMPlayInfo_(\w+)\s*,')
+
+
+def parse_music_players(project_root: str) -> dict[str, int]:
+    """``{'MUSIC_PLAYER_BGM': 0, 'MUSIC_PLAYER_SE1': 1, ...}``.
+
+    Read from the project's own ``sound/music_player_table.inc``, where the
+    row ORDER is the index the song table's middle field refers to. Not a
+    table written down in here: a project is free to add players or reorder
+    them, and a name resolved against a guess would point a song at the wrong
+    one — which plays it on the wrong channel rather than failing loudly.
+    """
+    path = os.path.join(project_root, 'sound', 'music_player_table.inc')
+    out: dict[str, int] = {}
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                m = _RE_MUSIC_PLAYER_ROW.search(line)
+                if m:
+                    out['MUSIC_PLAYER_' + m.group(1).upper()] = len(out)
+    except OSError:
+        pass
+    return out
+
+
+def _resolve_field(token: str, players: dict[str, int]) -> tuple[int, bool]:
+    """A song-table field as a number. Returns (value, understood)."""
+    if token.isdigit():
+        return int(token), True
+    hit = players.get(token.upper())
+    if hit is not None:
+        return hit, True
+    return 0, False
+
+
+def _parse_song_table(filepath: str,
+                      players: dict[str, int] | None = None,
+                      unresolved: list | None = None
+                      ) -> list[tuple[str, int, int]]:
+    """Parse song_table.inc -> [(label, music_player, unknown), ...]
+
+    A row whose fields cannot be resolved is KEPT, with 0 in the unresolved
+    field, and recorded in *unresolved*. Keeping it is the important part:
+    every entry's index is its position in this list, so dropping one row
+    renumbers every song after it.
+    """
+    players = players or {}
     entries = []
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
             m = _RE_SONG_MACRO.search(line)
-            if m:
-                entries.append((m.group(1), int(m.group(2)), int(m.group(3))))
+            if not m:
+                continue
+            label = m.group(1)
+            player, ok_p = _resolve_field(m.group(2), players)
+            unk, ok_u = _resolve_field(m.group(3), players)
+            if unresolved is not None:
+                for token, ok in ((m.group(2), ok_p), (m.group(3), ok_u)):
+                    if not ok:
+                        unresolved.append((label, token))
+            entries.append((label, player, unk))
     return entries
 
 
@@ -197,12 +268,26 @@ def load_song_table(project_root: str) -> SongTableData:
     cfg_path = os.path.join(project_root, 'sound', 'songs', 'midi', 'midi.cfg')
 
     # Parse all three sources
-    raw_entries = _parse_song_table(table_path)
+    players = parse_music_players(project_root)
+    unresolved: list[tuple[str, str]] = []
+    raw_entries = _parse_song_table(table_path, players, unresolved)
     constants_map = _parse_songs_h(songs_h_path)
     midi_config = _parse_midi_cfg(cfg_path)
 
     # Build unified entries
     data = SongTableData()
+    data.unresolved_fields = unresolved
+    if unresolved:
+        # Never let this pass unmentioned. A name this project does not define
+        # also will not ASSEMBLE — `.2byte MUSIC_PLAYER_BGM` has no value to
+        # emit — so the user's build is broken too, and until now nothing said
+        # so anywhere.
+        import logging
+        logging.getLogger("SoundEditor.SongTable").warning(
+            "%d song table field(s) use a name this project does not define: "
+            "%s. Those rows will not assemble.",
+            len(unresolved),
+            ", ".join(f"{lbl} -> {tok}" for lbl, tok in unresolved[:6]))
     for idx, (label, player, unk) in enumerate(raw_entries):
         constant = constants_map.get(idx, label.upper())
 

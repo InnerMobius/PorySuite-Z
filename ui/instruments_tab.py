@@ -449,8 +449,12 @@ class InstrumentsTab(QWidget):
     """Browse and preview all instruments across all voicegroups."""
 
     modified = pyqtSignal()  # emitted when any instrument property is edited
-    _preview_done = pyqtSignal()
-    _preview_failed = pyqtSignal(str)
+    # Both carry the token of the render they belong to. A preview is rendered
+    # on a background thread and can land long after the user has let go of
+    # the key or moved to another note, so the result has to be able to say
+    # which request it is answering — see `_preview_token`.
+    _preview_done = pyqtSignal(int)
+    _preview_failed = pyqtSignal(int, str)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -463,6 +467,26 @@ class InstrumentsTab(QWidget):
         self._current_vg_name = ""
         self._editing = False  # guard against feedback loops
         self._dirty_inst_keys: set[str] = set()
+
+        # ── Preview request tracking ────────────────────────────────────
+        # A sustained preview renders TEN SECONDS of audio on a background
+        # thread, and playback only begins when that thread finishes. So a
+        # key press and the sound it makes are separated by a gap the user
+        # can easily act inside — by letting go, or by pressing another key.
+        #
+        # `_preview_token` is the id of the most recent request. Every new
+        # render takes the next one, and a key RELEASE also takes one, which
+        # is how letting go cancels a render that has not landed yet. When a
+        # result arrives carrying a token that is no longer the current one,
+        # it is discarded instead of played.
+        #
+        # Before this existed, releasing the key during the render ran
+        # `if self._audio_player:` against a player that had not been created
+        # yet, so the release did nothing at all and the note started AFTER
+        # the key came up, with nothing left to stop it.
+        self._preview_token = 0
+        self._preview_lock = threading.Lock()
+        self._preview_results: dict[int, object] = {}
 
         self._build_ui()
 
@@ -952,8 +976,26 @@ class InstrumentsTab(QWidget):
     # Data loading
     # ═══════════════════════════════════════════════════════════════════════
 
+    def hideEvent(self, event):
+        """Stop a preview when the tab goes away.
+
+        A sustained preview is ten seconds long, so leaving the tab used to
+        take the note with you. Cancelling the token as well as stopping the
+        player means a render still in flight does not start playing into a
+        tab nobody is looking at.
+        """
+        with self._preview_lock:
+            self._preview_token += 1
+        self._stop_preview_player()
+        super().hideEvent(event)
+
     def load_data(self, project_root: str, voicegroup_data):
         """Load voicegroup data and populate the instrument list."""
+        # Whatever is playing was rendered from the data being replaced.
+        with self._preview_lock:
+            self._preview_token += 1
+            self._preview_results.clear()
+        self._stop_preview_player()
         self._project_root = project_root
         self._voicegroup_data = voicegroup_data
         self._unique_instruments: dict = {}  # key -> (inst, vg_names)
@@ -1671,6 +1713,13 @@ class InstrumentsTab(QWidget):
         try:
             self._write_loop_to_bin(sample, True, loop_bytes)
             self._update_loop_ui(sample, True, loop_bytes)
+            # Logged on SUCCESS, not only on failure. This path and the
+            # waveform drag wrote the loop and said nothing, so a session
+            # spent editing loops left no trace at all — which is exactly the
+            # state the log was in after the crash that prompted this.
+            _log.info("Loop start set to %d bytes (%.4fs) for %s",
+                      loop_bytes, loop_bytes / rate,
+                      getattr(sample, "label", "?"))
         except Exception as e:
             _log.error("Failed to update loop start: %s", e)
             QMessageBox.warning(self, "Loop Error",
@@ -1704,6 +1753,9 @@ class InstrumentsTab(QWidget):
                 pct = loop_bytes * 100 / size
                 self._loop_detail_label.setText(
                     f"(byte {loop_bytes:,} — {pct:.0f}%)")
+            _log.info("Loop start dragged to %d bytes (%.4fs) for %s",
+                      loop_bytes, loop_bytes / rate,
+                      getattr(sample, "label", "?"))
         except Exception as e:
             _log.error("Failed to update loop start: %s", e)
             return
@@ -1716,17 +1768,58 @@ class InstrumentsTab(QWidget):
     # Preview playback
     # ═══════════════════════════════════════════════════════════════════════
 
+    def _set_preview_player(self, player):
+        """Install *player*, stopping and dropping whatever it replaces.
+
+        **The only place a player is ever installed** — `__init__` sets the
+        attribute to None once, and nothing else writes it. That is the point:
+        the crash came from an assignment that skipped the stop, leaving a
+        player to become garbage with its PortAudio stream still running, and
+        the stream's teardown then fell to the garbage collector. Closing a
+        live stream from a finaliser faults natively — the process dies with no
+        Python traceback.
+
+        Spreading "remember to stop the old one" across every call site is how
+        that happened once already. Here it cannot be forgotten, because there
+        is nowhere else to put a player.
+        """
+        old = self._audio_player
+        self._audio_player = player
+        if old is None or old is player:
+            return
+        try:
+            old.stop()
+        except Exception:
+            _log.exception("Failed to stop the previous preview player")
+
+    def _stop_preview_player(self):
+        """Stop the current preview player and leave none in its place."""
+        self._set_preview_player(None)
+
     def _on_piano_key(self, midi_note: int):
         """User pressed a piano key — start sustained preview."""
         self._preview_note_label.setText(
             f"{_midi_to_name(midi_note)} ({midi_note})")
+        _log.debug("Piano key DOWN: %s (%d)", _midi_to_name(midi_note),
+                   midi_note)
         self._play_instrument_note(midi_note, sustain=True)
 
     def _on_piano_key_released(self, midi_note: int):
-        """User released a piano key — stop playback."""
-        if self._audio_player:
-            self._audio_player.stop()
-            self._audio_player = None
+        """User released a piano key — stop playback, and cancel any render.
+
+        Taking the next token is the important half. The sustained render runs
+        for long enough that a release routinely arrives before there is any
+        player to stop, and that used to be the end of it: the note started
+        after the key came up and played its full ten seconds with nothing
+        left to stop it. Bumping the token means the render that is still in
+        flight is recognised as unwanted when it lands.
+        """
+        with self._preview_lock:
+            self._preview_token += 1
+            cancelled = self._preview_token
+        _log.debug("Piano key UP: %s (%d) — cancelling preview up to token %d",
+                   _midi_to_name(midi_note), midi_note, cancelled)
+        self._stop_preview_player()
 
     def _on_play_preview(self):
         """Play button clicked — short preview at middle C (60)."""
@@ -1782,9 +1875,13 @@ class InstrumentsTab(QWidget):
             return
 
         # Stop any existing preview
-        if self._audio_player:
-            self._audio_player.stop()
-            self._audio_player = None
+        self._stop_preview_player()
+
+        # Claim this request. Anything already in flight is now superseded and
+        # will be discarded when it lands.
+        with self._preview_lock:
+            self._preview_token += 1
+            token = self._preview_token
 
         self._preview_status.setText("Rendering...")
         self._btn_play.setEnabled(False)
@@ -1796,42 +1893,77 @@ class InstrumentsTab(QWidget):
         sample_data = self._sample_data
         vg_data = self._voicegroup_data
 
+        _log.debug("Preview %d: rendering %s note %d, %dms",
+                   token, getattr(inst, 'sample_label', '?'), midi_note,
+                   duration_ms)
+
         def _do_preview():
+            # Results are filed under the request's own token. They used to go
+            # into one shared attribute, so two overlapping renders raced and
+            # the last to finish decided what got played — which could be the
+            # note the user had already moved off.
             try:
                 from core.sound.track_renderer import render_instrument_preview
                 audio = render_instrument_preview(
                     inst, midi_note, sample_data, vg_data,
                     duration_ms=duration_ms, velocity=100)
-                self._preview_audio = audio
-                self._preview_done.emit()
+                with self._preview_lock:
+                    self._preview_results[token] = audio
+                self._preview_done.emit(token)
             except Exception as e:
-                self._preview_failed.emit(str(e))
+                self._preview_failed.emit(token, str(e))
 
         t = threading.Thread(target=_do_preview, daemon=True)
         t.start()
 
-    def _on_preview_ready(self):
-        """Preview render finished — play it."""
+    def _on_preview_ready(self, token: int):
+        """A preview render finished. Play it only if it is still wanted."""
+        with self._preview_lock:
+            audio = self._preview_results.pop(token, None)
+            # Drop anything older too — nothing will ever ask for it, and a
+            # rendered buffer is several megabytes.
+            for stale in [t for t in self._preview_results if t <= token]:
+                self._preview_results.pop(stale, None)
+            current = self._preview_token
+
         self._preview_status.setText("")
         self._btn_play.setEnabled(True)
 
-        audio = getattr(self, '_preview_audio', None)
+        if token != current:
+            # The key came up, or another note was pressed, while this was
+            # rendering. Playing it now is the stuck-note bug.
+            _log.debug("Preview %d discarded — current request is %d",
+                       token, current)
+            return
         if audio is None:
+            _log.debug("Preview %d arrived with no audio", token)
             return
 
         try:
             from core.sound.audio_engine import AudioPlayer, OUTPUT_SAMPLE_RATE
-            self._audio_player = AudioPlayer()
-            self._audio_player.volume = 0.8
+            player = AudioPlayer()
+            player.volume = 0.8
             from PyQt6.QtCore import QSettings
             _mono = QSettings("PorySuite", "PorySuiteZ").value(
                 "sound/output_mode", "Stereo") == "Mono"
-            self._audio_player.play(audio, OUTPUT_SAMPLE_RATE, mono=_mono)
+            player.play(audio, OUTPUT_SAMPLE_RATE, mono=_mono)
+            # Through the setter, so anything still playing is stopped rather
+            # than orphaned. This used to be a bare assignment.
+            self._set_preview_player(player)
+            _log.debug("Preview %d playing (mono=%s)", token, _mono)
         except Exception as e:
+            _log.error("Preview %d playback failed: %s", token, e,
+                       exc_info=True)
             self._preview_status.setText(f"Playback failed: {e}")
 
-    def _on_preview_error(self, msg: str):
-        """Preview render failed."""
+    def _on_preview_error(self, token: int, msg: str):
+        """A preview render failed."""
+        with self._preview_lock:
+            self._preview_results.pop(token, None)
+            current = self._preview_token
+        _log.error("Preview %d failed: %s", token, msg)
+        if token != current:
+            return
         self._preview_status.setText(f"Preview failed: {msg}")
         self._btn_play.setEnabled(True)
 

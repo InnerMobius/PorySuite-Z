@@ -1220,7 +1220,7 @@ class AudioPlayer:
         self._stream.start()
 
     def stop(self):
-        """Stop playback."""
+        """Stop playback. Safe to call twice, and safe if nothing is playing."""
         with self._lock:
             self._playing = False
         if self._stream is not None:
@@ -1230,6 +1230,31 @@ class AudioPlayer:
             except Exception:
                 pass
             self._stream = None
+
+    def __del__(self):
+        """Last-resort teardown for a player somebody dropped while it played.
+
+        A caller is supposed to call :meth:`stop`. One did not: the instrument
+        preview replaced ``self._audio_player`` with a new player without
+        stopping the old one, so a live player became garbage with its stream
+        still running. Without this, closing that stream was left to
+        sounddevice's own finaliser — which runs whenever the collector
+        happens to run, on whatever thread it happens to be on. Tearing down a
+        live PortAudio stream that way faults natively: the process dies with
+        no Python traceback, which is exactly what it did.
+
+        The caller-side defect is fixed. This stays as the net, because the
+        failure mode it catches is an instant process death with nothing
+        written to any log, and the cost of the net is a few lines.
+
+        Deliberately silent and total: a finaliser can run during interpreter
+        shutdown, where the names it needs may already be torn down, and an
+        exception raised in here is unraisable noise rather than a diagnosis.
+        """
+        try:
+            self.stop()
+        except Exception:
+            pass
 
     def pause(self):
         """Pause playback (can be resumed)."""

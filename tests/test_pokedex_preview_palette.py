@@ -36,15 +36,31 @@ APP = QApplication.instance() or QApplication(sys.argv)
 
 import ui.pokedex_detail_panel as pdp  # noqa: E402
 
-CLONE = r"C:\GBA\porysuite-investigation-2026-10-30\work\firered-disposable"
+# Sprites come from the read-only vanilla reference, the same source the
+# engine-patch tests use.
+#
+# This used to point at a throwaway investigation folder
+# (`C:\GBA\porysuite-investigation-2026-10-30\work\firered-disposable`). When
+# that folder was deleted these three tests did not fail — they SKIPPED, so
+# the suite stayed green while three guards quietly stopped running. A guard
+# tied to a scratch directory is a guard with an expiry date on it.
+#
+# It still skips when the reference is absent, because a machine without it
+# genuinely cannot run this. The difference is that the reference is a
+# permanent fixture of this setup rather than one session's leftovers.
+_SPRITE_ROOTS = (
+    r"C:\GBA\READONLYREFERENCE\pokefirered",
+)
 
 
 def _a_sprite():
-    hits = sorted(glob.glob(os.path.join(
-        CLONE, "graphics", "pokemon", "*", "front.png")))
-    if not hits:
-        pytest.skip("no disposable project sprites available")
-    return hits[0]
+    """One sprite PNG, and the project root it belongs to."""
+    for root in _SPRITE_ROOTS:
+        hits = sorted(glob.glob(os.path.join(
+            root, "graphics", "pokemon", "*", "front.png")))
+        if hits:
+            return hits[0], root
+    pytest.skip("no vanilla reference sprites available on this machine")
 
 
 def _fingerprint(pm):
@@ -65,10 +81,10 @@ def test_the_preview_api_accepts_a_palette():
 
 
 def test_rendering_follows_the_palette():
-    png = _a_sprite()
+    png, root = _a_sprite()
     from core.sprite_palette_bus import get_bus
     const = "SPECIES_" + os.path.basename(os.path.dirname(png)).upper()
-    pal = get_bus().ensure_pokemon_palette(CLONE, const, "normal")
+    pal = get_bus().ensure_pokemon_palette(root, const, "normal")
     if not pal:
         pytest.skip("no palette resolved for the sample sprite")
     before = _fingerprint(pdp._render_sprite(png, pal))
@@ -80,7 +96,7 @@ def test_rendering_follows_the_palette():
 
 def test_the_old_flat_loader_is_palette_blind():
     """The premise. If this ever changes, the defect has moved."""
-    png = _a_sprite()
+    png, _root = _a_sprite()
     a = _fingerprint(pdp._load_gba_sprite(png))
     b = _fingerprint(pdp._load_gba_sprite(png))
     assert a == b
@@ -88,7 +104,8 @@ def test_the_old_flat_loader_is_palette_blind():
 
 def test_a_sprite_still_appears_without_a_palette():
     """Degrade, never vanish."""
-    assert pdp._render_sprite(_a_sprite(), None) is not None
+    png, _root = _a_sprite()
+    assert pdp._render_sprite(png, None) is not None
 
 
 def test_no_path_renders_nothing():

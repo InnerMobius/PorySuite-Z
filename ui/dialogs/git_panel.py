@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPlainTextEdit,
     QPushButton, QListWidget, QListWidgetItem,
     QRadioButton, QButtonGroup, QSizePolicy,
-    QFrame, QSplitter, QMessageBox,
+    QFrame, QSplitter, QMessageBox, QComboBox,
 )
 
 if TYPE_CHECKING:
@@ -337,6 +337,31 @@ class GitPanel(QDialog):
         row_or.addWidget(self._pull_origin_lbl)
         lay.addLayout(row_or)
 
+        # Which origin branch to pull — the counterpart of Push's target-branch
+        # picker. Defaults to the current branch's own; pick another (e.g. master
+        # while on a feature branch) and its contents become your current branch.
+        row_br = QHBoxLayout()
+        row_br.addSpacing(24)
+        row_br.addWidget(QLabel("Pull from origin branch:"))
+        self._pull_branch_combo = QComboBox()
+        self._pull_branch_combo.setMinimumWidth(220)
+        self._pull_branch_combo.setToolTip(
+            "The branch on origin to pull.  Your current branch is replaced with it\n"
+            "(after your uncommitted work is saved to a stash).  Commits only on your\n"
+            "branch are warned about before anything happens."
+        )
+        from ui.custom_widgets.scroll_guard import install_scroll_guard
+        install_scroll_guard(self._pull_branch_combo)   # the wheel never changes the pick
+        row_br.addWidget(self._pull_branch_combo)
+        self._pull_into_lbl = QLabel("")
+        self._pull_into_lbl.setStyleSheet("font-size: 11px; color: #aaa;")
+        row_br.addWidget(self._pull_into_lbl)
+        row_br.addStretch()
+        lay.addLayout(row_br)
+        # Only meaningful for an origin pull (upstream is a fixed URL, not a branch list).
+        self._pull_branch_combo.setEnabled(False)
+        self._pull_radio_origin.toggled.connect(self._pull_branch_combo.setEnabled)
+
         pull_btn = QPushButton("⬇  Pull Now")
         pull_btn.setFixedWidth(130)
         pull_btn.setToolTip(
@@ -363,10 +388,44 @@ class GitPanel(QDialog):
         _, origin_url = self._mw._git_run("remote", "get-url", "origin", timeout=5)
         host_or = (origin_url or "").strip().replace("https://github.com/", "").replace(".git", "")
         self._pull_origin_lbl.setText(host_or or "(not set)")
+        self._refresh_pull_branches()
+
+    def _refresh_pull_branches(self):
+        """Fill the origin-branch picker from the remote-tracking branches (as
+        of the last fetch). Keeps the user's pick across the 60 s auto-refresh;
+        otherwise defaults to the current branch's own upstream."""
+        _, cur = self._mw._git_run("rev-parse", "--abbrev-ref", "HEAD", timeout=5)
+        cur = (cur or "").strip()
+        ok, out = self._mw._git_run(
+            "branch", "-r", "--format=%(refname:short)", timeout=5)
+        names = []
+        for ln in (out or "").splitlines() if ok else []:
+            ln = ln.strip()
+            if ln.startswith("origin/") and ln != "origin/HEAD" and ln != "origin":
+                names.append(ln[len("origin/"):])
+        ok_up, up = self._mw._git_run(
+            "rev-parse", "--abbrev-ref", "@{upstream}", timeout=5)
+        up = (up or "").strip()
+        own = up[len("origin/"):] if (ok_up and up.startswith("origin/")) else cur
+
+        combo = self._pull_branch_combo
+        picked = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for n in sorted(names, key=lambda s: (s != own, s.lower())):
+            combo.addItem(f"{n}   (this branch's own)" if n == own else n, n)
+        idx = combo.findData(picked) if picked else -1
+        if idx < 0:
+            idx = combo.findData(own)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        self._pull_into_lbl.setText(f"→ into '{cur}'" if cur else "")
 
     def _do_pull(self):
         use_upstream = self._pull_btn_group.checkedId() == 0
-        self._mw._git_pull(use_upstream=use_upstream)
+        branch = "" if use_upstream else (self._pull_branch_combo.currentData() or "")
+        self._mw._git_pull(use_upstream=use_upstream, branch=branch)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Section 3 — Push

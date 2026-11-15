@@ -699,8 +699,7 @@ class SoundEditorTab(QWidget):
             self._song_name_label.setText(song_label)
             return
 
-        # Parse the song if not cached
-        if song_label not in self._all_songs:
+        if self._needs_parse(song_label):
             self._parse_song(entry)
 
         song = self._all_songs.get(song_label)
@@ -723,6 +722,18 @@ class SoundEditorTab(QWidget):
             self._detail_loop.setText("")
             self._btn_play.setEnabled(False)
             self._btn_piano_roll.setEnabled(False)
+            # Clear the track list. This branch used to leave it exactly as
+            # the last song left it, so a song with no .s was displayed with
+            # ANOTHER song's tracks — seven rows of named instruments and note
+            # counts, all of it somebody else's — directly under the words
+            # "Build required". A populated table reads as fact.
+            #
+            # The header spinboxes are deliberately NOT blanked. They are
+            # greyed out, which reads as "not applicable", and tempo's range
+            # starts at 1, so zeroing it would display "1 BPM" — a different
+            # wrong number rather than no number.
+            self._track_tree.clear()
+            current.setText(2, "")
         elif song:
             from core.sound.song_parser import get_song_tempo, get_loop_info
             bpm = get_song_tempo(song)
@@ -985,6 +996,26 @@ class SoundEditorTab(QWidget):
                                 parent=self, replace_target=entry)
         dlg.song_imported.connect(self._on_s_imported)
         dlg.exec()
+
+    def _needs_parse(self, song_label: str) -> bool:
+        """True when this song's `.s` should be read (again).
+
+        "No .s yet" is NEVER a final answer. A song registered outside
+        PorySuite — PoryDAW writes the table row and the `.mid`, not the `.s`
+        — has no `.s` until the project is built, and the entire point of
+        building is that the file then exists.
+
+        The sentinel used to be cached like any parsed song, so it stuck for
+        the life of the session: the song went on saying "Build required" and
+        stayed unplayable long after a successful build had written its `.s`.
+        Restarting the app was the only way out, and nothing on screen said
+        so.
+
+        Re-reading costs one `os.path.isfile` plus a parse of a file that is
+        usually there, and only for a song the user has actually clicked.
+        """
+        cached = self._all_songs.get(song_label, None)
+        return cached is None or cached == "MISSING_S_FILE"
 
     def _parse_song(self, entry):
         """Parse a song's .s file on demand."""

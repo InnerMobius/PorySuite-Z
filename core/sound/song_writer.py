@@ -1137,30 +1137,93 @@ def save_song_file(song: SongData, path: Optional[str] = None,
             "Could not regenerate .mid for %s: %s — .s saved OK",
             song.label, _exc)
 
-    # Step 3: timestamp lock.  Push .mid and midi.cfg 1 hour into the
-    # past so neither can ever appear newer than .s on the filesystem
-    # during a normal incremental build.
+    # Step 3: timestamp lock.
+    lock_song_timestamps(output_path, mid_path, cfg_path)
+
+    return output_path
+
+
+def lock_song_timestamps(s_path: str, mid_path: str, cfg_path: str) -> None:
+    """Keep ``.mid`` and ``midi.cfg`` from looking newer than the ``.s``.
+
+    The build rule is ``%.s: %.mid midi.cfg``, so either of those appearing
+    newer makes mid2agb regenerate the ``.s``. For a song PorySuite authored
+    directly that is destructive: the ``.mid`` beside it is a 26-byte
+    placeholder, and regenerating from it replaces the composition with an
+    empty header.
+
+    **A real ``.mid`` is exempt.** It holds somebody's music — very likely
+    from a DAW — and pushing its timestamp into the past tells make there is
+    nothing to rebuild, so the edit never reaches the ROM. That is exactly
+    what happened to a PoryDAW session: the arrangement was in the ``.mid``,
+    the build read the ``.s``, and the two had nothing to do with each other.
+
+    Extracted from :func:`save_song_file` so this decision can be exercised
+    directly. It was inline, and a test could not reach it without building a
+    whole song — so the one mutation that mattered, re-locking a real ``.mid``,
+    went uncaught.
+    """
+    import os
+    import time as _time
     now = _time.time()
     far_past = now - 3600
-    try:
-        os.utime(output_path, (now, now))
-    except OSError:
-        pass
+
+    # Decide ONCE, for the whole lock, who owns this song.
+    #
+    # The first version of this fix gated only the `.mid` half: it stopped
+    # pushing a real `.mid` into the past, and went on stamping the `.s` to
+    # NOW regardless. Those two halves are symmetric — either one alone makes
+    # the `.s` the newer file, which is the entire condition make tests. So
+    # the bug came straight back: a song edited in a DAW at 12:13:40 had its
+    # `.s` stamped 12:14:32 by a save PorySuite did on its own, the content
+    # byte-identical to what was already committed, and the build skipped the
+    # conversion again.
+    #
+    # Fixing half of a two-sided constraint fixes nothing.
+    lockable = True
     if os.path.isfile(mid_path):
+        try:
+            from core.sound.midi_ownership import may_lock_timestamp
+            lockable = may_lock_timestamp(mid_path)
+        except Exception:
+            lockable = True        # fail closed: the old behaviour
+
+    if lockable:
+        try:
+            os.utime(s_path, (now, now))
+        except OSError:
+            pass
+    else:
+        import logging as _logging
+        _logging.getLogger("SoundEditor.SongWriter").info(
+            "Left the timestamps of %s alone — its .mid holds real music, so "
+            "the build must stay free to regenerate from it",
+            os.path.basename(s_path))
+
+    if os.path.isfile(mid_path) and lockable:
         try:
             os.utime(mid_path, (far_past, far_past))
         except OSError:
             pass
+        try:
+            from core.sound.midi_ownership import record_own_write
+            # <root>/sound/songs/midi/<label>.mid -> <root>
+            root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(mid_path))))
+            record_own_write(root, os.path.basename(mid_path)[:-4])
+        except Exception:
+            pass
+
+    # midi.cfg is shared by every song, so it is backdated whoever owns this
+    # one — leaving it newer regenerates the whole soundtrack.
     if os.path.isfile(cfg_path):
         try:
             cfg_mtime = os.stat(cfg_path).st_mtime
             if cfg_mtime >= now:
-                # Only push it back if it's currently at/after our .s.
-                # If it's already in the past, leave it alone — other
-                # songs sharing midi.cfg shouldn't have their make
-                # dependency goalposts moved unnecessarily.
+                # Only push it back if it's currently at/after our .s. If it
+                # is already in the past, leave it — other songs sharing
+                # midi.cfg shouldn't have their make dependency goalposts
+                # moved unnecessarily.
                 os.utime(cfg_path, (far_past, far_past))
         except OSError:
             pass
-
-    return output_path

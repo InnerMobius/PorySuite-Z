@@ -2116,8 +2116,24 @@ class UnifiedMainWindow(QMainWindow):
             # recompiled. To intentionally REPLACE a song, re-import its .mid
             # through the Sound Editor (which regenerates the .s and makes it
             # newest); dropping a raw .mid in by hand no longer regenerates.
+            # A song whose .mid has CHANGED since PorySuite last saw it was
+            # edited by something else — PoryDAW is the music editor most
+            # projects use — and that edit is the whole reason the build is
+            # running. Protecting such a .s is not protection, it is
+            # discarding the user's work: this step touches a .s only when it
+            # is older than its .mid, which is exactly and only the songs
+            # with a pending edit. The guard was aimed at precisely the files
+            # it must not touch.
+            try:
+                from core.sound.midi_ownership import (is_external_edit,
+                                                       seed_ledger)
+            except Exception:
+                is_external_edit = None
+                seed_ledger = None
+
             try:
                 touched = 0
+                skipped: list = []
                 cfg_path = os.path.join(midi_dir, 'midi.cfg')
                 cfg_m = os.path.getmtime(cfg_path) if os.path.isfile(cfg_path) else 0.0
                 for fn in os.listdir(midi_dir):
@@ -2125,14 +2141,21 @@ class UnifiedMainWindow(QMainWindow):
                         continue
                     s_path = os.path.join(midi_dir, fn)
                     mid_path = s_path[:-2] + '.mid'
+                    label = fn[:-2]
                     try:
                         s_m = os.path.getmtime(s_path)
                         dep_m = cfg_m
                         if os.path.isfile(mid_path):
                             dep_m = max(dep_m, os.path.getmtime(mid_path))
-                        if s_m <= dep_m:
-                            os.utime(s_path)
-                            touched += 1
+                        if s_m > dep_m:
+                            continue        # already newest; nothing to do
+                        if is_external_edit is not None and is_external_edit(
+                                project_dir, label, when_unknown=False):
+                            # Someone else wrote this .mid. Let make use it.
+                            skipped.append(label)
+                            continue
+                        os.utime(s_path)
+                        touched += 1
                     except OSError:
                         pass
 
@@ -2141,6 +2164,22 @@ class UnifiedMainWindow(QMainWindow):
                         f"Pre-build: protected {touched} committed song .s "
                         f"file(s) from a lossy mid2agb rebuild"
                     )
+                if skipped:
+                    shown = ", ".join(skipped[:6])
+                    if len(skipped) > 6:
+                        shown += f", … (+{len(skipped) - 6} more)"
+                    self.log_message(
+                        f"Pre-build: left {len(skipped)} song(s) alone whose "
+                        f".mid was edited outside PorySuite, so the build "
+                        f"picks the edit up ({shown})")
+
+                # Record every .mid as it stands, so the NEXT outside edit is
+                # recognisable. Done after the decision, never before it.
+                if seed_ledger is not None:
+                    try:
+                        seed_ledger(project_dir)
+                    except Exception:
+                        pass
             except Exception as e:
                 self.log_message(f"Pre-build .s protection warning: {e}")
 
@@ -3718,6 +3757,17 @@ class UnifiedMainWindow(QMainWindow):
         except Exception as exc:
             return False, str(exc)
 
+    def _git_status_entries(self) -> list:
+        """[(xy, path), ...] with every path verbatim — see core/git_status.py.
+
+        The Git panel's Commit list calls this on the window that opened it.
+        It used to exist only on the legacy MainWindow, so here it raised
+        AttributeError and aborted the panel's refresh half way: Branches,
+        Stash, History and Remotes never filled in. tests/
+        test_git_panel_contract.py now checks every call the panel makes."""
+        from core.git_status import status_entries
+        return status_entries(self._git_exe(), (self.project_info or {}).get("dir", ""))
+
     def _open_git_panel(self, page: str = ""):
         """Open the Git panel dialog."""
         from git_panel import GitPanel
@@ -3747,8 +3797,9 @@ class UnifiedMainWindow(QMainWindow):
         if pm:
             pm.setEnabled(enabled)
 
-    def _git_pull(self, use_upstream: bool = False):
-        """Delegate to the appropriate child window's git pull."""
+    def _git_pull(self, use_upstream: bool = False, branch: str = ""):
+        """Delegate to the appropriate child window's git pull.
+        *branch*: the origin branch to pull from ('' = the current branch's own)."""
         # Use PorySuite's implementation if available (it has the full git UI)
         target = self._porysuite_window or self._eventide_window
         if target:
@@ -3775,7 +3826,7 @@ class UnifiedMainWindow(QMainWindow):
                         self._credits_editor.load_project(project_dir)
                     except Exception:
                         pass
-            target._git_pull(use_upstream=use_upstream,
+            target._git_pull(use_upstream=use_upstream, branch=branch,
                              on_refresh_done=_after_refresh)
 
     def _git_push(self):
@@ -3803,10 +3854,15 @@ class UnifiedMainWindow(QMainWindow):
         if target:
             target._git_new_branch()
 
-    def _git_checkout_branch(self, branch: str):
-        target = self._porysuite_window or self._eventide_window
-        if target:
-            target._git_checkout_branch(branch)
+    def _git_checkout_branch(self, branch: str, remote_only: bool = False):
+        # The Git panel's Switch button passes remote_only (the branch exists only on
+        # origin -> create it locally, tracking origin/<branch>). PorySuite's checkout
+        # takes it; EVENTide's does not, so it goes only to PorySuite. Without it here
+        # every Switch click raised TypeError and nothing switched (BUGS.md 2026-11-14).
+        if self._porysuite_window:
+            self._porysuite_window._git_checkout_branch(branch, remote_only=remote_only)
+        elif self._eventide_window:
+            self._eventide_window._git_checkout_branch(branch)
 
     def _git_view_log(self):
         target = self._porysuite_window or self._eventide_window
