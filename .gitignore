@@ -65,6 +65,10 @@ docs/*_FACTS.md
 docs/*_REPORT.md
 docs/*_LOG.md
 docs/*_AUDIT.md
+# Internal assessments of PorySuite against other tools. They quote source-read
+# behaviour of third-party programs that was never actually run here, which would
+# read as a public critique of somebody else's project.
+docs/*_ASSESSMENT.md
 docs/HANDOFF.md
 docs/*_HANDOFF.md
 docs/AGENTS.md
