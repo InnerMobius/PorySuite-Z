@@ -69,45 +69,6 @@ def _add_separator(toolbar: QToolBar):
     toolbar.addWidget(sep)
 
 
-def _ensure_song_s_tracked(project_dir: str) -> bool:
-    """Make sure song .s files are NOT gitignored.
-
-    In a PorySuite project the ``sound/songs/midi/*.s`` files are the source of
-    truth (hand-edited in the Sound Editor / Piano Roll; the .mid is often just a
-    placeholder or a lossy re-export). A stock pokefirered .gitignore ignores
-    them as build artifacts — but that meant a pull on another machine had no .s
-    and rebuilt a broken/short-note song from the .mid. This comments out that
-    one ignore rule so the .s can be committed. Idempotent; returns True only if
-    the .gitignore was actually changed.
-    """
-    gi = os.path.join(project_dir, ".gitignore")
-    if not os.path.isfile(gi):
-        return False
-    try:
-        with open(gi, "r", encoding="utf-8", errors="surrogateescape") as f:
-            lines = f.readlines()
-    except OSError:
-        return False
-    changed = False
-    out = []
-    for ln in lines:
-        if ln.strip() == "sound/songs/midi/*.s":
-            out.append("# song .s files are the source of truth in PorySuite — "
-                       "tracked, not ignored (un-ignored automatically):\n")
-            out.append("# " + ln if not ln.lstrip().startswith("#") else ln)
-            changed = True
-        else:
-            out.append(ln)
-    if changed:
-        try:
-            with open(gi, "w", encoding="utf-8", errors="surrogateescape",
-                      newline="\n") as f:
-                f.writelines(out)
-        except OSError:
-            return False
-    return changed
-
-
 class UnifiedMainWindow(QMainWindow):
     """Single window containing all PorySuite + EVENTide editors."""
 
@@ -657,6 +618,14 @@ class UnifiedMainWindow(QMainWindow):
             "are no longer used but still compiled into every ROM build.")
         cleanup_sound_action.triggered.connect(self._on_cleanup_sound)
         tools_menu.addAction(cleanup_sound_action)
+
+        song_guard_action = QAction("Song Build Protection...", self)
+        song_guard_action.setToolTip(
+            "Optional. Makes builds check each song before replacing or deleting it —\n"
+            "also when you build from a command prompt (make, make clean) with\n"
+            "PorySuite closed. Explains what it changes and asks before installing.")
+        song_guard_action.triggered.connect(self._on_song_guard)
+        tools_menu.addAction(song_guard_action)
 
         vars_flags_action = QAction("Variables && Flags...", self)
         vars_flags_action.setToolTip(
@@ -1956,21 +1925,19 @@ class UnifiedMainWindow(QMainWindow):
     def _on_make(self, extra_args: list):
         """Delegate make to PorySuite's existing _run_make method.
 
-        Two pre-build protections run before delegating:
+        Song protections run before delegating:
 
           1. **Song integrity sweep** — render a content-matching .mid for
              any song where the .s has tracks but the .mid is a placeholder
-             (< 30 bytes).  This is the safety net for hand-edited .s files
-             that were never saved via the Piano Roll: without it, the Make
-             rule `%.s: %.mid midi.cfg` would run mid2agb on the placeholder
-             and wipe the .s back to 0 tracks.
+             (< 30 bytes), so the build never converts an empty stand-in.
 
-          2. **Touch all .s files** to bump their mtimes ahead of .mid and
-             midi.cfg.  This is the primary guard against mid2agb re-running
-             during a normal incremental build.
+          2. **Song sync check** (``_prepare_song_sync``, core/sound/song_sync.py)
+             — decides by what each song's files PLAY which one holds its
+             newest music, sets the file times make reads to match, and stops
+             the build for songs with unique work on both sides. After make,
+             ``_verify_song_sync`` checks the result.
 
-        Step 1 must happen FIRST so that any newly-regenerated .mid gets
-        backdated by the sweep itself before step 2 touches the .s files.
+        Step 1 runs first so the check sees the rendered .mid files.
         """
         if not self._porysuite_window:
             self.log_message("Cannot build — no project loaded.")
@@ -2069,10 +2036,13 @@ class UnifiedMainWindow(QMainWindow):
         # Step 1: integrity sweep — regenerate placeholder .mids from .s
         # content so a stale placeholder can't drive mid2agb to wipe the
         # user's hand-composed work.
+        sync = None
+        swept: list = []
         if project_dir and os.path.isdir(midi_dir):
             try:
                 from core.sound.song_integrity import run_sweep
                 report = run_sweep(project_dir)
+                swept = list(report.regenerated)
                 if report.regenerated:
                     self.log_message(
                         f"Pre-build integrity sweep: regenerated "
@@ -2085,105 +2055,154 @@ class UnifiedMainWindow(QMainWindow):
             except Exception as exc:
                 self.log_message(f"Pre-build integrity sweep failed: {exc}")
 
-            # Step 1b: make sure the song .s files are TRACKABLE (not ignored).
-            # A stock decomp .gitignore ignores `sound/songs/midi/*.s`, but in a
-            # PorySuite project the .s is the source of truth — ignoring it meant
-            # a pull on another machine had no .s and rebuilt a broken/short-note
-            # song from the .mid. Idempotent: only rewrites .gitignore once.
-            if project_dir:
-                try:
-                    if _ensure_song_s_tracked(project_dir):
-                        self.log_message(
-                            "Pre-build: un-ignored song .s files so they can be "
-                            "committed (they are the source of truth). Commit + "
-                            "push them so other machines get the exact songs.")
-                except Exception as exc:
-                    self.log_message(f"Pre-build .s un-ignore check failed: {exc}")
-
-            # Step 2: protect committed song .s files from a lossy rebuild.
-            # The song .s files are the TRACKED SOURCE OF TRUTH in a PorySuite
-            # project — hand-edited in the Sound Editor / Piano Roll and now
-            # committed to git (they used to be .gitignored, which is why a
-            # pull on a second machine had no .s and rebuilt a broken/short-note
-            # song from the .mid). Ensure every existing .s is newer than its
-            # .mid + midi.cfg so Make's `%.s: %.mid midi.cfg` rule can never
-            # regenerate a lossy mid2agb rebuild over a committed/edited .s.
-            # (git checkout resets mtimes, so after a pull the committed .s no
-            # longer looks newest and Make would otherwise clobber it — this is
-            # exactly what turned long notes into short notes across machines.)
-            # Only touch a .s that WOULD be rebuilt (older/equal to a dep), so a
-            # fresh save — already newest — isn't bumped and needlessly
-            # recompiled. To intentionally REPLACE a song, re-import its .mid
-            # through the Sound Editor (which regenerates the .s and makes it
-            # newest); dropping a raw .mid in by hand no longer regenerates.
-            # A song whose .mid has CHANGED since PorySuite last saw it was
-            # edited by something else — PoryDAW is the music editor most
-            # projects use — and that edit is the whole reason the build is
-            # running. Protecting such a .s is not protection, it is
-            # discarding the user's work: this step touches a .s only when it
-            # is older than its .mid, which is exactly and only the songs
-            # with a pending edit. The guard was aimed at precisely the files
-            # it must not touch.
+            # Step 2: decide, by what each song's files PLAY, which one holds its
+            # newest music (core/sound/song_sync.py), then make the build follow
+            # that decision. Never decided from file times, git tracking or a
+            # missing record. Songs with unique work on both sides stop the build
+            # until the user chooses.
+            sync = self._prepare_song_sync(project_dir, swept)
+            if sync is False:
+                return
             try:
-                from core.sound.midi_ownership import (is_external_edit,
-                                                       seed_ledger)
+                from core.sound.midi_ownership import seed_ledger
+                seed_ledger(project_dir)
             except Exception:
-                is_external_edit = None
-                seed_ledger = None
+                pass
 
+        dlg = self._porysuite_window._run_make(extra_args)
+        if dlg is not None and sync:
+            dlg._proc.finished.connect(
+                lambda *_a, d=dlg, r=sync, root=project_dir: self._verify_song_sync(d, root, r))
+
+    def _prepare_song_sync(self, project_dir: str, swept):
+        """The Make button's song check. Returns the ApplyReport to verify
+        after the build, None when nothing needs verifying, or False when the
+        build must not run (the user cancelled, or the check could not run and
+        the user chose not to build unchecked)."""
+        from PyQt6.QtWidgets import QProgressDialog, QApplication
+        from core.sound import song_sync
+        prog = QProgressDialog("Checking songs…", "", 0, 0, self)
+        prog.setWindowTitle("Make")
+        prog.setCancelButton(None)
+        prog.setMinimumDuration(600)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+
+        def tick(done, total):
+            prog.setMaximum(total)
+            prog.setValue(done)
+            QApplication.processEvents()
+
+        try:
+            plan = song_sync.classify_project(project_dir, rendered_from_s=swept, progress=tick)
+        except Exception as exc:
+            prog.close()
+            self.log_message(f"Pre-build song check failed: {exc}")
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Song check failed")
+            box.setText("PorySuite could not check which of each song's files holds its newest "
+                        "music, so it cannot protect songs from being rebuilt or ignored by this "
+                        "build.\n\nNothing has been changed.")
+            box.setDetailedText(str(exc))
+            cancel = box.addButton("Cancel build", QMessageBox.ButtonRole.RejectRole)
+            go = box.addButton("Build without the check", QMessageBox.ButtonRole.AcceptRole)
+            box.setDefaultButton(cancel)
+            box.exec()
+            return None if box.clickedButton() is go else False
+        prog.close()
+        self.log_message(f"Pre-build song check: {plan.summary()}")
+        if plan.protected:
+            self.log_message("  Song build protection is installed: terminal builds, make clean "
+                             "and pulls are guarded by the project's own build too.")
+        else:
+            own = plan.of(song_sync.S_AHEAD, song_sync.S_AUTHORED)
+            if own:
+                self.log_message(
+                    f"  {len(own)} song(s) hold work that only their .s has. This build keeps it, "
+                    f"but a terminal make after a pull, or make clean, would erase it in this "
+                    f"project (Tools → Song Build Protection guards terminal builds too): "
+                    + ", ".join(sorted(s.label for s in own)[:8]) + (" …" if len(own) > 8 else ""))
+        if plan.note:
+            self.log_message(f"  Note: {plan.note}. This build follows make's own rules for the "
+                             f"other songs; build again afterwards to check them.")
+
+        keep = []
+        blocking = plan.blocking
+        if blocking:
+            names = {song_sync.CONFLICT: "changed in both files",
+                     song_sync.UNKNOWN: "cannot tell which file is newer"}
+            lines = [f"• {s.label} ({names[s.state]}): {s.reason}" for s in blocking]
+            for line in lines:
+                self.log_message("  " + line)
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Songs need your decision before building")
+            shown = "\n".join(lines[:8]) + (f"\n… and {len(lines) - 8} more" if len(lines) > 8 else "")
+            box.setText(
+                f"{len(blocking)} song(s) have changes in both their MIDI file (.mid) and their "
+                f"assembled music file (.s), or PorySuite cannot tell which of the two is newer. "
+                f"PorySuite cannot safely decide which changes you want to keep, so it has changed "
+                f"nothing.\n\n{shown}")
+            box.setInformativeText(
+                "Your choices:\n"
+                "• Cancel build (recommended): nothing changes. You can look at the songs first.\n"
+                "• Keep the MIDI version: cancel, then in the Sound Editor select the song and use "
+                "Refresh from MIDI. The .s changes are replaced (a backup is kept).\n"
+                "• Keep the .s version: choose “Keep the .s versions and build”. The MIDI changes "
+                "are not used in this build"
+                + (" or later ones, until the MIDI changes again" if plan.protected else "")
+                + ". The .mid files are not changed, and each .s is backed up first.")
+            box.setDetailedText("\n".join(lines))
+            cancel = box.addButton("Cancel build", QMessageBox.ButtonRole.RejectRole)
+            keep_btn = box.addButton("Keep the .s versions and build", QMessageBox.ButtonRole.AcceptRole)
+            box.setDefaultButton(cancel)
+            box.exec()
+            if box.clickedButton() is not keep_btn:
+                self.log_message("Build cancelled: songs need a decision (listed above). "
+                                 "Nothing was changed.")
+                return False
+            keep = [s.label for s in blocking]
+            self.log_message(f"Keeping the .s of {len(keep)} song(s) for this build, by choice.")
+
+        rep = song_sync.apply_plan(plan, keep=keep)
+        song_sync.expected_rebuilds(plan, rep)
+        if rep.rebuild:
+            self.log_message(f"Pre-build: {len(rep.rebuild)} song(s) will be rebuilt from their "
+                             f"newer .mid: {', '.join(rep.rebuild[:8])}"
+                             + (" …" if len(rep.rebuild) > 8 else ""))
+        if rep.kept:
+            self.log_message(f"Pre-build: kept the .s of {len(rep.kept)} song(s) that hold work "
+                             f"their .mid does not (backed up to {rep.backup_dir}): "
+                             + ", ".join(sorted(rep.kept)[:8]) + (" …" if len(rep.kept) > 8 else ""))
+        for label, err in rep.errors:
+            self.log_message(f"Pre-build song check warning: {label} — {err}")
+        return rep if (rep.kept or rep.expected) else None
+
+    def _verify_song_sync(self, dlg, project_dir: str, rep) -> None:
+        """After make: check the songs the pre-build check protected or sent to
+        the build. A successful ROM build is not proof the music survived."""
+        from core.sound.song_sync import verify_after_build
+        try:
+            problems = verify_after_build(project_dir, rep)
+        except Exception as exc:
+            problems = [f"the after-build song check failed: {exc}"]
+        if problems:
+            msg = "\n".join(["", "=== Song check after the build: PROBLEMS ==="]
+                            + [f"  {p}" for p in problems]) + "\n"
             try:
-                touched = 0
-                skipped: list = []
-                cfg_path = os.path.join(midi_dir, 'midi.cfg')
-                cfg_m = os.path.getmtime(cfg_path) if os.path.isfile(cfg_path) else 0.0
-                for fn in os.listdir(midi_dir):
-                    if not fn.endswith('.s'):
-                        continue
-                    s_path = os.path.join(midi_dir, fn)
-                    mid_path = s_path[:-2] + '.mid'
-                    label = fn[:-2]
-                    try:
-                        s_m = os.path.getmtime(s_path)
-                        dep_m = cfg_m
-                        if os.path.isfile(mid_path):
-                            dep_m = max(dep_m, os.path.getmtime(mid_path))
-                        if s_m > dep_m:
-                            continue        # already newest; nothing to do
-                        if is_external_edit is not None and is_external_edit(
-                                project_dir, label, when_unknown=False):
-                            # Someone else wrote this .mid. Let make use it.
-                            skipped.append(label)
-                            continue
-                        os.utime(s_path)
-                        touched += 1
-                    except OSError:
-                        pass
-
-                if touched:
-                    self.log_message(
-                        f"Pre-build: protected {touched} committed song .s "
-                        f"file(s) from a lossy mid2agb rebuild"
-                    )
-                if skipped:
-                    shown = ", ".join(skipped[:6])
-                    if len(skipped) > 6:
-                        shown += f", … (+{len(skipped) - 6} more)"
-                    self.log_message(
-                        f"Pre-build: left {len(skipped)} song(s) alone whose "
-                        f".mid was edited outside PorySuite, so the build "
-                        f"picks the edit up ({shown})")
-
-                # Record every .mid as it stands, so the NEXT outside edit is
-                # recognisable. Done after the decision, never before it.
-                if seed_ledger is not None:
-                    try:
-                        seed_ledger(project_dir)
-                    except Exception:
-                        pass
-            except Exception as e:
-                self.log_message(f"Pre-build .s protection warning: {e}")
-
-        self._porysuite_window._run_make(extra_args)
+                dlg._append_colored(msg, "#f44747")
+            except RuntimeError:
+                pass
+            for p in problems:
+                self.log_message(f"After-build song check: {p}")
+        else:
+            n = len(rep.kept) + len(rep.expected)
+            try:
+                dlg._append_colored(f"\n=== Song check after the build: all {n} checked song(s) "
+                                    f"are as intended ===\n", "#4ec9b0")
+            except RuntimeError:
+                pass
+            self.log_message(f"After-build song check: all {n} checked song(s) are as intended.")
 
     def _on_export_fulldex(self):
         """Export one big PNG of every species — front, back, icon, types.
@@ -2828,6 +2847,14 @@ class UnifiedMainWindow(QMainWindow):
                 tab._refresh_var_flag_pickers()
             except Exception:
                 pass
+
+    def _on_song_guard(self):
+        """Tools → Song Build Protection: install or remove the opt-in guard."""
+        if not self.project_info:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        from ui.dialogs.song_guard_dialog import open_song_guard_dialog
+        open_song_guard_dialog(self, self.project_info.get("dir", ""))
 
     def _on_cleanup_sound(self):
         """Open the Sound Cleanup dialog to find and delete orphaned audio data."""
@@ -4112,23 +4139,37 @@ class UnifiedMainWindow(QMainWindow):
         sfw.layouts_changed.connect(self._on_shared_layouts_changed)
         sfw.map_groups_changed.connect(self._on_shared_map_groups_changed)
         sfw.sound_s_changed.connect(self._on_sound_s_changed)
+        sfw.midi_cfg_changed.connect(self._on_midi_cfg_changed)
         sfw.file_changed.connect(
             lambda rel: self.log_message(f"External change detected: {rel}"))
 
         sfw.start()
 
+    def _on_midi_cfg_changed(self):
+        """midi.cfg changed on disk (a git pull, another program). Every song's
+        build depends on it, so let the next build rebuild only the songs
+        whose flags really changed (decided by content, midi_cfg_freshness)."""
+        project_dir = (self.project_info or {}).get("dir", "")
+        if not project_dir:
+            return
+        try:
+            from core.sound.midi_cfg_freshness import settle_midi_cfg
+            report = settle_midi_cfg(project_dir)
+        except Exception as exc:
+            self.log_message(f"Could not check midi.cfg: {exc}")
+            return
+        if report.checked:
+            self.log_message(f"midi.cfg changed: {report.summary()}.")
+
     def _on_sound_s_changed(self, label: str):
         """A sound .s file was edited externally (hand-fix, another tool, etc.).
 
-        The .s files in sound/songs/midi/ are gitignored build artifacts
-        regenerated from the committed .mid. An external edit therefore lives
-        ONLY in that gitignored file and would be lost on the next clean build
-        (or git clean), UNLESS it's captured back into the .mid source. The
-        song-integrity sweep does exactly that: it parses the .s (authoritative)
-        and re-renders a matching .mid when the .mid has drifted — and it's
-        idempotent, so a .s the app itself just generated (already matching its
-        .mid) is a no-op. So we run the sweep scoped to just this song right
-        when the edit is detected, keeping the .s safely gitignorable.
+        Runs the song-integrity sweep for just this song. The sweep writes a
+        real .mid from the .s only when the song's .mid is an empty stand-in
+        (a song written in PorySuite), so a rebuild cannot turn it into
+        silence. A song with a real .mid is left alone: which file holds its
+        newest music is decided by content (core/sound/song_sync.py), and the
+        Sound Editor offers Refresh from MIDI when the two disagree.
         """
         project_dir = (self.project_info or {}).get("dir", "")
         if not project_dir:
@@ -4138,9 +4179,9 @@ class UnifiedMainWindow(QMainWindow):
             report = run_sweep(project_dir, song_labels=[label])
             if report.regenerated:
                 self.log_message(
-                    f"♪ Captured your '{label}.s' edit back into '{label}.mid' "
-                    f"(the .s is a gitignored build file — the .mid keeps it "
-                    f"safe). Rebuild to hear it in-game.")
+                    f"♪ '{label}' had music only in its .s (its .mid was an empty "
+                    f"stand-in), so PorySuite wrote a real '{label}.mid' from it. A "
+                    f"rebuild can no longer turn this song silent.")
                 self.setWindowModified(True)
             elif report.errors:
                 for lbl, err in report.errors:

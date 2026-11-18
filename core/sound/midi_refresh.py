@@ -68,9 +68,11 @@ class MidiSyncStatus:
                     "PoryDAW), so what PorySuite shows is out of date. Refresh from MIDI "
                     "to load the new version.")
         if self.state == 'conflict':
-            return ("This song's .s file was changed by something other than PorySuite "
-                    "since PorySuite last wrote its MIDI file. Refreshing from MIDI would "
-                    "replace those .s changes with what the MIDI builds to.")
+            return ("This song has changes in both its MIDI file and its assembled music "
+                    "file (.s), so PorySuite cannot safely tell which changes you want to keep. "
+                    "Refresh from MIDI would replace the .s changes with what the MIDI builds "
+                    "to (a backup of the .s is kept). To keep the .s changes instead, leave "
+                    "the song as it is.")
         if self.state == 'no_s':
             return ("This song has a MIDI file but has never been built. Refresh from MIDI "
                     "to build just this song.")

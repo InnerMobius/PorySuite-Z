@@ -150,7 +150,10 @@ class MidiRefreshTest(GuiProjectCase):
     def test_song_with_no_s_yet(self):
         label = "mus_faron_woods"
         s = self.midi_path(label, ".s")
-        want = self._read(s)
+        # The copy is not protected (no build files), so its build writes no
+        # protection record line; the owner's real song may carry one.
+        from core.sound.song_guard import strip_stamp
+        want = strip_stamp(self._read(s))
         os.remove(s)
         self.assertEqual(midi_sync_status(self.root, label).state, "no_s")
         refresh_from_midi(self.root, label)

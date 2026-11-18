@@ -797,25 +797,16 @@ def register_song(
         # external DAW could never rebuild: make saw the .s as current and
         # skipped the conversion, and the edit never reached the ROM.
         #
-        # Backdate midi.cfg below the oldest .s instead. Same protection —
-        # midi.cfg can no longer be the newer file — without touching a single
-        # song's timestamp, so a genuinely newer .mid still rebuilds its own
-        # .s. This is the approach song_table_manager already documents as the
-        # replacement for "os.utime every .s"; this was the last site still
-        # doing it the old way.
+        # Decide by content instead (midi_cfg_freshness): every song the new
+        # line does not affect is left current, and a genuinely newer .mid
+        # still rebuilds its own .s. If that fails, nothing is hidden: the
+        # build rebuilds what make thinks is stale, which is never wrong.
         try:
-            from core.sound.song_table_manager import _backdate_midi_cfg
-            _backdate_midi_cfg(cfg_path)
-        except Exception:
-            # Fail closed to the old behaviour rather than leaving midi.cfg
-            # newer than everything, which regenerates every song.
-            midi_dir = os.path.dirname(cfg_path)
-            for fn in os.listdir(midi_dir):
-                if fn.endswith('.s'):
-                    try:
-                        os.utime(os.path.join(midi_dir, fn))
-                    except OSError:
-                        pass
+            from core.sound.midi_cfg_freshness import settle_for_cfg_path
+            settle_for_cfg_path(cfg_path)
+        except Exception as exc:
+            logging.getLogger("SoundEditor.MidiImporter").warning(
+                "Could not settle midi.cfg after the import: %s", exc)
 
     return True, ""
 
@@ -914,3 +905,156 @@ def validate_constant_name(name: str, project_root: str) -> Tuple[bool, str]:
             return False, f"{name} already exists"
 
     return True, ""
+
+
+# ── The import dialog's choices: instrument mapping, loop, layout ──────────
+#
+# Until 2026-11-15 the import dialog applied these by editing the .s text after
+# conversion and then pushing the .mid an hour into the past so make would not
+# convert it again. The choices then existed ONLY in the .s: any later rebuild
+# from the .mid (a terminal make after a midi.cfg change, make clean, a fresh
+# clone) silently replaced them, and the backdate hid later edits of the .mid.
+# Now the mapping and the loop are written into the .mid through the editor's
+# validated save (safe_song_save.save_editor_song: the .mid is patched, the
+# build's own converter checks the result, both files or neither), so the
+# build makes exactly the imported song from the .mid alone.
+
+class ImportChoicesRefused(Exception):
+    """The import's mapping / loop choices could not be applied safely."""
+
+
+def import_loop_region(song, loop_config: Optional[dict]):
+    """The loop the import dialog asked for, on the playback clock, as a
+    ``SongEdit.loop`` value: None = keep the song's own (automatic, or nothing
+    to change), (None, None) = no loop, (start, end) = loop. Also returns
+    plain-English notes about choices that cannot be represented."""
+    from core.sound.midi_exporter import (
+        song_loop_region, song_structure, song_time_signatures, bar_starts_for)
+    cfg = loop_config or {}
+    mode = cfg.get('mode', 'automatic')
+    current = song_loop_region(song)
+    if mode == 'automatic':
+        return None, []
+    if mode == 'no_loop':
+        return ((None, None) if current else None), []
+    sections = cfg.get('sections') or []
+    order = [i for i in (cfg.get('play_order') or []) if 0 <= i < len(sections)]
+    loop_point = int(cfg.get('loop_point', 1) or 1)
+    if not sections or not order:
+        return None, []
+    if loop_point > len(order):
+        return ((None, None) if current else None), []
+    notes = []
+    starts = [sections[i]['start'] for i in order]
+    if starts != sorted(starts) or len(set(order)) != len(order):
+        notes.append("The section play order (reordering or repeating sections) is not "
+                     "applied — only the loop point is. The song plays in its MIDI order.")
+    end = song_structure(song).get('end') or 0
+    bars = bar_starts_for(song_time_signatures(song), end)
+    bar = int(sections[order[loop_point - 1]]['start'])
+    if bar < 1 or bar - 1 >= len(bars) or bars[bar - 1] >= end:
+        raise ImportChoicesRefused(f"the loop point (bar {bar}) is at or past the end of the song")
+    return (bars[bar - 1], end), notes
+
+
+def _flattened_text(s_path: str) -> str:
+    """The import dialog's "No loop" layout: every track written out linearly,
+    without the converter's repeated-pattern blocks. Returns the text; writes
+    nothing."""
+    from core.sound.song_parser import parse_song_file, extract_tie_notes, Track
+    from core.sound.track_renderer import flatten_track_commands
+    from core.sound.song_writer import notes_to_track_commands, write_song
+    song = parse_song_file(s_path)
+    controls_kinds = {'VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR', 'LFOS', 'LFODL',
+                      'MODT', 'TUNE', 'TEMPO', 'KEYSH', 'XCMD', 'PRIO'}
+    for i, track in enumerate(song.tracks):
+        flat = flatten_track_commands(track.commands, loop_count=0)
+        notes = [{'tick': c.tick, 'pitch': c.pitch, 'duration': c.duration,
+                  'velocity': c.velocity if c.velocity else 100, 'track': i}
+                 for c in flat if c.cmd == 'NOTE' and c.pitch is not None]
+        tmp = Track(index=i, label=track.label)
+        tmp.commands = flat
+        for nd in extract_tie_notes(tmp):
+            nd['track'] = i
+            notes.append(nd)
+        controls, seen = [], set()
+        for c in flat:
+            if c.cmd in controls_kinds and c.value is not None:
+                key = (c.tick, c.cmd, c.value)
+                if key not in seen:
+                    seen.add(key)
+                    controls.append(c)
+        voice, volume, pan = 0, 100, 64
+        for c in controls:
+            if c.tick == 0:
+                if c.cmd == 'VOICE':
+                    voice = c.value
+                elif c.cmd == 'VOL':
+                    volume = c.value
+                elif c.cmd == 'PAN':
+                    pan = c.value
+        track.commands = notes_to_track_commands(
+            notes, i, voice, volume, pan, loop_start_tick=None, loop_end_tick=None,
+            loop_label=None, original_commands=controls)
+    return write_song(song)
+
+
+def apply_import_choices(project_root: str, label: str, voice_remap: Optional[dict],
+                         loop_config: Optional[dict]) -> List[str]:
+    """Apply the import dialog's instrument mapping and loop to a just-imported
+    song, through the validated save so they live in the .mid. Then, for the
+    "No loop" layout, flatten the .s — kept only if it plays exactly what the
+    build makes from the .mid (so a later rebuild cannot lose anything).
+
+    Returns plain-English notes for the user. Raises ImportChoicesRefused when
+    the mapping or loop cannot be applied safely; nothing is then written (the
+    song stays exactly as the converter made it from the MIDI)."""
+    from core.sound.song_parser import parse_song_file
+    from core.sound.midi_exporter import SongEdit
+    from core.sound.safe_song_save import (save_editor_song, SongSaveRefused,
+                                           render_s_with_mid2agb, mid2agb_flags)
+    from core.sound.song_sync import music_key
+    md = os.path.join(project_root, "sound", "songs", "midi")
+    s_path = os.path.join(md, label + ".s")
+    notes: List[str] = []
+    song = parse_song_file(s_path)
+    song.file_path = s_path
+    remapped = 0
+    for track in song.tracks:
+        for c in track.commands:
+            if c.cmd == 'VOICE' and voice_remap and c.value in voice_remap \
+                    and voice_remap[c.value] != c.value:
+                c.value = voice_remap[c.value]
+                remapped += 1
+    loop, loop_notes = import_loop_region(song, loop_config)
+    notes += loop_notes
+    if remapped or loop is not None:
+        try:
+            save_editor_song(project_root, song, SongEdit(loop=loop))
+        except SongSaveRefused as exc:
+            raise ImportChoicesRefused(str(exc)) from exc
+        if remapped:
+            notes.append(f"{remapped} instrument change(s) remapped — saved into the song's .mid.")
+        if loop and loop[0] is not None:
+            notes.append(f"Loop set from tick {loop[0]} to {loop[1]} — saved into the song's .mid.")
+        elif loop == (None, None):
+            notes.append("Loop removed — saved into the song's .mid.")
+
+    if (loop_config or {}).get('mode', 'automatic') == 'no_loop':
+        try:
+            flat = _flattened_text(s_path)
+            with open(os.path.join(md, label + ".mid"), "rb") as fh:
+                mid_bytes = fh.read()
+            built = render_s_with_mid2agb(project_root, label, mid_bytes,
+                                          mid2agb_flags(project_root, label))
+            a, b = music_key(flat, label), music_key(built, label)
+        except Exception as exc:
+            a, b = None, None
+            logging.getLogger("SoundEditor.MidiImporter").info("Flatten of %s skipped: %s", label, exc)
+        if a is not None and a == b:
+            with open(s_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(flat)
+        else:
+            notes.append("The song was kept in the converter's own layout (with repeated "
+                         "patterns): writing it out linearly would have changed what it plays.")
+    return notes

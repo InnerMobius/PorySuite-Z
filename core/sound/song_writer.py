@@ -1076,14 +1076,13 @@ def lock_song_timestamps(s_path: str, mid_path: str, cfg_path: str) -> None:
 
     # midi.cfg is shared by every song, so it is backdated whoever owns this
     # one — leaving it newer regenerates the whole soundtrack.
+    # Judged by content (midi_cfg_freshness): only songs whose flags really
+    # changed are left for the build to rebuild.
     if os.path.isfile(cfg_path):
         try:
-            cfg_mtime = os.stat(cfg_path).st_mtime
-            if cfg_mtime >= now:
-                # Only push it back if it's currently at/after our .s. If it
-                # is already in the past, leave it — other songs sharing
-                # midi.cfg shouldn't have their make dependency goalposts
-                # moved unnecessarily.
-                os.utime(cfg_path, (far_past, far_past))
-        except OSError:
-            pass
+            from core.sound.midi_cfg_freshness import settle_for_cfg_path
+            settle_for_cfg_path(cfg_path)
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger("SoundEditor.SongWriter").warning(
+                "Could not settle midi.cfg: %s", exc)

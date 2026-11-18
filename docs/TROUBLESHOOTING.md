@@ -99,6 +99,70 @@ Another program (often a virus scanner or a file-sync tool) held the song's file
 ### An empty track I added is gone after saving
 The game's converter writes no track that has no notes, so a new track is only saved once it has at least one note. For the same reason, deleting every note of an existing track makes the save refuse (the song would lose a track); remove the track with the track list's **-** button instead.
 
+### After a git pull, building from a terminal rebuilt every song
+In a stock pret project (FireRed, Emerald, pokeemerald-expansion), every song depends on the one shared `sound/songs/midi/midi.cfg`, so any change to it — including a pull that only rewrote its line endings — makes `make` rebuild every song. Building with PorySuite's **Make** button avoids this: before the build it checks which songs a `midi.cfg` change really affects and lets only those rebuild. Real setting changes and edited MIDI files are always rebuilt. A terminal `make` run while PorySuite is closed cannot be checked first; it behaves as the stock project always has. PorySuite never changes your Makefile; if your project's song rules are customised in a way PorySuite does not recognise, it leaves the build to decide and only protects songs written in PorySuite.
+
+
+### Song Build Protection: keeping terminal builds, `make clean` and git from losing music
+PorySuite's **Make** button checks every song before it builds. A build started from a **terminal** does not
+go through PorySuite. In a stock pret FireRed project it follows file dates alone, so it can overwrite an edit
+made directly in a `.s` after a pull re-dates the `.mid` or `midi.cfg`, or ship an old `.s` when one commit
+changes the `.mid` and touches the `.s`. `make clean` deletes every song `.s`, including one that is a song's
+only real copy.
+
+**Tools → Song Build Protection...** adds an optional guard to the project's own build, so it works from a
+terminal, on other computers and with PorySuite closed. The window shows every change as a diff before writing
+anything, and asks you to confirm. It:
+- adds two files to the project folder, `song_guard.sh` and `song_guard.mk`;
+- changes three lines: the song rule in `audio_rules.mk` runs the guard instead of the converter, an `include`
+  line is added above it, and `make clean` in the `Makefile` calls the guard instead of deleting every `.s`;
+- adds one comment line, a **protection record**, to the top of each song `.s`, recording which `.mid` and
+  settings it was built from (the music does not change). Git lists those songs as changed: commit them with
+  the build changes so protection also works on other computers;
+- optionally (**Include generated song files in Git**) changes one line of `.gitignore` so song `.s` files are
+  kept in Git history. That makes them easy to review and recover, but on its own it does not stop a build from
+  overwriting a song, and switching it off later does not untrack files Git already has.
+
+Protection cannot bring back music that was never saved or committed.
+
+The original build files are backed up first. If your build files are not a shape the setup recognises, it
+says why and changes nothing. Only stock-style pret FireRed projects have been tested.
+
+With protection installed, every build (`make`, `make modern`, a pull, a branch switch):
+- rebuilds a song whose `.mid` changed, whatever the file dates say;
+- keeps a `.s` that was edited after it was built, as long as its `.mid` and settings did not change;
+- keeps a song written in PorySuite whose `.mid` is still an empty stand-in, and warns if git ignores its `.s`
+  (the music would exist on that computer only);
+- **stops with a message** when a song's `.s` and `.mid` both changed. Nothing is changed. The message names
+  the song and how to choose:
+  - `sh song_guard.sh keep sound/songs/midi <song>` keeps the `.s`;
+  - `sh song_guard.sh rebuild sound/songs/midi <song>` rebuilds from the `.mid` (the `.s` is copied to
+    `song_guard_backups/` first);
+  - or press Make in PorySuite, which asks the same question.
+- `make clean` deletes only `.s` files that their `.mid` rebuilds exactly, and lists the ones it kept.
+
+When git stores song `.s` files with Unix line endings (pret's `.gitattributes` does), the guard writes rebuilt
+songs that way too, so rebuilding a song no longer makes git list it as changed when only its line endings
+differ.
+
+Nothing in the guard judges by file dates. A broken `.mid`, an unknown setting or a missing converter stops
+the build without touching the `.s`. `sh song_guard.sh status sound/songs/midi` lists what each song's record
+says.
+
+**If you don't install it,** existing projects keep working as before. PorySuite's editors and Make button
+stay safe; only builds started from a command prompt and `make clean` keep stock behaviour (judging songs by
+file dates). The Make button's log names any songs whose `.s` holds work that a terminal
+build could erase.
+The Sound Editor's Songs page also shows a line at the top: a quiet note when the project is protected or
+when every song can be rebuilt from its `.mid`, and an amber warning naming the songs whose music is only in
+their `.s`, with a button to the setup. PorySuite cannot stop a terminal command itself; the warning only tells
+you which songs a terminal build could erase.
+
+**To remove it,** open the same window and choose **Remove protection**. Your original build rules come back
+exactly and the two files are deleted. The protection records already added to song files **remain**, but
+they are no longer enforced during terminal builds, so removal does not restore every song file to how it was
+before installing. They are harmless comments and keep their meaning if you install protection again.
+
 ---
 
 ## Git — Pull / Push
@@ -346,11 +410,17 @@ Fixed (2026-04-08). The GM mapping table had no drum kit samples. Added kick, sn
 ### Building after editing songs wipes music (mid2agb overwrites .s files)
 Fixed (2026-04-08). pokefirered's Makefile has a `%.s: %.mid midi.cfg` rule — if midi.cfg or the .mid file is newer than the .s, mid2agb regenerates the .s from the .mid. For tool-edited songs, the .mid is a tiny placeholder, so mid2agb produces empty output that destroys the real music. This was the root cause of mus_evil losing all its data.
 
-Two-layer protection now in place:
-1. **midi.cfg writes touch all .s files** — `write_midi_cfg()` in `song_table_manager.py` runs `os.utime()` on every .s after writing midi.cfg, so they're always newer.
-2. **Every .s write backdates the .mid** — all paths that write .s files (piano roll save, MIDI import, .s import, song replace) set the .mid timestamp 2 seconds in the past.
+That fix worked by moving file dates so the `.s` always looked newer. File dates turned out to be the
+wrong thing to rely on: git sets them in the order it writes files, not in the order anybody wrote the music,
+so the same trick later hid MIDI edits and let terminal builds overwrite `.s` edits. It has been replaced.
+PorySuite now decides by content — what each file actually plays — and never by which file is newer:
 
-If you're writing new code that touches midi.cfg, .s files, or .mid files, you MUST maintain this timestamp ordering: .s newer than both .mid and midi.cfg.
+- The **Make** button checks every song before building, rebuilds songs whose `.mid` holds newer music, keeps
+  a `.s` that holds work its `.mid` does not, and stops to ask when both changed.
+- Saves write the `.mid` and the `.s` together and check them with the game's own converter.
+- For terminal builds and `make clean`, see **Song Build Protection** below.
+
+Do not write new code that moves song file dates to steer the build.
 
 ### Instrument loop checkbox shows unchecked even though the sample has looping
 Fixed (2026-04-08). Sample data was lazy-loaded — only loaded when you first tried playing audio. If you selected an instrument before playing anything, `_sample_data` was None and the loop controls stayed empty. Now samples load automatically when you switch to the Instruments or Voicegroups tab, and the display refreshes when sample data arrives.

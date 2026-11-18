@@ -774,8 +774,8 @@ def save_song_header(project_root: str, label: str, *, priority=None, reverb=Non
                            lambda a, b: bool(HEADER_EQU.match(a) and HEADER_EQU.match(b)), "header")
         if cfg_changed:
             commit_files([(cfg_path, new_cfg.encode("utf-8"))])
-            from core.sound.song_table_manager import _backdate_midi_cfg
-            _backdate_midi_cfg(cfg_path)
+            from core.sound.midi_cfg_freshness import settle_for_cfg_path
+            settle_for_cfg_path(cfg_path)
         return True
 
     if old_flags is None:
@@ -796,8 +796,8 @@ def save_song_header(project_root: str, label: str, *, priority=None, reverb=Non
         raise SongSaveRefused("the header edit would have changed more than the header: "
                               + diff.describe())
     commit_files([(s_path, new_s.encode("latin-1")), (cfg_path, new_cfg.encode("utf-8"))])
-    from core.sound.song_table_manager import _backdate_midi_cfg
-    _backdate_midi_cfg(cfg_path)
+    from core.sound.midi_cfg_freshness import settle_for_cfg_path
+    settle_for_cfg_path(cfg_path)
     try:
         os.utime(s_path, None)
     except OSError:
@@ -914,7 +914,22 @@ def midi_export_would_lose(original: bytes, exported: bytes) -> list:
     return out
 
 
-def save_editor_song(project_root: str, live_song, edit, *, voicegroup=None) -> str:
+def song_makes_patterns(project_root: str, label: str):
+    """Whether the build makes patterns of the song's repeats: True, False
+    (its midi.cfg line has -N), or None when the song has no midi.cfg line."""
+    from core.sound.song_table_manager import midi_cfg_with_flags
+    cfg_path = _cfg_path(project_root)
+    if not os.path.isfile(cfg_path):
+        return None
+    cfg_text = open(cfg_path, "rb").read().decode("utf-8")
+    _new, flags, _ = midi_cfg_with_flags(cfg_text, label)
+    if flags is None:
+        return None
+    return not any(f.upper() == '-N' for f in flags)
+
+
+def save_editor_song(project_root: str, live_song, edit, *, voicegroup=None,
+                     patterns=None) -> str:
     """Save an editor's version of a song — validated, all files or none.
 
     *live_song* is the editor's in-memory song (its header and its non-note
@@ -928,12 +943,17 @@ def save_editor_song(project_root: str, live_song, edit, *, voicegroup=None) -> 
     Refuses, writing nothing, when the build (mid2agb, run in a temp folder)
     would not play exactly what the editor holds, or would change anything the
     edit did not. Returns the .s path on success.
+
+    *patterns* (True / False / None = leave it) is whether the build makes
+    patterns of the song's repeats (midi.cfg's -N). It changes how the song
+    is stored, never what plays, so the checks below hold it to that.
     """
     import copy
     import tempfile
     from core.sound.song_parser import parse_song_file
     from core.sound.midi_exporter import expand_song, song_to_midi
-    from core.sound.song_table_manager import midi_cfg_with_flags, _backdate_midi_cfg
+    from core.sound.song_table_manager import midi_cfg_with_flags
+    from core.sound.midi_cfg_freshness import settle_for_cfg_path
 
     label = live_song.label
     md = os.path.join(project_root, MIDI_SUBDIR)
@@ -1008,7 +1028,7 @@ def save_editor_song(project_root: str, live_song, edit, *, voicegroup=None) -> 
     new_cfg, old_flags, new_flags = midi_cfg_with_flags(
         cfg_text, label, priority=getattr(edited, 'priority', None),
         reverb=getattr(edited, 'reverb', None), volume=getattr(edited, 'master_volume', None),
-        voicegroup=voicegroup)
+        voicegroup=voicegroup, patterns=patterns)
     if old_flags is None:
         raise SongSaveRefused(f"{label}.mid has no line in midi.cfg")
     import io
@@ -1133,7 +1153,7 @@ def save_editor_song(project_root: str, live_song, edit, *, voicegroup=None) -> 
     except OSError:
         pass
     if new_cfg != cfg_text:
-        _backdate_midi_cfg(cfg_path)
+        settle_for_cfg_path(cfg_path)
     try:
         from core.sound.midi_ownership import record_own_write
         record_own_write(project_root, label)

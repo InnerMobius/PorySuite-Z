@@ -52,6 +52,10 @@ class SharedFileWatcher(QObject):
     # an external edit must be captured back into the committed .mid source
     # (via the song-integrity sweep) or it's lost on the next clean build.
     sound_s_changed = pyqtSignal(str)
+    # Emitted when sound/songs/midi/midi.cfg changes (a git pull or another
+    # program rewrote it). Seen through the folder watch only: a watch on the
+    # file itself would block replacing it on Windows.
+    midi_cfg_changed = pyqtSignal()
 
     # Generic signal for any shared file change — carries the relative path.
     # This is handy for logging or showing a single "files changed" banner.
@@ -148,6 +152,8 @@ class SharedFileWatcher(QObject):
         # back into the .mid or it's lost on the next clean build. We watch the
         # dir (to catch new .s files) and each .s (to catch edits).
         sound_dir = os.path.join(root, "sound", "songs", "midi")
+        if os.path.isfile(os.path.join(sound_dir, "midi.cfg")):
+            self._record_mtime(os.path.join(sound_dir, "midi.cfg"))
         if os.path.isdir(sound_dir):
             self._watcher.addPath(sound_dir)
             for entry in os.scandir(sound_dir):
@@ -208,6 +214,15 @@ class SharedFileWatcher(QObject):
         # signal for a rewrite-in-place, not the file signal).
         sound_dir = os.path.join(self._project_dir, "sound", "songs", "midi")
         if dir_path == sound_dir and os.path.isdir(sound_dir):
+            cfg = os.path.join(sound_dir, "midi.cfg")
+            try:
+                cfg_mtime = os.path.getmtime(cfg)
+            except OSError:
+                cfg_mtime = None
+            if cfg_mtime is not None and cfg_mtime != self._mtimes.get(cfg):
+                self._mtimes[cfg] = cfg_mtime
+                self._pending_changes.add(cfg)
+                self._debounce_timer.start()
             for entry in os.scandir(sound_dir):
                 if not (entry.is_file() and entry.name.endswith(".s")):
                     continue
@@ -265,6 +280,9 @@ class SharedFileWatcher(QObject):
 
             elif rel == "src/data/heal_locations.h":
                 self.heal_locations_changed.emit()
+
+            elif rel == "sound/songs/midi/midi.cfg":
+                self.midi_cfg_changed.emit()
 
             elif rel.startswith("sound/songs/midi/") and rel.endswith(".s"):
                 # A gitignored build-artifact .s was edited externally — emit the

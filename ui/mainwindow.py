@@ -3572,30 +3572,25 @@ QTabBar::tab:hover:!selected {
     # ── Make ──────────────────────────────────────────────────────────────────
 
     def _prune_stale_song_s_files(self, project_dir: str) -> None:
-        """Delete song .s/.o files whose voicegroup no longer exists.
+        """Before a build, deal with song files that name a voicegroup the
+        project no longer has (``undefined reference to voicegroupXXX`` at
+        link time otherwise).
 
-        Runs before every build. Gitignored .s files from earlier PorySuite
-        sessions survive `git pull`, and if upstream removed a voicegroup the
-        stale .s breaks linking with `undefined reference to voicegroupXXX`.
-        Deleting the stale .s lets mid2agb regenerate it from the tracked
-        .mid + midi.cfg during the build — no user intervention needed.
-
-        Two kinds of leftovers have to go:
-
-        * The stale ``sound/songs/midi/*.s`` file (if still present on disk).
-          Identified by scanning its ``.equ NAME_grp, voicegroupNNN`` line
-          and checking that voicegroup exists in ``sound/voice_groups.inc``.
-        * The stale ``build/*/sound/songs/midi/*.o`` file in every build
-          sub-tree. If left in place, Make sees an ``.o`` newer than the
-          ``.mid`` source and decides nothing needs to rebuild — the
-          linker then pulls the stale ``.o`` with its baked-in reference
-          to the missing voicegroup and fails at link time even though
-          the ``.s`` was correctly removed.
-
-        A file is only deleted if we can unambiguously identify a missing
-        voicegroup reference — either from the ``.s`` itself (preferred)
-        or, when the ``.s`` is already gone, by symbol-dumping the ``.o``
-        in the build dir. When in doubt, everything is left alone.
+        * A ``sound/songs/midi/*.s`` naming a missing voicegroup is removed
+          ONLY when it is provably an old build of its ``.mid``: the build of
+          the current ``.mid`` + midi.cfg line names a voicegroup that exists
+          and plays exactly what the ``.s`` plays apart from that voicegroup
+          (``song_sync.stale_voicegroup_verdict``). It is backed up to
+          PorySuite's cache first, then removed with its ``.o`` so the build
+          remakes it. Any other such ``.s`` — music its ``.mid`` does not
+          have, a placeholder ``.mid``, a midi.cfg line naming a missing
+          voicegroup too, no converter — is LEFT UNTOUCHED and reported with
+          what to do. Until 2026-11-15 every such ``.s`` was deleted, which
+          destroyed tracked songs' only copy of their edits (forensic
+          scenario L).
+        * A ``build/*/sound/songs/midi/*.o`` whose ``.s`` is gone and which
+          names a missing voicegroup is build output and is deleted, so make
+          does not link the stale object.
         """
         vg_inc = os.path.join(project_dir, "sound", "voice_groups.inc")
         midi_dir = os.path.join(project_dir, "sound", "songs", "midi")
@@ -3663,21 +3658,26 @@ QTabBar::tab:hover:!selected {
                 return m.group(0).decode("ascii", errors="replace")
             return None
 
-        removed_s: list[tuple[str, str, list[str]]] = []
+        from core.sound.song_sync import stale_voicegroup_verdict, backup_song_file
+
+        removed_s: list[tuple[str, str, list[str], str, str]] = []
+        kept_s: list[tuple[str, str, str]] = []
         removed_o_only: list[tuple[str, str, list[str]]] = []
         handled_stems: set[str] = set()
 
-        # 1) Pass over every .s still on disk — the pre-2026-04-20 path.
+        # 1) Every .s on disk that names a missing voicegroup. Removed only
+        #    when provably an old build of its .mid (backed up first);
+        #    otherwise left exactly as it is and reported.
         for name in os.listdir(midi_dir):
             if not name.endswith(".s"):
                 continue
             s_path = os.path.join(midi_dir, name)
             try:
-                with open(s_path, "r", encoding="utf-8", errors="replace") as f:
-                    head = f.read(4096)  # voicegroup line is always near the top
+                with open(s_path, "rb") as f:
+                    s_text = f.read().decode("latin-1")
             except OSError:
                 continue
-            m = grp_re.search(head)
+            m = grp_re.search(s_text[:4096])  # voicegroup line is always near the top
             if not m:
                 continue  # No detectable vg reference — leave it alone.
             vg = m.group(1)
@@ -3685,17 +3685,21 @@ QTabBar::tab:hover:!selected {
             handled_stems.add(stem)
             if vg in valid_vgs:
                 continue  # Valid reference — keep the .s and the .o.
-            # Stale — delete the .s AND any matching .o under build/.
-            # The .mid is kept: mid2agb + midi.cfg will regenerate a
-            # correct .s on the next build (midi.cfg maps each .mid to a
-            # valid voicegroup; the stale references only lived in the
-            # previously compiled .s/.o pair).
             try:
+                ok, why = stale_voicegroup_verdict(project_dir, stem, s_text, valid_vgs)
+            except Exception as exc:
+                ok, why = False, f"it could not be checked ({exc})"
+            if not ok:
+                kept_s.append((name, vg, why))
+                continue
+            try:
+                backup = backup_song_file(project_dir, s_path, "song_backups")
                 os.remove(s_path)
-            except OSError:
-                pass
+            except OSError as exc:
+                kept_s.append((name, vg, f"it could not be backed up and removed ({exc})"))
+                continue
             dead_os = _delete_matching_o(stem)
-            removed_s.append((name, vg, dead_os))
+            removed_s.append((name, vg, dead_os, why, backup))
 
         # 2) Pass over every .o in the build tree whose .s is already
         #    gone — catches the case where a previous PorySuite session
@@ -3721,14 +3725,27 @@ QTabBar::tab:hover:!selected {
 
         if removed_s:
             self.log(
-                f"Pre-build cleanup: removed {len(removed_s)} stale song .s "
-                f"file(s) referencing voicegroups no longer in "
-                f"sound/voice_groups.inc. They will be regenerated from "
-                f"their .mid files during the build."
+                f"Pre-build cleanup: removed {len(removed_s)} old song .s "
+                f"file(s) naming voicegroups no longer in "
+                f"sound/voice_groups.inc. Each was checked to be an old build "
+                f"of its .mid and backed up first; the build remakes it."
             )
-            for name, vg, dead_os in removed_s:
+            for name, vg, dead_os, why, backup in removed_s:
                 suffix = f" + {len(dead_os)} stale .o" if dead_os else ""
-                self.log(f"  - sound/songs/midi/{name} (→ {vg}){suffix}")
+                self.log(f"  - sound/songs/midi/{name} (named {vg}; {why}){suffix} "
+                         f"— backup: {backup}")
+
+        if kept_s:
+            self.log(
+                f"Pre-build cleanup: {len(kept_s)} song .s file(s) name a "
+                f"voicegroup that sound/voice_groups.inc no longer defines. "
+                f"They were LEFT UNTOUCHED, so the build will stop with "
+                f"'undefined reference to voicegroup…' until each is fixed: "
+                f"restore that voicegroup, or open the song in the Sound "
+                f"Editor and choose a voicegroup that exists."
+            )
+            for name, vg, why in kept_s:
+                self.log(f"  - sound/songs/midi/{name} names {vg}: not removed because {why}")
 
         if removed_o_only:
             self.log(
@@ -3815,18 +3832,12 @@ QTabBar::tab:hover:!selected {
         make_args = ' '.join(extra_args)
         make_cmd  = f'make {make_args}'.strip()
 
-        # ── Pre-build sweep: drop stale .s files that reference dead voicegroups ─
-        # The Makefile's song wildcard (`$(wildcard sound/songs/midi/*.s)`) picks
-        # up EVERY .s file in that directory, including ones left over from
-        # earlier PorySuite sessions or git pulls. Those .s files are gitignored
-        # — `git pull` does not clean them — so if upstream drops a voicegroup
-        # the stale .s still tries to link against it, and the build dies with
-        # `undefined reference to voicegroupXXX`.
-        #
-        # Scan each .s before building. If it references a voicegroup that no
-        # longer exists in sound/voice_groups.inc, delete the .s — mid2agb will
-        # regenerate it fresh from the tracked .mid + midi.cfg during the build.
-        # Log every removal so the user sees exactly what was cleaned up.
+        # ── Pre-build: song files that name a voicegroup that no longer exists ─
+        # A leftover .s (or its .o) naming a removed voicegroup breaks linking
+        # with `undefined reference to voicegroupXXX`. An .s that is provably an
+        # old build of its .mid is backed up and removed so the build remakes
+        # it; any other is left untouched and reported (it may hold the song's
+        # only copy of its music). See _prune_stale_song_s_files.
         try:
             self._prune_stale_song_s_files(project_dir)
         except Exception as _prune_err:
@@ -3942,6 +3953,7 @@ QTabBar::tab:hover:!selected {
         # Modeless — user can interact with the app while the build runs.
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dlg.show()
+        return dlg      # the Make button checks songs when it finishes
 
     def load_save_data(self, project_info):
         """

@@ -261,6 +261,25 @@ class VoicegroupsTab(QWidget):
         self._vg_info_label.setStyleSheet("color: grey;")
         right_layout.addWidget(self._vg_info_label)
 
+        # Sampled instruments that can never be heard (attack 0) - usually a
+        # square / noise slot turned into a sample that kept its envelope.
+        self._silent_row = QWidget()
+        silent_layout = QHBoxLayout(self._silent_row)
+        silent_layout.setContentsMargins(0, 0, 0, 0)
+        self._silent_label = QLabel("")
+        self._silent_label.setWordWrap(True)
+        self._silent_label.setStyleSheet("color: #ff8a65;")
+        silent_layout.addWidget(self._silent_label, 1)
+        self._btn_fix_silent = QPushButton("Make Them Audible")
+        self._btn_fix_silent.setToolTip(
+            "Give these sampled instruments the normal sampled envelope:\n"
+            "attack 255, decay 0, sustain 255, release 0 (instant on, full volume).\n"
+            "Nothing else changes. Save to keep it.")
+        self._btn_fix_silent.clicked.connect(self._on_fix_silent_samples)
+        silent_layout.addWidget(self._btn_fix_silent)
+        self._silent_row.setVisible(False)
+        right_layout.addWidget(self._silent_row)
+
         # ── Slot list ─────────────────────────────────────────────────────
         right_splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -311,6 +330,9 @@ class VoicegroupsTab(QWidget):
             2, QHeaderView.ResizeMode.Stretch)
         slot_header.setStretchLastSection(True)
         self._slot_tree.currentItemChanged.connect(self._on_slot_selected)
+        # A mouse click on the instrument name plays it at middle C, through
+        # the Instruments tab's preview player (see `_on_slot_name_clicked`).
+        self._slot_tree.itemClicked.connect(self._on_slot_name_clicked)
         self._slot_tree.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self._slot_tree.customContextMenuRequested.connect(
@@ -707,6 +729,7 @@ class VoicegroupsTab(QWidget):
             self._current_vg = None
             self._vg_title.setText("No voicegroup selected")
             self._vg_info_label.setText("")
+            self._silent_row.setVisible(False)
             self._slot_tree.clear()
             self._clear_slot_editor()
             self._songs_label.setText("—")
@@ -751,6 +774,7 @@ class VoicegroupsTab(QWidget):
         if filler_count:
             summary += f", {filler_count} filler"
         self._vg_info_label.setText(summary)
+        self._update_silent_warning()
 
         self._populate_slot_list(vg)
         self._update_songs_using(vg)
@@ -880,6 +904,35 @@ class VoicegroupsTab(QWidget):
         self._current_slot_item = current
         self._current_inst = inst
         self._load_slot_editor(inst)
+
+    # Column of the slot list that shows the instrument's name.
+    _SLOT_NAME_COL = 2
+
+    def _on_slot_name_clicked(self, item, column: int):
+        """A click on a slot's instrument name plays it at middle C (note 60).
+
+        There is deliberately no second audio path here: the request goes to
+        the Instruments tab's preview, which owns the one preview player. A
+        new click therefore stops or supersedes the previous preview — from
+        either tab — instead of stacking. Filler slots and the other columns
+        stay silent. The instrument is only read, never changed, so nothing
+        is marked unsaved.
+        """
+        if column != self._SLOT_NAME_COL or self._current_vg is None:
+            return
+        slot_idx = item.data(0, _ROLE_SLOT_IDX)
+        if slot_idx is None:
+            return
+        inst = self._current_vg.get_instrument(slot_idx)
+        if not inst or _is_filler_instrument(inst):
+            return
+        se = getattr(self, '_sound_editor', None)
+        inst_tab = getattr(se, '_instruments_tab', None)
+        if inst_tab is None:
+            _log.debug("Name-click preview skipped: no Instruments tab")
+            return
+        from ui.instruments_tab import PREVIEW_NAME_CLICK_NOTE
+        inst_tab.preview_instrument(inst, PREVIEW_NAME_CLICK_NOTE)
 
     def _clear_slot_editor(self):
         """Reset the slot editor to empty state."""
@@ -1103,10 +1156,22 @@ class VoicegroupsTab(QWidget):
         if not new_macro or new_macro == self._current_inst.voice_type:
             return
 
-        from core.sound.sound_constants import VOICE_MACRO_TYPES
+        from core.sound.sound_constants import (
+            VOICE_MACRO_TYPES, CGB_VOICE_TYPES, DIRECTSOUND_VOICE_TYPES,
+            DIRECTSOUND_AUDIBLE_ENVELOPE, CGB_AUDIBLE_ENVELOPE)
         inst = self._current_inst
+        old_macro = inst.voice_type
         inst.voice_type = new_macro
         inst.type_byte = VOICE_MACRO_TYPES.get(new_macro, 0)
+
+        # Sampled voices and square / noise / wave voices read the envelope on
+        # different scales (0-255 vs 0-7 / 0-15). Keeping the old numbers
+        # across that switch makes the voice silent: a square slot's
+        # (0, 0, 15, 0) on a sample is "never fade in, hold at 6%".
+        for family, envelope in ((DIRECTSOUND_VOICE_TYPES, DIRECTSOUND_AUDIBLE_ENVELOPE),
+                                 (CGB_VOICE_TYPES, CGB_AUDIBLE_ENVELOPE)):
+            if new_macro in family and old_macro not in family:
+                inst.attack, inst.decay, inst.sustain, inst.release = envelope
 
         # Clear type-specific fields that don't apply
         if not inst.is_directsound:
@@ -1122,8 +1187,9 @@ class VoicegroupsTab(QWidget):
         if not inst.is_noise:
             inst.period = 0
 
-        # Set defaults for the new type
+        # Set defaults for the new type (the sample list loads on first need)
         if inst.is_directsound and not inst.sample_label:
+            self._ensure_samples_loaded()
             if self._sample_data and self._sample_data.direct_sound:
                 inst.sample_label = sorted(
                     self._sample_data.direct_sound.keys())[0]
@@ -1140,6 +1206,7 @@ class VoicegroupsTab(QWidget):
         self._mark_dirty()
         self._load_slot_editor(inst)
         self._refresh_slot_item(inst)
+        self._update_silent_warning()
 
     def _on_sample_changed(self, index):
         """User picked a different sample."""
@@ -1223,10 +1290,58 @@ class VoicegroupsTab(QWidget):
         setattr(self._current_inst, param, val)
         self._mark_dirty()
         self._refresh_slot_item(self._current_inst)
+        if param == 'attack':
+            self._update_silent_warning()
 
     # ═══════════════════════════════════════════════════════════════════════
     # Dirty tracking / slot refresh
     # ═══════════════════════════════════════════════════════════════════════
+
+    def _silent_samples(self, vg) -> list:
+        """Sampled instruments in *vg* that can never be heard (attack 0)."""
+        from core.sound.sound_constants import directsound_envelope_is_silent
+        return [inst for inst in (vg.instruments if vg else [])
+                if inst.is_directsound and directsound_envelope_is_silent(inst.attack)]
+
+    def _update_silent_warning(self) -> None:
+        silent = self._silent_samples(self._current_vg)
+        if not silent:
+            self._silent_row.setVisible(False)
+            return
+        n = len(silent)
+        self._silent_label.setText(
+            f"{n} sampled instrument{'s' if n != 1 else ''} here can't be heard: "
+            f"{'their' if n != 1 else 'its'} envelope never fades in (attack 0).")
+        self._silent_label.setToolTip("\n".join(
+            f"Slot {inst.slot_index}: {inst.friendly_name}  (A {inst.attack}, "
+            f"D {inst.decay}, S {inst.sustain}, R {inst.release})" for inst in silent))
+        self._silent_row.setVisible(True)
+
+    def _on_fix_silent_samples(self) -> None:
+        """Give every silent sampled instrument in the current voicegroup the
+        neutral sampled envelope. Marks them unsaved; Save writes them."""
+        from core.sound.sound_constants import DIRECTSOUND_AUDIBLE_ENVELOPE
+        vg = self._current_vg
+        silent = self._silent_samples(vg)
+        if not silent:
+            return
+        for inst in silent:
+            inst.attack, inst.decay, inst.sustain, inst.release = DIRECTSOUND_AUDIBLE_ENVELOPE
+        _log.info("Made %d silent sampled instrument(s) audible in %s: slots %s",
+                  len(silent), vg.name, [i.slot_index for i in silent])
+        self._dirty_slots.setdefault(vg.name, set()).update(i.slot_index for i in silent)
+        self._dirty_voicegroups.add(vg.name)
+        self._tint_vg_row(vg.name, True)
+        self._slots_group.setStyleSheet(_DIRTY_SS)
+        keep = self._current_inst.slot_index if self._current_inst else None
+        self._populate_slot_list(vg)          # (re-applies the amber per slot)
+        for i in range(self._slot_tree.topLevelItemCount()):
+            item = self._slot_tree.topLevelItem(i)
+            if keep is not None and item.data(0, _ROLE_SLOT_IDX) == keep:
+                self._slot_tree.setCurrentItem(item)   # stay on the same slot
+                break
+        self._update_silent_warning()
+        self.modified.emit()
 
     def _tint_vg_row(self, name: str, dirty: bool) -> None:
         """Set or clear the amber background on a voicegroup list row."""

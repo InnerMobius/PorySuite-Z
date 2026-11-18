@@ -78,7 +78,8 @@ def _song(project_root, label, *, real: bool, s_newer: bool):
         with open(mid, 'wb') as fh:
             fh.write(PLACEHOLDER)
     with open(s, 'w', encoding='utf-8') as fh:
-        fh.write(f'\t.include "MPlayDef.s"\n@ {label}\n')
+        # A real song: it plays a note (a silent .s is just an empty song).
+        fh.write(f'\t.include "MPlayDef.s"\n@ {label}\n\t.byte\t\tN06   , Cn3 , v100\n')
     base = time.time() - 10_000
     os.utime(mid, (base, base))
     os.utime(s, (base + (60 if s_newer else -60),) * 2)

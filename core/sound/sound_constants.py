@@ -171,6 +171,24 @@ CGB_VOICE_TYPES = {
 }
 
 
+# The two envelope scales. A voice that changes from one family to the other
+# must get the other family's envelope: the numbers mean different things.
+# These are the neutral, audible ones - instant on, full volume, instant off.
+DIRECTSOUND_AUDIBLE_ENVELOPE = (255, 0, 255, 0)   # attack, decay, sustain, release
+CGB_AUDIBLE_ENVELOPE = (0, 0, 15, 0)
+
+
+def directsound_envelope_is_silent(attack) -> bool:
+    """A DirectSound (sampled) voice with attack 0 can never be heard: the
+    engine adds the attack to the volume each frame, so it stays at 0. This is
+    what a square / noise / wave envelope (0, 0, 15, 0) means on a sampled
+    voice, which is how it usually gets there."""
+    try:
+        return int(attack) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def clamp_psg_envelope(attack, decay, sustain, release):
     """Force a Game Boy PSG (square/noise/wave) ADSR into the only ranges the
     hardware accepts: attack/decay/release 0-7, sustain 0-15 (attack/release

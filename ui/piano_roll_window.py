@@ -53,6 +53,9 @@ class PianoRollWindow(QMainWindow):
         self._vg_labels = vg_labels or {}
         self._project_root = project_root
         self._song_table = song_table
+        # Whether the build makes patterns of this song's repeats (midi.cfg
+        # -N off); None when the song has no midi.cfg line.
+        self._patterns_on = None
 
         # Real-time sequencer (created on first play)
         self._sequencer = None
@@ -273,6 +276,8 @@ class PianoRollWindow(QMainWindow):
 
         self._structure_panel = SongStructurePanel()
         self._structure_panel.loop_requested.connect(self._on_loop_requested)
+        self._structure_panel.patterns_requested.connect(self._on_patterns_requested)
+        self._structure_panel.clear_requested.connect(self._on_clear_structure)
         self._structure_panel.seek_to_tick.connect(self._on_ruler_seek)
         self._structure_panel.time_signatures_requested.connect(self._on_time_signatures)
         self._structure_panel.shift_time_requested.connect(self._on_shift_time)
@@ -357,6 +362,13 @@ class PianoRollWindow(QMainWindow):
 
         # Structure panel: patterns, markers and the end, where they play.
         self._structure_panel.load_from_song(song, self._total_ticks)
+        from core.sound.safe_song_save import song_makes_patterns
+        try:
+            self._patterns_on = (song_makes_patterns(self._song_root(), song.label)
+                                 if song.file_path else None)
+        except OSError:
+            self._patterns_on = None
+        self._structure_panel.set_patterns(self._patterns_on)
         from core.sound.midi_exporter import song_time_signatures
         self._time_sigs = song_time_signatures(song)
         self._apply_bar_map()
@@ -773,6 +785,15 @@ class PianoRollWindow(QMainWindow):
         if start is not None and (end is None or end <= start or start < 0):
             return
         self._history.checkpoint()
+        self._apply_loop(start, end)
+        self._mark_dirty()
+        self._status.showMessage(
+            "Loop removed" if start is None else
+            f"Loop set: {self._structure_panel.where(start)} → "
+            f"{self._structure_panel.where(end)}", 4000)
+
+    def _apply_loop(self, start, end):
+        canvas = self._piano_roll.canvas
         canvas.set_loop_region(start, end)
         if end is not None and end > canvas._total_ticks:
             canvas._total_ticks = end + 96
@@ -782,11 +803,38 @@ class PianoRollWindow(QMainWindow):
         # (None, None) must clear the sequencer's loop too.
         if self._sequencer is not None:
             self._sequencer.set_loop(start, end)
+
+    def _on_patterns_requested(self, on: bool):
+        """The panel asked the build to make patterns of the song's repeats,
+        or to stop (they are then written out in full). The song plays the
+        same either way; the save writes it to the song's midi.cfg line."""
+        if self._patterns_on is None or bool(on) == self._patterns_on:
+            return
+        self._history.checkpoint()
+        self._patterns_on = bool(on)
+        self._structure_panel.set_patterns(self._patterns_on)
         self._mark_dirty()
         self._status.showMessage(
-            "Loop removed" if start is None else
-            f"Loop set: {self._structure_panel.where(start)} → "
-            f"{self._structure_panel.where(end)}", 4000)
+            "Patterns on: the build will look for repeats when you save" if on else
+            "Patterns removed: the repeats are written out in full (sounds the same)",
+            5000)
+
+    def _on_clear_structure(self):
+        """Clear All: no loop and no patterns, as one undo step. The song's
+        end is where its music stops, so it stays."""
+        canvas = self._piano_roll.canvas
+        has_loop = canvas._loop_start is not None
+        has_patterns = self._patterns_on is True
+        if not (has_loop or has_patterns):
+            return
+        self._history.checkpoint()
+        if has_loop:
+            self._apply_loop(None, None)
+        if has_patterns:
+            self._patterns_on = False
+            self._structure_panel.set_patterns(False)
+        self._mark_dirty()
+        self._status.showMessage("Song structure cleared", 4000)
 
     def _on_boost_all(self):
         """🔊 Max Volume — boost the ACTIVE track only.
@@ -930,10 +978,36 @@ class PianoRollWindow(QMainWindow):
                 from core.sound.song_parser import TrackCommand
                 track.commands.insert(0, TrackCommand(
                     cmd='VOICE', tick=0, value=voice_slot, raw_line=''))
+            # The preview replays the canvas's tick-0 VOICE event every time it
+            # starts from the top (Play after Stop, song end, a loop back to
+            # 0); left alone it put the saved instrument straight back.
+            self._sync_canvas_start_event(track_index, 'VOICE', voice_slot)
             # Update live sequencer — no need to destroy and recreate
             if self._sequencer is not None:
                 self._sequencer.set_track_instrument(track_index, voice_slot)
             self._mark_dirty()
+
+    def _sync_canvas_start_event(self, track_index: int, kind: str, value: int):
+        """Make the canvas's tick-0 ``kind`` events on a track match ``value``.
+
+        A sidebar control writes the track's OPENING command, but playback is
+        fed from the canvas's control-event list, which holds its own copy of
+        that opening value at tick 0 and replays it whenever playback passes
+        tick 0. Both must change together. The tempo box has done this since
+        2026-11-15 (see `_on_bpm_changed`); instrument and pan did not.
+        Only existing tick-0 events are touched: with none, the starting value
+        comes from the opening command alone. Called after the undo
+        checkpoint, so undo restores the old value with everything else.
+        """
+        canvas = self._piano_roll.canvas
+        changed = False
+        for e in canvas._control_events:
+            if (e.get('track', 0) == track_index and e.get('type') == kind
+                    and e.get('tick', 0) == 0):
+                e['value'] = value
+                changed = True
+        if changed:
+            self._piano_roll.lane.update()
 
     _OPENING_ENDS = frozenset(('WAIT', 'NOTE', 'TIE', 'EOT', 'PATT', 'GOTO', 'FINE'))
 
@@ -1097,6 +1171,7 @@ class PianoRollWindow(QMainWindow):
                 from core.sound.song_parser import TrackCommand
                 track.commands.insert(0, TrackCommand(
                     cmd='PAN', tick=0, value=pan, raw_line=''))
+            self._sync_canvas_start_event(track_index, 'PAN', pan)
             self._mark_dirty()
 
     def _on_voicegroup_changed(self, vg_display: str):
@@ -1323,14 +1398,16 @@ class PianoRollWindow(QMainWindow):
         from core.sound.safe_song_save import save_editor_song, SongSaveRefused
         from core.sound.song_table_manager import voicegroup_index_from_name
         edit = self._build_song_edit()
-        # <root>/sound/songs/midi/<song>.s — the project the song lives in.
-        root = self._project_root or os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.abspath(self._song.file_path)))))
+        root = self._song_root()
+        patterns = self._patterns_on
+        if patterns == (self._baseline or {}).get('patterns', patterns):
+            patterns = None             # not edited: midi.cfg keeps its choice
         try:
             path = save_editor_song(
                 root, self._song, edit,
                 voicegroup=voicegroup_index_from_name(
-                    getattr(self._song, 'voicegroup', None)))
+                    getattr(self._song, 'voicegroup', None)),
+                patterns=patterns)
         except SongSaveRefused as e:
             _log.error("Piano Roll save refused for %s: %s", self._song.label, e)
             raise ValueError(
@@ -1340,6 +1417,8 @@ class PianoRollWindow(QMainWindow):
         # The file is now the truth: read it back so the in-memory song (shared
         # with the Sound Editor) holds exactly what was written, and measure
         # the next save's edits from here.
+        if patterns is not None:
+            self._remember_patterns_in_song_table(patterns)
         labels_before = [t.label for t in self._song.tracks]
         self._replace_song_from_disk()
         self._show_saved_song(labels_before)
@@ -1353,6 +1432,23 @@ class PianoRollWindow(QMainWindow):
         self._edit_label.setText("Saved")
         self._status.showMessage(f"Saved to {path}", 5000)
         return path
+
+    def _song_root(self) -> str:
+        """The project the song lives in (<root>/sound/songs/midi/<song>.s)."""
+        return self._project_root or os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(self._song.file_path)))))
+
+    def _remember_patterns_in_song_table(self, on: bool):
+        """The song list keeps its own copy of each midi.cfg line and rewrites
+        the file from it when the song list is saved. Give it the -N the save
+        just wrote, or that save would quietly undo it."""
+        for entry in getattr(self._song_table, 'entries', None) or []:
+            if getattr(entry, 'label', None) != self._song.label:
+                continue
+            flags = [f for f in (entry.extra_flags or '').split() if f.upper() != '-N']
+            if not on:
+                flags.append('-N')
+            entry.extra_flags = ' '.join(flags)
 
     def _on_flatten_dynamics(self):
         """Show + remove HIDDEN mid-song dynamics (volume / tempo / vibrato /
@@ -1430,6 +1526,7 @@ class PianoRollWindow(QMainWindow):
             'controls': {id(t): controls.get(i, []) for i, t in enumerate(self._song.tracks)},
             'loop': (canvas._loop_start, canvas._loop_end),
             'time_sigs': list(self._time_sigs),
+            'patterns': self._patterns_on,
         }
 
     @staticmethod
@@ -1608,12 +1705,14 @@ class PianoRollWindow(QMainWindow):
                          for t in tracks},
             'header': {a: getattr(self._song, a, None) for a in self._HEADER_ATTRS},
             'time_sigs': list(self._time_sigs),
+            'patterns': self._patterns_on,
         }
 
     @staticmethod
     def _same_state(a, b) -> bool:
         if (a['notes'] != b['notes'] or a['controls'] != b['controls']
                 or a['loop'] != b['loop'] or a['header'] != b['header']
+                or a.get('patterns') != b.get('patterns')
                 or a['time_sigs'] != b['time_sigs']
                 or [id(t) for t in a['tracks']] != [id(t) for t in b['tracks']]):
             return False
@@ -1654,6 +1753,9 @@ class PianoRollWindow(QMainWindow):
         canvas._control_events = [dict(e) for e in st['controls']]
         canvas._selected.clear()
         canvas.set_loop_region(*st['loop'])
+        self._structure_panel.set_loop(*st['loop'])
+        self._patterns_on = st.get('patterns', self._patterns_on)
+        self._structure_panel.set_patterns(self._patterns_on)
         self._time_sigs = list(st['time_sigs'])
         self._apply_bar_map()
         if canvas._active_track >= len(self._song.tracks):

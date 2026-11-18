@@ -160,8 +160,6 @@ def run_sweep(
     from core.sound.song_parser import parse_song_file
     from core.sound.midi_exporter import write_midi_file, song_to_midi
 
-    newest_s_mtime = 0.0
-
     for label in labels:
         s_path = os.path.join(midi_dir, label + ".s")
         mid_path = os.path.join(midi_dir, label + ".mid")
@@ -222,7 +220,14 @@ def run_sweep(
                     notes_match, tempo_diverges = False, False
                     _log.warning("Integrity sweep: divergence check failed "
                                  "for %s: %s", label, exc)
-                if notes_match and tempo_diverges:
+                # Only a .mid PorySuite itself wrote (its exact bytes are in
+                # the MIDI ledger) can be a stale render of ours. Any other
+                # .mid — a composer's, a pull's, another editor's — whose
+                # tempo differs from a stale .s is a real change: rewriting
+                # it from the .s would revert that change.
+                from core.sound.midi_ownership import is_external_edit
+                ours = not is_external_edit(project_root, label, when_unknown=True)
+                if notes_match and tempo_diverges and ours:
                     is_stale = True
                     needs_regen = True
                     _log.info(
@@ -234,13 +239,6 @@ def run_sweep(
                     needs_regen = False
 
         if not needs_regen:
-            # Track newest .s mtime for the final cfg lock pass.
-            try:
-                s_mt = os.stat(s_path).st_mtime
-                if s_mt > newest_s_mtime:
-                    newest_s_mtime = s_mt
-            except OSError:
-                pass
             continue
 
         # (Re)render the .mid from the .s.  write_midi_file is byte-equality
@@ -254,6 +252,16 @@ def run_sweep(
                     report.regenerated.append(label)
                 _log.info(
                     "Integrity sweep: wrote %s.mid from %s.s", label, label)
+                # Song build protection: the .mid was just rendered FROM the
+                # .s, so record the .s as this song's source against the new
+                # .mid — otherwise the build's guard would see both files
+                # changed and stop. No-op in unprotected projects.
+                try:
+                    from core.sound.song_guard import mark_source
+                    mark_source(project_root, label)
+                except Exception as exc:
+                    _log.warning("Integrity sweep: could not record %s.s as its "
+                                 "song's source: %s", label, exc)
             # wrote == False => already byte-identical; nothing to record.
         except Exception as exc:
             report.errors.append((label, f"render failed: {exc}"))
@@ -261,18 +269,9 @@ def run_sweep(
                          label, exc)
             continue
 
-        try:
-            s_mt = os.stat(s_path).st_mtime
-            if s_mt > newest_s_mtime:
-                newest_s_mtime = s_mt
-        except OSError:
-            pass
-
     # Final mtime lock pass.  Push the regenerated .mids 1 hour into the
     # past relative to NOW (not relative to .s — we want a stable target
-    # that doesn't drift if the user's clock jumps).  Push midi.cfg back
-    # too IF it's currently at/after the newest .s — that's the Make-rule
-    # trigger we're trying to defuse.
+    # that doesn't drift if the user's clock jumps).
     now = time.time()
     far_past = now - 3600
 
@@ -284,14 +283,18 @@ def run_sweep(
             except OSError:
                 pass
 
-    cfg_path = os.path.join(midi_dir, "midi.cfg")
-    if os.path.isfile(cfg_path) and newest_s_mtime > 0:
-        try:
-            cfg_mt = os.stat(cfg_path).st_mtime
-            if cfg_mt >= newest_s_mtime:
-                os.utime(cfg_path, (far_past, far_past))
-        except OSError:
-            pass
+    # midi.cfg: judged by content against EVERY song, not "an hour ago" and
+    # not just the songs in this sweep. The old rule moved it to now - 1 h
+    # when it was newer than the newest .s of the sweep — with a one-song
+    # sweep (the file watcher's) that left every song built earlier than an
+    # hour ago older than midi.cfg, and a plain make rebuilt all 371 of them
+    # (2026-11-15). midi_cfg_freshness rebuilds only songs whose flags
+    # really changed.
+    try:
+        from core.sound.midi_cfg_freshness import settle_midi_cfg
+        settle_midi_cfg(project_root)
+    except Exception as exc:
+        _log.warning("Integrity sweep: could not settle midi.cfg: %s", exc)
 
     report.timestamps_locked = True
 

@@ -84,6 +84,24 @@ def is_placeholder_mid(mid_path: str) -> bool:
         return False
 
 
+def s_has_music(s_path: str) -> bool:
+    """True when an .s plays notes (N.. / TIE commands)."""
+    import re
+    try:
+        text = open(s_path, "rb").read().decode("latin-1")
+    except OSError:
+        return False
+    return re.search(r"\b(N\d{2}|TIE)\b", text) is not None
+
+
+def is_porysuite_written(s_path: str, mid_path: str) -> bool:
+    """A song written in PorySuite: its .mid is a placeholder AND its .s holds
+    music — the .s is then the only copy. A placeholder-sized .mid whose .s is
+    silent is just an empty song (pret FireRed's own mus_dummy.mid is a
+    26-byte empty MIDI) and gets no special protection."""
+    return os.path.isfile(mid_path) and is_placeholder_mid(mid_path) and s_has_music(s_path)
+
+
 def may_lock_timestamp(mid_path: str) -> bool:
     """True when PorySuite may push this ``.mid``'s mtime into the past.
 
@@ -184,16 +202,16 @@ def is_external_edit(project_root: str, label: str, *,
                      when_unknown: bool) -> bool:
     """True when ``<label>.mid`` differs from what PorySuite last recorded.
 
-    *when_unknown* is required, and has no default on purpose. The two
-    callers want opposite answers for a song with no record yet, and a
-    default would have silently handed one of them the wrong one:
+    *when_unknown* is required, and has no default on purpose: it is the
+    answer for a song with no record yet, and every caller must decide it.
+    Today's callers (Refresh from MIDI's status, the tempo save, the integrity
+    sweep's tempo refresh) all pass ``True`` — PorySuite has no claim on a file
+    it has no record of writing.
 
-    * **Releasing a stuck song** passes ``True``. The user has named the song
-      and asked for it to rebuild; PorySuite has no claim on a file it has no
-      record of writing.
-    * **Withdrawing build protection** passes ``False``. An edit that does not
-      rebuild is visible and can be reported; regenerating over a
-      hand-authored ``.s`` is silent and permanent.
+    **Never use this to decide which of a song's files a BUILD should use.**
+    The record is per computer and only knows PorySuite's own writes, so a
+    missing or old entry says nothing about who wrote the music; the Make
+    button decides by content instead (``song_sync``, 2026-11-15).
 
     **Why content and not the music.** Comparing the notes — render the
     ``.s``, compare to the ``.mid`` — was tried and measured, and it does not

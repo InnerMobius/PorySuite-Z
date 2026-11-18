@@ -72,28 +72,30 @@ class _ImportWorker(QThread):
                 self.finished.emit(False, "", result.error)
                 return
 
-            # Post-process: remap VOICE commands if user changed any
-            if self._voice_remap:
-                try:
-                    _postprocess_voice_remap(result.s_file_path, self._voice_remap)
-                except Exception as e:
-                    self.finished.emit(False, result.s_file_path,
-                                       f"Song imported but VOICE remap failed: {e}")
-                    return
+            # The instrument mapping and loop go into the .mid through the
+            # validated save, so the build makes them from the .mid alone and no
+            # later rebuild can drop them (midi_importer.apply_import_choices).
+            # A choice that cannot be saved safely is reported and NOTHING is
+            # written for it: the song stays exactly as converted from the MIDI.
+            notes = []
+            label = os.path.splitext(os.path.basename(result.s_file_path))[0]
+            try:
+                from core.sound.midi_importer import apply_import_choices, ImportChoicesRefused
+                notes = apply_import_choices(self._project_root, label,
+                                             self._voice_remap, self._loop_config)
+            except ImportChoicesRefused as e:
+                notes = [f"The song was imported exactly as the MIDI plays, but the "
+                         f"instrument mapping / loop you chose could not be saved safely, "
+                         f"so it was not applied: {e}. You can change instruments and set "
+                         f"the loop in the Piano Roll."]
+            except Exception as e:
+                self.finished.emit(False, result.s_file_path,
+                                   f"Song imported but applying the instrument mapping / "
+                                   f"loop failed: {e}")
+                return
 
-            # Post-process: apply section structure / loop config
-            if self._loop_config and self._loop_config.get('mode') != 'automatic':
-                try:
-                    _postprocess_structure(result.s_file_path, self._loop_config)
-                except Exception as e:
-                    self.finished.emit(False, result.s_file_path,
-                                       f"Song imported but structure edit failed: {e}")
-                    return
-
-            # Validate the FINAL .s (after voice-remap + structure edits).
-            # mid2agb itself emits valid output, but the regex post-processing
-            # above could break it — surface that instead of leaving a
-            # non-building song registered.
+            # Validate the FINAL .s, so a song that would not build is
+            # surfaced instead of left registered.
             try:
                 from core.sound.song_validator import validate_s_file
                 verrs = validate_s_file(result.s_file_path, self._project_root)
@@ -106,7 +108,8 @@ class _ImportWorker(QThread):
                     "build — re-import or fix:\n  - " + "\n  - ".join(verrs))
                 return
 
-            self.finished.emit(True, result.s_file_path, "")
+            # On success the third value carries notes for the user, not an error.
+            self.finished.emit(True, result.s_file_path, "\n".join(notes))
         except Exception as e:
             self.finished.emit(False, "", str(e))
 
@@ -136,251 +139,10 @@ def _postprocess_voice_remap(s_path: str, remap: dict[int, int]):
             f.writelines(lines)
 
 
-def _postprocess_structure(s_path: str, loop_config: dict):
-    """Rewrite the .s file structure based on the user's section sequencer.
-
-    For 'automatic' mode, does nothing — mid2agb's output is kept as-is.
-    For 'no_loop' mode, fully linearizes the file — removes ALL PATT/PEND/
-      GOTO/internal labels and writes clean linear tracks ending with FINE.
-    For 'custom' mode, rebuilds the track structure using the section
-      sequencer's loop point.
-    """
-    mode = loop_config.get('mode', 'automatic')
-    if mode == 'automatic':
-        return
-
-    if mode == 'no_loop':
-        # Parse → flatten → rewrite as clean linear tracks.
-        # This strips ALL mid2agb structure: PATT calls, PEND markers,
-        # GOTO loops, and internal pattern labels (e.g. mus_name_3_007).
-        # The result is a clean file with just notes, waits, and controls.
-        from core.sound.song_parser import parse_song_file
-        from core.sound.track_renderer import flatten_track_commands
-        from core.sound.song_parser import TrackCommand, extract_tie_notes
-        from core.sound.song_writer import notes_to_track_commands, write_song
-
-        song = parse_song_file(s_path)
-
-        for i, track in enumerate(song.tracks):
-            flat_cmds = flatten_track_commands(track.commands, loop_count=0)
-
-            # Extract notes from flattened commands
-            notes = []
-            for cmd in flat_cmds:
-                if cmd.cmd == 'NOTE' and cmd.pitch is not None:
-                    notes.append({
-                        'tick': cmd.tick,
-                        'pitch': cmd.pitch,
-                        'duration': cmd.duration,
-                        'velocity': cmd.velocity if cmd.velocity else 100,
-                        'track': i,
-                    })
-            # Extract TIE/EOT notes
-            from core.sound.song_parser import Track as _Track
-            _flat_track = _Track(index=i, label=track.label)
-            _flat_track.commands = flat_cmds
-            for note_dict in extract_tie_notes(_flat_track):
-                note_dict['track'] = i
-                notes.append(note_dict)
-
-            # Extract control commands (only non-duplicated)
-            _CONTROL_CMDS = {
-                'VOICE', 'VOL', 'PAN', 'MOD', 'BEND', 'BENDR',
-                'LFOS', 'LFODL', 'MODT', 'TUNE', 'TEMPO', 'KEYSH',
-                'XCMD', 'PRIO',
-            }
-            controls = []
-            _seen: set[tuple[int, str, int]] = set()
-            for cmd in flat_cmds:
-                if cmd.cmd in _CONTROL_CMDS and cmd.value is not None:
-                    key = (cmd.tick, cmd.cmd, cmd.value)
-                    if key not in _seen:
-                        _seen.add(key)
-                        controls.append(cmd)
-
-            # Get voice/vol/pan from tick-0 controls
-            voice = 0
-            volume = 100
-            pan = 64
-            for cmd in controls:
-                if cmd.tick == 0:
-                    if cmd.cmd == 'VOICE':
-                        voice = cmd.value
-                    elif cmd.cmd == 'VOL':
-                        volume = cmd.value
-                    elif cmd.cmd == 'PAN':
-                        pan = cmd.value
-
-            # Rebuild as clean linear track — no loops, no structure
-            track.commands = notes_to_track_commands(
-                notes, i, voice, volume, pan,
-                loop_start_tick=None, loop_end_tick=None,
-                loop_label=None, original_commands=controls,
-            )
-
-        content = write_song(song)
-        with open(s_path, 'w', encoding='utf-8', newline='\n') as f:
-            f.write(content)
-
-        # Protect against mid2agb overwrite: backdate the .mid so it's
-        # older than the .s we just wrote.  make's %.s:%.mid rule skips
-        # mid2agb when .s is newer.  Use a 1-hour backdate (matching
-        # song_writer.lock_song_timestamps) — the previous 2-second value
-        # was inside filesystem-clock-jitter range.  Backdate midi.cfg
-        # too if it's currently at/after the .s, since midi.cfg is a
-        # co-dependency in the Make rule.
-        mid_path = s_path.rsplit('.', 1)[0] + '.mid'
-        cfg_path = os.path.join(os.path.dirname(s_path), 'midi.cfg')
-        import time as _time
-        now = _time.time()
-        far_past = now - 3600
-        try:
-            os.utime(s_path, (now, now))
-        except OSError:
-            pass
-        if os.path.isfile(mid_path):
-            try:
-                os.utime(mid_path, (far_past, far_past))
-            except OSError:
-                pass
-        if os.path.isfile(cfg_path):
-            try:
-                cfg_mt = os.stat(cfg_path).st_mtime
-                if cfg_mt >= now:
-                    os.utime(cfg_path, (far_past, far_past))
-            except OSError:
-                pass
-        return
-
-    # Custom mode: we need to understand measure boundaries in the .s file.
-    # mid2agb outputs notes with tick-counted delays. We use the MIDI's
-    # ticks_per_beat and time signature to figure out where measure
-    # boundaries land, then we split the assembly into sections and
-    # reconstruct with PATT/PEND/GOTO.
-    #
-    # For now, custom mode post-processes as intro+loop using the
-    # section sequencer's loop point to determine where the GOTO goes.
-    # Full PATT/PEND section extraction requires parsing .s tick offsets
-    # which is complex — we handle the most common case: a linear
-    # sequence of sections with a loop-back point.
-
-    sections = loop_config.get('sections', [])
-    play_order = loop_config.get('play_order', [])
-    loop_point = loop_config.get('loop_point', 1)
-
-    if not sections or not play_order:
-        return
-
-    # Find all track labels in the .s file (e.g. "mus_name_1:", "mus_name_2:")
-    # Each track has its own sequence of commands ending in FINE or GOTO
-    track_label_re = re.compile(r'^(\w+_\d+):$')
-    track_starts = []
-    for i, line in enumerate(lines):
-        m = track_label_re.match(line.strip())
-        if m:
-            track_starts.append((i, m.group(1)))
-
-    if not track_starts:
-        return  # Can't find track labels
-
-    # For each track, find the FINE line and insert a GOTO before it
-    # that jumps to a calculated loop label
-    if loop_point > len(play_order):
-        # No loop — just strip existing GOTO and ensure FINE
-        out = []
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith('.byte') and 'GOTO' in stripped:
-                continue
-            if stripped.startswith('.word') and any(
-                    ts[1] in stripped for ts in track_starts):
-                continue
-            out.append(line)
-        with open(s_path, "w", encoding="utf-8", newline="\n") as f:
-            f.write('\n'.join(out))
-        _backdate_mid(s_path)
-        return
-
-    # Has a loop point: we need to insert loop-back labels and GOTO
-    # The loop point position tells us: positions before it = intro (play once),
-    # positions from loop_point onward = loop body (repeats).
-    #
-    # Strategy: For each track, find the existing label, add a _loop label
-    # partway through (we approximate based on measure proportion), then
-    # replace any existing GOTO/FINE with a GOTO to the _loop label.
-
-    # Calculate what fraction of the song is intro vs loop
-    total_measures_in_order = sum(
-        sections[si]['end'] - sections[si]['start'] + 1
-        for si in play_order if 0 <= si < len(sections))
-    intro_measures = sum(
-        sections[play_order[i]]['end'] - sections[play_order[i]]['start'] + 1
-        for i in range(min(loop_point - 1, len(play_order)))
-        if 0 <= play_order[i] < len(sections))
-
-    if total_measures_in_order <= 0:
-        return
-
-    # For each track, count total non-directive lines (note/delay commands)
-    # and insert the loop label at the proportional position
-    out_lines = list(lines)
-    offset_adjust = 0  # track how many lines we've inserted
-
-    for track_idx, (track_line, track_name) in enumerate(track_starts):
-        # Find the end of this track (next track start or end of file)
-        if track_idx + 1 < len(track_starts):
-            track_end = track_starts[track_idx + 1][0]
-        else:
-            track_end = len(lines)
-
-        # Count note/command lines in this track (lines with .byte that aren't
-        # structural commands like FINE/GOTO)
-        cmd_lines = []
-        for li in range(track_line + 1, track_end):
-            stripped = lines[li].strip()
-            if stripped.startswith('.byte') and 'FINE' not in stripped and 'GOTO' not in stripped:
-                cmd_lines.append(li)
-
-        if not cmd_lines:
-            continue
-
-        # Calculate where the loop label goes (proportional)
-        loop_cmd_idx = int(len(cmd_lines) * intro_measures / total_measures_in_order)
-        loop_cmd_idx = max(0, min(loop_cmd_idx, len(cmd_lines) - 1))
-        loop_insert_line = cmd_lines[loop_cmd_idx]
-
-        loop_label = f"{track_name}_loop"
-
-        # Insert loop label
-        adjusted_pos = loop_insert_line + offset_adjust
-        out_lines.insert(adjusted_pos, f"{loop_label}:")
-        offset_adjust += 1
-
-        # Find and replace FINE/GOTO at end of this track with GOTO to loop label
-        for li in range(track_line + 1 + offset_adjust,
-                        track_end + offset_adjust):
-            if li >= len(out_lines):
-                break
-            stripped = out_lines[li].strip()
-            if stripped.startswith('.byte') and 'FINE' in stripped:
-                out_lines[li] = f"\t.byte\tGOTO"
-                out_lines.insert(li + 1, f"\t .word\t{loop_label}")
-                offset_adjust += 1
-                break
-            if stripped.startswith('.byte') and 'GOTO' in stripped:
-                # Replace existing GOTO target
-                if li + 1 < len(out_lines) and '.word' in out_lines[li + 1]:
-                    out_lines[li + 1] = f"\t .word\t{loop_label}"
-                break
-
-    with open(s_path, "w", encoding="utf-8", newline="\n") as f:
-        f.write('\n'.join(out_lines))
-    _backdate_mid(s_path)
-
-
 def _backdate_mid(s_path: str) -> None:
     """Backdate the .mid file and midi.cfg so both are older than the
-    .s we just wrote.
+    .s we just wrote. Used only by the .s import (s_file_import_dialog), whose
+    .mid is rendered from that .s; the MIDI import no longer moves times.
 
     pokefirered's Makefile rule `%.s: %.mid midi.cfg` reruns mid2agb if
     EITHER prereq is newer than the .s, so both must be locked.  Use a
@@ -402,12 +164,17 @@ def _backdate_mid(s_path: str) -> None:
             os.utime(mid_path, (far_past, far_past))
         except OSError:
             pass
+    _settle_cfg(cfg_path)
+
+
+def _settle_cfg(cfg_path: str) -> None:
+    """midi.cfg is shared by every song: let the build rebuild only the songs
+    its new content really affects (midi_cfg_freshness)."""
     if os.path.isfile(cfg_path):
         try:
-            cfg_mt = os.stat(cfg_path).st_mtime
-            if cfg_mt >= now:
-                os.utime(cfg_path, (far_past, far_past))
-        except OSError:
+            from core.sound.midi_cfg_freshness import settle_for_cfg_path
+            settle_for_cfg_path(cfg_path)
+        except Exception:
             pass
 
 
@@ -2003,16 +1770,12 @@ class MidiImportDialog(QDialog):
         if success:
             constant = self._name_edit.text().strip()
 
-            # Count remapped instruments
-            remap_count = sum(1 for gm, combo in self._mapping_combos
-                              if gm >= 0 and combo.currentIndex() != gm)
-
             self._progress_label.setText("Import successful!")
             self._progress_label.setStyleSheet("color: #6a6; font-size: 12px;")
 
-            remap_note = ""
-            if remap_count:
-                remap_note = f"\n{remap_count} instrument(s) remapped to different voicegroup slots.\n"
+            # On success *error* holds what applying the mapping / loop did (or
+            # why it could not), from midi_importer.apply_import_choices.
+            remap_note = f"\n{error}\n" if error else ""
 
             self._result_text.setVisible(True)
             self._result_text.setText(

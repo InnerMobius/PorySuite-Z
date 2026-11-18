@@ -900,8 +900,8 @@ _COMMAND_HELP: dict[str, str] = {
                          'use it for poses and reactions.',
     'lock': 'Freezes the player and this character so the scene can play out.',
     'lockall': 'Freezes the player and every character on the map.',
-    'release': 'Gives the player and this character control back.',
-    'releaseall': 'Gives the player and every character control back.',
+    'release': 'Gives control back to the player and everyone frozen, and sends the character you talked to back to their normal movement.',
+    'releaseall': 'Gives control back to the player and everyone frozen. A character turned by Face Player stays stuck facing the player: use Release for them.',
 
     # Screen and weather
     'fadescreen': 'Fades the screen to or from black or white.',
@@ -3929,6 +3929,27 @@ def _setvar_value_in(commands, var: str):
     return None
 
 
+RELEASE_ALL_WARNING = (
+    "⚠ Face Player + Release All: this character stays frozen after the "
+    "talk. Use Release instead.")
+
+
+def release_all_leaves_npc_frozen(commands) -> bool:
+    """True when a page turns its NPC with Face Player and lets go with
+    Release All.
+
+    Face Player gives the NPC a one-off turn that the engine keeps attached
+    until something clears it, and while it is attached the NPC's own
+    movement never runs. Release clears it on the NPC you talked to;
+    Release All clears it only on the player (scrcmd.c ScrCmd_release vs
+    ScrCmd_releaseall), so the NPC stands frozen facing where the player
+    was. Any Release All counts, even alongside a Release, because the
+    branch that ends with it still leaves the NPC stuck.
+    """
+    heads = {str(c[0]) for c in commands or [] if c}
+    return 'faceplayer' in heads and 'releaseall' in heads
+
+
 def trigger_condition_problem(var: str, value: str, commands):
     """What is wrong with a trigger's firing condition, as (severity, text).
 
@@ -4369,14 +4390,14 @@ class _ReleaseWidget(_CommandWidget):
         self._cmd = cmd
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
-        layout.addWidget(QLabel('Release All Movement' if cmd == 'releaseall' else 'Release Player Movement'))
+        layout.addWidget(QLabel('Release All' if cmd == 'releaseall' else 'Release'))
         layout.addStretch()
 
     def to_tuple(self):
         return (self._cmd,)
 
     def friendly_name(self):
-        return 'Release All Movement' if self._cmd == 'releaseall' else 'Release Player Movement'
+        return 'Release All' if self._cmd == 'releaseall' else 'Release'
 
 
 class _FadeScreenWidget(_CommandWidget):
@@ -6816,7 +6837,7 @@ _PAGE_1_COMMANDS = [
         ('Lock Player', 'lock'),
         ('Lock All', 'lockall'),
         ('Face Player', 'faceplayer'),
-        ('Release Player', 'release'),
+        ('Release', 'release'),
         ('Release All', 'releaseall'),
     ]),
 ]
@@ -7028,8 +7049,8 @@ _CMD_TOOLTIPS: dict[str, str] = {
     # ── Page 2: Movement Locking ─────────────────────────────────────
     'lock': 'Freeze the talking NPC in place during the script\nPrevents them from walking their route',
     'lockall': 'Freeze ALL NPCs on the map during the script',
-    'release': 'Let the talking NPC resume their movement route',
-    'releaseall': 'Let ALL NPCs resume their movement routes',
+    'release': 'Unfreeze the player and everyone frozen, and send the NPC you\ntalked to back to their normal movement. Use this after Face Player.',
+    'releaseall': 'Unfreeze the player and everyone frozen.\nAn NPC turned by Face Player stays stuck facing the player:\nuse Release for a talking NPC.',
 
     # ── Page 2: Camera ───────────────────────────────────────────────
     'movecamera': 'Open the cutscene camera editor\nPan, fade, shake, weather, sound — all in one dialog\nAuto-generates the full command sequence',
@@ -8602,6 +8623,14 @@ class EventEditorTab(QWidget):
         pf.addRow('', self.movement_warn_lbl)
         self.movement_combo.currentTextChanged.connect(
             self._update_movement_warning)
+
+        # Same quiet style: Face Player + Release All leaves this NPC frozen.
+        # Refreshed from _reindent_list, which every command edit runs.
+        self.release_warn_lbl = QLabel('')
+        self.release_warn_lbl.setStyleSheet(
+            'color:#d9a441;font-size:10px;')
+        self.release_warn_lbl.setWordWrap(True)
+        pf.addRow('', self.release_warn_lbl)
 
         # Mark dirty when the user edits any property field
         self.obj_id_edit.textEdited.connect(
@@ -10464,6 +10493,7 @@ class EventEditorTab(QWidget):
             self.movement_combo.setEnabled(False)
             self._set_object_only_fields_enabled(False)
             self.movement_warn_lbl.setText('')
+            self.release_warn_lbl.setText('')
             self.sprite_preview.set_sprite(None)
             self.script_edit.setText('')
             self.script_edit.setEnabled(False)
@@ -11184,6 +11214,20 @@ class EventEditorTab(QWidget):
                     if conds and _norm(conds[0]) == cond:
                         p['_appearance'] = appr
                         break
+
+    def _update_release_warning(self):
+        """Show RELEASE_ALL_WARNING for an NPC whose current page needs it."""
+        lbl = getattr(self, 'release_warn_lbl', None)
+        if lbl is None:
+            return
+        idx = getattr(self, '_current_obj_idx', -1)
+        objs = getattr(self, '_objects', None) or []
+        is_npc = (0 <= idx < len(objs)
+                  and objs[idx].get('_event_type', 'object') == 'object')
+        lbl.setText(RELEASE_ALL_WARNING
+                    if is_npc and release_all_leaves_npc_frozen(
+                        getattr(self, '_cmd_tuples', None))
+                    else '')
 
     def _update_movement_warning(self, *_):
         """Warn when the chosen base movement type can't turn to face the player.
@@ -12161,6 +12205,7 @@ class EventEditorTab(QWidget):
             pad = '      ' * ind
             base = _stringize(ct)
             item.setText('\n'.join(pad + ln for ln in base.split('\n')))
+        self._update_release_warning()
 
     def _scaffold_command(self, cmd: str) -> tuple:
         """Build a command tuple with auto-created supporting data.
@@ -14876,11 +14921,15 @@ class EventEditorTab(QWidget):
     def _create_npc_cutscene_talker(self, obj, script):
         """NPC that talks with EVERY npc on the map frozen (cutscene style).
 
-        Uses ``lockall``/``releaseall`` (freeze/unfreeze ALL objects) instead of
-        the per-npc lock that ``MSGBOX_NPC`` does internally — so the message
-        uses ``MSGBOX_DEFAULT`` (plain show-text, no lock of its own), which is
-        the correct pairing. Without this the msgbox's own lock/release would
-        fight the map-wide lockall.
+        Uses ``lockall`` (freeze ALL objects) instead of the per-npc lock that
+        ``MSGBOX_NPC`` does internally — so the message uses ``MSGBOX_DEFAULT``
+        (plain show-text, no lock of its own). Without this the msgbox's own
+        lock/release would fight the map-wide lockall.
+
+        Ends with ``release``, NOT ``releaseall`` (2026-11-18). Both unfreeze
+        every object, but only ``release`` clears the turn ``faceplayer`` left
+        on this NPC; after ``releaseall`` the NPC stood frozen facing the
+        player for good (Kakariko Carpenter1, see release_all_leaves_npc_frozen).
         """
         text_label = f'{script}_Text'
         placeholder = 'Everyone, listen up!$'
@@ -14889,7 +14938,7 @@ class EventEditorTab(QWidget):
             ('lockall',),
             ('faceplayer',),
             ('message', text_label, placeholder, 'MSGBOX_DEFAULT'),
-            ('releaseall',),
+            ('release',),
         ]
         obj['_pages'] = [{'commands': cmds, '_label': script,
                           '_short_label': script.split('_')[-1]}]

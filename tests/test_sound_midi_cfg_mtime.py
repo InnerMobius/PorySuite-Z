@@ -1,12 +1,15 @@
-"""Regression: PorySuite must not touch un-edited sound .s files, and must keep
-midi.cfg OLDER than every .s.
+"""Regression: PorySuite's own midi.cfg writes must not make the build rebuild
+songs they did not change, and must not hide a song they did change.
 
 The build rule is ``%.s: %.mid midi.cfg`` — if midi.cfg is newer than a .s, the
-next ``make`` re-runs mid2agb and regenerates the .s from its .mid, reverting any
-edit whose .mid has drifted (the "bomb sound keeps dying" bug). The old code
-rewrote midi.cfg to NOW and then os.utime-touched EVERY .s — perturbing the mtime
-of sounds the user never opened. The fix backdates midi.cfg below the oldest .s
-and touches nothing else.
+next ``make`` re-runs mid2agb and regenerates the .s from its .mid. The oldest
+code touched EVERY .s after a write; the next moved midi.cfg below the oldest
+.s without looking at it, which also hid real flag changes from the build.
+Now (midi_cfg_freshness) the decision is by content: a song whose .s header
+already carries its current flags is left alone, and a song whose flags really
+changed is left for the build to rebuild. The songs here are real mid2agb
+output, so their headers are what the build writes. See also
+tests/test_midi_cfg_freshness.py, which asks make itself.
 """
 import os
 import sys
@@ -19,35 +22,54 @@ for _p in (ROOT_DIR, os.path.join(ROOT_DIR, "core")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import shutil
+
 from core.sound.song_table_manager import (
     SongTableData, SongEntry, write_midi_cfg, update_midi_cfg_flags,
-    _backdate_midi_cfg, voicegroup_index_from_name,
+    voicegroup_index_from_name,
 )
+from core.sound.song_compiler import find_mid2agb
+
+GAME = os.path.join(ROOT_DIR, "pokefirered")
 
 _NAMES = ("se_heart", "se_coin", "se_small_item")
 
 
+@unittest.skipUnless(find_mid2agb(GAME), "the game's mid2agb is unavailable")
 class MidiCfgMtimeTest(unittest.TestCase):
     def setUp(self):
+        from core.sound import midi_cfg_freshness
+        from core.sound.midi_cfg_freshness import _probe_midi
+        midi_cfg_freshness._HEADER_CACHE.clear()
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         self.midi_dir = os.path.join(self.root, "sound", "songs", "midi")
         os.makedirs(self.midi_dir)
-        # .s files with KNOWN, well-past mtimes (one far older than 1 hour ago,
-        # to prove the old "now - 1h" backdate was insufficient).
-        base = time.time() - 100000
-        for i, name in enumerate(_NAMES):
-            s = os.path.join(self.midi_dir, name + ".s")
-            with open(s, "w", encoding="utf-8", newline="\n") as f:
-                f.write(f"\t.equ {name}_grp, voicegroup013\n\t.byte 0\n")
-            mt = base + i * 1000
-            os.utime(s, (mt, mt))
-            with open(os.path.join(self.midi_dir, name + ".mid"), "wb") as f:
-                f.write(b"MThd")
+        os.makedirs(os.path.join(self.root, "tools", "mid2agb"))
+        shutil.copy2(find_mid2agb(GAME), os.path.join(self.root, "tools", "mid2agb"))
+        # An upstream-shaped project: pret's Makefile shape and song rule.
+        from audio_rules_fixture import write_project
+        write_project(self.root)
         self.cfg = os.path.join(self.midi_dir, "midi.cfg")
         with open(self.cfg, "w", encoding="utf-8", newline="\n") as f:
             for name in _NAMES:
                 f.write(f"{name}.mid: -V100 -G013\n")
+        # Real mid2agb output for those flags, with KNOWN, well-past mtimes
+        # (one far older than 1 hour ago, which the old "now - 1h" missed).
+        from core.sound.safe_song_save import render_s_with_mid2agb
+        base = time.time() - 100000
+        for i, name in enumerate(_NAMES):
+            mid = os.path.join(self.midi_dir, name + ".mid")
+            with open(mid, "wb") as f:
+                f.write(_probe_midi())
+            s = os.path.join(self.midi_dir, name + ".s")
+            with open(s, "w", encoding="latin-1", newline="\n") as f:
+                f.write(render_s_with_mid2agb(self.root, name, _probe_midi(),
+                                              ["-V100", "-G013"]))
+            os.utime(mid, (base - 10, base - 10))
+            mt = base + i * 1000
+            os.utime(s, (mt, mt))
+        os.utime(self.cfg, (base - 5, base - 5))
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -82,14 +104,19 @@ class MidiCfgMtimeTest(unittest.TestCase):
                              f"{n}.s mtime was touched — PorySuite must not "
                              f"disturb a sound the user never edited")
 
-    def test_update_flags_backdates_and_leaves_s_untouched(self):
+    def test_update_flags_leaves_only_that_song_to_rebuild(self):
+        # A real flag change is NOT hidden from the build (the old backdate hid
+        # it): that song's .s is left older than midi.cfg, the others untouched
+        # and newer than midi.cfg.
         before = {n: self._s_mtime(n) for n in _NAMES}
         changed = update_midi_cfg_flags(self.root, "se_small_item", volume=90)
         self.assertTrue(changed)
         cfg_mt = os.stat(self.cfg).st_mtime
-        self.assertLess(cfg_mt, min(self._s_mtime(n) for n in _NAMES))
-        for n in _NAMES:
+        self.assertLess(self._s_mtime("se_small_item"), cfg_mt,
+                        "the song whose flags changed must be left for the build")
+        for n in ("se_heart", "se_coin"):
             self.assertEqual(self._s_mtime(n), before[n])
+            self.assertLess(cfg_mt, self._s_mtime(n))
 
     def test_voicegroup_index_from_name(self):
         self.assertEqual(voicegroup_index_from_name("voicegroup013"), 13)
@@ -146,17 +173,6 @@ class MidiCfgMtimeTest(unittest.TestCase):
                           f"{rel}:{fn_re} must pass the current voicegroup to the "
                           f"rebuild, or a bank change reverts")
             self.assertIn(rebuild_call, body)
-
-    def test_backdate_helper_handles_no_s_files(self):
-        # An empty dir (no .s) must not raise and must leave cfg alone.
-        empty = os.path.join(self.root, "empty")
-        os.makedirs(empty)
-        cfg = os.path.join(empty, "midi.cfg")
-        with open(cfg, "w") as f:
-            f.write("x")
-        before = os.stat(cfg).st_mtime
-        _backdate_midi_cfg(cfg)   # must not raise
-        self.assertEqual(os.stat(cfg).st_mtime, before)
 
 
 if __name__ == "__main__":

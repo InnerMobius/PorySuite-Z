@@ -140,6 +140,13 @@ class SoundEditorTab(QWidget):
         songs_layout = QVBoxLayout(songs_page)
         songs_layout.setContentsMargins(4, 4, 4, 4)
 
+        # Song build protection status (read-only check, in the background):
+        # warns only when some song's music is only in its .s and the project's
+        # own build is not protected.
+        from ui.song_protection_status import SongProtectionStatus
+        self._protection_status = SongProtectionStatus()
+        songs_layout.addWidget(self._protection_status)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         songs_layout.addWidget(splitter)
 
@@ -549,6 +556,7 @@ class SoundEditorTab(QWidget):
                         "Auto-generating voicegroup labels failed: %s", exc)
 
             self._populate_song_list()
+            self._protection_status.refresh(project_root)
 
             self._btn_import_midi.setEnabled(True)
             self._btn_import_s.setEnabled(True)

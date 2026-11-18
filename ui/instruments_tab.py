@@ -39,6 +39,10 @@ _ROLE_SLOT_IDX = Qt.ItemDataRole.UserRole + 11
 _ROLE_INST_TYPE = Qt.ItemDataRole.UserRole + 12
 _ROLE_INST_KEY = Qt.ItemDataRole.UserRole + 13
 
+# Clicking an instrument's name (here or in the Voicegroups tab) previews it
+# at MIDI note 60 — middle C, which M4A/GBA naming calls C5.
+PREVIEW_NAME_CLICK_NOTE = 60
+
 _DIRTY_BG = QColor("#3d2e00")
 _DIRTY_SS = ("QGroupBox { border: 1px solid #ffb74d; border-radius: 4px; }"
              "QGroupBox::title { color: #ffb74d; }")
@@ -540,6 +544,9 @@ class InstrumentsTab(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self._inst_tree.currentItemChanged.connect(self._on_instrument_selected)
+        # A mouse click on the name plays the instrument at middle C. Clicks
+        # only — arrowing through the list stays silent.
+        self._inst_tree.itemClicked.connect(self._on_instrument_name_clicked)
         left_layout.addWidget(self._inst_tree)
 
         # Action buttons at the bottom of the list (always visible)
@@ -920,7 +927,10 @@ class InstrumentsTab(QWidget):
         self._btn_play.clicked.connect(self._on_play_preview)
         play_row.addWidget(self._btn_play)
 
-        self._preview_note_label = QLabel("C4 (60)")
+        # Always names the note last previewed (Play Note, a name click or a
+        # piano key), via `_midi_to_name` so it matches the piano's naming.
+        self._preview_note_label = QLabel()
+        self._show_preview_note(PREVIEW_NAME_CLICK_NOTE)
         play_row.addWidget(self._preview_note_label)
 
         play_row.addStretch()
@@ -1189,28 +1199,32 @@ class InstrumentsTab(QWidget):
     # Selection — show instrument details
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _on_instrument_selected(self, current, previous):
-        """User clicked an instrument in the list."""
-        if current is None:
-            self._clear_details()
-            return
+    def _instrument_for_item(self, item):
+        """The (instrument, voicegroup) a tree row stands for, or (None, None).
 
-        vg_name = current.data(0, _ROLE_VG_NAME)
-        slot = current.data(0, _ROLE_SLOT_IDX)
-
-        if not vg_name or slot is None or not self._voicegroup_data:
-            self._clear_details()
-            return
-
+        Type-group header rows carry no voicegroup/slot and resolve to nothing.
+        """
+        if item is None or not self._voicegroup_data:
+            return None, None
+        vg_name = item.data(0, _ROLE_VG_NAME)
+        slot = item.data(0, _ROLE_SLOT_IDX)
+        if not vg_name or slot is None:
+            return None, None
         vg = self._voicegroup_data.get_voicegroup(vg_name)
         if not vg:
-            self._clear_details()
-            return
-
+            return None, None
         inst = vg.get_instrument(slot)
         if not inst:
+            return None, None
+        return inst, vg
+
+    def _on_instrument_selected(self, current, previous):
+        """User clicked an instrument in the list."""
+        inst, vg = self._instrument_for_item(current)
+        if inst is None:
             self._clear_details()
             return
+        vg_name = current.data(0, _ROLE_VG_NAME)
 
         self._current_instrument = inst
         self._current_vg_name = vg_name
@@ -1798,8 +1812,6 @@ class InstrumentsTab(QWidget):
 
     def _on_piano_key(self, midi_note: int):
         """User pressed a piano key — start sustained preview."""
-        self._preview_note_label.setText(
-            f"{_midi_to_name(midi_note)} ({midi_note})")
         _log.debug("Piano key DOWN: %s (%d)", _midi_to_name(midi_note),
                    midi_note)
         self._play_instrument_note(midi_note, sustain=True)
@@ -1825,6 +1837,53 @@ class InstrumentsTab(QWidget):
         """Play button clicked — short preview at middle C (60)."""
         self._play_instrument_note(60, sustain=False)
 
+    def _show_preview_note(self, midi_note: int):
+        """Name the note being previewed, e.g. "C5 (60)".
+
+        Every preview goes through `_play_instrument_note`, which calls this,
+        so the label can never be left naming a different note than the one
+        just played. It used to start as a hard-coded "C4 (60)" while the
+        piano keys named the same note "C5".
+        """
+        self._preview_note_label.setText(
+            f"{_midi_to_name(midi_note)} ({midi_note})")
+
+    def _sync_play_button(self):
+        """Enable Play Note only when the shown instrument can be previewed.
+
+        A preview can now be started for an instrument other than the one in
+        the detail panel (a name click from the Voicegroups tab), so when it
+        finishes the button must follow the panel, not just switch back on.
+        """
+        inst = self._current_instrument
+        self._btn_play.setEnabled(inst is not None and not inst.is_keysplit)
+
+    def _on_instrument_name_clicked(self, item, column: int):
+        """A click on an instrument's name plays it at middle C (note 60).
+
+        Only the name column counts; the "Used In" column and the type-group
+        header rows stay silent. Reads the instrument and nothing else, so a
+        click can never mark anything unsaved.
+        """
+        if column != 0:
+            return
+        inst, _vg = self._instrument_for_item(item)
+        if inst is None:
+            return
+        self.preview_instrument(inst, PREVIEW_NAME_CLICK_NOTE)
+
+    def preview_instrument(self, inst, midi_note: int = 60):
+        """Play a short preview of ``inst`` through this tab's preview player.
+
+        The one entry point for previews requested from outside the list —
+        the Voicegroups tab's name click uses it — so every preview in the
+        Sound Editor shares one player and one request token: a new preview
+        always stops or supersedes the previous one instead of stacking.
+        """
+        _log.debug("Preview requested: %s at note %d",
+                   getattr(inst, 'friendly_name', '?'), midi_note)
+        self._play_instrument_note(midi_note, sustain=False, inst=inst)
+
     def _on_octave_down(self):
         """Shift piano keyboard down one octave."""
         cur = self._piano.start_octave
@@ -1844,14 +1903,18 @@ class InstrumentsTab(QWidget):
         high = low + self._piano._num_octaves - 1
         self._piano_range_label.setText(f"C{low} – B{high}")
 
-    def _play_instrument_note(self, midi_note: int, sustain: bool = False):
-        """Render and play the current instrument at the given MIDI note.
+    def _play_instrument_note(self, midi_note: int, sustain: bool = False,
+                              inst=None):
+        """Render and play an instrument at the given MIDI note.
 
+        ``inst`` defaults to the instrument shown in the detail panel.
         If sustain=True, renders a long note (10 seconds) so the user can
         hear the loop sustain. Playback stops on key release.
         If sustain=False, renders a short 800ms preview.
         """
-        inst = self._current_instrument
+        if inst is None:
+            inst = self._current_instrument
+        self._show_preview_note(midi_note)
         if inst is None or inst.is_keysplit:
             return
 
@@ -1927,7 +1990,7 @@ class InstrumentsTab(QWidget):
             current = self._preview_token
 
         self._preview_status.setText("")
-        self._btn_play.setEnabled(True)
+        self._sync_play_button()
 
         if token != current:
             # The key came up, or another note was pressed, while this was
@@ -1965,7 +2028,7 @@ class InstrumentsTab(QWidget):
         if token != current:
             return
         self._preview_status.setText(f"Preview failed: {msg}")
-        self._btn_play.setEnabled(True)
+        self._sync_play_button()
 
     # ═══════════════════════════════════════════════════════════════════════
     # Sample management
@@ -2262,10 +2325,9 @@ class InstrumentsTab(QWidget):
         target.sample_label = sample_label
         target.base_midi_key = 60
         target.pan = 0
-        target.attack = 255
-        target.decay = 0
-        target.sustain = 255
-        target.release = 0
+        from core.sound.sound_constants import DIRECTSOUND_AUDIBLE_ENVELOPE
+        (target.attack, target.decay,
+         target.sustain, target.release) = DIRECTSOUND_AUDIBLE_ENVELOPE
 
         # Mark the voicegroup dirty so it gets saved
         if self._voicegroups_tab_ref:
