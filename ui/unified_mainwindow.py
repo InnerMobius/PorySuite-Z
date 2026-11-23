@@ -661,13 +661,17 @@ class UnifiedMainWindow(QMainWindow):
         fulldex_action.triggered.connect(self._on_export_fulldex)
         tools_menu.addAction(fulldex_action)
 
-        repair_action = QAction("Repair Map Script Damage…", self)
+        # ONE entry for every repair. Each of these used to have its own menu
+        # item, and the list only grows as older bugs get repairs — the menu
+        # was turning into a list of repairs with the real tools buried among
+        # them. The window reads its list from `core.repairs`.
+        repair_action = QAction("Repair…", self)
         repair_action.setToolTip(
-            "Check the project's map scripts for damage left by older\n"
-            "EVENTide builds, and offer to repair it. Shows you\n"
-            "exactly what it found and what it would change before touching\n"
-            "anything — and nothing is written unless you say so.")
-        repair_action.triggered.connect(self._on_repair_map_scripts)
+            "Fix problems in your game files that earlier versions of\n"
+            "PorySuite-Z may have created — damaged map scripts, dialogue\n"
+            "that does not fit the text box. Shows what it found and asks\n"
+            "before changing anything.")
+        repair_action.triggered.connect(self._open_repair_dialog)
         tools_menu.addAction(repair_action)
 
         sprite_swap_action = QAction("Install Sprite Swap Command…", self)
@@ -2314,7 +2318,9 @@ class UnifiedMainWindow(QMainWindow):
     def _on_repair_map_scripts(self):
         """Find and offer to repair damage left by older EVENTide saves.
 
-        Read-only until the user presses Repair. Everything it would change is
+        Opened from Tools → Repair…, which lists it alongside the other
+        repairs; this is its own confirm-and-report flow and is unchanged by
+        that. Read-only until the user presses Repair. Everything it would change is
         listed first, grouped and counted, and the one class of damage that
         cannot be told apart from the user's own edits is listed separately as
         review-only. See `core/eventide_repair.py` for how each detector was
@@ -2805,6 +2811,103 @@ class UnifiedMainWindow(QMainWindow):
             HealLocationsDialog(project_dir, parent=self).exec()
         except Exception as e:
             QMessageBox.critical(self, "Heal Locations", str(e))
+
+    def _open_repair_dialog(self):
+        """Tools → Repair…: the one window for every repair.
+
+        Each repair keeps its own confirm-and-report flow — those are where the
+        user sees what would be written and agrees to it — and this just lists
+        them, says what each one found, and hands over when a button is
+        pressed. Adding a repair means adding a `RepairSpec` in `core.repairs`
+        and one entry in the map below.
+        """
+        if not self.project_info:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        root = self.project_info.get("dir", "")
+        if not root:
+            QMessageBox.warning(self, "Repair",
+                                "This project has no folder set.")
+            return
+        try:
+            from core.repairs import KEY_DIALOGUE, KEY_MAP_SCRIPTS
+            from ui.dialogs.repair_dialog import RepairDialog
+            RepairDialog(root, {
+                KEY_MAP_SCRIPTS: self._on_repair_map_scripts,
+                KEY_DIALOGUE: self._on_repair_dialogue,
+            }, parent=self).exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Repair", str(e))
+
+    def _on_repair_dialogue(self):
+        """The dialogue repair's own flow, opened from Tools → Repair….
+
+        The message box shows two lines. Dialogue whose third line is reached
+        with a plain line break instead of a scroll is drawn below the box and
+        never seen. The writer no longer produces that, but bytes already on
+        disk stay broken until something rewrites them, and finding them by
+        hand means opening every map. This does it in one pass, writes only the
+        offending text blocks, and asks first.
+        """
+        if not self.project_info:
+            QMessageBox.warning(self, "No Project", "Open a project first.")
+            return
+        project_dir = self.project_info.get("dir", "")
+        from core.repairs import plural
+        try:
+            from eventide.backend.dialogue_repair import scan, repair
+            findings = scan(project_dir)
+        except Exception as e:
+            QMessageBox.critical(self, "Repair Dialogue",
+                                 f"Could not scan the project's maps:\n{e}")
+            return
+
+        if not findings:
+            QMessageBox.information(
+                self, "Repair Dialogue",
+                "No dialogue problems found.\n\n"
+                "Every text box in this project's maps fits what the game can "
+                "display.")
+            return
+
+        shown = findings[:25]
+        listing = "\n".join(f"  • {f.map_name} — {f.label}" for f in shown)
+        if len(findings) > len(shown):
+            listing += f"\n  … and {len(findings) - len(shown)} more"
+        reply = QMessageBox.question(
+            self, "Repair Overflowing Dialogue?",
+            f"Found {plural(len(findings), 'text box', 'text boxes')} with a line the game cannot "
+            "show.\nThe box opens, but that line is drawn below the bottom "
+            "edge.\n\n"
+            f"{listing}\n\n"
+            "Fixing changes only the line breaks in these text blocks — not a "
+            "word\nof the dialogue itself, and nothing else in the files.\n\n"
+            "Close or save the Event Editor first if you have unsaved map "
+            "edits.\nRebuild the game afterwards to see the change.\n\n"
+            "Repair them now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        done, failed = repair(findings)
+        for lab in done:
+            self.log_message(f"[Dialogue] repaired {lab}")
+        for lab in failed:
+            self.log_message(f"[Dialogue] COULD NOT repair {lab}")
+
+        fixed = plural(len(done), 'text box', 'text boxes')
+        msg = (f"Repaired {fixed}.\n\n"
+               "Rebuild the game to see the change in-game.")
+        if failed:
+            msg = (f"Repaired {fixed}.\n\n"
+                   f"{plural(len(failed), 'one', 'of them')} could not be "
+                   "written and were left exactly as they were:\n"
+                   + "\n".join(f"  • {lab}" for lab in failed[:15])
+                   + "\n\nNothing was lost — those files are unchanged.")
+            QMessageBox.warning(self, "Repair Dialogue", msg)
+        else:
+            QMessageBox.information(self, "Repair Dialogue", msg)
 
     def _open_var_flag_manager(self):
         """Tools → Variables & Flags: switch to the manager page."""

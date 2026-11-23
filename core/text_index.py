@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from core.gba_text_metrics import encode_gba_linebreaks
+
 
 # ── TextEntry — one indexed string ────────────────────────────────────────────
 
@@ -843,45 +845,6 @@ def build_script_xrefs(project_dir: str) -> dict[str, list[tuple[str, str, str]]
 
 # ── Save-back writers ─────────────────────────────────────────────────────────
 
-def _encode_gba_linebreaks(content: str) -> str:
-    """Encode dialogue text to pokefirered's GBA line-break convention.
-
-    Guarantees NO raw newline ever reaches a ``.string`` / ``_("...")`` — a real
-    newline inside the quotes is unterminated and the assembler/compiler rejects
-    it (breaks the build). Works from EITHER real newlines (an editor that
-    returned plain text) OR existing literal ``\\n``/``\\l``/``\\p`` escapes, and
-    is idempotent (re-encoding its own output is a no-op).
-
-    Convention, matching how pokefirered authors text in a 2-line message box:
-      * blank line (paragraph break)        -> ``\\p``  (clear box, wait)
-      * first line break within a paragraph -> ``\\n``  (line 1 -> line 2)
-      * each subsequent break in that para  -> ``\\l``  (scroll up one line)
-    """
-    s = content.replace("\r\n", "\n").replace("\r", "\n")
-
-    # NEVER re-derive breaks the author already wrote. Collapsing existing
-    # `\n`/`\l`/`\p` to newlines and re-deriving them REWRITES THE AUTHOR'S
-    # CHOICES: `a\nb\nc` came back as `a\nb\lc`, and `\l` SCROLLS where `\n`
-    # starts a line — different rendering, from a save the user did not ask
-    # for. It silently altered 77 lines of `new_game_intro.inc` and 126 of
-    # `strings.c` on a no-op rewrite.
-    #
-    # Real newlines are the only thing that needs converting: they come from a
-    # plain-text editor and cannot go into a `.string` at all.
-    if "\n" not in s:
-        return s
-
-    out_paras = []
-    for para in re.split(r"\n[ \t]*\n", s):           # blank line == paragraph
-        lines = para.split("\n")
-        if len(lines) <= 1:
-            out_paras.append(lines[0] if lines else "")
-        else:
-            # first break \n, every following break \l (the box only shows 2 lines)
-            out_paras.append(lines[0] + "\\n" + "\\l".join(lines[1:]))
-    return "\\p".join(out_paras)
-
-
 def _save_c_string(entry: TextEntry) -> bool:
     """Write back a modified C string (_("...")) to its source file."""
     text = _read(entry.file_path)
@@ -914,7 +877,7 @@ def _save_c_string(entry: TextEntry) -> bool:
     # last save", which only coincides with "what convention does the file
     # use" until the first save — after which a second edit silently dropped
     # the terminator.
-    content = _encode_gba_linebreaks(entry.content).rstrip("$")
+    content = encode_gba_linebreaks(entry.content).rstrip("$")
 
     pattern = re.compile(
         r'(\b' + re.escape(entry.label) +
@@ -943,7 +906,7 @@ def _save_asm_string(entry: TextEntry) -> bool:
     # the assembler rejects it (breaks the build). Encode to the convention from
     # whatever form the content is in (real newlines from a plain-text edit, or
     # existing escapes); idempotent, so a clean entry is rewritten unchanged.
-    value = _encode_gba_linebreaks(entry.content)
+    value = encode_gba_linebreaks(entry.content)
 
     # Split value at GBA line-break boundaries, keeping delimiter attached
     segments = re.split(r"(?<=\\[npl])", value)

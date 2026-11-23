@@ -650,7 +650,8 @@ class FameCheckerTab(QWidget):
             if entry is not None:
                 value = entry.content
         box = GameTextEdit(max_chars_per_line=cpl, max_lines=max(1, lines),
-                           show_toolbar=not locked)
+                           show_toolbar=not locked,
+                           lines_per_page=max(1, lines))
         box.setMaximumHeight(28 * max(1, rows))
         box.set_inc_text(value or "")
         box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)

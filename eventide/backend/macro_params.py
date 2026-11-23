@@ -12,7 +12,7 @@ Leaving a required one out does not fail in the editor and does not fail in
 game — it fails the BUILD, later, as a message that names a macro and a line
 number and nothing else:
 
-    data/maps/Faron/scripts.inc:69: Error: Missing value for required
+    data/maps/Route1/scripts.inc:69: Error: Missing value for required
         parameter `song' of macro `savebgm'
 
 Nothing in that connects back to the dialog it came from, and an audit of the
@@ -57,6 +57,116 @@ class MacroParam:
         # Recorded at parse time: `rest:vararg` loses its `:vararg` once the
         # name is split out, so asking the NAME about it later always says no.
         self.vararg = vararg
+
+
+# ── A project's own commands, described for the editor ──────────────────
+#
+# A project can add script commands of its own (a macro in its event.inc). The
+# editor can always ASSEMBLE them, but without help it can only show one as a
+# box of comma-separated text, which is useless to somebody who does not write
+# code. So a macro may carry a few comment lines, directly above its `.macro`
+# line, that tell the editor how to present it:
+#
+#     @ eventide name: Give Treasure
+#     @ eventide section: Items & Rewards
+#     @ eventide help: The player holds a treasure up, and it is theirs.
+#     @ eventide param what: Treasure | ITEM_ TREASURE_
+#     .macro givetreasure what:req, count=1
+#
+#   name     what the command is called in the list and in Add Command.
+#            A macro with a name is offered in Add Command; one without stays
+#            as it was.
+#   section  which Add Command heading it goes under. An existing heading is
+#            joined; any other name becomes a heading of its own.
+#   help     the one-line description shown in the picker and the dialog.
+#   param    which kinds of constant a parameter takes, by name prefix. Each
+#            prefix's names are offered in one searchable dropdown. A
+#            parameter with no line gets a plain value box. An optional label
+#            can come first, before a bar: `param item: Reward | ITEM_`.
+#
+# These are comments, so the build never sees them, and a project that writes
+# none loses nothing.
+
+_ANNOT_RE = re.compile(
+    r"^\s*@\s*eventide\s+(?P<key>name|section|help|param\s+\w+)\s*:\s*"
+    r"(?P<val>.*?)\s*$", re.I)
+
+
+class ProjectCommand:
+    """A project macro that described itself for the editor."""
+
+    __slots__ = ("name", "label", "section", "help", "params")
+
+    def __init__(self, name: str, label: str, section: str, help_: str,
+                 params: List[Tuple[MacroParam, str, Tuple[str, ...]]]):
+        self.name = name
+        self.label = label
+        self.section = section
+        self.help = help_
+        # (parameter, label shown beside its box, constant prefixes)
+        self.params = params
+
+
+_CMD_CACHE: Dict[str, Dict[str, ProjectCommand]] = {}
+
+
+def _read_macro_lines(root_dir: str):
+    for rel in _REL_MACRO_PATHS:
+        path = os.path.join(root_dir, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                yield fh.read().splitlines()
+        except OSError:
+            continue
+
+
+def _parse_project_commands(root_dir: str) -> Dict[str, ProjectCommand]:
+    macros = get_macros(root_dir)
+    out: Dict[str, ProjectCommand] = {}
+    for lines in _read_macro_lines(root_dir):
+        notes: Dict[str, str] = {}
+        for line in lines:
+            a = _ANNOT_RE.match(line)
+            if a:
+                key = " ".join(a.group("key").lower().split())
+                notes[key] = a.group("val")
+                continue
+            if line.strip().startswith("@"):
+                continue            # an ordinary comment in the same block
+            m = _MACRO_RE.match(line)
+            if m and notes.get("name"):
+                name = m.group("name")
+                params = []
+                for p in macros.get(name, []):
+                    spec = notes.get(f"param {p.name.lower()}", "")
+                    label, _, prefixes = spec.rpartition("|")
+                    label = label.strip() or p.name.replace("_", " ").title()
+                    pfx = tuple(x for x in re.split(r"[\s,]+", prefixes) if x)
+                    params.append((p, label, pfx))
+                out.setdefault(name, ProjectCommand(
+                    name, notes["name"], notes.get("section", ""),
+                    notes.get("help", ""), params))
+            notes = {}
+    _log.debug("found %d described project commands under %s",
+               len(out), root_dir)
+    return out
+
+
+def get_project_commands(root_dir) -> Dict[str, ProjectCommand]:
+    """Macro name -> how to present it, for every macro that described itself."""
+    if not root_dir:
+        return {}
+    key = os.path.abspath(str(root_dir))
+    if key not in _CMD_CACHE:
+        _CMD_CACHE[key] = _parse_project_commands(key)
+    return _CMD_CACHE[key]
+
+
+def project_command(root_dir, name: str) -> Optional[ProjectCommand]:
+    """How to present macro *name*, or None if it did not describe itself."""
+    return get_project_commands(root_dir).get(name)
 
 
 def _parse_macros(root_dir: str) -> Dict[str, List[MacroParam]]:
@@ -107,6 +217,7 @@ def get_macros(root_dir) -> Dict[str, List[MacroParam]]:
 def clear_cache() -> None:
     """Drop the parsed macros. Call when the project changes or reloads."""
     _CACHE.clear()
+    _CMD_CACHE.clear()
 
 
 def flatten_args(args: Sequence) -> List[str]:

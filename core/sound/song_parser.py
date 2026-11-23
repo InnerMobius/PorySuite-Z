@@ -22,6 +22,21 @@ from core.sound.sound_constants import (
 # Data classes
 # ---------------------------------------------------------------------------
 
+STRUCTURE_CMDS = frozenset(('LABEL', 'GOTO', 'PATT', 'PEND', 'FINE', 'WAIT'))
+NOTE_CMDS = frozenset(('NOTE', 'TIE', 'EOT'))
+
+
+def is_value_command(cmd: str) -> bool:
+    """True for a command whose VALUE an editor can change.
+
+    Everything else is either the song's STRUCTURE (labels, jumps, and WAIT —
+    the song's clock, which no editor edits and every length of which would
+    look alike when matching) or a NOTE, which comes from the editor's canvas
+    rather than from the file.
+    """
+    return cmd not in STRUCTURE_CMDS and cmd not in NOTE_CMDS
+
+
 @dataclass
 class TrackCommand:
     """A single command in a track's bytecode sequence."""
@@ -37,10 +52,19 @@ class TrackCommand:
     parsed_value: Optional[int] = None  # value captured at parse time (see __post_init__)
     sub: Optional[str] = None    # XCMD sub-command ('xIECV' / 'xIECL') or MEMACC operation ('mem_set', ...)
     arg1: Optional[int] = None   # MEMACC's first operand (the memory slot); value is the second
-    # Where the command came from: (line number, position on the line). Two
-    # reads of the same file give every command the same origin, and a command
-    # an editor creates has none — which is how a save tells exactly what an
-    # editor changed (safe_song_save.apply_command_edits).
+    # Which command this IS: (track index, ordinal among that track's value
+    # commands). Two reads of the same music give every command the same
+    # origin, and a command an editor creates has none — which is how a save
+    # tells exactly what an editor changed (safe_song_save.apply_command_edits).
+    #
+    # It deliberately does NOT say where in the file the command sat. It used
+    # to — (line number, position on the line) — and that made a command's
+    # identity depend on the file's layout, so anything that moved lines threw
+    # an open editor's save away. See docs/BUGS.md → "Piano Roll: a save is
+    # refused as 'changed on disk'".
+    #
+    # None for notes and structure: an editor's notes come from its canvas,
+    # not from the file, so they are never matched up this way.
     origin: Optional[tuple] = None
 
     def __post_init__(self):
@@ -156,52 +180,16 @@ def extract_tie_notes(track) -> list[dict]:
     with the piano roll's note format, leaving track.commands untouched
     so the song writer can round-trip the original assembly faithfully.
 
+    Which EOT ends which TIE is decided by ``core.sound.tie_pairing``, the
+    one rule the whole program uses -- see its docstring. It used to be
+    decided here, differently from the save check and from the MIDI
+    exporter, and a song whose readings disagreed could not be saved at all.
+
     Returns list of dicts with keys: tick, pitch, duration, velocity.
     (Caller must add the 'track' key.)
     """
-    cmds = track.commands
-    notes = []
-    used_eots: set[int] = set()
-
-    for i, cmd in enumerate(cmds):
-        if cmd.cmd != 'TIE' or cmd.pitch is None:
-            continue
-
-        tie_tick = cmd.tick
-        tie_pitch = cmd.pitch
-        tie_velocity = cmd.velocity
-
-        # Search forward for the matching EOT
-        eot_tick = None
-        for j in range(i + 1, len(cmds)):
-            if j in used_eots:
-                continue
-            other = cmds[j]
-            if other.cmd == 'EOT':
-                if other.pitch is None or other.pitch == tie_pitch:
-                    eot_tick = other.tick
-                    used_eots.add(j)
-                    break
-            if other.cmd == 'TIE' and other.pitch == tie_pitch:
-                eot_tick = other.tick
-                break
-            if other.cmd in ('FINE', 'GOTO'):
-                eot_tick = other.tick
-                break
-
-        if eot_tick is not None and eot_tick > tie_tick:
-            duration = eot_tick - tie_tick
-        else:
-            duration = 96
-
-        notes.append({
-            'tick': tie_tick,
-            'pitch': tie_pitch,
-            'duration': duration,
-            'velocity': tie_velocity if tie_velocity else 100,
-        })
-
-    return notes
+    from core.sound.tie_pairing import tie_notes
+    return tie_notes(track.commands)
 
 
 def parse_song_file(filepath: str) -> SongData:
@@ -413,7 +401,6 @@ def parse_song_file(filepath: str) -> SongData:
         byte_content = m.group(1)
         tokens = [t.strip() for t in byte_content.split(',')]
 
-        n_before = len(current_track.commands)
         i = 0
         while i < len(tokens):
             token = tokens[i]
@@ -715,12 +702,27 @@ def parse_song_file(filepath: str) -> SongData:
                 pass
             i += 1
 
-        for k, made in enumerate(current_track.commands[n_before:]):
-            made.origin = (line_idx, k)
-
     # Don't forget the last track
     if current_track is not None and not in_footer:
         tracks.append(current_track)
+
+    # --- Give every value command a durable identity ------------------------
+    # Assigned here rather than while parsing, because it must not depend on
+    # the file's layout. A build regenerating the .s from the .mid, or Song
+    # Build Protection adding its one header line, moves every line in the
+    # file without changing a note of the music; identifying commands by line
+    # number meant an open editor could no longer match its own song to the
+    # file and refused to save. Counting VALUE commands within each track
+    # survives both, and still shifts — so the save still refuses — if the
+    # music itself gained or lost a command.
+    for t_idx, track in enumerate(tracks):
+        n = 0
+        for cmd in track.commands:
+            if not is_value_command(cmd.cmd):
+                cmd.origin = None
+                continue
+            cmd.origin = (t_idx, n)
+            n += 1
 
     # --- Post-process: convert TIE/EOT pairs into NOTE commands ---
     song.tracks = tracks

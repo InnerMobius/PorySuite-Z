@@ -543,6 +543,57 @@ class GbaTextMetrics:
         return val
 
 
+def encode_gba_linebreaks(content: str) -> str:
+    """Encode dialogue text to pokefirered's GBA line-break convention.
+
+    This is the INVERSE of the slot model documented at the top of this module,
+    and the single encoder for the whole app — EVENTide's map writer, the Text
+    Editor tab's save-back and the rich text widget all call this one function,
+    because two implementations of it drifted and shipped broken dialogue.
+
+    Guarantees NO raw newline ever reaches a ``.string`` / ``_("...")`` — a real
+    newline inside the quotes is unterminated and the assembler/compiler rejects
+    it (breaks the build). Works from EITHER real newlines (an editor that
+    returned plain text) OR existing literal ``\\n``/``\\l``/``\\p`` escapes, and
+    is idempotent (re-encoding its own output is a no-op).
+
+    Convention, matching how pokefirered authors text in a 2-line message box:
+      * blank line (paragraph break)        -> ``\\p``  (clear box, wait)
+      * first line break within a paragraph -> ``\\n``  (line 1 -> line 2)
+      * each subsequent break in that para  -> ``\\l``  (scroll up one line)
+
+    The last rule is the load-bearing one. ``\\n`` moves the cursor DOWN a line
+    slot and ``\\l`` does not (behaviour 3 above), so a third line reached with
+    ``\\n`` is drawn below the window floor and renders as a one-pixel sliver.
+    Encoding every break as ``\\n`` is why a lass in a project's house map lost the
+    third line of her dialogue entirely (2026-11-22).
+    """
+    s = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    # NEVER re-derive breaks the author already wrote. Collapsing existing
+    # `\n`/`\l`/`\p` to newlines and re-deriving them REWRITES THE AUTHOR'S
+    # CHOICES: `a\nb\nc` came back as `a\nb\lc`, and `\l` SCROLLS where `\n`
+    # starts a line — different rendering, from a save the user did not ask
+    # for. It silently altered 77 lines of `new_game_intro.inc` and 126 of
+    # `strings.c` on a no-op rewrite.
+    #
+    # Real newlines are the only thing that needs converting: they come from a
+    # plain-text editor and cannot go into a `.string` at all.
+    if "\n" not in s:
+        return s
+
+    out_paras = []
+    for para in re.split(r"\n[ \t]*\n", s):           # blank line == paragraph
+        lines = para.split("\n")
+        if len(lines) <= 1:
+            out_paras.append(lines[0] if lines else "")
+        else:
+            # First break `\n` (line 1 -> line 2), every following break `\l`
+            # (scroll) — the box only ever shows two lines at once.
+            out_paras.append(lines[0] + _NEWLINE + _SCROLL.join(lines[1:]))
+    return _PAGE.join(out_paras)
+
+
 def load_text_metrics(root: str) -> GbaTextMetrics:
     """Build a measurer for the project at *root*. Never raises."""
     try:

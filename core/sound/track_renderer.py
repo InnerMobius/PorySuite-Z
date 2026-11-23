@@ -468,6 +468,9 @@ def render_track(
 
     current_tempo = bpm
 
+    from core.sound.tie_pairing import tie_ends as _tie_ends
+    tie_ends = _tie_ends(flat_cmds)
+
     for cmd_idx, cmd in enumerate(flat_cmds):
         if cmd.cmd == 'VOICE' and cmd.value is not None:
             state.voice = cmd.value
@@ -503,23 +506,13 @@ def render_track(
             if cmd.pitch is None:
                 continue
 
-            # For TIE commands, compute duration by finding the matching EOT
+            # A held note's length comes from the one shared rule, so the
+            # preview plays the note the editor draws and the save check
+            # measures. This used to pair ties here, in a rule of its own
+            # (and with `flat_cmds.index(cmd)`, which finds the FIRST equal
+            # command, not this one) — BUGS.md 2026-11-18.
             if cmd.cmd == 'TIE':
-                tie_duration = 0
-                cmd_idx = flat_cmds.index(cmd)
-                for fc in flat_cmds[cmd_idx + 1:]:
-                    if fc.cmd == 'EOT' and (fc.pitch is None or fc.pitch == cmd.pitch):
-                        tie_duration = fc.tick - cmd.tick
-                        break
-                    if fc.cmd == 'TIE' and fc.pitch == cmd.pitch:
-                        tie_duration = fc.tick - cmd.tick
-                        break
-                    if fc.cmd in ('FINE', 'GOTO'):
-                        tie_duration = fc.tick - cmd.tick
-                        break
-                if tie_duration <= 0:
-                    tie_duration = 96
-                note_duration = tie_duration
+                note_duration = max(0, tie_ends.get(cmd_idx, cmd.tick) - cmd.tick)
             else:
                 note_duration = cmd.duration
 

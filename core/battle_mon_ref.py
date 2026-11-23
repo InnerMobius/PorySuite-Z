@@ -82,7 +82,9 @@ def mon_palette(project_root: str, slug: str, dir_path: str) -> List[Color]:
     const = "SPECIES_" + slug.upper()
     try:
         from core.sprite_palette_bus import get_bus
-        pal = get_bus().ensure_pokemon_palette(project_root, const)
+        pal = get_bus().ensure_pokemon_palette(
+            project_root, const,
+            sprite_png_path=os.path.join(dir_path, "front.png"))
         if pal:
             return list(pal)
     except Exception:

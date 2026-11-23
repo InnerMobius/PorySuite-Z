@@ -14,7 +14,7 @@ from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSlider, QScrollArea, QFrame, QMessageBox, QInputDialog,
-    QSizePolicy, QComboBox,
+    QSizePolicy, QComboBox, QCompleter,
 )
 
 from ui.custom_widgets.scroll_guard import install_scroll_guard
@@ -27,6 +27,67 @@ _TRACK_COLORS = [
     QColor(180, 120, 220), QColor(100, 200, 220),
     QColor(220, 100, 160), QColor(160, 200, 100),
 ]
+
+
+class _InstrumentCombo(QComboBox):
+    """The instrument picker, with type-to-search.
+
+    A voicegroup has up to 128 slots and a real one is densely filled, with
+    names like "Sc88Pro Nylon Str Guitar" and "Zelda3 Z3 Trumpet". Finding
+    one by scrolling means reading the whole list. Typing narrows it
+    instead: the typed text is matched against the instrument NAMES, as
+    plain text, anywhere in the name and in any case.
+
+    Nothing clever sits between what is typed and what is matched. A
+    synonym layer was tried on 2026-11-18 and removed the same day: typing
+    "flute" offered an ocarina, which is not what was asked for and is not
+    what a search box is. What is typed is what is matched.
+
+    Editable ONLY so it can be typed into. Nothing new can be added
+    (``NoInsert``), and text that matches no instrument is put back to the
+    current one as soon as editing ends -- so the box can never sit there
+    showing an instrument the track is not actually playing.
+
+    The completer reads the combo's own model rather than a copied list, so
+    changing voicegroup repopulates both at once; a copied list would go on
+    offering the previous voicegroup's names.
+
+    The wheel is still handled by the shared scroll guard installed on the
+    instance. This class deliberately does NOT override ``wheelEvent`` --
+    see ``scroll_guard._handles_its_own_wheel``, which leaves such widgets
+    alone and would therefore skip this one.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        completer = QCompleter(self.model(), self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(
+            QCompleter.CompletionMode.PopupCompletion)
+        # A search can easily match more than Qt's default 7 rows; showing
+        # only 7 of them makes a long list of matches look like a short one.
+        completer.setMaxVisibleItems(14)
+        self.setCompleter(completer)
+        le = self.lineEdit()
+        if le is not None:
+            le.editingFinished.connect(self._restore_text)
+
+    def _restore_text(self):
+        """Put the box back to the instrument actually selected.
+
+        Typing something that matches nothing would otherwise leave that text
+        sitting in the box, which reads as if the track were set to it.
+        """
+        idx = self.currentIndex()
+        if idx >= 0 and self.currentText() != self.itemText(idx):
+            self.setEditText(self.itemText(idx))
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._restore_text()
 
 
 class _ColorSwatch(QWidget):
@@ -112,9 +173,11 @@ class TrackRow(QFrame):
         layout.addLayout(top_row)
 
         # ── Row 2: instrument selector (dropdown) ──
-        self._inst_combo = QComboBox()
+        self._inst_combo = _InstrumentCombo()
         self._inst_combo.setStyleSheet("font-size: 9px;")
-        self._inst_combo.setToolTip("Pick an instrument from the voicegroup")
+        self._inst_combo.setToolTip(
+            "Pick an instrument from the voicegroup.\n"
+            "Type part of a name to narrow the list — \"guitar\", \"trumpet\".")
         self._inst_combo.setMaxVisibleItems(20)
         install_scroll_guard(self._inst_combo)
 
@@ -245,7 +308,10 @@ class TrackRow(QFrame):
             else:
                 name = ''
             label = f"{i}: {name}" if name else f"{i}: (empty)"
-            self._inst_combo.addItem(label)
+            # The slot number rides on the item. It equals the row today, and
+            # the selection handler reads it rather than the row so that stays
+            # true if the list is ever ordered any other way.
+            self._inst_combo.addItem(label, i)
         if 0 <= old_idx < 128:
             self._inst_combo.setCurrentIndex(old_idx)
         self._inst_combo.blockSignals(False)
@@ -253,7 +319,9 @@ class TrackRow(QFrame):
     def _on_instrument_changed(self, index: int):
         if index < 0:
             return
-        self.instrument_changed.emit(self._index, index)
+        slot = self._inst_combo.itemData(index)
+        self.instrument_changed.emit(
+            self._index, index if slot is None else int(slot))
 
     def _vol_tooltip(self) -> str:
         c = getattr(self, '_vol_ceiling', 127)

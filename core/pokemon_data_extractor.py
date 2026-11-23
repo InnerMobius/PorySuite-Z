@@ -11,6 +11,8 @@ from core.pokemon_data_extractor_base import PokemonDataExtractor
 from . import hoenn_dex
 from .utils import preprocess_c_file
 
+_log = logging.getLogger(__name__)
+
 
 def _find_abilities_header(root: str) -> str | None:
     """Return the path to the header file defining all abilities."""
@@ -1091,23 +1093,29 @@ class AbilitiesDataExtractor(PokemonDataExtractor):
         header = _find_abilities_header(self.local_util.repo_root())
         data = _load_json(json_path)
         if data is not None:
+            # abilities.json is a cache of the header. An ability added to the
+            # engine after the cache was built (by hand, by another tool, or by
+            # a patch) would otherwise never reach the species editor's ability
+            # lists — and the Abilities tab's save, which rewrites abilities.h
+            # from this dict, would then DELETE its constant. Add any header
+            # constant the cache is missing; existing entries are untouched.
+            header_abs = self._parse_header(header) if header else {}
+            added = [c for c in header_abs if c not in data]
+            for const in added:
+                data[const] = header_abs[const]
             # Enrich with display names + descriptions from text file
             self._enrich_abilities(data)
+            if added:
+                _log.info("abilities.json was missing %d header abilit%s (%s) — added",
+                          len(added), "y" if len(added) == 1 else "ies", ", ".join(added))
+                _write_json(json_path, data, 1)
             print(f"Loaded {len(data)} abilities [OK]")
             return data
         if not header:
             print("Failed to locate abilities header for rebuild")
             return {}
 
-        with open(header, encoding="utf-8") as f:
-            lines = f.readlines()
-        abilities = {}
-        pattern = re.compile(r"^\s*#define\s+(ABILITY_[A-Z0-9_]+)\s+(\d+)")
-        for ln in lines:
-            m = pattern.match(ln)
-            if m:
-                const, ident = m.groups()
-                abilities[const] = {"name": const[len("ABILITY_"):], "id": int(ident)}
+        abilities = self._parse_header(header)
 
         # Enrich with display names + descriptions from text file
         self._enrich_abilities(abilities)
@@ -1117,6 +1125,24 @@ class AbilitiesDataExtractor(PokemonDataExtractor):
             return abilities
 
         print(f"Loaded {len(abilities)} abilities [OK]")
+        return abilities
+
+    @staticmethod
+    def _parse_header(header: str) -> dict:
+        """``#define ABILITY_X <id>`` lines → ``{ABILITY_X: {"name": "X", "id": id}}``,
+        in header order. ``ABILITIES_COUNT`` is not an ability and does not match."""
+        abilities: dict = {}
+        pattern = re.compile(r"^\s*#define\s+(ABILITY_[A-Z0-9_]+)\s+(\d+)")
+        try:
+            with open(header, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return abilities
+        for ln in lines:
+            m = pattern.match(ln)
+            if m:
+                const, ident = m.groups()
+                abilities[const] = {"name": const[len("ABILITY_"):], "id": int(ident)}
         return abilities
 
     def _enrich_abilities(self, abilities: dict) -> None:

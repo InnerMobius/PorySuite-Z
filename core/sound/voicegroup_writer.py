@@ -95,66 +95,22 @@ def append_voicegroup_to_inc(vg, project_root: str) -> str:
         sep = "" if existing.endswith("\n") or not existing else "\n"
         new_text = existing + sep + "\n" + block + "\n"
 
+    # Back up before overwriting. This looks additive, but the branch above
+    # REPLACES an existing block for the same name -- every slot in that
+    # voicegroup, from whatever is in memory. The copy goes to PorySuite's
+    # cache, never the game tree, and is verified byte for byte; if it
+    # cannot be made, nothing is written.
+    if existing:
+        from core.sound.song_sync import backup_song_file
+        try:
+            backup_song_file(project_root, out_path, why='voicegroup_backups')
+        except OSError as exc:
+            raise OSError(
+                "voice_groups.inc was not written: the existing file could "
+                f"not be backed up first ({exc}). Nothing was changed on "
+                "disk.") from exc
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'w', encoding='utf-8', newline='\n') as f:
         f.write(new_text)
-    return out_path
-
-
-def _voicegroup_sort_key(name: str):
-    """Sort voicegroupNNN by numeric index so the file stays ordered."""
-    import re
-    m = re.search(r'(\d+)', name)
-    return (0, int(m.group(1))) if m else (1, name)
-
-
-def write_voice_groups_inc(voicegroup_data, project_root: str) -> str:
-    """Write the full sound/voice_groups.inc for *voicegroup_data*.
-
-    Preserves any ``.include`` lines from the existing file (re-anchored to the
-    voicegroup they followed). Returns the path written.
-    """
-    out_path = os.path.join(project_root, 'sound', 'voice_groups.inc')
-
-    # Preserve .include lines and remember which VG each followed.
-    include_after: dict[str, list[str]] = {}
-    includes_before_first: list[str] = []
-    if os.path.isfile(out_path):
-        try:
-            with open(out_path, 'r', encoding='utf-8') as f:
-                last_vg = None
-                for raw in f:
-                    stripped = raw.strip()
-                    if stripped.endswith('::'):
-                        last_vg = stripped.rstrip(':')
-                    elif stripped.startswith('.include'):
-                        if last_vg is None:
-                            includes_before_first.append(stripped)
-                        else:
-                            include_after.setdefault(last_vg, []).append(stripped)
-        except OSError:
-            pass
-
-    lines: list[str] = []
-    if includes_before_first:
-        lines.extend(includes_before_first)
-        lines.append("")
-
-    for vg_name in sorted(voicegroup_data.voicegroups.keys(),
-                          key=_voicegroup_sort_key):
-        vg = voicegroup_data.voicegroups[vg_name]
-        lines.append("\t.align 2")
-        lines.append(f"{vg_name}::")
-        for inst in vg.instruments:
-            lines.append(f"\t{instrument_to_asm(inst)}")
-        lines.append("")
-        if vg_name in include_after:
-            for inc_line in include_after[vg_name]:
-                lines.append(inc_line)
-            lines.append("")
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, 'w', encoding='utf-8', newline='\n') as f:
-        f.write('\n'.join(lines))
-        f.write('\n')
     return out_path

@@ -307,7 +307,10 @@ def _species_pixmaps(source_data, project_root: str,
         except Exception:
             return ""
 
-    battle_pal = bus.ensure_pokemon_palette(project_root, sp, "normal")
+    # Pass the front-pic path so species on a SHARED sheet (no slug
+    # folder of their own) still resolve the .pal next to the sprite.
+    battle_pal = bus.ensure_pokemon_palette(
+        project_root, sp, "normal", sprite_png_path=_path("frontPic"))
 
     def _battle(key: str) -> Optional[QPixmap]:
         path = _path(key)

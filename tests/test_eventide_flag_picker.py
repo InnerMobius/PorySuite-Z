@@ -84,6 +84,12 @@ def tab(qapp, tmp_path, monkeypatch):
     for name in ('information', 'warning', 'critical', 'question'):
         monkeypatch.setattr(eet.QMessageBox, name,
                             staticmethod(lambda *a, **k: None), raising=False)
+    # Yes, so Apply's "replace this script?" prompt goes ahead -- these tests
+    # are about which flag gets picked, not about that prompt.
+    monkeypatch.setattr(
+        eet.QMessageBox, 'question',
+        staticmethod(lambda *a, **k: eet.QMessageBox.StandardButton.Yes),
+        raising=False)
     vf.invalidate_cache()
 
     inc = tmp_path / 'include' / 'constants'

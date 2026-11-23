@@ -63,6 +63,12 @@ DEFAULT_CHARS_PER_LINE = 36
 # Maximum display lines per text box type
 DEFAULT_MAX_LINES = 20
 
+# Lines VISIBLE at once in the field message box. `sStandardTextBox_WindowTemplates`
+# in `src/new_menu_helpers.c` is 4 tiles tall and prints at y=1 with
+# lineSpacing=1, which fits exactly two lines of FONT_NORMAL. Lines past this
+# arrive by scrolling (`\l`), which is what the counter's up-arrow marks.
+DEFAULT_LINES_PER_PAGE = 2
+
 # Recognised structural-placeholder tokens — render as visible markup.
 # (Color/shadow/highlight tokens are NOT in this list — those are
 # stripped on load, applied as character formats, and re-emitted on save.)
@@ -469,6 +475,17 @@ def display_to_inc(plain_text: str,
     # desyncing like the old positional map did.
     #   \n\n (blank line) -> \p   ;   remaining \n -> \n
     # Any literal \l already in the text passes through untouched.
+    #
+    # This DELIBERATELY does not call `core.gba_text_metrics.encode_gba_linebreaks`,
+    # which turns the third line of a page into a scroll (`\l`). That rule is the
+    # FIELD MESSAGE BOX's — two visible lines — and this function serves the Text
+    # Editor tab, which edits text destined for windows of every height: the
+    # controls guide's is 6 tiles, the new-game intro textbox 15
+    # (`src/oak_speech.c`). Three `\n`-separated lines are correct there. The
+    # 2-line rule is applied where the target window is known: EVENTide's map
+    # writer (`eventide_utils.text_body_lines`), which always writes dialogue for
+    # the field box. The Text Editor tab's save path reaches the shared encoder
+    # via `core.text_index`, whose guard leaves escapes the author wrote alone.
     result = text.replace("\n\n", "\\p").replace("\n", "\\n")
     if not result.endswith("$"):
         result += "$"
@@ -488,7 +505,15 @@ def display_to_eventide(plain_text: str,
     """Convert display state back to EVENTide's internal form."""
     inc = display_to_inc(plain_text, color_runs, escape_map)
     result = inc.rstrip("$")
-    result = result.replace("\\p", "\n\n").replace("\\n", "\n").replace("\\l", "\n")
+    # `\p` and `\n` collapse to EVENTide's structural form (blank line / real
+    # newline) and are re-derived on save. `\l` DOES NOT: it is the author's
+    # own choice to scroll rather than start a line, and the re-derivation
+    # cannot tell the two apart. Flattening it here downgraded every scroll
+    # code in Oak's Lab's e-mail text to `\n` the moment the map was opened
+    # and saved, dropping lines 3 and 4 of that page below the window floor
+    # (2026-11-22). The disk readers leave `\l` literal for the same reason;
+    # keep this path matching them.
+    result = result.replace("\\p", "\n\n").replace("\\n", "\n")
     result += "$"
     return result
 
@@ -512,9 +537,31 @@ def display_char_count(line: str) -> int:
 # ── Counter HTML rendering ─────────────────────────────────────────────────
 
 
-def _build_counter_html(lines: list[str], max_cpl: int, max_lines: int) -> str:
+def _build_counter_html(lines: list[str], max_cpl: int, max_lines: int,
+                        lines_per_page: int = DEFAULT_LINES_PER_PAGE) -> str:
+    """Per-line character counts, labelled with the textbox each line lands in.
+
+    The field message box shows two lines at a time, and a blank line in the
+    editor means "clear the box and wait" (`\\p`). So a flat `L1..L20` told the
+    user nothing about the thing that actually matters — where one textbox ends
+    and the next begins, and which lines arrive by scrolling. The label is
+    `P<page> L<line>`, and a line that only comes into view by scrolling
+    (past `lines_per_page`) carries an up-arrow.
+
+    `lines_per_page` is a parameter because not every window is two lines tall
+    — the Fame Checker's box knows its own capacity and passes it, so the arrow
+    never claims a scroll that will not happen.
+    """
     parts: list[str] = []
+    page = 1
+    line_no = 0
     for i, line in enumerate(lines[:max_lines + 5]):
+        if not line.strip():
+            # A blank line is the page break itself, not a line of text.
+            page += 1
+            line_no = 0
+            continue
+        line_no += 1
         n = display_char_count(line)
         if n > max_cpl:
             color = _CLR_RED
@@ -525,9 +572,10 @@ def _build_counter_html(lines: list[str], max_cpl: int, max_lines: int) -> str:
         else:
             color = _CLR_NORMAL
             weight = "normal"
+        scroll = "↑" if line_no > max(1, lines_per_page) else ""
         parts.append(
             f'<span style="color:{color}; font-weight:{weight}; '
-            f'font-size:10px;">L{i + 1}: {n}/{max_cpl}</span>'
+            f'font-size:10px;">P{page} L{line_no}{scroll}: {n}/{max_cpl}</span>'
         )
         if i < len(lines) - 1:
             parts.append('  ')
@@ -646,10 +694,15 @@ class GameTextEdit(QWidget):
         max_lines: int = DEFAULT_MAX_LINES,
         parent: QWidget | None = None,
         show_toolbar: bool = True,
+        lines_per_page: int = DEFAULT_LINES_PER_PAGE,
     ):
         super().__init__(parent)
         self._max_cpl = max_chars_per_line
         self._max_lines = max_lines
+        # How many lines this window shows at once — drives the counter's
+        # "this line scrolls into view" marker. Two for the field message box;
+        # the Fame Checker passes its own taller window's capacity.
+        self._lines_per_page = lines_per_page
         # Implicit color: the foreground used for un-coloured text.
         # Set by callers via set_implicit_color() to preview NPC
         # gender-tinted dialogue. Kept as a name (not hex) so save
@@ -934,7 +987,8 @@ class GameTextEdit(QWidget):
         txt = self._edit.toPlainText()
         lines = txt.split("\n")
         self._counter.setText(
-            _build_counter_html(lines, self._max_cpl, self._max_lines)
+            _build_counter_html(lines, self._max_cpl, self._max_lines,
+                                self._lines_per_page)
         )
 
 

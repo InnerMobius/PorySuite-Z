@@ -395,7 +395,45 @@ class App:
         """Check GitHub for a newer release.  Runs in the main thread
         but is called via QTimer.singleShot so it doesn't block startup."""
         try:
-            from core.updater import check_for_update, download_and_install, RELEASES_PAGE
+            from core.updater import (
+                check_for_update, download_and_install,
+                startup_update_check, launch_recovery_and_exit,
+                RELEASES_PAGE)
+
+            # Look for leftovers of a previous update: a failure that was
+            # rolled back, an interrupted apply that needs recovery, or
+            # update files that belong to a different installation.
+            state = startup_update_check()
+            if state:
+                kind = state.get("kind")
+                if kind == "recovery_needed":
+                    QMessageBox.warning(
+                        parent_window, "Update Interrupted",
+                        state["message"])
+                    if state.get("recovery_script"):
+                        # Restores the previous version, then relaunches.
+                        launch_recovery_and_exit()   # exits the app
+                elif kind == "rollback_failed":
+                    retry = QMessageBox.critical(
+                        parent_window, "Update Recovery Failed",
+                        state["message"] + "\n\nTry the recovery again now?",
+                        QMessageBox.StandardButton.Yes
+                        | QMessageBox.StandardButton.No)
+                    if (retry == QMessageBox.StandardButton.Yes
+                            and state.get("recovery_script")):
+                        launch_recovery_and_exit()   # exits the app
+                elif kind == "error":
+                    QMessageBox.warning(
+                        parent_window, "Previous Update Failed",
+                        state["message"])
+                elif kind == "notice":
+                    QMessageBox.information(
+                        parent_window, "Update Notes", state["message"])
+                elif kind == "foreign":
+                    QMessageBox.warning(
+                        parent_window, "Update Files From Another Install",
+                        state["message"])
+
             release = check_for_update()
             if release is None:
                 return  # Up to date or offline

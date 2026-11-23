@@ -39,6 +39,7 @@ from ui.palette_utils import read_jasc_pal, write_jasc_pal, clamp_to_gba
 from ui.draggable_palette_row import DraggablePaletteRow
 from core.gba_image_utils import (
     swap_palette_entries, export_indexed_png, _rebuild_color_table,
+    remap_to_palette,
 )
 from core.sprite_palette_bus import get_bus as _get_palette_bus
 
@@ -2597,6 +2598,26 @@ class GraphicsTabWidget(QWidget):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation))
 
+    def _current_indexed_for(self, sp: str, slot: str):
+        """Return the current in-memory Indexed8 QImage for a sprite slot,
+        loading it from disk (as Indexed8) when it hasn't been imported yet.
+
+        Used by the shiny-palette derivation to read the NORMAL sprite whose
+        pixel indices the shiny PNG is matched against. Deleted by mistake in
+        the 2026-10-22 dead-code sweep (commit 181629b) while this caller was
+        still live - see docs/BUGS.md 2026-11-22."""
+        cached = (self._sprite_imgs.get(sp) or {}).get(slot)
+        if cached is not None and not cached.isNull():
+            return cached
+        path = (self._sprite_paths.get(sp) or {}).get(slot, "")
+        if path and os.path.isfile(path):
+            disk = QImage(path)
+            if not disk.isNull():
+                if disk.format() != QImage.Format.Format_Indexed8:
+                    disk = disk.convertToFormat(QImage.Format.Format_Indexed8)
+                return disk
+        return None
+
     def _import_graphic(self, slot: str) -> None:
         """Replace this species' menu ICON or FOOTPRINT with a user-picked PNG.
         (Front/back sprites are imported via "Import Normal + Shiny Set", which
@@ -2676,6 +2697,66 @@ class GraphicsTabWidget(QWidget):
             self, "Footprint Imported",
             "The footprint preview is updated. Click File → Save to write it "
             "to the species' footprint.png.")
+
+    # -- shared-icon-palette helpers ------------------------------------
+    # These four were deleted by mistake in the 2026-10-22 dead-code sweep
+    # (commit 181629b, "Remove the non-functional per-box Front/Back Import
+    # buttons + their dead code") while five callers were still live. Result:
+    # "Import Menu Icon..." and the icon-palette save both died on an
+    # AttributeError that File -> Save swallowed. See docs/BUGS.md 2026-11-22.
+    # Do NOT remove any of them without re-running the self.<method> audit in
+    # tests/test_ui_self_calls_resolve.py.
+
+    def _icon_target_slot(self, sp: str) -> int:
+        """Which of the three shared icon palettes this species uses. Respects
+        a live combo edit for the currently-selected species, else the stored
+        gMonIconPaletteIndices value."""
+        if sp == self._current_species:
+            return self._icon_pal_combo.currentIndex()
+        if self._data:
+            try:
+                return int(self._data.get_icon_idx(sp))
+            except Exception:
+                pass
+        return 0
+
+    def _reindex_existing_icon(self, sp: str, path: str):
+        """Re-bake an EXISTING icon.png: keep its art (pixel indices) but pair it
+        with the shared icon palette this species now uses, so a palette edit
+        rewrites the PNG's colour table. Returns (indexed_img, palette) or
+        (None, None). Used when there's no pending import to remap."""
+        img = QImage(path)
+        if img.isNull():
+            return None, None
+        if img.format() != QImage.Format.Format_Indexed8:
+            img = img.convertToFormat(QImage.Format.Format_Indexed8)
+        pal = list(self._icon_palettes.get(self._icon_target_slot(sp))
+                   or [(0, 0, 0)] * 16)
+        return img, pal
+
+    def _remapped_imported_icon(self, sp: str):
+        """Fit a pending imported icon's raw artwork onto this species' shared
+        icon palette. Returns (indexed_img, palette) or (None, None)."""
+        src = self._icon_import_src.get(sp)
+        if src is None or src.isNull():
+            return None, None
+        pal = list(self._icon_palettes.get(self._icon_target_slot(sp))
+                   or [(0, 0, 0)] * 16)
+        rem = remap_to_palette(src, pal, bg_transparent=True)
+        if rem.format() != QImage.Format.Format_Indexed8:
+            rem = rem.convertToFormat(QImage.Format.Format_Indexed8)
+        return rem, pal
+
+    def _refresh_imported_icon_preview(self, sp: str) -> None:
+        """Re-render the icon preview from a pending import, fitted to whichever
+        shared icon palette the species points at right now."""
+        rem, pal = self._remapped_imported_icon(sp)
+        if rem is None:
+            return
+        self._icon_src = QPixmap.fromImage(_rebuild_color_table(rem, pal, 0))
+        self._icon_recoloured = None
+        self._icon_frame = 0
+        self._render_icon_frame()
 
     def _apply_imported_icon(self, sp: str, path: str, img: QImage) -> None:
         """Import a menu icon (mini). Icons don't own their palette — every
@@ -2758,7 +2839,7 @@ class GraphicsTabWidget(QWidget):
         # correspondence (front-shiny matches front, back-shiny matches back).
         best = None
         for slot in ("front", "back"):
-            spr = self._current_indexed_for(sp, slot, normal)
+            spr = self._current_indexed_for(sp, slot)
             if spr is None or spr.isNull():
                 continue
             if (spr.width(), spr.height()) != (sh.width(), sh.height()):
@@ -3194,7 +3275,25 @@ class GraphicsTabWidget(QWidget):
                     if not path:
                         continue
                     img = imgs.get(key)
-                    if img is None or img.format() != QImage.Format.Format_Indexed8:
+                    _staged = (img is not None
+                               and img.format() == QImage.Format.Format_Indexed8)
+                    if key == "back" and not _staged:
+                        # NEVER re-stamp a palette onto the back sprite's
+                        # EXISTING on-disk pixels. Those pixel indices were
+                        # drawn against the OLD palette ORDER; a front-sprite
+                        # import gives the species a NEW order, so re-stamping
+                        # points every back pixel at the wrong colour and the
+                        # file comes out garbled — with the original art gone.
+                        # Reported 2026-11-22; see docs/BUGS.md.
+                        #
+                        # The back is still written whenever its PIXELS were
+                        # actually imported (`_staged`) — that is how "Import
+                        # Normal + Shiny Set" writes it, both here and through
+                        # the `_sprite_png_dirty` loop below — so the user can
+                        # re-import a matching back and repair it. Only the
+                        # blind palette re-bake is gone.
+                        continue
+                    if not _staged:
                         if not os.path.isfile(path):
                             continue
                         disk_img = QImage(path)

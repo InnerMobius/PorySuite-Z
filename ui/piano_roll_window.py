@@ -377,7 +377,7 @@ class PianoRollWindow(QMainWindow):
 
         # The loop is drawn where it PLAYS. A loop label's position in the
         # song's text is earlier than that whenever pattern calls come before
-        # it (Kakariko: text 2879, plays 3935), and the canvas draws notes
+        # it (one song: text 2879, plays 3935), and the canvas draws notes
         # where they play.
         from core.sound.midi_exporter import song_loop_region
         played = song_loop_region(song)

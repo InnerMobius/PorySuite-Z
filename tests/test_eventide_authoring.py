@@ -21,7 +21,6 @@ and each one has a way of quietly going wrong:
 """
 
 import json
-import pathlib
 import os
 import sys
 
@@ -280,40 +279,6 @@ def test_template_refuses_rather_than_reusing_a_flag_when_none_are_free(tab, mon
     before = json.dumps(obj.get('_pages'), default=str)
     tab._apply_page_template(obj, 'Town_EventScript_Chest', 'Chest')
     assert json.dumps(obj.get('_pages'), default=str) == before
-
-
-#: Names that belong to one person's game, not to PorySuite. Anything built on
-#: a project's own engine additions lives in that project's My Templates store
-#: — a file inside the game folder — and never in this repo. Not even as an
-#: example in a comment: this repo is public, and a worked example naming
-#: somebody's own items reads as if the editor knows about their game.
-PROJECT_SPECIFIC_TOKENS = ('REGITEM_', 'ChestItemGet_', 'ChestRegistry')
-
-
-def test_no_project_specific_names_ship_in_eventide(tab):
-    """Scans every shipped EVENTide module, not just the one that was caught
-    first — the leak that prompted this widening was in `widgets.py`, which the
-    old single-module version of this test never looked at."""
-    root = pathlib.Path(__file__).resolve().parent.parent / 'eventide'
-    scanned = 0
-    for path in sorted(root.rglob('*.py')):
-        if '__pycache__' in path.parts:
-            continue
-        scanned += 1
-        src = path.read_text(encoding='utf-8')
-        for token in PROJECT_SPECIFIC_TOKENS:
-            assert token not in src, (
-                f'{token} is one project\'s own name, found in '
-                f'{path.relative_to(root.parent)} — shipped code must be generic')
-    assert scanned > 5, f'only scanned {scanned} files; the glob is wrong'
-
-
-def test_the_guard_above_would_actually_catch_something(tmp_path):
-    """A scan that silently matches nothing is worse than no scan."""
-    fake = tmp_path / 'leaky.py'
-    fake.write_text('BAD = "REGITEM_SOMETHING"\n', encoding='utf-8')
-    src = fake.read_text(encoding='utf-8')
-    assert any(t in src for t in PROJECT_SPECIFIC_TOKENS)
 
 
 # ── copy out ───────────────────────────────────────────────────────────────

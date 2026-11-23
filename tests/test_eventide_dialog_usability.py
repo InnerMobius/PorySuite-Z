@@ -103,6 +103,23 @@ def command_widgets():
         and c is not eet._CommandWidget)
 
 
+def build(cls):
+    """One instance of a command widget, ready to inspect.
+
+    Every widget can be made with no arguments except the one that lays a
+    project's own command out from its description; that one is given a
+    sample command with one dropdown parameter and one plain value.
+    """
+    if cls is eet._ProjectCommandWidget:
+        from eventide.backend.macro_params import MacroParam, ProjectCommand
+        pc = ProjectCommand(
+            'givetreasure', 'Give Treasure', '', 'Hands over a treasure.',
+            [(MacroParam('what', True, 0), 'Treasure', ('ITEM_',)),
+             (MacroParam('count', False, 1), 'Count', ())])
+        return cls(pc)
+    return cls()
+
+
 def fields(widget):
     """The widget's own input fields, as (attribute name, field) pairs.
 
@@ -165,7 +182,7 @@ def test_the_command_picker_can_describe_what_it_is_pointing_at(seeded):
 def test_no_field_is_capped_too_small_to_read(seeded):
     squeezed = []
     for name, cls in command_widgets():
-        w = cls()
+        w = build(cls)
         for attr, obj in fields(w):
             if isinstance(obj, QSpinBox):
                 continue  # a spin box holds a short number by definition
@@ -195,7 +212,7 @@ def test_every_field_has_a_tooltip(seeded):
     for name, cls in command_widgets():
         # Keep the parent alive: let it go and Qt deletes its children,
         # which turns every field lookup after it into a RuntimeError.
-        w = cls()
+        w = build(cls)
         for attr, obj in fields(w):
             if not obj.toolTip():
                 bare.append(f'{name}.{attr}')
@@ -207,7 +224,7 @@ def test_every_field_has_a_tooltip(seeded):
 def test_nothing_has_to_be_typed_by_hand(seeded):
     typed = []
     for name, cls in command_widgets():
-        w = cls()
+        w = build(cls)
         for attr, obj in fields(w):
             fid = f'{name}.{attr}'
             if fid in FREE_BY_DESIGN:

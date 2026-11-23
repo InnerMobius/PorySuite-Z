@@ -871,19 +871,27 @@ class PianoRollCanvas(QWidget):
 
     # ── Mouse: press ───────────────────────────────────────────────────
 
-    _debug_log = None
-
     def _debug(self, msg: str):
-        """Write debug message to file for troubleshooting."""
+        """Append a diagnostic line to porysuite/piano_roll_debug.log.
+
+        OFF BY DEFAULT — enable for a session with PORYSUITE_DIAG=1 (see
+        core/diag_log.py), the same gate the save diagnostics use. This used
+        to open a HARDCODED ``C:/GBA/porysuite/piano_roll_debug.log`` on the
+        first click, which raised inside the mouse handler on any machine
+        where that folder did not exist. The path is now derived from where
+        the application actually is, and ``diag_log.append`` never raises, so
+        logging can never break Piano Roll interaction. When disabled this is
+        a cached boolean check and writes nothing.
+        """
+        from core import diag_log
+        if not diag_log.enabled():
+            return
+        import os
         import time
-        if PianoRollCanvas._debug_log is None:
-            PianoRollCanvas._debug_log = open(
-                'C:/GBA/porysuite/piano_roll_debug.log', 'w')
-            PianoRollCanvas._debug_log.write(
-                f"=== Piano Roll Debug Log — {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
-        ts = time.strftime('%H:%M:%S')
-        PianoRollCanvas._debug_log.write(f"[{ts}] {msg}\n")
-        PianoRollCanvas._debug_log.flush()
+        log_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "piano_roll_debug.log")
+        diag_log.append(log_path, f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     def mousePressEvent(self, event: QMouseEvent):
         pos = event.position()

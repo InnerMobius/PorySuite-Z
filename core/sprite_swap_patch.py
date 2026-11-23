@@ -7,7 +7,7 @@ A ``setobjectgraphics`` script command, so a script can swap any event's
 sprite mid-scene — the player included. RPG Maker has had this as one command
 since forever ("Change Event Graphic"); pokefirered has no equivalent at all,
 which means an emotion pose, a character picking something up, an NPC changing
-outfit, or a chest turning into an open chest are each a C function somebody
+outfit, or a door sliding open are each a C function somebody
 has to write by hand.
 
 Three idempotent edits, each fenced with a sentinel so re-running is safe:

@@ -767,6 +767,40 @@ class AbilitiesHeaderPriorityTest(unittest.TestCase):
         path = os.path.join(self.project_info["dir"], "src", "data", "abilities.json")
         self.assertTrue(os.path.isfile(path))
 
+    def test_cache_gains_abilities_added_to_header_later(self):
+        """An ability added to abilities.h after abilities.json was cached must still
+        reach the editor (and so survive the Abilities tab's header rewrite), and the
+        cached entries must come back exactly as they were."""
+        root = self.project_info["dir"]
+        cached = {
+            "ABILITY_NONE": {"name": "NONE", "id": 0, "display_name": "-------"},
+            "ABILITY_TEST": {"name": "TEST", "id": 1, "display_name": "MY EDIT"},
+        }
+        path = os.path.join(root, "src", "data", "abilities.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cached, f)
+        with open(os.path.join(root, "include", "constants", "abilities.h"), "w") as f:
+            f.write("#define ABILITY_NONE 0\n#define ABILITY_TEST 1\n"
+                    "#define ABILITY_LATE 2\n\n#define ABILITIES_COUNT 3\n")
+        os.makedirs(os.path.join(root, "src", "data", "text"), exist_ok=True)
+        with open(os.path.join(root, "src", "data", "text", "abilities.h"), "w") as f:
+            f.write('static const u8 sLateDescription[] = _("Arrived late.");\n'
+                    "const u8 *const gAbilityDescriptionPointers[ABILITIES_COUNT] =\n{\n"
+                    "    [ABILITY_LATE] = sLateDescription,\n};\n"
+                    "const u8 gAbilityNames[ABILITIES_COUNT][ABILITY_NAME_LENGTH + 1] =\n{\n"
+                    '    [ABILITY_LATE] = _("LATE"),\n};\n')
+        ext = pdextractor.AbilitiesDataExtractor(self.project_info, "abilities.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            data = ext.extract_data()
+        self.assertEqual(list(data.keys()), ["ABILITY_NONE", "ABILITY_TEST", "ABILITY_LATE"])
+        self.assertEqual(data["ABILITY_LATE"]["id"], 2)
+        self.assertEqual(data["ABILITY_LATE"]["display_name"], "LATE")
+        self.assertEqual(data["ABILITY_LATE"]["description"], "Arrived late.")
+        self.assertEqual(data["ABILITY_TEST"], cached["ABILITY_TEST"])   # untouched
+        self.assertNotIn("ABILITIES_COUNT", data)
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("ABILITY_LATE", json.load(f))                   # cache re-synced
+
 
 class PokemonConstantsExtractorTest(unittest.TestCase):
     """Ensure constants.json is rebuilt from the pokemon.h header."""

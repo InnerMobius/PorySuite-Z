@@ -655,6 +655,51 @@ QTabBar::tab:hover:!selected {
             logging.exception("Failed to add Normalize button")
             self._normalize_btn = None
 
+        # ── Stat Balance Assistant (advisory, read-only) ─────────────────
+        # Sits under the six Base Stats inputs. Its widgets belong to the
+        # panel object, NOT to self.ui, so the blanket _dirty auto-wiring
+        # below never connects to them: choosing a tier/role there is
+        # editor metadata (PorySuite data folder), never a species edit,
+        # and must never mark the window modified.
+        self._stat_balance_panel = None
+        try:
+            from ui.stat_balance_panel import StatBalancePanel
+            self._stat_balance_panel = StatBalancePanel()
+            self.ui.formLayout_baseStats.addRow(self._stat_balance_panel)
+            for _w in (self.ui.base_hp, self.ui.base_atk, self.ui.base_def,
+                       self.ui.base_spatk, self.ui.base_spdef,
+                       self.ui.base_speed):
+                _w.valueChanged.connect(self._refresh_stat_balance_stats)
+        except Exception:
+            logging.exception("Failed to add the Stat Balance panel")
+            self._stat_balance_panel = None
+
+        # ── "Suggest EV Yield…" (advisory, preview-first) ────────────────
+        # Lives inside the EV Yield group, right under the six controls it
+        # advises on. Kept OFF self.ui so the blanket _dirty auto-wiring
+        # never connects to it; nothing changes unless the user clicks
+        # Apply in the preview, and Apply writes through the ordinary EV
+        # spinboxes exactly like typing (same dirty/save behavior).
+        # NOTE: QPushButton comes from the module-level import. A local
+        # "from PyQt6.QtWidgets import QPushButton" here would make the
+        # name local to ALL of __init__ and crash the earlier
+        # reset_species_button line with UnboundLocalError — that exact
+        # crash shipped on 2026-11-22 and killed every launch.
+        self._ev_suggest_btn = None
+        try:
+            self._ev_suggest_btn = QPushButton("Suggest EV Yield…")
+            self._ev_suggest_btn.setToolTip(
+                "<qt style='white-space:normal'>Recommends the EVs this "
+                "creature awards when defeated, from its stats, its place "
+                "in the project's evolution lines and authentic vanilla "
+                "Gen 3 patterns. Preview only — nothing changes unless "
+                "you apply it.</qt>")
+            self._ev_suggest_btn.clicked.connect(self._on_suggest_ev_yield)
+            self.ui.formLayout_evYield.addRow(self._ev_suggest_btn)
+        except Exception:
+            logging.exception("Failed to add the Suggest EV Yield button")
+            self._ev_suggest_btn = None
+
         # Monitor tab changes
         self.ui.mainTabs.currentChanged.connect(self.on_main_tab_changed)
         self.ui.tab_pokemon_data.currentChanged.connect(self.on_pokemon_tab_changed)
@@ -3916,7 +3961,8 @@ QTabBar::tab:hover:!selected {
         dkp_exports = _devkitpro_env_exports()
         if not dkp_exports:
             QMessageBox.warning(self, 'devkitPro Not Found',
-                'devkitPro was not found at C:\\devkitPro.\n\n'
+                'devkitPro was not found. PorySuite looks in C:\\devkitPro '
+                'and at the DEVKITPRO environment variable.\n\n'
                 'Install devkitPro (selecting GBA Development) from '
                 'https://devkitpro.org/wiki/Getting_Started, then try again.')
             return
@@ -4364,6 +4410,14 @@ QTabBar::tab:hover:!selected {
         # against stale species from the previous project.
         self.previous_selected_species = None
         self.previous_selected_form = None
+
+        # Drop the previous project's roster/evolution context from the
+        # Stat Balance panel so nothing carries across projects.
+        try:
+            if getattr(self, "_stat_balance_panel", None) is not None:
+                self._stat_balance_panel.clear()
+        except Exception:
+            logging.exception("Stat Balance panel clear failed")
 
         # Invalidate learnset option cache so it rebuilds for the new project's move data.
         self._learnset_cache_valid = False
@@ -7165,6 +7219,107 @@ in the game.</p>
 
         self.ui.tab_pokemon_data.setEnabled(True)
 
+        # Stat Balance Assistant: tell the panel which creature is now on
+        # screen, then feed it the freshly loaded spinbox values. Display
+        # only — the panel never writes species data or dirty state.
+        try:
+            self._refresh_stat_balance_context(species, form)
+        except Exception:
+            logging.exception("Stat Balance context refresh failed")
+
+    def _refresh_stat_balance_stats(self, *_a):
+        """Live BST feed: the six base-stat spinboxes → the balance panel.
+        Runs on every spinbox change (and during loads, harmlessly — it
+        only repaints labels, it cannot touch data or dirty tracking)."""
+        panel = getattr(self, "_stat_balance_panel", None)
+        if panel is None:
+            return
+        _u = self.ui
+        panel.update_stats({
+            "hp": _u.base_hp.value(), "attack": _u.base_atk.value(),
+            "defense": _u.base_def.value(),
+            "sp_attack": _u.base_spatk.value(),
+            "sp_defense": _u.base_spdef.value(),
+            "speed": _u.base_speed.value(),
+        })
+
+    def _refresh_stat_balance_context(self, species, form=None):
+        """Species/form switch → reload that creature's stored design
+        intent and the project roster/evolution context."""
+        panel = getattr(self, "_stat_balance_panel", None)
+        if panel is None:
+            return
+        try:
+            proj = (self.project_info or {}).get("dir", "")
+        except Exception:
+            proj = ""
+        panel.update_context(proj, self.source_data, species, form)
+        self._refresh_stat_balance_stats()
+
+    def _on_suggest_ev_yield(self):
+        """Open the Suggest EV Yield preview for the creature on screen.
+
+        Read-only toward the project while computing: it reads the live
+        spinboxes (unsaved edits included) and the evolution data, builds
+        the recommendation, and only an explicit Apply writes — through
+        the same EV spinboxes a manual edit uses, so dirty tracking and
+        Save behave identically."""
+        species = getattr(self, "previous_selected_species", None)
+        if not species or getattr(self, "source_data", None) is None:
+            return
+        try:
+            from PyQt6.QtWidgets import QDialog
+            from core.ev_yield import classify_project_stage
+            from core.stat_balance import classify_evolution_edges
+            from ui.ev_suggest_dialog import EvSuggestDialog
+            _u = self.ui
+            form = getattr(self, "previous_selected_form", None)
+            stats = {
+                "hp": _u.base_hp.value(), "attack": _u.base_atk.value(),
+                "defense": _u.base_def.value(),
+                "sp_attack": _u.base_spatk.value(),
+                "sp_defense": _u.base_spdef.value(),
+                "speed": _u.base_speed.value(),
+            }
+            current = {
+                "hp": _u.evs_hp.value(), "attack": _u.evs_atk.value(),
+                "defense": _u.evs_def.value(),
+                "sp_attack": _u.evs_spatk.value(),
+                "sp_defense": _u.evs_spdef.value(),
+                "speed": _u.evs_speed.value(),
+            }
+            raw = {}
+            for sp in (self.source_data.get_pokemon_data() or {}):
+                try:
+                    rows = [e for e in (self.source_data.get_evolutions(sp)
+                                        or []) if isinstance(e, dict)]
+                    if rows:
+                        raw[sp] = rows
+                except Exception:
+                    continue
+            edges = classify_evolution_edges(raw)
+            category, basis = classify_project_stage(species, edges)
+            name = (self.source_data.get_species_info(
+                species, "speciesName", form)
+                or species.replace("SPECIES_", "").title())
+            dlg = EvSuggestDialog(str(name), stats, current, category,
+                                  basis, _u.evs_hp.maximum(), self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return  # Cancel: nothing was touched.
+            evs = dlg.selected_evs()
+            if not evs:
+                return
+            # The normal edit path — identical to the user typing these
+            # values, so the usual dirty marking and Save apply.
+            _u.evs_hp.setValue(evs["hp"])
+            _u.evs_atk.setValue(evs["attack"])
+            _u.evs_def.setValue(evs["defense"])
+            _u.evs_spatk.setValue(evs["sp_attack"])
+            _u.evs_spdef.setValue(evs["sp_defense"])
+            _u.evs_speed.setValue(evs["speed"])
+        except Exception:
+            logging.exception("Suggest EV Yield failed")
+
     def update_gender_ratio(self, value):
         """
         Update the gender ratio label based on the given value.
@@ -9381,6 +9536,7 @@ in the game.</p>
                 if root:
                     pal = _spbus().ensure_pokemon_palette(
                         root, species, "normal",
+                        sprite_png_path=front_pic,
                     )
                 pm = load_sprite_pixmap(front_pic, pal)
                 if pm is not None and not pm.isNull():
@@ -9546,6 +9702,7 @@ in the game.</p>
                             if root:
                                 pal = get_bus().ensure_pokemon_palette(
                                     root, species, "normal",
+                                    sprite_png_path=front_pic,
                                 )
                         except Exception:
                             pal = None
@@ -9805,7 +9962,11 @@ QTabBar::tab:hover:!selected {
             self._current_dex_const: str | None = None
 
         except Exception as exc:
-            import logging
+            # No local "import logging" here: it would shadow the
+            # module-level import for the WHOLE function, so the inner
+            # "logging.exception(...)" handlers above would raise
+            # UnboundLocalError instead of logging (the same bug class
+            # that killed every launch on 2026-11-22).
             logging.warning("_setup_pokedex_tab failed: %s", exc)
 
     # ── Regional (Hoenn) Pokedex ─────────────────────────────────────────────
@@ -12794,7 +12955,10 @@ QTabBar::tab:hover:!selected {
                         "_load_trainers_editor class editor: %s", exc2
                     )
             except Exception as exc:
-                import logging
+                # No local "import logging": it would shadow the module-
+                # level import for this whole function and turn the inner
+                # "logging.getLogger(...).warning" above into an
+                # UnboundLocalError (launch-killer bug class, 2026-11-22).
                 logging.getLogger(__name__).warning("_load_trainers_editor: %s", exc)
 
     def _save_trainer_classes(self):

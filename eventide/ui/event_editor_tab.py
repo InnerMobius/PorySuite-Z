@@ -815,7 +815,7 @@ _COMMAND_HELP: dict[str, str] = {
 
     # Flags and variables
     'setflag': 'Turns a flag on. A flag remembers one yes-or-no fact forever, '
-               'like "this chest has been opened".',
+               'like "this item ball has been picked up".',
     'clearflag': 'Turns a flag back off.',
     'checkflag': 'Looks at whether a flag is on, so the next command can branch on it.',
     'setvar': 'Stores a number in a variable. Variables remember counts and choices.',
@@ -963,7 +963,7 @@ _COMMAND_HELP: dict[str, str] = {
                'something of its own.',
     'giveitem': 'Hands the player an item the normal way: the jingle plays, '
                 '“You got the X!” appears, and it goes in the bag. '
-                'This is what an item ball or a chest wants.',
+                'This is what an item ball or a gift from an NPC wants.',
     'removeitem': 'Takes an item out of the player’s bag.',
     'checkitem': 'Checks whether the player already has an item, and stores the answer.',
     'checkitemspace': 'Checks whether the bag has room for an item before you give it.',
@@ -999,7 +999,10 @@ _COMMAND_HELP: dict[str, str] = {
 def _command_help(cmd: str) -> str:
     """The one-line plain-English description of a command, or '' if we have
     nothing better to say than the command's own name."""
-    return _COMMAND_HELP.get(cmd, '')
+    if cmd in _COMMAND_HELP:
+        return _COMMAND_HELP[cmd]
+    pc = _project_command(cmd)
+    return pc.help if pc is not None else ''
 
 
 # Comparison operator display names
@@ -1095,6 +1098,15 @@ def _stringize(cmd_tuple: tuple) -> str:
         return ': Branch End'
 
     friendly = _FRIENDLY_NAMES.get(cmd, cmd)
+
+    # ── A command the project added and described itself ───────────────
+    pc = None if cmd in _FRIENDLY_NAMES else _project_command(cmd)
+    if pc is not None:
+        args = _split_args(str(cmd_tuple[1])) if len(cmd_tuple) > 1 else []
+        shown = [_project_value_name(a, pc.params[i][2] if i < len(pc.params)
+                                     else ()) for i, a in enumerate(args)]
+        return (f'@>{pc.label}: {", ".join(shown)}' if shown
+                else f'@>{pc.label}')
 
     # ── No-arg commands ─────────────────────────────────────────────────
     if cmd in ('end', 'return', 'faceplayer', 'lock', 'lockall', 'release',
@@ -1537,7 +1549,8 @@ class _CommandEditDialog(QDialog):
     def __init__(self, cmd_tuple: tuple, parent=None):
         super().__init__(parent)
         cmd = cmd_tuple[0] if cmd_tuple else 'nop'
-        friendly = _FRIENDLY_NAMES.get(cmd, cmd)
+        pc = None if cmd in _FRIENDLY_NAMES else _project_command(cmd)
+        friendly = pc.label if pc is not None else _FRIENDLY_NAMES.get(cmd, cmd)
         self.setWindowTitle(f'Edit: {friendly}')
         self.setMinimumWidth(480)
         self._goto_label: str = ''
@@ -4017,7 +4030,7 @@ def _movement_users(label: str) -> list[str]:
 def _fresh_movement_label(like: str) -> str:
     """A movement name not yet taken, numbered alongside `like`.
 
-    `Faron_Movement_4` -> `Faron_Movement_6` (the next free number), so a copy
+    `Route1_Movement_4` -> `Route1_Movement_6` (the next free number), so a copy
     sits with its siblings instead of being called something unrelated.
     """
     m = re.match(r'^(?P<base>.*_Movement_)(?P<n>\d+)$', (like or '').strip())
@@ -4092,8 +4105,8 @@ class _ApplyMovementWidget(_CommandWidget):
         A movement is a named list shared by every command that points at it.
         Copying an event copies the NAME, so the copy and the original walk the
         same steps, and editing either rewrites both — with nothing on screen to
-        say so. That is what happened duplicating Faron's intro trigger: the new
-        one looked independent and silently shared Faron_Movement_3/4/5.
+        say so. That is what happened duplicating a map's intro trigger: the new
+        one looked independent and silently shared its Movement_3/4/5.
 
         So when more than one command uses this movement, ask first, and offer
         to split off a private copy rather than leaving "edit them all" as the
@@ -6260,6 +6273,111 @@ class _GenericWidget(_CommandWidget):
         return FRIENDLY_COMMANDS.get(self._cmd, self._cmd.replace('_', ' ').title())
 
 
+class _ProjectCommandWidget(_CommandWidget):
+    """A command the PROJECT added, laid out from the project's own description.
+
+    A project that adds a script command can describe it in comment lines
+    above its macro (see macro_params.py): a name, a line of help, and which
+    kinds of constant each parameter takes. Each parameter then gets its own
+    labelled box — a searchable dropdown of exactly those constants — instead
+    of the one comma-separated text box every other unknown command gets.
+    Nothing here names a single game's command.
+    """
+
+    def __init__(self, pc, args='', parent=None):
+        super().__init__(parent)
+        self._pc = pc
+        self._fields: list = []          # (parameter, value getter)
+        values = _split_args(str(args)) if args else []
+        if not pc.params:
+            self._header_only = True
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(4, 2, 4, 2)
+            layout.addWidget(QLabel(pc.label))
+            layout.addStretch()
+            return
+        form = QFormLayout(self)
+        form.setContentsMargins(4, 2, 4, 2)
+        for i, (param, label, prefixes) in enumerate(pc.params):
+            value = values[i] if i < len(values) else ''
+            if prefixes:
+                pool: list[str] = []
+                for pfx in prefixes:
+                    pool += [c for c in ConstantsManager.with_prefix(pfx)
+                             if c not in pool]
+                box = ConstantPicker(pool, prefix=prefixes)
+                if value:
+                    box.set_constant(value)
+                else:
+                    box.setCurrentIndex(-1)
+                getter = box.selected_constant
+            else:
+                box = _make_value_combo(value)
+                if not value:
+                    # Left empty, not 0: an unfilled optional parameter must
+                    # fall back to the macro's own default when assembled.
+                    box.setCurrentIndex(-1)
+                    box.setEditText('')
+                getter = box.selected_value
+            kinds = (' or '.join(prefixes) + ' names' if prefixes
+                     else 'a number or one of the project’s constants')
+            need = 'Required.' if param.required else (
+                'Optional — leave it empty to use the command’s own default.')
+            box.setToolTip(_tt(f'{label}: pick from {kinds}. Type to search.'
+                               f'\n{need}' + (f'\n\n{pc.help}' if pc.help
+                                              else '')))
+            form.addRow(f'{label}:', box)
+            # An attribute as well as a list entry, so the box is a field of
+            # this widget like every other command's (the dialog checks are
+            # written against attributes).
+            setattr(self, f'field_{i}_{param.name}', box)
+            self._fields.append((param, getter))
+
+    def to_tuple(self):
+        vals = [str(get()).strip() for _, get in self._fields]
+        while vals and not vals[-1]:
+            vals.pop()                   # trailing blanks take the macro default
+        return (self._pc.name, ', '.join(vals)) if vals else (self._pc.name,)
+
+    def validation_error(self):
+        missing = [label for (p, get), (_, label, _) in
+                   zip(self._fields, self._pc.params)
+                   if p.required and not str(get()).strip()]
+        if not missing:
+            return None
+        return (f'Pick a value for "{missing[0]}" first.' if len(missing) == 1
+                else 'Fill in ' + ', '.join(f'"{m}"' for m in missing) + ' first.')
+
+    def friendly_name(self):
+        return self._pc.label
+
+
+def _project_command(cmd: str):
+    """How the project describes its own command *cmd*, or None.
+
+    Only ever consulted for commands the editor has no widget of its own for,
+    so a project describing a built-in command cannot replace its editor.
+    """
+    if not cmd or not _PROJECT_ROOT:
+        return None
+    try:
+        from eventide.backend.macro_params import project_command
+        return project_command(_PROJECT_ROOT, cmd)
+    except Exception:
+        logging.getLogger('EVENTide.ProjectCommands').debug(
+            'project command lookup failed for %s', cmd, exc_info=True)
+        return None
+
+
+def _project_value_name(value: str, prefixes) -> str:
+    """Readable name for one argument of a project command."""
+    shown = _resolve_name(value)
+    if shown != value:
+        return shown
+    hit = next((p for p in prefixes if value.startswith(p)), '')
+    return _smart_title(value[len(hit):].replace('_', ' ')) if hit else value
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Widget factory — maps command tuples to the right widget
 # ═════════════════════════════════════════════════════════════════════════════
@@ -6756,6 +6874,11 @@ def _widget_for_tuple(cmd_tuple: tuple) -> _CommandWidget:
         return _BufferStringWidget(parts[0] if parts else '0',
                                     parts[1] if len(parts) > 1 else '')
 
+    # ── A command the project added and described itself ─────────────────
+    pc = _project_command(cmd)
+    if pc is not None:
+        return _ProjectCommandWidget(pc, str(args) if args else '')
+
     # ── Fallback ─────────────────────────────────────────────────────────
     return _GenericWidget(cmd, str(args))
 
@@ -6986,6 +7109,42 @@ for _page_cmds in (_PAGE_1_COMMANDS, _PAGE_2_COMMANDS, _PAGE_3_COMMANDS):
             _CMD_FRIENDLY_NAMES[_raw] = _friendly
 
 
+#: Heading for project commands that did not name a section of their own.
+_PROJECT_SECTION = "This Project's Commands"
+
+
+def _pages_with_project_commands() -> list:
+    """The Add Command pages, plus every command the project described itself.
+
+    A described command joins the heading it names when one exists on any
+    page, so an item command can sit beside Give Item. Any other heading is
+    made on page 1, just above the Freeze & Release section that is kept last
+    on purpose. The module-level page lists are never modified.
+    """
+    pages = [('1', [(n, list(c)) for n, c in _PAGE_1_COMMANDS]),
+             ('2', [(n, list(c)) for n, c in _PAGE_2_COMMANDS]),
+             ('3', [(n, list(c)) for n, c in _PAGE_3_COMMANDS])]
+    try:
+        from eventide.backend.macro_params import get_project_commands
+        described = get_project_commands(_PROJECT_ROOT)
+    except Exception:
+        described = {}
+    for pc in described.values():
+        if pc.name in _CMD_FRIENDLY_NAMES:
+            continue                     # the editor already offers it
+        want = (pc.section or _PROJECT_SECTION).strip()
+        target = next((cmds for _, secs in pages for name, cmds in secs
+                       if name.lower() == want.lower()), None)
+        if target is None:
+            first = pages[0][1]
+            at = len(first) - 1 if first and first[-1][0].startswith('Freeze') \
+                else len(first)
+            target = []
+            first.insert(at, (want, target))
+        target.append((pc.label, pc.name))
+    return pages
+
+
 def _record_recent(cmd: str):
     """Record a command as recently used (most-recent first, no duplicates)."""
     if cmd in _RECENT_COMMANDS:
@@ -7156,7 +7315,7 @@ _CMD_TOOLTIPS: dict[str, str] = {
     'setobjectxyperm': 'Move an NPC to a new position permanently\nPersists across map reloads until flag/var resets it',
     'setobjectmovementtype': 'Change an NPC\'s movement behavior\n(e.g. from standing still to walking a route)',
     'setobjectgraphics': 'Swap any event\'s sprite mid-script — the player too.\n'
-                         'Use it for carry poses, emotions, a chest opening.\n'
+                         'Use it for carry poses, emotions, a door opening.\n'
                          'Needs Tools > Install Sprite Swap Command once per project.',
     'getplayerxy': 'Store the player\'s X and Y position into two variables',
     'random': 'Generate a random number from 0 to (max-1)\nResult stored in VAR_RESULT',
@@ -7405,12 +7564,7 @@ class _CommandSelectorDialog(QDialog):
         self.tabs = QTabWidget()
         self._all_buttons: list[tuple[QPushButton, str, str]] = []
 
-        pages = [
-            ('1', _PAGE_1_COMMANDS),
-            ('2', _PAGE_2_COMMANDS),
-            ('3', _PAGE_3_COMMANDS),
-        ]
-        for page_name, sections in pages:
+        for page_name, sections in _pages_with_project_commands():
             page_widget = QWidget()
             page_layout = QVBoxLayout(page_widget)
             page_layout.setSpacing(4)
@@ -7494,7 +7648,10 @@ class _CommandSelectorDialog(QDialog):
             btn.deleteLater()
         self._recent_buttons.clear()
         for cmd in _RECENT_COMMANDS:
-            friendly = _CMD_FRIENDLY_NAMES.get(cmd, cmd.replace('_', ' ').title())
+            pc = (None if cmd in _CMD_FRIENDLY_NAMES
+                  else _project_command(cmd))
+            friendly = (pc.label if pc is not None else
+                        _CMD_FRIENDLY_NAMES.get(cmd, cmd.replace('_', ' ').title()))
             btn = QPushButton(friendly)
             btn.setMinimumHeight(24)
             btn.setStyleSheet('font-size: 11px;')
@@ -7849,6 +8006,12 @@ class EventEditorTab(QWidget):
         # the comments and skip shared scripts the user never touched.
         self._external_hidden_lines: dict[str, list] = {}
         self._external_baseline: dict[str, list] = {}
+        # The same pair again for TEXT this map SHOWS but does not OWN.
+        # A borrowed text lives in another map's text.inc, which
+        # parse_all_texts never reads, so without these the editor showed the
+        # bare symbol and an edit to it was dropped on save.
+        self._external_text_files: dict[str, Path] = {}
+        self._external_text_baseline: dict[str, str] = {}
         # Content hash of every file this tab READ, taken at read time. Save
         # re-checks them and refuses to write over a file something else has
         # changed since. See _changed_on_disk().
@@ -8576,19 +8739,19 @@ class EventEditorTab(QWidget):
         pf.addRow('Movement:', self.movement_combo)
         # ── Visibility flag ─────────────────────────────────────────────
         # map.json's own `flag` field: while it is SET the engine does not
-        # spawn this event at all. It is how a collected chest stays open and
+        # spawn this event at all. It is how a collected item ball stays gone and
         # a one-off NPC stays gone, and it is NOT the same as a flag a script
         # checks — this one hides the object itself. Porymap has always been
         # able to set it; EVENTide could not, which meant the project's own
-        # documented chest workflow needed a trip to Porymap halfway through.
+        # documented item-ball workflow needed a trip to Porymap halfway through.
         flag_row = QHBoxLayout()
         flag_row.setContentsMargins(0, 0, 0, 0)
         self.obj_flag_combo = ConstantPicker(ConstantsManager.FLAGS,
                                              prefix='FLAG_')
         self.obj_flag_combo.setToolTip(_tt(
             "Hide this event once the flag is SET.\n"
-            "The engine skips spawning it entirely — use it for a chest that\n"
-            "stays open, an item already taken, or an NPC who has left.\n"
+            "The engine skips spawning it entirely — use it for an item ball\n"
+            "already picked up, a gift already given, or an NPC who has left.\n"
             "Leave blank for an event that is always there.\n"
             "This is the OBJECT's own flag, not a flag your script checks."))
         self.obj_flag_combo.currentTextChanged.connect(lambda: self._mark_dirty())
@@ -8760,6 +8923,13 @@ class EventEditorTab(QWidget):
         self.btn_add_cmd.setToolTip(_tt('Insert a new command at the selected position\nOpens the command selector with all available script commands'))
         self.btn_add_cmd.clicked.connect(self._on_add_command)
         cmd_btns.addWidget(self.btn_add_cmd)
+        self.btn_insert_template = QPushButton('Insert Template ▾')
+        self.btn_insert_template.setToolTip(_tt(
+            'Insert one of My Templates below the selected command.\n'
+            'Only adds its commands — the rest of this script, its other\n'
+            'pages and the event settings are left as they are.'))
+        self.btn_insert_template.clicked.connect(self._on_insert_template_button)
+        cmd_btns.addWidget(self.btn_insert_template)
         self.btn_del_cmd = QPushButton('Delete')
         self.btn_del_cmd.setToolTip(_tt('Delete the selected command from the list'))
         self.btn_del_cmd.clicked.connect(self._on_del_command)
@@ -9068,6 +9238,93 @@ class EventEditorTab(QWidget):
                             self.obj_combo.setCurrentIndex(i)
                             return
 
+    def _resolve_external_texts(self):
+        """Load dialogue this map SHOWS but does not OWN, and remember where.
+
+        ``parse_all_texts`` reads this map's ``text.inc`` and
+        ``data/text/*.inc`` — nothing else. But a shared script prints text
+        belonging to whichever map happened to define it: every PC in the
+        game shows ``OneIsland_PokemonCenter_1F_Text_UsualPCServicesUnavailable``,
+        which lives in One Island's ``text.inc``. On any other map that label
+        resolved to nothing, so the command list showed the bare symbol where
+        the words should be, and an edit to it was silently dropped on save
+        because the label is not one of ``_local_text_labels``.
+
+        Mirrors ``_resolve_external_scripts``: record the owning file and a
+        baseline of the text as read, so ``_save_external_texts`` can write
+        back the ones the user actually changed and leave the rest alone.
+        """
+        if not self._root_dir:
+            return
+        from eventide.backend.eventide_utils import (
+            find_text_definitions, parse_text_inc, _strip_braille_prefix,
+        )
+
+        def _message_labels(cmds):
+            for cmd in cmds or ():
+                if (cmd and cmd[0] == 'message' and len(cmd) > 1
+                        and cmd[1] and not (len(cmd) > 2 and cmd[2])):
+                    yield str(cmd[1]).strip()
+
+        def _walk(value):
+            """Every command list inside *value*, whatever shape it is.
+
+            `_all_scripts` holds label -> list of command tuples, while
+            `_pages` holds label -> list of PAGE DICTS, each with its own
+            'commands'. Treating the second as the first reads a dict as a
+            tuple.
+            """
+            if isinstance(value, dict):
+                yield from _walk(value.get('commands'))
+                return
+            if not isinstance(value, list):
+                return
+            pages = [v for v in value if isinstance(v, dict)]
+            if pages:
+                for v in pages:
+                    yield from _walk(v)
+            else:
+                yield value
+
+        def _command_lists():
+            for cmds in list(self._all_scripts.values()):
+                yield from _walk(cmds)
+            for page in list(self._pages.values()):
+                yield from _walk(page)
+
+        wanted = set()
+        for cmds in _command_lists():
+            wanted.update(_message_labels(cmds))
+        wanted -= set(self._texts.keys())
+        if not wanted:
+            return
+
+        by_file: dict = {}
+        for label, src in find_text_definitions(self._root_dir, wanted).items():
+            by_file.setdefault(src, []).append(label)
+        for src, labels in by_file.items():
+            block = parse_text_inc(src)
+            for label in labels:
+                if label not in block:
+                    continue
+                self._texts[label] = block[label]
+                self._external_text_files[label] = src
+                self._external_text_baseline[label] = block[label]
+            self._remember_disk_state(src)
+
+        # The text is baked into each command tuple when the script is parsed
+        # (`texts.get(label, '')`), so the tuples built before this ran still
+        # carry an empty string. Fill those in, or the list still shows the
+        # symbol. Only empty ones are touched — a command that already has
+        # its words keeps them.
+        for cmds in _command_lists():
+            for i, cmd in enumerate(cmds):
+                if (cmd and cmd[0] == 'message' and len(cmd) > 2
+                        and not cmd[2] and cmd[1] in self._texts):
+                    fixed = list(cmd)
+                    fixed[2] = _strip_braille_prefix(self._texts[cmd[1]])
+                    cmds[i] = tuple(fixed)
+
     def _resolve_external_scripts(self, missing: set[str]):
         """Search shared script files for missing labels.
 
@@ -9198,6 +9455,8 @@ class EventEditorTab(QWidget):
         self._external_script_files = {}
         self._external_hidden_lines = {}
         self._external_baseline = {}
+        self._external_text_files = {}
+        self._external_text_baseline = {}
         self._disk_state = {}
 
         self._map_dir = map_dir
@@ -9258,7 +9517,7 @@ class EventEditorTab(QWidget):
         seen = {raw for raw, _ in choices}
         # An object's local id is its 1-BASED POSITION in this list. map.json
         # does not store it as a field — the build writes it out positionally,
-        # so Faron's map.json objects become `object_event 1 ... object_event 8`
+        # so a map's map.json objects become `object_event 1 ... object_event 8`
         # in events.inc, in exactly this order.
         #
         # Reading a `local_id` key instead meant `obj.get('local_id')` was None
@@ -9342,6 +9601,11 @@ class EventEditorTab(QWidget):
                 missing = new_refs - set(self._all_scripts.keys())
                 if not missing:
                     break
+
+        # Borrowed dialogue can only be looked for once the scripts that
+        # reference it are loaded — the PC script comes from data/scripts/,
+        # so its message labels are not known until the step above ran.
+        self._resolve_external_texts()
 
         # Make available to stringizer for movement step lookups
         # Also stash texts under a special key so trainer battle stringizer
@@ -11847,6 +12111,9 @@ class EventEditorTab(QWidget):
         act_down.setEnabled(has_cmd and idx < len(self._cmd_tuples) - 1)
         menu.addSeparator()
         act_insert = menu.addAction('Insert Command...')
+        # Each entry inserts on its own trigger (lambdas), so nothing below
+        # needs to dispatch on it.
+        self._add_insert_template_actions(menu.addMenu('Insert Template'))
         act_del = menu.addAction(f'Delete{many}\tDel')
         act_del.setEnabled(has_cmd)
         menu.addSeparator()
@@ -12423,7 +12690,7 @@ class EventEditorTab(QWidget):
         Deleting the row is always allowed. But a label this map defines that
         something still does `goto`/`call` to would no longer exist once
         saved, and the build would fail on it — worth one line in the log.
-        Shared scripts (Std_ChestOpen and friends) live in their own files, so
+        Shared scripts (Std_ObtainItem and friends) live in their own files, so
         removing their row here never breaks anything.
         """
         external = getattr(self, '_external_script_labels', set()) or set()
@@ -12805,8 +13072,8 @@ class EventEditorTab(QWidget):
         That is data/scripts/*.inc and data/event_scripts.s — the same files
         `_resolve_external_scripts` searches — plus whatever this map already
         resolved from them. Read fresh each time (copy/paste are rare and the
-        files are small), because a map that had no chest when it was opened
-        has never resolved Std_ChestOpen, and paste must still recognise it.
+        files are small), because a map that never called a shared script when
+        it was opened has never resolved it, and paste must still recognise it.
         """
         labels = set(getattr(self, '_external_script_labels', set()) or set())
         root = getattr(self, '_root_dir', None)
@@ -12831,14 +13098,14 @@ class EventEditorTab(QWidget):
     def _strip_shared_sections(self, cmds: list) -> "tuple[list, list]":
         """Leave out the shared-script sections a page DISPLAYS.
 
-        A chest's page shows "Label: Std_ChestOpen" and the body of that shared
-        script under its own lines, so the user can see what it calls. Those
-        rows are a view of data/scripts/chest.inc, not part of the event, and
-        the event's own `call Std_ChestOpen` already runs them. Copying them
+        A page that calls a shared script shows "Label: Std_ObtainItem" and the
+        body of that shared script under its own lines, so the user can see what
+        it calls. Those rows are a view of the file under data/scripts/, not
+        part of the event, and the event's own `call` already runs them. Copying them
         along made a second definition of the shared script: saved into a map
-        that had no chest when opened, that is `Std_ChestOpen::` in the map's
+        that did not call it when opened, that is `Std_ObtainItem::` in the map's
         scripts.inc and a "symbol already defined" build failure; in a map that
-        had one, editing the copy edited every chest in the game.
+        had one, editing the copy edited every event that calls it.
 
         A section runs from its Label row to the next Label row. Returns
         (kept commands, labels of the sections left out).
@@ -14700,7 +14967,7 @@ class EventEditorTab(QWidget):
                 f'This page sets {shown}.\n\n'
                 f'Should each event made from this template get its OWN fresh '
                 f'flag instead of reusing that one?\n\n'
-                f'Say yes for a one-time thing — a chest, a pickup, an NPC who '
+                f'Say yes for a one-time thing — an item ball, a pickup, an NPC who '
                 f'leaves. Say no if every event really should share the flag.',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes)
@@ -14713,7 +14980,7 @@ class EventEditorTab(QWidget):
 
         # A page is only half of an event. The graphic it uses, and the flag
         # that stops it coming back once it has fired, are properties of the
-        # EVENT -- so a template that carries only commands reproduces a chest
+        # EVENT -- so a template that carries only commands reproduces an item ball
         # that works once and then reappears on every map load. Offer to
         # remember them too.
         props: dict = {}
@@ -14726,7 +14993,7 @@ class EventEditorTab(QWidget):
                 '• Hide when flag: each event made from this template gets '
                 'its OWN fresh flag\n\n'
                 'Say yes for something that should stay gone once used — a '
-                'chest, a one-time pickup. Say no to save just the commands.',
+                'item ball, a one-time pickup. Say no to save just the commands.',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes)
             if ret == QMessageBox.StandardButton.Yes:
@@ -14756,6 +15023,125 @@ class EventEditorTab(QWidget):
     #: together the first time any of them fired.
     TEMPLATE_UNUSED_FLAG = '$UNUSED_FLAG$'
 
+    def _fill_template_flag(self, name, cmds, props, title):
+        """Swap ``$UNUSED_FLAG$`` for one real unused flag.
+
+        Returns ``(cmds, props, chosen_flag)``, or ``None`` when the template
+        needs a flag and the project has none left (the user is told).
+        ``chosen_flag`` is '' when the template has no placeholder.
+
+        It is one flag per use, shared by the commands and the properties, so a
+        template that both sets a flag and hides the event behind it uses the
+        same one. Properties are checked too: an item ball needs a flag for its
+        "Hide when flag" even though its script never calls setflag -- the
+        engine sets that flag itself in removeobject.
+        """
+        needs_flag = (any(self.TEMPLATE_UNUSED_FLAG in str(c) for c in cmds)
+                      or any(self.TEMPLATE_UNUSED_FLAG in str(v)
+                             for v in props.values()))
+        if not needs_flag:
+            return cmds, props, ''
+        found = self._find_unused_flags(1)
+        if not found:
+            QMessageBox.warning(
+                self, title,
+                f'"{name}" needs a spare flag and the project has none '
+                f'left.\n\nFree one up in Variables & Flags, then use '
+                f'the template again.')
+            return None
+        chosen = found[0]
+        cmds = [tuple(str(part).replace(self.TEMPLATE_UNUSED_FLAG, chosen)
+                      if isinstance(part, str) else part
+                      for part in c)
+                for c in cmds]
+        props = {k: (v.replace(self.TEMPLATE_UNUSED_FLAG, chosen)
+                     if isinstance(v, str) else v)
+                 for k, v in props.items()}
+        return cmds, props, chosen
+
+    def _add_insert_template_actions(self, menu) -> None:
+        """Fill *menu* with one entry per saved template; each one inserts that
+        template's commands into the page being edited, below the selected
+        line. Shared by the command list's right-click menu and the
+        "Insert Template" button so the two cannot drift apart."""
+        templates = self._load_page_templates()
+        if not templates:
+            act = menu.addAction('(no saved templates yet)')
+            act.setEnabled(False)
+            return
+        for tname in sorted(templates):
+            menu.addAction(
+                tname,
+                lambda _=False, n=tname: self._insert_page_template(n))
+
+    def _on_insert_template_button(self):
+        menu = QMenu(self)
+        self._add_insert_template_actions(menu)
+        menu.exec(self.btn_insert_template.mapToGlobal(
+            self.btn_insert_template.rect().bottomLeft()))
+
+    def _insert_page_template(self, name):
+        """Insert a saved template's commands into the CURRENT page, below the
+        selected line (or at the end when nothing is selected), the same way
+        Paste does.
+
+        Unlike Apply (New Script → My Templates), this never touches the
+        event's other commands, its other pages or its properties -- it is for
+        dropping a known sequence into a script that is already being worked
+        on. ``$UNUSED_FLAG$`` still becomes a fresh flag.
+
+        A template saved from a whole page ends in ``end``. Dropped in above
+        existing commands, that would stop the script there and leave
+        everything below it dead, so a trailing ``end`` is left out when
+        anything follows the insertion point.
+        """
+        if self._current_obj_idx < 0:
+            return
+        from eventide.backend.eventide_utils import resugar_choices
+        templates = self._load_page_templates()
+        entry = templates.get(name)
+        if not entry:
+            return
+        cmds, props = self._template_parts(entry)
+        if not cmds:
+            self._mw.log_message(
+                f'Event Editor: template "{name}" has no commands to insert.')
+            return
+        filled = self._fill_template_flag(name, cmds, {}, 'Insert Template')
+        if filled is None:
+            return
+        cmds, _, chosen = filled
+        # Templates are stored as the page's raw primitives; the list shows
+        # the display form (Show Choices blocks), exactly like _display_page.
+        cmds = resugar_choices(cmds)
+
+        idx = self._selected_cmd_idx()
+        insert_at = idx + 1 if idx >= 0 else len(self._cmd_tuples)
+        dropped_end = False
+        if (insert_at < len(self._cmd_tuples) and cmds
+                and cmds[-1] and cmds[-1][0] == 'end'):
+            cmds = cmds[:-1]
+            dropped_end = True
+        if not cmds:
+            return
+
+        self._push_undo()
+        for i, cmd in enumerate(cmds):
+            self._add_list_item(cmd, insert_at + i)
+        self._cmd_list.setCurrentRow(insert_at + len(cmds) - 1)
+        self._reindent_list()
+        self._mark_dirty()
+        note = f' (flag {chosen})' if chosen else ''
+        if dropped_end:
+            note += ' — left out its closing "end" so the commands below still run'
+        if props:
+            note += (' — its event settings ('
+                     f'{", ".join(sorted(props))}) were not applied; '
+                     'insert only adds commands')
+        self._mw.log_message(
+            f'Event Editor: inserted template "{name}" '
+            f'({len(cmds)} command(s)){note}')
+
     def _apply_page_template(self, obj, script, name):
         """Apply a saved template's commands to the current event's page.
 
@@ -14765,8 +15151,8 @@ class EventEditorTab(QWidget):
         * ``$UNUSED_FLAG$`` anywhere in the commands becomes a real unused
           flag, so each event built from the template gets its own.
         * If the template sets a flag, the object's OWN visibility flag is
-          offered the same one. That is the field that stops a looted chest or
-          a taken item reappearing when the player walks back in — setting
+          offered the same one. That is the field that stops an opened item
+          ball or a taken item reappearing when the player walks back in — setting
           only the script flag leaves a bug that reads as an engine fault.
         """
         templates = self._load_page_templates()
@@ -14777,32 +15163,40 @@ class EventEditorTab(QWidget):
         if not cmds and not props:
             return
 
-        # One flag per APPLY, shared by the commands and the properties, so a
-        # template that both sets a flag and hides the event behind it uses the
-        # same one. Properties are checked too: a chest needs a flag for its
-        # "Hide when flag" even though its script never calls setflag -- the
-        # engine sets that flag itself in removeobject.
-        needs_flag = (any(self.TEMPLATE_UNUSED_FLAG in str(c) for c in cmds)
-                      or any(self.TEMPLATE_UNUSED_FLAG in str(v)
-                             for v in props.values()))
-        chosen = ''
-        if needs_flag:
-            found = self._find_unused_flags(1)
-            if not found:
-                QMessageBox.warning(
-                    self, 'Apply Template',
-                    f'"{name}" needs a spare flag and the project has none '
-                    f'left.\n\nFree one up in Variables & Flags, then apply '
-                    f'the template again.')
+        # Apply REPLACES the event's whole page list and pushes no undo, so
+        # anything already written there is gone for good. Say so first.
+        # A page holding only `end` (or nothing) is not work worth a prompt --
+        # that is what a just-named new script looks like.
+        # Sync the list on screen into the page dict first, so unsaved edits
+        # are counted.
+        self._collect_current_page()
+        pages = obj.get('_pages', []) or []
+        real = [c for pg in pages for c in pg.get('commands', [])
+                if c and c[0] not in ('end', '_label_marker')]
+        if real:
+            n_pages = len(pages)
+            ret = QMessageBox.question(
+                self, 'Replace this script?',
+                f'"{name}" will REPLACE {script}\'s whole script — '
+                f'{len(real)} command(s) on {n_pages} page'
+                f'{"s" if n_pages != 1 else ""} — and Undo cannot bring '
+                f'it back.\n\n'
+                f'To add the template to what is already there, choose No '
+                f'and use Insert Template (next to Add Command, or '
+                f'right-click a command) instead.\n\n'
+                f'Replace the script with the template?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if ret != QMessageBox.StandardButton.Yes:
+                self._mw.log_message(
+                    f'Event Editor: kept {script} — template "{name}" '
+                    f'not applied')
                 return
-            chosen = found[0]
-            cmds = [tuple(str(part).replace(self.TEMPLATE_UNUSED_FLAG, chosen)
-                          if isinstance(part, str) else part
-                          for part in c)
-                    for c in cmds]
-            props = {k: (v.replace(self.TEMPLATE_UNUSED_FLAG, chosen)
-                         if isinstance(v, str) else v)
-                     for k, v in props.items()}
+
+        filled = self._fill_template_flag(name, cmds, props, 'Apply Template')
+        if filled is None:
+            return
+        cmds, props, chosen = filled
 
         obj['_pages'] = [{'commands': cmds,
                           '_label': script,
@@ -14929,7 +15323,7 @@ class EventEditorTab(QWidget):
         Ends with ``release``, NOT ``releaseall`` (2026-11-18). Both unfreeze
         every object, but only ``release`` clears the turn ``faceplayer`` left
         on this NPC; after ``releaseall`` the NPC stood frozen facing the
-        player for good (Kakariko Carpenter1, see release_all_leaves_npc_frozen).
+        player for good (see release_all_leaves_npc_frozen).
         """
         text_label = f'{script}_Text'
         placeholder = 'Everyone, listen up!$'
@@ -16042,6 +16436,10 @@ class EventEditorTab(QWidget):
             # scripts.inc is likewise hand-listed — make sure it's registered.
             self._ensure_map_inc_registered('scripts.inc')
 
+            # Dialogue borrowed from another map is not in local_texts above
+            # and would otherwise be dropped without a word.
+            self._save_external_texts()
+
             # Remove the script blocks of any events the user DELETED this
             # session (write_scripts_inc preserves unmanaged blocks, so they'd
             # otherwise stay orphaned in scripts.inc). Also drop their `_Text`.
@@ -16121,6 +16519,53 @@ class EventEditorTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, 'Save', str(e))
 
+    def _save_external_texts(self):
+        """Write CHANGED borrowed texts back to the map that owns them.
+
+        The mirror of ``_save_external_scripts``, for dialogue. The map save
+        path writes only ``_local_text_labels`` and drops everything else, so
+        without this an edit to borrowed text goes nowhere at all — see
+        docs/BUGS.md → "EVENTide: editing a text that belongs to ANOTHER map
+        is dropped on save".
+
+        Only labels whose text differs from what was read are written, for the
+        same reason the shared-script writer compares against a baseline:
+        writing all of them would rewrite other maps' files on every save.
+
+        Borrowed text is SHARED. Changing it changes it everywhere it is
+        shown, exactly as editing a shared script does, so the user is told
+        which files were touched rather than left to find out.
+        """
+        if not self._external_text_files:
+            return
+        from eventide.backend.eventide_utils import patch_text_in_file
+
+        changed = {
+            label: self._texts[label]
+            for label in self._external_text_files
+            if label in self._texts
+            and self._texts[label] != self._external_text_baseline.get(label)
+        }
+        if not changed:
+            return
+
+        written: dict = {}
+        for label, content in changed.items():
+            src = self._external_text_files[label]
+            if patch_text_in_file(src, label, content):
+                written.setdefault(src, []).append(label)
+                self._external_text_baseline[label] = content
+                self._remember_disk_state(src)
+            else:
+                self._mw.log_message(
+                    f'Event Editor: WARNING — could not update {label} in '
+                    f'{src.name}; the edit was NOT saved.')
+        for src, labels in written.items():
+            self._mw.log_message(
+                f'Event Editor: updated {len(labels)} shared text(s) in '
+                f'{src.parent.name}/{src.name} ({", ".join(sorted(labels))}) '
+                f'— this text is shown wherever that label is used.')
+
     def _save_external_scripts(self):
         """Write CHANGED external scripts back to their source files.
 
@@ -16144,7 +16589,7 @@ class EventEditorTab(QWidget):
         #
         # A resolved shared script is NOT a page of its own — it is appended
         # into the calling page's command list behind a `_label_marker`, which
-        # is how the user sees `Std_ChestOpen` listed under the event that
+        # is how the user sees `Std_ObtainItem` listed under the event that
         # calls it. So the page's own `_label` is the CALLER's label, and
         # testing only that found no external script to write: edits to a
         # shared script were shown in the list, silently dropped on save, and

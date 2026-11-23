@@ -110,6 +110,7 @@ class ConstantsManager:
         root = Path(root_dir)
         cls._root = root
         cls._loaded = True
+        cls._prefix_cache = {}          # with_prefix(): headers may have changed
 
         cls.ITEMS = cls._from_header(root, 'include/constants/items.h', 'ITEM_')
         cls.SPECIES = cls._from_header(root, 'include/constants/species.h', 'SPECIES_')
@@ -175,6 +176,48 @@ class ConstantsManager:
     @classmethod
     def root(cls) -> Path | None:
         return cls._root
+
+    # Book-keeping names that share a family's prefix but are not members.
+    _NOT_A_VALUE = re.compile(r'_(?:BASE|COUNT|START|END|MAX|FIRST|LAST)$')
+    _prefix_cache: dict[str, list[str]] = {}
+
+    @classmethod
+    def with_prefix(cls, prefix: str) -> list[str]:
+        """Every constant in this project whose name starts with *prefix*.
+
+        For the families the editor already loads (items, species, moves...)
+        that list is returned, so a dropdown matches every other dropdown of
+        that kind. Any other prefix -- a family the project invented -- is
+        gathered from every header under include/constants, in file order.
+        """
+        known = {
+            'ITEM_': cls.ITEMS, 'SPECIES_': cls.SPECIES, 'MOVE_': cls.MOVES,
+            'FLAG_': cls.FLAGS, 'VAR_': cls.VARS, 'MUS_': cls.MUSIC,
+            'SE_': cls.SFX, 'TRAINER_': cls.TRAINERS, 'MAP_': cls.MAP_CONSTANTS,
+            'WEATHER_': cls.WEATHER, 'OBJ_EVENT_GFX_': cls.OBJECT_GFX,
+            'DECOR_': cls.DECORATIONS, 'HEAL_LOCATION_': cls.HEAL_LOCATIONS,
+            'MOVEMENT_TYPE_': cls.MOVEMENT_TYPES,
+        }
+        if prefix in known:
+            return list(known[prefix])
+        if prefix in cls._prefix_cache:
+            return list(cls._prefix_cache[prefix])
+        found: list[str] = []
+        inc = cls._root / 'include' / 'constants' if cls._root else None
+        if inc and inc.is_dir():
+            seen: set[str] = set()
+            for header in sorted(inc.rglob('*.h')):
+                rel = header.relative_to(cls._root).as_posix()
+                try:
+                    names = cls._from_header(cls._root, rel, prefix)
+                except (OSError, UnicodeDecodeError):
+                    continue            # one unreadable header loses only itself
+                for name in names:
+                    if name not in seen and not cls._NOT_A_VALUE.search(name):
+                        seen.add(name)
+                        found.append(name)
+        cls._prefix_cache[prefix] = found
+        return list(found)
 
     # ════════════════════════════════════════════════════════════════════════
     # Internal loaders

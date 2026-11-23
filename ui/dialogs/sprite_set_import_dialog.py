@@ -9,7 +9,7 @@ drawn (see that module).
 
 Convenience: pick the Normal Front file and the other rows auto-fill from
 same-folder siblings whose names differ only by a trailing number (the common
-``001Octorok1..5`` layout), each still editable.
+``001Bulbasaur1..5`` layout), each still editable.
 """
 
 from __future__ import annotations

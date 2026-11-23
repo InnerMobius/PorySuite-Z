@@ -125,7 +125,7 @@ RECLAIMABLE = ('free', 'review')
 # items as FLAG_HIDDEN_ITEMS_START + index, trainers as TRAINER_FLAGS_START +
 # trainer, system flags as SYS_FLAGS + n, and the temporary block the engine
 # wipes wholesale. A free slot inside one of these works today, but it is the
-# ground the engine grows into, so nothing hands one out on its own: a chest
+# ground the engine grows into, so nothing hands one out on its own: an item-ball
 # template takes a general-region slot instead. The user can still reclaim one
 # deliberately from the Flag Manager, where the region is on screen.
 INDEXED_REGIONS = ('temporary', 'hidden items', 'hidden items (spare)',
@@ -682,7 +682,7 @@ def auto_claim_names(entries: list) -> list:
     This is :func:`free_names` minus anything sitting in a region the engine
     addresses by slot number (see :data:`INDEXED_REGIONS`). Those slots are
     unreferenced and would work, but they are where the engine expands, so a
-    chest template must not quietly take one. They remain reclaimable by hand
+    item-ball template must not quietly take one. They remain reclaimable by hand
     from the Flag Manager, which shows the region.
     """
     return [e['name'] for e in entries

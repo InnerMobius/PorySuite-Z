@@ -761,6 +761,7 @@ class PokedexDetailPanel(QWidget):
         if species_const and self._project_root:
             pal = _get_palette_bus().ensure_pokemon_palette(
                 self._project_root, species_const, "normal",
+                sprite_png_path=png_path,
             )
         pm = load_sprite_pixmap(png_path, pal)
         self._sprite_lbl.setPixmap(pm or QPixmap())

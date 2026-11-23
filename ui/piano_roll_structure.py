@@ -7,7 +7,7 @@ clock the canvas draws notes on.
 
 It used to list the commands at their position in the song's TEXT, where a
 pattern call takes no time. In a song with repeats the loop then appeared too
-early (Kakariko: shown at 2879, plays at 3935; 40 of the project's 81 looping
+early (one song: shown at 2879, plays at 3935; 40 of the project's 81 looping
 songs were off), and a loop entered there landed too early in the song. Its
 Section / Pattern Call / End Song buttons rewrote the song's commands in
 memory, but no save ever wrote them: the build makes the song's patterns and

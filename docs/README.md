@@ -505,6 +505,18 @@ Build output streams in real time in-app.
 
 ---
 
+## Updating PorySuite-Z
+
+PorySuite-Z checks GitHub for a newer release when it starts (and from **Help > Check for Updates**). If one is available you can install it in one click: the update downloads, the app closes, the new files are applied, and the app restarts on the new version.
+
+Updates are transactional. Before anything is changed, every file the update will touch is backed up; if anything goes wrong mid-update — a locked file, a full disk, even a power loss — the previous version is restored automatically and the app tells you what happened on the next launch. Your settings, projects, caches, and any files you created or modified inside the install folder are never overwritten silently: modified files are set aside in `_update_preserved` and you're told about it.
+
+If the install folder is a Git working copy (you cloned the repository rather than downloading a release), the built-in updater steps aside and asks you to use `git pull` instead, so it can never flatten uncommitted work.
+
+See **TROUBLESHOOTING.md > Updating PorySuite-Z** for what to do if an update is interrupted or fails.
+
+---
+
 ## Credits & Acknowledgements
 
 - **Original PorySuite** by [jschoeny](https://github.com/jschoeny/PorySuite) — PorySuite-Z was originally forked from this project, but has been almost entirely rewritten. Very little of the original codebase remains.

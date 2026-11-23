@@ -25,7 +25,7 @@ def _bounded(token: str) -> "re.Pattern":
         MOVE_THUNDER -> ...     rewrote MOVE_THUNDERBOLT, MOVE_THUNDER_PUNCH,
                                 MOVE_THUNDER_WAVE and MOVE_THUNDER_SHOCK;
                                 0 of 4 neighbours survived
-        Octo -> ...             would rewrite Octorok
+        Kabuto -> ...             would rewrite Kabutops
 
     The underscore IS excluded here, which is what protects
     ``MOVE_THUNDER_PUNCH`` as well as ``MOVE_THUNDERBOLT``.
@@ -36,7 +36,7 @@ def _bounded(token: str) -> "re.Pattern":
         ABRA -> VOLTARIX        made KADABRA into KADVOLTARIX
 
     The underscore is deliberately NOT excluded, so a token still matches
-    straight after one. ``gMonFrontPic_Paras``, ``old_octo.4bpp`` and a
+    straight after one. ``gMonFrontPic_Paras``, ``old_kabuto.4bpp`` and a
     trainer's ``_BULBASAUR`` all have to keep renaming, and a symmetric word
     boundary stops them -- it half-renames maps and graphics rules. That
     symmetric version was proposed twice and rejected twice; see BUGS.md,
@@ -462,8 +462,8 @@ class RefactorService:
         changed = False
         # Bounded, not substring. Before 2026-11-08 this was
         # `if old in ln: ln.replace(old, new)`, so renaming MOVE_THUNDER
-        # rewrote MOVE_THUNDERBOLT and MOVE_THUNDER_PUNCH, and renaming Octo
-        # would rewrite Octorok. See _bounded for why the boundaries are
+        # rewrote MOVE_THUNDERBOLT and MOVE_THUNDER_PUNCH, and renaming Kabuto
+        # would rewrite Kabutops. See _bounded for why the boundaries are
         # asymmetric and why \b is wrong here.
         pat = _bounded(old)
         for idx, ln in enumerate(lines):
@@ -499,13 +499,13 @@ class RefactorService:
 
         which re-reads every file per token and, critically, re-scans the
         PREVIOUS pass's output.  When a new name contains the old name as a
-        substring (e.g. renaming ``Octo`` → ``Octorock``), a later token like
-        ``OCTO → OCTOROCK`` finds its own pattern inside ``SPECIES_OCTOROCK``
-        that the first pass just wrote, and cascades to ``SPECIES_OCTOROCKROCK``.
+        substring (e.g. renaming ``Kabuto`` → ``Kabutops``), a later token like
+        ``KABUTO → KABUTOPS`` finds its own pattern inside ``SPECIES_KABUTOPS``
+        that the first pass just wrote, and cascades to ``SPECIES_KABUTOPSPS``.
 
         This method builds a single combined regex from all token keys
         (``re.escape`` + ``|`` alternation), sorted longest-first so overlapping
-        prefixes resolve to the longer match (``SPECIES_OCTO`` beats ``OCTO`` at
+        prefixes resolve to the longer match (``SPECIES_KABUTO`` beats ``KABUTO`` at
         the same position).  ``re.sub`` advances past each replacement, so a
         newly-written substring can never be re-matched by a later token in the
         SAME sweep.  That is the exact property needed to kill the cascade.
@@ -795,7 +795,7 @@ class RefactorService:
         #    species_info (and each form's species_info). Renaming a species
         #    must repoint every OTHER species' evolution targetSpecies that
         #    referenced it — otherwise species.json keeps a dangling
-        #    targetSpecies (e.g. OCTO -> SPECIES_IVYSAUR after IVYSAUR was
+        #    targetSpecies (e.g. BULBASAUR -> SPECIES_IVYSAUR after IVYSAUR was
         #    renamed to REEFCLAW), which on the post-rename reload leaves the
         #    save-progress dialog stranded on "Reloading project…".
         def _repoint_evos(si) -> None:
@@ -1485,9 +1485,9 @@ class RefactorService:
                 # Atomic multi-token sweep.  Each file is scanned once with a
                 # combined regex; longer tokens win at overlap; no pass can
                 # re-match the output of an earlier pass.  This kills the
-                # cascade bug where renaming e.g. Octo → Octorock produced
-                # SPECIES_OCTOROCKROCK because the later OCTO→OCTOROCK token
-                # was finding OCTO inside the just-written OCTOROCK.
+                # cascade bug where renaming e.g. Kabuto → Kabutops produced
+                # SPECIES_KABUTOPSPS because the later KABUTO→KABUTOPS token
+                # was finding KABUTO inside the just-written KABUTOPS.
                 self._multi_search_and_replace(tokens, preview_only=False,
                                                bare_keys=bare_keys)
 

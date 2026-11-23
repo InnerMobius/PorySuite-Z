@@ -282,9 +282,11 @@ def _find_devkitpro() -> str:
     # /opt/devkitpro that don't map to actual Windows directories.
     env_val = os.environ.get("DEVKITPRO", "")
     if env_val:
-        # Convert /c/foo  →  C:\foo
-        if env_val.startswith("/c/") or env_val.startswith("/C/"):
-            win = "C:\\" + env_val[3:].replace("/", "\\")
+        # Convert MSYS-style /x/foo → X:\foo — ANY drive letter, not just C:
+        # (an install on D: used to be skipped here).
+        if (len(env_val) >= 3 and env_val[0] == "/" and env_val[2] == "/"
+                and env_val[1].isalpha()):
+            win = env_val[1].upper() + ":\\" + env_val[3:].replace("/", "\\")
             if _has_arm_gcc(win):
                 return win
         elif not env_val.startswith("/"):
@@ -311,9 +313,16 @@ def _devkitpro_env_exports() -> str:
 
 
 def _find_bash() -> str:
-    """Return path to bash.exe, checking devkitPro's MSYS2 first, then standalone MSYS2."""
+    """Return path to bash.exe, checking devkitPro's MSYS2 first, then standalone MSYS2.
+
+    The devkitPro candidate is derived from wherever devkitPro actually is
+    (default install location or the DEVKITPRO env var — see
+    `_find_devkitpro`), so an install on another drive still finds its
+    bundled MSYS2 instead of silently falling through to nothing."""
+    dkp = _find_devkitpro()
     candidates = [
-        r"C:\devkitPro\msys2\usr\bin\bash.exe",
+        os.path.join(dkp, "msys2", "usr", "bin", "bash.exe")
+        if dkp else r"C:\devkitPro\msys2\usr\bin\bash.exe",
         r"C:\msys64\usr\bin\bash.exe",
     ]
     for c in candidates:
@@ -739,8 +748,15 @@ def _pkg_installed(import_name: str) -> bool:
 
 
 def _devkitarm_works() -> bool:
-    """Return True only if arm-none-eabi-gcc exists AND actually runs."""
-    gcc = r"C:\devkitPro\devkitARM\bin\arm-none-eabi-gcc.exe"
+    """Return True only if arm-none-eabi-gcc exists AND actually runs.
+
+    Resolved through `_find_devkitpro` (default location or the DEVKITPRO
+    env var), not a hardcoded drive — an install on D: used to be reported
+    as broken here even though the build itself would have found it."""
+    dkp = _find_devkitpro()
+    if not dkp:
+        return False
+    gcc = os.path.join(dkp, "devkitARM", "bin", "arm-none-eabi-gcc.exe")
     if not os.path.isfile(gcc):
         return False
     prev = _suppress_win_error_dialogs()

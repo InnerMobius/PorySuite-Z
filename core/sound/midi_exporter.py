@@ -106,7 +106,7 @@ def song_loop_region(song: SongData):
     build makes (track 1's, as the exporter writes it) — or None.
 
     A loop label's position in the TEXT is not where it plays once pattern
-    calls take their time (Kakariko: text 2879, playback 3935), so an editor
+    calls take their time (in one song: text 2879, playback 3935), so an editor
     drawing notes on the playback clock must draw the loop from this."""
     if not song.tracks:
         return None

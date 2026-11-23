@@ -28,7 +28,7 @@ class ConstantPicker(QComboBox):
         raw = picker.selected_constant()  # 'ITEM_POKE_BALL'
     """
 
-    def __init__(self, constants: list[str], prefix: str = '',
+    def __init__(self, constants: list[str], prefix: str | tuple = '',
                  show_pretty: bool = True, keep_order: bool = False,
                  parent: QWidget | None = None):
         super().__init__(parent)
@@ -36,15 +36,20 @@ class ConstantPicker(QComboBox):
         self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.setMaxVisibleItems(20)
         self._raw_constants = list(constants)
-        self._prefix = prefix
+        # One box can hold several families (an item OR a project's own id), so a
+        # tuple of prefixes is accepted as well as one.
+        self._prefixes = tuple(p for p in ((prefix,) if isinstance(prefix, str)
+                                           else prefix) if p)
+        self._prefix = ' / '.join(self._prefixes)
         self._show_pretty = show_pretty
 
         # Build display items
         self._display_to_raw: dict[str, str] = {}
         display_items: list[str] = []
         for c in self._raw_constants:
-            if show_pretty and prefix:
-                pretty = c[len(prefix):].replace('_', ' ').title() if c.startswith(prefix) else c
+            hit = next((p for p in self._prefixes if c.startswith(p)), '')
+            if show_pretty and self._prefixes:
+                pretty = c[len(hit):].replace('_', ' ').title() if hit else c
                 display = f'{pretty}  ({c})'
             else:
                 display = c
@@ -98,9 +103,11 @@ class ConstantPicker(QComboBox):
             return None
         if text in self._display_to_raw or text in self._raw_constants:
             return None
-        if self._prefix and not text.upper().startswith(self._prefix.upper()):
+        if self._prefixes and not any(text.upper().startswith(p.upper())
+                                      for p in self._prefixes):
+            starts = ' or '.join(self._prefixes)
             return (f'"{text}" is not a {self._prefix}… name. '
-                    f'Names for this field start with {self._prefix}')
+                    f'Names for this field start with {starts}')
         return (f'"{text}" is not one of this project’s {self._prefix}'
                 f'… names. Check the spelling, or pick from the list.')
 

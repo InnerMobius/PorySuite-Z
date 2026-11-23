@@ -4,11 +4,11 @@ THE PROBLEM THIS SOLVES
 
 A Pokedex entry's description is a POINTER, not a string::
 
-    [NATIONAL_DEX_OCTO] = { .description = gOctoPokedexText, ... }
+    [NATIONAL_DEX_BULBASAUR] = { .description = gBulbasaurPokedexText, ... }
 
 and the text lives in a separate file::
 
-    const u8 gOctoPokedexText[] = _(
+    const u8 gBulbasaurPokedexText[] = _(
         "There is a plant seed on its back right\n"
         "from the day this POKeMON is born.\n"
         "The seed slowly grows larger.");
@@ -57,7 +57,7 @@ RULES, in the order they matter
    no-op on a project that has added nothing -- measured on a vanilla tree:
    387 entries, 1 placeholder pointer, that one.
 4. A new symbol is derived from the engine's own constant, never the display
-   name. Names are renamed, re-cased and translated; ``NATIONAL_DEX_OCTO`` is
+   name. Names are renamed, re-cased and translated; ``NATIONAL_DEX_BULBASAUR`` is
    stable, and it is also what vanilla's own symbols are named after.
 5. Collisions are checked against every symbol defined in any text file, every
    symbol referenced by the entries file, and the ones allocated earlier in the
@@ -173,7 +173,7 @@ def taken_symbols(entries_text: str, *text_files: str) -> set[str]:
 # ---------------------------------------------------------------------------
 
 def _camel(const: str) -> str:
-    """``NATIONAL_DEX_BIG_OCTO`` -> ``BigOcto``, matching vanilla's style."""
+    """``NATIONAL_DEX_MR_MIME`` -> ``MrMime``, matching vanilla's style."""
     body = const
     for prefix in ("NATIONAL_DEX_", "HOENN_DEX_", "SPECIES_"):
         if body.startswith(prefix):

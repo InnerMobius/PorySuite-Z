@@ -108,8 +108,34 @@ Nothing in a command dialog has to be typed as a raw constant, bar one deliberat
   **Multi-Choice** offers your `MULTICHOICE_*` option lists. **Set Metatile** offers your `METATILE_*` tiles.
 - **An id or constant EVENTide doesn't recognise is written back exactly as you typed it.** Nothing is quietly
   respelled, so a hand-written script keeps its own wording after a round trip through the editor.
-- The one field left as free text is the fallback editor for commands that have no dialog of their own. It takes
-  the arguments verbatim, the way the script file spells them, and its tooltip says so.
+- The one field left as free text is the fallback editor for commands that have no dialog of their own and that
+  your project has not described (see below). It takes the arguments verbatim, the way the script file spells
+  them, and its tooltip says so.
+
+### Commands your project adds
+A project can add script commands of its own: a `.macro` in `asm/macros/event.inc`. By default EVENTide shows
+such a command as one text box. Write a few comment lines directly above the `.macro` line and it becomes a
+proper command instead, with a name, a description, a place in **Add Command**, and a dropdown for each setting:
+
+```
+	@ eventide name: Give Treasure
+	@ eventide section: Items & Rewards
+	@ eventide help: The player holds a treasure up, and it is theirs.
+	@ eventide param what: Treasure | ITEM_ TREASURE_
+	.macro givetreasure what:req, count=1
+```
+
+- **name**: what the command is called in the list and in Add Command. Only a macro with a name changes.
+- **section**: the Add Command heading it goes under. An existing heading is joined. Any other name becomes a new
+  heading on page 1.
+- **help**: the one-line description shown in Add Command and at the top of the command's dialog.
+- **param**: which families of constant a setting takes, by prefix. Every constant with that prefix in
+  `include/constants/` goes into one searchable dropdown, so one box can offer two families (here, bag items and
+  the project's own treasure ids). A label can come first, before a `|`. A setting with no `param` line gets the
+  ordinary value picker. A required setting must be picked before the dialog will close, and an optional one left
+  empty uses the macro's own default.
+
+These are comments, so the build never sees them. The command list then reads `@>Give Treasure: Nugget`.
 
 ### Picking a sprite by looking at it
 Both places that choose an overworld graphic — the NPC's **Graphic** field and the **Change Graphic** command —
@@ -141,6 +167,18 @@ each gets its own, and each is edited in the normal Show Message dialog with the
 
 Templates can also carry `$UNUSED_FLAG$`, which is swapped for a real spare flag each time the template is
 applied.
+
+### Inserting a template into a script you are already editing
+**Insert Template ▾** (next to Add Command), or right-click a command → **Insert Template**, drops one of My
+Templates into the current page below the selected line, the same way Paste does. Nothing else on the page
+moves, and the event's other pages and settings are left alone. With nothing selected it goes at the end. If
+there are commands below the insertion point, the template's closing `end` is left out, so they still run. One
+Undo takes the whole insert back out.
+
+**New Script → My Templates** is different: it replaces the event's whole script, every page, with the
+template. Use it to start a fresh event, not to add to one. If the event already has commands, it asks first.
+The prompt says how much would be lost and points you to Insert Template. **No** is the default and keeps the
+script. An empty script, or one that is only `end`, is replaced without asking.
 
 ### Script creation
 - **New Script templates**: NPC Scripts, Signs, Map Scripts, Standard Wrappers, Field Objects, Item Balls

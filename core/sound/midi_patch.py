@@ -68,28 +68,23 @@ def _track_events(ex, master, tbs):
     Commands: (kind, time, value, sub, arg1) with VOL as its raw level and
     TEMPO kept apart as (time, bpm)."""
     from core.sound.midi_exporter import _raw_vol, _tempo_bpm, _clamp_velocity
+    from core.sound.safe_song_save import _HeldEvent
+    from core.sound.tie_pairing import tie_spans
     notes, cmds, tempo = Counter(), Counter(), Counter()
-    open_ties: dict = {}
-    last_key = None
+    # Held notes are paired after the walk, by the one shared rule, so this
+    # describes a song exactly as the save check does — BUGS.md 2026-11-18,
+    # where four pairings in four places disagreed and a song could not save.
+    held: list = []
     for t, _s, c in ex.events:
         k = c.cmd
         if k == 'NOTE':
             if c.pitch is None:
                 continue
-            last_key = c.pitch
+            held.append(_HeldEvent(k, t, c.pitch, c.velocity))
             notes[(t, c.pitch, _clamp_velocity(c.velocity),
                    int(c.duration or 0) + int(c.gate_time or 0))] += 1
-        elif k == 'TIE':
-            if c.pitch is None:
-                continue
-            last_key = c.pitch
-            open_ties.setdefault(c.pitch, []).append((t, _clamp_velocity(c.velocity)))
-        elif k == 'EOT':
-            p = c.pitch if c.pitch is not None else last_key
-            last_key = p
-            if open_ties.get(p):
-                t0, v = open_ties[p].pop(0)
-                notes[(t0, p, v, t - t0)] += 1
+        elif k in ('TIE', 'EOT'):
+            held.append(_HeldEvent(k, t, c.pitch, c.velocity))
         elif k == 'TEMPO':
             tempo[(t, round(_tempo_bpm(c, tbs)))] += 1
         elif k == 'KEYSH':
@@ -97,9 +92,8 @@ def _track_events(ex, master, tbs):
         else:
             value = _raw_vol(c, master) if k == 'VOL' else c.value
             cmds[(k, t, value, getattr(c, 'sub', None), getattr(c, 'arg1', None))] += 1
-    for p, opened in open_ties.items():
-        for t0, v in opened:
-            notes[(t0, p, v, ex.end_time - t0)] += 1
+    for t0, p, v, t1 in tie_spans(held, end_tick=ex.end_time):
+        notes[(t0, p, _clamp_velocity(v), t1 - t0)] += 1
     return notes, cmds, tempo
 
 

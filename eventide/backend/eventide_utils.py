@@ -13,6 +13,8 @@ import re
 from pathlib import Path
 from collections import OrderedDict
 
+from core.gba_text_metrics import encode_gba_linebreaks
+
 # EVENTide's own docs directory (ships with the app, not the project)
 _EVENTIDE_DOCS = Path(__file__).resolve().parent.parent / 'docs'
 
@@ -430,7 +432,7 @@ def strip_duplicate_text_blocks(scripts_inc_path: Path,
     this map's dialogue, so a `Foo_Text_3::` block in `scripts.inc` as well is
     a duplicate symbol and the build stops dead:
 
-        data/maps/Faron/text.inc:8: Error: symbol `Faron_Text_3' is already
+        data/maps/Route1/text.inc:8: Error: symbol `Route1_Text_3' is already
             defined
 
     They get there by pasting a copied event. "Copy as Script" renders the
@@ -497,26 +499,151 @@ def write_text_inc(texts: dict, path: Path):
     """
     lines = []
     for label, text in texts.items():
-        if text.startswith(_BRAILLE_PREFIX):
-            actual = text[len(_BRAILLE_PREFIX):]
-            escaped = actual.replace("\n\n", "\\p").replace("\n", "\\n")
-            escaped = escaped.replace('"', '\\"')
-            lines.append(f"{label}::\n")
-            lines.append(f"    .braille \"{escaped}\"\n\n")
-        else:
-            escaped = text.replace("\n\n", "\\p").replace("\n", "\\n")
-            escaped = escaped.replace('"', '\\"')
-            lines.append(f"{label}::\n")
-            # Emit ONE .string per display line (split after each \n / \p), to
-            # match pokefirered's own formatting. Writing the whole block as a
-            # single collapsed .string reformatted EVERY label, so a one-label
-            # edit churned the entire map's text.inc in git (spurious diffs).
-            segs = re.findall(r'.*?\\[npl]|.+', escaped) or [escaped]
-            for seg in segs:
-                lines.append(f"    .string \"{seg}\"\n")
-            lines.append("\n")
+        lines.append(f"{label}::\n")
+        lines.extend(text_body_lines(text))
+        lines.append("\n")
     with path.open('w', encoding='utf-8', newline='\n') as fh:
         fh.writelines(lines)
+
+
+_TEXT_LABEL_RE = re.compile(r'^([A-Za-z0-9_]+)::')
+_TEXT_DIRECTIVE_RE = re.compile(r'^\s*\.(?:string|braille)\s')
+
+
+def text_body_lines(text: str, indent: str = '    ', eol: str = '\n') -> list:
+    """The ``.string`` / ``.braille`` lines for ONE text, label line excluded.
+
+    Shared by ``write_text_inc`` (which rewrites a whole map-local file) and
+    ``patch_text_in_file`` (which replaces one block inside a file it must
+    otherwise leave alone), so the two can never drift apart.
+    """
+    if text.startswith(_BRAILLE_PREFIX):
+        # Braille draws in its own taller window, so the 2-line scroll rule
+        # below is wrong for it: plain `\n` all the way down.
+        actual = text[len(_BRAILLE_PREFIX):]
+        escaped = actual.replace("\n\n", "\\p").replace("\n", "\\n")
+        escaped = escaped.replace('"', '\\"')
+        return [f'{indent}.braille "{escaped}"{eol}']
+    # The field message box shows TWO lines. A third line reached with `\n` is
+    # drawn below the window floor and renders as a one-pixel sliver, which is
+    # how an NPC lost the third line of her dialogue
+    # (2026-11-22). `encode_gba_linebreaks` is the one encoder that knows this:
+    # blank line -> `\p`, first break in a paragraph -> `\n`, the rest -> `\l`.
+    # Never flatten this back to a pair of `str.replace` calls.
+    escaped = encode_gba_linebreaks(text)
+    escaped = escaped.replace('"', '\\"')
+    # Emit ONE .string per display line (split after each \n / \p), to match
+    # pokefirered's own formatting. Writing the whole block as a single
+    # collapsed .string reformatted EVERY label, so a one-label edit churned
+    # the entire map's text.inc in git (spurious diffs).
+    segs = re.findall(r'.*?\\[npl]|.+', escaped) or [escaped]
+    return [f'{indent}.string "{seg}"{eol}' for seg in segs]
+
+
+def find_text_definitions(root_dir, labels) -> dict:
+    """Locate the file that DEFINES each of *labels* as dialogue.
+
+    A map can SHOW text it does not own: the shared PC script prints One
+    Island's "the usual PC services aren't available" line on every map that
+    has a PC, and that label lives in
+    ``data/maps/OneIsland_PokemonCenter_1F/text.inc``. ``parse_all_texts``
+    reads only the current map's ``text.inc`` and ``data/text/*.inc``, so a
+    borrowed label resolves to nothing and the editor shows the bare symbol
+    where the words should be.
+
+    Returns ``{label: path}`` for those it finds. A label with no ``.string``
+    / ``.braille`` under it is a script, not a text, and is not returned.
+    """
+    wanted = set(labels)
+    found: dict = {}
+    if not wanted or root_dir is None:
+        return found
+    search: list = []
+    maps_dir = Path(root_dir) / 'data' / 'maps'
+    if maps_dir.is_dir():
+        search.extend(sorted(maps_dir.glob('*/text.inc')))
+    for sub_dir in ('text', 'scripts'):
+        d = Path(root_dir) / 'data' / sub_dir
+        if d.is_dir():
+            search.extend(sorted(d.glob('*.inc')))
+    for path in search:
+        if not wanted:
+            break
+        try:
+            content = path.read_text(encoding='utf-8')
+        except Exception:
+            continue
+        if not any(lbl in content for lbl in wanted):
+            continue
+        current = None
+        for line in content.splitlines():
+            m = _TEXT_LABEL_RE.match(line.strip())
+            if m:
+                current = m.group(1)
+                continue
+            if (current is not None and current in wanted
+                    and _TEXT_DIRECTIVE_RE.match(line)):
+                found[current] = path
+                wanted.discard(current)
+                current = None
+    return found
+
+
+def patch_text_in_file(path, label: str, content: str) -> bool:
+    """Replace ONE label's dialogue in *path*, leaving the rest untouched.
+
+    Only that block's ``.string`` / ``.braille`` lines are rewritten. Every
+    other byte of the file -- its other labels, its comments, its blank lines,
+    its line endings -- is preserved exactly. Rebuilding a whole shared file
+    from a parsed dict instead is the 2026-10-24 "saving a map rewrites shared
+    scripts and deletes their comments" bug in a different file, and these
+    files belong to OTHER maps, so there is even less excuse here.
+
+    Returns True when the block was found and the file is now correct.
+    """
+    try:
+        with Path(path).open(encoding='utf-8', newline='') as fh:
+            original = fh.read()
+    except Exception:
+        return False
+    lines = original.splitlines(keepends=True)
+    out: list = []
+    i, n = 0, len(lines)
+    done = False
+    while i < n:
+        line = lines[i]
+        m = _TEXT_LABEL_RE.match(line.strip())
+        if done or not m or m.group(1) != label:
+            out.append(line)
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+        eol = '\r\n' if line.endswith('\r\n') else '\n'
+        indent, emitted = '    ', False
+        while i < n:
+            nxt = lines[i]
+            if _TEXT_LABEL_RE.match(nxt.strip()):
+                break
+            if _TEXT_DIRECTIVE_RE.match(nxt):
+                if not emitted:
+                    indent = nxt[:len(nxt) - len(nxt.lstrip())] or indent
+                    out.extend(text_body_lines(content, indent, eol))
+                    emitted = True
+                i += 1          # drop the old directive lines
+                continue
+            out.append(nxt)     # keep comments and blank lines where they are
+            i += 1
+        if not emitted:
+            return False        # the label defines no dialogue
+        done = True
+    if not done:
+        return False
+    new = ''.join(out)
+    if new != original:
+        with Path(path).open('w', encoding='utf-8', newline='') as fh:
+            fh.write(new)
+    return True
 
 
 # ── Map "scene" scripts: per-page NPC appearance ⇄ On Transition ────────────
@@ -2020,11 +2147,11 @@ def lines_from_commands(
             else:
                 # Escape so the whole string stays on ONE physical line — the
                 # reader is line-based, and an embedded real newline both breaks
-                # parsing and (historically) froze it. Inverse of the reader's
-                # `\n`->newline / `\p`->blank-line mapping: paragraph breaks
-                # (blank line) become \p, single breaks become \n.
+                # parsing and (historically) froze it. Same 2-line box rule as
+                # `text_body_lines`: blank line -> `\p`, first break in a
+                # paragraph -> `\n`, every later break -> `\l` (scroll).
                 escaped = text.replace('"', '\\"')
-                escaped = escaped.replace('\n\n', '\\p').replace('\n', '\\n')
+                escaped = encode_gba_linebreaks(escaped)
                 line = f'msgbox "{escaped}"'
                 if msg_type:
                     line += f', {msg_type}'
@@ -2121,7 +2248,7 @@ def lines_from_commands(
 #
 # The project's own convention, counted across 12 real scripts.inc files:
 # 323 tab-indented command lines against 1 flush-left. LABELS are flush-left
-# by convention, which is why `Kakariko_MapScripts::` was untouched in the
+# by convention, which is why the map's `_MapScripts::` label was untouched in the
 # diff while every command under it moved. So this indents commands and must
 # NEVER indent a label.
 #

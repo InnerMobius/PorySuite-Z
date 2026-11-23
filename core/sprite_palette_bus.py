@@ -206,12 +206,30 @@ class SpritePaletteBus(QObject):
 
     def ensure_pokemon_palette(self, project_root: str,
                                species_const: str,
-                               kind: str = "normal") -> List[Color]:
+                               kind: str = "normal",
+                               sprite_png_path: str = "") -> List[Color]:
         """RAM-first, disk fallback. Always returns a list (empty on miss).
 
         The returned list is a COPY, safe to mutate without disturbing
         the cache. If the disk fallback loads a palette, the result is
         populated into the cache so future callers skip disk.
+
+        *sprite_png_path*, when supplied, is the sprite PNG the caller is
+        about to render, and the .pal sitting NEXT TO that PNG takes
+        priority over the slug-derived path (the same pairing rule the
+        shiny-sprite generator and the game's own palette table use).
+        A species whose graphics mapping points at a SHARED sheet —
+        pokefirered keeps several placeholder species on
+        graphics/pokemon/question_mark/... — renders that sheet's art, so
+        it must get that sheet's palette; its graphics/pokemon/<slug>/
+        folder, when one exists at all, may hold an unrelated placeholder
+        palette. The slug path remains the fallback for callers without a
+        sprite path and for sprites whose folder has no .pal.
+
+        A palette read from a DIFFERENT folder than the species' own is
+        deliberately NOT cached: the per-species RAM cache would otherwise
+        let a shared sheet's (or a form's) palette shadow the species' own
+        slug palette for every later caller.
         """
         pal = self.get_pokemon_palette(species_const, kind)
         if pal is not None:
@@ -219,11 +237,20 @@ class SpritePaletteBus(QObject):
         from ui.graphics_data import species_pal_paths
         from ui.palette_utils import read_jasc_pal
         npath, spath = species_pal_paths(project_root, species_const)
-        path = spath if kind == "shiny" else npath
+        slug_path = spath if kind == "shiny" else npath
+        path, cacheable = slug_path, True
+        if sprite_png_path:
+            cand = os.path.join(
+                os.path.dirname(sprite_png_path),
+                "shiny.pal" if kind == "shiny" else "normal.pal")
+            if os.path.isfile(cand):
+                path = cand
+                cacheable = (os.path.normcase(os.path.normpath(cand))
+                             == os.path.normcase(os.path.normpath(slug_path)))
         if not os.path.isfile(path):
             return []
         colors = read_jasc_pal(path, 16) or []
-        if colors:
+        if colors and cacheable:
             # Seed cache quietly (no signal — nothing changed, we just
             # hydrated from disk).
             self._cache[(CAT_POKEMON,

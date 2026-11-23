@@ -927,6 +927,33 @@ Fixed (2026-04-06). The Voicegroups Tab's `save_to_disk()` was writing the full 
 
 ---
 
+## Updating PorySuite-Z
+
+### "This installation is a Git checkout" when updating
+The built-in updater refuses to run when the PorySuite-Z install folder is itself a Git working copy (it has a `.git` folder at its root). Replacing files in a checkout could silently destroy uncommitted work, so even a clean checkout is refused. Update with `git pull` instead. Normal installs (downloaded as a zip or release package) are unaffected and keep one-click updates. A Pokémon project repo *inside* the install folder does not trigger this — only a `.git` at the install root counts.
+
+### An update failed — what state am I in?
+As of 2026-11-23 updates are transactional. Before any file is changed, everything the update will touch is copied into `_update_backup` and verified. If any step fails, the backup is restored automatically and files the update added are removed — the install comes back exactly as it was. On the next launch PorySuite shows a "Previous Update Failed" message with the reason (also saved in `_update_error.log` in the install folder). You are on your old version and can simply try the update again.
+
+### The update was interrupted (crash, power loss, forced shutdown)
+On the next launch PorySuite detects the half-applied update and offers to restore the previous version, then restarts.
+
+If PorySuite itself won't start after an interrupted update, you don't need it to recover: open the install folder and **double-click `_recover_update.bat`**. It is a plain Windows batch script that restores the backup and removes the partial update without needing Python or the app at all.
+
+### "Update Recovery Failed" dialog
+This means the rollback itself could not finish (for example, the backup folder was deleted mid-restore) and the install may be a mix of old and new files. PorySuite keeps all recovery materials and refuses further updates until this is resolved. The dialog offers to retry the recovery; manual instructions are appended to `_update_error.log`. If all else fails, reinstalling the release over the folder is safe — your settings, projects, and data are in folders the updater never touches.
+
+### Files the update didn't replace or remove
+- **A file you modified** (compared to the shipped release) that the new release replaces: your edited copy is saved to `_update_preserved` in the install folder before the new file goes in. `_update_preserved` is never deleted by the updater.
+- **A release file you modified** that the new release wants to *remove*: it is kept in place instead, and a note is written to `_update_notices.log`.
+- **A file you created** that a new release now ships under the same name: the update stops before changing anything and tells you, rather than taking the file over. Move or rename your file, then update again.
+- Obsolete files from *older* releases are only removed when the updater can prove (by checksum against its manifest, `_installed_manifest.json`) that they are untouched release files. Installs that predate the manifest have nothing removed; the first manifest is written for future updates.
+
+### Leftover `_update_*` files in the folder
+Files named `_update_staging`, `_update_backup`, `_apply_update.bat`, and similar are the updater's working materials. After a successful update they are cleaned up automatically. If they are left over from a *failed* update, leave them alone until the next launch — PorySuite uses them to recover. If they were copied in from a *different* install (the updater records which folder they belong to), PorySuite refuses to act on them and says so; it is safe to delete them in that case.
+
+---
+
 ## Sound Editor
 
 ### Songs sound wrong — wrong pitch, missing notes, volume too loud/quiet

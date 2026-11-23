@@ -306,6 +306,17 @@ class VoicegroupsTab(QWidget):
         self._slot_filter.setToolTip("Filter which instrument slots are shown.")
         self._slot_filter.currentIndexChanged.connect(self._apply_slot_filter)
         slot_filter_row.addWidget(self._slot_filter)
+
+        self._btn_sort_slots = QPushButton("Sort A–Z")
+        self._btn_sort_slots.setToolTip(
+            "Put this voicegroup's instruments in alphabetical order.\n"
+            "The slot number IS the instrument, so every song on this "
+            "voicegroup is renumbered to match.\n"
+            "You are shown exactly what will change before anything is "
+            "written.")
+        self._btn_sort_slots.clicked.connect(self._on_sort_slots)
+        slot_filter_row.addWidget(self._btn_sort_slots)
+
         slot_filter_row.addStretch()
 
         self._slot_count_label = QLabel("")
@@ -1317,6 +1328,91 @@ class VoicegroupsTab(QWidget):
             f"D {inst.decay}, S {inst.sustain}, R {inst.release})" for inst in silent))
         self._silent_row.setVisible(True)
 
+    def _on_sort_slots(self) -> None:
+        """Put the current voicegroup's instruments in alphabetical order.
+
+        The slot number IS the instrument, so this renumbers every song on
+        the voicegroup to match — see `core.sound.voicegroup_sort`. The plan
+        is worked out and checked in full BEFORE anything is written, the
+        user is shown exactly what it will do, and a refusal leaves
+        everything untouched.
+        """
+        from core.sound.voicegroup_sort import (
+            prepare, apply_sort, VoicegroupSortRefused)
+
+        vg = self._current_vg
+        if vg is None or not self._project_root:
+            return
+
+        try:
+            plan = prepare(self._project_root, vg)
+        except VoicegroupSortRefused as exc:
+            QMessageBox.warning(self, "Cannot sort this voicegroup", str(exc))
+            return
+        except Exception as exc:            # noqa: BLE001 - shown to the user
+            _log.exception("Sort plan failed for %s", vg.name)
+            QMessageBox.warning(self, "Cannot sort this voicegroup",
+                                f"The sort could not be worked out: {exc}\n\n"
+                                f"Nothing was changed.")
+            return
+
+        if plan.is_noop:
+            QMessageBox.information(
+                self, "Already in order",
+                f"{vg.name}'s instruments are already in alphabetical order.")
+            return
+
+        songs = len(plan.songs)
+        detail = (f"{plan.moved} of {len(vg.instruments)} slots move.\n\n")
+        if songs:
+            listed = ", ".join(plan.songs[:8])
+            if songs > 8:
+                listed += f" and {songs - 8} more"
+            detail += (
+                f"{songs} song{'s' if songs != 1 else ''} play on this "
+                f"voicegroup and will be renumbered so they keep playing the "
+                f"same instruments:\n{listed}\n\n"
+                f"Each song's .mid and .s are rewritten, and a copy of both "
+                f"is kept first.\n\n")
+        else:
+            detail += "No song plays on this voicegroup.\n\n"
+        detail += ("The voicegroup itself is marked unsaved — it is written "
+                   "when you save.\n\nSort it now?")
+
+        if QMessageBox.question(
+                self, f"Sort {vg.name} alphabetically?", detail,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            report = apply_sort(self._project_root, vg, plan)
+        except Exception as exc:            # noqa: BLE001 - shown to the user
+            _log.exception("Sort failed for %s", vg.name)
+            QMessageBox.warning(
+                self, "The sort did not finish",
+                f"{exc}\n\nSome songs may already have been renumbered. The "
+                f"copies taken first are in PorySuite's cache, under "
+                f"'voicegroup_sort'.")
+            return
+
+        _log.info("Sorted %s: %d slots moved, %d song(s) renumbered",
+                  vg.name, report['moved'], len(report['songs']))
+        self._dirty_voicegroups.add(vg.name)
+        self._dirty_slots.setdefault(vg.name, set()).update(
+            range(len(vg.instruments)))
+        self._tint_vg_row(vg.name, True)
+        self._slots_group.setStyleSheet(_DIRTY_SS)
+        self._populate_slot_list(vg)
+        self._update_silent_warning()
+        self.modified.emit()
+        QMessageBox.information(
+            self, "Sorted",
+            f"{vg.name} is in alphabetical order. {report['moved']} slots "
+            f"moved and {len(report['songs'])} song"
+            f"{'s were' if len(report['songs']) != 1 else ' was'} renumbered."
+            f"\n\nThe voicegroup is marked unsaved — save to write it.")
+
     def _on_fix_silent_samples(self) -> None:
         """Give every silent sampled instrument in the current voicegroup the
         neutral sampled envelope. Marks them unsaved; Save writes them."""
@@ -1882,6 +1978,34 @@ class VoicegroupsTab(QWidget):
                 for inc_line in include_after[vg_name]:
                     lines.append(inc_line)
                 lines.append("")
+
+        # ── Back up what is on disk BEFORE overwriting it ───────────
+        # This writes the WHOLE file from memory -- every voicegroup, every
+        # slot -- so a wrong or stale in-memory state overwrites the lot,
+        # silently and without a diff. Nothing else kept a copy: src/ gets
+        # backups and data/event_scripts.s gets backups, sound/ got none.
+        # On 2026-11-18 seventeen slots of one voicegroup were overwritten
+        # and the committed copy in git was the only surviving record of
+        # what had been there.
+        #
+        # The copy goes into PorySuite's cache, never the game tree, and is
+        # verified byte for byte. If it cannot be made, NOTHING is written
+        # and the dirty flags stay set: an unsaved edit can be made again,
+        # an overwritten voicegroup cannot. The caller reports the failure.
+        if os.path.isfile(out_path):
+            from core.sound.song_sync import backup_song_file
+            try:
+                backup_path = backup_song_file(
+                    self._project_root, out_path, why='voicegroup_backups')
+            except OSError as exc:
+                _log.error(
+                    "voice_groups.inc NOT written — could not back it up "
+                    "first: %s", exc)
+                raise OSError(
+                    "voice_groups.inc was not saved: the existing file could "
+                    f"not be backed up first ({exc}). Nothing was changed on "
+                    "disk, and the edits are still pending.") from exc
+            _log.info("Backed up voice_groups.inc to %s", backup_path)
 
         with open(out_path, 'w', encoding='utf-8', newline='\n') as f:
             f.write('\n'.join(lines))

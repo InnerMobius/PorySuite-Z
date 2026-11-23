@@ -13,8 +13,8 @@ species save, with no rotation and no size cap, into the APPLICATION folder:
 Nothing in the application reads either file. Both record the project's own
 content — species constants and field values, e.g.
 
-    SPECIES_OCTO form=None DIRTY[evolutions] stored=[{'method': 'EVO_LEVEL',
-    'param': 16, 'targetSpecies': 'SPECIES_OCTOROK'}] …
+    SPECIES_POLIWAG form=None DIRTY[evolutions] stored=[{'method': 'EVO_LEVEL',
+    'param': 16, 'targetSpecies': 'SPECIES_POLIWHIRL'}] …
 
 so they are a running transcript of the user's game data, written without being
 asked, for a diagnostic nobody is currently running.

@@ -281,6 +281,20 @@ _DEFAULT_AT_START = {('PAN', 64), ('BEND', 64), ('MOD', 0), ('KEYSH', 0), ('TUNE
 _STARTING = frozenset(('VOICE', 'VOL', 'PAN', 'MOD', 'TEMPO'))
 
 
+class _HeldEvent:
+    """One NOTE / TIE / EOT at its PLAYED tick, for the pairing pass.
+
+    The walk below works on an expanded stream, where a command inside a
+    pattern is heard at a different tick each time the pattern plays, so the
+    pairing cannot read the raw commands -- it needs the tick the note was
+    actually heard at.
+    """
+    __slots__ = ('cmd', 'tick', 'pitch', 'velocity')
+
+    def __init__(self, cmd, tick, pitch, velocity):
+        self.cmd, self.tick, self.pitch, self.velocity = cmd, tick, pitch, velocity
+
+
 def audible_signature(song, expanded=None) -> dict:
     """Everything the engine plays, per track, grouped by kind.
 
@@ -298,6 +312,7 @@ def audible_signature(song, expanded=None) -> dict:
     """
     from collections import Counter
     from core.sound.midi_exporter import expand_song, _raw_vol, _tempo_bpm, _clamp_velocity
+    from core.sound.tie_pairing import tie_spans
     if expanded is None:
         expanded = expand_song(song)
     master = getattr(song, 'master_volume', None)
@@ -309,24 +324,23 @@ def audible_signature(song, expanded=None) -> dict:
         def put(group, key):
             groups.setdefault(group, Counter())[key] += 1
 
-        last_key = None
-        open_ties: dict = {}
+        held: list = []
         played = ex.events[:ex.played_count]
         for t, _seq, c in played:
             kind = c.cmd
             if kind == 'NOTE':
-                last_key = c.pitch
+                # Not held, but it sets the running key a keyless EOT reads,
+                # so the pairing pass has to see it too.
+                held.append(_HeldEvent(kind, t, c.pitch, c.velocity))
                 put('notes', (t, c.pitch, _clamp_velocity(c.velocity),
                               int(c.duration or 0) + int(c.gate_time or 0)))
-            elif kind == 'TIE':
-                last_key = c.pitch
-                open_ties.setdefault(c.pitch, []).append((t, _clamp_velocity(c.velocity)))
-            elif kind == 'EOT':
-                pitch = c.pitch if c.pitch is not None else last_key
-                last_key = pitch
-                if open_ties.get(pitch):
-                    t0, vel = open_ties[pitch].pop(0)
-                    put('notes', (t0, pitch, vel, t - t0))
+            elif kind in ('TIE', 'EOT'):
+                # Held notes are paired after the walk, by the one shared
+                # rule in core.sound.tie_pairing. Pairing them here, in a
+                # rule of this function's own, is what let the save check
+                # and the editor read the same note as two different
+                # lengths -- BUGS.md 2026-11-18.
+                held.append(_HeldEvent(kind, t, c.pitch, c.velocity))
             elif kind in SIGNATURE_GROUPS:
                 if kind == 'VOL':
                     value = _raw_vol(c, master)
@@ -341,9 +355,8 @@ def audible_signature(song, expanded=None) -> dict:
                     group = 'starting ' + group
                 put(group, (kind, t, value, getattr(c, 'sub', None), getattr(c, 'arg1', None)))
         end = ex.goto_time if ex.goto_time is not None else ex.end_time
-        for pitch, opened in open_ties.items():
-            for t0, vel in opened:
-                put('notes', (t0, pitch, vel, end - t0))
+        for t0, pitch, vel, t1 in tie_spans(held, end_tick=end):
+            put('notes', (t0, pitch, _clamp_velocity(vel), t1 - t0))
         # mid2agb gives a track with no volume before its first note a full one
         # at the start (agb.cpp PrintAgbTrack: "VOL , 127*mvl/mxv"); that is
         # what the engine then plays, so it is what is compared.
@@ -410,8 +423,50 @@ def signature_differences(before: dict, after: dict, ignore=(),
                     bits.append(f"{lost} lost or moved")
                 if added:
                     bits.append(f"{added} new or moved")
-                out.append(f"track {ti + 1}: {group} — {', '.join(bits)}")
+                line = f"track {ti + 1}: {group} — {', '.join(bits)}"
+                detail = _examples(group, ca - cb, cb - ca)
+                if detail:
+                    line += f" ({detail})"
+                out.append(line)
     return out
+
+
+def _examples(group: str, lost, added, limit: int = 2) -> str:
+    """A couple of concrete items behind a count.
+
+    "2 lost or moved, 2 new or moved" says nothing a person can act on. This
+    names the notes and, where the same note is on both sides, what actually
+    differs about it. Diagnosing the 2026-11-18 mus_lab refusal needed the
+    comparison monkeypatched in a scratch script to get at exactly this.
+    """
+    if group != 'notes':
+        gone = sorted(lost)[:limit]
+        came = sorted(added)[:limit]
+        parts = [f"gone: {g}" for g in gone] + [f"new: {c}" for c in came]
+        return "; ".join(parts)
+    # (tick, pitch, velocity, length) — pair the two sides up by the note's
+    # identity so a changed length reads as a change rather than as two
+    # unrelated notes.
+    by_head = {}
+    for k in lost:
+        by_head.setdefault((k[0], k[1]), [None, None])[0] = k
+    for k in added:
+        by_head.setdefault((k[0], k[1]), [None, None])[1] = k
+    parts = []
+    for (tick, pitch), (a, b) in sorted(by_head.items()):
+        if a and b and a[3] != b[3]:
+            parts.append(f"tick {tick} key {pitch}: length {a[3]} on screen, "
+                         f"{b[3]} in the build")
+        elif a and b:
+            parts.append(f"tick {tick} key {pitch}: velocity {a[2]} on screen, "
+                         f"{b[2]} in the build")
+        elif a:
+            parts.append(f"tick {tick} key {pitch}: on screen, not in the build")
+        else:
+            parts.append(f"tick {tick} key {pitch}: in the build, not on screen")
+        if len(parts) >= limit:
+            break
+    return "; ".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -810,10 +865,10 @@ def save_song_header(project_root: str, label: str, *, priority=None, reverb=Non
 # Editor saves (the Piano Roll)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# WAIT is the song's clock: an editor never edits a wait, and every wait of
-# every length would look alike to the matching below, so waits stay out of it.
-_STRUCTURE = frozenset(('LABEL', 'GOTO', 'PATT', 'PEND', 'FINE', 'WAIT'))
-_NOTE_CMDS = frozenset(('NOTE', 'TIE', 'EOT'))
+# Which commands an editor edits the value of lives with the parser, beside
+# the identity that is numbered from it -- the two have to agree, or a
+# command gets an identity the matching below never looks for.
+from core.sound.song_parser import is_value_command
 
 
 def apply_command_edits(base_track, live_track) -> set:
@@ -831,11 +886,18 @@ def apply_command_edits(base_track, live_track) -> set:
     Refuses when the editor's song does not come from the file as it is now
     (it was changed on disk after the editor opened it): matching it up would
     be guessing.
+
+    "The file as it is now" means its MUSIC, not its layout. Commands are
+    matched by (track, ordinal among that track's value commands), so a .s
+    rebuilt from the same .mid -- or one that Song Build Protection has added
+    its header line to -- still lines up and still saves. A command added to
+    or removed from the file shifts the ordinals after it, the values stop
+    matching, and the save is refused as it should be.
     """
     import copy
 
     def relevant(cmds):
-        return [c for c in cmds if c.cmd not in _STRUCTURE and c.cmd not in _NOTE_CMDS]
+        return [c for c in cmds if is_value_command(c.cmd)]
 
     base_ns = relevant(base_track.commands)
     live_ns = relevant(live_track.commands)
