@@ -1752,6 +1752,15 @@ class RefactorService:
                     self._logger("Updated src/data/trainers.json")
                 self._record("trainers", old, new)
                 applied.append(op)
+        # A rename changes the display name the dex search sorts by, so the
+        # derived sort arrays in pokedex_orders.h must be re-derived from the
+        # just-written name table. Never blocks the rename on failure.
+        if applied:
+            try:
+                from core import pokedex_orders as _pokedex_orders
+                _pokedex_orders.regenerate_pokedex_orders(root)
+            except Exception:
+                logging.exception("pokedex_orders.h regeneration failed")
         # Summary log
         if self._logger and self._changed_files:
             self._logger(f"Saved {len(self._changed_files)} source files")

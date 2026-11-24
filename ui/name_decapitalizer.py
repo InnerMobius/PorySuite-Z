@@ -24,6 +24,7 @@ Skip-list is persisted per-project in settings.ini under
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Callable
@@ -717,6 +718,16 @@ class NameDecapitalizerDialog(QDialog):
                 self._write_species_names_header(species_changed)
             except Exception:
                 pass
+            # The dex search sort arrays are derived from these display
+            # names — rebuild them from the just-written name table so the
+            # next build's in-game search stays correctly ordered.
+            try:
+                from core import pokedex_orders as _pokedex_orders
+                root = self._ps.project_info.get("dir", "")
+                if root:
+                    _pokedex_orders.regenerate_pokedex_orders(root)
+            except Exception:
+                logging.exception("pokedex_orders.h regeneration failed")
 
         # Mark dirty + refresh lists in open editors so the user sees the change
         self._refresh_editors()

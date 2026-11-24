@@ -3040,6 +3040,36 @@ class PokemonDataManager(pokemon_data.PokemonDataManager):
         self._fr_move_desc_overlay: dict[str, str] = {}
         self._fr_move_desc_ready: bool = False
 
+    @override
+    def parse_to_c_code(self):
+        super().parse_to_c_code()
+        # The dex search sort arrays are DERIVED from data the plugins just
+        # wrote (display names, dex heights/weights); rebuild them so every
+        # save leaves pokedex_orders.h consistent. Runs after all plugin
+        # threads have joined — the regeneration reads the headers they wrote.
+        self.regenerate_pokedex_orders()
+
+    def regenerate_pokedex_orders(self) -> int:
+        """Re-derive gPokedexOrder_* in pokedex_orders.h from current data.
+
+        Numeric height/weight come from the in-memory national dex model
+        when available (UI edits live there before any header write);
+        names come from the name table on disk. Never raises — a failed
+        regeneration logs and leaves the file as it is.
+        """
+        from core import pokedex_orders as _pokedex_orders
+        try:
+            natdex = None
+            dex = self.data.get("pokedex")
+            if dex is not None and getattr(dex, "data", None):
+                natdex = dex.data.get("national_dex")
+            root = LocalUtil(self.project_info).repo_root()
+            return _pokedex_orders.regenerate_pokedex_orders(
+                root, natdex=natdex)
+        except Exception:
+            logger.exception("pokedex_orders.h regeneration failed")
+            return -1
+
     # --- FireRed-specific overlays to avoid load-time writes ---
     def _fr_read_header_lines(self, *parts: str) -> list[str]:
         try:
